@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -314,6 +314,8 @@
       
         
       
+        
+      
     
     
     
@@ -358,6 +360,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -469,7 +499,7 @@
   <a href="#protect-cannot-be-reconstructed" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Protect — cannot be reconstructed
+        Protect - cannot be reconstructed
       
     </span>
   </a>
@@ -480,7 +510,7 @@
   <a href="#rebuild-safe-to-lose" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Rebuild — safe to lose
+        Rebuild - safe to lose
       
     </span>
   </a>
@@ -491,7 +521,7 @@
   <a href="#binaries-reinstall-dont-back-up" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Binaries — reinstall, don't back up
+        Binaries - reinstall, don't back up
       
     </span>
   </a>
@@ -732,6 +762,18 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -812,6 +854,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -847,7 +917,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1322,7 +1532,7 @@
   <a href="#protect-cannot-be-reconstructed" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Protect — cannot be reconstructed
+        Protect - cannot be reconstructed
       
     </span>
   </a>
@@ -1333,7 +1543,7 @@
   <a href="#rebuild-safe-to-lose" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Rebuild — safe to lose
+        Rebuild - safe to lose
       
     </span>
   </a>
@@ -1344,7 +1554,7 @@
   <a href="#binaries-reinstall-dont-back-up" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Binaries — reinstall, don't back up
+        Binaries - reinstall, don't back up
       
     </span>
   </a>
@@ -1564,14 +1774,14 @@
   
 
 
-<h1 id="operations-config-upkeep-and-backup">Operations — config, upkeep, and backup<a class="headerlink" href="#operations-config-upkeep-and-backup" title="Permanent link">&para;</a></h1>
+<h1 id="operations-config-upkeep-and-backup">Operations - config, upkeep, and backup<a class="headerlink" href="#operations-config-upkeep-and-backup" title="Permanent link">&para;</a></h1>
 <p>Where things live on disk, what needs protecting, what can be rebuilt
 from scratch, and the maintenance tasks that keep the daemon healthy.</p>
 <h2 id="what-to-protect-vs-whats-rebuildable">What to protect vs. what's rebuildable<a class="headerlink" href="#what-to-protect-vs-whats-rebuildable" title="Permanent link">&para;</a></h2>
 <p>This is the most important section for disaster recovery and multi-machine
 replication. Get this wrong and a disk failure or mistaken <code>rm -rf</code> takes
 out months of accumulated knowledge.</p>
-<h3 id="protect-cannot-be-reconstructed">Protect — cannot be reconstructed<a class="headerlink" href="#protect-cannot-be-reconstructed" title="Permanent link">&para;</a></h3>
+<h3 id="protect-cannot-be-reconstructed">Protect - cannot be reconstructed<a class="headerlink" href="#protect-cannot-be-reconstructed" title="Permanent link">&para;</a></h3>
 <p>These files are the durable state blackbox accumulates over time. Back
 them up, version them, and replicate them to wherever your next machine
 will run.</p>
@@ -1626,7 +1836,7 @@ will run.</p>
 </tr>
 <tr>
 <td><code>~/.local/state/blackbox/bro/</code></td>
-<td><strong>The entire bro directory</strong> — see breakdown below</td>
+<td><strong>The entire bro directory</strong> - see breakdown below</td>
 <td>varies</td>
 </tr>
 <tr>
@@ -1699,7 +1909,7 @@ will run.</p>
 </tr>
 </tbody>
 </table>
-<h3 id="rebuild-safe-to-lose">Rebuild — safe to lose<a class="headerlink" href="#rebuild-safe-to-lose" title="Permanent link">&para;</a></h3>
+<h3 id="rebuild-safe-to-lose">Rebuild - safe to lose<a class="headerlink" href="#rebuild-safe-to-lose" title="Permanent link">&para;</a></h3>
 <p>These can be fully reconstructed from the protected files + source
 repos. Don't waste backup space on them.</p>
 <table>
@@ -1736,7 +1946,7 @@ repos. Don't waste backup space on them.</p>
 </tr>
 </tbody>
 </table>
-<h3 id="binaries-reinstall-dont-back-up">Binaries — reinstall, don't back up<a class="headerlink" href="#binaries-reinstall-dont-back-up" title="Permanent link">&para;</a></h3>
+<h3 id="binaries-reinstall-dont-back-up">Binaries - reinstall, don't back up<a class="headerlink" href="#binaries-reinstall-dont-back-up" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>~/.local/bin/blackboxd
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>~/.local/bin/blackboxd-dev
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>~/.local/bin/bro
@@ -1745,7 +1955,7 @@ repos. Don't waste backup space on them.</p>
 <h2 id="configuration">Configuration<a class="headerlink" href="#configuration" title="Permanent link">&para;</a></h2>
 <h3 id="api-keys">API keys<a class="headerlink" href="#api-keys" title="Permanent link">&para;</a></h3>
 <p>Blackbox uses Voyage AI for embeddings. The daemon needs the key in its
-environment — not in a config file, not hardcoded.</p>
+environment - not in a config file, not hardcoded.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># ~/.config/systemd/user/blackbox.service.d/secrets.conf</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="k">[Service]</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="na">Environment</span><span class="o">=</span><span class="s">DAYSTROM_VOYAGE_API_KEY=pa-...</span>
@@ -1784,7 +1994,7 @@ model requires re-embedding that route: <code>bbox_reembed(route="knowledge")</c
 <h3 id="port">Port<a class="headerlink" href="#port" title="Permanent link">&para;</a></h3>
 <p>Default port: <code>7264</code> (HTTP MCP + <code>/tail</code> + <code>/roster</code>). Override with
 <code>BBOX_PORT</code> environment variable. Port <code>7263</code> is retired (old <code>bro.service</code>)
-— avoid it.</p>
+- avoid it.</p>
 <h3 id="daemon-variants">Daemon variants<a class="headerlink" href="#daemon-variants" title="Permanent link">&para;</a></h3>
 <p>Prod and dev intentionally run from separate installed binary paths so
 a dev build swap doesn't touch the running prod service:</p>
@@ -1875,15 +2085,15 @@ old inode until systemd restarts it.</p>
 <a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>install<span class="w"> </span>-m<span class="w"> </span><span class="m">755</span><span class="w"> </span>target/release/bro<span class="w"> </span>~/.local/bin/bro
 <a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>systemctl<span class="w"> </span>--user<span class="w"> </span>restart<span class="w"> </span>blackbox.service<span class="w"> </span>blackbox-dev.service
 </code></pre></div>
-<p>Watch the journal for <code>auto-reindex: indexed N files</code> — if the schema
+<p>Watch the journal for <code>auto-reindex: indexed N files</code> - if the schema
 version changed, the index will drop and rebuild (~5–7 min for 1M docs).</p>
 <h3 id="after-a-schema-version-bump">After a schema version bump<a class="headerlink" href="#after-a-schema-version-bump" title="Permanent link">&para;</a></h3>
 <p>The daemon drops and rebuilds the index automatically on start. You'll
 see <code>dropping transcript index for schema migration</code> in the journal.
 Wait for:</p>
 <ol>
-<li><code>auto-reindex: indexed N files (M docs)</code> — tantivy rebuild done</li>
-<li><code>edge-index watcher: corpus grew, EdgeIndex rebuilt</code> — graph projection done (~6 sec after)</li>
+<li><code>auto-reindex: indexed N files (M docs)</code> - tantivy rebuild done</li>
+<li><code>edge-index watcher: corpus grew, EdgeIndex rebuilt</code> - graph projection done (~6 sec after)</li>
 <li>Smoke: <code>bbox_describe_schema</code> should return all entity types with non-zero populations; <code>bbox_hybrid_search("test", limit=5)</code> should show both <code>bm25</code> and <code>vector</code> sources.</li>
 </ol>
 <h3 id="after-changing-an-embedding-route-provider">After changing an embedding route provider<a class="headerlink" href="#after-changing-an-embedding-route-provider" title="Permanent link">&para;</a></h3>
@@ -1908,7 +2118,7 @@ start taking noticeably longer.</p>
 <a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a>bbox_render<span class="o">(</span><span class="nv">scope</span><span class="o">=</span><span class="s2">&quot;global&quot;</span><span class="o">)</span><span class="w">  </span><span class="c1"># re-sync provider markdown files if out of date</span>
 </code></pre></div>
 <h2 id="backup-strategy">Backup strategy<a class="headerlink" href="#backup-strategy" title="Permanent link">&para;</a></h2>
-<p>Minimal working backup — tar the protect list:</p>
+<p>Minimal working backup - tar the protect list:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>tar<span class="w"> </span>-czf<span class="w"> </span>blackbox-backup-<span class="k">$(</span>date<span class="w"> </span>+%F<span class="k">)</span>.tar.gz<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a><span class="w">  </span>~/.local/state/blackbox/blackbox-knowledge.json<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="w">  </span>~/.local/state/blackbox/blackbox-notes.json<span class="w"> </span><span class="se">\</span>
@@ -1929,7 +2139,7 @@ vectors, run <code>bbox_reembed(route="&lt;route&gt;")</code> for each configure
 <li>Restore the protected files to the same paths.</li>
 <li>Build and install the daemon binaries.</li>
 <li>Copy systemd units and drop-ins (including secrets).</li>
-<li>Start the daemon — index rebuilds automatically.</li>
+<li>Start the daemon - index rebuilds automatically.</li>
 <li>Run <code>bbox_reembed(route="&lt;route&gt;")</code> for each embedding route.</li>
 <li>Verify: <code>bbox_describe_schema</code>, <code>bbox_embed_status</code>, <code>bbox_inbox</code>.</li>
 </ol>

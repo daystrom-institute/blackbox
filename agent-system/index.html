@@ -6,12 +6,12 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
       
-        <link rel="prev" href="../refactor/">
+        <link rel="prev" href="../artifact-catalog/">
       
       
         <link rel="next" href="../badgey/">
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -430,6 +460,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -527,6 +569,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -562,7 +632,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -724,6 +934,17 @@
     <span class="md-ellipsis">
       
         When to install an agent vs. inline a prompt
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#agent-vs-atom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agent vs. Atom
       
     </span>
   </a>
@@ -1256,6 +1477,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#agent-vs-atom" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Agent vs. Atom
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#see-also" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1287,11 +1519,12 @@
 
 
 <h1 id="agent-system">Agent System<a class="headerlink" href="#agent-system" title="Permanent link">&para;</a></h1>
-<p>Installed agents are registered, versioned LLM personas that bundle a
-brofile, a prompt template, allow/disallow tool surfaces, and metadata
-like <code>when_to_use</code> and <code>anti_patterns</code>. They're discoverable by agents
-themselves via <code>bro_agent_search</code>, making them the primary mechanism
-for self-delegation.</p>
+<p>Agents are the old reusable-dispatch surface: a named persona, a brofile, a
+prompt template, and search metadata. They still matter because existing
+<code>bro_agent_*</code> callers and legacy workflow examples use them.</p>
+<p>For new public capabilities, use <a href="../atoms/">Atoms</a>. An atom can still wrap a
+brofile, but it also gives callers schemas, effect limits, child-call rules,
+owned invocation handles, and non-LLM backends.</p>
 <h2 id="agent-anatomy">Agent anatomy<a class="headerlink" href="#agent-anatomy" title="Permanent link">&para;</a></h2>
 <p>An agent artifact carries:</p>
 <table>
@@ -1345,8 +1578,10 @@ for self-delegation.</p>
 </tbody>
 </table>
 <h2 id="installing-agents">Installing agents<a class="headerlink" href="#installing-agents" title="Permanent link">&para;</a></h2>
-<p>Agents are installed as artifacts. The source can be a local JSON file
-or an HTTP URL:</p>
+<p>Agents are installed as artifacts. Blackbox-owned defaults live under
+<code>system-defaults/agents/</code>; tutorial and integration examples stay under
+<code>examples/</code>.</p>
+<p>The source can be a local JSON file or an HTTP URL:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="c1">// From a local file</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="err">bbox_ar</span><span class="kc">t</span><span class="err">i</span><span class="kc">fa</span><span class="err">c</span><span class="kc">t</span><span class="err">_i</span><span class="kc">nstall</span><span class="err">(</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="err">ki</span><span class="kc">n</span><span class="err">d</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;agent&quot;</span><span class="p">,</span>
@@ -1370,9 +1605,12 @@ or an HTTP URL:</p>
 <a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="c1">// Get full details for one agent</span>
 <a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="err">bro_age</span><span class="kc">nt</span><span class="err">_ge</span><span class="kc">t</span><span class="err">(</span><span class="kc">na</span><span class="err">me</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;pr-reviewer&quot;</span><span class="err">)</span>
 <a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1">// Agent describe — full manifest + resolved brofile + merged filters</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="c1">// Agent describe - full manifest + resolved brofile + merged filters</span>
 <a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="err">bro_age</span><span class="kc">nt</span><span class="err">_describe(age</span><span class="kc">nt</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;pr-reviewer@v1.0.0&quot;</span><span class="err">)</span>
 </code></pre></div>
+<p>For new capability discovery, prefer <code>atom_search</code> / <code>atom_describe</code>. Agent
+manifests do not carry effect or composition policy, so they are weaker as a
+public contract.</p>
 <h2 id="dispatching-an-agent">Dispatching an agent<a class="headerlink" href="#dispatching-an-agent" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="err">bro_age</span><span class="kc">nt</span><span class="err">_dispa</span><span class="kc">t</span><span class="err">ch(</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="err">age</span><span class="kc">nt</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;pr-reviewer&quot;</span><span class="p">,</span>
@@ -1384,26 +1622,27 @@ or an HTTP URL:</p>
 <a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="err">)</span>
 </code></pre></div>
-<p>Returns <code>{task_id, session_id, agent_label}</code>. The task is now a regular
-bro task — you can <code>bro_status</code>, <code>bro_wait</code>, <code>bro_cancel</code> it.</p>
+<p>Returns <code>{task_id, session_id, agent_label}</code>. The task is now a regular bro
+task; use <code>bro_status</code>, <code>bro_wait</code>, and <code>bro_cancel</code> for lifecycle control.</p>
+<p>Agents dispatch one bro task. If you need a reusable operation that can also be
+bound into a workflow, expose the brofile through a profile-backed atom instead.</p>
 <h2 id="tool-surface-filter-merging">Tool surface (filter merging)<a class="headerlink" href="#tool-surface-filter-merging" title="Permanent link">&para;</a></h2>
-<p>Every dispatched agent has a computed tool surface determined by Deny wins
-merge of three layers:</p>
+<p>Every dispatched agent has a computed tool surface determined by a deny-wins
+merge of four layers:</p>
 <ol>
-<li><strong>Global MCP config</strong> (<code>~/.bro/mcp.json</code>) — allow/disallow patterns
+<li><strong>Global MCP config</strong> (<code>~/.bro/mcp.json</code>) - allow/disallow patterns
    from <code>bro_mcp action=allow/disallow</code></li>
 <li><strong>Project overlay</strong> (<code>&lt;project&gt;/.bro/mcp.json</code>)</li>
-<li><strong>Brofile persona</strong> — <code>allow_tools</code> / <code>disallow_tools</code> on the
+<li><strong>Brofile persona</strong> - <code>allow_tools</code> / <code>disallow_tools</code> on the
    brofile the agent uses</li>
-<li><strong>Per-dispatch overlay</strong> — <code>allow_tools</code> / <code>disallow_tools</code> on the
+<li><strong>Per-dispatch overlay</strong> - <code>allow_tools</code> / <code>disallow_tools</code> on the
    exec call itself</li>
 </ol>
-<p>Layer 4 is the most specific and overrides everything. The mechanical
-recursion guard (<code>bro_*</code> disallowed by default) applies at argv
-construction for every dispatch-capable provider — translated per
-provider into the native disallow syntax (Claude <code>--disallowedTools</code>,
-Codex <code>-c mcp_servers.blackbox.disabled_tools=[...]</code>, Gemini
-<code>--policy &lt;tempfile&gt;</code>).</p>
+<p>Layer 4 is the most specific and overrides everything. The mechanical recursion
+guard (<code>bro_*</code> disallowed by default) applies at argv construction for every
+dispatch-capable provider. Each provider gets its native deny syntax: Claude
+<code>--disallowedTools</code>, Codex
+<code>-c mcp_servers.blackbox.disabled_tools=[...]</code>, Gemini <code>--policy &lt;tempfile&gt;</code>.</p>
 <h2 id="lifecycle">Lifecycle<a class="headerlink" href="#lifecycle" title="Permanent link">&para;</a></h2>
 <p>Agents can be superseded:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="err">bbox_ar</span><span class="kc">t</span><span class="err">i</span><span class="kc">fa</span><span class="err">c</span><span class="kc">t</span><span class="err">_supersede(</span>
@@ -1431,7 +1670,7 @@ non-standard execution path. The built-in ones:</p>
 </tr>
 <tr>
 <td><code>badgey</code></td>
-<td>Routes through Badgey's consultant wrapper — the agent runs as a Badgey instance with its own thread-of-record and proposal store</td>
+<td>Routes through Badgey's consultant wrapper. The agent runs as a Badgey instance with its own thread-of-record and proposal store.</td>
 </tr>
 </tbody>
 </table>
@@ -1464,12 +1703,44 @@ non-standard execution path. The built-in ones:</p>
 </tr>
 </tbody>
 </table>
+<h2 id="agent-vs-atom">Agent vs. Atom<a class="headerlink" href="#agent-vs-atom" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>Situation</th>
+<th>Prefer</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Existing <code>bro_agent_*</code> caller or compatibility workflow</td>
+<td>Agent</td>
+</tr>
+<tr>
+<td>Persona-only dispatch with no stable input/output contract</td>
+<td>Agent or brofile</td>
+</tr>
+<tr>
+<td>Discoverable capability with schemas, effect limits, and trace handles</td>
+<td>Atom</td>
+</tr>
+<tr>
+<td>Capability implemented by a workflow, deterministic runner, or adapter</td>
+<td>Atom</td>
+</tr>
+<tr>
+<td>Workflow wants a reusable capability boundary</td>
+<td>Atom plus workflow <code>atom_bindings</code></td>
+</tr>
+</tbody>
+</table>
 <h2 id="see-also">See also<a class="headerlink" href="#see-also" title="Permanent link">&para;</a></h2>
 <p>See also:</p>
 <ul>
-<li><a href="../rule-packets/">Rule Packets</a> — agents use packets for deterministic classification</li>
-<li><a href="../workflows/">Workflow Engine</a> — agents are dispatched as workflow nodes</li>
-<li>Design docs: <code>design/agent-system.md</code>, <code>design/agent-system-impl.md</code></li>
+<li><a href="../rule-packets/">Rule Packets</a>: agents use packets for deterministic classification</li>
+<li><a href="../workflows/">Workflow Engine</a>: agents are dispatched as actor nodes; atoms are bound through <code>atom_bindings</code></li>
+<li><a href="../atoms/">Atoms</a>: use these for new reusable surfaces</li>
+<li>Design docs: <code>design/archive/agent-system.md</code>, <code>design/archive/agent-system-impl.md</code></li>
 </ul>
 
 

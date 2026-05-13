@@ -6,12 +6,12 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
       
-        <link rel="prev" href="../getting-started/">
+        <link rel="prev" href="../operating-blackbox/">
       
       
         <link rel="next" href="../operations/">
@@ -314,6 +314,8 @@
       
         
       
+        
+      
     
     
     
@@ -358,6 +360,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -743,6 +773,18 @@
       
         
       
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
     
     
     
@@ -823,6 +865,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -858,7 +928,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1586,15 +1796,15 @@
   
 
 
-<h1 id="internals-graph-grounding-search-and-indexing">Internals — graph grounding, search, and indexing<a class="headerlink" href="#internals-graph-grounding-search-and-indexing" title="Permanent link">&para;</a></h1>
+<h1 id="internals-graph-grounding-search-and-indexing">Internals - graph grounding, search, and indexing<a class="headerlink" href="#internals-graph-grounding-search-and-indexing" title="Permanent link">&para;</a></h1>
 <h2 id="the-grounding-problem">The grounding problem<a class="headerlink" href="#the-grounding-problem" title="Permanent link">&para;</a></h2>
 <p>An LLM asked a cold-start question about a codebase it hasn't seen this
-session will answer from training priors — confidently, often wrong.
+session will answer from training priors - confidently, often wrong.
 Even with BM25 transcript search, naive rerank on the top-N results
 achieves around <strong>23% recall</strong> on questions that require tracing
 provenance or following a reasoning chain across multiple entities.</p>
 <p>Blackbox's graph layer raises that to around <strong>97%</strong> on the same probe
-set. The improvement doesn't come from a better model — it comes from
+set. The improvement doesn't come from a better model - it comes from
 giving agents a structured traversal surface and a sequence of tool
 calls with interlocking shapes that carry evidence forward rather than
 starting each step from scratch.</p>
@@ -1604,15 +1814,15 @@ starting each step from scratch.</p>
 output shape of step N is the required input shape of step N+1.</p>
 <h3 id="bbox_hybrid_search-bbox_discover_seed_entities"><code>bbox_hybrid_search</code> / <code>bbox_discover_seed_entities</code><a class="headerlink" href="#bbox_hybrid_search-bbox_discover_seed_entities" title="Permanent link">&para;</a></h3>
 <p><strong>Output shape:</strong> a ranked list of entity refs, each with a
-<code>notable_edges</code> preview — the highest-signal outgoing and incoming edges
+<code>notable_edges</code> preview - the highest-signal outgoing and incoming edges
 for that entity, prioritized semantic-first.</p>
 <p><strong>Why this shape:</strong> the agent doesn't have to run a second call to know
 what to inspect next. The notable_edges are a pre-vetted traversal menu.
 <code>bbox_discover_seed_entities</code> is the same search but with notable_edges
-rendered inline for every result — use it when the next step is
+rendered inline for every result - use it when the next step is
 <code>bbox_inspect_entity</code> and you want the hop targets surfaced before you
 commit to one.</p>
-<p>The vector lane catches paraphrases — if the user's query wording
+<p>The vector lane catches paraphrases - if the user's query wording
 doesn't match the corpus's wording, cosine similarity finds the
 canonical entity anyway. This is why the top seed is canonical for the
 query even when lexical matching would miss it.</p>
@@ -1624,21 +1834,21 @@ semantic-first (the hops most likely to carry meaningful context, not
 just structurally reachable nodes)</p>
 <p><strong>Why this shape:</strong> one call returns both properties and edges.
 <code>recommended_next_hops</code> means the agent doesn't have to reason about
-which edges to follow — the index pre-ranks them. The <code>edge_types</code> and
+which edges to follow - the index pre-ranks them. The <code>edge_types</code> and
 <code>direction</code> parameters exist so you can narrow from the orientation
 sweep (<code>direction=both</code>) to targeted reads (<code>direction=out,
 edge_types=SUPERSEDES</code>) as you understand the subgraph.</p>
 <p>Critical: entity refs are canonical strings. When a call returns
-<code>error.bad_input</code> with a <code>suggested_fix</code>, use the suggestion verbatim —
+<code>error.bad_input</code> with a <code>suggested_fix</code>, use the suggestion verbatim -
 don't guess a corrected ref. The ref format encodes path hashes and
 chunk positions that aren't reconstructible by inspection.</p>
 <h3 id="bbox_find_paths"><code>bbox_find_paths</code><a class="headerlink" href="#bbox_find_paths" title="Permanent link">&para;</a></h3>
 <p><strong>Input:</strong> a <code>from</code> entity ref, optional <code>to</code> ref or <code>to_type</code> target,
 optional <code>edge_types</code> filter<br />
-<strong>Output:</strong> BFS chains with <strong>path_ids</strong> — server-side identifiers for
+<strong>Output:</strong> BFS chains with <strong>path_ids</strong> - server-side identifiers for
 the validated traversal results</p>
 <p><strong>Why this shape:</strong> path_ids are the key. They are opaque handles that
-the server holds — passing them to <code>bbox_bundle_evidence</code> lets you cite
+the server holds - passing them to <code>bbox_bundle_evidence</code> lets you cite
 a multi-hop reasoning chain without reconstructing the path text from
 memory (which would be subject to hallucination). Direction is
 preserved; do not invert edges from memory.</p>
@@ -1658,14 +1868,14 @@ evidence to a human reviewer without them having to re-run the walk.</p>
 <p>For any task that touches the codebase, prior decisions, or
 conversational history, run this sequence before falling back to
 filesystem search or training-prior answers:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>1. bbox_describe_schema           # orient — entity types + edge families (once per session)
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>2. bbox_hybrid_search(q, k=5)     # seed — ranked results with notable_edges
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>3. bbox_inspect_entity(ref)       # confirm — properties + edges + recommended_next_hops
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>4. bbox_find_paths(from, to_*)    # traverse — direction-preserving BFS, returns path_ids
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>5. bbox_bundle_evidence(...)      # close — package entity refs + path_ids before answering
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>1. bbox_describe_schema           # orient - entity types + edge families (once per session)
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>2. bbox_hybrid_search(q, k=5)     # seed - ranked results with notable_edges
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>3. bbox_inspect_entity(ref)       # confirm - properties + edges + recommended_next_hops
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>4. bbox_find_paths(from, to_*)    # traverse - direction-preserving BFS, returns path_ids
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>5. bbox_bundle_evidence(...)      # close - package entity refs + path_ids before answering
 </code></pre></div>
-<p>Step 1 is one-time per session — cache the schema mentally, don't
-repeat it on every query. Step 4 is conditional — skip it when the
+<p>Step 1 is one-time per session - cache the schema mentally, don't
+repeat it on every query. Step 4 is conditional - skip it when the
 answer is single-hop. Step 5 is the close-the-loop write.</p>
 <p><strong>What makes this work is the data flowing forward:</strong></p>
 <ul>
@@ -1759,7 +1969,7 @@ counts for all types.</p>
 </tr>
 </tbody>
 </table>
-<p>One Tantivy document is indexed per content block — not per session.
+<p>One Tantivy document is indexed per content block - not per session.
 This enables role-based filtering (<code>role=user</code> vs <code>role=assistant</code>) and
 precise excerpt generation. Sessions with 50 turns produce 50+ documents,
 each independently searchable.</p>
@@ -1767,7 +1977,7 @@ each independently searchable.</p>
 <p>Edges are directional and typed. <code>bbox_find_paths</code> follows them;
 <code>bbox_inspect_entity</code> returns them filtered by <code>edge_types</code> and
 <code>direction</code>. Use <code>direction=out</code> or <code>direction=in</code> once you know what
-you're looking for — <code>direction=both</code> is for initial orientation only.</p>
+you're looking for - <code>direction=both</code> is for initial orientation only.</p>
 <table>
 <thead>
 <tr>
@@ -1815,7 +2025,7 @@ auto-triggers a rebuild when the tantivy doc count grows.</p>
 <p><code>bbox_hybrid_search</code> fuses three ranked lists via Reciprocal Rank
 Fusion (RRF), then applies four post-processing passes.</p>
 <h3 id="the-three-lists">The three lists<a class="headerlink" href="#the-three-lists" title="Permanent link">&para;</a></h3>
-<p><strong>BM25 (chunk-level)</strong> — Tantivy BM25 over indexed fields, with boosts:</p>
+<p><strong>BM25 (chunk-level)</strong> - Tantivy BM25 over indexed fields, with boosts:</p>
 <table>
 <thead>
 <tr>
@@ -1847,11 +2057,11 @@ Fusion (RRF), then applies four post-processing passes.</p>
 </tr>
 </tbody>
 </table>
-<p><strong>BM25-file (file-level aggregation)</strong> — sums per-chunk BM25 scores
+<p><strong>BM25-file (file-level aggregation)</strong> - sums per-chunk BM25 scores
 across all chunks of a file, weighted by <code>sum × √chunk_count</code>. Lifts
 files with many sparse mentions (e.g. a STATUS.md with 21 references to
 a topic) that per-chunk ranking buries.</p>
-<p><strong>Vector</strong> — HNSW approximate nearest neighbor over Voyage embeddings
+<p><strong>Vector</strong> - HNSW approximate nearest neighbor over Voyage embeddings
 (<code>voyage-code-3</code>, 1024d). Default RRF weight: 0.6 vector / 0.4 BM25.
 Override with <code>vector_weight</code>: <code>0.0</code> for BM25-only, <code>1.0</code> for
 vector-only.</p>
@@ -1864,25 +2074,25 @@ completely dominating results that appear consistently across all three.</p>
 <p>Applied in order after fusion:</p>
 <ol>
 <li>
-<p><strong>Project filter</strong> — <code>project=&lt;path or project_id&gt;</code> drops
+<p><strong>Project filter</strong> - <code>project=&lt;path or project_id&gt;</code> drops
    <code>project_file</code> refs from other projects while passing commits,
    knowledge, and transcripts through. Without this, a query for
    "voyage" in the transcript-search repo surfaces <code>erlang-test/voyage.ex</code>
    ahead of <code>transcript-search/src/embed/voyage.rs</code>.</p>
 </li>
 <li>
-<p><strong>Per-file collapse</strong> — only the highest-scoring chunk per file
+<p><strong>Per-file collapse</strong> - only the highest-scoring chunk per file
    survives. Ensures result diversity across files rather than returning
    10 chunks from the same large file.</p>
 </li>
 <li>
-<p><strong>Modal diversification</strong> — guarantees at least one <code>code_block</code>,
+<p><strong>Modal diversification</strong> - guarantees at least one <code>code_block</code>,
    <code>doc_section</code>, and <code>git_message</code> in top-N when the fetch set contains
    them. Without this, a query like "triad implementation" can return 10
    doc chunks with the defining <code>.ex</code> source file invisible.</p>
 </li>
 <li>
-<p><strong>Symbol_exact boost</strong> — single-token queries (snake_case, CamelCase,
+<p><strong>Symbol_exact boost</strong> - single-token queries (snake_case, CamelCase,
    dotted paths) add a SHOULD clause on <code>symbol_exact</code> with 6× boost,
    lifting the defining chunk above documents that only mention the
    symbol in prose.</p>
@@ -1987,7 +2197,7 @@ EdgeIndex watcher fires ~6 seconds after the doc count stabilizes.</p>
 </tr>
 <tr>
 <td><code>agentic-corpus-g5-symbol-tokenized</code></td>
-<td><code>symbol</code> switched to code_tokenizer — <code>Substrate.TriadClosure</code> now matches both camelCase and snake_case queries</td>
+<td><code>symbol</code> switched to code_tokenizer - <code>Substrate.TriadClosure</code> now matches both camelCase and snake_case queries</td>
 </tr>
 </tbody>
 </table>
@@ -2035,7 +2245,7 @@ grounding, reducing them to filesystem search. Tracked in the deferred
 items thread.</p>
 <hr />
 <h2 id="system-memories">System memories<a class="headerlink" href="#system-memories" title="Permanent link">&para;</a></h2>
-<p>Code-embedded runbooks pulled on demand — not rendered into provider
+<p>Code-embedded runbooks pulled on demand - not rendered into provider
 files, so they don't bloat every session's context. Fetch with
 <code>bbox_knowledge(query="sm-&lt;id&gt;")</code>.</p>
 <table>

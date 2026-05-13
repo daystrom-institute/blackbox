@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -428,6 +458,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -525,6 +567,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -560,7 +630,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1499,10 +1709,11 @@
 
 
 <h1 id="ingress-paths">Ingress Paths<a class="headerlink" href="#ingress-paths" title="Permanent link">&para;</a></h1>
-<p>Three trigger sources feed into the same routing pipeline. Each one
-produces an entity, passes it through an extractor, runs a routing
-packet against it, and dispatches the verdict — start an arc, signal a
-waiting arc, cancel, or ignore.</p>
+<p>Ingress is how outside events reach workflow state.</p>
+<p>Webhooks, pollers, and crons all do the same thing once they enter the daemon:
+produce an entity, extract the fields the packet cares about, apply a routing
+packet, then dispatch the verdict. The verdict starts an arc, signals a waiting
+arc, cancels an arc, dead-letters the event, or ignores it.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>┌──────────┐  ┌──────────┐  ┌──────────┐
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>│ Webhooks │  │ Pollers  │  │  Crons   │
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>└────┬─────┘  └────┬─────┘  └────┬─────┘
@@ -1515,10 +1726,9 @@ waiting arc, cancel, or ignore.</p>
 <a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>   start_arc   signal_arc   cancel_arc
 <a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>   ignore      dead_letter
 </code></pre></div>
-<p>The daemon has no hardcoded integrations — Forgejo, GitHub, Slack, any
-JSON-speaking upstream — they all converge on the same extractor →
-packet → dispatch path. You iterate on routing rules by replaying
-payloads, not by redeploying.</p>
+<p>The daemon has no hardcoded Forgejo/GitHub/Slack path. JSON-speaking upstreams
+all converge on extractor to packet to dispatch. You iterate on routing by
+replaying payloads, not by redeploying code.</p>
 <h2 id="webhooks">Webhooks<a class="headerlink" href="#webhooks" title="Permanent link">&para;</a></h2>
 <p>The daemon exposes <code>POST /webhook/&lt;name&gt;</code> for inbound webhook deliveries.
 Each webhook carries a signature scheme, an extractor, and a routing
@@ -1632,7 +1842,7 @@ the same routing packet pipeline.</p>
 </tr>
 <tr>
 <td><code>extractor</code></td>
-<td>Field projections — same shape as webhook extractors</td>
+<td>Field projections - same shape as webhook extractors</td>
 </tr>
 <tr>
 <td><code>routing_packet</code></td>
@@ -1646,7 +1856,7 @@ the same routing packet pipeline.</p>
 <a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="err">bro_poller_i</span><span class="kc">nstall</span><span class="err">(spec</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="err">...</span><span class="w"> </span><span class="p">}</span><span class="err">)</span><span class="w">  </span><span class="c1">// same name = replace</span>
 </code></pre></div>
 <h2 id="crons">Crons<a class="headerlink" href="#crons" title="Permanent link">&para;</a></h2>
-<p>Crons are calendar-driven triggers — no fetch, just a scheduled tick that
+<p>Crons are calendar-driven triggers - no fetch, just a scheduled tick that
 produces a synthetic entity and routes it through the packet pipeline.</p>
 <h3 id="install-a-cron">Install a cron<a class="headerlink" href="#install-a-cron" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="err">bro_cro</span><span class="kc">n</span><span class="err">_i</span><span class="kc">nstall</span><span class="err">(spec</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="p">{</span>
@@ -1661,8 +1871,8 @@ produces a synthetic entity and routes it through the packet pipeline.</p>
 </code></pre></div>
 <p>At each tick, the daemon merges two synthetic fields into the entity:</p>
 <ul>
-<li><code>cron_name</code> — the cron's name (so routing rules can discriminate)</li>
-<li><code>tick_at</code> — ISO 8601 timestamp of the tick</li>
+<li><code>cron_name</code> - the cron's name (so routing rules can discriminate)</li>
+<li><code>tick_at</code> - ISO 8601 timestamp of the tick</li>
 </ul>
 <p>Your routing packet can use <code>Eq{field: "cron_name", value: "daily-triage"}</code>
 to route only this cron's ticks.</p>
@@ -1716,13 +1926,13 @@ to route only this cron's ticks.</p>
 <h2 id="debugging-routing-rules">Debugging routing rules<a class="headerlink" href="#debugging-routing-rules" title="Permanent link">&para;</a></h2>
 <p>The universal debugging pattern across all three ingress types:</p>
 <ol>
-<li><strong>Replay</strong> — <code>bro_webhook_replay()</code> for webhooks; pollers and crons
+<li><strong>Replay</strong> - <code>bro_webhook_replay()</code> for webhooks; pollers and crons
    can be triggered manually by calling their dispatch path</li>
-<li><strong>Inspect deliveries</strong> — <code>bro_webhook_deliveries()</code> shows the
+<li><strong>Inspect deliveries</strong> - <code>bro_webhook_deliveries()</code> shows the
    classification verdict for every webhook event (and replay)</li>
-<li><strong>Inspect signals</strong> — <code>bro_signals()</code> shows whether <code>signal_arc</code>
+<li><strong>Inspect signals</strong> - <code>bro_signals()</code> shows whether <code>signal_arc</code>
    verdicts matched waiting arcs or fell idle</li>
-<li><strong>Check arc state</strong> — <code>bro_arc_status()</code> shows whether a
+<li><strong>Check arc state</strong> - <code>bro_arc_status()</code> shows whether a
    <code>start_arc</code> verdict actually started running</li>
 </ol>
 <h2 id="when-to-use-which">When to use which<a class="headerlink" href="#when-to-use-which" title="Permanent link">&para;</a></h2>

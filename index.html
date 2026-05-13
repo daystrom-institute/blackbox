@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -379,6 +379,8 @@
       
         
       
+        
+      
     
     
     
@@ -423,6 +425,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -495,6 +525,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -592,6 +634,34 @@
   
   
     <li class="md-nav__item">
+      <a href="atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="rule-packets/" class="md-nav__link">
         
   
@@ -627,7 +697,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1129,12 +1339,12 @@
 
 
 <h1 id="blackbox">blackbox<a class="headerlink" href="#blackbox" title="Permanent link">&para;</a></h1>
-<p>Single daemon for AI dev tooling: hybrid (BM25 + vector + path-token)
-search across Claude Code / Codex / Copilot / Vibe / Gemini transcripts
-<strong>plus</strong> registered project source code, an agentic graph projection
-over the same substrate, a unified knowledge store rendered into each
-provider's markdown files, work-thread tracking, and multi-provider
-agent orchestration with a live multi-lane tail TUI.</p>
+<p>Blackbox is the daemon that keeps agent work from evaporating.</p>
+<p>It indexes transcripts and project source, turns them into a graph agents can
+walk, stores rules and decisions in one knowledge store, and runs multi-provider
+work through <code>bro</code>. The point is not another search box. The point is that a
+fresh agent can answer "where did this come from?", "what already decided this?",
+and "which task is still alive?" without guessing from memory.</p>
 <p>The crate is <code>blackbox</code>. It produces four binaries:</p>
 <table>
 <thead>
@@ -1146,7 +1356,7 @@ agent orchestration with a live multi-lane tail TUI.</p>
 <tbody>
 <tr>
 <td><code>blackboxd</code></td>
-<td>HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)</td>
+<td>HTTP-MCP daemon. Run one long-lived user service per host.</td>
 </tr>
 <tr>
 <td><code>bro</code></td>
@@ -1154,11 +1364,11 @@ agent orchestration with a live multi-lane tail TUI.</p>
 </tr>
 <tr>
 <td><code>bro-slack</code></td>
-<td>Slack sidecar bridge — translates Slack events into the daemon's webhook pipeline</td>
+<td>Slack sidecar bridge. Translates Slack events into the daemon's webhook pipeline.</td>
 </tr>
 <tr>
 <td><code>bro-irc</code></td>
-<td>LAN IRC bridge — IRC commands relayed to <code>bro exec/resume/status</code> via the daemon</td>
+<td>LAN IRC bridge. Relays IRC commands to <code>bro exec/resume/status</code>.</td>
 </tr>
 </tbody>
 </table>
@@ -1177,23 +1387,51 @@ agent orchestration with a live multi-lane tail TUI.</p>
 </tr>
 <tr>
 <td><a href="operating-blackbox/">Operating Guide</a></td>
-<td>Agentic graph internals, hybrid search, embedding pipeline, upkeep</td>
+<td>What landed in the agentic corpus and how to keep it healthy</td>
 </tr>
 <tr>
 <td><a href="workflows/">Workflow Engine</a></td>
 <td>Canonical reference for authoring and running workflows</td>
 </tr>
 <tr>
+<td><a href="atoms/">Atoms</a></td>
+<td>Install, discover, invoke, resume, and bind reusable capabilities</td>
+</tr>
+<tr>
 <td><a href="rule-packets/">Rule Packets</a></td>
-<td>Compile, audit, apply — the first-match-wins classification mechanism</td>
+<td>Compile, audit, apply. First-match-wins classification.</td>
+</tr>
+<tr>
+<td><a href="refactor/">Refactor Tools And Atoms</a></td>
+<td>Structural refactor primitives plus shipped Java/Rust refactor atoms</td>
+</tr>
+<tr>
+<td><a href="bro-runtime/">Bro Runtime</a></td>
+<td>Direct dispatch, resume, wait, teams, brofiles, and provider runtime controls</td>
+</tr>
+<tr>
+<td><a href="knowledge-store/">Knowledge Store</a></td>
+<td>Learn, decide, remember, pin, render, review, notes, and inbox</td>
+</tr>
+<tr>
+<td><a href="transcript-retrieval/">Transcript Retrieval</a></td>
+<td>Search, cite, context, sessions, messages, topics, and freshness checks</td>
+</tr>
+<tr>
+<td><a href="projects-code-indexing/">Projects And Code Indexing</a></td>
+<td>Project registration, <code>.bbox</code>, code navigation, reindex, and reembed</td>
+</tr>
+<tr>
+<td><a href="artifact-catalog/">Artifact Catalog</a></td>
+<td>Install, list, supersede, and reason about <code>system-defaults/</code></td>
 </tr>
 <tr>
 <td><a href="agent-system/">Agent System</a></td>
-<td>Installing, discovering, and dispatching registered agents</td>
+<td>Legacy registered-agent compatibility surface</td>
 </tr>
 <tr>
 <td><a href="ingress-paths/">Ingress Paths</a></td>
-<td>Webhooks, pollers, crons — all three converge on the same routing pipeline</td>
+<td>Webhooks, pollers, and crons. One routing pipeline.</td>
 </tr>
 <tr>
 <td><a href="slack-bridge/">Slack Bridge</a></td>

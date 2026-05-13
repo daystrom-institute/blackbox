@@ -6,12 +6,12 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
       
-        <link rel="prev" href="../workflows/">
+        <link rel="prev" href="../atoms/">
       
       
         <link rel="next" href="../refactor/">
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -430,6 +460,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -524,6 +566,34 @@
                 
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
     
   
   
@@ -587,15 +657,15 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-workflow-compile-audit-apply" class="md-nav__link">
+  <a href="#the-loop-compile-audit-apply" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The workflow: compile → audit → apply
+        The Loop: Compile, Audit, Apply
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="The workflow: compile → audit → apply">
+    <nav class="md-nav" aria-label="The Loop: Compile, Audit, Apply">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -725,7 +795,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1185,15 +1395,15 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#the-workflow-compile-audit-apply" class="md-nav__link">
+  <a href="#the-loop-compile-audit-apply" class="md-nav__link">
     <span class="md-ellipsis">
       
-        The workflow: compile → audit → apply
+        The Loop: Compile, Audit, Apply
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="The workflow: compile → audit → apply">
+    <nav class="md-nav" aria-label="The Loop: Compile, Audit, Apply">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -1321,20 +1531,22 @@
 
 
 <h1 id="rule-packets">Rule Packets<a class="headerlink" href="#rule-packets" title="Permanent link">&para;</a></h1>
-<p>Rule packets are the blackbox classification mechanism — a reusable,
-deterministic judge that evaluates any entity against a priority-ordered
-rule set. No LLM involved at apply time. Packets are portable: dispatch a
-<code>packet_id</code> to sub-agents and every one of them produces bit-identical
-output.</p>
-<p>Packets are the answer to "I'm about to paste this rubric into five
-sub-agent prompts." Compile once, dispatch the <code>packet_id</code> instead.</p>
-<h2 id="the-workflow-compile-audit-apply">The workflow: compile → audit → apply<a class="headerlink" href="#the-workflow-compile-audit-apply" title="Permanent link">&para;</a></h2>
+<p>Use a rule packet when you are about to paste the same rubric into multiple
+prompts.</p>
+<p>A packet is a stored deterministic judge. It evaluates one JSON-shaped entity
+against ordered rules and returns the same answer every time. No LLM runs at
+apply time, so a <code>packet_id</code> can be handed to five agents and every one of them
+uses the same decision function.</p>
+<p>Packets are good for gates, routing, review findings, surface filtering, and
+repeatable "should this proceed?" decisions. They are not a replacement for
+knowledge entries or prose instructions.</p>
+<h2 id="the-loop-compile-audit-apply">The Loop: Compile, Audit, Apply<a class="headerlink" href="#the-loop-compile-audit-apply" title="Permanent link">&para;</a></h2>
 <h3 id="1-compile-bbox_compile">1. Compile (<code>bbox_compile</code>)<a class="headerlink" href="#1-compile-bbox_compile" title="Permanent link">&para;</a></h3>
 <p>Author a packet from a domain tag, a classification lattice (priority
 order), and a rules array. Each rule has an <code>id</code>, an <code>antecedent</code>
 (predicate AST), and a <code>consequent</code> (the output value when the rule
 fires).</p>
-<p>Rules are <strong>first-match-wins</strong> — order anomalies before general fallbacks.</p>
+<p>Rules are <strong>first-match-wins</strong>. Put anomalies before general fallbacks.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="err">bbox_compile(</span>
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span><span class="err">domai</span><span class="kc">n</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;pr-triage&quot;</span><span class="p">,</span>
 <a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="w">  </span><span class="err">classi</span><span class="kc">f</span><span class="err">ica</span><span class="kc">t</span><span class="err">io</span><span class="kc">n</span><span class="err">_la</span><span class="kc">tt</span><span class="err">ice</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="p">[</span><span class="s2">&quot;fail&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;flag&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;manual&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;pass&quot;</span><span class="p">,</span><span class="w"> </span><span class="s2">&quot;info&quot;</span><span class="p">],</span>
@@ -1366,7 +1578,7 @@ or dispatch it to sub-agents.</p>
 <h3 id="2-audit-bbox_audit">2. Audit (<code>bbox_audit</code>)<a class="headerlink" href="#2-audit-bbox_audit" title="Permanent link">&para;</a></h3>
 <p><strong>Always run this after compile.</strong> Validates the packet against a known
 dataset of <code>{entity, expected}</code> pairs. A fidelity &lt; 1.0 means the packet
-is misgeneralizing — catches rule-ordering bugs, over-broad antecedents,
+is misgeneralizing. This catches rule-ordering bugs, over-broad antecedents,
 and field-name typos before the packet goes live.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="err">bbox_audi</span><span class="kc">t</span><span class="err">(</span>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="err">packe</span><span class="kc">t</span><span class="err">_id</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;packet-7f01324e&quot;</span><span class="p">,</span>
@@ -1424,14 +1636,15 @@ and field-name typos before the packet goes live.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1">// By domain</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="err">bbox_packe</span><span class="kc">t</span><span class="err">_lis</span><span class="kc">t</span><span class="err">(domai</span><span class="kc">n</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;pr-triage&quot;</span><span class="p">,</span><span class="w"> </span><span class="err">la</span><span class="kc">test</span><span class="err">_per_domai</span><span class="kc">n</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="kc">true</span><span class="err">)</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1">// By concept — when you don&#39;t know the domain label</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="c1">// By concept, when you don&#39;t know the domain label</span>
 <a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="err">bbox_packe</span><span class="kc">t</span><span class="err">_lis</span><span class="kc">t</span><span class="err">(query</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;breaking&quot;</span><span class="p">,</span><span class="w"> </span><span class="err">limi</span><span class="kc">t</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="mi">10</span><span class="err">)</span>
 <a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>
 <a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="c1">// Via knowledge search (surfaces packets + system memories)</span>
 <a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a><span class="err">bbox_k</span><span class="kc">n</span><span class="err">owledge(ca</span><span class="kc">te</span><span class="err">gory</span><span class="w"> </span><span class="err">=</span><span class="w"> </span><span class="s2">&quot;packet&quot;</span><span class="err">)</span>
 </code></pre></div>
 <h2 id="packet-composition">Packet composition<a class="headerlink" href="#packet-composition" title="Permanent link">&para;</a></h2>
-<p>Packets can embed other packets via the <code>Apply</code> predicate — no re-deriving:</p>
+<p>Packets can embed other packets via the <code>Apply</code> predicate. Do not re-derive a
+rule you already compiled:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">{</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;flag_breaking&quot;</span><span class="p">,</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">  </span><span class="nt">&quot;antecedent&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
@@ -1551,19 +1764,19 @@ gaps later with <code>bbox_packet_events(op = "gap")</code>.</p>
 <tbody>
 <tr>
 <td>"I'm coordinating sub-agents and pasting the same rubric into each prompt"</td>
-<td><code>bbox_compile</code> — compile once, dispatch <code>packet_id</code></td>
+<td><code>bbox_compile</code>: compile once, dispatch <code>packet_id</code></td>
 </tr>
 <tr>
 <td>"I need to classify 100+ entities against the same rubric"</td>
-<td><code>bbox_apply</code> — deterministic, no LLM drift</td>
+<td><code>bbox_apply</code>: deterministic, no LLM drift</td>
 </tr>
 <tr>
 <td>"I want a durable decision function that survives system prompt changes"</td>
-<td><code>bbox_compile</code> — packets are stored, not inlined in prompts</td>
+<td><code>bbox_compile</code>: packets are stored, not inlined in prompts</td>
 </tr>
 <tr>
 <td>"I just need a one-off prose instruction"</td>
-<td>Don't compile — use prose in the prompt</td>
+<td>Don't compile. Use prose in the prompt.</td>
 </tr>
 <tr>
 <td>"I need to remember a convention, not a classification"</td>

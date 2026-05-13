@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -430,6 +460,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -527,6 +569,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -562,7 +632,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1411,7 +1621,7 @@
 <h1 id="roadmap-tool">Roadmap Tool<a class="headerlink" href="#roadmap-tool" title="Permanent link">&para;</a></h1>
 <p><code>bbox_roadmap</code> is a prospective work tracker: designed-but-not-implemented
 features, refactors, explorations, tech debt, and risks. It sits in a
-distinct time band from the other stores — inbox is reactive, threads
+distinct time band from the other stores - inbox is reactive, threads
 are active, knowledge is atemporal. The roadmap tracks the <em>future</em>.</p>
 <p>The <a href="../roadmap/">blackbox project roadmap</a> is the generated output of
 this tool applied to this repo. This page explains the tool itself.</p>
@@ -1542,7 +1752,7 @@ the thread.</p>
 </code></pre></div>
 <h3 id="repair_links"><code>repair_links</code><a class="headerlink" href="#repair_links" title="Permanent link">&para;</a></h3>
 <p>Validate all edges for an item (or the full store). Reports dangling
-references — <code>designed_in</code> pointing to a deleted knowledge entry,
+references - <code>designed_in</code> pointing to a deleted knowledge entry,
 <code>spawns</code> pointing to a resolved thread, etc.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_roadmap(action=&quot;repair_links&quot;, dry_run=true)          # full store
 <a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>bbox_roadmap(action=&quot;repair_links&quot;, id=&quot;rm-a1b2c3d4&quot;)      # single item
@@ -1555,7 +1765,7 @@ via <code>write_path</code>).</p>
 <a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>bbox_roadmap(action=&quot;render&quot;, write_path=&quot;/tmp/roadmap-draft.md&quot;)
 </code></pre></div>
 <p>The generated file carries a <code>&lt;!-- Generated by blackbox --&gt;</code> header.
-Do not edit it by hand — changes are overwritten on the next render.</p>
+Do not edit it by hand - changes are overwritten on the next render.</p>
 <h3 id="delete"><code>delete</code><a class="headerlink" href="#delete" title="Permanent link">&para;</a></h3>
 <p>Remove an item and all its edges.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>bbox_roadmap(action=&quot;delete&quot;, id=&quot;rm-a1b2c3d4&quot;)
@@ -1579,7 +1789,7 @@ Do not edit it by hand — changes are overwritten on the next render.</p>
 </code></pre></div>
 <h2 id="storage">Storage<a class="headerlink" href="#storage" title="Permanent link">&para;</a></h2>
 <p>Items persist to <code>~/.local/share/blackbox/roadmap.json</code> (path follows
-<code>BBOX_DATA_DIR</code> if set). The store is a flat JSON array — no external
+<code>BBOX_DATA_DIR</code> if set). The store is a flat JSON array - no external
 database.</p>
 
 

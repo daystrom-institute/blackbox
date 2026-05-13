@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -14,7 +14,7 @@
         <link rel="prev" href="../rule-packets/">
       
       
-        <link rel="next" href="../agent-system/">
+        <link rel="next" href="../bro-runtime/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>Refactor Tools - blackbox</title>
+        <title>Refactor Tools And Atoms - blackbox</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#refactor-mechanization" class="md-skip">
+        <a href="#refactor-tools-and-atoms" class="md-skip">
           Skip to content
         </a>
       
@@ -112,7 +112,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Refactor Tools
+              Refactor Tools And Atoms
             
           </span>
         </div>
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -430,6 +460,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -527,6 +569,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -571,7 +641,7 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
   
 
     
@@ -589,7 +659,7 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
   
 
     
@@ -615,10 +685,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#tool-overview" class="md-nav__link">
+  <a href="#operator-loop" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Tool overview
+        Operator Loop
       
     </span>
   </a>
@@ -626,10 +696,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#workflow" class="md-nav__link">
+  <a href="#tool-map" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Workflow
+        Tool Map
       
     </span>
   </a>
@@ -637,63 +707,13 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#inventory-tools" class="md-nav__link">
+  <a href="#inventory" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Inventory tools
+        Inventory
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Inventory tools">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_code_symbols" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_code_symbols
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#bbox_code_query" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_code_query
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#bbox_code_node_describe" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_code_node_describe
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_status" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_refactor_status
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -706,100 +726,27 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Planning">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_plan" class="md-nav__link">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#plan-kinds" class="md-nav__link">
     <span class="md-ellipsis">
       
-        bbox_refactor_plan
+        Plan Kinds
       
     </span>
   </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#generic-plan-kinds" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Generic plan kinds
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#java-plan-kinds" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Java plan kinds
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Java plan kinds">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#lombokify_java_class-notes" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        lombokify_java_class notes
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#deep_analysis-flag" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        deep_analysis flag
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#applying" class="md-nav__link">
+  <a href="#java-notes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Applying
+        Java Notes
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Applying">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_apply" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_refactor_apply
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -807,19 +754,52 @@
   <a href="#compound-runs" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Compound runs
+        Compound Runs
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Compound runs">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#refactor-atoms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Refactor Atoms
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Refactor Atoms">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#bbox_refactor_run" class="md-nav__link">
+  <a href="#java-refactor-atoms" class="md-nav__link">
     <span class="md-ellipsis">
       
-        bbox_refactor_run
+        Java Refactor Atoms
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rust-refactor-atoms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust Refactor Atoms
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#atom-operating-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atom Operating Rules
       
     </span>
   </a>
@@ -835,35 +815,18 @@
   <a href="#grounding-entity-refs" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Grounding entity refs
+        Grounding Entity Refs
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Grounding entity refs">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_project_refs" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_refactor_project_refs
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#language-support-summary" class="md-nav__link">
+  <a href="#language-support" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Language support summary
+        Language Support
       
     </span>
   </a>
@@ -874,6 +837,146 @@
   
 </nav>
       
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
+  
+
+    
+  </span>
+  
+  
+
+      </a>
     </li>
   
 
@@ -1325,10 +1428,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#tool-overview" class="md-nav__link">
+  <a href="#operator-loop" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Tool overview
+        Operator Loop
       
     </span>
   </a>
@@ -1336,10 +1439,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#workflow" class="md-nav__link">
+  <a href="#tool-map" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Workflow
+        Tool Map
       
     </span>
   </a>
@@ -1347,63 +1450,13 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#inventory-tools" class="md-nav__link">
+  <a href="#inventory" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Inventory tools
+        Inventory
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Inventory tools">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_code_symbols" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_code_symbols
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#bbox_code_query" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_code_query
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#bbox_code_node_describe" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_code_node_describe
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_status" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_refactor_status
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -1416,100 +1469,27 @@
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Planning">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_plan" class="md-nav__link">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#plan-kinds" class="md-nav__link">
     <span class="md-ellipsis">
       
-        bbox_refactor_plan
+        Plan Kinds
       
     </span>
   </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#generic-plan-kinds" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Generic plan kinds
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#java-plan-kinds" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Java plan kinds
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Java plan kinds">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#lombokify_java_class-notes" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        lombokify_java_class notes
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#deep_analysis-flag" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        deep_analysis flag
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#applying" class="md-nav__link">
+  <a href="#java-notes" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Applying
+        Java Notes
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Applying">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_apply" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_refactor_apply
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
@@ -1517,19 +1497,52 @@
   <a href="#compound-runs" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Compound runs
+        Compound Runs
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Compound runs">
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#refactor-atoms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Refactor Atoms
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Refactor Atoms">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
-  <a href="#bbox_refactor_run" class="md-nav__link">
+  <a href="#java-refactor-atoms" class="md-nav__link">
     <span class="md-ellipsis">
       
-        bbox_refactor_run
+        Java Refactor Atoms
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#rust-refactor-atoms" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Rust Refactor Atoms
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#atom-operating-rules" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Atom Operating Rules
       
     </span>
   </a>
@@ -1545,35 +1558,18 @@
   <a href="#grounding-entity-refs" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Grounding entity refs
+        Grounding Entity Refs
       
     </span>
   </a>
-  
-    <nav class="md-nav" aria-label="Grounding entity refs">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#bbox_refactor_project_refs" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        bbox_refactor_project_refs
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
   
 </li>
       
         <li class="md-nav__item">
-  <a href="#language-support-summary" class="md-nav__link">
+  <a href="#language-support" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Language support summary
+        Language Support
       
     </span>
   </a>
@@ -1600,96 +1596,104 @@
   
 
 
-<h1 id="refactor-mechanization">Refactor Mechanization<a class="headerlink" href="#refactor-mechanization" title="Permanent link">&para;</a></h1>
-<p>Tree-sitter-backed structural refactoring: syntax inventory, dry-run
-plans, hash-checked apply, transactional compound runs. The toolchain
-knows where code is; language servers and compilers know what it means.
-Use these tools for the mechanical half, LSP and <code>cargo check</code>/<code>javac</code>
-for the semantic half.</p>
-<p>Full runbook (plan kinds, language caveats, validation commands):
-<code>bbox_knowledge(query="sm-refactor")</code>.</p>
-<h2 id="tool-overview">Tool overview<a class="headerlink" href="#tool-overview" title="Permanent link">&para;</a></h2>
+<h1 id="refactor-tools-and-atoms">Refactor Tools And Atoms<a class="headerlink" href="#refactor-tools-and-atoms" title="Permanent link">&para;</a></h1>
+<p>Blackbox has two refactor layers.</p>
+<p>The low layer is mechanical: tree-sitter inventory, dry-run plans, hash-checked
+apply, and transactional compound runs. It knows where syntax lives and can move
+or rewrite it without losing byte ranges.</p>
+<p>The high layer is packaged as atoms. A refactor atom wraps the mechanical tools
+with a prompt protocol, guardrails, validation commands, and a stable input
+schema. Use the tools when you are driving the operation yourself. Use an atom
+when you want a reusable refactor capability with a trace handle and clear
+contract.</p>
+<p>Full runbooks still live in system memory:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>bbox_knowledge(query=&quot;sm-refactor&quot;)
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>bbox_knowledge(query=&quot;sm-refactor-java&quot;)
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>bbox_knowledge(query=&quot;sm-refactor-rust&quot;)
+</code></pre></div>
+<h2 id="operator-loop">Operator Loop<a class="headerlink" href="#operator-loop" title="Permanent link">&para;</a></h2>
+<p>For direct tool use, keep the loop boring:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>1. Inventory   bbox_code_symbols / bbox_refactor_status
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>2. Plan        bbox_refactor_plan with dry-run output
+<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>3. Review      read the plan, hashes, edits, and leftovers
+<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>4. Apply       bbox_refactor_apply(confirm=true)
+<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>5. Validate    cargo check, mvn test, javac, or the local equivalent
+</code></pre></div>
+<p>For multi-step work, use <code>bbox_refactor_run</code> so planning, writes, and validation
+share one rollback boundary.</p>
+<p>For repeatable work, install and invoke a refactor atom:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>bbox_artifact_install(kind=&quot;brofile&quot;, source=&quot;system-defaults/brofiles/refactor/rust-refactor-persona.json&quot;)
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/rust-test-island-extract.json&quot;)
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>atom_invoke(
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a>  atom=&quot;atom:rust-test-island-extract@v1&quot;,
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a>  project_dir=&quot;/repo/blackbox&quot;,
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a>  args={
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a>    &quot;project_dir&quot;: &quot;/repo/blackbox&quot;,
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a>    &quot;source_file_or_dir&quot;: &quot;src/tests.rs&quot;,
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a>    &quot;apply&quot;: false
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a>  },
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a>  owner=&quot;operator:me&quot;
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a>)
+</code></pre></div>
+<p>Plan-only first is the sane default. Flip <code>apply</code> only after the target and
+guardrails are clear.</p>
+<h2 id="tool-map">Tool Map<a class="headerlink" href="#tool-map" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
 <th>Tool</th>
-<th>When</th>
+<th>Use it for</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td><code>bbox_code_symbols</code></td>
-<td>Find method/function/type line ranges across a project</td>
+<td>Find methods, functions, types, and modules across a project with real line ranges.</td>
 </tr>
 <tr>
 <td><code>bbox_code_query</code></td>
-<td>Run a tree-sitter S-expression query against one file</td>
+<td>Run a tree-sitter query against one file once you know the grammar shape.</td>
 </tr>
 <tr>
 <td><code>bbox_code_node_describe</code></td>
-<td>Discover grammar shape at a line/column before writing a query</td>
+<td>Inspect the node at a line/column before writing a query or plan.</td>
 </tr>
 <tr>
 <td><code>bbox_refactor_status</code></td>
-<td>Inventory refactorable items in a file, confirm parse health</td>
+<td>Check parse health and list refactorable items in one file.</td>
 </tr>
 <tr>
 <td><code>bbox_refactor_project_refs</code></td>
-<td>Ground <code>project_file:</code> entity refs for a source file</td>
+<td>Get current <code>project_file:</code> refs for provenance or eval fixtures.</td>
 </tr>
 <tr>
 <td><code>bbox_refactor_plan</code></td>
-<td>Create a dry-run structural refactor plan</td>
+<td>Produce reviewable JSON without touching files.</td>
 </tr>
 <tr>
 <td><code>bbox_refactor_apply</code></td>
-<td>Apply a reviewed plan with hash checks + rollback</td>
+<td>Apply one reviewed plan with hash checks and rollback.</td>
 </tr>
 <tr>
 <td><code>bbox_refactor_run</code></td>
-<td>Transactional compound run: multiple plans + validation commands</td>
+<td>Run multiple plans plus validation commands transactionally.</td>
 </tr>
 </tbody>
 </table>
-<h2 id="workflow">Workflow<a class="headerlink" href="#workflow" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>1. Inventory   bbox_code_symbols / bbox_refactor_status
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>2. Plan        bbox_refactor_plan (dry run, reviewable JSON)
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>3. Review      read the plan — check hashes, edits, leftovers
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>4. Apply       bbox_refactor_apply(confirm=true)
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>5. Validate    language-specific check (cargo check, javac, etc.)
+<p>Use <code>rg</code> for plain text search. Use these tools when identity matters: item
+kind, byte range, imports, call sites, moved fields, or compile repair.</p>
+<h2 id="inventory">Inventory<a class="headerlink" href="#inventory" title="Permanent link">&para;</a></h2>
+<p>Start with symbols when you do not know the file:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>bbox_code_symbols(
+<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>  project_dir=&quot;/repo/x&quot;,
+<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>  query=&quot;readFromProperties&quot;,
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>  languages=[&quot;java&quot;],
+<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>  item_kinds=[&quot;method_declaration&quot;],
+<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>  limit=20
+<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>)
 </code></pre></div>
-<p>For multi-step restructuring: <code>bbox_refactor_run</code> instead of steps 2–5.</p>
-<h2 id="inventory-tools">Inventory tools<a class="headerlink" href="#inventory-tools" title="Permanent link">&para;</a></h2>
-<h3 id="bbox_code_symbols"><code>bbox_code_symbols</code><a class="headerlink" href="#bbox_code_symbols" title="Permanent link">&para;</a></h3>
-<p>Project-wide symbol search with kind filtering. Returns file, language,
-kind, name, and line range. Use this instead of <code>rg -n</code> when you need
-exact line numbers for method/function/type names.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>bbox_code_symbols(
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>  project_dir=&quot;/repo/x&quot;,
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>  query=&quot;readFromProperties&quot;,
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a>  languages=[&quot;java&quot;],
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>  item_kinds=[&quot;method_declaration&quot;],
-<a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a>  limit=20
-<a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a>)
-</code></pre></div>
-<h3 id="bbox_code_query"><code>bbox_code_query</code><a class="headerlink" href="#bbox_code_query" title="Permanent link">&para;</a></h3>
-<p>Tree-sitter S-expression query against a single file. Returns matched
-nodes, byte/line ranges, and optional text. Use after you know the file;
-use <code>bbox_code_symbols</code> first when you don't.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>bbox_code_query(
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>  file=&quot;src/foo.rs&quot;,
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>  query=&quot;(function_item name: (identifier) @name)&quot;
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a>)
-</code></pre></div>
-<h3 id="bbox_code_node_describe"><code>bbox_code_node_describe</code><a class="headerlink" href="#bbox_code_node_describe" title="Permanent link">&para;</a></h3>
-<p>Discover the grammar shape at a position before writing a query. Returns
-node kind, parent chain, named children, and sibling summaries.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>bbox_code_node_describe(file=&quot;src/foo.rs&quot;, line=42, column=12)
-</code></pre></div>
-<h3 id="bbox_refactor_status"><code>bbox_refactor_status</code><a class="headerlink" href="#bbox_refactor_status" title="Permanent link">&para;</a></h3>
-<p>Inventory a file for refactorable items and confirm tree-sitter parse
-health. Use before planning when you need exact item names/kinds to pass
-into a plan.</p>
+<p>Use status once you do know the file:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>bbox_refactor_status(
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>  file=&quot;src/path/to/File.java&quot;,
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>  project_dir=&quot;/repo/x&quot;,
@@ -1698,23 +1702,30 @@ into a plan.</p>
 <a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>  include_attributes=false
 <a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>)
 </code></pre></div>
-<h2 id="planning">Planning<a class="headerlink" href="#planning" title="Permanent link">&para;</a></h2>
-<h3 id="bbox_refactor_plan"><code>bbox_refactor_plan</code><a class="headerlink" href="#bbox_refactor_plan" title="Permanent link">&para;</a></h3>
-<p>Creates a dry-run plan as reviewable JSON. The plan carries file hashes,
-proposed text edits or moves, parse validation results, and leftovers
-(items the plan couldn't handle). Read it before applying.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>bbox_refactor_plan(
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>  kind=&quot;&lt;plan_kind&gt;&quot;,
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>  source=&quot;src/path/to/file.ext&quot;,
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>  target=&quot;src/path/to/target.ext&quot;,
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>  item_names=[&quot;Thing&quot;],
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a>  project_dir=&quot;/repo/x&quot;
-<a id="__codelineno-5-7" name="__codelineno-5-7" href="#__codelineno-5-7"></a>)
+<p>Use node describe before writing a tree-sitter query from memory:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>bbox_code_node_describe(file=&quot;src/foo.rs&quot;, line=42, column=12)
 </code></pre></div>
-<p><code>output_path</code> writes the plan to disk — required when the plan body
-exceeds the MCP transport limit. Pass the same path via <code>plan_path</code> to
-apply.</p>
-<h3 id="generic-plan-kinds">Generic plan kinds<a class="headerlink" href="#generic-plan-kinds" title="Permanent link">&para;</a></h3>
+<p>That call is cheap, and it prevents the usual grammar-name guessing.</p>
+<h2 id="planning">Planning<a class="headerlink" href="#planning" title="Permanent link">&para;</a></h2>
+<p><code>bbox_refactor_plan</code> is a dry run. It returns hashes, proposed edits, file moves,
+parse checks, and leftovers. Read the leftovers. They are where bad refactors
+usually hide.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_refactor_plan(
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>  kind=&quot;&lt;plan_kind&gt;&quot;,
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>  source=&quot;src/path/to/file.ext&quot;,
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>  target=&quot;src/path/to/target.ext&quot;,
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>  item_names=[&quot;Thing&quot;],
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>  project_dir=&quot;/repo/x&quot;
+<a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>)
+</code></pre></div>
+<p>Use <code>output_path</code> for large plans and pass that path to apply:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>bbox_refactor_plan(..., output_path=&quot;/tmp/refactor-plan.json&quot;)
+<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>bbox_refactor_apply(confirm=true, plan_path=&quot;/tmp/refactor-plan.json&quot;)
+</code></pre></div>
+<p>The apply tool refuses stale hashes. If someone edits the file after planning,
+re-plan instead of forcing it.</p>
+<h2 id="plan-kinds">Plan Kinds<a class="headerlink" href="#plan-kinds" title="Permanent link">&para;</a></h2>
+<p>Generic:</p>
 <table>
 <thead>
 <tr>
@@ -1725,24 +1736,23 @@ apply.</p>
 <tbody>
 <tr>
 <td><code>move_file</code></td>
-<td>Move a file, updating imports where supported</td>
+<td>Move a file and update imports where supported.</td>
 </tr>
 <tr>
 <td><code>replace_text</code></td>
-<td>Exact text replacement (not semantic rename)</td>
+<td>Exact replacement. This is not semantic rename.</td>
 </tr>
 <tr>
 <td><code>write_file</code></td>
-<td>Whole-file write</td>
+<td>Whole-file write.</td>
 </tr>
 <tr>
-<td><code>toml_ensure_table</code></td>
-<td>Idempotent TOML table upsert</td>
+<td><code>ensure_toml_table</code></td>
+<td>Idempotent TOML table upsert.</td>
 </tr>
 </tbody>
 </table>
-<h3 id="java-plan-kinds">Java plan kinds<a class="headerlink" href="#java-plan-kinds" title="Permanent link">&para;</a></h3>
-<p>Pull <code>sm-refactor-java</code> for full argument docs and caveats.</p>
+<p>Java:</p>
 <table>
 <thead>
 <tr>
@@ -1753,154 +1763,293 @@ apply.</p>
 <tbody>
 <tr>
 <td><code>extract_java_methods</code></td>
-<td>Extract methods into a new or existing class</td>
+<td>Move selected methods into a new or existing class.</td>
 </tr>
 <tr>
 <td><code>extract_java_class</code></td>
-<td>Extract a class with method + field migration</td>
+<td>Extract a cohesive class with method, field, delegate, caller, and visibility wiring.</td>
+</tr>
+<tr>
+<td><code>extract_java_nested_classes</code></td>
+<td>Move static/implicitly-static nested types to top-level classes.</td>
+</tr>
+<tr>
+<td><code>promote_java_inner_class</code></td>
+<td>Promote a non-static inner class with outer captures to a top-level class.</td>
 </tr>
 <tr>
 <td><code>add_java_fields</code></td>
-<td>Add fields to a class</td>
+<td>Add fields to a class.</td>
 </tr>
 <tr>
 <td><code>add_java_constructor</code></td>
-<td>Add a constructor</td>
+<td>Add a constructor.</td>
 </tr>
 <tr>
 <td><code>move_java_field</code></td>
-<td>Move a field to another class</td>
+<td>Move a field to another class.</td>
 </tr>
 <tr>
 <td><code>move_java_constant</code></td>
-<td>Move a constant</td>
+<td>Move a constant.</td>
 </tr>
 <tr>
 <td><code>add_java_delegate_field</code></td>
-<td>Add a delegate field with forwarding methods</td>
+<td>Add a delegate field with forwarding methods.</td>
 </tr>
 <tr>
 <td><code>update_java_callers</code></td>
-<td>Rewrite call sites after an extraction</td>
+<td>Rewrite call sites after an extraction.</td>
+</tr>
+<tr>
+<td><code>rewrite_java_visibility</code></td>
+<td>Rewrite method visibility to public/protected/private/package.</td>
+</tr>
+<tr>
+<td><code>add_java_implements</code></td>
+<td>Add an implements clause to a Java class.</td>
+</tr>
+<tr>
+<td><code>extract_java_interface</code></td>
+<td>Extract an interface, add implements, and widen selected methods as needed.</td>
+</tr>
+<tr>
+<td><code>migrate_java_type_usages</code></td>
+<td>Rewrite structural type-use positions from concretion to interface/type.</td>
+</tr>
+<tr>
+<td><code>java_lsp_organize_imports</code></td>
+<td>Organize imports through warm JDTLS with structural fallback.</td>
+</tr>
+<tr>
+<td><code>find_java_usages</code></td>
+<td>Analysis-only project-wide reference walk for simple Java names.</td>
+</tr>
+<tr>
+<td><code>rename_java_symbol</code></td>
+<td>Project-wide syntax rename for Java declarations and references.</td>
+</tr>
+<tr>
+<td><code>java_class_dependency_analysis</code></td>
+<td>Analysis-only class dependency graph for partition decisions.</td>
+</tr>
+<tr>
+<td><code>java_public_api_guard</code></td>
+<td>Analysis-only public API delta advisory before mutating refactors.</td>
 </tr>
 <tr>
 <td><code>lombokify_java_class</code></td>
-<td>Replace POJO boilerplate with Lombok annotations</td>
+<td>Replace POJO boilerplate with Lombok annotations.</td>
 </tr>
 </tbody>
 </table>
-<h4 id="lombokify_java_class-notes"><code>lombokify_java_class</code> notes<a class="headerlink" href="#lombokify_java_class-notes" title="Permanent link">&para;</a></h4>
-<p>Replaces trivial getters/setters, Apache Commons equals/hashCode/toString,
-canonical constructors, and SLF4J <code>Logger log</code> fields with Lombok
-annotations. Full-coverage classes collapse to <code>@Data</code> or <code>@Value</code>.</p>
+<p>Rust support is still more atom-led than primitive-led. Inventory and generic
+plans are available; the shipped Rust refactor atoms carry the higher-level
+protocols.</p>
+<h2 id="java-notes">Java Notes<a class="headerlink" href="#java-notes" title="Permanent link">&para;</a></h2>
+<p>Use <code>deep_analysis: true</code> on <code>move_java_field</code>, <code>extract_java_methods</code>, or
+<code>extract_java_class</code> when the change crosses state or caller boundaries.</p>
+<p>The report fields are meant to stop you:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Why it matters</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>remaining_source_accessors</code></td>
+<td>Reads/writes of a moved field still left behind. Non-empty usually means compile failure.</td>
+</tr>
+<tr>
+<td><code>captured_variables</code></td>
+<td>Source-class fields used by extracted methods. Decide whether they move, become constructor args, or stay delegated.</td>
+</tr>
+<tr>
+<td><code>external_calls</code></td>
+<td>Source-class methods called by the extracted set but not included.</td>
+</tr>
+<tr>
+<td><code>inherited_dependencies</code></td>
+<td>Superclass or interface methods reached through the type index.</td>
+</tr>
+</tbody>
+</table>
+<p>For Lombok:</p>
 <ul>
-<li><code>boolean_getter_strategy=bridge</code> — emit a <code>getXxx()</code> bridge after
-  <code>@Getter</code> for <code>boolean</code> fields whose original getter used <code>get-</code>
-  prefix (Lombok generates <code>isXxx()</code> by default). Use when callers
-  you can't update depend on the <code>get-</code> form.</li>
-<li><code>boolean_getter_strategy=skip</code> (default) — leave the field's getter
-  alone; safer when API compatibility matters.</li>
-<li>Lombok must already be on the classpath.</li>
-<li><code>source</code> can be a directory for bulk mode; <code>output_path</code> is required
-  for large bulk plans.</li>
+<li>Lombok must already be on the classpath. The tool does not add the dependency.</li>
+<li><code>boolean_getter_strategy=bridge</code> preserves callers that expect <code>getXxx()</code> for
+  boolean fields.</li>
+<li><code>boolean_getter_strategy=skip</code> keeps the original getter. This is safer when
+  public API compatibility matters.</li>
+<li>Bulk mode requires <code>output_path</code>; review the skipped entries before applying.</li>
 </ul>
-<h4 id="deep_analysis-flag"><code>deep_analysis</code> flag<a class="headerlink" href="#deep_analysis-flag" title="Permanent link">&para;</a></h4>
-<p>Pass <code>deep_analysis: true</code> on <code>move_java_field</code>, <code>extract_java_methods</code>,
-or <code>extract_java_class</code> for pessimistic safety reports:</p>
-<ul>
-<li><code>move_java_field</code> — <code>remaining_source_accessors</code>: every read/write of
-  the moved field still in the source class. Non-empty means lines that
-  will fail to compile.</li>
-<li><code>extract_java_methods</code> / <code>extract_java_class</code> — <code>captured_variables</code>
-  (source-class fields used by extracted methods), <code>external_calls</code>
-  (source-class methods called by the extracted set but not in it),
-  <code>inherited_dependencies</code> (superclass/interface methods reached via the
-  type index).</li>
-</ul>
-<p>Resolve every reported entry before applying.</p>
-<h2 id="applying">Applying<a class="headerlink" href="#applying" title="Permanent link">&para;</a></h2>
-<h3 id="bbox_refactor_apply"><code>bbox_refactor_apply</code><a class="headerlink" href="#bbox_refactor_apply" title="Permanent link">&para;</a></h3>
-<p>Apply a reviewed plan. Refuses stale hashes; validates rewritten source
-files before writing; rolls back on any write failure.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_refactor_apply(confirm=true, plan_path=&quot;/tmp/refactor.json&quot;)
-<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a># or inline:
-<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>bbox_refactor_apply(confirm=true, plan=&lt;plan-json&gt;)
-</code></pre></div>
-<p><code>confirm=true</code> is required — the tool will not apply without it.</p>
-<h2 id="compound-runs">Compound runs<a class="headerlink" href="#compound-runs" title="Permanent link">&para;</a></h2>
-<h3 id="bbox_refactor_run"><code>bbox_refactor_run</code><a class="headerlink" href="#bbox_refactor_run" title="Permanent link">&para;</a></h3>
-<p>Compose multiple plans and validation commands into one transaction.
-Snapshots touched files before the first write; rolls back all primitive-
-plan writes if any required step fails.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>bbox_refactor_run(
-<a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>  title=&quot;extract UserRepository&quot;,
-<a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>  project_dir=&quot;/repo/x&quot;,
-<a id="__codelineno-7-4" name="__codelineno-7-4" href="#__codelineno-7-4"></a>  confirm=true,
-<a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a>  steps=[
-<a id="__codelineno-7-6" name="__codelineno-7-6" href="#__codelineno-7-6"></a>    {
-<a id="__codelineno-7-7" name="__codelineno-7-7" href="#__codelineno-7-7"></a>      &quot;op&quot;: &quot;plan&quot;,
-<a id="__codelineno-7-8" name="__codelineno-7-8" href="#__codelineno-7-8"></a>      &quot;kind&quot;: &quot;extract_java_class&quot;,
-<a id="__codelineno-7-9" name="__codelineno-7-9" href="#__codelineno-7-9"></a>      &quot;source&quot;: &quot;src/UserService.java&quot;,
-<a id="__codelineno-7-10" name="__codelineno-7-10" href="#__codelineno-7-10"></a>      &quot;item_names&quot;: [&quot;UserRepository&quot;]
-<a id="__codelineno-7-11" name="__codelineno-7-11" href="#__codelineno-7-11"></a>    },
-<a id="__codelineno-7-12" name="__codelineno-7-12" href="#__codelineno-7-12"></a>    {
-<a id="__codelineno-7-13" name="__codelineno-7-13" href="#__codelineno-7-13"></a>      &quot;op&quot;: &quot;command&quot;,
-<a id="__codelineno-7-14" name="__codelineno-7-14" href="#__codelineno-7-14"></a>      &quot;command&quot;: &quot;mvn&quot;,
-<a id="__codelineno-7-15" name="__codelineno-7-15" href="#__codelineno-7-15"></a>      &quot;args&quot;: [&quot;-q&quot;, &quot;compile&quot;],
-<a id="__codelineno-7-16" name="__codelineno-7-16" href="#__codelineno-7-16"></a>      &quot;touches&quot;: []
-<a id="__codelineno-7-17" name="__codelineno-7-17" href="#__codelineno-7-17"></a>    }
-<a id="__codelineno-7-18" name="__codelineno-7-18" href="#__codelineno-7-18"></a>  ]
-<a id="__codelineno-7-19" name="__codelineno-7-19" href="#__codelineno-7-19"></a>)
-</code></pre></div>
-<p><strong>Step kinds:</strong></p>
-<ul>
-<li><code>op: "plan"</code> — a <code>bbox_refactor_plan</code> primitive. Required to succeed
-  unless <code>optional: true</code> is set (turns plan-time failures into
-  <code>skipped</code> entries — useful for bulk lombokify batches where some files
-  have nothing to do).</li>
-<li><code>op: "command"</code> — a validation command. Validation-only unless <code>touches</code>
-  declares paths it may mutate; declared touches are snapshotted for
-  rollback.</li>
-</ul>
-<h2 id="grounding-entity-refs">Grounding entity refs<a class="headerlink" href="#grounding-entity-refs" title="Permanent link">&para;</a></h2>
-<h3 id="bbox_refactor_project_refs"><code>bbox_refactor_project_refs</code><a class="headerlink" href="#bbox_refactor_project_refs" title="Permanent link">&para;</a></h3>
-<p>Returns current <code>project_file:&lt;project&gt;:&lt;rel_path_hash&gt;:&lt;chunk_hash&gt;:&lt;occurrence_idx&gt;</code>
-refs for a source file. Use before editing eval fixtures, provenance
-metadata, or design docs that store these refs — do not guess the hash
-segments.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>bbox_refactor_project_refs(
-<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>  file=&quot;src/packets/mod.rs&quot;,
+<h2 id="compound-runs">Compound Runs<a class="headerlink" href="#compound-runs" title="Permanent link">&para;</a></h2>
+<p><code>bbox_refactor_run</code> is the right tool when a refactor needs more than one plan or
+when validation needs to be part of rollback.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>bbox_refactor_run(
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>  title=&quot;extract UserRepository&quot;,
 <a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>  project_dir=&quot;/repo/x&quot;,
-<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>  query=&quot;compile&quot;,
-<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>  limit=20
-<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>)
+<a id="__codelineno-8-4" name="__codelineno-8-4" href="#__codelineno-8-4"></a>  confirm=true,
+<a id="__codelineno-8-5" name="__codelineno-8-5" href="#__codelineno-8-5"></a>  steps=[
+<a id="__codelineno-8-6" name="__codelineno-8-6" href="#__codelineno-8-6"></a>    {
+<a id="__codelineno-8-7" name="__codelineno-8-7" href="#__codelineno-8-7"></a>      &quot;op&quot;: &quot;plan&quot;,
+<a id="__codelineno-8-8" name="__codelineno-8-8" href="#__codelineno-8-8"></a>      &quot;kind&quot;: &quot;extract_java_class&quot;,
+<a id="__codelineno-8-9" name="__codelineno-8-9" href="#__codelineno-8-9"></a>      &quot;source&quot;: &quot;src/UserService.java&quot;,
+<a id="__codelineno-8-10" name="__codelineno-8-10" href="#__codelineno-8-10"></a>      &quot;item_names&quot;: [&quot;UserRepository&quot;]
+<a id="__codelineno-8-11" name="__codelineno-8-11" href="#__codelineno-8-11"></a>    },
+<a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a>    {
+<a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a>      &quot;op&quot;: &quot;command&quot;,
+<a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a>      &quot;command&quot;: &quot;mvn&quot;,
+<a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a>      &quot;args&quot;: [&quot;-q&quot;, &quot;compile&quot;],
+<a id="__codelineno-8-16" name="__codelineno-8-16" href="#__codelineno-8-16"></a>      &quot;touches&quot;: []
+<a id="__codelineno-8-17" name="__codelineno-8-17" href="#__codelineno-8-17"></a>    }
+<a id="__codelineno-8-18" name="__codelineno-8-18" href="#__codelineno-8-18"></a>  ]
+<a id="__codelineno-8-19" name="__codelineno-8-19" href="#__codelineno-8-19"></a>)
 </code></pre></div>
-<h2 id="language-support-summary">Language support summary<a class="headerlink" href="#language-support-summary" title="Permanent link">&para;</a></h2>
+<p>Plan steps write through the same hash-checked apply path. Command steps are
+validation-only unless <code>touches</code> declares files they may mutate. Declared touches
+are snapshotted for rollback.</p>
+<h2 id="refactor-atoms">Refactor Atoms<a class="headerlink" href="#refactor-atoms" title="Permanent link">&para;</a></h2>
+<p>Refactor atoms live under <code>system-defaults/atoms/refactor/</code>. Install the ones you
+actually use. <a href="../artifact-catalog/">Artifact Catalog And System Defaults</a> covers
+general install order and supersession; this section focuses on refactor choices:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>bbox_artifact_install(kind=&quot;brofile&quot;, source=&quot;system-defaults/brofiles/refactor/java-refactor-persona.json&quot;)
+<a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>bbox_artifact_install(kind=&quot;brofile&quot;, source=&quot;system-defaults/brofiles/refactor/rust-refactor-persona.json&quot;)
+<a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/java-extract-cohesive-class.json&quot;)
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/rust-split-god-impl.json&quot;)
+</code></pre></div>
+<p>They are profile-backed atoms, so each invocation starts a brofile-backed
+provider task and returns a resumable atom handle. The atom input schema is the
+contract; the prompt template inside the manifest is the runbook the dispatched
+agent follows.</p>
+<h3 id="java-refactor-atoms">Java Refactor Atoms<a class="headerlink" href="#java-refactor-atoms" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Atom</th>
+<th>Job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>atom:java-class-dependency-graph@v2</code></td>
+<td>Inventory a Java class before deciding what can be extracted.</td>
+</tr>
+<tr>
+<td><code>atom:java-extract-cohesive-class@v3</code></td>
+<td>Extract methods plus field moves, delegate wiring, caller rewrites, and visibility fixes.</td>
+</tr>
+<tr>
+<td><code>atom:java-extract-interface@v2</code></td>
+<td>Extract an interface and optionally migrate callers to the interface type.</td>
+</tr>
+<tr>
+<td><code>atom:java-find-usages@v1</code></td>
+<td>Walk references for one or more Java names.</td>
+</tr>
+<tr>
+<td><code>atom:java-lombokify@v1</code></td>
+<td>Convert hand-written POJO boilerplate to Lombok where semantics are safe.</td>
+</tr>
+<tr>
+<td><code>atom:java-promote-inner-class@v1</code></td>
+<td>Promote a non-static inner class with outer captures to a top-level class.</td>
+</tr>
+<tr>
+<td><code>atom:java-public-api-guard@v1</code></td>
+<td>Report public API impact before a Java refactor.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="rust-refactor-atoms">Rust Refactor Atoms<a class="headerlink" href="#rust-refactor-atoms" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Atom</th>
+<th>Job</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>atom:rust-error-migrate@v1</code></td>
+<td>Rewrite a Rust module's error type and repair construction / <code>?</code> sites.</td>
+</tr>
+<tr>
+<td><code>atom:rust-impl-partition-graph@v1</code></td>
+<td>Produce a method/field/call graph for a large impl block.</td>
+</tr>
+<tr>
+<td><code>atom:rust-public-api-guard@v1</code></td>
+<td>Report public API impact before a Rust refactor.</td>
+</tr>
+<tr>
+<td><code>atom:rust-split-god-impl@v1</code></td>
+<td>Split a multi-domain impl block into modules with router wiring and visibility updates.</td>
+</tr>
+<tr>
+<td><code>atom:rust-state-extract@v1</code></td>
+<td>Pull a cluster of <code>self.field</code> reads into a separate state struct.</td>
+</tr>
+<tr>
+<td><code>atom:rust-test-island-extract@v1</code></td>
+<td>Move inline <code>#[cfg(test)] mod tests</code> blocks into sibling <code>src/tests/*.rs</code> modules.</td>
+</tr>
+<tr>
+<td><code>atom:rust-trait-from-impl@v1</code></td>
+<td>Lift selected inherent methods into a trait plus impl.</td>
+</tr>
+</tbody>
+</table>
+<h3 id="atom-operating-rules">Atom Operating Rules<a class="headerlink" href="#atom-operating-rules" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Invoke with <code>apply=false</code> first when the atom supports it.</li>
+<li>Read <code>atom_status</code> before resuming. Provider-backed handles may need a moment
+  before the real session id is available.</li>
+<li>Delegate before asking another operator or reviewer to resume.</li>
+<li>Treat <code>bbox_note(kind="blocked")</code> from an atom as a real stop, not advisory
+  prose.</li>
+<li>If the atom produces a plan path, inspect the plan before applying or asking it
+  to continue.</li>
+</ul>
+<h2 id="grounding-entity-refs">Grounding Entity Refs<a class="headerlink" href="#grounding-entity-refs" title="Permanent link">&para;</a></h2>
+<p>Use <code>bbox_refactor_project_refs</code> before editing eval fixtures, provenance
+metadata, or design docs that store <code>project_file:</code> refs.</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>bbox_refactor_project_refs(
+<a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a>  file=&quot;src/packets/mod.rs&quot;,
+<a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>  project_dir=&quot;/repo/x&quot;,
+<a id="__codelineno-10-4" name="__codelineno-10-4" href="#__codelineno-10-4"></a>  query=&quot;compile&quot;,
+<a id="__codelineno-10-5" name="__codelineno-10-5" href="#__codelineno-10-5"></a>  limit=20
+<a id="__codelineno-10-6" name="__codelineno-10-6" href="#__codelineno-10-6"></a>)
+</code></pre></div>
+<p>Do not guess hash segments. They encode the current indexed file/chunk identity.</p>
+<h2 id="language-support">Language Support<a class="headerlink" href="#language-support" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
 <tr>
 <th>Language</th>
-<th>Status</th>
+<th>Practical status</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>Java</td>
-<td>Full — extract class/method, move field/constant, lombokify, add constructor/fields, update callers, JDTLS import repair</td>
+<td>Mature primitive support plus refactor atoms. Extract class/method/interface, nested/inner type extraction, move field/constant, visibility/type migration, find usages, rename, dependency/API analysis, lombokify, caller updates, and JDTLS import repair are wired.</td>
 </tr>
 <tr>
 <td>Rust</td>
-<td>Status inventory + plan scaffolding</td>
+<td>Inventory, generic plans, and a growing atom catalog for higher-level transformations.</td>
 </tr>
 <tr>
 <td>Other</td>
-<td>Generic plans (file move, text replace, write, TOML)</td>
+<td>Inspection plus generic file/text/TOML plans.</td>
 </tr>
 </tbody>
 </table>
-<p>Tree-sitter grammars cover inspection across more languages than writable
-plans. When a plan kind isn't available, use <code>replace_text</code> or <code>write_file</code>
-plus manual verification.</p>
+<p>When the primitive plan kind does not exist, use an atom if one matches the job.
+If neither exists, fall back to <code>replace_text</code> / <code>write_file</code> and run the local
+compiler or test suite yourself.</p>
 
 
 

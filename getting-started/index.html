@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -14,7 +14,7 @@
         <link rel="prev" href="..">
       
       
-        <link rel="next" href="../internals/">
+        <link rel="next" href="../operating-blackbox/">
       
       
         
@@ -442,6 +442,8 @@
       
         
       
+        
+      
     
     
     
@@ -486,6 +488,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -558,6 +588,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -655,6 +697,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -690,7 +760,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1253,10 +1463,15 @@
 
 
 <h1 id="getting-started">Getting Started<a class="headerlink" href="#getting-started" title="Permanent link">&para;</a></h1>
-<p>Five steps. After step 5 every agent CLI on your host is talking to the
-same daemon, your existing <code>CLAUDE.md</code> / <code>AGENTS.md</code> / <code>GEMINI.md</code>
-content has been absorbed into one store, and the store is rendered back
-out to each provider in a consistent layered form.</p>
+<p>This gets one host into the normal blackbox shape:</p>
+<ul>
+<li>one long-running <code>blackboxd</code></li>
+<li>every agent CLI pointed at the same MCP endpoint</li>
+<li>one knowledge store rendered back into provider markdown</li>
+<li>project source indexed into the agentic corpus</li>
+</ul>
+<p>Do this once per machine, then use the same daemon from Claude, Codex, Gemini,
+Copilot, and Vibe.</p>
 <h2 id="1-build-and-install-the-binaries">1. Build and install the binaries<a class="headerlink" href="#1-build-and-install-the-binaries" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>git<span class="w"> </span>clone<span class="w"> </span>https://github.com/invidious9000/transcript-search.git
 <a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nb">cd</span><span class="w"> </span>transcript-search
@@ -1272,11 +1487,12 @@ out to each provider in a consistent layered form.</p>
 <a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>systemctl<span class="w"> </span>--user<span class="w"> </span>daemon-reload
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>systemctl<span class="w"> </span>--user<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>blackbox.service
 </code></pre></div>
-<p>One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on
-the host, so they all share the same tantivy index, knowledge store, and
-orchestration state. Prod and dev should use separate installed daemon
-paths even when they come from the same built artifact — dev restarts
-never mutate the prod service binary in place.</p>
+<p>One daemon serves every Claude / Codex / Gemini / Copilot / Vibe CLI on the
+host. That is what makes transcript search, knowledge, threads, notes, and bro
+tasks shared instead of provider-local.</p>
+<p>Prod and dev should use separate installed daemon paths even when they come from
+the same built artifact. Dev restarts should never mutate the prod service
+binary in place.</p>
 <p>Logs live in journald:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>journalctl<span class="w"> </span>--user<span class="w"> </span>-u<span class="w"> </span>blackbox<span class="w"> </span>-f
 </code></pre></div>
@@ -1286,7 +1502,7 @@ never mutate the prod service binary in place.</p>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>systemctl<span class="w"> </span>--user<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>blackbox-dev.service
 </code></pre></div>
 <h2 id="3-connect-each-provider-cli-to-the-daemon">3. Connect each provider CLI to the daemon<a class="headerlink" href="#3-connect-each-provider-cli-to-the-daemon" title="Permanent link">&para;</a></h2>
-<p><strong>Claude Code</strong> — add to each <code>~/.claude*/.claude.json</code>:</p>
+<p><strong>Claude Code</strong> - add to each <code>~/.claude*/.claude.json</code>:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="p">{</span>
 <a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="w">  </span><span class="nt">&quot;mcpServers&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="w">    </span><span class="nt">&quot;blackbox&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span>
@@ -1296,24 +1512,25 @@ never mutate the prod service binary in place.</p>
 <a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a><span class="w">  </span><span class="p">}</span>
 <a id="__codelineno-4-8" name="__codelineno-4-8" href="#__codelineno-4-8"></a><span class="p">}</span>
 </code></pre></div>
-<p><strong>Codex CLI</strong> — add to <code>~/.codex/config.toml</code>:</p>
+<p><strong>Codex CLI</strong> - add to <code>~/.codex/config.toml</code>:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">[mcp_servers.blackbox]</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="n">url</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="s2">&quot;http://127.0.0.1:7264/mcp&quot;</span>
 </code></pre></div>
-<p><strong>Gemini CLI</strong> — <code>gemini mcp add blackbox http://127.0.0.1:7264/mcp</code></p>
-<p><strong>Copilot</strong> — <code>copilot mcp add blackbox http://127.0.0.1:7264/mcp</code></p>
+<p><strong>Gemini CLI</strong> - <code>gemini mcp add blackbox http://127.0.0.1:7264/mcp</code></p>
+<p><strong>Copilot</strong> - <code>copilot mcp add blackbox http://127.0.0.1:7264/mcp</code></p>
 <h2 id="4-bootstrap-a-project">4. Bootstrap a project<a class="headerlink" href="#4-bootstrap-a-project" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_bootstrap<span class="o">(</span><span class="nv">project</span><span class="o">=</span><span class="s2">&quot;/absolute/path/to/your/repo&quot;</span><span class="o">)</span>
 </code></pre></div>
-<p>This onboards the repo into the knowledge system, registers it with the
-agentic corpus, and emits structural edges (file → function, file →
-class, etc.).</p>
+<p>This onboards the repo into the knowledge system, registers it with the agentic
+corpus, and emits structural edges such as file to function and file to class.</p>
 <h2 id="5-render-the-knowledge-store">5. Render the knowledge store<a class="headerlink" href="#5-render-the-knowledge-store" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>bbox_render<span class="o">(</span><span class="nv">scope</span><span class="o">=</span><span class="s2">&quot;both&quot;</span>,<span class="w"> </span><span class="nv">project</span><span class="o">=</span><span class="s2">&quot;/path/to/repo&quot;</span><span class="o">)</span>
 </code></pre></div>
 <p>This writes a unified layered markdown file for each provider:
 <code>~/.claude-shared/CLAUDE.md</code>, <code>~/.codex/AGENTS.md</code>, <code>~/.gemini/GEMINI.md</code>,
 and per-project <code>CLAUDE.md</code> / <code>AGENTS.md</code> / <code>GEMINI.md</code>.</p>
+<p>Rendering is a projection. The durable source of truth is the blackbox knowledge
+store, not the rendered markdown.</p>
 <h2 id="environment-variables">Environment Variables<a class="headerlink" href="#environment-variables" title="Permanent link">&para;</a></h2>
 <table>
 <thead>

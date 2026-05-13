@@ -11,10 +11,10 @@
       
       
       
-        <link rel="prev" href="../slack-bridge/">
+        <link rel="prev" href="../knowledge-store/">
       
       
-        <link rel="next" href="../examples/">
+        <link rel="next" href="../projects-code-indexing/">
       
       
         
@@ -25,7 +25,7 @@
     
     
       
-        <title>IRC Bridge - blackbox</title>
+        <title>Transcript Retrieval - blackbox</title>
       
     
     
@@ -76,7 +76,7 @@
     <div data-md-component="skip">
       
         
-        <a href="#irc-bridge" class="md-skip">
+        <a href="#transcript-retrieval" class="md-skip">
           Skip to content
         </a>
       
@@ -112,7 +112,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              IRC Bridge
+              Transcript Retrieval
             
           </span>
         </div>
@@ -454,8 +454,10 @@
       
   
   
+    
   
   
+  
     
     
       
@@ -496,11 +498,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" checked>
         
           
           <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="">
@@ -521,7 +523,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_4">
             <span class="md-nav__icon md-icon"></span>
             
@@ -704,10 +706,37 @@
                 
   
   
+    
   
   
-    <li class="md-nav__item">
-      <a href="../transcript-retrieval/" class="md-nav__link">
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
         
   
   
@@ -723,6 +752,92 @@
   
 
       </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#retrieval-ladder" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Retrieval Ladder
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#search" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Search
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#sessions-and-messages" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Sessions And Messages
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#topics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Topics
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reindex-and-health" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reindex And Health
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#when-to-use-graph-instead" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When To Use Graph Instead
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -935,10 +1050,8 @@
       
   
   
-    
   
   
-  
     
     
       
@@ -957,11 +1070,11 @@
       
     
     
-    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" checked>
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_5" >
         
           
           <label class="md-nav__link" for="__nav_5" id="__nav_5_label" tabindex="">
@@ -982,7 +1095,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="true">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_5_label" aria-expanded="false">
           <label class="md-nav__title" for="__nav_5">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1053,37 +1166,10 @@
                 
   
   
-    
   
   
-  
-    <li class="md-nav__item md-nav__item--active">
-      
-      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
-      
-      
-        
-      
-      
-        <label class="md-nav__link md-nav__link--active" for="__toc">
-          
-  
-  
-  <span class="md-ellipsis">
-    
-  
-    IRC Bridge
-  
-
-    
-  </span>
-  
-  
-
-          <span class="md-nav__icon md-icon"></span>
-        </label>
-      
-      <a href="./" class="md-nav__link md-nav__link--active">
+    <li class="md-nav__item">
+      <a href="../irc-bridge/" class="md-nav__link">
         
   
   
@@ -1099,137 +1185,6 @@
   
 
       </a>
-      
-        
-
-<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
-  
-  
-  
-    
-  
-  
-    <label class="md-nav__title" for="__toc">
-      <span class="md-nav__icon md-icon"></span>
-      Table of contents
-    </label>
-    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
-      
-        <li class="md-nav__item">
-  <a href="#how-it-works" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        How it works
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#setup" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Setup
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Setup">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#1-ngircd-server" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        1. ngircd server
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#2-bro-irc-service" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2. bro-irc service
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#3-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3. Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#commands" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Commands
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Commands">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#examples" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Examples
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#council-integration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Council integration
-      
-    </span>
-  </a>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#security" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Security
-      
-    </span>
-  </a>
-  
-</li>
-      
-    </ul>
-  
-</nav>
-      
     </li>
   
 
@@ -1390,10 +1345,10 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
-  <a href="#how-it-works" class="md-nav__link">
+  <a href="#retrieval-ladder" class="md-nav__link">
     <span class="md-ellipsis">
       
-        How it works
+        Retrieval Ladder
       
     </span>
   </a>
@@ -1401,88 +1356,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#setup" class="md-nav__link">
+  <a href="#search" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Setup
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Setup">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#1-ngircd-server" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        1. ngircd server
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#2-bro-irc-service" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        2. bro-irc service
-      
-    </span>
-  </a>
-  
-</li>
-        
-          <li class="md-nav__item">
-  <a href="#3-configuration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        3. Configuration
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#commands" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Commands
-      
-    </span>
-  </a>
-  
-    <nav class="md-nav" aria-label="Commands">
-      <ul class="md-nav__list">
-        
-          <li class="md-nav__item">
-  <a href="#examples" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Examples
-      
-    </span>
-  </a>
-  
-</li>
-        
-      </ul>
-    </nav>
-  
-</li>
-      
-        <li class="md-nav__item">
-  <a href="#council-integration" class="md-nav__link">
-    <span class="md-ellipsis">
-      
-        Council integration
+        Search
       
     </span>
   </a>
@@ -1490,10 +1367,43 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#security" class="md-nav__link">
+  <a href="#sessions-and-messages" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Security
+        Sessions And Messages
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#topics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Topics
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reindex-and-health" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reindex And Health
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#when-to-use-graph-instead" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        When To Use Graph Instead
       
     </span>
   </a>
@@ -1520,173 +1430,105 @@
   
 
 
-<h1 id="irc-bridge">IRC Bridge<a class="headerlink" href="#irc-bridge" title="Permanent link">&para;</a></h1>
-<p><code>bro-irc</code> is a LAN IRC bridge that relays IRC commands into the blackbox
-daemon's <code>bro exec/resume/status</code> surface. It's designed for couch
-steering - operators on a local IRC server can dispatch bros, check task
-status, and participate in councils via IRC messages.</p>
-<p>The bridge runs as a sidecar process (just like <code>bro-slack</code>), connecting
-to both an ngircd instance and the blackbox daemon.</p>
-<h2 id="how-it-works">How it works<a class="headerlink" href="#how-it-works" title="Permanent link">&para;</a></h2>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>IRC client ──► ngircd ──► bro-irc sidecar ──► POST /irc/{exec,resume,status,...}
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>                │              │                         │
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>                │              │ translates:             │ blackboxd
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>                │              │ !exec &lt;prompt&gt;  ──►     │ bro exec
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                │              │ !resume &lt;prompt&gt; ──►    │ bro resume
-<a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>                │              │ !st                     │ bro status
-<a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>                │              │ !dash                   │ bro dashboard
-<a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>                │              │ !team                   │ bro team
-<a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>                │              │ !council                │ council integration
+<h1 id="transcript-retrieval">Transcript Retrieval<a class="headerlink" href="#transcript-retrieval" title="Permanent link">&para;</a></h1>
+<p>Use transcript tools when the answer lives in prior agent conversations: who
+said a rule, what a task did, where a failed attempt happened, or what context a
+handoff lost.</p>
+<p>Use graph tools when the answer depends on connected entities. Use transcript
+tools when you need the conversation itself.</p>
+<h2 id="retrieval-ladder">Retrieval Ladder<a class="headerlink" href="#retrieval-ladder" title="Permanent link">&para;</a></h2>
+<p>Start broad:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>bbox_search(query=&quot;redis locking&quot;, project=&quot;/repo/x&quot;, role=&quot;user&quot;)
 </code></pre></div>
-<p>The daemon exposes a dedicated <code>/irc/*</code> HTTP route set (not MCP) that
-accepts the same parameters as the MCP tools but returns IRC-friendly
-output. The bridge formats responses into IRC messages with colored
-prefixes and multi-line splitting.</p>
-<h2 id="setup">Setup<a class="headerlink" href="#setup" title="Permanent link">&para;</a></h2>
-<h3 id="1-ngircd-server">1. ngircd server<a class="headerlink" href="#1-ngircd-server" title="Permanent link">&para;</a></h3>
-<p>A sample ngircd config ships at <code>deploy/irc/config/ngircd.conf</code>. Install
-and configure:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1"># Arch</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>pacman<span class="w"> </span>-S<span class="w"> </span>ngircd
-<a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>
-<a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1"># Edit /etc/ngircd/ngircd.conf - see deploy/irc/config/ngircd.conf for reference</span>
-<a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a>systemctl<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>ngircd
+<p>Open context around a hit:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>bbox_context(file_path=&quot;&lt;jsonl&gt;&quot;, byte_offset=12345)
 </code></pre></div>
-<h3 id="2-bro-irc-service">2. bro-irc service<a class="headerlink" href="#2-bro-irc-service" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>install<span class="w"> </span>-m<span class="w"> </span><span class="m">755</span><span class="w"> </span>target/release/bro-irc<span class="w"> </span>~/.local/bin/bro-irc
-<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>cp<span class="w"> </span>deploy/bro-irc.service<span class="w"> </span>~/.config/systemd/user/
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>systemctl<span class="w"> </span>--user<span class="w"> </span><span class="nb">enable</span><span class="w"> </span>--now<span class="w"> </span>bro-irc.service
+<p>Inspect the session:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>bbox_session(session_id=&quot;&lt;session-id&gt;&quot;)
+<a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a>bbox_messages(session_id=&quot;&lt;session-id&gt;&quot;, from_end=true, limit=40)
 </code></pre></div>
-<p>The service defaults to connecting to ngircd on <code>192.168.0.251:6667</code>,
-channel <code>#bros</code>, and the daemon at <code>http://127.0.0.1:7264</code>.</p>
-<h3 id="3-configuration">3. Configuration<a class="headerlink" href="#3-configuration" title="Permanent link">&para;</a></h3>
-<p>All config is via CLI flags (or environment for secrets):</p>
+<p>If you need the origin of a standing claim, use cite:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>bbox_cite(claim=&quot;never kill processes by port&quot;)
+</code></pre></div>
+<p><code>bbox_cite</code> returns oldest-first so the origin comes before later repetitions.</p>
+<h2 id="search">Search<a class="headerlink" href="#search" title="Permanent link">&para;</a></h2>
+<p><code>bbox_search</code> is for topics when you do not know the session:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>bbox_search(
+<a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a>  query=&quot;atom binding workflow&quot;,
+<a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>  project=&quot;/repo/x&quot;,
+<a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a>  role=&quot;assistant&quot;,
+<a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a>  exclude_self=true,
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a>  limit=10
+<a id="__codelineno-4-7" name="__codelineno-4-7" href="#__codelineno-4-7"></a>)
+</code></pre></div>
+<p>Default smart mode broadens adjacent terms for recall. Use quoted phrases for
+exact text and <code>-term</code> for exclusions. Use <code>mode="fulltext"</code> only when you want
+raw Tantivy/Lucene syntax.</p>
+<p>Filter early:</p>
 <table>
 <thead>
 <tr>
-<th>Flag</th>
-<th>Default</th>
-<th>Purpose</th>
+<th>Filter</th>
+<th>Use</th>
 </tr>
 </thead>
 <tbody>
 <tr>
-<td><code>--irc-host</code></td>
-<td><code>192.168.0.251</code></td>
-<td>IRC server host</td>
+<td><code>project</code></td>
+<td>Keep results scoped to the repo you care about.</td>
 </tr>
 <tr>
-<td><code>--irc-port</code></td>
-<td><code>6667</code></td>
-<td>IRC server port</td>
+<td><code>role</code></td>
+<td>Find user directives, assistant summaries, tool results, or thinking blocks.</td>
 </tr>
 <tr>
-<td><code>--nick</code></td>
-<td><code>blackbox</code></td>
-<td>Bot nickname</td>
+<td><code>account</code></td>
+<td>Separate multiple Claude/Codex accounts.</td>
 </tr>
 <tr>
-<td><code>--channel</code></td>
-<td><code>#bros</code></td>
-<td>Channel to join</td>
+<td><code>include_subagents</code></td>
+<td>Include or exclude subagent transcript blocks.</td>
 </tr>
 <tr>
-<td><code>--daemon-url</code></td>
-<td><code>http://127.0.0.1:7264</code></td>
-<td>blackboxd base URL</td>
-</tr>
-<tr>
-<td><code>--prefix</code></td>
-<td><code>!</code></td>
-<td>Command prefix</td>
-</tr>
-<tr>
-<td><code>--allow-nicks</code></td>
-<td>(none - permissive)</td>
-<td>Comma-separated nick allowlist</td>
-</tr>
-<tr>
-<td><code>--announce</code></td>
-<td><code>false</code></td>
-<td>Print command help on startup</td>
+<td><code>exclude_self</code></td>
+<td>Avoid echoing the current turn.</td>
 </tr>
 </tbody>
 </table>
-<h2 id="commands">Commands<a class="headerlink" href="#commands" title="Permanent link">&para;</a></h2>
-<p>All commands are prefixed with <code>!</code> (configurable):</p>
-<table>
-<thead>
-<tr>
-<th>Command</th>
-<th>Action</th>
-<th>MCP equivalent</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td><code>!exec &lt;prompt&gt;</code></td>
-<td>Dispatch a bro with the given prompt</td>
-<td><code>bro_exec</code></td>
-</tr>
-<tr>
-<td><code>!resume &lt;prompt&gt;</code></td>
-<td>Resume the last conversation in this channel</td>
-<td><code>bro_resume</code></td>
-</tr>
-<tr>
-<td><code>!st [task_id]</code></td>
-<td>Check task status (or list recent)</td>
-<td><code>bro_status</code> / <code>bro_dashboard</code></td>
-</tr>
-<tr>
-<td><code>!dash</code></td>
-<td>Show recent tasks dashboard</td>
-<td><code>bro_dashboard</code></td>
-</tr>
-<tr>
-<td><code>!team [name]</code></td>
-<td>Show team roster or create a team</td>
-<td><code>bro_team</code></td>
-</tr>
-<tr>
-<td><code>!cancel &lt;task_id&gt;</code></td>
-<td>Cancel a running task</td>
-<td><code>bro_cancel</code></td>
-</tr>
-<tr>
-<td><code>!council</code></td>
-<td>Council integration (open, list, post)</td>
-<td><code>bro_council_*</code></td>
-</tr>
-</tbody>
-</table>
-<h3 id="examples">Examples<a class="headerlink" href="#examples" title="Permanent link">&para;</a></h3>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>&lt;operator&gt; !exec audit the rule-packets docs for gaps
-<a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a>&lt;blackbox&gt; [task-3f7a1b2c] dispatched - Claude/Opus 4.7
-<a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a>&lt;blackbox&gt; [task-3f7a1b2c] completed - found 2 missing AST primitives, logged gaps
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a>
-<a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a>&lt;operator&gt; !st task-3f7a1b2c
-<a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a>&lt;blackbox&gt; task-3f7a1b2c | completed | claude | 47s | &quot;audit the rule-packets docs for gaps&quot;
-<a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a>
-<a id="__codelineno-3-8" name="__codelineno-3-8" href="#__codelineno-3-8"></a>&lt;operator&gt; !dash
-<a id="__codelineno-3-9" name="__codelineno-3-9" href="#__codelineno-3-9"></a>&lt;blackbox&gt; Recent tasks:
-<a id="__codelineno-3-10" name="__codelineno-3-10" href="#__codelineno-3-10"></a>&lt;blackbox&gt; task-3f7a1b2c | completed | claude | 47s | audit docs
-<a id="__codelineno-3-11" name="__codelineno-3-11" href="#__codelineno-3-11"></a>&lt;blackbox&gt; task-9d2e4f1a | running   | codex  | 12m  | refactor index module
+<h2 id="sessions-and-messages">Sessions And Messages<a class="headerlink" href="#sessions-and-messages" title="Permanent link">&para;</a></h2>
+<p>Use <code>bbox_sessions_list</code> when recency matters more than text:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>bbox_sessions_list(project=&quot;/repo/x&quot;, limit=20)
 </code></pre></div>
-<h2 id="council-integration">Council integration<a class="headerlink" href="#council-integration" title="Permanent link">&para;</a></h2>
-<p>The bridge auto-opens an IRC council when bros are dispatched. The
-council is a structured deliberation board where bro outputs are posted
-and operators can annotate, vote, and advance through phases - all via
-IRC. See the <a href="../workflows/">Workflow Engine</a> docs for council mechanics.</p>
-<h2 id="security">Security<a class="headerlink" href="#security" title="Permanent link">&para;</a></h2>
-<p>By default, the bridge runs in permissive LAN mode (any nick on the IRC
-server can issue commands). Set <code>--allow-nicks</code> to restrict:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>bro-irc<span class="w"> </span>--allow-nicks<span class="w"> </span>alice,bob,charlie
+<p>Use <code>bbox_session</code> for metadata: first prompt, project, duration, tool counts,
+and transcript file path.</p>
+<p>Use <code>bbox_messages</code> when you already know the session and need chronological
+flow. Tail mode is useful for takeover:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>bbox_messages(session_id=&quot;&lt;session-id&gt;&quot;, from_end=true, limit=80)
 </code></pre></div>
-<p>The <code>--daemon-url</code> should always stay loopback (<code>127.0.0.1:7264</code>). The
-bridge has no authentication of its own beyond the IRC server's
-connection model. For exposed deployments, run ngircd with <code>Password</code> in
-<code>[Global]</code> and place the IRC server behind a VPN or firewall.</p>
+<h2 id="topics">Topics<a class="headerlink" href="#topics" title="Permanent link">&para;</a></h2>
+<p><code>bbox_topics</code> is a cheap "what was this session about?" read. It is term
+frequency, not summarization:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>bbox_topics(session_id=&quot;&lt;session-id&gt;&quot;)
+</code></pre></div>
+<h2 id="reindex-and-health">Reindex And Health<a class="headerlink" href="#reindex-and-health" title="Permanent link">&para;</a></h2>
+<p>Background reindex runs periodically. Reach for manual tools only when you are
+diagnosing freshness:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>bbox_stats()
+<a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>bbox_reindex(full=false)
+<a id="__codelineno-8-3" name="__codelineno-8-3" href="#__codelineno-8-3"></a>bbox_embed_status()
+</code></pre></div>
+<p>Use <code>full=true</code> only after schema changes, corruption, or an explicit reason to
+throw away incremental assumptions.</p>
+<h2 id="when-to-use-graph-instead">When To Use Graph Instead<a class="headerlink" href="#when-to-use-graph-instead" title="Permanent link">&para;</a></h2>
+<p>Use <a href="../internals/">Internals</a> and the agentic opening sequence when the question
+needs provenance across entities:</p>
+<ul>
+<li>why a line exists</li>
+<li>which decision superseded another</li>
+<li>what thread/session/note produced a commit</li>
+<li>which docs and symbols relate to an artifact</li>
+</ul>
+<p>Transcript search finds text. The graph finds paths.</p>
 
 
 

@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -430,6 +460,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -527,6 +569,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -562,7 +632,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1311,10 +1521,10 @@
 
 
 <h1 id="mcp-surfaces">MCP Surfaces<a class="headerlink" href="#mcp-surfaces" title="Permanent link">&para;</a></h1>
-<p>A <strong>surface</strong> is a caller-selected view of the daemon's MCP tool catalog. Different callers
-— a read-only reviewer agent, an executor with full write access, an audit-only operator —
-connect to the same daemon but see a different set of tools based on which surface they
-select at connect time.</p>
+<p>A <strong>surface</strong> is a named view of the daemon's MCP tools.</p>
+<p>Use surfaces when different callers should connect to the same daemon but see
+different tool catalogs: a read-only reviewer, an executor with write tools, an
+audit-only observer, or an internal workflow actor.</p>
 <p>Surfaces are not roles, not permissions, not per-user ACLs. They are named
 configurations that filter the tool list and optionally inject surface-scoped
 instructions into the caller's context.</p>
@@ -1360,7 +1570,7 @@ returns a verdict from the lattice <code>["tool_surface", "deny"]</code>:</p>
 </tr>
 <tr>
 <td><code>deny</code></td>
-<td>MCP <code>initialize</code> fails with the verdict's <code>reason</code> — the client is rejected outright, not given an empty catalog</td>
+<td>MCP <code>initialize</code> fails with the verdict's <code>reason</code>. The client is rejected outright, not given an empty catalog.</td>
 </tr>
 </tbody>
 </table>
@@ -1373,13 +1583,13 @@ returns a verdict from the lattice <code>["tool_surface", "deny"]</code>:</p>
 <a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="p">}</span>
 </code></pre></div>
 <p><code>allow</code> and <code>disallow</code> support glob patterns. An empty <code>allow</code> list passes all tools;
-a non-empty <code>allow</code> list is an explicit allowlist — only listed tools are visible.
+a non-empty <code>allow</code> list is an explicit allowlist - only listed tools are visible.
 <code>disallow</code> always takes precedence over <code>allow</code>.</p>
 <h3 id="example-packet">Example packet<a class="headerlink" href="#example-packet" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="p">{</span>
 <a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="w">  </span><span class="nt">&quot;id&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;surface-readonly&quot;</span><span class="p">,</span>
 <a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="w">  </span><span class="nt">&quot;domain&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;mcp-surface/routing&quot;</span><span class="p">,</span>
-<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read-only surface — search and inspect, no writes&quot;</span><span class="p">,</span>
+<a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="w">  </span><span class="nt">&quot;description&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;Read-only surface: search and inspect, no writes&quot;</span><span class="p">,</span>
 <a id="__codelineno-3-5" name="__codelineno-3-5" href="#__codelineno-3-5"></a><span class="w">  </span><span class="nt">&quot;rules&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
 <a id="__codelineno-3-6" name="__codelineno-3-6" href="#__codelineno-3-6"></a><span class="w">    </span><span class="p">{</span>
 <a id="__codelineno-3-7" name="__codelineno-3-7" href="#__codelineno-3-7"></a><span class="w">      </span><span class="nt">&quot;when&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="nt">&quot;surface&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;readonly&quot;</span><span class="w"> </span><span class="p">},</span>
@@ -1406,11 +1616,11 @@ a non-empty <code>allow</code> list is an explicit allowlist — only listed too
 <h2 id="enforcement">Enforcement<a class="headerlink" href="#enforcement" title="Permanent link">&para;</a></h2>
 <p>Enforcement is layered so filtering can't be bypassed:</p>
 <ul>
-<li><strong><code>list_tools</code></strong> — returns only the tools the surface allows. Hidden tools are
+<li><strong><code>list_tools</code></strong> - returns only the tools the surface allows. Hidden tools are
   invisible to the caller.</li>
-<li><strong><code>call_tool</code></strong> — rejects calls to hidden tools with a clear error, even if the
+<li><strong><code>call_tool</code></strong> - rejects calls to hidden tools with a clear error, even if the
   caller somehow knows the tool name. The filter is not advisory.</li>
-<li><strong><code>deny</code> verdict</strong> — causes <code>initialize</code> to fail immediately. The session is not
+<li><strong><code>deny</code> verdict</strong> - causes <code>initialize</code> to fail immediately. The session is not
   established; the caller receives the denial reason. Use <code>deny</code> for surfaces that
   should never be reachable except from an authorized dispatch path.</li>
 </ul>
@@ -1420,9 +1630,9 @@ a non-empty <code>allow</code> list is an explicit allowlist — only listed too
 </code></pre></div>
 <p>Returns the packet evaluation result without establishing a session:</p>
 <ul>
-<li><strong>entity</strong> — the synthesized <code>initialize</code> entity the packet received</li>
-<li><strong>verdict</strong> — the raw verdict from the winning rule (or the default pass-through)</li>
-<li><strong>visible_tools</strong> — the filtered tool list after applying the verdict</li>
+<li><strong>entity</strong> - the synthesized <code>initialize</code> entity the packet received</li>
+<li><strong>verdict</strong> - the raw verdict from the winning rule (or the default pass-through)</li>
+<li><strong>visible_tools</strong> - the filtered tool list after applying the verdict</li>
 </ul>
 <p>Use <code>replay</code> to validate a surface packet before deploying it, or to diagnose why
 a specific tool is or isn't visible to a given surface.</p>

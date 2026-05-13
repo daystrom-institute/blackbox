@@ -6,7 +6,7 @@
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width,initial-scale=1">
       
-        <meta name="description" content="Single daemon for AI dev tooling — hybrid search, knowledge store, multi-provider agent orchestration">
+        <meta name="description" content="Single daemon for AI dev tooling: hybrid search, knowledge store, multi-provider agent orchestration">
       
       
       
@@ -312,6 +312,8 @@
       
         
       
+        
+      
     
     
     
@@ -356,6 +358,34 @@
 
           </label>
           <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../operating-blackbox/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Operating Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
             
               
                 
@@ -430,6 +460,18 @@
   
     
     
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
+      
+        
       
         
       
@@ -527,6 +569,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../atoms/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../rule-packets/" class="md-nav__link">
         
   
@@ -562,7 +632,147 @@
   <span class="md-ellipsis">
     
   
-    Refactor Tools
+    Refactor Tools And Atoms
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../bro-runtime/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Bro Runtime
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../knowledge-store/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Knowledge Store
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../transcript-retrieval/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Transcript Retrieval
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../projects-code-indexing/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Projects And Code Indexing
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../artifact-catalog/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Artifact Catalog
   
 
     
@@ -1399,62 +1609,61 @@
 
 
 <h1 id="badgey">Badgey<a class="headerlink" href="#badgey" title="Permanent link">&para;</a></h1>
-<p>Long-lived corpus consultant. Given a project scope, Badgey traces
-provenance, walks the typed entity graph, explains why decisions exist,
-investigates threads and sessions, and distills recurring transcript
-patterns into proposed durable artifacts (knowledge entries, brofiles,
-packets, workflows, agents) — every claim cited against round-trippable
-entity refs.</p>
+<p>Badgey is the slow, evidence-carrying consultant for the blackbox corpus.</p>
+<p>Give it a project scope and a hard question. It walks the typed graph, traces
+provenance, reads related sessions and threads, and returns claims tied to
+round-trippable entity refs. When it sees a reusable pattern, it can draft a
+proposal: a knowledge entry, packet, workflow, brofile, agent, or atom candidate.</p>
 <p>Badgey is not a code editor and not a direct knowledge-store CRUD shim.
 It synthesizes evidence-grounded proposals; a human (or the
 apply-proposal arc) executes them.</p>
 <h2 id="core-concept-instances-and-proposals">Core concept: instances and proposals<a class="headerlink" href="#core-concept-instances-and-proposals" title="Permanent link">&para;</a></h2>
 <p>A <strong>Badgey instance</strong> (<code>badgey_id</code>) is a persistent consultation session
-with a work-item thread of record. Turns are serialized per instance —
+with a work-item thread of record. Turns are serialized per instance, so
 concurrent callers queue rather than corrupt the provider session.</p>
 <p>Each turn can emit one or more <strong>proposals</strong>: structured action items
 (artifact promotions, redispatch tasks, knowledge entries, workflow
 installs) the instance believes should happen. Proposals sit in <code>pending</code>
 state until someone applies or rejects them.</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>badgey_exec → badgey_id (instance created, thread opened)
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>badgey_resume / badgey_ask → turns (evidence walk, proposals emitted)
-<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>badgey_proposals_list → read pending proposals
-<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>badgey_apply_proposal → apply one
-<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>badgey_dismiss → close instance, resolve thread
+<div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>badgey_exec -&gt; badgey_id (instance created, thread opened)
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>badgey_resume / badgey_ask -&gt; turns (evidence walk, proposals emitted)
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>badgey_proposals_list -&gt; read pending proposals
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>badgey_apply_proposal -&gt; apply one
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>badgey_dismiss -&gt; close instance, resolve thread
 </code></pre></div>
 <h2 id="tools">Tools<a class="headerlink" href="#tools" title="Permanent link">&para;</a></h2>
 <h3 id="starting-and-resuming">Starting and resuming<a class="headerlink" href="#starting-and-resuming" title="Permanent link">&para;</a></h3>
-<p><strong><code>badgey_exec</code></strong> — Start a new Badgey instance for a project scope.
+<p><strong><code>badgey_exec</code></strong> - Start a new Badgey instance for a project scope.
 Returns <code>badgey_id</code>, provider session, task, and thread-of-record IDs.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>badgey_exec(project_dir=&quot;/repo/x&quot;, brief=&quot;help me understand the graph edge schema&quot;)
 </code></pre></div>
-<p><strong><code>badgey_resume</code></strong> — Send a follow-up turn to an existing instance.
+<p><strong><code>badgey_resume</code></strong> - Send a follow-up turn to an existing instance.
 Keeps thread-of-record context. Use for all follow-ups; never call
 <code>badgey_exec</code> again for continuity.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a>badgey_resume(badgey_id=&quot;bg-0123abcd-4567ef89&quot;, prompt=&quot;trace the origin of this decision&quot;)
 </code></pre></div>
-<p><strong><code>badgey_ask</code></strong> — Question-shaped alias for <code>badgey_resume</code>. Same
+<p><strong><code>badgey_ask</code></strong> - Question-shaped alias for <code>badgey_resume</code>. Same
 semantics; <code>question</code> field instead of <code>prompt</code>.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a>badgey_ask(badgey_id=&quot;bg-0123abcd-4567ef89&quot;, question=&quot;what should I inspect next?&quot;)
 </code></pre></div>
 <h3 id="inspection">Inspection<a class="headerlink" href="#inspection" title="Permanent link">&para;</a></h3>
-<p><strong><code>badgey_status</code></strong> — Inspect one instance: queue status, proposals,
+<p><strong><code>badgey_status</code></strong> - Inspect one instance: queue status, proposals,
 provider/session/thread bindings. Without <code>badgey_id</code>, lists active
 instances.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>badgey_status(badgey_id=&quot;bg-0123abcd-4567ef89&quot;)
 </code></pre></div>
-<p><strong><code>badgey_list</code></strong> — List instances and their thread/session bindings.
+<p><strong><code>badgey_list</code></strong> - List instances and their thread/session bindings.
 Pass <code>include_dismissed=true</code> for audit view.</p>
 <h3 id="scout-mode">Scout mode<a class="headerlink" href="#scout-mode" title="Permanent link">&para;</a></h3>
-<p><strong><code>badgey_scout</code></strong> — Ask Badgey to decompose one question into focused
+<p><strong><code>badgey_scout</code></strong> - Ask Badgey to decompose one question into focused
 sub-charters and fan them out. The wrapper dispatches emitted scout
 actions without exposing <code>bro_exec</code> to the Badgey provider session.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>badgey_scout(badgey_id=&quot;bg-0123abcd-4567ef89&quot;, charter=&quot;compare these two graph paths&quot;)
 </code></pre></div>
-<p><strong><code>badgey_collect</code></strong> — Read scout/sub-bro events for an instance: see
+<p><strong><code>badgey_collect</code></strong> - Read scout/sub-bro events for an instance: see
 whether scout work is still walking or has produced dispatch records.</p>
 <h3 id="proposals">Proposals<a class="headerlink" href="#proposals" title="Permanent link">&para;</a></h3>
-<p><strong><code>badgey_proposals_list</code></strong> — Read full proposal records (id, kind,
+<p><strong><code>badgey_proposals_list</code></strong> - Read full proposal records (id, kind,
 state, draft fields, created_at, events). Pass <code>since</code> to scope to a
 specific synthesis turn's output.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>badgey_proposals_list(
@@ -1463,24 +1672,24 @@ specific synthesis turn's output.</p>
 <a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>  only_pending=true
 <a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>)
 </code></pre></div>
-<p><strong><code>badgey_apply_proposal</code></strong> — One-shot apply: state-machine transition
-<code>Pending/Failed → Applying</code>, kind-specific dispatch, record
-<code>applied_task_id</code>, transition <code>Applying → Applied | Failed</code>.</p>
+<p><strong><code>badgey_apply_proposal</code></strong> - One-shot apply: state-machine transition
+<code>Pending/Failed -&gt; Applying</code>, kind-specific dispatch, record
+<code>applied_task_id</code>, transition <code>Applying -&gt; Applied | Failed</code>.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>badgey_apply_proposal(badgey_id=&quot;bg-deadbeef-cafef00d&quot;, proposal_id=&quot;P-3&quot;)
 </code></pre></div>
 <p>For the Slack-reaction flow, use the split pair instead (see below).</p>
-<p><strong><code>badgey_dismiss</code></strong> — Close an instance: drain queued turns, write a
+<p><strong><code>badgey_dismiss</code></strong> - Close an instance: drain queued turns, write a
 dismiss event, resolve the thread of record. New resumes after dismissal
 fail with <code>instance_dismissed</code>.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>badgey_dismiss(badgey_id=&quot;bg-0123abcd-4567ef89&quot;, reason=&quot;work complete&quot;)
 </code></pre></div>
 <h3 id="triage-helpers">Triage helpers<a class="headerlink" href="#triage-helpers" title="Permanent link">&para;</a></h3>
-<p><strong><code>badgey_triage_inbox</code></strong> — Produce a proposal-sheet for stale/open
+<p><strong><code>badgey_triage_inbox</code></strong> - Produce a proposal-sheet for stale/open
 work in a scope. Morning-brief starting point; concrete actions still
 go through the proposal gate.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>badgey_triage_inbox(scope=&quot;/repo/x&quot;)
 </code></pre></div>
-<p><strong><code>badgey_close_loops</code></strong> — Classify dispatched tasks without done
+<p><strong><code>badgey_close_loops</code></strong> - Classify dispatched tasks without done
 notes. Reports suspected completions, crashes, or stalls; does not
 write <code>kind=done</code> on behalf of executors.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a>badgey_close_loops(window_days=14, project_dir=&quot;/repo/x&quot;)
@@ -1543,12 +1752,12 @@ pipeline:</p>
 - In-thread reply → <code>proposal-clarify</code> signal → <code>bro_resume</code> on the
   originating authoring session</p>
 <h3 id="slack-specific-tools">Slack-specific tools<a class="headerlink" href="#slack-specific-tools" title="Permanent link">&para;</a></h3>
-<p><strong><code>badgey_ensure_for_channel</code></strong> — Get-or-create the system Badgey
+<p><strong><code>badgey_ensure_for_channel</code></strong> - Get-or-create the system Badgey
 instance for a channel binding. Idempotent; returns <code>created=false</code> for
 an already-active instance.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a>badgey_ensure_for_channel(team_id=&quot;T0123ABCD&quot;, channel_id=&quot;C0123XYZ&quot;)
 </code></pre></div>
-<p><strong><code>bro_slack_bind</code></strong> — Bind a Slack channel to a project. Required
+<p><strong><code>bro_slack_bind</code></strong> - Bind a Slack channel to a project. Required
 before <code>badgey_ensure_for_channel</code> works; <code>bro_slack_bind(action=list)</code>
 to inspect.</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>bro_slack_bind(
@@ -1559,7 +1768,7 @@ to inspect.</p>
 <a id="__codelineno-13-6" name="__codelineno-13-6" href="#__codelineno-13-6"></a>  project=&quot;/home/me/repos/my-project&quot;
 <a id="__codelineno-13-7" name="__codelineno-13-7" href="#__codelineno-13-7"></a>)
 </code></pre></div>
-<p><strong><code>bro_slack_link_record</code></strong> / <strong><code>bro_slack_link_lookup</code></strong> — Record and
+<p><strong><code>bro_slack_link_record</code></strong> / <strong><code>bro_slack_link_lookup</code></strong> - Record and
 resolve the mapping between a posted Slack message timestamp and its
 <code>(BadgeyId, proposal_id)</code> pair. Used by the apply/refine arcs.</p>
 <h3 id="split-apply-path-for-slack-workflows">Split apply path (for Slack workflows)<a class="headerlink" href="#split-apply-path-for-slack-workflows" title="Permanent link">&para;</a></h3>
@@ -1567,12 +1776,12 @@ resolve the mapping between a posted Slack message timestamp and its
 when you use the split pair rather than the one-shot <code>badgey_apply_proposal</code>:</p>
 <ol>
 <li>
-<p><strong><code>badgey_proposal_begin_apply</code></strong> — Transition <code>Pending|Failed → Applying</code>,
+<p><strong><code>badgey_proposal_begin_apply</code></strong> - Transition <code>Pending|Failed → Applying</code>,
    return dispatch parameters without spawning. The workflow caller
    dispatches via an actor node or <code>bbox_artifact_install</code> mcp_call.</p>
 </li>
 <li>
-<p><strong><code>badgey_proposal_complete_apply</code></strong> — Given the dispatched work's
+<p><strong><code>badgey_proposal_complete_apply</code></strong> - Given the dispatched work's
    outcome, transition <code>Applying → Applied | Failed</code> and write the audit
    decision.</p>
 </li>
@@ -1580,18 +1789,18 @@ when you use the split pair rather than the one-shot <code>badgey_apply_proposal
 <p>Skip the complete call entirely on <code>already_applied</code> / <code>rejected</code>
 short-circuit paths.</p>
 <h2 id="install">Install<a class="headerlink" href="#install" title="Permanent link">&para;</a></h2>
-<p>Install the example artifacts from <code>examples/badgey/</code>:</p>
+<p>Install the Badgey system-default artifacts from <code>system-defaults/badgey/</code>:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a># Workflows
-<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;examples/badgey/workflows/badgey-scout-arc.json&quot;)
-<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;examples/badgey/workflows/badgey-slack-emit-proposal-arc.json&quot;)
-<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;examples/badgey/workflows/badgey-triage-channel-arc.json&quot;)
-<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;examples/badgey/workflows/badgey-triage-fanout-arc.json&quot;)
+<a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;system-defaults/badgey/workflows/badgey-scout-arc.json&quot;)
+<a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;system-defaults/badgey/workflows/badgey-slack-emit-proposal-arc.json&quot;)
+<a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;system-defaults/badgey/workflows/badgey-triage-channel-arc.json&quot;)
+<a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a>bbox_artifact_install(kind=&quot;workflow&quot;, source=&quot;system-defaults/badgey/workflows/badgey-triage-fanout-arc.json&quot;)
 <a id="__codelineno-14-6" name="__codelineno-14-6" href="#__codelineno-14-6"></a>
 <a id="__codelineno-14-7" name="__codelineno-14-7" href="#__codelineno-14-7"></a># Routing packet
-<a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>bbox_artifact_install(kind=&quot;packet&quot;, source=&quot;examples/badgey/packets/badgey-cron-routing.json&quot;)
+<a id="__codelineno-14-8" name="__codelineno-14-8" href="#__codelineno-14-8"></a>bbox_artifact_install(kind=&quot;packet&quot;, source=&quot;system-defaults/badgey/packets/badgey-cron-routing.json&quot;)
 <a id="__codelineno-14-9" name="__codelineno-14-9" href="#__codelineno-14-9"></a>
-<a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a># Cron (no artifact catalog for crons — install directly)
-<a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a>bro_cron_install(spec=&lt;contents of examples/badgey/crons/badgey-triage-daily.json&gt;)
+<a id="__codelineno-14-10" name="__codelineno-14-10" href="#__codelineno-14-10"></a># Cron (no artifact catalog for crons - install directly)
+<a id="__codelineno-14-11" name="__codelineno-14-11" href="#__codelineno-14-11"></a>bro_cron_install(spec=&lt;contents of system-defaults/badgey/crons/badgey-triage-daily.json&gt;)
 </code></pre></div>
 <p>Then bind your channels:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a>bbox_project_register(path=&quot;/home/me/repos/my-project&quot;)
@@ -1607,14 +1816,14 @@ short-circuit paths.</p>
 in daemon environment.</p>
 <h2 id="anti-patterns">Anti-patterns<a class="headerlink" href="#anti-patterns" title="Permanent link">&para;</a></h2>
 <ul>
-<li>Do not use for code generation, edits, refactors, or bug fixes —
+<li>Do not use for code generation, edits, refactors, or bug fixes -
   Badgey investigates and proposes, not implements.</li>
 <li>Do not use for direct <code>bbox_*</code> primitive lookups the caller can run
   themselves.</li>
-<li>Do not auto-apply proposals without reading them — the apply path
+<li>Do not auto-apply proposals without reading them - the apply path
   requires explicit approval, deliberate or via the Slack-reaction hook.</li>
 <li>Do not use as a write-through proxy for <code>bbox_remember</code> /
-  <code>bbox_decide</code> / <code>bbox_learn</code> — those are direct surfaces; Badgey
+  <code>bbox_decide</code> / <code>bbox_learn</code> - those are direct surfaces; Badgey
   synthesizes evidence-grounded proposals.</li>
 </ul>
 
