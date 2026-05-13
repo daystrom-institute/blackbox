@@ -110,6 +110,10 @@ pub struct ManifestStatus {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    pub active_materialized_bytes: u64,
+    pub active_materialized_files: u64,
+    pub inactive_materialized_bytes: u64,
+    pub inactive_materialized_files: u64,
 }
 
 pub fn scan_storage_health(
@@ -157,14 +161,37 @@ pub fn scan_storage_health(
 }
 
 fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
+    let mat_dir = crate::manifest::materialized_dir(edges_dir);
+    let mut inactive_bytes: u64 = 0;
+    let mut inactive_files: u64 = 0;
+    if mat_dir.is_dir() {
+        let active_jsonl_prefixes = collect_active_jsonl_prefixes(edges_dir);
+        if let Ok(entries) = fs::read_dir(&mat_dir) {
+            for entry in entries.filter_map(Result::ok) {
+                count_materialized_tree(
+                    &entry.path(),
+                    &active_jsonl_prefixes,
+                    &mut inactive_bytes,
+                    &mut inactive_files,
+                );
+            }
+        }
+    }
+
     match crate::manifest::try_load_manifest_index(edges_dir) {
         Ok(idx) => {
             let workspace_count = idx.workspaces.len();
+            let active_paths = idx.active_materialized_paths(edges_dir);
+            let (active_bytes, active_files) = count_paths_bytes(&active_paths);
             Some(ManifestStatus {
                 index_exists: true,
                 workspace_count,
                 status: "valid".to_string(),
                 fallback_reason: None,
+                active_materialized_bytes: active_bytes,
+                active_materialized_files: active_files,
+                inactive_materialized_bytes: inactive_bytes,
+                inactive_materialized_files: inactive_files,
             })
         }
         Err(reason) => match reason {
@@ -174,20 +201,76 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
                 workspace_count: 0,
                 status: "corrupt".to_string(),
                 fallback_reason: Some(error),
+                active_materialized_bytes: 0,
+                active_materialized_files: 0,
+                inactive_materialized_bytes: inactive_bytes,
+                inactive_materialized_files: inactive_files,
             }),
             crate::manifest::ManifestFallbackReason::Stale {
                 missing_manifests,
-                missing_snapshots,
+                missing_paths,
             } => Some(ManifestStatus {
                 index_exists: true,
                 workspace_count: 0,
                 status: "stale".to_string(),
                 fallback_reason: Some(format!(
-                    "missing manifests: {:?}, missing snapshots: {:?}",
-                    missing_manifests, missing_snapshots
+                    "missing manifests: {:?}, missing paths: {:?}",
+                    missing_manifests, missing_paths
                 )),
+                active_materialized_bytes: 0,
+                active_materialized_files: 0,
+                inactive_materialized_bytes: inactive_bytes,
+                inactive_materialized_files: inactive_files,
             }),
         },
+    }
+}
+
+fn collect_active_jsonl_prefixes(edges_dir: &Path) -> Vec<String> {
+    match crate::manifest::try_load_manifest_index(edges_dir) {
+        Ok(idx) => idx
+            .active_materialized_paths(edges_dir)
+            .into_iter()
+            .filter_map(|p| p.to_str().map(String::from))
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn count_paths_bytes(paths: &[PathBuf]) -> (u64, u64) {
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for p in paths {
+        if let Ok(meta) = fs::metadata(p) {
+            bytes += meta.len();
+            files += 1;
+        }
+    }
+    (bytes, files)
+}
+
+fn count_materialized_tree(
+    dir: &Path,
+    active_prefixes: &[String],
+    inactive_bytes: &mut u64,
+    inactive_files: &mut u64,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            count_materialized_tree(&path, active_prefixes, inactive_bytes, inactive_files);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            let path_str = path.to_str().unwrap_or("");
+            if !active_prefixes.iter().any(|prefix| path_str == prefix) {
+                if let Ok(meta) = fs::metadata(&path) {
+                    *inactive_bytes += meta.len();
+                    *inactive_files += 1;
+                }
+            }
+        }
     }
 }
 

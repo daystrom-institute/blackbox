@@ -8,6 +8,16 @@
 //   snapshot/branch mechanics. Health warnings for excessive observed bytes
 //   per project should be added in a follow-up. Cap, archive, and prune
 //   options remain available for future policy without schema changes.
+//
+// P1 observed backfill consideration:
+//   `bbox_project_register` post-step will retroactively walk transcripts
+//   and emit EDITED_FILE/READ_FILE/RAN_BASH edges for the newly registered
+//   project (see design/proposed/agentic-corpus-followups.md §P1). This
+//   will grow observed history for every project that gets registered after
+//   initial transcript indexing. Storage health must surface observed bytes
+//   per project before that lands so operators can see growth. The observed
+//   byte accounting in storage_health.rs (tool_bytes in StorageHealthTotals)
+//   is the foundation; per-project breakdown is a follow-up.
 // ---------------------------------------------------------------------------
 
 use std::fs;
@@ -168,7 +178,7 @@ impl ManifestIndex {
 
     pub fn active_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
-        for (_project_id, entry) in &self.workspaces {
+        for (project_id, entry) in &self.workspaces {
             if let Some(ref snapshot) = entry.active_snapshot {
                 let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
                 if snapshot_dir.is_dir() {
@@ -187,15 +197,14 @@ impl ManifestIndex {
                     append_jsonl_files(&repo_dir, &mut paths);
                 }
             }
-            let manifest_dir = materialized_dir(edges_dir)
-                .join("workspace")
-                .join(_project_id);
-            let managed_dir = edges_dir
-                .join("derived")
-                .join("project")
-                .join(format!("{}.jsonl", _project_id));
-            if managed_dir.exists() {
-                paths.push(managed_dir);
+            if entry.active_snapshot.is_none() {
+                let managed_dir = edges_dir
+                    .join("derived")
+                    .join("project")
+                    .join(format!("{}.jsonl", project_id));
+                if managed_dir.exists() {
+                    paths.push(managed_dir);
+                }
             }
         }
         paths
@@ -203,7 +212,7 @@ impl ManifestIndex {
 
     pub fn validate(&self, edges_dir: &Path) -> ManifestValidation {
         let mut missing_manifests = Vec::new();
-        let mut missing_snapshots = Vec::new();
+        let mut missing_paths = Vec::new();
         for (project_id, entry) in &self.workspaces {
             let manifest_path = materialized_dir(edges_dir).join(&entry.manifest);
             if !manifest_path.exists() {
@@ -213,16 +222,28 @@ impl ManifestIndex {
             if let Some(ref snapshot) = entry.active_snapshot {
                 let snap_dir = materialized_dir(edges_dir).join(snapshot);
                 if !snap_dir.is_dir() {
-                    missing_snapshots.push(snapshot.clone());
+                    missing_paths.push(snapshot.clone());
+                }
+            }
+            if let Some(ref overlay) = entry.dirty_overlay {
+                let overlay_dir = materialized_dir(edges_dir).join(overlay);
+                if !overlay_dir.is_dir() {
+                    missing_paths.push(overlay.clone());
+                }
+            }
+            if let Some(ref repo_mat) = entry.repo_materialization {
+                let repo_dir = materialized_dir(edges_dir).join(repo_mat);
+                if !repo_dir.is_dir() {
+                    missing_paths.push(repo_mat.clone());
                 }
             }
         }
-        if missing_manifests.is_empty() && missing_snapshots.is_empty() {
+        if missing_manifests.is_empty() && missing_paths.is_empty() {
             ManifestValidation::Valid
         } else {
             ManifestValidation::Invalid {
                 missing_manifests,
-                missing_snapshots,
+                missing_paths,
             }
         }
     }
@@ -253,7 +274,7 @@ pub enum ManifestFallbackReason {
     },
     Stale {
         missing_manifests: Vec<String>,
-        missing_snapshots: Vec<String>,
+        missing_paths: Vec<String>,
     },
 }
 
@@ -266,7 +287,7 @@ pub enum ManifestValidation {
     Valid,
     Invalid {
         missing_manifests: Vec<String>,
-        missing_snapshots: Vec<String>,
+        missing_paths: Vec<String>,
     },
 }
 
@@ -284,10 +305,10 @@ pub fn try_load_manifest_index(edges_dir: &Path) -> Result<ManifestIndex, Manife
             ManifestValidation::Valid => Ok(idx),
             ManifestValidation::Invalid {
                 missing_manifests,
-                missing_snapshots,
+                missing_paths,
             } => Err(ManifestFallbackReason::Stale {
                 missing_manifests,
-                missing_snapshots,
+                missing_paths,
             }),
         },
         Err(e) => Err(ManifestFallbackReason::Corrupt {
@@ -486,6 +507,49 @@ mod tests {
                 .iter()
                 .any(|p| p.to_str().unwrap().contains("head-old-branch")),
             "inactive snapshot must NOT be in paths"
+        );
+    }
+
+    #[test]
+    fn active_paths_excludes_managed_sidecar_when_snapshot_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let managed_dir = edges_dir.join("derived").join("project");
+        fs::create_dir_all(&managed_dir).unwrap();
+        fs::write(managed_dir.join("p1.jsonl"), b"{}").unwrap();
+
+        let snap_dir = materialized_dir(edges_dir)
+            .join("workspace")
+            .join("p1")
+            .join("snapshots")
+            .join("head-abc");
+        fs::create_dir_all(&snap_dir).unwrap();
+        fs::write(snap_dir.join("project.jsonl"), b"{}").unwrap();
+
+        let mut idx = ManifestIndex::new();
+        idx.upsert_workspace(
+            "p1",
+            WorkspaceIndexEntry {
+                manifest: "workspace/p1/manifest.json".into(),
+                active_snapshot: Some("workspace/p1/snapshots/head-abc".into()),
+                dirty_overlay: None,
+                repo_materialization: None,
+            },
+        );
+
+        let paths = idx.active_materialized_paths(edges_dir);
+        assert!(
+            paths
+                .iter()
+                .any(|p| p.to_str().unwrap().contains("head-abc")),
+            "active snapshot must be in paths"
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.to_str().unwrap().contains("derived/project/p1.jsonl")),
+            "managed sidecar must NOT be in paths when snapshot exists"
         );
     }
 

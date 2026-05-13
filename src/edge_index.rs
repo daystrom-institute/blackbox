@@ -634,25 +634,6 @@ impl EdgeIndex {
                 sidecar_file_stem(&path).is_some_and(|stem| projects_with_managed.contains(stem));
             self.project_sidecar_edges_file(&path, seen, skip_derived);
         }
-        for namespace_dir in fs::read_dir(&managed_derived_dir)
-            .ok()
-            .into_iter()
-            .flatten()
-            .filter_map(Result::ok)
-            .filter(|e| e.path().is_dir())
-        {
-            let ns_path = namespace_dir.path();
-            let ns_name = ns_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if ns_name == "project" {
-                continue;
-            }
-            self.project_sidecar_edges_in_dir(
-                &ns_path,
-                registered_project_ids,
-                seen,
-                &HashSet::new(),
-            );
-        }
     }
 }
 
@@ -2681,5 +2662,152 @@ mod tests {
 
         let after = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
         assert_eq!(after.len(), 1, "re-merge with same edge must not duplicate");
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 3: EdgeIndex rebuild manifest-mode tests
+    // -----------------------------------------------------------------------
+
+    fn write_jsonl(path: &Path, lines: &[&str]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut content = lines.join("\n");
+        if !content.is_empty() {
+            content.push('\n');
+        }
+        fs::write(path, content).unwrap();
+    }
+
+    fn make_explicit_edge_line(source: &str, kind: &str, target: &str) -> String {
+        serde_json::to_string(&Edge {
+            source: EntityRef::Knowledge { id: source.into() },
+            kind: kind.into(),
+            target: EntityRef::Knowledge { id: target.into() },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        })
+        .unwrap()
+    }
+
+    fn make_derived_edge_line(source: &str, kind: &str, target: &str) -> String {
+        serde_json::to_string(&Edge {
+            source: EntityRef::Knowledge { id: source.into() },
+            kind: kind.into(),
+            target: EntityRef::Knowledge { id: target.into() },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn manifest_mode_active_snapshot_loads_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let active_edge = make_derived_edge_line("k_active", "DESCRIBES", "k_target");
+        let snap_dir = crate::manifest::materialized_dir(edges_dir)
+            .join("workspace")
+            .join("p1")
+            .join("snapshots")
+            .join("head-abc");
+        write_jsonl(&snap_dir.join("project.jsonl"), &[&active_edge]);
+
+        let inactive_edge = make_derived_edge_line("k_stale", "DESCRIBES", "k_target");
+        let inactive_dir = crate::manifest::materialized_dir(edges_dir)
+            .join("workspace")
+            .join("p1")
+            .join("snapshots")
+            .join("head-old");
+        write_jsonl(&inactive_dir.join("project.jsonl"), &[&inactive_edge]);
+
+        let mut idx = crate::manifest::ManifestIndex::new();
+        idx.upsert_workspace(
+            "p1",
+            crate::manifest::WorkspaceIndexEntry {
+                manifest: "workspace/p1/manifest.json".into(),
+                active_snapshot: Some("workspace/p1/snapshots/head-abc".into()),
+                dirty_overlay: None,
+                repo_materialization: None,
+            },
+        );
+        idx.write_atomic(edges_dir).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        let active_paths = idx.active_materialized_paths(edges_dir);
+        index.load_manifest_active_paths(&active_paths, &mut seen);
+
+        let active_source = EntityRef::Knowledge {
+            id: "k_active".into(),
+        };
+        let stale_source = EntityRef::Knowledge {
+            id: "k_stale".into(),
+        };
+        assert_eq!(
+            index.forward_edges(&active_source).len(),
+            1,
+            "active snapshot edge must load"
+        );
+        assert_eq!(
+            index.forward_edges(&stale_source).len(),
+            0,
+            "inactive snapshot edge must NOT load"
+        );
+    }
+
+    #[test]
+    fn manifest_mode_corrupt_index_falls_back_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let mat_dir = crate::manifest::materialized_dir(edges_dir);
+        fs::create_dir_all(&mat_dir).unwrap();
+        fs::write(
+            crate::manifest::manifest_index_path(edges_dir),
+            b"not json{{{",
+        )
+        .unwrap();
+
+        let legacy_edge = make_explicit_edge_line("k_legacy", "SUPERSEDES", "k_old");
+        write_jsonl(&edges_dir.join("p1.jsonl"), &[&legacy_edge]);
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(edges_dir, None, &mut seen);
+
+        let source = EntityRef::Knowledge {
+            id: "k_legacy".into(),
+        };
+        assert_eq!(
+            index.forward_edges(&source).len(),
+            1,
+            "corrupt manifest must fall back to legacy loading"
+        );
+    }
+
+    #[test]
+    fn manifest_mode_missing_is_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let explicit_line = make_explicit_edge_line("k_explicit", "DESCRIBES", "k_target");
+        write_jsonl(&edges_dir.join("p1.jsonl"), &[&explicit_line]);
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.project_sidecar_edges(edges_dir, None, &mut seen);
+
+        let source = EntityRef::Knowledge {
+            id: "k_explicit".into(),
+        };
+        assert_eq!(
+            index.forward_edges(&source).len(),
+            1,
+            "missing manifest must fall back to legacy loading"
+        );
     }
 }
