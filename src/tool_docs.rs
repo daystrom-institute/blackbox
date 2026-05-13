@@ -579,6 +579,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_artifact_supersede(kind="workflow", name="auto-digest-arc", superseded_by="auto-digest-arc-v2")"#,
         ),
     },
+    ToolDoc {
+        name: "bbox_artifact_remove",
+        category: ToolCategory::Artifacts,
+        summary: "Hard-remove one installed artifact.",
+        when_to_use: "Use for obsolete catalog artifacts that should be pruned, not superseded. dry_run=true lists paths; dry_run=false requires confirm=true.",
+        example: None,
+    },
     // ── Rule-packets ─────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_compile",

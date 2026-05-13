@@ -767,7 +767,9 @@ impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter
 // Bbox tools (search, knowledge, threads)
 // ---------------------------------------------------------------------------
 
-use artifacts::{ArtifactInstallParams, ArtifactListParams, ArtifactSupersedeParams};
+use artifacts::{
+    ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
+};
 use embed::ReembedParams;
 use inbox::InboxParams;
 use index::{
@@ -2008,6 +2010,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/admin/artifact/supersede",
             axum::routing::post(admin_artifact_supersede),
+        )
+        .route(
+            "/admin/artifact/remove",
+            axum::routing::post(admin_artifact_remove),
         )
         .route(
             "/admin/webhook/install",

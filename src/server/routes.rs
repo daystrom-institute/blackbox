@@ -1682,6 +1682,52 @@ pub(crate) async fn admin_artifact_supersede(
     }
 }
 
+pub(crate) async fn admin_artifact_remove(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<ArtifactRemoveParams>,
+) -> impl axum::response::IntoResponse {
+    use axum::response::IntoResponse;
+    if !req.dry_run && !req.confirm {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            "artifact remove: hard artifact removal requires confirm=true".to_string(),
+        )
+            .into_response();
+    }
+    if !req.dry_run {
+        if let Err(e) = state
+            .artifacts
+            .read()
+            .remove_hard(req.kind, &req.name, true, true)
+        {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("artifact remove: {e:#}"),
+            )
+                .into_response();
+        }
+        if let Err(e) = deactivate_artifact(&state, req.kind, &req.name) {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                format!("artifact deactivate: {e:#}"),
+            )
+                .into_response();
+        }
+    }
+    match state
+        .artifacts
+        .write()
+        .remove_hard(req.kind, &req.name, req.dry_run, req.confirm)
+    {
+        Ok(result) => axum::Json(json!({"status": "removed", "artifact": result})).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("artifact remove: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct AdminWebhookInstallReq {
     spec: Value,

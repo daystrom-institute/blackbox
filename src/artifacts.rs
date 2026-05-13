@@ -65,6 +65,18 @@ pub struct ArtifactSupersedeParams {
     pub superseded_by: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArtifactRemoveParams {
+    pub kind: ArtifactKind,
+    pub name: String,
+    /// Show the exact catalog paths that would be removed without deleting.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    /// Required when `dry_run=false`.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactMetadata {
     pub kind: ArtifactKind,
@@ -113,6 +125,15 @@ pub struct DiscoveredArtifact {
     pub kind: ArtifactKind,
     pub path: String,
     pub local: bool,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ArtifactRemoveResult {
+    pub kind: ArtifactKind,
+    pub name: String,
+    pub dry_run: bool,
+    pub removed: bool,
+    pub paths: Vec<String>,
 }
 
 /// Discriminates between a globally-stored artifact and one scoped to a
@@ -456,6 +477,62 @@ impl ArtifactCatalog {
         self.load_metadata(kind, superseded_by)
             .with_context(|| format!("superseding artifact `{superseded_by}` must exist"))?;
         self.mark_superseded(kind, name, superseded_by)
+    }
+
+    pub fn remove_hard(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        dry_run: bool,
+        confirm: bool,
+    ) -> Result<ArtifactRemoveResult> {
+        validate_artifact_name(name)?;
+        if !dry_run && !confirm {
+            bail!("hard artifact removal requires confirm=true");
+        }
+
+        let meta_path = self.metadata_path(kind, name)?;
+        crate::json_store::with_store_lock(&meta_path, || {
+            self.remove_hard_locked(kind, name, dry_run)
+        })
+    }
+
+    fn remove_hard_locked(
+        &self,
+        kind: ArtifactKind,
+        name: &str,
+        dry_run: bool,
+    ) -> Result<ArtifactRemoveResult> {
+        let artifact_path = self.artifact_path(kind, name)?;
+        let metadata_dir = self.root.join(kind.as_str()).join(name_dir_path(name)?);
+        if !artifact_path.exists() && !metadata_dir.exists() {
+            bail!("artifact `{}` `{}` not found", kind.as_str(), name);
+        }
+
+        let paths = vec![
+            artifact_path.to_string_lossy().into_owned(),
+            metadata_dir.to_string_lossy().into_owned(),
+        ];
+
+        if dry_run {
+            return Ok(ArtifactRemoveResult {
+                kind,
+                name: name.to_string(),
+                dry_run,
+                removed: false,
+                paths,
+            });
+        }
+
+        remove_file_if_exists(&artifact_path)?;
+        remove_dir_if_exists(&metadata_dir)?;
+        Ok(ArtifactRemoveResult {
+            kind,
+            name: name.to_string(),
+            dry_run,
+            removed: true,
+            paths,
+        })
     }
 
     fn mark_superseded(
@@ -1105,6 +1182,26 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<()> {
 
 fn default_active() -> bool {
     true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn remove_file_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
 }
 
 /// Compute a stable SHA-256 hash of a JSON value with sorted object keys.
@@ -2053,5 +2150,106 @@ mod tests {
             .mark_removed_by_source(scope, ArtifactKind::Workflow, &source_path)
             .unwrap();
         assert!(second_remove.is_none(), "second remove should be no-op");
+    }
+
+    #[test]
+    fn hard_remove_dry_run_lists_exact_paths_without_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let artifact = serde_json::json!({
+            "name": "obsolete-agent",
+            "version": 1,
+            "description": "old",
+            "brofile": "sonnet-standard"
+        });
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "agent.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let result = catalog
+            .remove_hard(ArtifactKind::Agent, "obsolete-agent", true, false)
+            .unwrap();
+
+        assert!(!result.removed);
+        assert!(result.dry_run);
+        assert_eq!(result.paths.len(), 2);
+        assert!(
+            result
+                .paths
+                .iter()
+                .any(|p| p.ends_with("agent/obsolete-agent.json"))
+        );
+        assert!(
+            result
+                .paths
+                .iter()
+                .any(|p| p.ends_with("agent/obsolete-agent"))
+        );
+        assert!(
+            catalog
+                .load_artifact_value(ArtifactKind::Agent, "obsolete-agent")
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Agent, "obsolete-agent")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn hard_remove_requires_confirmation_and_prunes_catalog_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = ArtifactCatalog::open(dir.path().join("artifacts")).unwrap();
+        let artifact = serde_json::json!({
+            "name": "obsolete-agent",
+            "version": 1,
+            "description": "old",
+            "brofile": "sonnet-standard"
+        });
+        catalog
+            .install_value(
+                ArtifactKind::Agent,
+                "agent.json".into(),
+                &artifact,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+
+        let unconfirmed = catalog.remove_hard(ArtifactKind::Agent, "obsolete-agent", false, false);
+        assert!(unconfirmed.is_err());
+
+        let result = catalog
+            .remove_hard(ArtifactKind::Agent, "obsolete-agent", false, true)
+            .unwrap();
+
+        assert!(result.removed);
+        assert!(!result.dry_run);
+        assert!(
+            catalog
+                .load_artifact_value(ArtifactKind::Agent, "obsolete-agent")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            catalog
+                .metadata_for(ArtifactKind::Agent, "obsolete-agent")
+                .unwrap()
+                .is_none()
+        );
+        for path in result.paths {
+            assert!(!std::path::Path::new(&path).exists());
+        }
     }
 }

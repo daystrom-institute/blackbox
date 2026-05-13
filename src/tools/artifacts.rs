@@ -57,4 +57,32 @@ impl BlackboxServer {
             Ok(serde_json::to_string_pretty(&meta)?)
         })
     }
+
+    #[tool(
+        name = "bbox_artifact_remove",
+        description = "Hard-remove one installed artifact."
+    )]
+    pub(crate) fn bbox_artifact_remove(
+        &self,
+        Parameters(p): Parameters<ArtifactRemoveParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_artifact_remove", || {
+            if !p.dry_run && !p.confirm {
+                anyhow::bail!("hard artifact removal requires confirm=true");
+            }
+            if !p.dry_run {
+                self.state
+                    .artifacts
+                    .read()
+                    .remove_hard(p.kind, &p.name, true, true)?;
+                deactivate_artifact(&self.state, p.kind, &p.name)?;
+            }
+            let result = self
+                .state
+                .artifacts
+                .write()
+                .remove_hard(p.kind, &p.name, p.dry_run, p.confirm)?;
+            Ok(serde_json::to_string_pretty(&result)?)
+        })
+    }
 }
