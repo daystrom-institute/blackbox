@@ -1569,7 +1569,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Tool reference sync failed: {e:#}"),
     }
 
-    let bbox_url = format!("http://{}:{}/mcp", cfg.daemon.bind, cfg.daemon.port);
+    let bbox_url = dispatch_mcp_url(&cfg.daemon.bind, cfg.daemon.port);
     let bbox_mcp_name = cfg.daemon.mcp_name.clone();
     // Export for provider arg-builders so they can inject `--mcp-config`
     // etc. at dispatch time. Provider-owned MCP config files are never
@@ -2195,4 +2195,16 @@ async fn main() -> anyhow::Result<()> {
     }
     tracing::info!("blackboxd shut down");
     Ok(())
+}
+
+fn dispatch_mcp_url(bind_host: &str, port: u16) -> String {
+    let host = dispatch_mcp_host(bind_host);
+    format!("http://{host}:{port}/mcp")
+}
+
+fn dispatch_mcp_host(bind_host: &str) -> &str {
+    match bind_host.trim() {
+        "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
+        other => other,
+    }
 }
