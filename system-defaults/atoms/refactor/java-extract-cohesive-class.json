@@ -97,7 +97,7 @@
           },
           "propagate_class_annotations": {
             "type": "string",
-            "description": "Controls whether class-level annotations on the source propagate to the target. `auto` (default) propagates when moved bodies reference a known annotation-processor-generated identifier (v1: `@Slf4j` → `log`). `all` copies every annotation. `none` strips all. `list:@A,@B` is an operator-supplied allowlist."
+            "description": "Controls whether class-level annotations on the source propagate to the target. `auto` (default) propagates when moved bodies reference a known annotation-processor-generated identifier (current heuristic: `@Slf4j` → `log`). `all` copies every annotation. `none` strips all. `list:@A,@B` is an operator-supplied allowlist."
           },
           "apply": {
             "type": "boolean"

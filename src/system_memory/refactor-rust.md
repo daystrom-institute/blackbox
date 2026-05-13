@@ -219,7 +219,7 @@ Writable plan kinds:
   inside `use` declarations. Word-boundary checked (`mod_ax::moved` is
   left alone). `module_name` overrides the source simple-name default
   (file stem); `target_prelude` overrides the target simple-name
-  default. v1 limits: simple-name segment match only (FQN that skip the
+  default. Current limits: simple-name segment match only (FQN that skip the
   source module aren't matched), multi-import use trees not split,
   no alias awareness. Pair with `extract_rust_items_to_submodule` when
   you also need visibility bumps + a `use` decl in the source's parent.
@@ -263,7 +263,7 @@ Writable plan kinds:
   the source struct, optional `target` + `delegate_type` so the rewriter can
   consult the delegate struct for Copy-whitelist behavior. Sites it refuses
   to rewrite surface as `unrewriteable` / `overlapping` / `borrow_promotions`.
-- `migrate_rust_string_field_to_enum`: conservative G6 helper for one struct
+- `migrate_rust_string_field_to_enum`: conservative helper for one struct
   field at a time. `toml_entries.field_name` names the `String` field,
   `toml_entries.enum_name` or `module_name` names the generated enum, and
   `toml_entries.variants=[{"name":"Variant","rename":"wire", "aliases":[...]}]`
@@ -577,7 +577,7 @@ doc comments). Operator gets a 6k-line file split in one apply.
 
 One plan: `move_rust_items_with_callers`. Same shape as Case 1 but walks
 the whole project and rewrites every `<source_simple>::<item>` occurrence
-in any `.rs` file. v1 covers the simple-name path segment match; complex
+in any `.rs` file. Current support covers the simple-name path segment match; complex
 use-tree splitting and FQN paths that skip the source segment require
 manual cleanup after.
 

@@ -122,13 +122,13 @@ Design proposals are the entities. Attributes describe the proposal's observable
 
 ## Supersession
 
-Design packets naturally compose with bbox's supersession machinery. When a proposal evolves (v2 addresses v1's blockers), both can live in the store as separate entities, and the new proposal can carry a `supersedes` field. The criteria packet is the evaluation function; the proposals are data that supersedes over time.
+Design packets naturally compose with bbox's supersession machinery. When a proposal evolves to address earlier blockers, both can live in the store as separate entities, and the new proposal can carry a `supersedes` field. The criteria packet is the evaluation function; the proposals are data that supersedes over time.
 
 ## Why this works
 
 The flat-independent-rules model of rule-packets maps exactly to the "evaluate each proposal against each criterion independently" structure of design review. Each proposal gets a findings set; the findings aggregate to a verdict; verdicts sort the proposal set.
 
-What this DOESN'T handle well (phase-next):
+Current limitations:
 - Quantified claims across proposals ("every proposal must address concern X")
 - Pairwise comparison ("does proposal A dominate proposal B?")
 - Multi-attribute optimization ("best Pareto front")

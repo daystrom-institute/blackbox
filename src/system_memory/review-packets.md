@@ -76,14 +76,12 @@ Rule IDs should use one of these prefixes so the classification infers automatic
 2. Build a feature entity from the PR's observable properties.
 3. Apply in `mode="all"` — capture all findings + verdict.
 4. Dispatch peer bros in parallel to critique the *packet itself* ("what rules are missing? what's over-specific? wrong ordering?").
-5. Merge critiques into a v2 packet.
+5. Merge critiques into a revised packet.
 6. Iterate until bros stop finding structural issues.
-
-This is how phase 2 + 2.5 got built — see `thread-0b20e854` and `thread-cc7ff97d`.
 
 ## Anti-patterns
 
-- **Severity in the consequent string** (old v1/v2). Severity is first-class now via `classification`. The consequent is just display text.
+- **Severity in the consequent string.** Severity is first-class via `classification`. The consequent is just display text.
 - **First-match-wins for multi-finding review.** Use `mode="all"`. First-match is only right for classification tasks.
 - **Non-fallback pass catchall.** A `pass_all_clean` with `emit: "independent"` fires alongside real findings. Always use `emit: "fallback"` for catchalls.
 - **Phony review dimensions.** `flag_many_files > 5` is vibes-as-a-rule; churn ≠ risk. Drop rules that don't have mechanical backing.

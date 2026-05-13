@@ -34,7 +34,7 @@ hand-rolled boilerplate (POJO DOJO).
   primitive below. Optional params:
   - `declaring_class: String` — filter results to usages whose
     receiver expression plausibly resolves to a field of that type
-    on the enclosing class. v1 heuristic walks the enclosing class
+    on the enclosing class. The current heuristic walks the enclosing class
     for `private final <DeclaringClass> <field>;` declarations and
     keeps only call sites whose receiver identifier is one of those
     field names. Use this whenever the simple name isn't globally
@@ -98,23 +98,6 @@ tag set. Pull the relevant child for parameter detail; this parent stays a
 language-level map of plan kinds, the tool sequence, safety rules, and
 contextual atom signposts.
 
-## Atom gaps to crystallize next
-
-These plan kinds/workflows are real enough to deserve atoms if they recur:
-
-- `java-rename-symbol` over `rename_java_symbol`: project-wide syntax rename
-  with `java-find-usages`/public-API preflight, `file_rename_advisory` handling
-  for top-level type renames, and compile validation.
-- `java-extract-static-nested-class` over `extract_java_nested_classes`: the
-  static-inner counterpart to `java-promote-inner-class`, useful before
-  cohesive-class extraction when the cluster owns helper inner types.
-- `java-organize-imports` over `java_lsp_organize_imports`: cheap cleanup atom
-  for JDTLS/fallback import repair after manual edits, Lombok conversion, or
-  generated target files.
-- `java-extract-methods-light` over `extract_java_methods`: method-only move to
-  a new/existing class when the composite `extract_java_class` delegate/field
-  machinery is intentionally too heavy.
-
 ## `promote_java_inner_class` — for clusters with capture-aware inner classes
 
 When a cluster you want to extract includes a non-static inner class that
@@ -156,10 +139,10 @@ Refusal codes (the planner returns these instead of emitting broken Java):
 |------|------|
 | `static_inner_class_in_promote` | Inner is declared `static`. Use `extract_java_nested_classes` for a syntactic move; static inners have no outer captures. |
 | `inner_class_writes_outer_field` | Inner writes (assigns / increments) an outer field. `final` ctor params can't be reassigned. Refactor the write before promoting. |
-| `inner_class_calls_outer_method` | Inner calls a source-class method. v1 does not thread outer-method calls; refactor (inline or accept a `Runnable` callback) before promoting. |
+| `inner_class_calls_outer_method` | Inner calls a source-class method. The planner does not thread outer-method calls; refactor (inline or accept a `Runnable` callback) before promoting. |
 | `inner_class_multiple_ctors` | Inner has more than one constructor. Consolidate first. |
 | `inner_class_this_chain_ctor` | Inner's ctor delegates via `this(...)`. Inline the delegation first. |
-| `inner_class_referenced_as_type` | Inner is referenced outside `new <Inner>(...)` (variable decl, cast, method reference, `Outer.Inner` path). v1 only rewrites instantiations; handle other sites manually. |
+| `inner_class_referenced_as_type` | Inner is referenced outside `new <Inner>(...)` (variable decl, cast, method reference, `Outer.Inner` path). The planner only rewrites instantiations; handle other sites manually. |
 
 Workflow after promotion: run `extract_java_class` on the outer cluster
 as a separate call. The moved methods will reference the promoted class
@@ -181,7 +164,7 @@ bbox_refactor_plan(
 )
 ```
 
-What it does (post-Gap-10):
+What it does:
 
 - **Filesystem-derived `package` declaration** on the target, same
   rules as `extract_java_class`. Operator can override with explicit
@@ -200,9 +183,8 @@ What it does (post-Gap-10):
   keyword if no modifiers), so the source's qualified references
   still resolve from the new package. Same-package extracts keep
   package-default visibility — operator widens afterwards if needed.
-- **Tree-sitter validation steps cover both source and target**. The
-  previous `validations: vec![]` left a hole wide enough to drive a
-  truck through; v2 wires them up so regressions surface at plan time.
+- **Tree-sitter validation steps cover both source and target**, so
+  regressions surface at plan time.
 
 Use this kind when:
 
@@ -296,7 +278,7 @@ by moved methods. Use that report to decide which fields to move, which fields
 to recreate on the target, and which dependencies should become constructor
 parameters.
 
-Capture resolution rules (Gap 19): `captured_variables` only contains
+Capture resolution rules: `captured_variables` only contains
 identifiers that resolve to a direct `field_declaration` of the **outer
 source class**. Method parameters, local variables, enhanced-for variables,
 and inner-class fields are not captures — they either travel with the method
@@ -306,7 +288,7 @@ accesses bypass shadowing. This stops false captures like a method parameter
 named the same as an inner-class field from being promoted into a constructor
 parameter on the target.
 
-Each capture also carries two mutability indicators (Gap 21):
+Each capture also carries two mutability indicators:
 - `source_mutable: true` when the source field is declared without `final`.
   Promoting a mutable field to a `final` constructor parameter snapshots its
   value at construction time and the target sees stale data after later
@@ -335,7 +317,7 @@ risks the report surfaces:
   Each entry carries `method`, a best-effort `signature` (with
   `signature_partial: true` when the declaring node could not be cleanly
   recovered), and `call_sites`. Each call site has `line`, `column`,
-  `in_method`, and `context` (`"direct"` or `"lambda"` — Gap 14: lambdas
+  `in_method`, and `context` (`"direct"` or `"lambda"` — lambdas
   capture `this` differently and may need a closure over a parent reference
   rather than a simple delegate).
 - `inherited_dependencies` lists method invocations that resolve to a

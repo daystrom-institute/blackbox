@@ -21,7 +21,7 @@ The tool you want is **`bbox_compile`**. Not prose. Not Python scripts. Not `bbo
 
 If a prior packet already covers your concept:
 - **Reuse wholesale** — call `bbox_apply(packet_id, entity)` directly.
-- **Compose** — reference it from your new packet via `Apply{packet_id, expect: [...]}`. See *Packet composition (phase 5)* below. Composing is how a standard library emerges: one authoritative `is_breaking` packet, every review packet that needs the concept references it.
+- **Compose** — reference it from your new packet via `Apply{packet_id, expect: [...]}`. See *Packet composition* below. Composing is how a standard library emerges: one authoritative `is_breaking` packet, every review packet that needs the concept references it.
 - **Supersede** — if the prior packet is stale but the domain is the same, compile the replacement and `bbox_decide(supersedes=<prior>)` to make the chain auditable.
 
 **Discovery is cheap, re-derivation is wasteful.** The `bbox_packet_list` call costs nothing; re-compiling a concept another agent already solved costs a round-trip, drift risk, and any future caller's composition cost.
@@ -78,19 +78,19 @@ Packets are for *structured domains that admit generators*. If priors already pr
 - `InRangeF{field, min, max}` — float variant. Inclusive both ends; non-numeric fields return false.
 
 **String predicates:**
-- `StringContains{field, needle, case_insensitive?}` — substring match. Non-string / missing fields return false. For multi-needle ("alternation") use `Any{[StringContains{a}, StringContains{b}, ...]}` — there's no regex primitive in v1 on purpose; composition is the path.
+- `StringContains{field, needle, case_insensitive?}` — substring match. Non-string / missing fields return false. For multi-needle ("alternation") use `Any{[StringContains{a}, StringContains{b}, ...]}` — there's no regex primitive by design; composition is the path.
 
 **Logical composition:**
 - `All{args: [...]}` / `Any{args: [...]}` / `Not{arg: ...}`
 - `True` / `False` — constants
 - `CountMatches{args: [...], compare, value}` — counts how many sub-predicates evaluate to true, compares against `value` (compare: `lt/le/eq/ge/gt`). Sibling to All (count == len) and Any (count >= 1) but with explicit threshold semantics. Natural for "exactly K of N" and "at least K of N" shapes — especially tallying sub-packet verdicts via `Apply`. Use this instead of enumerating all C(N,K) pairwise combinations; collapses a tally to one rule and generalizes to any N.
 
-**Quantified collection predicates (phase 4):**
+**Quantified collection predicates:**
 - `ForAll{path, pred}` — every element at `path` satisfies `pred`. Empty/missing collection is vacuously true.
 - `Exists{path, pred}` — some element satisfies. Empty/missing is false (no witness).
 - `CountCmp{path, compare, value}` — length of collection at `path` compared with `value`. `compare` is one of `lt/le/eq/ge/gt`. Missing path → count 0.
 
-**Packet composition (phase 5):**
+**Packet composition:**
 - `Apply{packet_id, expect, entity_map?}` — true iff applying the referenced packet produces a first-match verdict whose classification is in `expect`. Lets a theory depend on another theory — a review packet can compose a `is_breaking` packet; an auth packet can compose a `privileged_role` packet. Use when a concept is worth extracting and reusing across packets.
 
     **When to extract a sub-packet** (the naming-as-compression heuristic):
@@ -104,7 +104,7 @@ Packets are for *structured domains that admit generators*. If priors already pr
     - Runtime: depth-limited at 8 composition levels. Exceeding that returns false with a warning log (not a panic).
     - Cycles are detected by depth limit, not visited-set. A direct self-reference compiles because the new packet's ID isn't known until save — authoring discipline catches those.
 
-Path syntax in v1: single field with `[*]` suffix, e.g. `"tools[*]"`. Dotted paths like `"config.rules[*]"` are phase-next; flatten the entity if you need them.
+Current path syntax: single field with `[*]` suffix, e.g. `"tools[*]"`. Dotted paths like `"config.rules[*]"` are not supported; flatten the entity if you need them.
 
 Inside the inner predicate, the sub-entity IS the array element. Object elements are addressable directly by their fields (`IsNonNull{field: "description"}`). Primitive elements (strings, ints, bools) get wrapped as `{"$": value}` — address via the special field `"$"`.
 
@@ -328,7 +328,7 @@ With field remapping:
 - `bbox_merge` via behavioral equivalence — merge two packets by clustering rules that fire identically on a witness set
 - `bbox_packets` list/filter — discovery tool
 - Dotted paths in quantified predicates (`config.rules[*]`)
-- Nested `ForAll` — currently rejected in v1 to keep evaluator complexity bounded
+- Nested `ForAll` — currently rejected to keep evaluator complexity bounded
 - `where` filter on `CountCmp` — "count items matching X"
 - Rule dependency DAG beyond Independent/Fallback
 - Packet-level automation — `bbox_extract_packet(witness_set, domain)` that dispatches an LLM to author rules from examples
