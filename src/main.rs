@@ -179,7 +179,17 @@ impl BlackboxServer {
     }
 
     fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
-        let mut counts = self.state.edge_index.read().entity_type_counts();
+        let mut counts = match self.state.edge_index.try_read() {
+            Some(edge_index) => edge_index.entity_type_counts(),
+            None => {
+                tracing::warn!(
+                    target: "blackbox::tool",
+                    tool = "bbox_describe_schema",
+                    "EdgeIndex is busy; returning schema with store-backed counts only"
+                );
+                BTreeMap::new()
+            }
+        };
         counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
         counts.insert("thread".into(), self.state.threads.read().all().len());
         counts.insert("note".into(), self.state.notes.read().all().len());
@@ -190,7 +200,14 @@ impl BlackboxServer {
         // wire-up matures (design/agent-system.md §8.1), seed the
         // counts directly from the catalog so describe_schema reflects
         // installed artifacts.
-        let catalog = self.state.artifacts.read();
+        let Some(catalog) = self.state.artifacts.try_read() else {
+            tracing::warn!(
+                target: "blackbox::tool",
+                tool = "bbox_describe_schema",
+                "artifact catalog is busy; omitting brofile/agent counts"
+            );
+            return counts;
+        };
         for (kind, key) in [
             (artifacts::ArtifactKind::Brofile, "brofile"),
             (artifacts::ArtifactKind::Agent, "agent"),
@@ -210,7 +227,14 @@ impl BlackboxServer {
 
     fn build_agent_schema_entries(&self) -> Vec<mcp_tools::describe_schema::AgentSchemaEntry> {
         use orchestration::agents::registry::AgentRegistry;
-        let catalog = self.state.artifacts.read();
+        let Some(catalog) = self.state.artifacts.try_read() else {
+            tracing::warn!(
+                target: "blackbox::tool",
+                tool = "bbox_describe_schema",
+                "artifact catalog is busy; omitting installed-agent details"
+            );
+            return Vec::new();
+        };
         let registry = AgentRegistry::new(&catalog);
         let filter = orchestration::agents::registry::ListFilter::default();
         let Ok(summaries) = registry.list(&filter) else {

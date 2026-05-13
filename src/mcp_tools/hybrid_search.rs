@@ -162,12 +162,22 @@ pub(crate) fn hybrid_search_typed(
         });
     }
 
+    let mut degraded = HybridDegraded::default();
+    let partitions = match vectors::try_metrics() {
+        Some(partitions) => partitions,
+        None => {
+            degraded.skipped_partitions.insert(
+                "vector_store".into(),
+                "vector store is still warming; returning BM25-only results".into(),
+            );
+            BTreeMap::new()
+        }
+    };
     let mut vector_status = HybridVectorStatus {
         queues: queue_status_for_hybrid(ctx, p.doc_type.as_deref()).routes,
-        partitions: vectors::metrics(),
+        partitions,
         searched_partitions: Vec::new(),
     };
-    let mut degraded = HybridDegraded::default();
     if p.include_vectors.unwrap_or(true) && vector_weight > 0.0 {
         let vector_lists = vector_ranked_lists(
             query,

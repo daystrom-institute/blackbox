@@ -178,6 +178,20 @@ pub fn global() -> Arc<VectorStore> {
         .clone()
 }
 
+/// Return the installed vector store only if it is already available.
+///
+/// This deliberately avoids `OnceLock::get_or_init`: search/status tools use
+/// it to degrade during cold-start warmup instead of blocking behind a
+/// multi-GB partition load.
+pub fn try_global() -> Option<Arc<VectorStore>> {
+    #[cfg(test)]
+    if let Some(store) = test_global_store().read().clone() {
+        return Some(store);
+    }
+
+    GLOBAL_STORE.get().cloned()
+}
+
 pub fn upsert(route: &str, entity_id: &str, content_hash: &str, vector: Vec<f32>) -> Result<()> {
     global().upsert(route, entity_id, content_hash, vector)
 }
@@ -246,6 +260,10 @@ pub fn rebuild(route: &str) -> Result<()> {
 
 pub fn metrics() -> BTreeMap<String, PartitionMetrics> {
     global().metrics()
+}
+
+pub fn try_metrics() -> Option<BTreeMap<String, PartitionMetrics>> {
+    try_global().map(|store| store.metrics())
 }
 
 pub fn default_vectors_dir() -> PathBuf {
