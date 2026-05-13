@@ -288,7 +288,7 @@ fn index_project(
         );
         ctx.stats.indexed_files += 1;
     }
-    crate::edge_index::replace_materialized_edges(
+    crate::edge_index::replace_materialized_edges_incremental(
         ctx.edges_dir,
         "project",
         &project.project_id,

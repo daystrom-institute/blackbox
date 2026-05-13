@@ -115,16 +115,20 @@ pub(super) fn index_git_history_for_project(
         edges.extend(commit_edges(root, repo_id, &commit, project_chunks)?);
     }
     stats.emitted_edges = edges.len() as u64;
-    // Phase 2: always replace materialized git edges, never append.
-    // TODO: split into "git-current" (workspace chunk linkage) and repo-scoped
-    // content-addressed commit history lane. Until that exists, all git commit
-    // edges use namespace "git" with full replacement semantics.
-    crate::edge_index::replace_materialized_edges(
-        ctx.edges_dir,
-        "git",
-        &project.project_id,
-        &edges,
-    )?;
+    // Git commit edges are immutable historical facts, not workspace
+    // current-state. Replacing the whole namespace with only new-commit edges
+    // would drop older commit edges. Deferred from Phase 2: a repo-scoped
+    // content-addressed lane keyed by commit SHA would enable full replacement.
+    if ctx.force_full {
+        crate::edge_index::replace_project_edges(
+            ctx.edges_dir,
+            "git",
+            &project.project_id,
+            &edges,
+        )?;
+    } else {
+        crate::edge_index::append_project_edges(ctx.edges_dir, &project.project_id, &edges)?;
+    }
     git_meta.last_ingested_sha = Some(head);
     save_git_meta(&git_meta_path, &git_meta)?;
     ctx.meta.insert(

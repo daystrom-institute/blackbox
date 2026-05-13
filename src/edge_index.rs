@@ -1047,6 +1047,90 @@ pub(crate) fn replace_materialized_edges(
     replace_project_edges(edges_dir, namespace, project_id, edges)
 }
 
+pub(crate) fn read_managed_derived_edges(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+) -> Result<Vec<Edge>> {
+    let path = managed_derived_edges_dir(edges_dir)
+        .join(namespace)
+        .join(format!("{project_id}.jsonl"));
+    let file = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let reader = std::io::BufReader::new(file);
+    let mut edges = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(edge) = serde_json::from_str::<Edge>(trimmed) {
+            edges.push(edge);
+        }
+    }
+    Ok(edges)
+}
+
+pub(crate) fn rel_path_hashes_of(edges: &[crate::chunker::Edge]) -> HashSet<String> {
+    let mut hashes = HashSet::new();
+    for e in edges {
+        if let EntityRef::ProjectFile { rel_path_hash, .. } = &e.source {
+            hashes.insert(rel_path_hash.clone());
+        }
+        if let EntityRef::ProjectFile { rel_path_hash, .. } = &e.target {
+            hashes.insert(rel_path_hash.clone());
+        }
+    }
+    hashes
+}
+
+fn edge_touches_any_path_hash(edge: &Edge, stale_hashes: &HashSet<String>) -> bool {
+    match (&edge.source, &edge.target) {
+        (EntityRef::ProjectFile { rel_path_hash, .. }, _)
+        | (_, EntityRef::ProjectFile { rel_path_hash, .. }) => stale_hashes.contains(rel_path_hash),
+        _ => false,
+    }
+}
+
+pub(crate) fn replace_materialized_edges_incremental(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+    new_edges: &[crate::chunker::Edge],
+) -> Result<()> {
+    for e in new_edges {
+        debug_assert!(
+            e.provenance == EdgeProvenance::Derived,
+            "replace_materialized_edges_incremental: rejected non-Derived edge kind={} provenance={:?}",
+            e.kind,
+            e.provenance,
+        );
+    }
+    if new_edges.is_empty() {
+        return Ok(());
+    }
+    let stale_hashes = rel_path_hashes_of(new_edges);
+    let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
+    let preserved: Vec<crate::chunker::Edge> = existing
+        .into_iter()
+        .filter(|e| !edge_touches_any_path_hash(e, &stale_hashes))
+        .map(|e| crate::chunker::Edge {
+            source: e.source,
+            kind: e.kind,
+            target: e.target,
+            provenance: e.provenance,
+            confidence: e.confidence,
+        })
+        .collect();
+    let mut merged = preserved;
+    merged.extend_from_slice(new_edges);
+    replace_project_edges(edges_dir, namespace, project_id, &merged)
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2: Legacy edge extraction dry-run
 // ---------------------------------------------------------------------------
@@ -2265,6 +2349,134 @@ mod tests {
                 .len()
                 == 1,
             "legacy derived edge must still load"
+        );
+    }
+
+    #[test]
+    fn incremental_materialized_replace_preserves_unchanged_file_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let file_a = crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "aaa".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "aaa".into(),
+                chunk_hash: "b".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        let file_b = crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "bbb".into(),
+                chunk_hash: "c".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "bbb".into(),
+                chunk_hash: "d".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+
+        replace_materialized_edges(
+            edges_dir,
+            "project",
+            "p1",
+            &[file_a.clone(), file_b.clone()],
+        )
+        .unwrap();
+
+        let after_full = read_managed_derived_edges(edges_dir, "project", "p1").unwrap();
+        assert_eq!(after_full.len(), 2);
+
+        let file_a_updated = crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "aaa".into(),
+                chunk_hash: "e".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "aaa".into(),
+                chunk_hash: "f".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+
+        replace_materialized_edges_incremental(edges_dir, "project", "p1", &[file_a_updated])
+            .unwrap();
+
+        let after_incremental = read_managed_derived_edges(edges_dir, "project", "p1").unwrap();
+        assert_eq!(after_incremental.len(), 2, "total edges must stay at 2");
+
+        let b_edges: Vec<_> = after_incremental
+            .iter()
+            .filter(|e| match &e.source {
+                EntityRef::ProjectFile { rel_path_hash, .. } => rel_path_hash == "bbb",
+                _ => false,
+            })
+            .collect();
+        assert_eq!(b_edges.len(), 1, "unchanged file-b edge must be preserved");
+
+        let a_edges: Vec<_> = after_incremental
+            .iter()
+            .filter(|e| match &e.source {
+                EntityRef::ProjectFile { rel_path_hash, .. } => rel_path_hash == "aaa",
+                _ => false,
+            })
+            .collect();
+        assert_eq!(a_edges.len(), 1, "updated file-a edge must be present");
+        assert_eq!(a_edges[0].kind, "NEXT_SECTION");
+    }
+
+    #[test]
+    fn incremental_materialized_replace_no_duplicates_on_repeat() {
+        let dir = tempfile::tempdir().unwrap();
+        let edge = crate::chunker::Edge {
+            source: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "xxx".into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            kind: "NEXT_SECTION".into(),
+            target: EntityRef::ProjectFile {
+                project_id: "p1".into(),
+                rel_path_hash: "xxx".into(),
+                chunk_hash: "b".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+
+        replace_materialized_edges_incremental(dir.path(), "project", "p1", &[edge.clone()])
+            .unwrap();
+        replace_materialized_edges_incremental(dir.path(), "project", "p1", &[edge]).unwrap();
+
+        let after = read_managed_derived_edges(dir.path(), "project", "p1").unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "re-incremental with same edges must not duplicate"
         );
     }
 }
