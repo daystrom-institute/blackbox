@@ -5883,22 +5883,66 @@ fn lombokify_apache_equals_hashcode_tostring() {
     let params = java_plan_params("lombokify_java_class", &path);
     let plan_text = plan_lombokify_java_class(&params).unwrap();
     let rewritten = apply_plan_to_source(&plan_text, &path);
-    // Class-level @Getter (full coverage) + @EqualsAndHashCode + @ToString.
+    // Class-level @Getter + @ToString. The explicit HashCodeBuilder(17, 37)
+    // hash algorithm is not Lombok-equivalent, so equals/hashCode stay explicit.
     assert!(
-        rewritten.contains("@Getter\n@EqualsAndHashCode\n@ToString\npublic class Input"),
+        rewritten.contains("@Getter\n@ToString\npublic class Input"),
         "expected stacked class-level annotations:\n{rewritten}"
     );
     assert!(rewritten.contains("import lombok.Getter;"));
-    assert!(rewritten.contains("import lombok.EqualsAndHashCode;"));
+    assert!(!rewritten.contains("import lombok.EqualsAndHashCode;"));
     assert!(rewritten.contains("import lombok.ToString;"));
-    // All four method bodies removed.
-    assert!(!rewritten.contains("public boolean equals("));
-    assert!(!rewritten.contains("public int hashCode()"));
+    // Accessors and toString removed; equals/hashCode preserved.
+    assert!(rewritten.contains("public boolean equals("));
+    assert!(rewritten.contains("public int hashCode()"));
     assert!(!rewritten.contains("public String toString()"));
     assert!(!rewritten.contains("public String getTriggeredAt()"));
-    // Apache imports still there (we don't touch them; user can run
-    // organize_imports separately to drop unused).
+    // Apache imports still needed by preserved equals/hashCode stay; stale
+    // ToStringBuilder import is pruned.
     assert!(rewritten.contains("EqualsBuilder"));
+    assert!(rewritten.contains("HashCodeBuilder"));
+    assert!(!rewritten.contains("ToStringBuilder;"));
+}
+
+#[test]
+fn lombokify_avoids_duplicate_existing_accessor_annotations() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Source.java");
+    fs::write(
+        &path,
+        "package com.example;\n\
+             \n\
+             import lombok.Getter;\n\
+             import lombok.Setter;\n\
+             \n\
+             @Getter\n\
+             @Setter\n\
+             public class Source {\n\
+            \x20   private String name;\n\
+            \n\
+            \x20   public String getName() { return name; }\n\
+            \x20   public void setName(String name) { this.name = name; }\n\
+             }\n",
+    )
+    .unwrap();
+    let params = java_plan_params("lombokify_java_class", &path);
+    let plan_text = plan_lombokify_java_class(&params).unwrap();
+    let rewritten = apply_plan_to_source(&plan_text, &path);
+
+    assert_eq!(rewritten.matches("@Getter").count(), 1, "{rewritten}");
+    assert_eq!(rewritten.matches("@Setter").count(), 1, "{rewritten}");
+    assert_eq!(
+        rewritten.matches("import lombok.Getter;").count(),
+        1,
+        "{rewritten}"
+    );
+    assert_eq!(
+        rewritten.matches("import lombok.Setter;").count(),
+        1,
+        "{rewritten}"
+    );
+    assert!(!rewritten.contains("public String getName()"));
+    assert!(!rewritten.contains("public void setName("));
 }
 
 #[test]
@@ -6139,6 +6183,7 @@ fn lombokify_collapses_to_data() {
     assert!(rewritten.contains("import lombok.Data;"));
     assert!(!rewritten.contains("import lombok.Getter;"));
     assert!(!rewritten.contains("import lombok.Setter;"));
+    assert!(!rewritten.contains("org.apache.commons.lang3.builder"));
     // All accessors and ctor + e/h/ts dropped.
     assert!(!rewritten.contains("public String getName()"));
     assert!(!rewritten.contains("public Bean()"));
@@ -6301,6 +6346,24 @@ fn lombokify_tree_walks_directory_and_aggregates() {
              }\n",
     )
     .unwrap();
+    // Existing parser gaps, such as unsupported modern switch pattern
+    // syntax, should quarantine only that file rather than poisoning the
+    // whole directory transaction.
+    fs::write(
+        src.join("ModernSwitch.java"),
+        "package com.example;\n\
+             public class ModernSwitch {\n\
+            \x20   private String name;\n\
+            \x20   public String getName() { return name; }\n\
+            \x20   public String render(Object value) {\n\
+            \x20       return switch (value) {\n\
+            \x20           case String s when -> s;\n\
+            \x20           default -> \"\";\n\
+            \x20       };\n\
+            \x20   }\n\
+             }\n",
+    )
+    .unwrap();
     // A non-Java file (must not be picked up at all).
     fs::write(src.join("README.md"), "ignore me\n").unwrap();
     // A `target/` directory must be skipped.
@@ -6321,8 +6384,8 @@ fn lombokify_tree_walks_directory_and_aggregates() {
     let plan_text = plan_lombokify_java_class(&params).unwrap();
     let plan: RefactorPlan = serde_json::from_str(&plan_text).unwrap();
     assert!(
-        plan.title.starts_with("Lombokify 2/3"),
-        "title should report 2/3 conversions (Pair + Single, Service skipped, target/ filtered): {}",
+        plan.title.starts_with("Lombokify 2/4"),
+        "title should report 2/4 conversions (Pair + Single, Service + ModernSwitch skipped, target/ filtered): {}",
         plan.title
     );
     // Two FileEdits — one per converted file.
@@ -6342,6 +6405,14 @@ fn lombokify_tree_walks_directory_and_aggregates() {
         plan.leftovers.iter().any(|s| s.contains("Service.java")
             && (s.contains("no lombokifiable") || s.contains("no instance fields"))),
         "Service.java should be in leftovers: {:?}",
+        plan.leftovers
+    );
+    assert!(
+        plan.leftovers
+            .iter()
+            .any(|s| s.contains("ModernSwitch.java")
+                && s.contains("existing file has tree-sitter parse errors")),
+        "ModernSwitch.java should be quarantined in leftovers: {:?}",
         plan.leftovers
     );
     // target/ tree must NOT have leaked in.

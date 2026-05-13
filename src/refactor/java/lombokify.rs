@@ -182,6 +182,33 @@ pub(crate) fn has_preceding_javadoc(node: Node<'_>, source: &str) -> bool {
     between.iter().all(|b| b.is_ascii_whitespace())
 }
 
+fn has_lombok_annotation(node: Node<'_>, source: &str, simple_name: &str) -> bool {
+    let end = node
+        .child_by_field_name("body")
+        .map(|body| body.start_byte())
+        .unwrap_or_else(|| node.end_byte());
+    has_lombok_annotation_in_range(source, node.start_byte(), end, simple_name)
+}
+
+fn has_lombok_annotation_in_range(
+    source: &str,
+    start: usize,
+    end: usize,
+    simple_name: &str,
+) -> bool {
+    source
+        .get(start.min(source.len())..end.min(source.len()))
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .any(|line| {
+            line == format!("@{simple_name}")
+                || line.starts_with(&format!("@{simple_name}("))
+                || line == format!("@lombok.{simple_name}")
+                || line.starts_with(&format!("@lombok.{simple_name}("))
+        })
+}
+
 /// Compute the getter method name Lombok's `@Getter` would generate for a
 /// given field, applying Lombok's primitive-`boolean` `is-` prefix rule
 /// (vs the default `get-` for everything else, including boxed `Boolean`).
@@ -496,6 +523,67 @@ pub(crate) fn merge_colocated_inserts(edits: Vec<TextEdit>) -> Vec<TextEdit> {
     out
 }
 
+fn import_line_range(source: &str, fqcn: &str) -> Option<(usize, usize)> {
+    let target = format!("import {fqcn};");
+    let mut offset = 0usize;
+    for line in source.split_inclusive('\n') {
+        if line.trim() == target {
+            return Some((offset, offset + line.len()));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+fn is_identifier_boundary(source: &str, start: usize, end: usize) -> bool {
+    let before = start
+        .checked_sub(1)
+        .and_then(|idx| source.as_bytes().get(idx))
+        .copied();
+    let after = source.as_bytes().get(end).copied();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    !before.is_some_and(is_word) && !after.is_some_and(is_word)
+}
+
+fn referenced_outside_ranges(
+    source: &str,
+    symbol: &str,
+    ignored_ranges: &[(usize, usize)],
+) -> bool {
+    source.match_indices(symbol).any(|(idx, _)| {
+        let end = idx + symbol.len();
+        is_identifier_boundary(source, idx, end)
+            && !ignored_ranges
+                .iter()
+                .any(|(start, stop)| idx >= *start && end <= *stop)
+    })
+}
+
+fn prune_import_if_unused_after_edits(
+    text_edits: &mut Vec<TextEdit>,
+    source: &str,
+    fqcn: &str,
+    simple_name: &str,
+) {
+    let Some(import_range) = import_line_range(source, fqcn) else {
+        return;
+    };
+    let mut ignored_ranges: Vec<(usize, usize)> = text_edits
+        .iter()
+        .filter(|edit| edit.byte_start < edit.byte_end)
+        .map(|edit| (edit.byte_start, edit.byte_end))
+        .collect();
+    ignored_ranges.push(import_range);
+    if referenced_outside_ranges(source, simple_name, &ignored_ranges) {
+        return;
+    }
+    text_edits.push(TextEdit {
+        byte_start: import_range.0,
+        byte_end: import_range.1,
+        replacement: String::new(),
+    });
+}
+
 /// Walk the method-invocation chain that ends at `outer`, returning the
 /// list of `(method_name, args)` pairs from the innermost call to the
 /// outermost, plus the root expression at the bottom of the chain (the
@@ -685,6 +773,12 @@ pub(crate) fn detect_apache_hashcode(method: Node<'_>, source: &str) -> Option<V
         .and_then(|n| n.utf8_text(source.as_bytes()).ok())
         .unwrap_or("");
     if root_type.trim() != "HashCodeBuilder" {
+        return None;
+    }
+    if root
+        .child_by_field_name("arguments")
+        .is_some_and(|args| args.named_child_count() > 0)
+    {
         return None;
     }
     let last_call = chain.last()?;
@@ -1162,6 +1256,25 @@ pub(crate) fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Re
         }
         total_files += 1;
 
+        match parse_source_file(path) {
+            Ok(parsed) => {
+                let report = parse_report(parsed.tree.root_node());
+                if report.has_error || report.error_nodes > 0 || report.missing_nodes > 0 {
+                    skipped.push(format!(
+                        "{}: skipped before lombokify because the existing file has tree-sitter parse errors ({} ERROR, {} MISSING)",
+                        path.display(),
+                        report.error_nodes,
+                        report.missing_nodes
+                    ));
+                    continue;
+                }
+            }
+            Err(e) => {
+                skipped.push(format!("{}: {}", path.display(), e));
+                continue;
+            }
+        }
+
         let mut file_params = p.clone();
         file_params.source = path.to_string_lossy().into_owned();
         // Don't propagate `item_names` — the per-class selector only makes
@@ -1257,6 +1370,29 @@ pub(crate) fn plan_lombokify_java_class_single(
     }
 
     let methods = collect_direct_class_methods(body, &parsed.source);
+    let existing_class_getter = has_lombok_annotation(class_node, &parsed.source, "Getter")
+        || has_lombok_annotation(class_node, &parsed.source, "Data")
+        || has_lombok_annotation(class_node, &parsed.source, "Value");
+    let existing_class_setter = has_lombok_annotation(class_node, &parsed.source, "Setter")
+        || has_lombok_annotation(class_node, &parsed.source, "Data");
+    let existing_class_equals_hashcode =
+        has_lombok_annotation(class_node, &parsed.source, "EqualsAndHashCode")
+            || has_lombok_annotation(class_node, &parsed.source, "Data")
+            || has_lombok_annotation(class_node, &parsed.source, "Value");
+    let existing_class_tostring = has_lombok_annotation(class_node, &parsed.source, "ToString")
+        || has_lombok_annotation(class_node, &parsed.source, "Data")
+        || has_lombok_annotation(class_node, &parsed.source, "Value");
+    let existing_class_constructor =
+        has_lombok_annotation(class_node, &parsed.source, "NoArgsConstructor")
+            || has_lombok_annotation(class_node, &parsed.source, "AllArgsConstructor")
+            || has_lombok_annotation(class_node, &parsed.source, "RequiredArgsConstructor")
+            || has_lombok_annotation(class_node, &parsed.source, "Data")
+            || has_lombok_annotation(class_node, &parsed.source, "Value");
+    let existing_class_lombok_component = existing_class_getter
+        || existing_class_setter
+        || existing_class_equals_hashcode
+        || existing_class_tostring
+        || existing_class_constructor;
 
     let bool_strategy = parse_boolean_getter_strategy(p.boolean_getter_strategy.as_deref())?;
     let mut field_to_getter: std::collections::BTreeMap<String, Node<'_>> =
@@ -1446,6 +1582,7 @@ pub(crate) fn plan_lombokify_java_class_single(
         && setter_class_level
         && emit_equals_and_hashcode
         && emit_tostring
+        && !existing_class_lombok_component
         && (if has_final_field {
             requiredargs_ctor.is_some()
         } else {
@@ -1463,6 +1600,7 @@ pub(crate) fn plan_lombokify_java_class_single(
         && field_to_setter.is_empty()
         && emit_equals_and_hashcode
         && emit_tostring
+        && !existing_class_lombok_component
         && allargs_ctor.is_some();
 
     let mut text_edits: Vec<TextEdit> = Vec::new();
@@ -1527,6 +1665,28 @@ pub(crate) fn plan_lombokify_java_class_single(
             replacement: String::new(),
         });
     }
+    if emit_equals_and_hashcode {
+        prune_import_if_unused_after_edits(
+            &mut text_edits,
+            &parsed.source,
+            "org.apache.commons.lang3.builder.EqualsBuilder",
+            "EqualsBuilder",
+        );
+        prune_import_if_unused_after_edits(
+            &mut text_edits,
+            &parsed.source,
+            "org.apache.commons.lang3.builder.HashCodeBuilder",
+            "HashCodeBuilder",
+        );
+    }
+    if emit_tostring {
+        prune_import_if_unused_after_edits(
+            &mut text_edits,
+            &parsed.source,
+            "org.apache.commons.lang3.builder.ToStringBuilder",
+            "ToStringBuilder",
+        );
+    }
 
     // Class-level annotations are stacked one per line, alphabetical for
     // deterministic output. We compose them into a single insert so the
@@ -1535,35 +1695,43 @@ pub(crate) fn plan_lombokify_java_class_single(
     if data_eligible {
         class_level_annotations.push("@Data");
         // @AllArgsConstructor is independent of @Data and stacks if matched.
-        if allargs_ctor.is_some() {
+        if allargs_ctor.is_some()
+            && !has_lombok_annotation(class_node, &parsed.source, "AllArgsConstructor")
+        {
             class_level_annotations.push("@AllArgsConstructor");
         }
     } else if value_eligible {
         class_level_annotations.push("@Value");
     } else {
-        if getter_class_level {
+        if getter_class_level && !existing_class_getter {
             class_level_annotations.push("@Getter");
         }
-        if setter_class_level {
+        if setter_class_level && !existing_class_setter {
             class_level_annotations.push("@Setter");
         }
-        if emit_equals_and_hashcode {
+        if emit_equals_and_hashcode && !existing_class_equals_hashcode {
             class_level_annotations.push("@EqualsAndHashCode");
         }
-        if emit_tostring {
+        if emit_tostring && !existing_class_tostring {
             class_level_annotations.push("@ToString");
         }
-        if noargs_ctor.is_some() {
+        if noargs_ctor.is_some()
+            && !has_lombok_annotation(class_node, &parsed.source, "NoArgsConstructor")
+        {
             class_level_annotations.push("@NoArgsConstructor");
         }
-        if allargs_ctor.is_some() {
+        if allargs_ctor.is_some()
+            && !has_lombok_annotation(class_node, &parsed.source, "AllArgsConstructor")
+        {
             class_level_annotations.push("@AllArgsConstructor");
         }
-        if requiredargs_ctor.is_some() {
+        if requiredargs_ctor.is_some()
+            && !has_lombok_annotation(class_node, &parsed.source, "RequiredArgsConstructor")
+        {
             class_level_annotations.push("@RequiredArgsConstructor");
         }
     }
-    if slf4j_field.is_some() {
+    if slf4j_field.is_some() && !has_lombok_annotation(class_node, &parsed.source, "Slf4j") {
         class_level_annotations.push("@Slf4j");
     }
     // Build the class-level annotation block but DEFER pushing it until
@@ -1586,8 +1754,26 @@ pub(crate) fn plan_lombokify_java_class_single(
     // stack them on consecutive lines above the field.
     if !getter_class_level || !setter_class_level {
         for field in &instance_fields {
-            let want_getter = !getter_class_level && field_to_getter.contains_key(&field.name);
-            let want_setter = !setter_class_level && field_to_setter.contains_key(&field.name);
+            let field_has_getter = has_lombok_annotation_in_range(
+                &parsed.source,
+                field.field_node_byte_start,
+                field.field_node_byte_end,
+                "Getter",
+            );
+            let field_has_setter = has_lombok_annotation_in_range(
+                &parsed.source,
+                field.field_node_byte_start,
+                field.field_node_byte_end,
+                "Setter",
+            );
+            let want_getter = !getter_class_level
+                && !existing_class_getter
+                && !field_has_getter
+                && field_to_getter.contains_key(&field.name);
+            let want_setter = !setter_class_level
+                && !existing_class_setter
+                && !field_has_setter
+                && field_to_setter.contains_key(&field.name);
             if !want_getter && !want_setter {
                 continue;
             }
@@ -1610,39 +1796,46 @@ pub(crate) fn plan_lombokify_java_class_single(
     // Import injection — every applied annotation needs its FQCN imported.
     let imports = extract_java_imports(&parsed.source);
     let mut needed_imports: Vec<&'static str> = Vec::new();
-    if data_eligible {
+    if class_level_annotations.contains(&"@Data") {
         needed_imports.push("lombok.Data");
-        if allargs_ctor.is_some() {
-            needed_imports.push("lombok.AllArgsConstructor");
-        }
-    } else if value_eligible {
-        needed_imports.push("lombok.Value");
-    } else {
-        if !field_to_getter.is_empty() {
-            needed_imports.push("lombok.Getter");
-        }
-        if !field_to_setter.is_empty() {
-            needed_imports.push("lombok.Setter");
-        }
-        if emit_equals_and_hashcode {
-            needed_imports.push("lombok.EqualsAndHashCode");
-        }
-        if emit_tostring {
-            needed_imports.push("lombok.ToString");
-        }
-        if noargs_ctor.is_some() {
-            needed_imports.push("lombok.NoArgsConstructor");
-        }
-        if allargs_ctor.is_some() {
-            needed_imports.push("lombok.AllArgsConstructor");
-        }
-        if requiredargs_ctor.is_some() {
-            needed_imports.push("lombok.RequiredArgsConstructor");
-        }
     }
-    if slf4j_field.is_some() {
+    if class_level_annotations.contains(&"@Value") {
+        needed_imports.push("lombok.Value");
+    }
+    if class_level_annotations.contains(&"@AllArgsConstructor") {
+        needed_imports.push("lombok.AllArgsConstructor");
+    }
+    if class_level_annotations.contains(&"@Getter")
+        || text_edits
+            .iter()
+            .any(|edit| edit.replacement.contains("@Getter\n"))
+    {
+        needed_imports.push("lombok.Getter");
+    }
+    if class_level_annotations.contains(&"@Setter")
+        || text_edits
+            .iter()
+            .any(|edit| edit.replacement.contains("@Setter\n"))
+    {
+        needed_imports.push("lombok.Setter");
+    }
+    if class_level_annotations.contains(&"@EqualsAndHashCode") {
+        needed_imports.push("lombok.EqualsAndHashCode");
+    }
+    if class_level_annotations.contains(&"@ToString") {
+        needed_imports.push("lombok.ToString");
+    }
+    if class_level_annotations.contains(&"@NoArgsConstructor") {
+        needed_imports.push("lombok.NoArgsConstructor");
+    }
+    if class_level_annotations.contains(&"@RequiredArgsConstructor") {
+        needed_imports.push("lombok.RequiredArgsConstructor");
+    }
+    if class_level_annotations.contains(&"@Slf4j") {
         needed_imports.push("lombok.extern.slf4j.Slf4j");
     }
+    needed_imports.sort_unstable();
+    needed_imports.dedup();
     let mut import_block = String::new();
     for fqcn in &needed_imports {
         let already = imports.iter().any(|i| {
