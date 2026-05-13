@@ -66,7 +66,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now blackbox-dev.service
 ```
 
-This sample unit listens on `127.0.0.1:7265/mcp` and self-registers as `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It also runs a separate installed binary path, `~/.local/bin/blackboxd-dev`, so dev restarts and binary swaps do not touch the prod service executable.
+This sample unit listens on `127.0.0.1:7265/mcp` with MCP name `blackbox-dev`, while keeping knowledge/threads/notes/index/render backups under dev-specific XDG paths. It also runs a separate installed binary path, `~/.local/bin/blackboxd-dev`, so dev restarts and binary swaps do not touch the prod service executable.
 
 ### 2b. Build, run, or develop with Nix
 
@@ -518,7 +518,7 @@ Auto-detection works out of the box for most setups. Override via environment va
 | `TRANSCRIPT_SEARCH_ROOTS` | auto-detect `~/.claude` + `~/.claude-*` | Account roots. Format: `name=/path,name2=/path2` |
 | `TRANSCRIPT_SEARCH_CODEX_ROOT` | `~/.codex` if it exists | Codex CLI data directory |
 | `TRANSCRIPT_SEARCH_INDEX_PATH` | `~/.local/share/blackbox/index` | Tantivy index location |
-| `BLACKBOX_MCP_NAME` | `blackbox` | MCP server name used for self-registration and transient provider injection |
+| `BLACKBOX_MCP_NAME` | `blackbox` | MCP server name used for transient provider injection |
 | `BLACKBOX_STATE_DIR` | `~/.local/state/blackbox` | Base dir for default bbox JSON stores when explicit per-store paths are unset |
 | `BLACKBOX_KNOWLEDGE_PATH` | `<state-dir>/blackbox-knowledge.json` | Knowledge store path |
 | `BLACKBOX_THREADS_PATH` | `<state-dir>/blackbox-threads.json` | Thread store path |

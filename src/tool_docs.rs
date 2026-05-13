@@ -830,7 +830,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_mcp",
         category: ToolCategory::Orchestration,
         summary: "Manage MCP servers + tool filters for dispatched bros.",
-        when_to_use: "Add/remove MCP servers and manage dispatch-time tool filters. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        when_to_use: "Explicitly add/remove MCP servers and manage dispatch-time tool filters. The daemon does not rewrite provider MCP configs on startup. Before `action=add`, call `action=list` first. The default bro-tool disallow is mechanical recursion protection, not just prose guidance. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_mcp(action="disallow", pattern="mcp__blackbox__bro_*", scope="global")"#,
         ),

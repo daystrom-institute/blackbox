@@ -8,11 +8,9 @@
 //!
 //! At dispatch time, the effective set is (global entries) merged with
 //! (project entries override), and translated into provider-specific CLI
-//! args — each provider has native `mcp add/list/remove` and tool-filter
-//! flags (see `providers.rs::build_mcp_*_args`). Gemini and the persistent-
-//! only providers are handled through their own CLI at registration time;
-//! transient-injection providers (Claude, Copilot, Codex) receive the
-//! effective set per-invocation as well for determinism.
+//! args. Provider-owned MCP config files are never rewritten on daemon
+//! startup; persistent provider registration happens only as the direct
+//! result of explicit `bro_mcp add/remove/sync` calls.
 //!
 //! The recursion guard is mechanical: the default filter set disallows
 //! the current blackbox MCP prefix's dispatch-capable `bro_*`
@@ -34,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use rmcp::schemars;
 
 use super::brofile;
-use super::providers::{MatchState, Provider};
+use super::providers::Provider;
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -138,8 +136,7 @@ impl McpServerConfig {
 }
 
 impl McpServerConfig {
-    /// True if this is the blackbox self-entry (used by self-registration
-    /// to detect URL drift and decide add vs remove+add).
+    /// True if this is the blackbox self-entry at the expected URL.
     #[allow(dead_code)] // used by tests in same file
     pub fn blackbox_matches(&self, current_url: &str) -> bool {
         matches!(self, Self::Http { url, .. } if url == current_url)
@@ -571,268 +568,6 @@ fn glob_match_inner(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
         '?' => ti < t.len() && glob_match_inner(p, pi + 1, t, ti + 1),
         c => ti < t.len() && t[ti] == c && glob_match_inner(p, pi + 1, t, ti + 1),
     }
-}
-
-// ── Self-registration ──────────────────────────────────────────────
-
-/// Per-provider outcome for `self_register_blackbox`.
-#[derive(Debug, Clone)]
-pub enum SelfRegisterOutcome {
-    /// Provider registered blackbox with the expected URL — nothing to do.
-    Unchanged,
-    /// Provider had no blackbox entry; `mcp add` succeeded.
-    Added,
-    /// Provider had a stale URL; removed then added.
-    Updated,
-    /// Provider binary isn't on PATH (spawn failed). Distinguished from
-    /// ListFailed: the CLI is genuinely absent, not just misbehaving.
-    NotInstalled {
-        #[allow(dead_code)] // Debug-formatted for logs
-        detail: String,
-    },
-    /// Provider binary spawned but `mcp list` exited non-zero. CLI is
-    /// installed but something is wrong (auth, schema mismatch, etc.).
-    /// Worth surfacing differently — the user can fix this; NotInstalled
-    /// requires actually installing the CLI.
-    ListFailed {
-        #[allow(dead_code)] // Debug-formatted for logs
-        detail: String,
-    },
-    /// Provider has no MCP CRUD (Vibe).
-    Unsupported,
-    /// The subsequent add/remove CLI call errored out.
-    Error { detail: String },
-}
-
-#[derive(Debug, Default)]
-pub struct SelfRegisterReport {
-    pub per_provider: Vec<(Provider, SelfRegisterOutcome)>,
-}
-
-impl SelfRegisterReport {
-    pub fn summary(&self) -> String {
-        let mut parts = Vec::new();
-        for (p, o) in &self.per_provider {
-            let label = match o {
-                SelfRegisterOutcome::Unchanged => "unchanged",
-                SelfRegisterOutcome::Added => "added",
-                SelfRegisterOutcome::Updated => "updated",
-                SelfRegisterOutcome::NotInstalled { .. } => "not-installed",
-                SelfRegisterOutcome::ListFailed { .. } => "list-failed",
-                SelfRegisterOutcome::Unsupported => "unsupported",
-                SelfRegisterOutcome::Error { .. } => "error",
-            };
-            parts.push(format!("{p}={label}"));
-        }
-        parts.join(", ")
-    }
-}
-
-/// On daemon startup, ensure every provider with MCP CRUD has a
-/// `name` entry pointing at `url`. Idempotent: no-op when the
-/// entry is already correct; updates on drift. Per-provider failures
-/// are captured and returned in the report — one missing CLI doesn't
-/// block the others.
-pub fn self_register_blackbox(name: &str, url: &str) -> SelfRegisterReport {
-    let mut report = SelfRegisterReport::default();
-    for provider in [
-        Provider::Claude,
-        Provider::Copilot,
-        Provider::Codex,
-        Provider::Gemini,
-        Provider::Vibe,
-    ] {
-        let outcome = register_one(provider, name, url);
-        report.per_provider.push((provider, outcome));
-    }
-    report
-}
-
-fn register_one(provider: Provider, name: &str, url: &str) -> SelfRegisterOutcome {
-    // Vibe manages MCP via ~/.vibe/config.toml, not CLI subcommands.
-    // Special-case it with file-based registration.
-    if provider == Provider::Vibe {
-        return register_vibe_file_based(name, url);
-    }
-
-    let Some(list_args) = provider.build_mcp_list_args() else {
-        return SelfRegisterOutcome::Unsupported;
-    };
-
-    let raw_bin = provider.bin();
-    let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let list_out = match capture_cli_with_timeout(&provider, &list_args, None, CLI_TIMEOUT) {
-        Ok(o) if o.status.success() => o,
-        Ok(o) => {
-            // CLI installed but `mcp list` errored — distinct from
-            // not-installed. User can fix this without installing.
-            return SelfRegisterOutcome::ListFailed {
-                detail: format!(
-                    "{bin} mcp list exited {:?}: {}",
-                    o.status.code(),
-                    String::from_utf8_lossy(&o.stderr)
-                        .lines()
-                        .next()
-                        .unwrap_or(""),
-                ),
-            };
-        }
-        Err(e) => {
-            // Spawn failed (binary not on PATH, unreadable, etc.) OR
-            // the CLI hung past CLI_TIMEOUT. Either way the daemon
-            // can't talk to this provider; treat as NotInstalled so
-            // self-registration doesn't block startup.
-            return SelfRegisterOutcome::NotInstalled {
-                detail: format!("{bin}: {e}"),
-            };
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&list_out.stdout).to_string();
-    // Both arg builders return None for providers without MCP CRUD
-    // (today: only Vibe, which is filtered out earlier by the
-    // build_mcp_list_args check). Treat unexpected None as Unsupported
-    // rather than spawning the bare binary with zero args, which would
-    // open an interactive REPL on most CLIs.
-    let Some(add_args) = provider.build_mcp_add_http_args(name, url, &[]) else {
-        return SelfRegisterOutcome::Unsupported;
-    };
-    match provider.mcp_list_has(&stdout, name, Some(url)) {
-        MatchState::MatchesName => SelfRegisterOutcome::Unchanged,
-        MatchState::Drift => {
-            let Some(rm_args) = provider.build_mcp_remove_args(name) else {
-                return SelfRegisterOutcome::Unsupported;
-            };
-            if let Err(e) = run_cli(&provider, &rm_args) {
-                return SelfRegisterOutcome::Error {
-                    detail: format!("remove: {e}"),
-                };
-            }
-            match run_cli(&provider, &add_args) {
-                Ok(()) => SelfRegisterOutcome::Updated,
-                Err(e) => SelfRegisterOutcome::Error {
-                    detail: format!("re-add: {e}"),
-                },
-            }
-        }
-        MatchState::Missing => match run_cli(&provider, &add_args) {
-            Ok(()) => SelfRegisterOutcome::Added,
-            Err(e) => SelfRegisterOutcome::Error {
-                detail: format!("add: {e}"),
-            },
-        },
-    }
-}
-
-/// Register blackbox in Vibe's config.toml. Vibe has no `mcp add/list`
-/// CLI; its MCP servers live as an inline-table array in
-/// `~/.vibe/config.toml`:
-///   `mcp_servers = [ { name = "blackbox", transport = "http", url = "..." }, ... ]`
-/// Honors `VIBE_HOME` env. If the config file doesn't exist, returns
-/// NotInstalled (don't create it from scratch just for our entry —
-/// that's vibe's job).
-fn register_vibe_file_based(name: &str, url: &str) -> SelfRegisterOutcome {
-    let vibe_home = std::env::var("VIBE_HOME")
-        .ok()
-        .map(std::path::PathBuf::from);
-    let config_path = match vibe_home {
-        Some(p) => p.join("config.toml"),
-        None => match dirs::home_dir() {
-            Some(h) => h.join(".vibe").join("config.toml"),
-            None => {
-                return SelfRegisterOutcome::Error {
-                    detail: "no home dir".into(),
-                };
-            }
-        },
-    };
-
-    if !config_path.exists() {
-        return SelfRegisterOutcome::NotInstalled {
-            detail: format!("{} does not exist", config_path.display()),
-        };
-    }
-
-    let raw = match std::fs::read_to_string(&config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            return SelfRegisterOutcome::Error {
-                detail: format!("read {}: {e}", config_path.display()),
-            };
-        }
-    };
-
-    let mut doc: toml_edit::DocumentMut = match raw.parse() {
-        Ok(d) => d,
-        Err(e) => {
-            return SelfRegisterOutcome::Error {
-                detail: format!("parse {}: {e}", config_path.display()),
-            };
-        }
-    };
-
-    // mcp_servers is an array of inline tables.
-    let servers = match doc.get_mut("mcp_servers") {
-        Some(toml_edit::Item::Value(toml_edit::Value::Array(arr))) => arr.clone(),
-        Some(_) => {
-            return SelfRegisterOutcome::Error {
-                detail: "mcp_servers is not an array".into(),
-            };
-        }
-        None => toml_edit::Array::new(),
-    };
-
-    // Scan for an existing entry with our name.
-    let mut found_index: Option<usize> = None;
-    for (i, item) in servers.iter().enumerate() {
-        if let toml_edit::Value::InlineTable(t) = item {
-            if t.get("name").and_then(|v| v.as_str()) == Some(name) {
-                found_index = Some(i);
-                break;
-            }
-        }
-    }
-
-    let mut new_servers = servers.clone();
-    let outcome = match found_index {
-        Some(i) => {
-            let existing_url = new_servers.get(i).and_then(|v| {
-                if let toml_edit::Value::InlineTable(t) = v {
-                    t.get("url").and_then(|x| x.as_str()).map(String::from)
-                } else {
-                    None
-                }
-            });
-            if existing_url.as_deref() == Some(url) {
-                return SelfRegisterOutcome::Unchanged;
-            }
-            // Drift — rewrite the entry in place.
-            let mut entry = toml_edit::InlineTable::new();
-            entry.insert("name", toml_edit::Value::from(name));
-            entry.insert("transport", toml_edit::Value::from("http"));
-            entry.insert("url", toml_edit::Value::from(url));
-            let _ = new_servers.replace(i, toml_edit::Value::InlineTable(entry));
-            SelfRegisterOutcome::Updated
-        }
-        None => {
-            let mut entry = toml_edit::InlineTable::new();
-            entry.insert("name", toml_edit::Value::from(name));
-            entry.insert("transport", toml_edit::Value::from("http"));
-            entry.insert("url", toml_edit::Value::from(url));
-            new_servers.push(toml_edit::Value::InlineTable(entry));
-            SelfRegisterOutcome::Added
-        }
-    };
-
-    doc["mcp_servers"] = toml_edit::Item::Value(toml_edit::Value::Array(new_servers));
-
-    if let Err(e) = std::fs::write(&config_path, doc.to_string()) {
-        return SelfRegisterOutcome::Error {
-            detail: format!("write {}: {e}", config_path.display()),
-        };
-    }
-
-    outcome
 }
 
 /// Default timeout for provider CLI invocations. MCP CRUD calls
@@ -1675,29 +1410,6 @@ mod tests {
             }
             _ => panic!("expected Http variant"),
         }
-    }
-
-    #[test]
-    fn self_register_outcome_distinguishes_not_installed_from_list_failed() {
-        let r = SelfRegisterReport {
-            per_provider: vec![
-                (
-                    Provider::Claude,
-                    SelfRegisterOutcome::NotInstalled {
-                        detail: "spawn err".into(),
-                    },
-                ),
-                (
-                    Provider::Codex,
-                    SelfRegisterOutcome::ListFailed {
-                        detail: "exit 1".into(),
-                    },
-                ),
-            ],
-        };
-        let s = r.summary();
-        assert!(s.contains("not-installed"));
-        assert!(s.contains("list-failed"));
     }
 
     #[test]

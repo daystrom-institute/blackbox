@@ -1543,33 +1543,23 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Tool reference sync failed: {e:#}"),
     }
 
-    // Register blackbox in each installed provider's MCP config so that
-    // every `{provider} ...` invocation (dispatched bros or interactive
-    // sessions) sees the daemon without requiring user-managed config.
-    // Resolves the "subprocessed bros don't see bbox tools" gap
-    // discovered in the self-test pass.
     let bbox_url = format!("http://{}:{}/mcp", cfg.daemon.bind, cfg.daemon.port);
     let bbox_mcp_name = cfg.daemon.mcp_name.clone();
     // Export for provider arg-builders so they can inject `--mcp-config`
-    // etc. at dispatch time — ensures dispatched subprocesses see
-    // blackbox regardless of which config file their CLI inherits.
+    // etc. at dispatch time. Provider-owned MCP config files are never
+    // rewritten on daemon startup; persistent registration is user-owned
+    // or happens only through explicit `bro_mcp` calls.
     unsafe {
         std::env::set_var("BLACKBOX_MCP_URL", &bbox_url);
     }
     unsafe {
         std::env::set_var("BLACKBOX_MCP_NAME", &bbox_mcp_name);
     }
-    let report = orchestration::mcp::self_register_blackbox(&bbox_mcp_name, &bbox_url);
     tracing::info!(
-        "blackbox MCP self-registration (name={}): {}",
+        "blackbox MCP dispatch injection configured (name={}, url={})",
         bbox_mcp_name,
-        report.summary()
+        bbox_url
     );
-    for (p, outcome) in &report.per_provider {
-        if let orchestration::mcp::SelfRegisterOutcome::Error { detail } = outcome {
-            tracing::warn!("self-register {p}: {detail}");
-        }
-    }
 
     // Sweep orphaned Gemini policy tempfiles from crashed/force-killed
     // dispatches. Files younger than 24h are kept in case they belong
