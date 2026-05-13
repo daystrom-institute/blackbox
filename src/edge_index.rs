@@ -107,6 +107,24 @@ impl EdgeIndex {
         index
     }
 
+    pub fn load_sidecar_edges(
+        &mut self,
+        edges_dir: &Path,
+        registered_project_ids: Option<&HashSet<String>>,
+        seen: &mut HashSet<Edge>,
+    ) {
+        match crate::manifest::try_load_manifest_index(edges_dir) {
+            Ok(manifest_index) => {
+                let active_paths = manifest_index.active_materialized_paths(edges_dir);
+                self.load_manifest_active_paths(&active_paths, seen);
+                self.load_legacy_explicit_edges(edges_dir, registered_project_ids, seen);
+            }
+            Err(_) => {
+                self.project_sidecar_edges(edges_dir, registered_project_ids, seen);
+            }
+        }
+    }
+
     #[allow(dead_code)]
     pub fn forward_edges(&self, source: &EntityRef) -> &[Edge] {
         self.forward.get(source).map(Vec::as_slice).unwrap_or(&[])
@@ -2704,7 +2722,7 @@ mod tests {
     }
 
     #[test]
-    fn manifest_mode_active_snapshot_loads_edges() {
+    fn load_sidecar_manifest_mode_active_snapshot_loads_edges() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
@@ -2724,6 +2742,23 @@ mod tests {
             .join("head-old");
         write_jsonl(&inactive_dir.join("project.jsonl"), &[&inactive_edge]);
 
+        let manifest = crate::manifest::WorkspaceManifest {
+            version: 1,
+            project_id: "p1".into(),
+            repo_id: None,
+            canonical_path: None,
+            git_common_dir: None,
+            git_worktree_dir: None,
+            branch: Some("main".into()),
+            head_sha: Some("abc".into()),
+            dirty: false,
+            dirty_fingerprint: None,
+            active_snapshot_id: Some("head-abc".into()),
+            active_dirty_overlay_id: None,
+            updated_at: None,
+        };
+        crate::manifest::WorkspaceManifest::write_to(edges_dir, &manifest).unwrap();
+
         let mut idx = crate::manifest::ManifestIndex::new();
         idx.upsert_workspace(
             "p1",
@@ -2738,8 +2773,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        let active_paths = idx.active_materialized_paths(edges_dir);
-        index.load_manifest_active_paths(&active_paths, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen);
 
         let active_source = EntityRef::Knowledge {
             id: "k_active".into(),
@@ -2750,17 +2784,17 @@ mod tests {
         assert_eq!(
             index.forward_edges(&active_source).len(),
             1,
-            "active snapshot edge must load"
+            "active snapshot edge must load via load_sidecar_edges"
         );
         assert_eq!(
             index.forward_edges(&stale_source).len(),
             0,
-            "inactive snapshot edge must NOT load"
+            "inactive snapshot edge must NOT load via load_sidecar_edges"
         );
     }
 
     #[test]
-    fn manifest_mode_corrupt_index_falls_back_safely() {
+    fn load_sidecar_corrupt_index_falls_back_to_legacy() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
@@ -2777,7 +2811,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(edges_dir, None, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen);
 
         let source = EntityRef::Knowledge {
             id: "k_legacy".into(),
@@ -2785,12 +2819,12 @@ mod tests {
         assert_eq!(
             index.forward_edges(&source).len(),
             1,
-            "corrupt manifest must fall back to legacy loading"
+            "corrupt manifest must fall back to legacy loading via load_sidecar_edges"
         );
     }
 
     #[test]
-    fn manifest_mode_missing_is_not_error() {
+    fn load_sidecar_missing_manifest_uses_legacy() {
         let dir = tempfile::tempdir().unwrap();
         let edges_dir = dir.path();
 
@@ -2799,7 +2833,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(edges_dir, None, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen);
 
         let source = EntityRef::Knowledge {
             id: "k_explicit".into(),
@@ -2807,7 +2841,43 @@ mod tests {
         assert_eq!(
             index.forward_edges(&source).len(),
             1,
-            "missing manifest must fall back to legacy loading"
+            "missing manifest must fall back to legacy loading via load_sidecar_edges"
+        );
+    }
+
+    #[test]
+    fn load_sidecar_stale_manifest_falls_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        let legacy_edge = make_explicit_edge_line("k_stale_test", "DESCRIBES", "k_target");
+        write_jsonl(&edges_dir.join("p1.jsonl"), &[&legacy_edge]);
+
+        let mut idx = crate::manifest::ManifestIndex::new();
+        idx.upsert_workspace(
+            "p1",
+            crate::manifest::WorkspaceIndexEntry {
+                manifest: "workspace/p1/manifest.json".into(),
+                active_snapshot: None,
+                dirty_overlay: Some(
+                    "workspace/p1/dirty-overlay/does-not-exist".into(),
+                ),
+                repo_materialization: None,
+            },
+        );
+        idx.write_atomic(edges_dir).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.load_sidecar_edges(edges_dir, None, &mut seen);
+
+        let source = EntityRef::Knowledge {
+            id: "k_stale_test".into(),
+        };
+        assert_eq!(
+            index.forward_edges(&source).len(),
+            1,
+            "stale manifest (missing dirty_overlay) must fall back to legacy loading"
         );
     }
 }
