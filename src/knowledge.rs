@@ -1617,6 +1617,7 @@ impl Knowledge {
     /// Body for the shared global include: provider-neutral global entries only.
     fn render_global_common_body(&self) -> Result<String> {
         let mut md = String::new();
+        render_global_common_core_rules(&mut md);
         self.render_steerage_filtered("agents", ScopeFilter::Global, &mut md, |e| {
             e.providers.is_empty()
         });
@@ -2048,6 +2049,12 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
         out.push_str(content);
         out.push_str("\n\n");
     }
+}
+
+fn render_global_common_core_rules(out: &mut String) {
+    out.push_str("## Critical Instructions\n\n");
+    out.push_str("**Report Blackbox substrate gaps with gap notes.**\n\n");
+    out.push_str("When blackbox itself is missing a reusable capability — tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, rendered instruction, or runbook — file a gap note, not an ad hoc TODO. First dedupe with `bbox_notes(kind=\"followup\", query=\"blackbox.gap_note.v1\", include_addressed=false)`, then call `bbox_note(kind=\"followup\")` with a `blackbox.gap_note.v1` JSON body. Use `bbox_packet_gap` only for packet AST expressiveness gaps while authoring packets. Pull `sm-gap-notes` via `bbox_knowledge` for the full envelope and lifecycle.\n\n");
 }
 
 fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
@@ -3148,6 +3155,20 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(!claude.contains("provider-neutral global body"));
         assert!(!common.contains("bb:entry"));
         assert!(!claude.contains("bb:entry"));
+    }
+
+    #[test]
+    fn render_global_common_body_includes_gap_note_core_rule() {
+        let (_tmp, kb) = mk_kb();
+        let common = kb.render_global_common_body().unwrap();
+
+        assert!(common.starts_with("## Critical Instructions"));
+        assert!(common.contains("Report Blackbox substrate gaps with gap notes"));
+        assert!(common.contains("blackbox.gap_note.v1"));
+        assert!(common.contains("bbox_note(kind=\"followup\")"));
+        assert!(common.contains("bbox_notes(kind=\"followup\""));
+        assert!(common.contains("bbox_packet_gap"));
+        assert!(common.contains("sm-gap-notes"));
     }
 
     #[test]
