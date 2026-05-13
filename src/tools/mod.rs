@@ -1,5 +1,6 @@
 pub mod agents;
 pub mod artifacts;
+pub mod atoms;
 pub mod attention;
 pub mod badgey;
 pub mod badgey_adapter;

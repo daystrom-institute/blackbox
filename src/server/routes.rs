@@ -1051,6 +1051,29 @@ pub(crate) async fn install_artifact_value(
             );
             installed_agent = Some((agent_ref, manifest, install_warnings));
         }
+        artifacts::ArtifactKind::Atom => {
+            if !value.is_object() {
+                anyhow::bail!("atom artifact must be a JSON object");
+            }
+            let catalog = state.artifacts.read();
+            let ctx = orchestration::atoms::validate::InstallCtx {
+                brofile_exists: |name: &str| -> bool {
+                    catalog
+                        .metadata_for(artifacts::ArtifactKind::Brofile, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
+                },
+                atom_exists: |name: &str| -> bool {
+                    catalog
+                        .metadata_for(artifacts::ArtifactKind::Atom, name)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|m| m.active)
+                },
+            };
+            orchestration::atoms::validate::validate_atom_install(&value, &ctx)?;
+        }
     }
     let mut meta = state
         .artifacts
@@ -1206,6 +1229,9 @@ pub(crate) fn deactivate_artifact(
         }
         artifacts::ArtifactKind::Agent => {
             // No separate registry to deactivate for agents (yet).
+        }
+        artifacts::ArtifactKind::Atom => {
+            // No separate registry to deactivate for atoms (yet).
         }
         artifacts::ArtifactKind::Team => {
             // Teams are stored purely as artifacts; no separate registry to deactivate.

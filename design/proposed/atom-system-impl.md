@@ -124,7 +124,7 @@ or be replaced:
 - `src/tool_docs.rs`
 - `examples/mcp-surfaces/*`
 - `schema/workflow.schema.json`
-- `examples/agents/refactor/*.json`
+- `examples/atoms/refactor/*.json` (canonical atom path; `examples/agents/refactor/` is the legacy agent-only path)
 - `src/system_memory/refactor*.md`
 
 0.2 **Current behavior snapshot.** Use `bbox_code_symbols` and

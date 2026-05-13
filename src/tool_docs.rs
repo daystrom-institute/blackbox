@@ -557,8 +557,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a workflow, packet, brofile, or agent artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
-        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, or brofile registry (agent artifacts receive basic JSON validation), then records version/source/supersession metadata in the catalog.",
+        summary: "Install a workflow, packet, brofile, agent, atom, or team artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under examples/agentic-corpus, examples/atoms, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, or team path, then records version/source/supersession metadata in the catalog.",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="examples/agentic-corpus/workflows/schema-migration-arc.json")"#,
         ),
@@ -566,7 +566,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_list",
         category: ToolCategory::Artifacts,
-        summary: "List installed workflow, packet, brofile, and agent artifacts with version, source, active status, and supersession metadata.",
+        summary: "List installed workflow, packet, brofile, agent, atom, and team artifacts with version, source, active status, and supersession metadata.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
         example: Some(r#"bbox_artifact_list(kind="packet")"#),
     },
@@ -1074,6 +1074,35 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         summary: "Dispatch a registered agent for a focused task. Routes through manifest dispatch_adapter if set, otherwise resolves brofile, merges filters, expands prompt template, and spawns via the standard bro execution path. Returns task_id, session, and agent attribution (agentLabel on the spawned task, preserved even when bro= routes to a named team member).",
         when_to_use: "Dispatching an agent after discovery via bro_agent_search. Returns (task_id, session) — resume with bro_resume, status with bro_status. Prefer over hand-rolling a brofile + bro_exec when the task matches an agent's description and when_to_use. Anti-pattern: do not dispatch when the agent's manifest declares one of your task's properties as an anti_pattern.",
         example: Some(r#"bro_agent_dispatch(agent="code-reviewer", args={"diff": "..."})"#),
+    },
+    // ── Atoms ───────────────────────────────────────────────────
+    ToolDoc {
+        name: "atom_list",
+        category: ToolCategory::Orchestration,
+        summary: "List installed atoms from the registry. Optional filters for cost_class, provenance_kind, subcontract, include_superseded, and limit.",
+        when_to_use: "Discover what typed capabilities (atoms) are available. Filter by subcontract to find e.g. refactor atoms (subcontract=\"refactor/v1\"). Use include_superseded=true to see version history.",
+        example: Some(r#"atom_list(subcontract="refactor/v1")"#),
+    },
+    ToolDoc {
+        name: "atom_get",
+        category: ToolCategory::Orchestration,
+        summary: "Read full details for a single atom by name or atom-ref (atom:name@vN, atom:name@latest, or bare name). Returns manifest, metadata, lifecycle state, and subcontract.",
+        when_to_use: "Inspect a specific atom's manifest (implementation, effects, composition, inputs/outputs, supervision, trace) before invoking or composing it.",
+        example: Some(r#"atom_get(name="atom:rust-test-island-extract@v1")"#),
+    },
+    ToolDoc {
+        name: "atom_describe",
+        category: ToolCategory::Orchestration,
+        summary: "Full manifest + implementation details for one atom. Returns the complete manifest including effects, composition constraints, supervision policy, and any install warnings.",
+        when_to_use: "Pre-invocation inspection: understand the full contract an atom exposes — what it accepts, what it returns, what effects it may perform, and which atoms it may invoke.",
+        example: Some(r#"atom_describe(atom="rust-test-island-extract")"#),
+    },
+    ToolDoc {
+        name: "atom_search",
+        category: ToolCategory::Orchestration,
+        summary: "Search installed atoms by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores and provenance.",
+        when_to_use: "Discovery: find atoms relevant to a task. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits. Filter by cost_class, provenance_kind, or subcontract to narrow results.",
+        example: Some(r#"atom_search(query="extract inline tests from Rust files", limit=3)"#),
     },
     // ── Whiteboards ─────────────────────────────────────────────
     ToolDoc {
@@ -1724,6 +1753,7 @@ mod tests {
                     || n.starts_with("badgey_")
                     || n.starts_with("whiteboard_")
                     || n.starts_with("work_")
+                    || n.starts_with("atom_")
                 {
                     out.push((n, d));
                 }

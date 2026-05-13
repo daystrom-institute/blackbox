@@ -149,6 +149,7 @@ impl BlackboxServer {
                 + tools::whiteboards::router()
                 + tools::badgey::router()
                 + tools::agents::router()
+                + tools::atoms::router()
                 + tools::orchestrate::router()
                 + tools::councils::router()
                 + tools::roster::router()

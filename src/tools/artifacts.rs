@@ -9,7 +9,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_artifact_install",
-        description = "Install a workflow, packet, brofile, or agent artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
+        description = "Install a workflow, packet, brofile, agent, atom, or team artifact from a local JSON file path or http(s) URL into the versioned artifact catalog."
     )]
     pub(crate) async fn bbox_artifact_install(
         &self,
@@ -23,7 +23,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_artifact_list",
-        description = "List installed workflow, packet, brofile, and agent artifacts with version, source, active status, and supersession metadata."
+        description = "List installed workflow, packet, brofile, agent, atom, and team artifacts with version, source, active status, and supersession metadata."
     )]
     pub(crate) fn bbox_artifact_list(
         &self,

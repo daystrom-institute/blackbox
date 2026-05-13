@@ -662,3 +662,46 @@ pub(crate) struct AdvisorCheckpoint {
     pub(crate) members: Vec<AdvisorMemberCheckpoint>,
     pub(crate) notes: AdvisorNoteSummary,
 }
+
+// ---------------------------------------------------------------------------
+// Atom read tools
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomListParams {
+    #[serde(default)]
+    pub(crate) include_superseded: Option<bool>,
+    #[serde(default)]
+    pub(crate) cost_class: Option<String>,
+    #[serde(default)]
+    pub(crate) provenance_kind: Option<String>,
+    #[serde(default)]
+    pub(crate) subcontract: Option<String>,
+    #[serde(default)]
+    pub(crate) limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomGetParams {
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomDescribeParams {
+    pub(crate) atom: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AtomSearchParams {
+    pub(crate) query: String,
+    #[serde(default)]
+    pub(crate) limit: Option<u64>,
+    #[serde(default)]
+    pub(crate) cost_class: Option<String>,
+    #[serde(default)]
+    pub(crate) provenance_kind: Option<String>,
+    #[serde(default)]
+    pub(crate) subcontract: Option<String>,
+    #[serde(default)]
+    pub(crate) exclude_anti_pattern_matches: Option<bool>,
+}

@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod atoms;
 pub mod badgey;
 pub mod brofile;
 pub mod http_fetch;

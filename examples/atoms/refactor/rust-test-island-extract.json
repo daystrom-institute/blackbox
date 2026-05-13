@@ -1,8 +1,9 @@
 {
-  "kind": "agent",
+  "_contract": "atom/v1",
+  "kind": "atom",
   "name": "rust-test-island-extract",
   "version": 1,
-  "_contract": "refactor-atom/v1",
+  "subcontract": "refactor/v1",
   "manifest": {
     "description": "Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files declared via mod tests; in the source's parent module.",
     "when_to_use": [
@@ -15,11 +16,6 @@
       "do not use for crate-level integration tests (those belong in tests/, not src/tests/*.rs)",
       "do not use on non-Rust files"
     ],
-    "brofile_ref": "rust-refactor-persona",
-    "filter_overlay": {
-      "allow": [],
-      "disallow": []
-    },
     "inputs": {
       "schema": {
         "type": "object",
@@ -47,7 +43,7 @@
           }
         }
       },
-      "prompt_template": "You are rust-test-island-extract. Charter: Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"\",\n                     languages=[\"rust\"], item_kinds=[\"mod_item\"])\n   bbox_refactor_status(file=\"{{source_file_or_dir}}\", project_dir=\"{{project_dir}}\")\n   Identify mod_items annotated #[cfg(test)] (typically `mod tests`). Copy\n   exact `name`/`kind`/byte_range values. If the test block references items\n   via super::super::* or otherwise outside its parent module's scope, RECORD\n   THE REFS — those don't survive a sibling move.\n\n2. Plan with deep_analysis=true (extract_rust_items moves the cfg(test) mod item):\n   bbox_refactor_plan(kind=\"extract_rust_items\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file_or_dir}}\",\n                      target=\"{{target_dir}}/<basename>.rs\",\n                      item_names=[\"<cfg-test-mod-name>\"])\n   Then plan add_rust_mod_decl for `#[cfg(test)] mod tests;` in the source.\n\n3. Decide:\n   - If grounding step 1 found super::super::* or sibling-incompatible refs,\n     save the plan via output_path, emit bbox_note(kind=\"blocked\",\n     body=<concrete diagnostic naming the offending refs + plan_path>) and\n     return status=\"blocked\".\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_rust_items step>,\n     <add_rust_mod_decl step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true}\n   ])\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: extracted_test_files count,\n     refs_preserved, cargo result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside your filter_overlay.\n- Never extract into crate-level tests/ — that breaks private-item access.\n- Never proceed when grounding found super::super::* refs.\n- Never apply when status=blocked.\n\nInputs:\n{{project_dir}} {{source_file_or_dir}} {{target_dir}} {{apply}} {{validation_bin}}"
+      "prompt_template": "You are rust-test-island-extract. Charter: Peel inline #[cfg(test)] mod tests blocks into sibling src/tests/*.rs files.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"\",\n                     languages=[\"rust\"], item_kinds=[\"mod_item\"])\n   bbox_refactor_status(file=\"{{source_file_or_dir}}\", project_dir=\"{{project_dir}}\")\n   Identify mod_items annotated #[cfg(test)] (typically `mod tests`). Copy\n   exact `name`/`kind`/byte_range values. If the test block references items\n   via super::super::* or otherwise outside its parent module's scope, RECORD\n   THE REFS — those don't survive a sibling move.\n\n2. Plan with deep_analysis=true (extract_rust_items moves the cfg(test) mod item):\n   bbox_refactor_plan(kind=\"extract_rust_items\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file_or_dir}}\",\n                      target=\"{{target_dir}}/<basename>.rs\",\n                      item_names=[\"<cfg-test-mod-name>\"])\n   Then plan add_rust_mod_decl for `#[cfg(test)] mod tests;` in the source.\n\n3. Decide:\n   - If grounding step 1 found super::super::* or sibling-incompatible refs,\n     save the plan via output_path, emit bbox_note(kind=\"blocked\",\n     body=<concrete diagnostic naming the offending refs + plan_path>) and\n     return status=\"blocked\".\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(confirm=true, steps=[\n     <extract_rust_items step>,\n     <add_rust_mod_decl step>,\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\n      \"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"diagnostics_ref\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"on_failure\":\"optional\"}\n   ], title=\"rust-test-island-extract for {{source_file_or_dir}}\")\n\n5. Report:\n   Emit bbox_note(kind=\"done\", body=<summary with files_touched, fixme_count,\n   cargo_result, extracted_test_files>).\n\nGuardrails:\n- NEVER touch files outside the target dir or source file.\n- NEVER delete the source file — only remove the inline test block.\n- If cargo check fails after apply, the continue_for_repair + rust_compile_fix_round\n  will attempt automated fixes. If that fails, the run rolls back.\n- ALWAYS validate that extracted test files compile before reporting done."
     },
     "outputs": {
       "schema": {
@@ -95,9 +91,25 @@
       },
       "evidence_density": "high"
     },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 0,
+      "max_depth": 0,
+      "uses_network": false
+    },
     "composition": {
-      "chainable_after": [],
-      "parallel_safe": false
+      "may_invoke_atoms": { "kind": "none" }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
     },
     "cost_class": "normal",
     "provenance": {
