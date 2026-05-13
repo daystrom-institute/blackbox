@@ -1978,7 +1978,8 @@ general install order and supersession; this section focuses on refactor choices
 <div class="highlight"><pre><span></span><code><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a>bbox_artifact_install(kind=&quot;brofile&quot;, source=&quot;system-defaults/brofiles/refactor/java-refactor-persona.json&quot;)
 <a id="__codelineno-9-2" name="__codelineno-9-2" href="#__codelineno-9-2"></a>bbox_artifact_install(kind=&quot;brofile&quot;, source=&quot;system-defaults/brofiles/refactor/rust-refactor-persona.json&quot;)
 <a id="__codelineno-9-3" name="__codelineno-9-3" href="#__codelineno-9-3"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/java-extract-cohesive-class.json&quot;)
-<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/rust-split-god-impl.json&quot;)
+<a id="__codelineno-9-4" name="__codelineno-9-4" href="#__codelineno-9-4"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/java-rename-symbol.json&quot;)
+<a id="__codelineno-9-5" name="__codelineno-9-5" href="#__codelineno-9-5"></a>bbox_artifact_install(kind=&quot;atom&quot;, source=&quot;system-defaults/atoms/refactor/rust-split-god-impl.json&quot;)
 </code></pre></div>
 <p>They are profile-backed atoms, so each invocation starts a brofile-backed
 provider task and returns a resumable atom handle. The atom input schema is the
@@ -2006,6 +2007,14 @@ agent follows.</p>
 <td>Extract an interface and optionally migrate callers to the interface type.</td>
 </tr>
 <tr>
+<td><code>atom:java-extract-methods-light@v1</code></td>
+<td>Move selected methods to a target class without delegate wiring or caller rewrites.</td>
+</tr>
+<tr>
+<td><code>atom:java-extract-static-nested-class@v1</code></td>
+<td>Move static or implicitly-static nested types to top-level Java files.</td>
+</tr>
+<tr>
 <td><code>atom:java-find-usages@v1</code></td>
 <td>Walk references for one or more Java names.</td>
 </tr>
@@ -2014,12 +2023,20 @@ agent follows.</p>
 <td>Convert hand-written POJO boilerplate to Lombok where semantics are safe.</td>
 </tr>
 <tr>
+<td><code>atom:java-organize-imports@v1</code></td>
+<td>Organize Java imports through JDTLS with the structural fallback.</td>
+</tr>
+<tr>
 <td><code>atom:java-promote-inner-class@v1</code></td>
 <td>Promote a non-static inner class with outer captures to a top-level class.</td>
 </tr>
 <tr>
 <td><code>atom:java-public-api-guard@v1</code></td>
 <td>Report public API impact before a Java refactor.</td>
+</tr>
+<tr>
+<td><code>atom:java-rename-symbol@v1</code></td>
+<td>Project-wide Java symbol rename with usage inventory, public-API preflight, optional file rename handling, and validation.</td>
 </tr>
 </tbody>
 </table>
