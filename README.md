@@ -13,14 +13,13 @@ Voyage `voyage-code-3` (1024d) is the default embedding provider; Ollama
 `nomic-embed-text` (768d) supported as a local fallback.
 
 The crate is `blackbox`. It produces two binaries:
-- **`blackboxd`** — HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)
-- **`bro`** — terminal TUI for tailing live orchestration activity
+- **`blackboxd`** - HTTP-MCP daemon (one long-lived user service, shared across all CLIs on the host)
+- **`bro`** - terminal TUI for tailing live orchestration activity
 
-**For deep operating notes** — agentic graph internals, hybrid retrieval
-internals, embedding pipeline + voyage/ollama config, schema migration
-flow, upkeep checklist, key paths on disk, system memories index,
-provider integration matrix — see
-[`docs/operating-blackbox.md`](docs/operating-blackbox.md).
+**For day-2 operations** - reindexing, re-embedding, compaction,
+post-update checks, key paths, and restore boundaries - see
+[`docs/operating-blackbox.md`](docs/operating-blackbox.md). For design
+mechanics, start at [`docs/internals.md`](docs/internals.md).
 
 ---
 
@@ -145,7 +144,7 @@ provider-specific env var when the CLI supports one.
 
 The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at the same URL.
 
-**Claude Code** — `~/.claude*/.claude.json`:
+**Claude Code** - `~/.claude*/.claude.json`:
 ```json
 {
   "mcpServers": {
@@ -154,7 +153,7 @@ The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at 
 }
 ```
 
-**Codex CLI** — `~/.codex/config.toml`:
+**Codex CLI** - `~/.codex/config.toml`:
 ```toml
 [mcp_servers.blackbox]
 url = "http://127.0.0.1:7264/mcp"
@@ -177,7 +176,7 @@ For a dev daemon, add a separate MCP entry instead of replacing prod:
 
 `bbox_bootstrap` scans an existing repo's instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `PROJECT.md`, any headings it can identify) and migrates them into the unified knowledge store as discrete entries, preserving scope (global vs project) and category.
 
-From any connected CLI, run the MCP tool directly — for example in Claude Code:
+From any connected CLI, run the MCP tool directly - for example in Claude Code:
 
 ```
 bbox_bootstrap(project: "/home/you/repos/my-app")
@@ -193,15 +192,15 @@ Rewrite the provider instruction files from the canonical store so every agent s
 bbox_render(scope: "both", project: "/home/you/repos/my-app")
 ```
 
-- **`scope=global`** — patches `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including RTK `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
-- **`scope=project`** — writes `<repo>/{CLAUDE,AGENTS,GEMINI}.md` with **only** project-scope entries + verbatim `PROJECT.md` content. Global entries aren't duplicated per project.
-- **`scope=both`** — both. Useful on first install or for a forced re-sync.
+- **`scope=global`** - patches `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including RTK `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
+- **`scope=project`** - writes `<repo>/{CLAUDE,AGENTS,GEMINI}.md` with **only** project-scope entries + verbatim `PROJECT.md` content. Global entries aren't duplicated per project.
+- **`scope=both`** - both. Useful on first install or for a forced re-sync.
 
 From this point on: `bbox_learn` / `bbox_remember` to add or update, `bbox_render` to push changes out to provider files, `bbox_absorb` to pull external edits back in. See [Knowledge lifecycle](#knowledge-lifecycle) below for the full loop.
 
 ### 6. Migrate hand-authored content (one-time, per scope)
 
-> **Critical**: pre-existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content is **not deleted** by `bbox_bootstrap` or `bbox_render`. Without explicit migration, the same rules end up in the file **twice** — once as your original prose, once again rendered inside the bbox managed region. Agents read both and get confused.
+> **Critical**: pre-existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content is **not deleted** by `bbox_bootstrap` or `bbox_render`. Without explicit migration, the same rules end up in the file **twice** - once as your original prose, once again rendered inside the bbox managed region. Agents read both and get confused.
 
 The migration loop is the same for global and project scope:
 
@@ -220,7 +219,7 @@ The migration loop is the same for global and project scope:
    ```
 4. **Prune** the original hand-authored content from the file:
    - **Global** files: delete content **inside** the managed region that's now also stored in bbox; leave RTK `@imports` and your own notes outside the markers untouched.
-   - **Project** files (`<repo>/CLAUDE.md` etc.): if you want everything bbox-managed, delete the entire file's contents — `bbox_render scope=project` will recreate it from the store. If you want a hybrid, leave the section above the managed region.
+   - **Project** files (`<repo>/CLAUDE.md` etc.): if you want everything bbox-managed, delete the entire file's contents - `bbox_render scope=project` will recreate it from the store. If you want a hybrid, leave the section above the managed region.
 5. **Render** to confirm a clean output:
    ```
    bbox_render(scope: "both", project: "/home/you/repos/my-app")
@@ -232,7 +231,7 @@ After step 5 the rendered file should match the bbox managed region with no dupl
 
 ## Knowledge lifecycle
 
-Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) as *rendered outputs* of a single canonical store — not as sources of truth. This lets every agent on the host see consistent content, lets you edit in any file and have it reconciled, and keeps provider-specific quirks (Copilot's greedy reading, Gemini's unsupported global memory) handled in one place.
+Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) as *rendered outputs* of a single canonical store - not as sources of truth. This lets every agent on the host see consistent content, lets you edit in any file and have it reconciled, and keeps provider-specific quirks (Copilot's greedy reading, Gemini's unsupported global memory) handled in one place.
 
 ```
   edit from a CLI               edit in a rendered file
@@ -256,9 +255,9 @@ Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMI
 
 | Tool | When to use |
 |---|---|
-| **`bbox_bootstrap`** | New repo — scan existing instruction files and import as entries. Run once per repo. |
+| **`bbox_bootstrap`** | New repo - scan existing instruction files and import as entries. Run once per repo. |
 | **`bbox_learn`** | Add or update an entry. Entry will be rendered into provider markdown on next `bbox_render`. |
-| **`bbox_remember`** | Store an on-demand fact. **NOT rendered** into markdown — searchable via `bbox_knowledge` only. |
+| **`bbox_remember`** | Store an on-demand fact. **NOT rendered** into markdown - searchable via `bbox_knowledge` only. |
 | **`bbox_knowledge`** | List / search entries with category / scope / provider filters. |
 | **`bbox_render`** | Emit the canonical store back to provider instruction files (global / project / both). |
 | **`bbox_absorb`** | Detect external edits to rendered files and import them as unverified entries. `scope=project` (default) reads the whole `<repo>/{CLAUDE,AGENTS,GEMINI}.md`; `scope=global` reads only the managed region of `~/.claude-shared/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md`. |
@@ -266,11 +265,11 @@ Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMI
 | **`bbox_forget`** | Remove or supersede an entry. |
 | **`bbox_lint`** | Health check: contradictions, stale entries, duplicates. |
 
-`bbox_render` is the write step; without it, changes stay in the store and don't reach your agents. `bbox_absorb` is the inverse — handy after you've edited a `CLAUDE.md` directly and want the change captured before a later render overwrites it.
+`bbox_render` is the write step; without it, changes stay in the store and don't reach your agents. `bbox_absorb` is the inverse - handy after you've edited a `CLAUDE.md` directly and want the change captured before a later render overwrites it.
 
 ---
 
-## `bro tail` — multi-lane orchestration TUI
+## `bro tail` - multi-lane orchestration TUI
 
 Live tail one or more bros (named agent instances) side-by-side:
 
@@ -281,11 +280,11 @@ bro tail --provider codex           # all codex bros across all teams
 ```
 
 Each lane seeds from the bro's session JSONL on disk, then follows it live. Displayed per event:
-- Assistant / user / developer text — markdown rendered, code fences syntax-highlighted via `syntect`.
-- Thinking blocks — italicized.
-- Tool use — name + extracted target (Bash→command, Read/Edit/Write→path, Grep→pattern, etc.).
-- Tool result — size, exit code (when present), preview, error-state color.
-- System signals — session init, compaction, hooks, system-reminders, slash commands — rendered as inline dividers so you can see *why* an agent shifted.
+- Assistant / user / developer text - markdown rendered, code fences syntax-highlighted via `syntect`.
+- Thinking blocks - italicized.
+- Tool use - name + extracted target (Bash→command, Read/Edit/Write→path, Grep→pattern, etc.).
+- Tool result - size, exit code (when present), preview, error-state color.
+- System signals - session init, compaction, hooks, system-reminders, slash commands - rendered as inline dividers so you can see *why* an agent shifted.
 
 **Keybindings:**
 
@@ -313,7 +312,7 @@ Five providers at parity: Claude (`.jsonl`), Codex (`.jsonl`), Gemini (`.json` s
 
 ---
 
-## `bro orchestrate` — workflow engine
+## `bro orchestrate` - workflow engine
 
 Protocol-level orchestration: define a workflow as a mermaid
 state-diagram plus actor/node metadata, then dispatch it. The daemon
@@ -340,7 +339,7 @@ MCP surface: `bro_orchestrate_run`, `bro_orchestrate_author`,
 HMAC-SHA256 signature verification (Forgejo / GitHub / None for
 closed networks).
 
-> **See [`WORKFLOWS.md`](WORKFLOWS.md) for the canonical reference** —
+> **See [`WORKFLOWS.md`](WORKFLOWS.md) for the canonical reference** -
 > ArcContext templating, hook ops, Wait/signal correlation,
 > subworkflow imports/exports, capability tags, webhook routing,
 > operator-blessed registries, audit surfaces, and authoring loops.
@@ -353,14 +352,15 @@ closed networks).
 
 ## MCP tools reference
 
-For deep operating notes — agentic graph internals, hybrid retrieval,
-embedding pipeline, schema migration, upkeep checklist, key paths on
-disk, system memories, provider integration matrix, open follow-ups —
-see [`docs/operating-blackbox.md`](docs/operating-blackbox.md).
+For day-2 operations - reindexing, re-embedding, compaction, post-update
+checks, key paths, and restore boundaries - see
+[`docs/operating-blackbox.md`](docs/operating-blackbox.md). For graph,
+retrieval, indexing, and embedding mechanics, start at
+[`docs/internals.md`](docs/internals.md).
 
 ### Agentic graph (`bbox_*`)
 
-The 5-step opening sequence — orient → search → inspect → traverse →
+The 5-step opening sequence - orient → search → inspect → traverse →
 answer. Pull `sm-agentic-opening-sequence` via `bbox_knowledge` for the
 full protocol + question-type checklist.
 
@@ -390,21 +390,21 @@ full protocol + question-type checklist.
 | `bbox_embed_status` | Per-route status: provider, model, dimensions, queue depth, indexed count, last error. |
 | `bbox_stats` | Corpus statistics: document count, index size, per-account file counts. |
 | `bbox_project_register` / `bbox_project_list` | Register a repo root for project_file indexing + git history tracking. |
-| `bbox_cite` | Origin-finding for a rule or claim — returns transcripts oldest-first. |
+| `bbox_cite` | Origin-finding for a rule or claim - returns transcripts oldest-first. |
 
 ### Knowledge store (`bbox_*`)
 
-See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative — quick reference here.
+See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative - quick reference here.
 
 | Tool | Description |
 |---|---|
 | `bbox_bootstrap` | Scan an existing repo's instruction files and migrate them into the knowledge store. |
 | `bbox_learn` | Add / update a knowledge entry. Rendered into provider markdown on next `bbox_render`. |
-| `bbox_remember` | Store a fact for on-demand recall only — NOT rendered into markdown. |
+| `bbox_remember` | Store a fact for on-demand recall only - NOT rendered into markdown. |
 | `bbox_knowledge` | List / search knowledge entries with category / scope / provider filters. |
 | `bbox_render` | Render entries → CLAUDE.md / AGENTS.md / GEMINI.md (steerage → memory → PROJECT.md). |
 | `bbox_absorb` | Detect external edits to rendered files and import them as unverified entries. |
-| `bbox_review` | Review unverified entries — list, approve, reject. |
+| `bbox_review` | Review unverified entries - list, approve, reject. |
 | `bbox_forget` | Remove or supersede an entry. |
 | `bbox_lint` | Health check: contradictions, stale entries, duplicates. |
 
@@ -412,7 +412,7 @@ See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative — quick refe
 
 | Tool | Description |
 |---|---|
-| `bbox_thread` | Manage long-running work threads — friendly names, edges to other threads/sessions, notes. |
+| `bbox_thread` | Manage long-running work threads - friendly names, edges to other threads/sessions, notes. |
 | `bbox_thread_list` | List / scan threads (open / active / stale by default). |
 
 ### Multi-provider orchestration (`bro_*`)
@@ -491,7 +491,7 @@ Full reference and authoring guide in [`WORKFLOWS.md`](WORKFLOWS.md).
 
 Content is capped at 12KB per document. Responses are capped at 80KB to avoid blowing MCP result limits.
 
-`bro tail` reads a richer `TranscriptEvent` model that preserves tool-call structure and out-of-band system signals — the indexer projects that down to the flat `ParsedEvent` shape it needs.
+`bro tail` reads a richer `TranscriptEvent` model that preserves tool-call structure and out-of-band system signals - the indexer projects that down to the flat `ParsedEvent` shape it needs.
 
 ---
 
@@ -499,19 +499,19 @@ Content is capped at 12KB per document. Responses are capped at 80KB to avoid bl
 
 Maintained in `src/orchestration/providers.rs`:
 
-- **Claude** — Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
-- **GLM** — Z.AI Coding Plan API models via OpenCode transport. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
-- **DeepSeek** — DeepSeek API models via OpenCode transport. Defaults to `deepseek/deepseek-v4-pro`, helper model `deepseek/deepseek-chat`, and OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
-- **Inception** — Inception Mercury via OpenCode transport. Exposes only `inception/mercury-2` as the default/tool-capable model, with OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
-- **Codex** — gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
-- **Copilot** — Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
-- **Vibe**, **Gemini** — model lists only.
+- **Claude** - Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
+- **GLM** - Z.AI Coding Plan API models via OpenCode transport. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
+- **DeepSeek** - DeepSeek API models via OpenCode transport. Defaults to `deepseek/deepseek-v4-pro`, helper model `deepseek/deepseek-chat`, and OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
+- **Inception** - Inception Mercury via OpenCode transport. Exposes only `inception/mercury-2` as the default/tool-capable model, with OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
+- **Codex** - gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
+- **Copilot** - Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
+- **Vibe**, **Gemini** - model lists only.
 
 ---
 
 ## Configuration
 
-Auto-detection works out of the box for most setups. Override via environment variables (typically via a systemd unit drop-in — see *Multi-account example* below).
+Auto-detection works out of the box for most setups. Override via environment variables (typically via a systemd unit drop-in - see *Multi-account example* below).
 
 | Env var | Default | Description |
 |---|---|---|
@@ -553,27 +553,27 @@ Then `systemctl --user daemon-reload && systemctl --user restart blackbox`.
 
 ## Transcript schemas (appendix)
 
-**Claude Code** — `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`:
+**Claude Code** - `~/.claude/projects/<encoded-path>/<session-uuid>.jsonl`:
 ```jsonc
 {"type": "user|assistant|system|summary", "message": {...}, "sessionId": "uuid", "timestamp": "ISO-8601", ...}
 ```
 
-**Codex CLI** — `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`:
+**Codex CLI** - `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<uuid>.jsonl`:
 ```jsonc
 {"timestamp": "ISO-8601", "type": "session_meta|response_item|event_msg", "payload": {...}}
 ```
 
-**Gemini** — `~/.gemini/tmp/<project>/chats/session-<ts>-<first8>.json` (single JSON object, not JSONL):
+**Gemini** - `~/.gemini/tmp/<project>/chats/session-<ts>-<first8>.json` (single JSON object, not JSONL):
 ```jsonc
 {"sessionId": "uuid", "messages": [{"id", "timestamp", "type": "user|gemini", "content", "thoughts": [...], ...}]}
 ```
 
-**Copilot** — `~/.copilot/session-state/<full-session-id>/events.jsonl`:
+**Copilot** - `~/.copilot/session-state/<full-session-id>/events.jsonl`:
 ```jsonc
 {"type": "session.start|user.message|assistant.message|tool.execution_start|tool.execution_complete|...", "data": {...}, "id", "timestamp", "parentId"}
 ```
 
-**Vibe** — `~/.vibe/logs/session/session_<date>_<time>_<first8>/messages.jsonl`:
+**Vibe** - `~/.vibe/logs/session/session_<date>_<time>_<first8>/messages.jsonl`:
 ```jsonc
 {"role": "user|assistant|tool", "content": "...", "tool_calls": [...], "tool_call_id": "...", "message_id": "..."}
 ```
@@ -583,24 +583,24 @@ Then `systemctl --user daemon-reload && systemctl --user restart blackbox`.
 ## Architecture
 
 - **Tantivy** for full-text indexing with BM25 ranking, phrase queries, and positional indexing.
-- **Separate documents per content block** — each text / thinking / tool_use block is its own document, enabling role-based filtering and precise excerpts.
+- **Separate documents per content block** - each text / thinking / tool_use block is its own document, enabling role-based filtering and precise excerpts.
 - **Incremental indexing** via file mtime/size tracking; background reindex thread runs every 120s.
-- **MCP over streamable HTTP** — `rmcp` crate as transport, axum for auxiliary `/tail` and `/roster` endpoints. Progress notifications echo the caller's `progressToken` per spec.
-- **Knowledge render pipeline** — three-layer composition (steerage → shared memory → per-project PROJECT.md) into provider-specific markdown, with atomic-replace safety and external-edit absorption.
-- **Multi-provider orchestration** — spawns provider CLIs as child processes, streams JSON events, manages task lifecycle, team coordination, and SSE broadcast to `/tail` subscribers.
-- **Atom registry and invocation** — installable `atom:*@vN` capability artifacts with input/output contracts, effect limits, composition policy, and profile/workflow/deterministic/adapter implementations.
-- **Two-layer transcript model** — `parser::TranscriptEvent` (rich, tool-call structured, system-signal aware) for the `bro tail` TUI; projected to `ParsedEvent` for the flat tantivy doc shape.
-- **No LLM calls** — pure local indexing and retrieval. `bbox_topics` uses term frequency, not embeddings.
+- **MCP over streamable HTTP** - `rmcp` crate as transport, axum for auxiliary `/tail` and `/roster` endpoints. Progress notifications echo the caller's `progressToken` per spec.
+- **Knowledge render pipeline** - three-layer composition (steerage → shared memory → per-project PROJECT.md) into provider-specific markdown, with atomic-replace safety and external-edit absorption.
+- **Multi-provider orchestration** - spawns provider CLIs as child processes, streams JSON events, manages task lifecycle, team coordination, and SSE broadcast to `/tail` subscribers.
+- **Atom registry and invocation** - installable `atom:*@vN` capability artifacts with input/output contracts, effect limits, composition policy, and profile/workflow/deterministic/adapter implementations.
+- **Two-layer transcript model** - `parser::TranscriptEvent` (rich, tool-call structured, system-signal aware) for the `bro tail` TUI; projected to `ParsedEvent` for the flat tantivy doc shape.
+- **No LLM calls** - pure local indexing and retrieval. `bbox_topics` uses term frequency, not embeddings.
 
 Source layout (`src/`):
 
-- **main.rs** — `rmcp` server with `#[tool]`-annotated handlers, axum routes for `/tail` / `/roster`, progress-notifier plumbing, signal handling.
-- **cli.rs** — `bro` binary. Ratatui TUI with per-lane seed-from-history + live follow, tui-markdown + syntect rendering, crossterm mouse capture.
-- **index/** — Tantivy lifecycle, schema, search / browse / session handlers, incremental reindex thread, session-file discovery.
-- **parser.rs** — Claude / Codex / Gemini / Copilot / Vibe JSONL parsers emitting both rich `TranscriptEvent` and flat `ParsedEvent`.
-- **knowledge.rs**, **render.rs** — Knowledge CRUD and three-layer markdown render pipeline.
-- **threads.rs** — Work-thread tracker.
-- **orchestration/** — Provider catalogs, exec/resume arg builders, brofile/team persistence, task lifecycle, tail event stream, bro-name ↔ session-id resolution.
+- **main.rs** - `rmcp` server with `#[tool]`-annotated handlers, axum routes for `/tail` / `/roster`, progress-notifier plumbing, signal handling.
+- **cli.rs** - `bro` binary. Ratatui TUI with per-lane seed-from-history + live follow, tui-markdown + syntect rendering, crossterm mouse capture.
+- **index/** - Tantivy lifecycle, schema, search / browse / session handlers, incremental reindex thread, session-file discovery.
+- **parser.rs** - Claude / Codex / Gemini / Copilot / Vibe JSONL parsers emitting both rich `TranscriptEvent` and flat `ParsedEvent`.
+- **knowledge.rs**, **render.rs** - Knowledge CRUD and three-layer markdown render pipeline.
+- **threads.rs** - Work-thread tracker.
+- **orchestration/** - Provider catalogs, exec/resume arg builders, brofile/team persistence, task lifecycle, tail event stream, bro-name ↔ session-id resolution.
 
 ---
 
@@ -618,10 +618,10 @@ auto-install them; seed only the catalog entries you want with
 
 Drop-in configs for wiring blackbox into agent CLIs live in [`examples/`](examples/README.md):
 
-- **Agents** — [`session-searcher`](examples/agents/session-searcher.md): read-only subagent that keeps transcript digging off your main context window.
-- **Skills / slash commands** — [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals), [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope), and [`overmind`](examples/skills/overmind.md) (meta-orchestration — strategic Advisor above crucible, with a durable spine doc that survives orchestrator compaction; demonstrates the legitimate `allow_recursion=true` pattern).
-- **Workflow shape catalog** — [`examples/workflows/`](examples/workflows/) — runnable single-file specs covering linear, gated, ensemble, fork-join, atom-binding, blind-convergence, optimistic-review, self-audit patterns.
-- **Keystone end-to-end** — [`examples/keystone/`](examples/keystone/README.md) — Forgejo issue → arc → implementer subworkflow → wait → reviewer ensemble → wait-loop until merged → cleanup hooks. Real LLM dispatch. Adaptation guide in the example's README.
+- **Agents** - [`session-searcher`](examples/agents/session-searcher.md): read-only subagent that keeps transcript digging off your main context window.
+- **Skills / slash commands** - [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals), [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope), and [`overmind`](examples/skills/overmind.md) (meta-orchestration - strategic Advisor above crucible, with a durable spine doc that survives orchestrator compaction; demonstrates the legitimate `allow_recursion=true` pattern).
+- **Workflow shape catalog** - [`examples/workflows/`](examples/workflows/) - runnable single-file specs covering linear, gated, ensemble, fork-join, atom-binding, blind-convergence, optimistic-review, self-audit patterns.
+- **Keystone end-to-end** - [`examples/keystone/`](examples/keystone/README.md) - Forgejo issue → arc → implementer subworkflow → wait → reviewer ensemble → wait-loop until merged → cleanup hooks. Real LLM dispatch. Adaptation guide in the example's README.
 
 ---
 

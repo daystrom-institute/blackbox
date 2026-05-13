@@ -40,6 +40,8 @@ nav:
   - How It Works:
     - Operating Guide: operating-blackbox.md
     - Internals: internals.md
+    - Graph And Retrieval Internals: graph-retrieval-internals.md
+    - Index And Embedding Internals: index-embedding-internals.md
     - Operations: operations.md
   - Toolbelt:
     - Workflow Engine: workflows.md

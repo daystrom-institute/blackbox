@@ -1,318 +1,343 @@
-# Operating blackbox - what landed in agentic-corpus, how to keep it healthy
+# Operating blackbox - day 2 runbook
 
-This doc covers everything the bbox daemon now does beyond what the README
-describes: the agentic graph surface, hybrid retrieval, the embedding
-pipeline, and the upkeep steps that keep all of it healthy. Read in order
-or jump via the section index. Cross-linked from the [README](index.md).
+This is the page for keeping a running daemon healthy. It is deliberately
+not the design tour. For graph and retrieval mechanics, see
+[Graph And Retrieval Internals](graph-retrieval-internals.md). For index,
+embedding, and compaction implementation details, see
+[Index And Embedding Internals](index-embedding-internals.md).
 
-## Section index
+## What healthy looks like
 
-- [What's new at a glance](#whats-new-at-a-glance)
-- [The agentic graph surface](#the-agentic-graph-surface)
-- [Hybrid search internals](#hybrid-search-internals)
-- [Embedding pipeline](#embedding-pipeline)
-- [Schema migrations](#schema-migrations)
-- [Upkeep checklist](#upkeep-checklist)
-- [Key locations on disk](#key-locations-on-disk)
-- [System memories - on-demand runbooks](#system-memories-on-demand-runbooks)
-- [Provider integration matrix](#provider-integration-matrix)
-- [Open follow-ups](#open-follow-ups)
+Run these from any MCP client connected to the daemon:
 
-## What's new at a glance
+```text
+bbox_stats()
+bbox_embed_status()
+bbox_project_list()
+bbox_describe_schema()
+bbox_hybrid_search(query="blackbox daemon", limit=5)
+```
 
-The agentic-corpus arc added a graph projection layer over the same
-transcript / knowledge / commit / file substrate that bbox already
-indexed. Every entity has a canonical `<type>:<segments>` ref; entities
-are connected by typed edges (CONTAINS_SYMBOL, CALLS, EDITED_BY_SESSION,
-COMMIT_TOUCHED_FILE, KNOWLEDGE_FROM_SESSION, READ_FILE, etc); five new
-MCP tools (`bbox_describe_schema`, `bbox_hybrid_search`,
-`bbox_discover_seed_entities`, `bbox_inspect_entity`, `bbox_find_paths`,
-`bbox_bundle_evidence`) compose into a 5-step opening sequence that
-replaces the old "single bbox_knowledge call" cold-start pattern.
+Healthy output usually means:
 
-The hybrid retrieval blends BM25, vector cosine (Voyage embeddings or
-Ollama fallback), and a path-token boost. The fusion runs RRF, then a
-per-file collapse + modal diversification pass before returning the
-top-N. The recall improvement on cold-start questions matches what the
-donor McpPoc spike measured (~97% vs ~23% with naive rerank), with a
-local benchmark reaching 4 of top-5 ground truth on the erlang-test
-"recombination" probe and surfacing the .ex code chunks alongside docs
-on the "triad implementation" probe.
-
-## The agentic graph surface
-
-`bbox_describe_schema` is the canonical orientation call. As of this
-writing the corpus knows:
-
-| Entity type | Population | Used for |
+| Check | Healthy signal | If not |
 |---|---|---|
-| `knowledge` | rules / decisions / conventions | "what's the policy on X?" |
-| `project_file` | source / doc chunks (10454+) | "where does X live?" |
-| `transcript` | one block of one Claude/Codex/Gemini session (~1M) | "what did this turn say?" |
-| `session` | a full agent conversation (~4500) | "what was that session about?" |
-| `thread` | persistent investigation across sessions | active arcs / deferred work |
-| `note` | side-channel records (~6700) | dispute/done/blocked/etc |
-| `symbol` | named code symbols (~6300) | call graph + defining file |
-| `brofile` | persona+model+lens triple | dispatch provenance |
-| `whiteboard` | multi-agent deliberation surface | board state |
-| `commit` | git commits with parent + touched-file edges (~770) | version history |
-| `task` (virtual) | bro_exec dispatch unit | what produced this artifact |
-| `bash_call` (virtual) | one shell invocation in a transcript | what did this command emit |
+| `bbox_stats` | Non-zero documents, recent sessions visible, index size plausible | Run `bbox_reindex(full=false)` first |
+| `bbox_embed_status` | `available: true`, `last_error: null`; queue drains after churn | Fix provider/API key, then `bbox_reembed(route="...")` if needed |
+| `bbox_project_list` | Expected repos registered with stable `project_id`s | Register missing repos before blaming search |
+| `bbox_describe_schema` | Entity populations are non-zero for transcripts/project files/knowledge | Reindex and watch EdgeIndex rebuild logs |
+| `bbox_hybrid_search` | Results include useful refs and sources; project filter works | Check index freshness, embedding status, and project registration |
 
-Edge families (full list via `bbox_describe_schema`):
+Useful shell checks:
 
-- **Structural** - IN_FILE, IN_SESSION, NEXT_SECTION, NEXT_CHUNK,
-  PREV_CHUNK, THREAD_HAS_SESSION
-- **AST** - DEFINED_IN, CONTAINS_SYMBOL, CALLS, USES_TYPE, HAS_FIELD,
-  IMPLEMENTS_TRAIT
-- **Knowledge** - SUPERSEDES, DERIVED_FROM, Contradicts,
-  KNOWLEDGE_FROM_SESSION, KNOWLEDGE_FROM_BOARD
-- **Provenance** - SESSION_USED_BROFILE, ARC_USED_BROFILE,
-  ARC_OPENED_BOARD, NOTE_FROM_SESSION, NOTE_IN_THREAD, NOTE_FROM_TASK,
-  TASK_PRODUCED_NOTE
-- **Git** - COMMIT_PARENT, COMMIT_TOUCHED_FILE, COMMIT_PRODUCED_BY_ARC
-- **Format-specific** - LINKS_TO_FILE, LINKS_TO_SECTION, DESCRIBES,
-  ON_PAGE, FIGURE_OF, TABLE_OF
-- **Tool-call** - EDITED_FILE, EDITED_BY_SESSION, READ_FILE, RAN_BASH
+```bash
+systemctl --user status blackbox.service
+journalctl --user -u blackbox.service -n 100 --no-pager
+journalctl --user -u blackbox.service -f
+```
 
-The 5-step opening sequence is documented in detail in the
-`sm-agentic-opening-sequence` system memory. Pull on demand with
-`bbox_knowledge(query="sm-agentic-opening-sequence")`.
+## After every daemon update
 
-## Hybrid search internals
+Build and install the binaries you changed:
 
-`bbox_hybrid_search` fuses three ranked lists via RRF:
+```bash
+cargo build --release
+install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
+install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
+install -m 755 target/release/bro ~/.local/bin/bro
+systemctl --user restart blackbox.service
+```
 
-1. **bm25** - chunk-level Tantivy BM25 over `content`, `project`,
-   `code_content`, `symbol`, `commit_author_name`, `path_tokens` fields.
-   Path tokens use the code tokenizer (splits on `/_-.:>` plus
-   CamelCase) and carry a 1.5× field boost. Symbol field also 1.5×.
-2. **bm25_file** - sum-of-scores aggregated per `(project_id,
-   rel_path_hash)`, then weighted by `sum * sqrt(chunk_count)`. Lifts
-   high-coverage files (e.g. STATUS.md with 21 sparse mentions) that
-   would otherwise be invisible to per-chunk ranking.
-3. **vector** - per-route HNSW search via Voyage `voyage-code-3` (1024d)
-   embeddings. RRF default weight 0.6 (0.4 BM25, 0.6 vector); set
-   `vector_weight=0` for BM25-only, `1.0` for vector-only.
+Restart `blackbox-dev.service` only if you updated the dev daemon too.
+Prod and dev intentionally use different installed binary paths.
 
-After fusion, the result list is post-processed:
+Then watch the journal:
 
-- **Project filter** - when `project=<path or project_id>` is passed,
-  drop project_file refs from other projects. Commits / knowledge /
-  transcripts pass through. Cuts cross-repo keyword pollution that
-  otherwise dominates ("voyage" returning erlang-test/voyage.ex above
-  transcript-search/src/embed/voyage.rs).
-- **Per-file collapse** - only the highest-scoring chunk per file
-  survives. Mirrors the AgenticTools donor's diversity-by-file pass.
-- **Modal diversification** - guarantees at least one
-  `code_block` / `doc_section` / `git_message` in top-N when the fetch
-  set has them. Stops a query like "triad implementation" from being
-  10 docs with the defining .ex file invisible.
-- **Symbol_exact boost** - single-token queries (snake_case, CamelCase,
-  dotted) add a SHOULD clause matching `symbol_exact` with 6× boost so
-  the defining chunk lifts above docs that just mention the symbol.
+```bash
+journalctl --user -u blackbox.service -f
+```
 
-`bbox_discover_seed_entities` is the same call with `notable_edges`
-rendered for each result - useful when the next step is
-`bbox_inspect_entity` and you want pre-vetted hops.
+Expected after a normal restart:
 
-## Embedding pipeline
+- Existing index opens.
+- Background reindex starts after its startup delay.
+- Embedding queues may receive new/changed docs.
+- EdgeIndex rebuilds if the indexed corpus grew.
 
-Voyage embeddings drive the vector lane. The daemon runs a per-route
-async queue (one worker per route) with debounce, batching, and retry.
-Routes:
+Expected after a schema change:
 
-| Route | What's embedded | Default provider |
-|---|---|---|
-| code | source-file code chunks | voyage / voyage-code-3 |
-| docs | source-file doc chunks (markdown) | voyage / voyage-code-3 |
-| git_message | commit subject + body | voyage / voyage-code-3 |
-| knowledge | knowledge-store entries | voyage / voyage-code-3 |
-| notes | side-channel notes | voyage / voyage-code-3 |
-| transcripts | transcript event blocks | voyage / voyage-code-3 |
+- Log contains `dropping transcript index for schema migration`.
+- Reindex takes minutes on a large corpus.
+- EdgeIndex rebuild follows after the document count changes.
 
-Provider config lives in `src/embed/mod.rs::EmbeddingRouter`. Override
-per-bucket or per-project in `~/.config/blackbox/embed.toml`.
+Smoke the daemon after the journal quiets:
 
-### API key configuration
+```text
+bbox_stats()
+bbox_embed_status()
+bbox_describe_schema()
+bbox_hybrid_search(query="recent changes", project="/abs/path/to/repo", limit=5)
+```
 
-Production daemon needs `DAYSTROM_VOYAGE_API_KEY` (or `VOYAGE_API_KEY`)
-in its environment. The systemd drop-in pattern:
+## Reindexing
+
+The daemon keeps a Tantivy index for transcripts, project files, git
+messages, knowledge entries, notes, threads, and tool-call records. The
+background reindexer runs periodically, controlled by
+`BLACKBOX_REINDEX_INTERVAL_SECS` (default `120`).
+
+Manual reindexing is for operator intervention, not normal file edits.
+
+```text
+bbox_reindex(full=false)
+```
+
+Use incremental reindex when:
+
+- search looks stale after recent transcript or source changes;
+- you restored protected JSON stores and want the index to catch up;
+- you registered a project and want to start indexing immediately;
+- a background reindex failed after a transient filesystem or lock issue.
+
+```text
+bbox_reindex(full=true)
+```
+
+Use full reindex when:
+
+- `INDEX_SCHEMA_VERSION` changed;
+- chunking/tokenization changed;
+- the index was created by an older incompatible binary;
+- `bbox_stats` looks impossible, or searches return stale/deleted paths;
+- you suspect index corruption.
+
+Watch for:
+
+```text
+auto-reindex: indexed N files (M docs)
+edge-index watcher: corpus grew, EdgeIndex rebuilt
+```
+
+The rebuildable index lives at:
+
+```text
+~/.local/share/blackbox/index/
+```
+
+Do not back it up as durable state. Rebuild it from transcripts,
+registered projects, and protected JSON stores.
+
+## Project registration and code freshness
+
+Project file indexing only covers registered repos. Check before adding:
+
+```text
+bbox_project_list()
+```
+
+Register with an absolute path:
+
+```text
+bbox_project_register(path="/abs/path/to/repo")
+```
+
+Registration records the root in `~/.local/state/blackbox/projects.json`,
+starts an incremental reindex, and triggers graph projection work. Large
+repos can take 10+ minutes on first index.
+
+If source navigation or refactor tools cannot see a repo, verify in this
+order:
+
+1. `bbox_project_list()` includes the repo.
+2. `bbox_stats()` shows project-file growth after reindex.
+3. `bbox_hybrid_search(query="known symbol", project="/abs/path/to/repo")`
+   returns project-file refs.
+4. `bbox_embed_status()` shows the `code` route available if you need vector search.
+
+For more code-specific tooling, see
+[Projects And Code Indexing](projects-code-indexing.md).
+
+## Embeddings and re-embedding
+
+Embeddings are a second lane beside Tantivy. Reindexing creates source
+documents; embedding workers turn those source docs into vector
+partitions under:
+
+```text
+~/.local/state/blackbox/vectors/
+```
+
+Check route health:
+
+```text
+bbox_embed_status()
+```
+
+Important fields:
+
+| Field | Meaning |
+|---|---|
+| `available` | Provider/model can currently serve that route |
+| `provider`, `model`, `dim` | Active embedding backend and vector shape |
+| `indexed_count` | Number of vectors stored for that route |
+| `queue_depth` | Pending docs waiting to embed |
+| `retried_count` | Retry pressure; should not climb forever |
+| `last_error` | First place to look for auth, dimension, or provider failures |
+
+Routes normally include:
+
+| Route | Typical contents |
+|---|---|
+| `code` | Source code chunks |
+| `docs` | Markdown and doc chunks |
+| `git_message` | Commit subjects/bodies |
+| `knowledge` | Knowledge-store entries |
+| `notes` | Side-channel notes |
+| `transcripts` | Transcript blocks |
+
+Re-embed a route when:
+
+- provider/model/dimension changed in `~/.config/blackbox/embed.toml`;
+- Voyage/Ollama was down and a route accumulated failures;
+- vectors were deleted during restore;
+- vector search misses content that BM25 finds after reindexing.
+
+```text
+bbox_reembed(route="code")
+bbox_reembed(route="docs")
+bbox_reembed(route="transcripts")
+```
+
+Then watch:
+
+```text
+bbox_embed_status()
+```
+
+`queue_depth` should trend down. A non-zero queue is normal during a
+large reindex; a queue that never drains is an operations issue.
+
+Voyage needs `DAYSTROM_VOYAGE_API_KEY` or `VOYAGE_API_KEY` in the
+systemd environment:
 
 ```ini
-# ~/.config/systemd/user/blackbox.service.d/voyage-key.conf
+# ~/.config/systemd/user/blackbox.service.d/secrets.conf
 [Service]
 Environment=DAYSTROM_VOYAGE_API_KEY=pa-...
 ```
 
-Then `systemctl --user daemon-reload && systemctl --user restart blackbox.service`.
-
-Falling back to `Ollama` works without an API key - set the route to
-`ollama` in `embed.toml` to use a local `nomic-embed-text` (768d)
-endpoint. Mixing Voyage and Ollama is fine; each route persists its own
-HNSW partition keyed on `(provider, model, dimensions)`.
-
-### Batch caps
-
-The queue caps at **64 documents** or **80KB total** per Voyage request
-(under the 128/120k Voyage limits). Without this cap a single restart
-that re-fills the queue with thousands of pending chunks would send one
-oversized request, get rejected, retry 3×, then DROP the entire batch.
-See the cap definition in `src/embed/queue.rs::collect_quiescent_batch`.
-
-### Status check
+Apply changes with:
 
 ```bash
-# Via MCP
-bbox_embed_status()
-
-# Or curl directly
-curl -sN -X POST http://127.0.0.1:7264/mcp \
-  -H 'content-type: application/json' \
-  -H 'accept: application/json,text/event-stream' \
-  -H "mcp-session-id: $SESSION" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"bbox_embed_status","arguments":{}}}'
+systemctl --user daemon-reload
+systemctl --user restart blackbox.service
 ```
 
-Per-route fields: `available`, `provider`, `model`, `dim`,
-`indexed_count`, `queue_depth`, `retried_count`, `last_error`. A healthy
-daemon shows `available: true` everywhere with `last_error: null`.
+## Compaction
 
-## Schema migrations
+There are three different things people mean by compaction. They do not
+share the same fix.
 
-Tantivy index schema changes are versioned via the
-`INDEX_SCHEMA_VERSION` constant in `src/index/mod.rs`. On daemon start
-the schema marker is compared and the index dropped + rebuilt if it
-mismatches. A full rebuild on a 1.1M-doc corpus takes 5-7 minutes
-including the EdgeIndex projection pass (which auto-fires via the
-`blackbox-edge-rebuild` watcher thread when tantivy's doc count grows).
+| Area | What grows | Normal action |
+|---|---|---|
+| Vector partitions | WAL records under `~/.local/state/blackbox/vectors/` | Automatic background compactor |
+| Edge sidecars | JSONL graph sidecars under `~/.local/state/blackbox/edges/` | `bbox_edge_compact` when sidecars grow from repeated full reindex replay |
+| Workflow context | Rolling `ANCHOR` notes on workflow threads | Read via `bro orchestrate status` or `bbox_notes`; no storage cleanup needed |
 
-Recent schema bumps in chronological order:
+### Vector compaction
 
-- `agentic-corpus-g1` - initial agentic schema
-- `agentic-corpus-g2-path-tokens` - added tokenized `path_tokens` field
-- `agentic-corpus-g3-commit-subject-tokens` - populates `path_tokens`
-  from commit subject too so commits compete on equal footing with
-  project_files for ranking
-- `agentic-corpus-g4-elixir-symbols` - elixir symbol extraction (defmodule/
-  def/defp/defmacro/etc via tree-sitter `call` node filtering)
-- `agentic-corpus-g5-symbol-tokenized` - `symbol` field switched from
-  default tokenizer to code_tokenizer so `Substrate.TriadClosure`
-  indexes as the union of [Substrate, TriadClosure, Triad, Closure]
-  and matches both camelCase and snake_case query forms
+Vector WAL compaction is automatic. You should not normally run a tool
+for it. Watch the journal for `vector partition compacted` if disk churn
+or vector files look suspicious.
 
-Bumping the version triggers a full reindex; old segments are removed.
+If vectors are bad because the provider changed, the operational fix is
+not "compact harder"; it is:
 
-## Upkeep checklist
+```text
+bbox_reembed(route="<route>")
+```
 
-Daily / on-demand:
-- `bbox_inbox(project="...")` - round-boundary attention sweep
-- `bbox_thread_list(status="open")` - investigation continuity check
+### Edge sidecar compaction
 
-Per-release / when changing schema or chunker:
-- Bump `INDEX_SCHEMA_VERSION`
-- `cargo build --release && install -m 755 target/release/blackboxd ~/.local/bin/blackboxd && systemctl --user restart blackbox.service`
-- Wait for `auto-reindex: indexed N files (M docs)` log line
-  (~5-7 min for 1.1M docs)
-- Wait for `edge-index watcher: corpus grew, EdgeIndex rebuilt` log line
-  (~6 sec after reindex completes)
-- Smoke: `bbox_describe_schema` should return all entity types with
-  populations; `bbox_hybrid_search("test query", limit=5)` should return
-  results with both `bm25` and `vector` sources contributing.
+Project graph sidecars can grow when old derived edges are appended by
+repeated full refreshes. Compact one project at a time.
 
-After tantivy schema bump:
-- The schema-version marker file at `~/.local/share/blackbox/index/schema_version.txt`
-  is rewritten on successful start. If you see "dropping transcript
-  index for schema migration" in the journal, that's the expected path.
+First dry-run:
 
-After embedding provider change:
-- `bbox_reembed(route="<route>")` to re-fill the queue from existing
-  indexed entities (lands in E3 and verified working)
-- Watch `bbox_embed_status` for `queue_depth` to drain
+```text
+bbox_edge_compact(project_id="d723917f", apply=false)
+```
 
-After registering a new project:
-- `bbox_project_register(path="/abs/path")` adds to the registry,
-  triggers an EdgeIndex rebuild, and runs an incremental reindex
-- The auto-reindex thread (120s tick) picks up new project files within
-  the next 1-2 cycles
-- For large repos (10k+ files) this can take 10+ minutes
+Review removed/retained counts. If the scope is expected, apply:
 
-## Key locations on disk
+```text
+bbox_edge_compact(project_id="d723917f", apply=true, rebuild=false)
+```
+
+When compacting several projects, leave `rebuild=false` until the last
+one. On the final project:
+
+```text
+bbox_edge_compact(project_id="d723917f", apply=true, rebuild=true)
+```
+
+The tool keeps explicit/provenance/malformed lines and removes legacy
+derived edges. It writes a backup before replacing the sidecar.
+
+## Backup and restore boundary
+
+Protect durable JSON stores and installed operator artifacts. Rebuild
+indexes, vectors, edge projections, and git metadata.
+
+Protect:
+
+- `~/.local/state/blackbox/blackbox-knowledge.json`
+- `~/.local/state/blackbox/blackbox-notes.json`
+- `~/.local/state/blackbox/blackbox-threads.json`
+- `~/.local/state/blackbox/blackbox-pins.json`
+- `~/.local/state/blackbox/blackbox-roadmap.json`
+- `~/.local/state/blackbox/projects.json`
+- `~/.local/state/blackbox/packets/`
+- `~/.local/state/blackbox/artifacts/`
+- `~/.local/state/blackbox/bro/`
+- customized `~/.config/blackbox/embed.toml`
+- systemd drop-ins containing API keys
+
+Rebuild:
+
+- `~/.local/share/blackbox/index/` with `bbox_reindex(full=true)`
+- `~/.local/state/blackbox/vectors/` with `bbox_reembed(route="...")`
+- `~/.local/state/blackbox/edges/` via reindex/EdgeIndex rebuild
+- `~/.local/state/blackbox/git_meta/` via the next reindex
+
+The longer backup checklist lives in [Operations](operations.md).
+
+## Troubleshooting quick map
+
+| Symptom | First checks | Likely action |
+|---|---|---|
+| Search misses recent transcripts | `bbox_stats`, journal reindex lines | `bbox_reindex(full=false)` |
+| Search returns deleted files | project registration, index age | `bbox_reindex(full=true)` |
+| Hybrid search is lexical only | `bbox_embed_status` | Fix route/provider, then `bbox_reembed(route="...")` |
+| Code nav cannot see repo | `bbox_project_list` | `bbox_project_register(path="/abs/path")` |
+| Graph paths look sparse | `bbox_describe_schema`, EdgeIndex log lines | Reindex, then wait for EdgeIndex rebuild |
+| Disk grows under `vectors/` | journal compaction lines | Usually wait; re-embed only after provider/data issues |
+| Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
+| Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` |
+
+## Key paths
 
 | Path | Contents |
 |---|---|
 | `~/.local/bin/blackboxd` | Production daemon binary |
-| `~/.local/bin/blackboxd-dev` | Dev daemon binary (separate inode) |
+| `~/.local/bin/blackboxd-dev` | Dev daemon binary |
 | `~/.local/bin/bro` | Terminal TUI client |
 | `~/.config/systemd/user/blackbox.service` | Prod systemd unit |
-| `~/.config/systemd/user/blackbox.service.d/*.conf` | Drop-in env (e.g. voyage-key.conf) |
-| `~/.local/share/blackbox/index/` | Tantivy index + schema_version.txt |
-| `~/.local/state/blackbox/` | Knowledge / threads / notes / pins / projects / packets / artifacts JSON stores |
-| `~/.local/state/blackbox/edges/<project_id>.jsonl` | Per-project edge sidecars |
-| `~/.local/state/blackbox/vectors/` | HNSW partitions (one per provider+model+dim) |
-| `~/.local/state/blackbox/backups/<ISO-ts>/` | Pre-render snapshots of provider markdown files |
-| `~/.local/state/blackbox/git_meta/<project_id>.json` | Git history fingerprints for incremental indexing |
-| `~/.bro/mcp.json` | Global MCP server config (per-provider sync) |
-| `<project>/.bro/mcp.json` | Project-overlay MCP config |
-| `~/.claude-shared/BLACKBOX.md` | Rendered tool reference + CORE RULEs (single source of truth, included by other provider files) |
-| `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` | Per-provider memory files that include BLACKBOX.md by reference |
-
-## System memories - on-demand runbooks
-
-Code-embedded markdown runbooks queryable via `bbox_knowledge(query="sm-...")`.
-Not rendered into provider files (kept cold; pulled when an agent reaches
-for a primitive it hasn't used before).
-
-| ID | Topic |
-|---|---|
-| `sm-agentic-opening-sequence` | The 5-step grounding pattern (orient → search → inspect → traverse → answer) |
-| `sm-rule-packets` | Compile reusable judges/rubrics from examples |
-| `sm-workflow-orchestration` | JSON workflow specs with per-node next transitions |
-| `sm-bro-dispatch-patterns` | bro_exec / bro_resume usage |
-| `sm-whiteboards` | Multi-agent deliberation boards |
-| `sm-transcript-retrieval` | search / cite / context / session ladders |
-| `sm-persistence-taxonomy` | learn vs decide vs remember vs pin lane selection |
-| `sm-render-lifecycle` | Render → review → revoke flow |
-| `sm-scoped-pins` | Active-arc context pins |
-| `sm-create-etiquette` | List-before-create dedupe hygiene |
-| `sm-side-channel-notes` | dispute/assumption/surprise/followup/blocked/learned/done |
-| `sm-design-packets` | Multi-domain rule-packet design |
-| `sm-auth-packets` | Authorization/policy packets |
-| `sm-review-packets` | Review-style packets |
-
-## Provider integration matrix
-
-Validated grounding behavior across CLI providers when given a cold-start
-question:
-
-| Provider | Honors AGENTS.md @-imports | Reaches for bbox_* tools | Notes |
-|---|---|---|---|
-| `claude` (claude-opus-4-7) | ✅ | ✅ first-class | Followed full 5-step loop, caught cross-repo collisions naturally. Best cold-start reliability. |
-| `codex` (gpt-5.5) | ✅ | ✅ first-class | Quality high, latency tends 2× of claude - verbose exploratory turns |
-| `gemini` (gemini-3.1-pro) | ✅ | Untested in probe series | Renders to GEMINI.md; should mirror claude pattern |
-| `glm` (zai-coding-plan/glm-5.1, via opencode) | ❌ | Falls back to grep/read | Opencode SQLite contention with parallel deepseek runs |
-| `deepseek` (deepseek-v4-pro, via opencode) | ❌ | Falls back to grep/read | Same opencode integration gap |
-
-Opencode-based bros currently grep instead of using the agentic surface
-because opencode doesn't follow `@/path/...` includes in AGENTS.md by
-default. Workaround under investigation; tracked in deferred-items
-thread.
-
-## Open follow-ups
-
-Tracked in bbox threads; surface with `bbox_thread_list(status="open")`.
-
-- `thread-3cfbf9e0` - agentic-corpus impl: deferred items across all phases
-- `thread-f4e4624f` - Agentic-loop tools as composable subagents (scout
-  brofile + workflow actor type)
-- `thread-cba8bfa1` - workflow engine: foreach/matrix primitive
-- `thread-e8f0371a` - apply_brofile_lens runs every turn - strip from
-  resume paths
-- `thread-7e2bd735` - workflow engine phase-next: template library + resume
-
-Smaller items still open at session end:
-- file: virtual entity refactor (currently chunk[0] proxies as the file)
-- opencode bros not loading rendered guidance
-- bbox_blame anchor-metadata file_path mismatch when multi-file edits
-  share a commit
-- Probe-team Q2-Q8 (only Q1 captured in this session)
+| `~/.config/systemd/user/blackbox.service.d/*.conf` | Drop-in env and secrets |
+| `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
+| `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
+| `~/.local/state/blackbox/edges/` | Rebuildable graph sidecars |
+| `~/.local/state/blackbox/git_meta/` | Rebuildable git fingerprints |
+| `~/.local/state/blackbox/` | Durable JSON stores plus rebuildable projections |
+| `~/.bro/mcp.json` | Global MCP server config |
+| `<project>/.bro/mcp.json` | Project MCP overlay |

@@ -22,7 +22,10 @@ The crate is `blackbox`. It produces four binaries:
 | Page | What it covers |
 |---|---|
 | [Getting Started](getting-started.md) | Build, install, systemd service, connect CLIs, bootstrap |
-| [Operating Guide](operating-blackbox.md) | What landed in the agentic corpus and how to keep it healthy |
+| [Operating Guide](operating-blackbox.md) | Day-2 runbooks: reindexing, re-embedding, compaction, post-update checks |
+| [Internals](internals.md) | Map of the internal projections and where the deeper design pages live |
+| [Graph And Retrieval Internals](graph-retrieval-internals.md) | Graph grounding, opening sequence, entity refs, edges, hybrid search ranking |
+| [Index And Embedding Internals](index-embedding-internals.md) | Tantivy indexing, embedding queues, schema migration, vector and edge compaction |
 | [Workflow Engine](workflows.md) | Canonical reference for authoring and running workflows |
 | [Atoms](atoms.md) | Install, discover, invoke, resume, and bind reusable capabilities |
 | [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |
