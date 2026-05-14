@@ -45,6 +45,7 @@ impl BlackboxServer {
             brofile_filters,
             coerce_workspace,
         ) = self.resolve_exec_target(Some(brofile), None, project_dir)?;
+        let mut runtime_lease = None;
         if is_resume {
             if let Some(lease) = existing_task_id.and_then(|task_id| {
                 orchestration::allocator::lookup_lease_for_task(&store_dir, task_id)
@@ -66,6 +67,7 @@ impl BlackboxServer {
                     lease.model.as_deref(),
                     &store_dir,
                 );
+                runtime_lease = Some(lease);
             }
         }
 
@@ -176,13 +178,25 @@ impl BlackboxServer {
             session_id,
             cwd,
             env_overrides,
-            store_dir,
+            store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             None,
             None,
             Some(self.state.system_events.clone()),
         );
+        if let Some(lease) = &runtime_lease {
+            let inner = task.inner.lock();
+            orchestration::allocator::record_lease(
+                &store_dir,
+                orchestration::allocator::lease_for_resume_task(
+                    lease,
+                    inner.id.clone(),
+                    inner.session_id.clone(),
+                    inner.cwd.clone(),
+                ),
+            );
+        }
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(lease) = resume_lease {
             release_resume_lease_when_done(task.clone(), lease);

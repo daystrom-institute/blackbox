@@ -1291,11 +1291,7 @@ pub fn lookup_lease_for_session(
 }
 
 pub fn lookup_lease_for_task(store_dir: &Path, task_id: &str) -> Option<RuntimeLease> {
-    lease_store_load(store_dir)
-        .leases
-        .get(task_id)
-        .filter(|lease| lease.durable)
-        .cloned()
+    lease_store_load(store_dir).leases.get(task_id).cloned()
 }
 
 pub fn save_trace(store_dir: &Path, trace: &SelectionTrace) {
@@ -1353,6 +1349,30 @@ pub fn lease_from_allocation(
         project_dir,
         cwd,
         selection_trace_id: allocation.trace.id.clone(),
+        created_at: super::now_ms(),
+        last_seen_at: super::now_ms(),
+    }
+}
+
+pub fn lease_for_resume_task(
+    previous: &RuntimeLease,
+    task_id: String,
+    session_id: String,
+    cwd: Option<String>,
+) -> RuntimeLease {
+    RuntimeLease {
+        task_id,
+        session_id,
+        provider: previous.provider,
+        account: previous.account.clone(),
+        model: previous.model.clone(),
+        effort: previous.effort.clone(),
+        tier: previous.tier.clone(),
+        durable: previous.durable,
+        capabilities: previous.capabilities.clone(),
+        project_dir: previous.project_dir.clone(),
+        cwd: cwd.or_else(|| previous.cwd.clone()),
+        selection_trace_id: previous.selection_trace_id.clone(),
         created_at: super::now_ms(),
         last_seen_at: super::now_ms(),
     }
@@ -1929,5 +1949,73 @@ mod tests {
         assert!(load_trace(tmp.path(), "../leases").is_none());
         assert!(load_trace(tmp.path(), "alloc-../../leases").is_none());
         assert!(load_trace(tmp.path(), "not-a-trace-id").is_none());
+    }
+
+    #[test]
+    fn task_lease_lookup_returns_exact_non_durable_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lease = RuntimeLease {
+            task_id: "task-1".into(),
+            session_id: "session-1".into(),
+            provider: Provider::Codex,
+            account: Some("codex-alt".into()),
+            model: Some("gpt-5.3-codex-spark".into()),
+            effort: Some("low".into()),
+            tier: Some("economy".into()),
+            durable: false,
+            capabilities: Vec::new(),
+            project_dir: None,
+            cwd: None,
+            selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
+            created_at: 1,
+            last_seen_at: 1,
+        };
+        lease_store_save(
+            tmp.path(),
+            &RuntimeLeaseStore {
+                leases: BTreeMap::from([(lease.task_id.clone(), lease.clone())]),
+            },
+        );
+
+        let loaded = lookup_lease_for_task(tmp.path(), "task-1").unwrap();
+        assert!(!loaded.durable);
+        assert_eq!(loaded.provider, Provider::Codex);
+        assert_eq!(loaded.model.as_deref(), Some("gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn resume_task_lease_preserves_selected_lane() {
+        let previous = RuntimeLease {
+            task_id: "task-1".into(),
+            session_id: "session-1".into(),
+            provider: Provider::Codex,
+            account: Some("codex-alt".into()),
+            model: Some("gpt-5.3-codex-spark".into()),
+            effort: Some("low".into()),
+            tier: Some("economy".into()),
+            durable: false,
+            capabilities: vec![Capability::ToolUse],
+            project_dir: Some("/repo".into()),
+            cwd: Some("/repo".into()),
+            selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
+            created_at: 1,
+            last_seen_at: 1,
+        };
+
+        let resumed = lease_for_resume_task(
+            &previous,
+            "task-2".into(),
+            "session-1".into(),
+            Some("/repo/subdir".into()),
+        );
+        assert_eq!(resumed.task_id, "task-2");
+        assert_eq!(resumed.provider, Provider::Codex);
+        assert_eq!(resumed.account.as_deref(), Some("codex-alt"));
+        assert_eq!(resumed.model.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert_eq!(resumed.effort.as_deref(), Some("low"));
+        assert_eq!(resumed.capabilities, vec![Capability::ToolUse]);
+        assert_eq!(resumed.project_dir.as_deref(), Some("/repo"));
+        assert_eq!(resumed.cwd.as_deref(), Some("/repo/subdir"));
+        assert!(!resumed.durable);
     }
 }

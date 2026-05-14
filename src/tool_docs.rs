@@ -690,9 +690,11 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_allocator_status",
         category: ToolCategory::Orchestration,
-        summary: "Read pool-backed runtime allocation config, active leases, and in-flight lane counts.",
-        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, active runtime leases, and current in-flight lane counts. This is read-only; allocation config is hot-loaded from allocator.json on each dispatch.",
-        example: Some(r#"bro_allocator_status(project_dir="/repo/x")"#),
+        summary: "Read pool-backed runtime allocation config, active leases, in-flight lane counts, and optional candidate preview.",
+        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, active runtime leases, probe state, and current in-flight lane counts. Pass tier/pool/capability/pin fields to preview the candidate table without spawning a task or writing a lease.",
+        example: Some(
+            r#"bro_allocator_status(project_dir="/repo/x", tier="standard", pool_name="coding")"#,
+        ),
     },
     ToolDoc {
         name: "bro_allocator_trace",

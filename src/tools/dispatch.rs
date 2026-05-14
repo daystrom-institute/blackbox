@@ -168,6 +168,38 @@ fn exec_params_runtime_request(
     Ok(Some(request))
 }
 
+fn allocator_status_runtime_request(
+    p: &AllocatorStatusParams,
+) -> Result<Option<orchestration::allocator::RuntimeRequest>, String> {
+    let exec_like = ExecParams {
+        prompt: String::new(),
+        bro: None,
+        provider: None,
+        project_dir: p.project_dir.clone(),
+        allow_recursion: None,
+        allow_tools: None,
+        disallow_tools: None,
+        surface: None,
+        coerce_workspace: None,
+        tier: p.tier.clone(),
+        tier_ladder: p.tier_ladder.clone(),
+        tier_mode: p.tier_mode.clone(),
+        min_tier: p.min_tier.clone(),
+        max_tier: p.max_tier.clone(),
+        pool_name: p.pool_name.clone(),
+        pool_providers: p.pool_providers.clone(),
+        pin_provider: p.pin_provider.clone(),
+        pin_account: p.pin_account.clone(),
+        pin_model: p.pin_model.clone(),
+        pin_effort: p.pin_effort.clone(),
+        prefer_provider: p.prefer_provider.clone(),
+        capabilities: p.capabilities.clone(),
+        durable: p.durable,
+        selection_policy: p.selection_policy.clone(),
+    };
+    exec_params_runtime_request(&exec_like, None)
+}
+
 impl BlackboxServer {
     pub(crate) fn dispatch_fresh_bro_task(
         &self,
@@ -422,6 +454,7 @@ impl BlackboxServer {
             cwd,
             brofile_filters,
             brofile_coerce_workspace,
+            runtime_lease,
         ) = match self.resolve_resume_target(
             p.bro.as_deref(),
             p.session_id.as_deref(),
@@ -525,13 +558,25 @@ impl BlackboxServer {
             session_id,
             cwd,
             env_overrides,
-            store_dir,
+            store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             None,
             None,
             Some(self.state.system_events.clone()),
         );
+        if let Some(lease) = &runtime_lease {
+            let inner = task.inner.lock();
+            orchestration::allocator::record_lease(
+                &store_dir,
+                orchestration::allocator::lease_for_resume_task(
+                    lease,
+                    inner.id.clone(),
+                    inner.session_id.clone(),
+                    inner.cwd.clone(),
+                ),
+            );
+        }
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task.clone(), resume_lease);
 
@@ -549,7 +594,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_allocator_status",
-        description = "Read pool-backed runtime allocation config, active leases, and in-flight lane counts."
+        description = "Read pool-backed runtime allocation config, active leases, in-flight lane counts, and optional candidate preview."
     )]
     pub(crate) fn bro_allocator_status(
         &self,
@@ -566,6 +611,62 @@ impl BlackboxServer {
             &leases,
             probes.clone(),
         );
+        let preview_request = match allocator_status_runtime_request(&p) {
+            Ok(request) => request,
+            Err(err) => return Self::err_text(&err),
+        };
+        let preview = preview_request.map(|request| {
+            let bro_config = orchestration::brofile::load_config(&self.state.store_dir);
+            let allocation =
+                orchestration::allocator::allocate(request, &cfg, &bro_config, &ctx);
+            let now = orchestration::now_ms();
+            let candidates: Vec<_> = allocation
+                .trace
+                .candidates
+                .iter()
+                .map(|candidate| {
+                    let lane_key = format!(
+                        "{}:{}",
+                        candidate.lane.provider.as_str(),
+                        candidate.lane.account.as_deref().unwrap_or("default")
+                    );
+                    let probe = ctx.probes.get(&lane_key);
+                    let probe_observed_at = probe.and_then(|probe| {
+                        probe
+                            .last_probe_at
+                            .into_iter()
+                            .chain(probe.last_runtime_observation_at)
+                            .max()
+                    });
+                    json!({
+                        "lane": &candidate.lane,
+                        "lane_key": lane_key,
+                        "eligible": candidate.eligible,
+                        "exclusion_reason": &candidate.exclusion_reason,
+                        "score": candidate.score,
+                        "score_components": &candidate.score_components,
+                        "in_flight": ctx.in_flight.get(&lane_key).copied().unwrap_or(0),
+                        "probe": probe,
+                        "credential_status": probe.map(|probe| &probe.credential_status),
+                        "quota_status": probe.map(|probe| &probe.quota_status),
+                        "quota_confidence": probe.map(|probe| &probe.quota_confidence),
+                        "cooldown_until": probe.and_then(|probe| probe.cooldown_until),
+                        "cooldown_active": probe.and_then(|probe| probe.cooldown_until).is_some_and(|until| until > now),
+                        "probe_observed_at": probe_observed_at,
+                        "probe_staleness_ms": probe_observed_at.map(|observed| now.saturating_sub(observed)),
+                    })
+                })
+                .collect();
+            json!({
+                "trace_id": &allocation.trace.id,
+                "request": &allocation.trace.request,
+                "candidate_tiers": &allocation.trace.candidate_tiers,
+                "required_capabilities": &allocation.trace.required_capabilities,
+                "selected": &allocation.trace.selected,
+                "error": &allocation.trace.error,
+                "candidates": candidates,
+            })
+        });
         Self::ok_json(&json!({
             "tiers": cfg.tiers,
             "tier_ladders": cfg.tier_ladders,
@@ -574,6 +675,7 @@ impl BlackboxServer {
             "in_flight": ctx.in_flight,
             "probes": probes.records,
             "leases": leases.leases,
+            "preview": preview,
         }))
     }
 
@@ -1298,6 +1400,7 @@ impl BlackboxServer {
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
             bool,
+            Option<orchestration::allocator::RuntimeLease>,
         ),
         String,
     > {
@@ -1331,25 +1434,50 @@ impl BlackboxServer {
                 bro_match.team.project_dir.as_deref(),
             )
             .ok_or(format!("Brofile not found: {}", member.brofile))?;
-            let env = orchestration::brofile::resolve_provider_env(
-                bf.provider,
-                bf.account.as_deref(),
-                bf.model.as_deref(),
-                store_dir,
-            );
-            let opts = if bf.model.is_some() || bf.effort.is_some() {
-                Some(ExecOpts {
-                    model: bf.model.clone(),
-                    effort: bf.effort.clone(),
-                })
+            let lease = member.task_history.last().and_then(|task_id| {
+                orchestration::allocator::lookup_lease_for_task(store_dir, task_id)
+            });
+            let (provider, opts, env) = if let Some(lease) = lease.as_ref() {
+                let provider = lease.provider;
+                let opts = orchestration::allocator::exec_opts_for_lane(
+                    &orchestration::allocator::RuntimeLane {
+                        provider,
+                        account: lease.account.clone(),
+                        tier: lease.tier.clone(),
+                        model: lease.model.clone(),
+                        effort: lease.effort.clone(),
+                        capabilities: lease.capabilities.clone(),
+                    },
+                );
+                let env = orchestration::brofile::resolve_provider_env(
+                    provider,
+                    lease.account.as_deref(),
+                    lease.model.as_deref(),
+                    store_dir,
+                );
+                (provider, opts, env)
             } else {
-                None
+                let env = orchestration::brofile::resolve_provider_env(
+                    bf.provider,
+                    bf.account.as_deref(),
+                    bf.model.as_deref(),
+                    store_dir,
+                );
+                let opts = if bf.model.is_some() || bf.effort.is_some() {
+                    Some(ExecOpts {
+                        model: bf.model.clone(),
+                        effort: bf.effort.clone(),
+                    })
+                } else {
+                    None
+                };
+                (bf.provider, opts, env)
             };
             let cwd = project_dir
                 .map(String::from)
                 .or(bro_match.team.project_dir.clone());
             return Ok((
-                bf.provider,
+                provider,
                 sid.to_string(),
                 bf.lens,
                 opts,
@@ -1357,6 +1485,7 @@ impl BlackboxServer {
                 cwd,
                 bf.filters,
                 bf.coerce_workspace.unwrap_or(false),
+                lease,
             ));
         }
 
@@ -1394,10 +1523,11 @@ impl BlackboxServer {
                     env,
                     project_dir
                         .map(String::from)
-                        .or(lease.cwd)
-                        .or(lease.project_dir),
+                        .or_else(|| lease.cwd.clone())
+                        .or_else(|| lease.project_dir.clone()),
                     None,
                     false,
+                    Some(lease),
                 ));
             }
             let env = orchestration::brofile::resolve_provider_env(provider, None, None, store_dir);
@@ -1410,6 +1540,7 @@ impl BlackboxServer {
                 project_dir.map(String::from),
                 None,
                 false,
+                None,
             ));
         }
 
@@ -1527,6 +1658,57 @@ mod tests {
         assert!(
             request
                 .derived_capabilities
+                .contains(&orchestration::providers::Capability::ToolUse)
+        );
+    }
+
+    #[test]
+    fn allocator_status_runtime_request_matches_exec_allocation_fields() {
+        let params = AllocatorStatusParams {
+            project_dir: None,
+            tier: Some("standard".into()),
+            tier_ladder: Some("default".into()),
+            tier_mode: Some("at_least".into()),
+            min_tier: None,
+            max_tier: None,
+            pool_name: Some("coding".into()),
+            pool_providers: Some(vec!["codex".into()]),
+            pin_provider: Some("codex".into()),
+            pin_account: Some("codex-alt".into()),
+            pin_model: Some("gpt-5.3-codex-spark".into()),
+            pin_effort: Some("low".into()),
+            prefer_provider: Some("codex".into()),
+            capabilities: Some(vec!["tool_use".into()]),
+            durable: Some(false),
+            selection_policy: Some(serde_json::json!("availability")),
+        };
+        let request = allocator_status_runtime_request(&params).unwrap().unwrap();
+        assert_eq!(request.tier.as_deref(), Some("standard"));
+        assert_eq!(request.tier_ladder.as_deref(), Some("default"));
+        assert_eq!(
+            request.tier_mode,
+            orchestration::allocator::TierMode::AtLeast
+        );
+        assert_eq!(
+            request.pool.unwrap().providers,
+            vec![orchestration::providers::Provider::Codex]
+        );
+        assert_eq!(
+            request.pin.as_ref().and_then(|pin| pin.provider),
+            Some(orchestration::providers::Provider::Codex)
+        );
+        assert_eq!(
+            request.pin.as_ref().and_then(|pin| pin.account.as_deref()),
+            Some("codex-alt")
+        );
+        assert_eq!(
+            request.prefer.and_then(|prefer| prefer.provider),
+            Some(Provider::Codex)
+        );
+        assert!(!request.durable);
+        assert!(
+            request
+                .capabilities
                 .contains(&orchestration::providers::Capability::ToolUse)
         );
     }

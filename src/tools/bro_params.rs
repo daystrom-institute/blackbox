@@ -313,6 +313,51 @@ pub(crate) struct AllocatorStatusParams {
     /// Optional project path whose .bro/allocator.json overlay should be included.
     #[serde(default)]
     pub(crate) project_dir: Option<String>,
+    /// Runtime allocation tier key to preview.
+    #[serde(default)]
+    pub(crate) tier: Option<String>,
+    /// Named tier ladder for at_least/bounded tier modes.
+    #[serde(default)]
+    pub(crate) tier_ladder: Option<String>,
+    /// Tier mode: exact, at_least, or bounded. Defaults to exact.
+    #[serde(default)]
+    pub(crate) tier_mode: Option<String>,
+    /// Lower tier bound for bounded mode.
+    #[serde(default)]
+    pub(crate) min_tier: Option<String>,
+    /// Upper tier bound for bounded mode.
+    #[serde(default)]
+    pub(crate) max_tier: Option<String>,
+    /// Named provider/account pool to preview.
+    #[serde(default)]
+    pub(crate) pool_name: Option<String>,
+    /// Provider aliases that narrow the selected pool.
+    #[serde(default)]
+    pub(crate) pool_providers: Option<Vec<String>>,
+    /// Hard provider pin for preview.
+    #[serde(default)]
+    pub(crate) pin_provider: Option<String>,
+    /// Hard account pin for preview.
+    #[serde(default)]
+    pub(crate) pin_account: Option<String>,
+    /// Hard model pin for preview.
+    #[serde(default)]
+    pub(crate) pin_model: Option<String>,
+    /// Hard effort pin for preview.
+    #[serde(default)]
+    pub(crate) pin_effort: Option<String>,
+    /// Soft provider preference for preview scoring.
+    #[serde(default)]
+    pub(crate) prefer_provider: Option<String>,
+    /// Explicit hard capability requirements.
+    #[serde(default)]
+    pub(crate) capabilities: Option<Vec<String>>,
+    /// Preview as a durable/resumable allocation.
+    #[serde(default)]
+    pub(crate) durable: Option<bool>,
+    /// Named policy or inline policy object for preview scoring.
+    #[serde(default)]
+    pub(crate) selection_policy: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

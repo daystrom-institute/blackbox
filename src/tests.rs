@@ -2376,9 +2376,10 @@ fn resolve_resume_target_accepts_scoped_team_bro_selector() {
         );
     }
 
-    let (provider, session_id, _lens, _opts, _env, cwd, _filters, _coerce_ws) = server
-        .resolve_resume_target(Some("blue::reviewer"), None, None, None)
-        .unwrap();
+    let (provider, session_id, _lens, _opts, _env, cwd, _filters, _coerce_ws, _runtime_lease) =
+        server
+            .resolve_resume_target(Some("blue::reviewer"), None, None, None)
+            .unwrap();
     assert_eq!(provider, Provider::Gemini);
     assert_eq!(session_id, "sid-blue");
     assert_eq!(cwd.as_deref(), Some("/tmp/blue"));

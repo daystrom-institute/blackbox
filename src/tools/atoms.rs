@@ -1159,13 +1159,19 @@ impl BlackboxServer {
             );
         }
 
-        let (session_id, provider_str, cwd) = match &inv.handle {
+        let (session_id, provider_str, cwd, handle_task_id) = match &inv.handle {
             AtomHandle::Profile {
                 session_id,
                 provider,
                 project_dir,
+                task_id,
                 ..
-            } => (session_id.clone(), provider.clone(), project_dir.clone()),
+            } => (
+                session_id.clone(),
+                provider.clone(),
+                project_dir.clone(),
+                task_id.clone(),
+            ),
             _ => unreachable!("is_resumable checked above"),
         };
         if session_id == "pending" {
@@ -1175,17 +1181,10 @@ impl BlackboxServer {
             );
         }
 
-        let provider = match provider_str.parse::<orchestration::providers::Provider>() {
+        let mut provider = match provider_str.parse::<orchestration::providers::Provider>() {
             Ok(p) => p,
             Err(_) => return Err(format!("invalid provider: {provider_str}")),
         };
-
-        if !provider.supports_resume() {
-            return Err(format!(
-                "provider '{}' does not support resume",
-                provider.as_str()
-            ));
-        }
 
         let (_, _, manifest) = match self.resolve_active_atom_manifest(&inv.atom_ref) {
             Ok(found) => found,
@@ -1213,14 +1212,33 @@ impl BlackboxServer {
             Some(b) => b,
             None => return Err(format!("brofile '{}' not found", brofile_name)),
         };
-        if bf.provider != provider {
+        let selected_lease =
+            orchestration::allocator::lookup_lease_for_task(&self.state.store_dir, &handle_task_id);
+        if let Some(lease) = &selected_lease {
+            provider = lease.provider;
+        } else if bf.provider != provider {
             return Err(format!(
                 "error.not_resumable(code=provider_changed): atom brofile now resolves to provider {}, but handle was created with {}",
                 bf.provider.as_str(),
                 provider.as_str()
             ));
         }
-        let exec_opts = if bf.model.is_some() || bf.effort.is_some() {
+        if !provider.supports_resume() {
+            return Err(format!(
+                "provider '{}' does not support resume",
+                provider.as_str()
+            ));
+        }
+        let exec_opts = if let Some(lease) = &selected_lease {
+            orchestration::allocator::exec_opts_for_lane(&orchestration::allocator::RuntimeLane {
+                provider,
+                account: lease.account.clone(),
+                tier: lease.tier.clone(),
+                model: lease.model.clone(),
+                effort: lease.effort.clone(),
+                capabilities: lease.capabilities.clone(),
+            })
+        } else if bf.model.is_some() || bf.effort.is_some() {
             Some(ExecOpts {
                 model: bf.model.clone(),
                 effort: bf.effort.clone(),
@@ -1228,10 +1246,15 @@ impl BlackboxServer {
         } else {
             None
         };
+        let (env_account, env_model) = if let Some(lease) = &selected_lease {
+            (lease.account.as_deref(), lease.model.as_deref())
+        } else {
+            (bf.account.as_deref(), bf.model.as_deref())
+        };
         let env_overrides = orchestration::brofile::resolve_provider_env(
-            bf.provider,
-            bf.account.as_deref(),
-            bf.model.as_deref(),
+            provider,
+            env_account,
+            env_model,
             &self.state.store_dir,
         );
 
@@ -1301,6 +1324,18 @@ impl BlackboxServer {
             Some(inv.atom_ref.clone()),
             Some(self.state.system_events.clone()),
         );
+        if let Some(lease) = &selected_lease {
+            let inner = task.inner.lock();
+            orchestration::allocator::record_lease(
+                &self.state.store_dir,
+                orchestration::allocator::lease_for_resume_task(
+                    lease,
+                    inner.id.clone(),
+                    inner.session_id.clone(),
+                    inner.cwd.clone(),
+                ),
+            );
+        }
 
         crate::server::progress::cleanup_policy_file_when_done(
             task.clone(),
