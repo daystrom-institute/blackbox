@@ -41,6 +41,9 @@ binary test suite passes or every pre-existing failure is documented.
 - Bundle apply validates the full plan before activating any member.
 - Bundle generations are the uninstall boundary. Never infer removal from a
   shared source prefix such as `system-defaults/`.
+- The surface is ops-only. Use a daemon-local mutation guard plus last-moment
+  generation/content-hash rechecks; do not introduce a distributed lock system
+  for hypothetical parallel artifact mutators.
 
 ## Phase 0: Baseline And Anchors
 
@@ -152,7 +155,7 @@ Add internal APIs:
 
 ```rust
 impl CronRegistry {
-    fn uninstall(&self, name: &str) -> Option<CronSpec>;
+    fn uninstall(&self, name: &str) -> Option<CronSpec>; // can wrap/evolve remove()
     fn status(&self, name: &str) -> Option<InletRuntimeStatus>;
 }
 
@@ -167,9 +170,16 @@ impl WebhookRegistry {
 }
 ```
 
+`InletRuntimeStatus` should be a read-only projection for doctor/planner output:
+registered spec present, handle present, handle finished, in-flight count when
+applicable, persisted runtime path, and persisted runtime content hash when
+available. It is not a second registry.
+
 Uninstall rules:
 
-- cron: abort handle and drop run/concurrency state for that name;
+- cron: abort handle and drop run/concurrency state for that name; the existing
+  `remove` method already does the core teardown, but status/return-value shape
+  should be normalized for activators and doctor;
 - poller: abort handle and drop the per-name dedup ring;
 - webhook: drop endpoint registration and per-name delivery ring.
 
@@ -203,15 +213,18 @@ surface roles while preserving behavior for existing kinds.
 
 Update `src/artifacts.rs`:
 
-- add `Cron`, `Poller`, `Webhook`, and `Bundle` to `ArtifactKind`;
+- keep the existing `Cron` variant and add `Poller`, `Webhook`, and `Bundle` to
+  `ArtifactKind`;
 - update string parsing/rendering for new kinds;
-- update `artifact_kind_from_dir_pub` for:
+- update/verify `artifact_kind_from_dir_pub` for:
   - `crons`
   - `pollers`
   - `webhooks`
   - `bundles`
-- update `artifact_name()` so `Cron`, `Poller`, `Webhook`, and `Bundle` all
-  read `value["name"]`;
+- update/verify `artifact_name()` so `Cron`, `Poller`, `Webhook`, and `Bundle`
+  all read `value["name"]`;
+- extend `ArtifactInstallParams` with optional `role` so MCP-surface packets can
+  stay `kind="packet"` while still carrying role metadata into the catalog;
 - extend `ArtifactMetadata`:
 
 ```rust
@@ -256,6 +269,15 @@ trait ArtifactActivator {
     fn deactivate(&self, state: &SharedState, name: &str) -> anyhow::Result<DeactivationResult>;
 }
 ```
+
+Helper structs:
+
+- `PreparedArtifact`: parsed artifact payload plus resolved dependency refs;
+  validation produces it without touching runtime registries or files.
+- `ActivationResult`: runtime ref, activated content hash, and warnings for
+  metadata/generation records.
+- `DeactivationResult`: booleans/details for registry removal, persisted runtime
+  file removal, and per-name side-state cleanup.
 
 Extract current kinds first:
 
@@ -393,6 +415,18 @@ Operations:
 - `uninstall`: deactivate and remove members from the selected generation;
 - `verify`: validate catalog and runtime presence without mutation.
 
+Apply guard:
+
+- wrap mutating artifact/bundle/upgrade operations in one daemon-local mutex or
+  equivalent operation guard;
+- plan output records expected active generation ids and content hashes;
+- immediately before any destructive action, re-check those expected values;
+- if reality changed, stop with a drift result instead of trying to merge
+  operator intent automatically.
+
+This is not a general distributed lock. It only prevents accidental in-process
+overlap and stale-plan mutation on an ops surface.
+
 Persist generation records:
 
 ```text
@@ -447,7 +481,7 @@ system-defaults/bundles/
 Use shallow meta-bundle references. The generation record expands transitive
 membership so uninstall remains precise.
 
-Add top-level `version` fields to shipped cron specs. Require the same for
+Verify shipped cron specs keep top-level `version` fields. Require the same for
 future shipped poller/webhook defaults.
 
 ### 3.7 Tests

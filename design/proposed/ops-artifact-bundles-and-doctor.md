@@ -16,13 +16,15 @@ Today the artifact catalog manages only:
 - agents
 - atoms
 - teams
+- crons
 
-That list is narrower than the shipped default surface. `system-defaults/` also
-contains crons and MCP surface routing, and the runtime already has install/list
-tools for crons, pollers, and webhooks. Those objects are operational artifacts:
-they are versioned JSON specs, daemon-owned, installed into runtime registries,
-and need upgrade/uninstall semantics. Their current invisibility is historical,
-not principled.
+That list is still narrower than the shipped default surface. Cron support has
+started moving into the catalog, but pollers, webhooks, bundles, and MCP surface
+routing are not yet managed through the same lifecycle. The runtime already has
+install/list tools for crons, pollers, and webhooks. Those objects are
+operational artifacts: they are versioned JSON specs, daemon-owned, installed
+into runtime registries, and need upgrade/uninstall semantics. Any remaining
+invisibility is historical, not principled.
 
 The current day-2 runbooks also scatter health and upgrade checks across
 `bbox_stats`, `bbox_embed_status`, `bbox_project_list`, `bbox_describe_schema`,
@@ -43,7 +45,7 @@ tool shows the truth.
 Artifact catalog:
 
 - `src/artifacts.rs` defines `ArtifactKind::{Workflow, Packet, Brofile, Agent,
-  Atom, Team}`.
+  Atom, Team, Cron}`.
 - `ArtifactCatalog::install_value[_scoped]` stores active JSON payloads,
   `metadata.json`, `.versions/v<version>.json`, and
   `.versions/v<version>.metadata.json`.
@@ -52,6 +54,9 @@ Artifact catalog:
   content hash, optional project id, supersession fields, and install warnings.
 - `bbox_artifact_install`, `bbox_artifact_list`, `bbox_artifact_supersede`, and
   `bbox_artifact_remove` are the public MCP tools in `src/tools/artifacts.rs`.
+  Cron is already accepted as an artifact kind, but its activation still writes
+  the old runtime path and has not gone through the planned activator/path
+  extraction.
 - Hard remove exists for one global artifact and calls `deactivate_artifact`
   before deleting catalog files.
 - Project-scoped artifacts exist in the storage layer and `.bbox/` watcher, but
@@ -70,9 +75,9 @@ Activation path:
   provenance edges, and may enqueue agent-manifest embeddings.
 - Atom install validates dependency references.
 - Team install is catalog-only today.
-- `deactivate_artifact` removes workflow files, packet domains, and brofiles;
-  agents, atoms, and teams currently have no separate runtime registry to tear
-  down.
+- `deactivate_artifact` removes workflow files, packet domains, brofiles, and
+  cron runtime files; agents, atoms, and teams currently have no separate
+  runtime registry to tear down.
 
 Inlet runtime:
 
@@ -87,14 +92,16 @@ Inlet runtime:
 - Crons persist under the orchestration runtime store's `crons/<name>.json`,
   install into
   `CronRegistry`, validate schedule syntax, and spawn a tick loop.
-- Those tools expose list operations, but there is no catalog metadata,
-  supersession chain, bundle membership, hard uninstall, or source tracking for
-  these specs.
-- `CronRegistry` and `PollerRegistry` keep `JoinHandle`s and abort the previous
-  handle on reinstall, but they do not currently expose an uninstall/remove API.
-  `WebhookRegistry` has install/get/list and no remove API. Managed removal
-  therefore requires new registry methods, not just wiring existing functions
-  into `deactivate_artifact`.
+- Those tools expose list operations, but pollers and webhooks have no catalog
+  metadata, supersession chain, bundle membership, hard uninstall, or source
+  tracking. Cron has partial artifact support but no bundle metadata or new
+  daemon-owned runtime path yet.
+- `CronRegistry` already exposes `remove`, which aborts the handle and drops
+  run state. `PollerRegistry` keeps `JoinHandle`s and aborts the previous handle
+  on reinstall but does not expose uninstall/remove. `WebhookRegistry` has
+  install/get/list and no remove API. Managed removal therefore still requires
+  new registry methods for pollers/webhooks and a status-oriented cleanup pass
+  for cron, not just wiring existing functions into `deactivate_artifact`.
 - Daemon startup restores webhooks, pollers, and crons directly from that
   runtime store and respawns poller/cron loops. That restore path bypasses the
   artifact catalog today, so doctor must treat these runtime files as
@@ -109,15 +116,18 @@ System defaults:
 - `system-defaults/badgey/crons/*.json`,
   `system-defaults/agentic-corpus/crons/*.json`, and
   `system-defaults/agents/crons/*.json` are therefore shipped defaults that
-  must currently be installed directly through `bro_cron_install`.
+  can be installed through the partial cron artifact path but still lack bundle
+  membership and neutral runtime-store semantics.
 - `system-defaults/mcp-surfaces/routing.json` is also shipped default
   machinery, but it is installed through `bbox_compile`, not the artifact
   catalog.
-- Current cron, poller, and webhook runtime structs do not define `version` or
-  `supersedes` fields. Runtime serde will ignore extra top-level fields in JSON
-  specs, but the artifact catalog requires a version to install. Managed inlet
-  sources therefore need either a top-level `version` field in shipped JSON, or
-  an install-time version override/synthesis rule.
+- Runtime serde ignores extra top-level fields in inlet JSON specs, while the
+  artifact catalog requires a version to install. Shipped cron specs already
+  carry top-level `version` fields. Future shipped poller/webhook defaults must
+  do the same; adoption/backfill of already-active user specs can synthesize
+  `version="unmanaged"` with an explicit warning. Do not add `version` or
+  `supersedes` fields to runtime structs just for cataloging; serde's existing
+  tolerance for extra fields is the compatibility boundary.
 
 Operations baseline:
 
@@ -327,20 +337,25 @@ source happens to live under `system-defaults/`.
 
 Extend `kind` to include:
 
-- `cron`
+- `cron` (already partially present; included here for path/activator/bundle
+  completion)
 - `poller`
 - `webhook`
 - `bundle`
 
 Keep the existing artifact install shape: `source`, optional `name`, optional
-`version`, and optional `supersedes`. New kinds use that same shape so operators
-learn one lifecycle command instead of one command family per runtime object.
+`version`, and optional `supersedes`, and add optional `role` for artifacts such
+as MCP-surface packets whose activation kind stays `packet` but whose ops role
+matters to doctor and bundle planning. New kinds use that same shape so
+operators learn one lifecycle command instead of one command family per runtime
+object.
 
-Version rule for new kinds:
+Version rule for inlet kinds:
 
-- Managed cron/poller/webhook sources under `system-defaults/` should gain a
-  top-level `version`. The runtime structs will ignore it, while
-  `ArtifactCatalog` can record it.
+- Managed cron/poller/webhook sources under `system-defaults/` must carry a
+  top-level `version`. Shipped cron specs already do; future poller/webhook
+  defaults must follow the same rule. Runtime structs ignore the extra field
+  while `ArtifactCatalog` records it.
 - For direct adoption of already-installed runtime specs that lack `version`,
   backfill should synthesize `version="unmanaged"` or require an explicit
   `version` override. Do not silently store `version=1` for unknown user specs;
@@ -366,14 +381,24 @@ trait ArtifactActivator {
 }
 ```
 
+Helper shapes:
+
+- `PreparedArtifact` is the parsed/validated runtime payload plus any resolved
+  dependency refs needed for activation; validation must not mutate registries or
+  runtime files.
+- `ActivationResult` records the runtime ref, activated content hash, and
+  warnings to persist into artifact metadata/generation records.
+- `DeactivationResult` records whether runtime state, persisted runtime files,
+  and per-name side state were actually removed.
+
 This keeps runtime-specific behavior in one place per kind and lets bundles run
 the same path a single install uses.
 
 The implementation is not a trivial wrapper. `install_artifact_value` currently
 conflates validation, runtime activation, catalog write, agent embedding, and
 provenance edge persistence. The first implementation should extract one
-activator at a time while preserving exact existing behavior for the six current
-kinds before adding inlet kinds.
+activator at a time while preserving exact existing behavior for the current
+kinds before adding poller, webhook, and bundle support.
 
 ### `bbox_artifact_plan`
 
@@ -457,11 +482,11 @@ The current hard-remove sequence has the right safety shape:
 
 It needs to stop being global-only and kind-limited.
 
-New runtime removal APIs needed before inlet artifacts can be safely managed:
+Runtime removal/status APIs needed before inlet artifacts can be safely managed:
 
 ```rust
 impl CronRegistry {
-    fn uninstall(&self, name: &str) -> Option<CronSpec>; // abort handle, drop run state
+    fn uninstall(&self, name: &str) -> Option<CronSpec>; // may evolve existing remove()
     fn status(&self, name: &str) -> Option<InletRuntimeStatus>; // handle exists/is_finished/in_flight
 }
 
@@ -474,6 +499,12 @@ impl WebhookRegistry {
     fn uninstall(&self, name: &str) -> Option<WebhookSpec>; // drop endpoint + delivery ring
 }
 ```
+
+`InletRuntimeStatus` is a small doctor/planner projection, not a new source of
+truth. It should expose only what operators need to decide whether runtime state
+matches catalog intent: whether a spec is registered, whether a tick-loop handle
+exists and is finished, current in-flight count when applicable, and the
+persisted runtime path/hash when available.
 
 Each activator's `deactivate` must call the registry uninstall method and then
 remove the persisted runtime spec for that inlet. Uninstall must also remove
@@ -630,6 +661,21 @@ Recovery model:
 This is not full transaction rollback. It is an auditable, resumable operation
 log that prevents a partial bundle reinstall or targeted re-embed from looking
 complete.
+
+Concurrency model:
+
+- This is an ops-only surface; do not build a distributed lock subsystem for a
+  hypothetical fleet of mutating agents.
+- Mutating artifact/bundle/upgrade tools should use one daemon-local operation
+  guard so accidental overlapping apply/reinstall/remove calls in the same
+  process cannot interleave.
+- Destructive apply steps should re-check the generation id and content hashes
+  recorded by the plan immediately before mutation. If the runtime or catalog
+  changed since planning, refuse with a drift finding and ask the operator to
+  re-plan or choose `overwrite_runtime`, `adopt_runtime`, or `skip`.
+- On daemon restart, stale `applying` operation records are reported by
+  doctor/upgrade-check. They are recovery evidence, not lock files that block
+  forever.
 
 ## Doctor
 
