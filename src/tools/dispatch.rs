@@ -180,9 +180,11 @@ impl BlackboxServer {
                 orchestration::allocator::load_effective_config(&store_dir, request.cwd.as_deref());
             let bro_config = orchestration::brofile::load_config(&store_dir);
             let lease_store = orchestration::allocator::lease_store_load(&store_dir);
-            let ctx = orchestration::allocator::allocation_context(
+            let probe_store = orchestration::allocator::probe_store_load(&store_dir);
+            let ctx = orchestration::allocator::allocation_context_with_probes(
                 &self.state.task_store.read(),
                 &lease_store,
+                probe_store,
             );
             let selected = orchestration::allocator::allocate(
                 runtime_request,
@@ -558,14 +560,19 @@ impl BlackboxServer {
             p.project_dir.as_deref(),
         );
         let leases = orchestration::allocator::lease_store_load(&self.state.store_dir);
-        let ctx =
-            orchestration::allocator::allocation_context(&self.state.task_store.read(), &leases);
+        let probes = orchestration::allocator::probe_store_load(&self.state.store_dir);
+        let ctx = orchestration::allocator::allocation_context_with_probes(
+            &self.state.task_store.read(),
+            &leases,
+            probes.clone(),
+        );
         Self::ok_json(&json!({
             "tiers": cfg.tiers,
             "tier_ladders": cfg.tier_ladders,
             "pools": cfg.pools,
             "selection_policies": cfg.selection_policies,
             "in_flight": ctx.in_flight,
+            "probes": probes.records,
             "leases": leases.leases,
         }))
     }

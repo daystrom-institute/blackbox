@@ -176,6 +176,71 @@ pub struct RuntimeLeaseStore {
     pub leases: BTreeMap<String, RuntimeLease>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialStatus {
+    Present,
+    Missing,
+    Expired,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaStatus {
+    Known,
+    Exhausted,
+    ProbeFailed,
+    #[default]
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuotaConfidence {
+    QuotaProbe,
+    RuntimeRateLimit,
+    PaygBalance,
+    ActiveAcceptance,
+    CredentialOnly,
+    #[default]
+    None,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProbeRecord {
+    pub provider: Provider,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub credential_status: CredentialStatus,
+    #[serde(default)]
+    pub quota_status: QuotaStatus,
+    #[serde(default)]
+    pub quota_confidence: QuotaConfidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour_utilization: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day_utilization: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balance_capacity: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_until: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probe_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_runtime_observation_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ProbeStore {
+    #[serde(default)]
+    pub records: BTreeMap<String, ProbeRecord>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeLane {
     pub provider: Provider,
@@ -229,9 +294,10 @@ struct LaneId {
     account: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AllocationContext {
     pub in_flight: BTreeMap<String, usize>,
+    pub probes: BTreeMap<String, ProbeRecord>,
 }
 
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -250,6 +316,10 @@ fn allocator_dir(store_dir: &Path) -> PathBuf {
 
 fn leases_file(store_dir: &Path) -> PathBuf {
     allocator_dir(store_dir).join("leases.json")
+}
+
+fn probes_file(store_dir: &Path) -> PathBuf {
+    allocator_dir(store_dir).join("probes.json")
 }
 
 fn traces_dir(store_dir: &Path) -> PathBuf {
@@ -487,6 +557,14 @@ pub fn parse_capabilities(values: &[String]) -> Result<Vec<Capability>, String> 
 }
 
 pub fn allocation_context(task_store: &TaskStore, leases: &RuntimeLeaseStore) -> AllocationContext {
+    allocation_context_with_probes(task_store, leases, ProbeStore::default())
+}
+
+pub fn allocation_context_with_probes(
+    task_store: &TaskStore,
+    leases: &RuntimeLeaseStore,
+    probes: ProbeStore,
+) -> AllocationContext {
     let mut in_flight = BTreeMap::new();
     for task in task_store.all_tasks() {
         let inner = task.inner.lock();
@@ -498,7 +576,10 @@ pub fn allocation_context(task_store: &TaskStore, leases: &RuntimeLeaseStore) ->
             }
         }
     }
-    AllocationContext { in_flight }
+    AllocationContext {
+        in_flight,
+        probes: probes.records,
+    }
 }
 
 pub fn allocate(
@@ -727,6 +808,20 @@ fn score_candidate(
 
     let key = lane_key(lane.provider, lane.account.as_deref());
     let in_flight = *ctx.in_flight.get(&key).unwrap_or(&0);
+    let probe = ctx.probes.get(&key);
+    if probe.is_some_and(|probe| {
+        matches!(
+            probe.credential_status,
+            CredentialStatus::Missing | CredentialStatus::Expired
+        )
+    }) {
+        candidate.exclusion_reason = Some("credential_unavailable".into());
+        return candidate;
+    }
+    if probe.is_some_and(|probe| matches!(probe.quota_status, QuotaStatus::Exhausted)) {
+        candidate.exclusion_reason = Some("quota_exhausted".into());
+        return candidate;
+    }
     let max_concurrent = lane
         .account
         .as_deref()
@@ -746,19 +841,28 @@ fn score_candidate(
         1.0 - (in_flight as f64 / max_concurrent as f64)
     }
     .clamp(0.0, 1.0);
+    let quota_capacity = probe.map(quota_capacity).unwrap_or(0.5);
+    let cooldown_capacity = probe
+        .and_then(|probe| probe.cooldown_until)
+        .map(|until| if until > super::now_ms() { 0.0 } else { 1.0 })
+        .unwrap_or(1.0);
+    if cooldown_capacity == 0.0 {
+        candidate.exclusion_reason = Some("cooldown_active".into());
+        return candidate;
+    }
     let tier_fit = if tier.is_some() { 1.0 } else { 0.8 };
     candidate
         .score_components
         .insert("provider_preference".into(), provider_preference);
     candidate
         .score_components
-        .insert("quota_capacity".into(), 0.5);
+        .insert("quota_capacity".into(), quota_capacity);
     candidate
         .score_components
         .insert("concurrency_capacity".into(), concurrency_capacity);
     candidate
         .score_components
-        .insert("cooldown_capacity".into(), 1.0);
+        .insert("cooldown_capacity".into(), cooldown_capacity);
     candidate
         .score_components
         .insert("tier_fit".into(), tier_fit);
@@ -779,13 +883,31 @@ fn score_candidate(
         .score_components
         .insert("runtime_preference".into(), runtime_preference);
     candidate.score = provider_preference
-        * 0.5
+        * quota_capacity
         * concurrency_capacity
+        * cooldown_capacity
         * tier_fit
         * policy_score
         * runtime_preference;
     candidate.eligible = true;
     candidate
+}
+
+fn quota_capacity(probe: &ProbeRecord) -> f64 {
+    match probe.quota_confidence {
+        QuotaConfidence::QuotaProbe | QuotaConfidence::RuntimeRateLimit => {
+            let utilization = probe
+                .five_hour_utilization
+                .into_iter()
+                .chain(probe.seven_day_utilization)
+                .fold(0.0_f64, f64::max);
+            (1.0 - utilization).clamp(0.0, 1.0)
+        }
+        QuotaConfidence::PaygBalance => probe.balance_capacity.unwrap_or(0.5).clamp(0.0, 1.0),
+        QuotaConfidence::ActiveAcceptance => 0.95,
+        QuotaConfidence::CredentialOnly => 0.35,
+        QuotaConfidence::None => 0.25,
+    }
 }
 
 fn resolve_selection_policy(request: &RuntimeRequest, config: &AllocatorConfig) -> SelectionPolicy {
@@ -1118,6 +1240,17 @@ pub fn lease_store_save(store_dir: &Path, store: &RuntimeLeaseStore) {
     write_json_atomic(&leases_file(store_dir), store);
 }
 
+pub fn probe_store_load(store_dir: &Path) -> ProbeStore {
+    fs::read_to_string(probes_file(store_dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn probe_store_save(store_dir: &Path, store: &ProbeStore) {
+    write_json_atomic(&probes_file(store_dir), store);
+}
+
 pub fn record_lease(store_dir: &Path, lease: RuntimeLease) {
     let _guard = LEASE_STORE_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -1316,6 +1449,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1348,6 +1482,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1383,6 +1518,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1418,6 +1554,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1461,6 +1598,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1505,6 +1643,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1550,6 +1689,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1566,6 +1706,78 @@ mod tests {
                 "{:?}",
                 allocation.trace.candidates
             );
+        });
+    }
+
+    #[test]
+    fn probe_quota_capacity_participates_in_scoring() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            let request = RuntimeRequest {
+                tier: Some("standard".into()),
+                pool: Some(PoolRef {
+                    name: Some("coding".into()),
+                    providers: vec![Provider::Glm, Provider::Claude],
+                }),
+                ..Default::default()
+            };
+            let probes = BTreeMap::from([
+                (
+                    lane_key(Provider::Glm, None),
+                    ProbeRecord {
+                        provider: Provider::Glm,
+                        account: None,
+                        credential_status: CredentialStatus::Present,
+                        quota_status: QuotaStatus::Known,
+                        quota_confidence: QuotaConfidence::QuotaProbe,
+                        five_hour_utilization: Some(0.95),
+                        seven_day_utilization: Some(0.9),
+                        balance_capacity: None,
+                        cooldown_until: None,
+                        last_probe_at: Some(crate::orchestration::now_ms()),
+                        last_runtime_observation_at: None,
+                        raw_summary: None,
+                    },
+                ),
+                (
+                    lane_key(Provider::Claude, None),
+                    ProbeRecord {
+                        provider: Provider::Claude,
+                        account: None,
+                        credential_status: CredentialStatus::Present,
+                        quota_status: QuotaStatus::Known,
+                        quota_confidence: QuotaConfidence::QuotaProbe,
+                        five_hour_utilization: Some(0.1),
+                        seven_day_utilization: Some(0.2),
+                        balance_capacity: None,
+                        cooldown_until: None,
+                        last_probe_at: Some(crate::orchestration::now_ms()),
+                        last_runtime_observation_at: None,
+                        raw_summary: None,
+                    },
+                ),
+            ]);
+            let allocation = allocate(
+                request,
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                    probes,
+                },
+            );
+            assert!(
+                allocation.trace.error.is_none(),
+                "{:?}",
+                allocation.trace.error
+            );
+            assert_eq!(allocation.lane.provider, Provider::Claude);
+            assert!(allocation.trace.candidates.iter().any(|candidate| {
+                candidate
+                    .score_components
+                    .get("quota_capacity")
+                    .is_some_and(|score| *score < 0.1)
+            }));
         });
     }
 
@@ -1594,6 +1806,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::new(),
+                    ..Default::default()
                 },
             );
             assert!(
@@ -1626,6 +1839,7 @@ mod tests {
             &BroConfig::default(),
             &AllocationContext {
                 in_flight: BTreeMap::new(),
+                ..Default::default()
             },
         );
         assert!(
@@ -1673,6 +1887,7 @@ mod tests {
                 &BroConfig::default(),
                 &AllocationContext {
                     in_flight: BTreeMap::from([(lane_key(Provider::Codex, None), 1)]),
+                    ..Default::default()
                 },
             );
             assert!(
