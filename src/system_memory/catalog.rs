@@ -429,9 +429,12 @@ mod tests {
         )
         .unwrap();
 
-        let err =
-            MemoryCatalog::load(defaults.path(), None, &serde_json::json!({"version": "1.2.3"}))
-                .unwrap_err();
+        let err = MemoryCatalog::load(
+            defaults.path(),
+            None,
+            &serde_json::json!({"version": "1.2.3"}),
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("rendering system memory template"));
     }
