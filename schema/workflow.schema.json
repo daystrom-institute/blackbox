@@ -83,9 +83,113 @@
           "items": { "$ref": "#/definitions/Capability" }
         },
         "limits":            { "$ref": "#/definitions/AtomBindingLimits" },
-        "supervision_override": {},
+        "supervision_override": { "$ref": "#/definitions/SupervisionPlanOverride" },
         "trace_override": {},
         "portal": {}
+      }
+    },
+
+    "SupervisionPlanOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "classifier": { "$ref": "#/definitions/SupervisionClassifierOverride" },
+        "advisor": { "$ref": "#/definitions/SupervisionAdvisorOverride" },
+        "recovery": { "$ref": "#/definitions/SupervisionRecoveryOverride" },
+        "trigger": { "$ref": "#/definitions/SupervisionTriggerOverride" },
+        "tail_policy": { "$ref": "#/definitions/SupervisionTailPolicyOverride" },
+        "alert_dedup": { "$ref": "#/definitions/SupervisionAlertDedupOverride" }
+      }
+    },
+
+    "SupervisionClassifierOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": ["none", "on_mechanical_alert", "cadence", "cadence_or_alert", "turn_end_only"]
+        },
+        "atom_ref": {
+          "type": "string",
+          "pattern": "^atom:[^@]+@(v[1-9][0-9]*|latest)$"
+        },
+        "required": { "type": "boolean" },
+        "cadence_ms": { "type": "integer", "minimum": 1 },
+        "max_polls": { "type": "integer", "minimum": 0 },
+        "alerting_classifications": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "runtime": { "$ref": "#/definitions/SupervisionRuntimeIntent" }
+      }
+    },
+
+    "SupervisionAdvisorOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["none", "on_alert", "always"] },
+        "atom_ref": {
+          "type": "string",
+          "pattern": "^atom:[^@]+@(v[1-9][0-9]*|latest)$"
+        },
+        "durable": { "type": "boolean" },
+        "runtime": { "$ref": "#/definitions/SupervisionRuntimeIntent" }
+      }
+    },
+
+    "SupervisionRecoveryOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_attempts": { "type": "integer", "minimum": 1 },
+        "tier_ladder": { "type": "string", "minLength": 1 },
+        "tier_mode": { "enum": ["exact", "at_least", "bounded"] },
+        "runtime": { "$ref": "#/definitions/SupervisionRuntimeIntent" }
+      }
+    },
+
+    "SupervisionTriggerOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mechanical_alerts": { "type": "boolean" },
+        "turn_end": { "type": "boolean" }
+      }
+    },
+
+    "SupervisionTailPolicyOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "events": { "type": "integer", "minimum": 0 },
+        "notes": { "type": "integer", "minimum": 0 },
+        "assistant_bytes": { "type": "integer", "minimum": 0 },
+        "reports": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "SupervisionAlertDedupOverride": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "window_ms": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "SupervisionRuntimeIntent": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tier": { "type": "string", "minLength": 1 },
+        "tier_ladder": { "type": "string", "minLength": 1 },
+        "tier_mode": { "enum": ["exact", "at_least", "bounded"] },
+        "capabilities": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "selection_policy": { "type": "string", "minLength": 1 }
       }
     },
 

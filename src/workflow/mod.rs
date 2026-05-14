@@ -71,6 +71,9 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
                 binding.atom_ref
             );
         }
+        if let Some(supervision_override) = &binding.supervision_override {
+            validate_supervision_override(binding_id, supervision_override)?;
+        }
     }
 
     // Every node's `next` targets must reference declared nodes; gate
@@ -173,6 +176,16 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
         bail!("workflow has no Terminal transition — arc can never complete normally");
     }
 
+    Ok(())
+}
+
+fn validate_supervision_override(
+    binding_id: &str,
+    override_policy: &crate::orchestration::atoms::types::SupervisionPlanOverride,
+) -> Result<()> {
+    override_policy.validate_shape().map_err(|e| {
+        anyhow!("atom binding '{binding_id}' has invalid supervision_override: {e}")
+    })?;
     Ok(())
 }
 
@@ -705,6 +718,67 @@ mod tests {
             }"#,
         );
         assert!(err.contains("invalid atom_ref"), "{err}");
+    }
+
+    #[test]
+    fn atom_binding_accepts_typed_supervision_override() {
+        let json = r#"{
+            "name": "atom-binding-supervision",
+            "version": 1,
+            "actors": {},
+            "atom_bindings": {
+                "echoer": {
+                    "atom_ref": "atom:echo@v1",
+                    "supervision_override": {
+                        "classifier": {
+                            "mode": "none"
+                        },
+                        "advisor": {
+                            "mode": "on_alert",
+                            "atom_ref": "atom:turn-end-advisor@v1"
+                        },
+                        "tail_policy": {
+                            "events": 5,
+                            "notes": 3,
+                            "assistant_bytes": 2048
+                        }
+                    }
+                }
+            },
+            "nodes": {
+                "Echo": {"atom": "echoer", "next": {"type": "terminal"}}
+            },
+            "start": "Echo"
+        }"#;
+        let spec = load_workflow(json).expect("parse atom-binding workflow");
+        compile(spec).expect("typed supervision_override should compile");
+    }
+
+    #[test]
+    fn atom_binding_rejects_malformed_supervision_override() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-binding-supervision",
+                "version": 1,
+                "actors": {},
+                "atom_bindings": {
+                    "echoer": {
+                        "atom_ref": "atom:echo@v1",
+                        "supervision_override": {
+                            "classifier": {
+                                "atom_ref": "behavior-classifier"
+                            }
+                        }
+                    }
+                },
+                "nodes": {
+                    "Echo": {"atom": "echoer", "next": {"type": "terminal"}}
+                },
+                "start": "Echo"
+            }"#,
+        );
+        assert!(err.contains("supervision_override"), "{err}");
+        assert!(err.contains("typed atom ref"), "{err}");
     }
 
     #[test]
@@ -1612,6 +1686,61 @@ mod tests {
         assert!(
             !compiled.is_valid(&invalid_child_xor),
             "workflow.schema.json should reject foreach child workflow XOR violations"
+        );
+
+        let valid_supervision_override: serde_json::Value = serde_json::json!({
+            "name": "supervised-binding",
+            "version": 1,
+            "actors": {},
+            "atom_bindings": {
+                "worker": {
+                    "atom_ref": "atom:echo@v1",
+                    "supervision_override": {
+                        "classifier": {
+                            "mode": "cadence",
+                            "atom_ref": "atom:behavior-classifier@v1",
+                            "cadence_ms": 1000
+                        },
+                        "advisor": {
+                            "mode": "on_alert",
+                            "atom_ref": "atom:turn-end-advisor@v1"
+                        }
+                    }
+                }
+            },
+            "nodes": {
+                "Only": { "atom": "worker", "next": { "type": "terminal" } }
+            },
+            "start": "Only"
+        });
+        assert!(
+            compiled.is_valid(&valid_supervision_override),
+            "workflow.schema.json should accept typed supervision_override"
+        );
+
+        let invalid_supervision_override: serde_json::Value = serde_json::json!({
+            "name": "bad-supervised-binding",
+            "version": 1,
+            "actors": {},
+            "atom_bindings": {
+                "worker": {
+                    "atom_ref": "atom:echo@v1",
+                    "supervision_override": {
+                        "classifier": {
+                            "mode": "cadence",
+                            "atom_ref": "behavior-classifier"
+                        }
+                    }
+                }
+            },
+            "nodes": {
+                "Only": { "atom": "worker", "next": { "type": "terminal" } }
+            },
+            "start": "Only"
+        });
+        assert!(
+            !compiled.is_valid(&invalid_supervision_override),
+            "workflow.schema.json should reject malformed supervision_override"
         );
     }
 

@@ -157,6 +157,597 @@ fn default_supervision_advisor() -> String {
     "none".to_string()
 }
 
+// ---------------------------------------------------------------------------
+// Runtime supervision plan
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionPlan {
+    pub classifier: SupervisionClassifierPlan,
+    pub advisor: SupervisionAdvisorPlan,
+    pub recovery: SupervisionRecoveryPlan,
+    pub trigger: SupervisionTriggerPlan,
+    pub tail_policy: SupervisionTailPolicy,
+    pub alert_dedup: SupervisionAlertDedupPolicy,
+}
+
+impl Default for SupervisionPlan {
+    fn default() -> Self {
+        Self {
+            classifier: SupervisionClassifierPlan::default(),
+            advisor: SupervisionAdvisorPlan::default(),
+            recovery: SupervisionRecoveryPlan::default(),
+            trigger: SupervisionTriggerPlan::default(),
+            tail_policy: SupervisionTailPolicy::default(),
+            alert_dedup: SupervisionAlertDedupPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionClassifierPlan {
+    pub mode: SupervisionClassifierMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_ref: Option<AtomRef>,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_polls: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub alerting_classifications: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SupervisionRuntimeIntent>,
+}
+
+impl Default for SupervisionClassifierPlan {
+    fn default() -> Self {
+        Self {
+            mode: SupervisionClassifierMode::None,
+            atom_ref: None,
+            required: false,
+            cadence_ms: None,
+            max_polls: None,
+            alerting_classifications: default_alerting_classifications(),
+            runtime: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisionClassifierMode {
+    None,
+    OnMechanicalAlert,
+    Cadence,
+    CadenceOrAlert,
+    TurnEndOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionAdvisorPlan {
+    pub mode: SupervisionAdvisorMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_ref: Option<AtomRef>,
+    #[serde(default = "default_advisor_durable")]
+    pub durable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SupervisionRuntimeIntent>,
+}
+
+impl Default for SupervisionAdvisorPlan {
+    fn default() -> Self {
+        Self {
+            mode: SupervisionAdvisorMode::None,
+            atom_ref: None,
+            durable: default_advisor_durable(),
+            runtime: None,
+        }
+    }
+}
+
+fn default_advisor_durable() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisionAdvisorMode {
+    None,
+    OnAlert,
+    Always,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionRecoveryPlan {
+    #[serde(default = "default_recovery_max_attempts")]
+    pub max_attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_ladder: Option<String>,
+    #[serde(default)]
+    pub tier_mode: SupervisionTierMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SupervisionRuntimeIntent>,
+}
+
+impl Default for SupervisionRecoveryPlan {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_recovery_max_attempts(),
+            tier_ladder: None,
+            tier_mode: SupervisionTierMode::Exact,
+            runtime: None,
+        }
+    }
+}
+
+fn default_recovery_max_attempts() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SupervisionTierMode {
+    #[default]
+    Exact,
+    AtLeast,
+    Bounded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionTriggerPlan {
+    #[serde(default)]
+    pub mechanical_alerts: bool,
+    #[serde(default)]
+    pub turn_end: bool,
+}
+
+impl Default for SupervisionTriggerPlan {
+    fn default() -> Self {
+        Self {
+            mechanical_alerts: true,
+            turn_end: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionTailPolicy {
+    #[serde(default = "default_tail_events")]
+    pub events: u32,
+    #[serde(default = "default_tail_notes")]
+    pub notes: u32,
+    #[serde(default = "default_tail_assistant_bytes")]
+    pub assistant_bytes: u32,
+    #[serde(default = "default_tail_reports")]
+    pub reports: u32,
+}
+
+impl Default for SupervisionTailPolicy {
+    fn default() -> Self {
+        Self {
+            events: default_tail_events(),
+            notes: default_tail_notes(),
+            assistant_bytes: default_tail_assistant_bytes(),
+            reports: default_tail_reports(),
+        }
+    }
+}
+
+fn default_tail_events() -> u32 {
+    20
+}
+fn default_tail_notes() -> u32 {
+    20
+}
+fn default_tail_assistant_bytes() -> u32 {
+    4000
+}
+fn default_tail_reports() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionAlertDedupPolicy {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_alert_dedup_window_ms")]
+    pub window_ms: u64,
+}
+
+impl Default for SupervisionAlertDedupPolicy {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_ms: default_alert_dedup_window_ms(),
+        }
+    }
+}
+
+fn default_alert_dedup_window_ms() -> u64 {
+    60_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisionRuntimeIntent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_ladder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_mode: Option<SupervisionTierMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_policy: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionPlanOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<SupervisionClassifierOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor: Option<SupervisionAdvisorOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<SupervisionRecoveryOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger: Option<SupervisionTriggerOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tail_policy: Option<SupervisionTailPolicyOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_dedup: Option<SupervisionAlertDedupOverride>,
+}
+
+impl SupervisionPlanOverride {
+    pub fn validate_shape(&self) -> Result<(), String> {
+        if let Some(classifier) = &self.classifier {
+            if let Some(atom_ref) = &classifier.atom_ref {
+                parse_supervision_atom_ref(atom_ref, "classifier.atom_ref")?;
+            }
+            if classifier.mode == Some(SupervisionClassifierMode::None)
+                && classifier.atom_ref.is_some()
+            {
+                return Err("classifier.atom_ref is invalid when classifier.mode=none".into());
+            }
+            if classifier.cadence_ms == Some(0) {
+                return Err("classifier.cadence_ms must be greater than zero".into());
+            }
+        }
+        if let Some(advisor) = &self.advisor {
+            if let Some(atom_ref) = &advisor.atom_ref {
+                parse_supervision_atom_ref(atom_ref, "advisor.atom_ref")?;
+            }
+            if advisor.mode == Some(SupervisionAdvisorMode::None) && advisor.atom_ref.is_some() {
+                return Err("advisor.atom_ref is invalid when advisor.mode=none".into());
+            }
+        }
+        if let Some(recovery) = &self.recovery {
+            if recovery.max_attempts == Some(0) {
+                return Err("recovery.max_attempts must be greater than zero".into());
+            }
+            if recovery
+                .tier_ladder
+                .as_deref()
+                .is_some_and(|ladder| ladder.trim().is_empty())
+            {
+                return Err("recovery.tier_ladder must not be empty".into());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionClassifierOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SupervisionClassifierMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_polls: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alerting_classifications: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SupervisionRuntimeIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionAdvisorOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SupervisionAdvisorMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub atom_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durable: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SupervisionRuntimeIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionRecoveryOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_attempts: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_ladder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier_mode: Option<SupervisionTierMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<SupervisionRuntimeIntent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionTriggerOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mechanical_alerts: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_end: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionTailPolicyOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub events: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assistant_bytes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reports: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SupervisionAlertDedupOverride {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SupervisionPlanDefaults {
+    pub default_classifier_atom: Option<AtomRef>,
+    pub default_classifier_mode: Option<SupervisionClassifierMode>,
+    pub default_advisor_atom: Option<AtomRef>,
+}
+
+impl SupervisionPlan {
+    pub fn normalize(
+        manifest: Option<&AtomSupervisionPolicy>,
+        binding_override: Option<&SupervisionPlanOverride>,
+        caller_override: Option<&SupervisionPlanOverride>,
+        defaults: &SupervisionPlanDefaults,
+    ) -> Result<Self, String> {
+        let mut plan = SupervisionPlan::default();
+        if let Some(manifest) = manifest {
+            plan.apply_manifest_policy(manifest, defaults)?;
+        }
+        if let Some(override_policy) = binding_override {
+            plan.apply_override(override_policy)?;
+        }
+        if let Some(override_policy) = caller_override {
+            plan.apply_override(override_policy)?;
+        }
+        plan.validate()?;
+        Ok(plan)
+    }
+
+    fn apply_manifest_policy(
+        &mut self,
+        policy: &AtomSupervisionPolicy,
+        defaults: &SupervisionPlanDefaults,
+    ) -> Result<(), String> {
+        match policy.oracle.as_str() {
+            "none" => {
+                self.classifier.mode = SupervisionClassifierMode::None;
+                self.classifier.atom_ref = None;
+            }
+            "default" => {
+                self.classifier.mode = defaults
+                    .default_classifier_mode
+                    .unwrap_or(SupervisionClassifierMode::CadenceOrAlert);
+                self.classifier.atom_ref =
+                    Some(defaults.default_classifier_atom.clone().ok_or_else(|| {
+                        "supervision.oracle=default requires a configured default classifier atom"
+                            .to_string()
+                    })?);
+            }
+            raw => {
+                self.classifier.mode = SupervisionClassifierMode::CadenceOrAlert;
+                self.classifier.atom_ref = Some(parse_supervision_atom_ref(raw, "oracle")?);
+            }
+        }
+
+        match policy.advisor.as_str() {
+            "none" => {
+                self.advisor.mode = SupervisionAdvisorMode::None;
+                self.advisor.atom_ref = None;
+            }
+            "on_alert" => {
+                self.advisor.mode = SupervisionAdvisorMode::OnAlert;
+                self.advisor.atom_ref = defaults.default_advisor_atom.clone();
+            }
+            "always" => {
+                self.advisor.mode = SupervisionAdvisorMode::Always;
+                self.advisor.atom_ref = defaults.default_advisor_atom.clone();
+            }
+            raw => {
+                self.advisor.mode = SupervisionAdvisorMode::OnAlert;
+                self.advisor.atom_ref = Some(parse_supervision_atom_ref(raw, "advisor")?);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn apply_override(
+        &mut self,
+        override_policy: &SupervisionPlanOverride,
+    ) -> Result<(), String> {
+        if let Some(classifier) = &override_policy.classifier {
+            if let Some(mode) = classifier.mode {
+                self.classifier.mode = mode;
+                if mode == SupervisionClassifierMode::None {
+                    self.classifier.atom_ref = None;
+                }
+            }
+            if let Some(atom_ref) = &classifier.atom_ref {
+                self.classifier.atom_ref =
+                    Some(parse_supervision_atom_ref(atom_ref, "classifier.atom_ref")?);
+            }
+            if let Some(required) = classifier.required {
+                self.classifier.required = required;
+            }
+            if let Some(cadence_ms) = classifier.cadence_ms {
+                self.classifier.cadence_ms = Some(cadence_ms);
+            }
+            if let Some(max_polls) = classifier.max_polls {
+                self.classifier.max_polls = Some(max_polls);
+            }
+            if let Some(alerting) = &classifier.alerting_classifications {
+                self.classifier.alerting_classifications = alerting.clone();
+            }
+            if let Some(runtime) = &classifier.runtime {
+                self.classifier.runtime = Some(runtime.clone());
+            }
+        }
+
+        if let Some(advisor) = &override_policy.advisor {
+            if let Some(mode) = advisor.mode {
+                self.advisor.mode = mode;
+                if mode == SupervisionAdvisorMode::None {
+                    self.advisor.atom_ref = None;
+                }
+            }
+            if let Some(atom_ref) = &advisor.atom_ref {
+                self.advisor.atom_ref =
+                    Some(parse_supervision_atom_ref(atom_ref, "advisor.atom_ref")?);
+            }
+            if let Some(durable) = advisor.durable {
+                self.advisor.durable = durable;
+            }
+            if let Some(runtime) = &advisor.runtime {
+                self.advisor.runtime = Some(runtime.clone());
+            }
+        }
+
+        if let Some(recovery) = &override_policy.recovery {
+            if let Some(max_attempts) = recovery.max_attempts {
+                self.recovery.max_attempts = max_attempts;
+            }
+            if let Some(tier_ladder) = &recovery.tier_ladder {
+                self.recovery.tier_ladder = Some(tier_ladder.clone());
+            }
+            if let Some(tier_mode) = recovery.tier_mode {
+                self.recovery.tier_mode = tier_mode;
+            }
+            if let Some(runtime) = &recovery.runtime {
+                self.recovery.runtime = Some(runtime.clone());
+            }
+        }
+
+        if let Some(trigger) = &override_policy.trigger {
+            if let Some(mechanical_alerts) = trigger.mechanical_alerts {
+                self.trigger.mechanical_alerts = mechanical_alerts;
+            }
+            if let Some(turn_end) = trigger.turn_end {
+                self.trigger.turn_end = turn_end;
+            }
+        }
+
+        if let Some(tail) = &override_policy.tail_policy {
+            if let Some(events) = tail.events {
+                self.tail_policy.events = events;
+            }
+            if let Some(notes) = tail.notes {
+                self.tail_policy.notes = notes;
+            }
+            if let Some(assistant_bytes) = tail.assistant_bytes {
+                self.tail_policy.assistant_bytes = assistant_bytes;
+            }
+            if let Some(reports) = tail.reports {
+                self.tail_policy.reports = reports;
+            }
+        }
+
+        if let Some(alert_dedup) = &override_policy.alert_dedup {
+            if let Some(enabled) = alert_dedup.enabled {
+                self.alert_dedup.enabled = enabled;
+            }
+            if let Some(window_ms) = alert_dedup.window_ms {
+                self.alert_dedup.window_ms = window_ms;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self.classifier.mode != SupervisionClassifierMode::None
+            && self.classifier.atom_ref.is_none()
+        {
+            return Err("enabled classifier supervision requires classifier.atom_ref".into());
+        }
+        if self.classifier.mode == SupervisionClassifierMode::None
+            && self.classifier.atom_ref.is_some()
+        {
+            return Err("classifier.atom_ref is invalid when classifier.mode=none".into());
+        }
+        if matches!(
+            self.classifier.mode,
+            SupervisionClassifierMode::Cadence | SupervisionClassifierMode::CadenceOrAlert
+        ) && self.classifier.cadence_ms == Some(0)
+        {
+            return Err("classifier.cadence_ms must be greater than zero".into());
+        }
+        if self.advisor.mode != SupervisionAdvisorMode::None && self.advisor.atom_ref.is_none() {
+            return Err("enabled advisor supervision requires advisor.atom_ref".into());
+        }
+        if self.advisor.mode == SupervisionAdvisorMode::None && self.advisor.atom_ref.is_some() {
+            return Err("advisor.atom_ref is invalid when advisor.mode=none".into());
+        }
+        if self.recovery.max_attempts == 0 {
+            return Err("recovery.max_attempts must be greater than zero".into());
+        }
+        if matches!(
+            self.recovery.tier_mode,
+            SupervisionTierMode::AtLeast | SupervisionTierMode::Bounded
+        ) && self
+            .recovery
+            .tier_ladder
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+        {
+            return Err("recovery tier_mode at_least/bounded requires tier_ladder".into());
+        }
+        Ok(())
+    }
+}
+
+fn parse_supervision_atom_ref(raw: &str, field: &str) -> Result<AtomRef, String> {
+    AtomRef::parse(raw)
+        .ok_or_else(|| format!("supervision.{field} must be a typed atom ref (atom:name@vN)"))
+}
+
+fn default_alerting_classifications() -> Vec<String> {
+    [
+        "maybe_stuck",
+        "maybe_scope_drift",
+        "maybe_unsupported_claims",
+        "maybe_tool_misuse",
+        "needs_advisor",
+        "classifier_failed",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AtomTracePolicy {
     #[serde(default = "default_trace_retain")]
@@ -524,6 +1115,112 @@ mod tests {
         assert_eq!(AtomCostClass::Cheap.to_string(), "cheap");
         assert_eq!(AtomCostClass::Normal.to_string(), "normal");
         assert_eq!(AtomCostClass::Expensive.to_string(), "expensive");
+    }
+
+    #[test]
+    fn supervision_manifest_defaults_normalize_disabled() {
+        let plan =
+            SupervisionPlan::normalize(None, None, None, &SupervisionPlanDefaults::default())
+                .unwrap();
+
+        assert_eq!(plan.classifier.mode, SupervisionClassifierMode::None);
+        assert_eq!(plan.classifier.atom_ref, None);
+        assert_eq!(plan.advisor.mode, SupervisionAdvisorMode::None);
+        assert_eq!(plan.advisor.atom_ref, None);
+    }
+
+    #[test]
+    fn supervision_oracle_default_resolves_configured_classifier() {
+        let defaults = SupervisionPlanDefaults {
+            default_classifier_atom: Some(AtomRef::pinned("behavior-classifier", 1)),
+            default_classifier_mode: Some(SupervisionClassifierMode::OnMechanicalAlert),
+            default_advisor_atom: None,
+        };
+        let manifest = AtomSupervisionPolicy {
+            oracle: "default".into(),
+            advisor: "none".into(),
+        };
+
+        let plan = SupervisionPlan::normalize(Some(&manifest), None, None, &defaults).unwrap();
+
+        assert_eq!(
+            plan.classifier.atom_ref,
+            Some(AtomRef::pinned("behavior-classifier", 1))
+        );
+        assert_eq!(
+            plan.classifier.mode,
+            SupervisionClassifierMode::OnMechanicalAlert
+        );
+    }
+
+    #[test]
+    fn supervision_binding_override_can_disable_classifier() {
+        let defaults = SupervisionPlanDefaults {
+            default_classifier_atom: Some(AtomRef::pinned("behavior-classifier", 1)),
+            default_classifier_mode: Some(SupervisionClassifierMode::CadenceOrAlert),
+            default_advisor_atom: None,
+        };
+        let manifest = AtomSupervisionPolicy {
+            oracle: "default".into(),
+            advisor: "none".into(),
+        };
+        let override_policy = SupervisionPlanOverride {
+            classifier: Some(SupervisionClassifierOverride {
+                mode: Some(SupervisionClassifierMode::None),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let plan =
+            SupervisionPlan::normalize(Some(&manifest), Some(&override_policy), None, &defaults)
+                .unwrap();
+
+        assert_eq!(plan.classifier.mode, SupervisionClassifierMode::None);
+        assert_eq!(plan.classifier.atom_ref, None);
+    }
+
+    #[test]
+    fn supervision_alerting_classifications_are_preserved() {
+        let override_policy = SupervisionPlanOverride {
+            classifier: Some(SupervisionClassifierOverride {
+                mode: Some(SupervisionClassifierMode::Cadence),
+                atom_ref: Some("atom:behavior-classifier@v1".into()),
+                alerting_classifications: Some(vec![
+                    "maybe_scope_drift".into(),
+                    "needs_advisor".into(),
+                ]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let plan = SupervisionPlan::normalize(
+            None,
+            Some(&override_policy),
+            None,
+            &SupervisionPlanDefaults::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan.classifier.alerting_classifications,
+            vec!["maybe_scope_drift", "needs_advisor"]
+        );
+    }
+
+    #[test]
+    fn supervision_malformed_override_fails_validation() {
+        let override_policy = SupervisionPlanOverride {
+            classifier: Some(SupervisionClassifierOverride {
+                atom_ref: Some("behavior-classifier".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = override_policy.validate_shape().unwrap_err();
+        assert!(err.contains("typed atom ref"), "{err}");
     }
 
     #[test]

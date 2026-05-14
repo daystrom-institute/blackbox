@@ -11,6 +11,7 @@ use super::context::VarsSchema;
 use super::ops::HookOp;
 use super::wait::WaitSpec;
 use crate::orchestration::allocator::RuntimeRequest;
+use crate::orchestration::atoms::types::SupervisionPlanOverride;
 use crate::orchestration::providers::Capability;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,7 +107,7 @@ pub struct AtomBinding {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<AtomBindingLimits>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub supervision_override: Option<serde_json::Value>,
+    pub supervision_override: Option<SupervisionPlanOverride>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_override: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
