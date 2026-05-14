@@ -5841,6 +5841,23 @@ impl Cache {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn refactor_run_steps_schema_exposes_structured_step_variants() {
+        let schema = rmcp::schemars::schema_for!(RefactorRunParams);
+        let value = serde_json::to_value(schema).unwrap();
+        let steps = &value["properties"]["steps"];
+        assert_ne!(
+            steps["items"]["type"], "string",
+            "bbox_refactor_run.steps must not be advertised as string[]"
+        );
+        assert!(
+            steps["items"].get("oneOf").is_some()
+                || steps["items"].get("anyOf").is_some()
+                || steps["items"].get("$ref").is_some(),
+            "bbox_refactor_run.steps should expose structured RefactorRunStep variants: {steps}"
+        );
+    }
+
     // G15: bbox_refactor_apply refuses to apply when the caller's cwd
     // is in a different git toplevel than the plan's recorded paths,
     // unless `force_path=true`. Without the guard, plans built against
