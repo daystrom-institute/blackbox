@@ -11,6 +11,16 @@ use crate::*;
 
 pub(crate) const PROGRESS_TICK_SECS: u64 = 15;
 
+fn ellipsize_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let prefix: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
+}
+
 pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, bool) {
     let inner = task.inner.lock();
     let terminal = inner.status.is_terminal();
@@ -26,11 +36,7 @@ pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, b
             .as_deref()
             .map(|m| {
                 let c = m.replace('\n', " ");
-                if c.len() > 80 {
-                    format!("{}…", &c[..80])
-                } else {
-                    c
-                }
+                ellipsize_chars(&c, 80)
             })
             .unwrap_or_else(|| {
                 if events == 0 {
@@ -44,6 +50,25 @@ pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, b
         format!("[{label}] {elapsed} | {events} ev | {activity}"),
         terminal,
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn ellipsize_chars_handles_utf8_boundaries() {
+        let input = format!("{}’{}", "x".repeat(79), "tail");
+        let output = ellipsize_chars(&input, 80);
+
+        assert_eq!(output.chars().count(), 81);
+        assert!(output.ends_with('…'));
+    }
+
+    #[test]
+    fn ellipsize_chars_leaves_short_text_unchanged() {
+        assert_eq!(ellipsize_chars("working…", 80), "working…");
+    }
 }
 
 pub(crate) fn format_progress_snapshot(

@@ -361,7 +361,7 @@ impl EmbedQueueHandle {
             vector_store: self.inner.vector_store.clone(),
             persist_vectors: true,
         };
-        tokio::spawn(worker_loop(spec, rx));
+        spawn_worker_loop(route, spec, rx);
         self.inner
             .senders
             .write()
@@ -450,7 +450,7 @@ impl EmbedQueueHandle {
                 vector_store: vector_store.clone(),
                 persist_vectors: vector_store.is_some(),
             };
-            tokio::spawn(worker_loop(spec, rx));
+            spawn_worker_loop(&route, spec, rx);
             senders.insert(route, tx);
         }
         Self {
@@ -463,6 +463,39 @@ impl EmbedQueueHandle {
                 retry_backoff,
             }),
         }
+    }
+}
+
+fn spawn_worker_loop(route: &str, spec: WorkerSpec, rx: mpsc::UnboundedReceiver<WorkerCommand>) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(worker_loop(spec, rx));
+        return;
+    }
+
+    let route_for_thread = route.to_string();
+    let thread_name = format!("embed-worker-{route_for_thread}");
+    let spawn_result = std::thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime.block_on(worker_loop(spec, rx)),
+                Err(err) => tracing::error!(
+                    route = %route_for_thread,
+                    error = %err,
+                    "embedding worker runtime failed to initialize"
+                ),
+            }
+        });
+
+    if let Err(err) = spawn_result {
+        tracing::error!(
+            route = %route,
+            error = %err,
+            "embedding worker thread failed to start"
+        );
     }
 }
 
@@ -1010,6 +1043,26 @@ mod tests {
         fn id(&self) -> &str {
             "mock"
         }
+    }
+
+    #[test]
+    fn provider_workers_can_start_without_current_tokio_runtime() {
+        let provider = Arc::new(MockProvider::ok());
+        let queue = EmbedQueueHandle::from_providers_for_test(
+            vec![("knowledge", provider.clone())],
+            Duration::from_millis(10),
+            Duration::from_millis(10),
+        );
+
+        assert!(queue.enqueue(request(Bucket::Knowledge, "a", "h1")));
+        std::thread::sleep(Duration::from_millis(80));
+
+        let status = queue.status().routes["knowledge"].clone();
+        assert!(status.available);
+        assert_eq!(status.indexed_count, 1);
+        assert_eq!(status.queue_depth, 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        queue.shutdown();
     }
 
     #[tokio::test]
