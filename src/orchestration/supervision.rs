@@ -311,6 +311,45 @@ impl SupervisionState {
         obj
     }
 
+    /// Response-optimized snapshot: collapses to `{"ok": true, "event_count": N}`
+    /// when all supervision metrics are green, otherwise delegates to `snapshot()`.
+    /// Use for bro response rendering (task_result_json, timeout_snapshot_json).
+    /// Machine consumers that need the full shape should call `snapshot()` directly.
+    pub fn snapshot_for_response(&self, now_ms: u64) -> Value {
+        if !self.enabled {
+            return self.snapshot(now_ms);
+        }
+
+        let cfg = config();
+        let alerts = self.recent_alerts();
+        let loop_max = self.max_loop_count();
+        let compactions = self.compactions_within_window(now_ms);
+        let stall_elapsed_ms = self
+            .last_event_at_ms
+            .map(|last| now_ms.saturating_sub(last))
+            .unwrap_or(0);
+        let burn_is_green = token_burn_ratio(
+            self.total_input_tokens + self.total_output_tokens,
+            self.token_baseline,
+        )
+        .is_none_or(|r| r < cfg.token_burn_amber_ratio);
+
+        let is_green = alerts.is_empty()
+            && loop_max < cfg.loop_amber_count
+            && stall_elapsed_ms < cfg.stall_amber_ms
+            && compactions < cfg.compaction_amber_count
+            && burn_is_green;
+
+        if is_green {
+            return serde_json::json!({
+                "ok": true,
+                "event_count": self.event_count,
+            });
+        }
+
+        self.snapshot(now_ms)
+    }
+
     fn observe_usage(&mut self, sink: &EventSink) {
         if let Some(usage) = &sink.usage {
             if usage.input_tokens > self.total_input_tokens {
@@ -1012,5 +1051,96 @@ mod tests {
             }),
             "expected red compaction alert"
         );
+    }
+
+    // --- snapshot_for_response tests ---
+
+    #[test]
+    fn green_state_returns_ok_sentinel() {
+        let state = SupervisionState::default();
+        let snap = state.snapshot_for_response(1_000);
+        assert_eq!(snap["ok"], true);
+        assert_eq!(snap["event_count"], 0);
+        assert!(snap.get("alerts").is_none(), "green sentinel should not have alerts");
+    }
+
+    #[test]
+    fn disabled_supervision_returns_full_snapshot() {
+        let state = SupervisionState {
+            enabled: false,
+            ..Default::default()
+        };
+        let snap = state.snapshot_for_response(1_000);
+        assert_eq!(snap["enabled"], false);
+        assert!(snap.get("ok").is_none(), "disabled should not get ok sentinel");
+        assert!(snap.get("alerts").is_some());
+    }
+
+    #[test]
+    fn alerts_force_full_snapshot() {
+        let mut state = SupervisionState::default();
+        state.push_alert(
+            AlertKind::Stall,
+            AlertSeverity::Amber,
+            "test stall".into(),
+            Some(200.0),
+            None,
+            None,
+            1_000,
+        );
+        let snap = state.snapshot_for_response(2_000);
+        assert!(snap.get("ok").is_none(), "alerts should force full snapshot");
+        assert!(snap.get("alerts").is_some());
+        assert!(snap["alerts"].as_array().unwrap().len() > 0);
+    }
+
+    #[test]
+    fn loop_below_threshold_is_green() {
+        let mut state = SupervisionState::default();
+        let event = tool_call_event();
+        // loop_amber_count is 3, so 2 consecutive is below threshold → green
+        state.observe_event(&event, &sink_without_usage(), 1_000);
+        state.observe_event(&event, &sink_without_usage(), 1_010);
+        assert_eq!(state.max_loop_count(), 2);
+        let snap = state.snapshot_for_response(1_020);
+        assert_eq!(snap["ok"], true, "loop_max=2 (below amber=3) should be green");
+    }
+
+    #[test]
+    fn loop_at_threshold_forces_full_snapshot() {
+        let mut state = SupervisionState::default();
+        let event = tool_call_event();
+        // loop_amber_count is 3, so 3 consecutive hits the threshold → full
+        state.observe_event(&event, &sink_without_usage(), 1_000);
+        state.observe_event(&event, &sink_without_usage(), 1_010);
+        state.observe_event(&event, &sink_without_usage(), 1_020);
+        assert_eq!(state.max_loop_count(), 3);
+        let snap = state.snapshot_for_response(1_030);
+        assert!(snap.get("ok").is_none(), "loop_max=3 (at amber threshold) should force full snapshot");
+    }
+
+    #[test]
+    fn stall_near_threshold_returns_full_snapshot() {
+        let mut state = SupervisionState::default();
+        state.last_event_at_ms = Some(0);
+        // stall_amber_ms is 180_000, so elapsed=170_000 is below threshold
+        // but stall_elapsed_ms (170_000) is checked against stall_amber_ms (180_000)
+        // which passes, so this should still be green
+        let snap = state.snapshot_for_response(170_000);
+        assert_eq!(snap["ok"], true, "170s elapsed should still be green");
+
+        // At exactly stall_amber_ms it should go full
+        let snap = state.snapshot_for_response(180_000);
+        assert!(snap.get("ok").is_none(), "at stall_amber_ms should force full snapshot");
+    }
+
+    #[test]
+    fn snapshot_full_remains_unchanged() {
+        let state = SupervisionState::default();
+        let full = state.snapshot(1_000);
+        assert!(full.get("enabled").is_some());
+        assert!(full.get("event_count").is_some());
+        assert!(full.get("alerts").is_some());
+        assert!(full.get("loop_hash_max").is_some());
     }
 }

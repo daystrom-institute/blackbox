@@ -1862,7 +1862,7 @@ pub fn task_result_json(task: &Task) -> Value {
     }
     let supervision_now = inner.completed_at.unwrap_or_else(now_ms);
     inner.supervision.observe_stall(supervision_now);
-    obj["supervision"] = inner.supervision.snapshot(supervision_now);
+    obj["supervision"] = inner.supervision.snapshot_for_response(supervision_now);
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
             obj["exitCode"] = Value::from(code);
@@ -1956,7 +1956,7 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "eventCount": event_count,
         "keep_going": keep_going,
         "lastAssistantSnippet": last_activity,
-        "supervision": inner.supervision.snapshot(now_ms()),
+        "supervision": inner.supervision.snapshot_for_response(now_ms()),
     })
 }
 
