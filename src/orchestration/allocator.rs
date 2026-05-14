@@ -409,6 +409,74 @@ impl AllocatorConfig {
     }
 }
 
+pub fn merge_runtime_request(
+    base: Option<RuntimeRequest>,
+    overlay: Option<RuntimeRequest>,
+) -> Option<RuntimeRequest> {
+    match (base, overlay) {
+        (Some(mut request), Some(overlay)) => {
+            apply_runtime_overlay(&mut request, overlay);
+            Some(request)
+        }
+        (Some(request), None) | (None, Some(request)) => Some(request),
+        (None, None) => None,
+    }
+}
+
+pub fn runtime_request_with_overlay(
+    base: Option<RuntimeRequest>,
+    overlay: RuntimeRequest,
+) -> RuntimeRequest {
+    let mut request = base.unwrap_or_default();
+    apply_runtime_overlay(&mut request, overlay);
+    request
+}
+
+fn apply_runtime_overlay(request: &mut RuntimeRequest, overlay: RuntimeRequest) {
+    let tier_is_some = overlay.tier.is_some();
+    let bounded_fields_present = overlay.min_tier.is_some() || overlay.max_tier.is_some();
+    if tier_is_some {
+        request.tier = overlay.tier;
+    }
+    if overlay.tier_ladder.is_some() {
+        request.tier_ladder = overlay.tier_ladder;
+    }
+    if overlay.tier_mode != TierMode::Exact || tier_is_some || bounded_fields_present {
+        request.tier_mode = overlay.tier_mode;
+    }
+    if overlay.min_tier.is_some() {
+        request.min_tier = overlay.min_tier;
+    }
+    if overlay.max_tier.is_some() {
+        request.max_tier = overlay.max_tier;
+    }
+    request.capabilities.extend(overlay.capabilities);
+    request.capabilities.sort_by_key(|cap| format!("{cap:?}"));
+    request.capabilities.dedup();
+    request
+        .derived_capabilities
+        .extend(overlay.derived_capabilities);
+    request
+        .derived_capabilities
+        .sort_by_key(|cap| format!("{cap:?}"));
+    request.derived_capabilities.dedup();
+    if overlay.durable {
+        request.durable = true;
+    }
+    if overlay.pool.is_some() {
+        request.pool = overlay.pool;
+    }
+    if overlay.selection_policy.is_some() {
+        request.selection_policy = overlay.selection_policy;
+    }
+    if overlay.pin.is_some() {
+        request.pin = overlay.pin;
+    }
+    if overlay.prefer.is_some() {
+        request.prefer = overlay.prefer;
+    }
+}
+
 pub fn parse_capabilities(values: &[String]) -> Result<Vec<Capability>, String> {
     values
         .iter()
@@ -1087,6 +1155,14 @@ pub fn lookup_lease_for_session(
         })
         .max_by_key(|(started_at, _)| *started_at)
         .map(|(_, lease)| lease)
+}
+
+pub fn lookup_lease_for_task(store_dir: &Path, task_id: &str) -> Option<RuntimeLease> {
+    lease_store_load(store_dir)
+        .leases
+        .get(task_id)
+        .filter(|lease| lease.durable)
+        .cloned()
 }
 
 pub fn save_trace(store_dir: &Path, trace: &SelectionTrace) {

@@ -716,7 +716,6 @@ impl BlackboxServer {
         effective_limits: orchestration::atoms::invocation::InvocationLimits,
     ) -> Result<serde_json::Value, String> {
         use orchestration::atoms::invocation::AtomInvocation;
-        use orchestration::providers::ExecOpts;
 
         let typed_name =
             match orchestration::atoms::validate::parse_typed_ref(brofile_ref, "brofile:") {
@@ -744,7 +743,7 @@ impl BlackboxServer {
             &self.state.store_dir,
         );
         let exec_opts = if bf.model.is_some() || bf.effort.is_some() {
-            Some(ExecOpts {
+            Some(orchestration::providers::ExecOpts {
                 model: bf.model.clone(),
                 effort: bf.effort.clone(),
             })
@@ -765,90 +764,47 @@ impl BlackboxServer {
             }
         };
 
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = if matches!(bf.provider, orchestration::providers::Provider::Claude) {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            "pending".to_string()
-        };
         let cwd = p.project_dir.clone();
-
-        let atom_label = atom_ref.to_string();
-        let ambient_ctx = orchestration::AmbientContext {
-            task_id: Some(task_id.clone()),
-            session_id: Some(session_id.clone()),
-            project_dir: cwd.clone(),
-            bro_name: Some(atom_label.clone()),
-            thread_id: None,
-            work_item_id: None,
-            pin_block: self.ambient_pin_block(
-                cwd.as_deref(),
-                Some(atom_label.as_str()),
-                Some(session_id.as_str()),
-                None,
-                None,
-            ),
-            completion_contract: Some(orchestration::DEFAULT_COMPLETION_CONTRACT.to_string()),
-            allow_recursion: false,
-            provider: Some(bf.provider),
-            coerce_workspace: bf.coerce_workspace.unwrap_or(false),
-        };
-        let final_prompt = orchestration::apply_brofile_lens(
-            &orchestration::apply_ambient(&prompt, &ambient_ctx),
-            bf.lens.as_deref(),
-        );
-
-        let mut args = bf.provider.build_exec_args(
-            &final_prompt,
-            &session_id,
-            cwd.as_deref(),
-            exec_opts.as_ref(),
-        );
         let brofile_filters = orchestration::mcp::McpFilters {
             allow: base_allow,
             disallow: base_disallow,
         };
-        let extra = crate::server::progress::combine_dispatch_filters(Some(&brofile_filters), None);
-        let dispatch_filters = match crate::server::progress::resolve_dispatch_filters(
-            bf.provider,
-            cwd.as_deref(),
-            false,
-            &task_id,
-            extra.as_ref(),
-            None,
-            &self.state.packets.read(),
-        ) {
-            Ok(df) => df,
-            Err(e) => return Err(format!("dispatch filter resolution failed: {e}")),
-        };
-        args.extend(dispatch_filters.args);
-
-        let task = orchestration::spawn_task(
-            task_id.clone(),
-            bf.provider,
-            args,
-            session_id.clone(),
-            cwd.clone(),
-            env_overrides,
-            self.state.store_dir.clone(),
-            self.state.task_store.clone(),
-            self.state.tail_tx.clone(),
-            Some(atom_label.clone()),
-            Some(atom_label.clone()),
-            Some(self.state.system_events.clone()),
-        );
-
-        crate::server::progress::cleanup_policy_file_when_done(
-            task.clone(),
-            dispatch_filters.policy_file,
-        );
+        let atom_label = atom_ref.to_string();
+        let runtime =
+            orchestration::allocator::merge_runtime_request(bf.runtime, manifest.runtime.clone());
+        let dispatched =
+            self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
+                prompt,
+                provider: bf.provider,
+                lens: bf.lens,
+                exec_opts,
+                env_overrides,
+                cwd: cwd.clone(),
+                brofile_filters: Some(brofile_filters),
+                coerce_workspace: bf.coerce_workspace.unwrap_or(false),
+                allow_recursion: false,
+                allow_tools: None,
+                disallow_tools: None,
+                surface: None,
+                allocation_request: runtime,
+                project_dir_for_lease: p.project_dir.clone(),
+                ambient_bro_name: Some(atom_label.clone()),
+                spawn_bro_label: Some(atom_label.clone()),
+                spawn_agent_label: Some(atom_label.clone()),
+                record_to_bro: None,
+            })?;
+        let inner = dispatched.task.inner.lock();
+        let task_id = inner.id.clone();
+        let session_id = inner.session_id.clone();
+        let selected_provider = inner.provider;
+        drop(inner);
 
         let mut inv = AtomInvocation::new_profile(
             invocation_id.to_string(),
             atom_ref.to_string(),
             p.parent_invocation_id.clone(),
             owner.to_string(),
-            bf.provider.as_str().to_string(),
+            selected_provider.as_str().to_string(),
             session_id.clone(),
             cwd,
             task_id.clone(),

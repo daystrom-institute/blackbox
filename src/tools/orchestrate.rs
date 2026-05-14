@@ -50,7 +50,14 @@ Constraints:\n\
         );
 
         let first_task = match self
-            .workflow_dispatch_executor(&p.brofile, &base_prompt, p.project_dir.as_deref(), None)
+            .workflow_dispatch_executor(
+                &p.brofile,
+                &base_prompt,
+                p.project_dir.as_deref(),
+                None,
+                None,
+                None,
+            )
             .await
         {
             Ok(t) => t,
@@ -66,6 +73,7 @@ Constraints:\n\
             .unwrap_or("")
             .to_string();
         let first_session_id = first_task.inner.lock().session_id.clone();
+        let first_task_id = first_task.inner.lock().id.clone();
 
         // Try to compile. If it fails, retry once with the error.
         match extract_and_compile_workflow(&first_output) {
@@ -85,6 +93,8 @@ Constraints:\n\
                         &retry_prompt,
                         p.project_dir.as_deref(),
                         Some(&first_session_id),
+                        Some(&first_task_id),
+                        None,
                     )
                     .await
                 {

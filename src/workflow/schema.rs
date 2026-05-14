@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use super::context::VarsSchema;
 use super::ops::HookOp;
 use super::wait::WaitSpec;
+use crate::orchestration::allocator::RuntimeRequest;
 use crate::orchestration::providers::Capability;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +80,9 @@ pub struct ActorSpec {
     /// downgrade.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub requires: Vec<Capability>,
+    /// Optional runtime allocation defaults for executor dispatch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeRequest>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

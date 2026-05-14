@@ -766,6 +766,7 @@ mod tests {
                         durable: false,
                         compaction_anchor: false,
                         requires: Vec::new(),
+                        runtime: None,
                     },
                 );
                 m

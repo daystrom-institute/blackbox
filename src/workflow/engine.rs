@@ -694,6 +694,24 @@ impl<'a> WorkflowRunner<'a> {
             .or_else(|| self.project_dir.clone())
     }
 
+    fn runtime_for_actor(
+        &self,
+        actor: &ActorSpec,
+    ) -> Option<crate::orchestration::allocator::RuntimeRequest> {
+        let mut request = actor.runtime.clone();
+        if actor.durable || !actor.requires.is_empty() {
+            let mut derived = request.unwrap_or_default();
+            if actor.durable {
+                derived.durable = true;
+            }
+            derived.capabilities.extend(actor.requires.iter().copied());
+            derived.capabilities.sort_by_key(|cap| format!("{cap:?}"));
+            derived.capabilities.dedup();
+            request = Some(derived);
+        }
+        request
+    }
+
     /// Apply a single OpEffect to the runner state. Used by hook
     /// execution to centralize logging + schema validation.
     fn apply_op_effect(&mut self, effect: OpEffect) -> Result<()> {
@@ -1563,6 +1581,11 @@ impl<'a> WorkflowRunner<'a> {
         } else {
             None
         };
+        let existing_task_id = if actor.durable {
+            self.actor_tasks.get(actor_name).cloned()
+        } else {
+            None
+        };
         self.log_event(
             "node_dispatch",
             json!({
@@ -1581,6 +1604,8 @@ impl<'a> WorkflowRunner<'a> {
                 prompt,
                 self.project_dir.as_deref(),
                 existing_session.as_deref(),
+                existing_task_id.as_deref(),
+                self.runtime_for_actor(actor),
             )
             .await
             .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?;
@@ -1843,6 +1868,11 @@ impl<'a> WorkflowRunner<'a> {
                 } else {
                     None
                 };
+                let existing_task_id = if actor.durable {
+                    self.actor_tasks.get(&actor_name).cloned()
+                } else {
+                    None
+                };
                 let task = self
                     .server
                     .workflow_dispatch_executor(
@@ -1850,6 +1880,8 @@ impl<'a> WorkflowRunner<'a> {
                         &prompt,
                         self.project_dir.as_deref(),
                         existing.as_deref(),
+                        existing_task_id.as_deref(),
+                        self.runtime_for_actor(actor),
                     )
                     .await
                     .map_err(|e| anyhow!("fire-and-forget dispatch '{target_id}': {e}"))?;

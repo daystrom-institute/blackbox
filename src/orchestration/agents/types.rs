@@ -49,6 +49,9 @@ pub struct AgentManifest {
     pub cost_class: AgentCostClass,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::orchestration::allocator::RuntimeRequest>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_adapter: Option<String>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -306,6 +309,7 @@ impl Default for AgentManifest {
             outputs: None,
             composition: None,
             cost_class: default_cost_class(),
+            runtime: None,
             dispatch_adapter: None,
             provenance: None,
             embedding: None,
@@ -379,6 +383,7 @@ mod tests {
                 fan_out_aggregator: Some("vote-majority".into()),
             }),
             cost_class: AgentCostClass::Normal,
+            runtime: None,
             dispatch_adapter: None,
             provenance: Some(AgentProvenance::HandAuthored {
                 author: "user".into(),

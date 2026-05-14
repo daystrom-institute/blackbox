@@ -5,6 +5,32 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::dispatch_tools()
 }
 
+pub(crate) struct FreshDispatchRequest {
+    pub(crate) prompt: String,
+    pub(crate) provider: Provider,
+    pub(crate) lens: Option<String>,
+    pub(crate) exec_opts: Option<orchestration::providers::ExecOpts>,
+    pub(crate) env_overrides: Option<std::collections::HashMap<String, String>>,
+    pub(crate) cwd: Option<String>,
+    pub(crate) brofile_filters: Option<orchestration::mcp::McpFilters>,
+    pub(crate) coerce_workspace: bool,
+    pub(crate) allow_recursion: bool,
+    pub(crate) allow_tools: Option<Vec<String>>,
+    pub(crate) disallow_tools: Option<Vec<String>>,
+    pub(crate) surface: Option<String>,
+    pub(crate) allocation_request: Option<orchestration::allocator::RuntimeRequest>,
+    pub(crate) project_dir_for_lease: Option<String>,
+    pub(crate) ambient_bro_name: Option<String>,
+    pub(crate) spawn_bro_label: Option<String>,
+    pub(crate) spawn_agent_label: Option<String>,
+    pub(crate) record_to_bro: Option<String>,
+}
+
+pub(crate) struct FreshDispatchResult {
+    pub(crate) task: std::sync::Arc<orch::Task>,
+    pub(crate) allocation: Option<orchestration::allocator::Allocation>,
+}
+
 fn exec_params_have_runtime(p: &ExecParams) -> bool {
     p.tier.is_some()
         || p.tier_ladder.is_some()
@@ -142,6 +168,134 @@ fn exec_params_runtime_request(
     Ok(Some(request))
 }
 
+impl BlackboxServer {
+    pub(crate) fn dispatch_fresh_bro_task(
+        &self,
+        mut request: FreshDispatchRequest,
+    ) -> Result<FreshDispatchResult, String> {
+        let store_dir = self.state.store_dir.clone();
+        let mut allocation: Option<orchestration::allocator::Allocation> = None;
+        if let Some(runtime_request) = request.allocation_request.take() {
+            let allocator_config =
+                orchestration::allocator::load_effective_config(&store_dir, request.cwd.as_deref());
+            let bro_config = orchestration::brofile::load_config(&store_dir);
+            let lease_store = orchestration::allocator::lease_store_load(&store_dir);
+            let ctx = orchestration::allocator::allocation_context(
+                &self.state.task_store.read(),
+                &lease_store,
+            );
+            let selected = orchestration::allocator::allocate(
+                runtime_request,
+                &allocator_config,
+                &bro_config,
+                &ctx,
+            );
+            orchestration::allocator::save_trace(&store_dir, &selected.trace);
+            if let Some(err) = selected.trace.error.as_deref() {
+                return Err(err.to_string());
+            }
+            request.provider = selected.lane.provider;
+            request.exec_opts = orchestration::allocator::exec_opts_for_lane(&selected.lane);
+            request.env_overrides = orchestration::brofile::resolve_provider_env(
+                request.provider,
+                selected.lane.account.as_deref(),
+                selected.lane.model.as_deref(),
+                &store_dir,
+            );
+            allocation = Some(selected);
+        }
+
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = if matches!(request.provider, Provider::Claude) {
+            uuid::Uuid::new_v4().to_string()
+        } else {
+            "pending".to_string()
+        };
+        let ambient_ctx = orch::AmbientContext {
+            task_id: Some(task_id.clone()),
+            session_id: Some(session_id.clone()),
+            project_dir: request.cwd.clone(),
+            bro_name: request.ambient_bro_name.clone(),
+            thread_id: None,
+            work_item_id: None,
+            pin_block: self.ambient_pin_block(
+                request.cwd.as_deref(),
+                request.ambient_bro_name.as_deref(),
+                Some(session_id.as_str()),
+                None,
+                None,
+            ),
+            completion_contract: if request.allow_recursion {
+                None
+            } else {
+                Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
+            },
+            allow_recursion: request.allow_recursion,
+            provider: Some(request.provider),
+            coerce_workspace: request.coerce_workspace,
+        };
+        let final_prompt = orch::apply_brofile_lens(
+            &orch::apply_ambient(&request.prompt, &ambient_ctx),
+            request.lens.as_deref(),
+        );
+        let mut args = request.provider.build_exec_args(
+            &final_prompt,
+            &session_id,
+            request.cwd.as_deref(),
+            request.exec_opts.as_ref(),
+        );
+        let params_extra = extra_filters_from_params(
+            request.allow_tools.as_deref(),
+            request.disallow_tools.as_deref(),
+        );
+        let extra =
+            combine_dispatch_filters(request.brofile_filters.as_ref(), params_extra.as_ref());
+        let dispatch_filters = resolve_dispatch_filters(
+            request.provider,
+            request.cwd.as_deref(),
+            request.allow_recursion,
+            &task_id,
+            extra.as_ref(),
+            request.surface.as_deref(),
+            &self.state.packets.read(),
+        )
+        .map_err(|e| e.to_string())?;
+        args.extend(dispatch_filters.args);
+
+        let task = orch::spawn_task(
+            task_id,
+            request.provider,
+            args,
+            session_id,
+            request.cwd,
+            request.env_overrides,
+            store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            request.spawn_bro_label,
+            request.spawn_agent_label,
+            Some(self.state.system_events.clone()),
+        );
+        if let Some(allocation) = &allocation {
+            orchestration::allocator::record_lease(
+                &store_dir,
+                orchestration::allocator::lease_from_allocation(
+                    task.inner.lock().id.clone(),
+                    task.inner.lock().session_id.clone(),
+                    allocation,
+                    request.project_dir_for_lease,
+                    task.inner.lock().cwd.clone(),
+                ),
+            );
+        }
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        if let Some(bro_name) = &request.record_to_bro {
+            self.record_task_to_bro(bro_name, &task);
+        }
+        Ok(FreshDispatchResult { task, allocation })
+    }
+}
+
 #[tool_router(router = dispatch_tools)]
 impl BlackboxServer {
     #[tool(
@@ -150,13 +304,12 @@ impl BlackboxServer {
     )]
     pub(crate) async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
-        let store_dir = self.state.store_dir.clone();
 
         let (
-            mut provider,
+            provider,
             lens,
-            mut exec_opts,
-            mut env_overrides,
+            exec_opts,
+            env_overrides,
             cwd,
             brofile_filters,
             brofile_coerce_workspace,
@@ -191,12 +344,11 @@ impl BlackboxServer {
                 self.resolve_exec_brofile_for_allocator(name, p.project_dir.as_deref())
             })
             .and_then(|bf| bf.runtime);
-        let allocation_request = match exec_params_runtime_request(&p, brofile_runtime) {
+        let mut allocation_request = match exec_params_runtime_request(&p, brofile_runtime) {
             Ok(request) => request,
             Err(err) => return Self::err_text(&err),
         };
-        let mut allocation: Option<orchestration::allocator::Allocation> = None;
-        if let Some(mut request) = allocation_request {
+        if let Some(request) = &mut allocation_request {
             if let Some(raw_provider) = p.provider.as_deref() {
                 let pinned_provider = match raw_provider.parse::<Provider>() {
                     Ok(provider) => provider,
@@ -206,134 +358,39 @@ impl BlackboxServer {
                 pin.provider = Some(pinned_provider);
                 pin.authority = orchestration::allocator::PinAuthority::Operator;
             }
-            let allocator_config =
-                orchestration::allocator::load_effective_config(&store_dir, cwd.as_deref());
-            let bro_config = orchestration::brofile::load_config(&store_dir);
-            let lease_store = orchestration::allocator::lease_store_load(&store_dir);
-            let ctx = orchestration::allocator::allocation_context(
-                &self.state.task_store.read(),
-                &lease_store,
-            );
-            let selected =
-                orchestration::allocator::allocate(request, &allocator_config, &bro_config, &ctx);
-            orchestration::allocator::save_trace(&store_dir, &selected.trace);
-            if let Some(err) = selected.trace.error.as_deref() {
-                return Self::err_text(err);
-            }
-            provider = selected.lane.provider;
-            exec_opts = orchestration::allocator::exec_opts_for_lane(&selected.lane);
-            env_overrides = orchestration::brofile::resolve_provider_env(
-                provider,
-                selected.lane.account.as_deref(),
-                selected.lane.model.as_deref(),
-                &store_dir,
-            );
-            allocation = Some(selected);
         }
-
-        // Pre-generate task_id so it lands in the ambient [scope] block
-        // before subprocess launch — the primary correlation key for
-        // bbox_note emissions regardless of when the provider itself
-        // emits a session ID.
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = if matches!(provider, Provider::Claude) {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            "pending".to_string()
-        };
         let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
-        let ambient_ctx = orch::AmbientContext {
-            task_id: Some(task_id.clone()),
-            session_id: Some(session_id.clone()),
-            project_dir: cwd.clone(),
-            bro_name: p.bro.clone(),
-            thread_id: None,
-            work_item_id: None,
-            pin_block: self.ambient_pin_block(
-                cwd.as_deref(),
-                p.bro.as_deref(),
-                Some(session_id.as_str()),
-                None,
-                None,
-            ),
-            completion_contract: if allow_recursion {
-                None
-            } else {
-                Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string())
-            },
-            allow_recursion,
-            provider: Some(provider),
-            coerce_workspace,
-        };
-        let final_prompt = orch::apply_brofile_lens(
-            &orch::apply_ambient(&p.prompt, &ambient_ctx),
-            lens.as_deref(),
-        );
-        let mut args = provider.build_exec_args(
-            &final_prompt,
-            &session_id,
-            cwd.as_deref(),
-            exec_opts.as_ref(),
-        );
-        let params_extra =
-            extra_filters_from_params(p.allow_tools.as_deref(), p.disallow_tools.as_deref());
-        let extra = combine_dispatch_filters(brofile_filters.as_ref(), params_extra.as_ref());
-        let dispatch_filters = match resolve_dispatch_filters(
+        let dispatched = match self.dispatch_fresh_bro_task(FreshDispatchRequest {
+            prompt: p.prompt.clone(),
             provider,
-            cwd.as_deref(),
+            lens,
+            exec_opts,
+            env_overrides,
+            cwd: cwd.clone(),
+            brofile_filters,
+            coerce_workspace,
             allow_recursion,
-            &task_id,
-            extra.as_ref(),
-            p.surface.as_deref(),
-            &self.state.packets.read(),
-        ) {
-            Ok(df) => df,
+            allow_tools: p.allow_tools.clone(),
+            disallow_tools: p.disallow_tools.clone(),
+            surface: p.surface.clone(),
+            allocation_request,
+            project_dir_for_lease: p.project_dir.clone(),
+            ambient_bro_name: p.bro.clone(),
+            spawn_bro_label: None,
+            spawn_agent_label: None,
+            record_to_bro: p.bro.clone(),
+        }) {
+            Ok(result) => result,
             Err(e) => return Self::err_text(&e),
         };
-        args.extend(dispatch_filters.args);
 
-        let task = orch::spawn_task(
-            task_id,
-            provider,
-            args,
-            session_id,
-            cwd,
-            env_overrides,
-            store_dir.clone(),
-            self.state.task_store.clone(),
-            self.state.tail_tx.clone(),
-            None,
-            None,
-            Some(self.state.system_events.clone()),
-        );
-        if let Some(allocation) = &allocation {
-            orchestration::allocator::record_lease(
-                &store_dir,
-                orchestration::allocator::lease_from_allocation(
-                    task.inner.lock().id.clone(),
-                    task.inner.lock().session_id.clone(),
-                    allocation,
-                    p.project_dir.clone(),
-                    task.inner.lock().cwd.clone(),
-                ),
-            );
-        }
-
-        // Register Gemini policy-file cleanup once the task terminates.
-        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-
-        // If targeting a named bro in a team, record the task
-        if let Some(bro_name) = &p.bro {
-            self.record_task_to_bro(bro_name, &task);
-        }
-
-        let inner = task.inner.lock();
+        let inner = dispatched.task.inner.lock();
         let mut response = json!({
             "taskId": inner.id,
             "sessionId": inner.session_id,
             "status": "running",
         });
-        if let Some(allocation) = &allocation {
+        if let Some(allocation) = &dispatched.allocation {
             response["provider"] = json!(allocation.lane.provider);
             response["account"] = json!(allocation.lane.account);
             response["model"] = json!(allocation.lane.model);

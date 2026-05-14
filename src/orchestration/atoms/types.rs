@@ -55,6 +55,9 @@ pub struct AtomManifest {
     pub cost_class: AtomCostClass,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<crate::orchestration::allocator::RuntimeRequest>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<AtomProvenance>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -402,6 +405,7 @@ mod tests {
                 portal_focus: "on_request".into(),
             }),
             cost_class: AtomCostClass::Normal,
+            runtime: None,
             provenance: Some(AtomProvenance::HandAuthored {
                 author: "user".into(),
                 created_at: Some("2026-05-13T00:00:00Z".into()),
@@ -573,6 +577,7 @@ mod tests {
                 supervision: None,
                 trace: None,
                 cost_class: AtomCostClass::Normal,
+                runtime: None,
                 provenance: None,
                 embedding: None,
             },

@@ -28,17 +28,79 @@ impl BlackboxServer {
         prompt: &str,
         project_dir: Option<&str>,
         existing_session_id: Option<&str>,
+        existing_task_id: Option<&str>,
+        actor_runtime: Option<orchestration::allocator::RuntimeRequest>,
     ) -> Result<Arc<orch::Task>, String> {
         let store_dir = self.state.store_dir.clone();
         let is_resume = existing_session_id.is_some();
 
         // Always use exec-target resolution. The workflow engine owns
         // the project_dir; resume just swaps the provider args call.
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters, _coerce_workspace) =
-            self.resolve_exec_target(Some(brofile), None, project_dir)?;
+        let (
+            mut provider,
+            lens,
+            mut exec_opts,
+            mut env_overrides,
+            cwd,
+            brofile_filters,
+            coerce_workspace,
+        ) = self.resolve_exec_target(Some(brofile), None, project_dir)?;
+        if is_resume {
+            if let Some(lease) = existing_task_id.and_then(|task_id| {
+                orchestration::allocator::lookup_lease_for_task(&store_dir, task_id)
+            }) {
+                provider = lease.provider;
+                exec_opts = orchestration::allocator::exec_opts_for_lane(
+                    &orchestration::allocator::RuntimeLane {
+                        provider,
+                        account: lease.account.clone(),
+                        tier: lease.tier.clone(),
+                        model: lease.model.clone(),
+                        effort: lease.effort.clone(),
+                        capabilities: lease.capabilities.clone(),
+                    },
+                );
+                env_overrides = orchestration::brofile::resolve_provider_env(
+                    provider,
+                    lease.account.as_deref(),
+                    lease.model.as_deref(),
+                    &store_dir,
+                );
+            }
+        }
 
         if is_resume && !provider.supports_resume() {
             return Err(format!("provider {provider} does not support resume"));
+        }
+
+        if !is_resume {
+            let brofile_runtime = self
+                .resolve_exec_brofile_for_allocator(brofile, project_dir)
+                .and_then(|bf| bf.runtime);
+            let runtime =
+                orchestration::allocator::merge_runtime_request(brofile_runtime, actor_runtime);
+            let dispatched =
+                self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
+                    prompt: prompt.to_string(),
+                    provider,
+                    lens,
+                    exec_opts,
+                    env_overrides,
+                    cwd,
+                    brofile_filters,
+                    coerce_workspace,
+                    allow_recursion: false,
+                    allow_tools: None,
+                    disallow_tools: None,
+                    surface: None,
+                    allocation_request: runtime,
+                    project_dir_for_lease: project_dir.map(String::from),
+                    ambient_bro_name: Some(brofile.to_string()),
+                    spawn_bro_label: None,
+                    spawn_agent_label: None,
+                    record_to_bro: Some(brofile.to_string()),
+                })?;
+            return Ok(dispatched.task);
         }
 
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -162,7 +224,14 @@ impl BlackboxServer {
         for (member_name, brofile) in &members {
             let existing = existing_session_ids.get(member_name).cloned();
             let task = self
-                .workflow_dispatch_executor(brofile, prompt, cwd.as_deref(), existing.as_deref())
+                .workflow_dispatch_executor(
+                    brofile,
+                    prompt,
+                    cwd.as_deref(),
+                    existing.as_deref(),
+                    None,
+                    None,
+                )
                 .await
                 .map_err(|e| format!("member {member_name}: {e}"))?;
             // Stamp the precise team::member label, overriding the

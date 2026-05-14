@@ -634,79 +634,114 @@ impl BlackboxServer {
         }
 
         // Direct path
-        let (provider, lens, brofile_name, base_allow, base_disallow, exec_opts, env_overrides) =
-            if let Some(ref br) = manifest.brofile_ref {
-                let bf = match orchestration::brofile::resolve_brofile(
-                    br,
-                    &self.state.store_dir,
-                    p.project_dir.as_deref(),
-                ) {
-                    Some(b) => b,
-                    None => {
-                        return Self::err_text(&format!("brofile_ref '{}' not found", br));
-                    }
-                };
-                let (ba, bd) = match &bf.filters {
-                    Some(f) => (f.allow.clone(), f.disallow.clone()),
-                    None => (Vec::new(), Vec::new()),
-                };
-                let env = orchestration::brofile::resolve_provider_env(
-                    bf.provider,
-                    bf.account.as_deref(),
-                    bf.model.as_deref(),
-                    &self.state.store_dir,
-                );
-                let opts = if bf.model.is_some() || bf.effort.is_some() {
-                    Some(ExecOpts {
-                        model: bf.model.clone(),
-                        effort: bf.effort.clone(),
-                    })
-                } else {
-                    None
-                };
-                (bf.provider, bf.lens, Some(br.clone()), ba, bd, opts, env)
-            } else if let Some(ref inline) = manifest.brofile_inline {
-                let prov_str = inline
-                    .get("provider")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude");
-                let provider = match prov_str.parse::<orchestration::providers::Provider>() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        return Self::err_text(&format!(
-                            "error.bad_input(code=unknown_provider): unknown provider in inline brofile: {prov_str}"
-                        ));
-                    }
-                };
-                let (ba, bd) = Self::extract_inline_filters(inline);
-                let env = orchestration::brofile::resolve_provider_env(
-                    provider,
-                    None,
-                    inline.get("model").and_then(|v| v.as_str()),
-                    &self.state.store_dir,
-                );
-                let opts = if inline.get("model").is_some() || inline.get("effort").is_some() {
-                    Some(ExecOpts {
-                        model: inline
-                            .get("model")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                        effort: inline
-                            .get("effort")
-                            .and_then(|v| v.as_str())
-                            .map(String::from),
-                    })
-                } else {
-                    None
-                };
-                let lens = inline
-                    .get("lens")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                (provider, lens, None, ba, bd, opts, env)
-            } else {
-                return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
+        let (
+            provider,
+            lens,
+            brofile_name,
+            base_allow,
+            base_disallow,
+            exec_opts,
+            env_overrides,
+            runtime,
+            coerce_workspace,
+        ) = if let Some(ref br) = manifest.brofile_ref {
+            let bf = match orchestration::brofile::resolve_brofile(
+                br,
+                &self.state.store_dir,
+                p.project_dir.as_deref(),
+            ) {
+                Some(b) => b,
+                None => {
+                    return Self::err_text(&format!("brofile_ref '{}' not found", br));
+                }
             };
+            let (ba, bd) = match &bf.filters {
+                Some(f) => (f.allow.clone(), f.disallow.clone()),
+                None => (Vec::new(), Vec::new()),
+            };
+            let env = orchestration::brofile::resolve_provider_env(
+                bf.provider,
+                bf.account.as_deref(),
+                bf.model.as_deref(),
+                &self.state.store_dir,
+            );
+            let opts = if bf.model.is_some() || bf.effort.is_some() {
+                Some(ExecOpts {
+                    model: bf.model.clone(),
+                    effort: bf.effort.clone(),
+                })
+            } else {
+                None
+            };
+            (
+                bf.provider,
+                bf.lens,
+                Some(br.clone()),
+                ba,
+                bd,
+                opts,
+                env,
+                bf.runtime,
+                bf.coerce_workspace.unwrap_or(false),
+            )
+        } else if let Some(ref inline) = manifest.brofile_inline {
+            let prov_str = inline
+                .get("provider")
+                .and_then(|v| v.as_str())
+                .unwrap_or("claude");
+            let provider = match prov_str.parse::<orchestration::providers::Provider>() {
+                Ok(p) => p,
+                Err(_) => {
+                    return Self::err_text(&format!(
+                        "error.bad_input(code=unknown_provider): unknown provider in inline brofile: {prov_str}"
+                    ));
+                }
+            };
+            let (ba, bd) = Self::extract_inline_filters(inline);
+            let env = orchestration::brofile::resolve_provider_env(
+                provider,
+                None,
+                inline.get("model").and_then(|v| v.as_str()),
+                &self.state.store_dir,
+            );
+            let opts = if inline.get("model").is_some() || inline.get("effort").is_some() {
+                Some(ExecOpts {
+                    model: inline
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    effort: inline
+                        .get("effort")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                })
+            } else {
+                None
+            };
+            let lens = inline
+                .get("lens")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let runtime = inline
+                .get("runtime")
+                .and_then(|value| serde_json::from_value(value.clone()).ok());
+            (
+                provider,
+                lens,
+                None,
+                ba,
+                bd,
+                opts,
+                env,
+                runtime,
+                inline
+                    .get("coerce_workspace")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
+        } else {
+            return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
+        };
 
         let merged = MergedFilters::merge(
             &base_allow,
@@ -763,85 +798,46 @@ impl BlackboxServer {
             }
         };
 
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = if matches!(provider, Provider::Claude) {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            "pending".to_string()
-        };
         let cwd = p.project_dir.clone();
-
-        let ambient_ctx = orch::AmbientContext {
-            task_id: Some(task_id.clone()),
-            session_id: Some(session_id.clone()),
-            project_dir: cwd.clone(),
-            bro_name: p.bro.clone(),
-            thread_id: None,
-            work_item_id: None,
-            pin_block: self.ambient_pin_block(
-                cwd.as_deref(),
-                p.bro.as_deref(),
-                Some(session_id.as_str()),
-                None,
-                None,
-            ),
-            completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
-            allow_recursion: false,
-            provider: Some(provider),
-            coerce_workspace: false,
-        };
-        let final_prompt =
-            orch::apply_brofile_lens(&orch::apply_ambient(&prompt, &ambient_ctx), lens.as_deref());
-
-        let mut args = provider.build_exec_args(
-            &final_prompt,
-            &session_id,
-            cwd.as_deref(),
-            exec_opts.as_ref(),
-        );
         let brofile_filters = orchestration::mcp::McpFilters {
             allow: merged.allow.clone(),
             disallow: merged.disallow.clone(),
         };
-        let extra = combine_dispatch_filters(Some(&brofile_filters), None);
-        let dispatch_filters = match resolve_dispatch_filters(
-            provider,
-            cwd.as_deref(),
-            false,
-            &task_id,
-            extra.as_ref(),
-            None,
-            &self.state.packets.read(),
-        ) {
-            Ok(df) => df,
-            Err(e) => return Self::err_text(&e),
-        };
-        args.extend(dispatch_filters.args);
-
-        let task = orch::spawn_task(
-            task_id.clone(),
-            provider,
-            args,
-            session_id.clone(),
-            cwd,
-            env_overrides,
-            self.state.store_dir.clone(),
-            self.state.task_store.clone(),
-            self.state.tail_tx.clone(),
-            Some(bro_label.clone()),
-            Some(bro_label.clone()),
-            Some(self.state.system_events.clone()),
-        );
-
-        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
-
-        if let Some(bro_name) = &p.bro {
-            self.record_task_to_bro(bro_name, &task);
-        }
+        let runtime =
+            orchestration::allocator::merge_runtime_request(runtime, manifest.runtime.clone());
+        let dispatched =
+            match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
+                prompt,
+                provider,
+                lens,
+                exec_opts,
+                env_overrides,
+                cwd,
+                brofile_filters: Some(brofile_filters),
+                coerce_workspace,
+                allow_recursion: false,
+                allow_tools: None,
+                disallow_tools: None,
+                surface: None,
+                allocation_request: runtime,
+                project_dir_for_lease: p.project_dir.clone(),
+                ambient_bro_name: p.bro.clone(),
+                spawn_bro_label: Some(bro_label.clone()),
+                spawn_agent_label: Some(bro_label.clone()),
+                record_to_bro: p.bro.clone(),
+            }) {
+                Ok(result) => result,
+                Err(e) => return Self::err_text(&e),
+            };
+        let inner = dispatched.task.inner.lock();
+        let task_id = inner.id.clone();
+        let session_id = inner.session_id.clone();
+        let selected_provider = inner.provider;
+        drop(inner);
 
         let agent_session = AgentSession {
             session_id: session_id.clone(),
-            provider: provider.as_str().to_string(),
+            provider: selected_provider.as_str().to_string(),
             project_dir: p.project_dir.clone(),
             agent: agent_ref,
             task_id: Some(task_id.clone()),
