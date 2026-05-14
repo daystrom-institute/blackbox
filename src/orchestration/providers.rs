@@ -1569,11 +1569,8 @@ pub fn discover_gemini_session_in(
         };
         for chat in chats.filter_map(|e| e.ok()) {
             let path = chat.path();
-            if path.extension().map(|e| e != "json").unwrap_or(true) {
-                continue;
-            }
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if !name.starts_with("session-") {
+            if !is_gemini_session_file_name(name) {
                 continue;
             }
             let Ok(stat) = std::fs::metadata(&path) else {
@@ -1594,13 +1591,9 @@ pub fn discover_gemini_session_in(
                 .as_ref()
                 .map(|marker| raw.contains(marker))
                 .unwrap_or(false);
-            let Ok(data) = serde_json::from_str::<Value>(&raw) else {
+            let Some(session_id) = extract_gemini_session_id(&raw) else {
                 continue;
             };
-            let Some(session_id) = data["sessionId"].as_str() else {
-                continue;
-            };
-            let session_id = session_id.to_string();
             scored.push((session_id, mtime_ms, matches_dir, recent, matches_task));
         }
     }
@@ -1808,13 +1801,10 @@ pub fn resolve_gemini_session_cwd_in(
     tmp_root: &std::path::Path,
     session_id: &str,
 ) -> Option<std::path::PathBuf> {
-    use std::io::Read;
     if session_id.len() < 8 {
         return None;
     }
     let first8 = &session_id[..8];
-    let suffix = format!("-{first8}.json");
-    let needle = format!("\"sessionId\": \"{session_id}\"");
 
     for entry in std::fs::read_dir(tmp_root).ok()?.flatten() {
         let chats = entry.path().join("chats");
@@ -1824,19 +1814,15 @@ pub fn resolve_gemini_session_cwd_in(
         for chat in chat_entries.flatten() {
             let name = chat.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.starts_with("session-") || !name.ends_with(&suffix) {
+            if !is_gemini_session_file_for_id(name, first8) {
                 continue;
             }
-            // The filename suffix is only the UUID's first 8 chars, so
-            // confirm the full sessionId via the file header before
-            // trusting the match.
-            let Ok(mut f) = std::fs::File::open(chat.path()) else {
+            let Ok(raw) = std::fs::read_to_string(chat.path()) else {
                 continue;
             };
-            let mut buf = [0u8; 256];
-            let n = f.read(&mut buf).ok()?;
-            let header = std::str::from_utf8(&buf[..n]).unwrap_or("");
-            if !header.contains(&needle) {
+            // The filename suffix is only the UUID's first 8 chars, so
+            // confirm the full sessionId before trusting the match.
+            if extract_gemini_session_id(&raw).as_deref() != Some(session_id) {
                 continue;
             }
 
@@ -1851,6 +1837,24 @@ pub fn resolve_gemini_session_cwd_in(
         }
     }
     None
+}
+
+fn is_gemini_session_file_name(name: &str) -> bool {
+    name.starts_with("session-") && (name.ends_with(".json") || name.ends_with(".jsonl"))
+}
+
+fn is_gemini_session_file_for_id(name: &str, first8: &str) -> bool {
+    is_gemini_session_file_name(name)
+        && (name.ends_with(&format!("-{first8}.json"))
+            || name.ends_with(&format!("-{first8}.jsonl")))
+}
+
+fn extract_gemini_session_id(raw: &str) -> Option<String> {
+    let mut values = serde_json::Deserializer::from_str(raw).into_iter::<Value>();
+    let data = values.next()?.ok()?;
+    data.get("sessionId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -3177,6 +3181,32 @@ mod tests {
         .unwrap();
     }
 
+    fn seed_gemini_jsonl_fixture(
+        tmp_root: &std::path::Path,
+        project_name: &str,
+        project_root: &str,
+        session_id: &str,
+        iso: &str,
+        task_id: Option<&str>,
+    ) {
+        let proj_dir = tmp_root.join(project_name);
+        let chats = proj_dir.join("chats");
+        std::fs::create_dir_all(&chats).unwrap();
+        std::fs::write(proj_dir.join(".project_root"), project_root).unwrap();
+        let first8 = &session_id[..8];
+        let path = chats.join(format!("session-{iso}-{first8}.jsonl"));
+        let message_text = task_id
+            .map(|task| format!("[scope] task: {task}"))
+            .unwrap_or_default();
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"sessionId\":\"{session_id}\",\"kind\":\"main\"}}\n{{\"type\":\"user\",\"content\":[{{\"text\":{message_text:?}}}]}}\n"
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn resolve_gemini_session_finds_cwd_from_fixture() {
         let tmp = tempfile::tempdir().unwrap();
@@ -3193,6 +3223,27 @@ mod tests {
         assert_eq!(
             cwd,
             std::path::PathBuf::from("/home/user/repos/daystrom-mk2")
+        );
+    }
+
+    #[test]
+    fn resolve_gemini_session_accepts_jsonl_minified_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_jsonl_fixture(
+            tmp.path(),
+            "transcript-search-system-memories-runtime-loading",
+            "/home/user/repos/transcript-search-system-memories-runtime-loading",
+            "72d7e84e-6b26-49c1-96ba-8a9ea51b9e82",
+            "2026-05-14T17-22",
+            None,
+        );
+        let cwd = resolve_gemini_session_cwd_in(tmp.path(), "72d7e84e-6b26-49c1-96ba-8a9ea51b9e82")
+            .expect("should resolve");
+        assert_eq!(
+            cwd,
+            std::path::PathBuf::from(
+                "/home/user/repos/transcript-search-system-memories-runtime-loading"
+            )
         );
     }
 
@@ -3275,6 +3326,37 @@ mod tests {
         let sid = discover_gemini_session_in(tmp.path(), now_ms, "/repo/b", None)
             .expect("should resolve");
         assert_eq!(sid, "bbbbbbbb-1111-2222-3333-444444444444");
+    }
+
+    #[test]
+    fn discover_gemini_session_accepts_jsonl_minified_header() {
+        let tmp = tempfile::tempdir().unwrap();
+        seed_gemini_jsonl_fixture(
+            tmp.path(),
+            "proj-jsonl",
+            "/repo/jsonl",
+            "72d7e84e-6b26-49c1-96ba-8a9ea51b9e82",
+            "2026-05-14T17-22",
+            Some("task-jsonl"),
+        );
+        let path = tmp
+            .path()
+            .join("proj-jsonl/chats/session-2026-05-14T17-22-72d7e84e.jsonl");
+        let mtime = std::fs::metadata(path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let sid = discover_gemini_session_in(
+            tmp.path(),
+            mtime.saturating_sub(1),
+            "/repo/jsonl",
+            Some("task-jsonl"),
+        )
+        .expect("should discover");
+        assert_eq!(sid, "72d7e84e-6b26-49c1-96ba-8a9ea51b9e82");
     }
 
     #[test]
