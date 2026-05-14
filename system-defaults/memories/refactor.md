@@ -150,6 +150,10 @@ Writable structural plans are narrower:
   Use `bbox_refactor_apply(confirm=true)` for one plan or
   `bbox_refactor_run(confirm=true)` when several primitive plans and command
   validations must succeed or rollback together.
+  `bbox_refactor_run.steps` is a structured array of step objects. The runner
+  also accepts legacy JSON-string step entries for clients whose stale MCP
+  schema still advertises `steps: string[]`; prefer structured objects in new
+  calls.
   In `bbox_refactor_run` command steps, `command` is the executable only and
   arguments go in `args`: use `{"command":"cargo","args":["fmt"]}`, not
   `{"command":"cargo fmt"}`.
@@ -159,9 +163,11 @@ Writable structural plans are narrower:
   - `"continue_for_repair"`: exit-code != 0 opens a repair obligation and
     continues. A later step (e.g. `rust_compile_fix_round`) must mark the
     obligation `Consumed` or `LeftOver`. Any obligation still `Open` at run
-    end triggers rollback from the first soft-fail cursor. Consumed and
-    LeftOver obligations remain live rollback anchors until terminal success
-    — only reaching the end of the run without any failure releases them.
+    end triggers rollback. The soft-fail rollback anchor covers the whole
+    transaction segment validated by the repair command, including prior plan
+    writes and the command's declared touches. Consumed and LeftOver
+    obligations remain live rollback anchors until terminal success — only
+    reaching the end of the run without any failure releases them.
   The `on_failure` field supersedes the legacy `required: bool` when set.
   Canonical repair sequence: `[extract_plan, add_mod_decl, cargo_check
   (continue_for_repair, capture=rustc_json), rust_compile_fix_round, cargo_check

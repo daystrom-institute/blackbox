@@ -31,6 +31,9 @@ ask `bbox_refactor_plan` (dry-run) before `bbox_refactor_apply(confirm=true)`.
 Inspect: `bbox_refactor_status`. Apply: `bbox_refactor_apply(confirm=true)`.
 Compound: `bbox_refactor_run(confirm=true)` runs ordered plan + command steps
 with rollback across primitive-plan file writes if a later required step fails.
+When a repair command uses `on_failure="continue_for_repair"`, any later
+terminal failure rolls back the whole validated transaction segment, including
+plan writes that happened before the repair command.
 
 Plan kinds, grouped by intent:
 
@@ -305,8 +308,11 @@ Writable plan kinds:
   refactor envelope (sha256 check, atomic rename, rollback).
 - `rust_impl_partition_analysis` (analysis-only): build the call/state graph
   of methods inside one `impl` block. Pass `source` + `impl_name` (or
-  `module_name`). Returns `partition_graph`; no FileEdits. Use before a split
-  to see which methods cluster together.
+  `module_name`). `impl_name` accepts either the simple type name
+  (`"BlackboxServer"`) or the status-style impl header emitted by
+  `bbox_refactor_status` (`"impl BlackboxServer"`). Returns
+  `partition_graph`; no FileEdits. Use before a split to see which methods
+  cluster together.
 - `rust_top_level_dependency_analysis` (analysis-only): build a dependency
   graph for named or all top-level Rust items in one file. Returns
   `top_level_dependency_graph` with item->call/type/module/global edges,
