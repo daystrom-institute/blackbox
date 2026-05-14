@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use tantivy::Term;
 use tantivy::collector::TopDocs;
@@ -25,6 +28,12 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 const OUTPUT_CAP_BYTES: usize = 32 * 1024;
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_LOG_LIMIT: u32 = 20;
+
+#[derive(Debug)]
+struct WorkBashEvent {
+    stream: &'static str,
+    chunk: String,
+}
 
 // ── Sensitive-path guard ──────────────────────────────────────────────
 
@@ -120,6 +129,71 @@ fn cap_output(s: &str) -> (String, bool) {
     (out, true)
 }
 
+fn read_capped_stream<R: std::io::Read + Send + 'static>(
+    mut reader: R,
+    stream: &'static str,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkBashEvent>>,
+) -> thread::JoinHandle<(String, bool)> {
+    thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut truncated = false;
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some(tx) = &progress_tx {
+                        let _ = tx.send(WorkBashEvent {
+                            stream,
+                            chunk: String::from_utf8_lossy(&buf[..n]).to_string(),
+                        });
+                    }
+                    let remaining = OUTPUT_CAP_BYTES.saturating_sub(out.len());
+                    if remaining > 0 {
+                        let keep = remaining.min(n);
+                        out.extend_from_slice(&buf[..keep]);
+                    }
+                    if n > remaining {
+                        truncated = true;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let mut text = String::from_utf8_lossy(&out).to_string();
+        if truncated {
+            text.push_str("\n[... truncated to 32KB by work_bash output cap]");
+        }
+        (text, truncated)
+    })
+}
+
+#[cfg(unix)]
+fn configure_child_process_group(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_child_process_group(_cmd: &mut Command) {}
+
+#[cfg(unix)]
+fn kill_child_process_group(pid: u32) {
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_child_process_group(_pid: u32) {}
+
 // ── Helper: resolve repo path ─────────────────────────────────────────
 
 fn resolve_repo(repo: Option<&str>) -> anyhow::Result<PathBuf> {
@@ -151,43 +225,87 @@ fn git_run(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
 }
 
 // ── Helper: run subprocess with timeout ──────────────────────────────
-// Returns (exit_code, stdout, stderr, was_truncated)
+// Returns (exit_code, stdout, stderr, was_truncated, timed_out)
 
 fn run_with_timeout(
     command: &str,
     cwd: &Path,
     timeout_secs: u64,
-) -> anyhow::Result<(i32, String, String, bool)> {
-    let command = command.to_string();
-    let cwd = cwd.to_path_buf();
-    let (tx, rx) = mpsc::channel();
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkBashEvent>>,
+) -> anyhow::Result<(i32, String, String, bool, bool)> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    configure_child_process_group(&mut cmd);
 
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to spawn command: {e}"))?;
+    let child_pid = child.id();
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture stderr"))?;
+
+    let stdout_reader = read_capped_stream(stdout, "stdout", progress_tx.clone());
+    let stderr_reader = read_capped_stream(stderr, "stderr", progress_tx);
+
+    let (status_tx, status_rx) = mpsc::channel();
     thread::spawn(move || {
-        let result = Command::new("sh")
-            .arg("-c")
-            .arg(&command)
-            .current_dir(&cwd)
-            .output();
-        let _ = tx.send(result);
+        let _ = status_tx.send(child.wait());
     });
 
-    match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
-        Ok(Ok(output)) => {
-            let exit_code = output.status.code().unwrap_or(-1);
-            let raw_stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let raw_stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            let (stdout, trunc_out) = cap_output(&raw_stdout);
-            let (stderr, trunc_err) = cap_output(&raw_stderr);
-            Ok((exit_code, stdout, stderr, trunc_out || trunc_err))
-        }
-        Ok(Err(e)) => anyhow::bail!("failed to spawn command: {e}"),
+    let mut timed_out = false;
+    let status = match status_rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(Ok(status)) => status,
+        Ok(Err(e)) => return Err(e.into()),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            anyhow::bail!("command timed out after {timeout_secs}s")
+            timed_out = true;
+            kill_child_process_group(child_pid);
+            match status_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(status)) => status,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    anyhow::bail!(
+                        "command timed out after {timeout_secs}s and did not exit after kill"
+                    )
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    anyhow::bail!("command wait thread disconnected after timeout")
+                }
+            }
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
-            anyhow::bail!("command thread disconnected")
+            anyhow::bail!("command wait thread disconnected")
         }
-    }
+    };
+
+    let (stdout, trunc_out) = stdout_reader
+        .join()
+        .unwrap_or_else(|_| ("".to_string(), false));
+    let (stderr, trunc_err) = stderr_reader
+        .join()
+        .unwrap_or_else(|_| ("".to_string(), false));
+
+    Ok((
+        if timed_out {
+            -1
+        } else {
+            status.code().unwrap_or(-1)
+        },
+        stdout,
+        stderr,
+        trunc_out || trunc_err,
+        timed_out,
+    ))
 }
 
 // ── Parameter structs ─────────────────────────────────────────────────
@@ -492,16 +610,25 @@ fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow:
     Ok(out)
 }
 
-fn impl_work_bash(p: &WorkBashParams) -> anyhow::Result<String> {
+fn impl_work_bash(
+    p: &WorkBashParams,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<WorkBashEvent>>,
+) -> anyhow::Result<String> {
     let cwd = Path::new(&p.cwd);
     if !cwd.exists() {
         anyhow::bail!("`cwd` does not exist: {}", p.cwd);
     }
+    if !cwd.is_dir() {
+        anyhow::bail!("`cwd` is not a directory: {}", p.cwd);
+    }
 
     let timeout = p.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS).min(300);
-    let (exit_code, stdout, stderr, truncated) = run_with_timeout(&p.command, cwd, timeout)?;
+    let (exit_code, stdout, stderr, truncated, timed_out) =
+        run_with_timeout(&p.command, cwd, timeout, progress_tx)?;
 
-    let outcome = if exit_code == 0 {
+    let outcome = if timed_out {
+        "timeout"
+    } else if exit_code == 0 {
         if truncated { "truncated" } else { "success" }
     } else {
         "error"
@@ -515,7 +642,65 @@ fn impl_work_bash(p: &WorkBashParams) -> anyhow::Result<String> {
         "stdout": stdout,
         "stderr": stderr,
         "truncated": truncated,
+        "timed_out": timed_out,
     }))?)
+}
+
+fn work_bash_progress_notification(
+    token: &rmcp::model::ProgressToken,
+    progress: f64,
+    event: WorkBashEvent,
+) -> anyhow::Result<rmcp::model::ServerNotification> {
+    let message = serde_json::to_string(&json!({
+        "stream": event.stream,
+        "chunk": event.chunk,
+    }))?;
+    Ok(rmcp::model::ServerNotification::ProgressNotification(
+        rmcp::model::Notification::new(rmcp::model::ProgressNotificationParam {
+            progress_token: token.clone(),
+            progress,
+            total: None,
+            message: Some(message),
+        }),
+    ))
+}
+
+async fn impl_work_bash_streaming(
+    p: WorkBashParams,
+    context: rmcp::service::RequestContext<rmcp::RoleServer>,
+) -> anyhow::Result<String> {
+    let progress_token = context.meta.get_progress_token();
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<WorkBashEvent>();
+    let use_progress = progress_token.is_some();
+    let worker_tx = use_progress.then_some(progress_tx);
+    let handle = tokio::task::spawn_blocking(move || impl_work_bash(&p, worker_tx));
+    tokio::pin!(handle);
+
+    let mut progress_idx = 0f64;
+    loop {
+        tokio::select! {
+            event = progress_rx.recv(), if use_progress => {
+                if let (Some(token), Some(event)) = (&progress_token, event) {
+                    progress_idx += 1.0;
+                    let _ = context.peer
+                        .send_notification(work_bash_progress_notification(token, progress_idx, event)?)
+                        .await;
+                }
+            }
+            result = &mut handle => {
+                let output = result.map_err(|e| anyhow::anyhow!("work_bash worker panicked: {e}"))??;
+                if let Some(token) = &progress_token {
+                    while let Ok(event) = progress_rx.try_recv() {
+                        progress_idx += 1.0;
+                        let _ = context.peer
+                            .send_notification(work_bash_progress_notification(token, progress_idx, event)?)
+                            .await;
+                    }
+                }
+                return Ok(output);
+            }
+        }
+    }
 }
 
 fn impl_work_git_status(repo_path: &Path) -> anyhow::Result<String> {
@@ -736,10 +921,17 @@ impl BlackboxServer {
 
     #[tool(
         name = "work_bash",
-        description = "Run a shell command in an explicit cwd with 32KB output caps and a timeout. Returns exit_code, stdout, stderr, and outcome."
+        description = "Run a shell command in an explicit cwd with streaming progress chunks, 32KB stdout/stderr final caps, and timeout handling."
     )]
-    pub(crate) fn work_bash(&self, Parameters(p): Parameters<WorkBashParams>) -> CallToolResult {
-        Self::run("work_bash", || impl_work_bash(&p))
+    pub(crate) async fn work_bash(
+        &self,
+        Parameters(p): Parameters<WorkBashParams>,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> CallToolResult {
+        match impl_work_bash_streaming(p, context).await {
+            Ok(text) => Self::ok_text(&text),
+            Err(e) => Self::err_text(&format!("Error: {e:#}")),
+        }
     }
 
     #[tool(
@@ -905,6 +1097,70 @@ mod tests {
         assert!(truncated);
         assert!(out.len() <= OUTPUT_CAP_BYTES + 100); // suffix adds a few bytes
         assert!(out.contains("truncated"));
+    }
+
+    // ── work_bash runner ────────────────────────────────────────────
+
+    #[test]
+    fn work_bash_captures_stdout_and_stderr() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exit_code, stdout, stderr, truncated, timed_out) =
+            run_with_timeout("printf out; printf err >&2", tmp.path(), 5, None).unwrap();
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, "out");
+        assert_eq!(stderr, "err");
+        assert!(!truncated);
+        assert!(!timed_out);
+    }
+
+    #[test]
+    fn work_bash_timeout_returns_partial_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (exit_code, stdout, _stderr, _truncated, timed_out) =
+            run_with_timeout("printf start; sleep 5; printf end", tmp.path(), 1, None).unwrap();
+        assert_eq!(exit_code, -1);
+        assert_eq!(stdout, "start");
+        assert!(timed_out);
+    }
+
+    #[test]
+    fn work_bash_emits_progress_chunks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_exit_code, stdout, _stderr, _truncated, timed_out) =
+            run_with_timeout("printf one; printf two", tmp.path(), 5, Some(tx)).unwrap();
+        assert_eq!(stdout, "onetwo");
+        assert!(!timed_out);
+
+        let mut chunks = String::new();
+        while let Ok(event) = rx.try_recv() {
+            assert_eq!(event.stream, "stdout");
+            chunks.push_str(&event.chunk);
+        }
+        assert_eq!(chunks, "onetwo");
+    }
+
+    #[test]
+    fn work_bash_progress_notification_preserves_stream_and_chunk() {
+        let token = rmcp::model::ProgressToken(rmcp::model::NumberOrString::String("tok".into()));
+        let event = WorkBashEvent {
+            stream: "stderr",
+            chunk: "tail line\n".to_string(),
+        };
+
+        let notification = work_bash_progress_notification(&token, 2.0, event).unwrap();
+        let rmcp::model::ServerNotification::ProgressNotification(notification) = notification
+        else {
+            panic!("expected progress notification");
+        };
+
+        assert_eq!(notification.params.progress_token, token);
+        assert_eq!(notification.params.progress, 2.0);
+        assert_eq!(notification.params.total, None);
+        let message: serde_json::Value =
+            serde_json::from_str(notification.params.message.as_deref().unwrap()).unwrap();
+        assert_eq!(message["stream"], "stderr");
+        assert_eq!(message["chunk"], "tail line\n");
     }
 
     // ── git_commit sensitive guard (no live git) ─────────────────────

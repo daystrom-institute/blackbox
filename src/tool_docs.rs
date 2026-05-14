@@ -122,6 +122,24 @@ fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
     }
 }
 
+const HOT_RENDER_CATEGORIES: &[ToolCategory] = &[
+    ToolCategory::Transcripts,
+    ToolCategory::Graph,
+    ToolCategory::Projects,
+    ToolCategory::Refactor,
+    ToolCategory::Knowledge,
+    ToolCategory::Threads,
+    ToolCategory::Notes,
+    ToolCategory::Inbox,
+    ToolCategory::Artifacts,
+    ToolCategory::Packets,
+    ToolCategory::Orchestration,
+    ToolCategory::Workflows,
+    ToolCategory::Whiteboards,
+    ToolCategory::Councils,
+    ToolCategory::Roadmap,
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct ToolDoc {
     pub name: &'static str,
@@ -1275,8 +1293,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "work_bash",
         category: ToolCategory::Workspace,
-        summary: "Run a shell command in an explicit cwd with 32KB output caps and a timeout. Returns exit_code, stdout, stderr, and outcome.",
-        when_to_use: "Use instead of raw Bash inside a registered project. `cwd` is required; `task_id` correlates the call to a dispatch task.",
+        summary: "Run a shell command in an explicit cwd with streaming progress chunks, 32KB stdout/stderr final caps, and timeout handling.",
+        when_to_use: "Use instead of raw Bash only when workspace-tools mode is explicitly enabled for the dispatch. `cwd` is required; `task_id` correlates the call to a dispatch task.",
         example: Some(
             r#"work_bash(command="cargo test --bin blackboxd", cwd="/repo/x", timeout_secs=120)"#,
         ),
@@ -1490,29 +1508,10 @@ pub fn render_markdown() -> String {
 
     out.push_str("**Scope selection.** Default to `project` for repo-local conventions. Choose `global` only when the user's phrasing explicitly reaches beyond this repo — \"across every project\", \"on every machine\", \"in every X I write\", \"I always X as a personal rule\", \"house rule on this machine\". Technology-scoped but project-agnostic statements (\"in all Rust code I write\", \"always prefer fd over find\") are `global`. Strong wording alone is not enough — \"we always use tokio here\" stays `project`. Presence of a current project does not imply `project` scope when the user states a cross-project personal rule. If both readings are plausible, choose `project`.\n\n");
 
-    let categories = [
-        ToolCategory::Transcripts,
-        ToolCategory::Graph,
-        ToolCategory::Projects,
-        ToolCategory::Refactor,
-        ToolCategory::Knowledge,
-        ToolCategory::Threads,
-        ToolCategory::Notes,
-        ToolCategory::Inbox,
-        ToolCategory::Artifacts,
-        ToolCategory::Packets,
-        ToolCategory::Orchestration,
-        ToolCategory::Workflows,
-        ToolCategory::Whiteboards,
-        ToolCategory::Councils,
-        ToolCategory::Roadmap,
-        ToolCategory::Workspace,
-    ];
-
-    for cat in categories {
+    for cat in HOT_RENDER_CATEGORIES {
         out.push_str(&format!("## {}\n\n", cat.heading()));
 
-        if let Some(memory_id) = deferred_system_memory(cat) {
+        if let Some(memory_id) = deferred_system_memory(*cat) {
             out.push_str(&format!(
                 "On-demand runbook: `{memory_id}` via `bbox_knowledge(query=\"{memory_id}\")`.\n\n"
             ));
@@ -1520,7 +1519,7 @@ pub fn render_markdown() -> String {
         } else {
             out.push_str(cat.intro());
             out.push_str("\n\n");
-            for doc in TOOL_DOCS.iter().filter(|d| d.category == cat) {
+            for doc in TOOL_DOCS.iter().filter(|d| d.category == *cat) {
                 out.push_str(&format!(
                     "- **`{}`** — {}\n",
                     doc.name,
@@ -1640,6 +1639,9 @@ mod tests {
     fn render_contains_hot_tool_names() {
         let md = render_markdown();
         for doc in TOOL_DOCS {
+            if !HOT_RENDER_CATEGORIES.contains(&doc.category) {
+                continue;
+            }
             if deferred_system_memory(doc.category).is_some() {
                 continue;
             }
@@ -1671,6 +1673,22 @@ mod tests {
                     doc.name
                 );
             }
+        }
+    }
+
+    #[test]
+    fn render_omits_workspace_tools_from_hot_layer() {
+        let md = render_markdown();
+        assert!(!md.contains("## Workspace tools"));
+        for doc in TOOL_DOCS
+            .iter()
+            .filter(|d| d.category == ToolCategory::Workspace)
+        {
+            assert!(
+                !md.contains(doc.name),
+                "workspace tool leaked into rendered hot layer: {}",
+                doc.name
+            );
         }
     }
 
