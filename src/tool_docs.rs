@@ -1352,15 +1352,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_storage_health",
         category: ToolCategory::StorageHealth,
-        summary: "Read-only edge sidecar inventory. Totals by kind; include_files=true for rows.",
-        when_to_use: "Sidecar disk usage.",
+        summary: "Read-only edge sidecar inventory. Totals active legacy, managed derived, backups, temps, orphan classes, inactive snapshots, and observed history; include_files=true for exact rows.",
+        when_to_use: "Use when diagnosing storage growth or validating retention before GC. Observed history is reported separately and retained by explicit keep/no-cap policy unless an operator supplies a cap to GC.",
         example: None,
     },
     ToolDoc {
         name: "bbox_storage_gc",
         category: ToolCategory::StorageHealth,
-        summary: "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule.",
-        when_to_use: "Sidecar cleanup.",
+        summary: "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule for temps, backups, orphan classes, inactive snapshots, and observed cap warnings.",
+        when_to_use: "Use for sidecar cleanup after inspecting health. Defaults retain newest backups, recent inactive snapshots per workspace/repo, branch-switch grace, and keep observed history. `dangling_path` and `legacy_unknown` orphans can auto-prune after grace; `explicitly_unregistered` requires `prune_explicitly_unregistered=true`.",
         example: None,
     },
     ToolDoc {

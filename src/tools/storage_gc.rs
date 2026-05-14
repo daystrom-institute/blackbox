@@ -18,15 +18,14 @@ pub(crate) struct StorageGcParams {
     /// Prune compaction backup files. Default true.
     #[serde(default = "default_true")]
     pub prune_backups: bool,
-    /// Prune orphan/unregistered sidecars. Default false; Phase 1 reports only.
+    /// Prune orphan/unregistered sidecars. Default false.
     #[serde(default)]
     pub prune_orphans: bool,
     /// Prune compact temp files older than 24h. Default true.
     #[serde(default = "default_true")]
     pub prune_temps: bool,
-    /// Prune inactive snapshot dirs not referenced by any manifest. Default
-    /// false; inactive snapshots are reported but not pruned unless explicitly
-    /// enabled. Retention policy (keep_recent/grace) not yet implemented.
+    /// Prune inactive snapshot files not referenced by any manifest after
+    /// snapshot retention policy is applied. Default false.
     #[serde(default)]
     pub prune_inactive_snapshots: bool,
     /// Maximum age in days for backup files. If set, backups older than this
@@ -36,6 +35,37 @@ pub(crate) struct StorageGcParams {
     /// Number of newest backups to retain per source. Default 1.
     #[serde(default = "default_keep_newest")]
     pub keep_newest_backup_per_source: u64,
+    /// Backup byte cap across all scanned backups. Retained newest backups are
+    /// never deleted solely to satisfy this cap. Default 2 GiB.
+    #[serde(default = "default_backup_cap")]
+    pub max_backup_total_bytes: Option<u64>,
+    /// Number of recent inactive snapshot directories retained per workspace.
+    /// Default 3.
+    #[serde(default = "default_keep_recent_workspace")]
+    pub keep_recent_snapshots_per_workspace: u64,
+    /// Number of recent inactive snapshot directories retained per repo.
+    /// Default 10.
+    #[serde(default = "default_keep_recent_repo")]
+    pub keep_recent_snapshots_per_repo: u64,
+    /// Grace window after branch switches before inactive snapshots can prune.
+    /// Default 60 minutes.
+    #[serde(default = "default_branch_grace_minutes")]
+    pub branch_switch_grace_minutes: u64,
+    /// Maximum age in days for inactive snapshots. Default 14.
+    #[serde(default = "default_snapshot_max_age_days")]
+    pub max_snapshot_age_days: Option<u64>,
+    /// Auto-prune dangling_path and legacy_unknown orphans after this many
+    /// days. Default 30.
+    #[serde(default = "default_orphan_after_days")]
+    pub orphan_auto_prune_after_days: u64,
+    /// Prune explicitly_unregistered storage after orphan_auto_prune_after_days.
+    /// Default false; this is a separate operator decision.
+    #[serde(default)]
+    pub prune_explicitly_unregistered: bool,
+    /// Optional observed lane cap per project. Over-cap observed history is
+    /// reported as operator-review only; it is not auto-deleted.
+    #[serde(default)]
+    pub max_observed_bytes_per_project: Option<u64>,
 }
 
 fn default_true() -> bool {
@@ -43,6 +73,24 @@ fn default_true() -> bool {
 }
 fn default_keep_newest() -> u64 {
     1
+}
+fn default_backup_cap() -> Option<u64> {
+    Some(2 * 1024 * 1024 * 1024)
+}
+fn default_keep_recent_workspace() -> u64 {
+    3
+}
+fn default_keep_recent_repo() -> u64 {
+    10
+}
+fn default_branch_grace_minutes() -> u64 {
+    60
+}
+fn default_snapshot_max_age_days() -> Option<u64> {
+    Some(14)
+}
+fn default_orphan_after_days() -> u64 {
+    30
 }
 
 #[tool_router(router = storage_gc_tools)]
@@ -84,7 +132,32 @@ impl BlackboxServer {
                 keep_newest_backup_per_source: p.keep_newest_backup_per_source,
             };
 
-            let candidates = crate::storage_health::plan_gc(&edges_dir, &registered, &gc_params)?;
+            let policy = crate::storage_health::GcPolicy {
+                materialized_snapshots: crate::storage_health::SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: p.keep_recent_snapshots_per_workspace,
+                    keep_recent_per_repo: p.keep_recent_snapshots_per_repo,
+                    branch_switch_grace_minutes: p.branch_switch_grace_minutes,
+                    max_age_days: p.max_snapshot_age_days,
+                },
+                backups: crate::storage_health::BackupRetentionPolicy {
+                    max_total_bytes: p.max_backup_total_bytes,
+                },
+                orphans: crate::storage_health::OrphanRetentionPolicy {
+                    auto_prune_after_days: p.orphan_auto_prune_after_days,
+                    prune_explicitly_unregistered: p.prune_explicitly_unregistered,
+                },
+                observed: crate::storage_health::ObservedRetentionPolicy {
+                    max_bytes_per_project: p.max_observed_bytes_per_project,
+                },
+            };
+
+            let candidates = crate::storage_health::plan_gc_with_policy(
+                &edges_dir,
+                &registered,
+                &gc_params,
+                &policy,
+            )?;
 
             let deletable: Vec<&crate::storage_health::GcCandidate> = candidates
                 .iter()

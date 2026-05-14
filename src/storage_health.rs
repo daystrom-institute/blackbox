@@ -1,8 +1,8 @@
 use std::cmp::Reverse;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,11 @@ pub enum FileKind {
     Backup,
     Temp,
     Orphan,
+    OrphanDanglingPath,
+    OrphanLegacyUnknown,
+    OrphanExplicitlyUnregistered,
     InactiveSnapshot,
+    Observed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,6 +45,10 @@ pub struct StorageHealthTotals {
     pub temp_files: u64,
     pub orphan_bytes: u64,
     pub orphan_files: u64,
+    pub observed_bytes: u64,
+    pub observed_files: u64,
+    pub inactive_snapshot_bytes: u64,
+    pub inactive_snapshot_files: u64,
     pub total_bytes: u64,
     pub total_files: u64,
 }
@@ -58,6 +66,10 @@ impl Default for StorageHealthTotals {
             temp_files: 0,
             orphan_bytes: 0,
             orphan_files: 0,
+            observed_bytes: 0,
+            observed_files: 0,
+            inactive_snapshot_bytes: 0,
+            inactive_snapshot_files: 0,
             total_bytes: 0,
             total_files: 0,
         }
@@ -89,9 +101,19 @@ impl StorageHealthTotals {
                 self.orphan_bytes += bytes;
                 self.orphan_files += 1;
             }
-            FileKind::InactiveSnapshot => {
+            FileKind::OrphanDanglingPath
+            | FileKind::OrphanLegacyUnknown
+            | FileKind::OrphanExplicitlyUnregistered => {
                 self.orphan_bytes += bytes;
                 self.orphan_files += 1;
+            }
+            FileKind::Observed => {
+                self.observed_bytes += bytes;
+                self.observed_files += 1;
+            }
+            FileKind::InactiveSnapshot => {
+                self.inactive_snapshot_bytes += bytes;
+                self.inactive_snapshot_files += 1;
             }
         }
     }
@@ -106,6 +128,17 @@ pub struct StorageHealthReport {
     pub files: Vec<StorageFileInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_status: Option<ManifestStatus>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub observed: Vec<ObservedProjectUsage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observed_policy_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedProjectUsage {
+    pub project_id: String,
+    pub path: String,
+    pub bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,10 +162,12 @@ pub fn scan_storage_health(
 ) -> Result<StorageHealthReport> {
     let mut totals = StorageHealthTotals::default();
     let mut files: Vec<StorageFileInfo> = Vec::new();
+    let project_facts = collect_project_storage_facts(edges_dir);
 
     scan_legacy_dir(
         edges_dir,
         registered_project_ids,
+        &project_facts,
         project_filter,
         &mut totals,
         &mut files,
@@ -143,6 +178,7 @@ pub fn scan_storage_health(
         scan_managed_derived_dir(
             &managed_dir,
             registered_project_ids,
+            &project_facts,
             project_filter,
             &mut totals,
             &mut files,
@@ -150,6 +186,7 @@ pub fn scan_storage_health(
     }
 
     scan_inactive_snapshots(edges_dir, project_filter, &mut totals, &mut files);
+    let observed = scan_observed_dir(edges_dir, project_filter, &mut totals, &mut files);
 
     files.sort_by(|a, b| b.bytes.cmp(&a.bytes));
 
@@ -164,7 +201,20 @@ pub fn scan_storage_health(
         top_offenders,
         files: files_out,
         manifest_status,
+        observed_policy_warning: observed_policy_warning(&observed),
+        observed,
     })
+}
+
+fn observed_policy_warning(observed: &[ObservedProjectUsage]) -> Option<String> {
+    let total = observed.iter().map(|o| o.bytes).sum::<u64>();
+    if total == 0 {
+        None
+    } else {
+        Some(format!(
+            "observed_retention_keep_no_cap(total_bytes={total}); no observed pruning policy is configured"
+        ))
+    }
 }
 
 fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
@@ -303,6 +353,7 @@ fn project_filter_matches(project_id: Option<&str>, project_filter: Option<&str>
 fn scan_legacy_dir(
     edges_dir: &Path,
     registered_project_ids: &HashSet<String>,
+    project_facts: &ProjectStorageFacts,
     project_filter: Option<&str>,
     totals: &mut StorageHealthTotals,
     files: &mut Vec<StorageFileInfo>,
@@ -381,14 +432,13 @@ fn scan_legacy_dir(
             continue;
         }
 
-        let is_registered = registered_project_ids.contains(stem);
         let project_id = stem.to_string();
 
         if !project_filter_matches(Some(&project_id), project_filter) {
             continue;
         }
 
-        if is_registered {
+        if registered_project_ids.contains(stem) {
             totals.accumulate(FileKind::ActiveLegacy, bytes);
             files.push(StorageFileInfo {
                 path: path.display().to_string(),
@@ -398,13 +448,14 @@ fn scan_legacy_dir(
                 reason: None,
             });
         } else {
-            totals.accumulate(FileKind::Orphan, bytes);
+            let kind = project_facts.orphan_kind_for(&project_id);
+            totals.accumulate(kind, bytes);
             files.push(StorageFileInfo {
                 path: path.display().to_string(),
-                kind: FileKind::Orphan,
+                kind,
                 project_id: Some(project_id),
                 bytes,
-                reason: Some("unregistered project sidecar".to_string()),
+                reason: Some(orphan_reason(kind).to_string()),
             });
         }
     }
@@ -415,6 +466,7 @@ fn scan_legacy_dir(
 fn scan_managed_derived_dir(
     managed_dir: &Path,
     registered_project_ids: &HashSet<String>,
+    project_facts: &ProjectStorageFacts,
     project_filter: Option<&str>,
     totals: &mut StorageHealthTotals,
     files: &mut Vec<StorageFileInfo>,
@@ -511,21 +563,80 @@ fn scan_managed_derived_dir(
                     reason: None,
                 });
             } else {
-                totals.accumulate(FileKind::Orphan, bytes);
+                let kind = project_facts.orphan_kind_for(&project_id);
+                totals.accumulate(kind, bytes);
                 files.push(StorageFileInfo {
                     path: path.display().to_string(),
-                    kind: FileKind::Orphan,
+                    kind,
                     project_id: Some(project_id),
                     bytes,
-                    reason: Some(format!(
-                        "unregistered managed derived sidecar (namespace={namespace})"
-                    )),
+                    reason: Some(format!("{} (namespace={namespace})", orphan_reason(kind))),
                 });
             }
         }
     }
 
     Ok(())
+}
+
+#[derive(Default)]
+struct ProjectStorageFacts {
+    manifest_projects: HashSet<String>,
+    dangling_projects: HashSet<String>,
+    repo_by_project: HashMap<String, String>,
+}
+
+impl ProjectStorageFacts {
+    fn orphan_kind_for(&self, project_id: &str) -> FileKind {
+        if self.dangling_projects.contains(project_id) {
+            FileKind::OrphanDanglingPath
+        } else if self.manifest_projects.contains(project_id) {
+            FileKind::OrphanExplicitlyUnregistered
+        } else {
+            FileKind::OrphanLegacyUnknown
+        }
+    }
+}
+
+fn orphan_reason(kind: FileKind) -> &'static str {
+    match kind {
+        FileKind::OrphanDanglingPath => "dangling_path project storage",
+        FileKind::OrphanExplicitlyUnregistered => "explicitly_unregistered project storage",
+        FileKind::OrphanLegacyUnknown => "legacy_unknown project sidecar",
+        FileKind::Orphan => "unclassified orphan project storage",
+        _ => "not orphan storage",
+    }
+}
+
+fn collect_project_storage_facts(edges_dir: &Path) -> ProjectStorageFacts {
+    let workspace_dir = crate::manifest::materialized_dir(edges_dir).join("workspace");
+    let mut facts = ProjectStorageFacts::default();
+    let Ok(entries) = fs::read_dir(workspace_dir) else {
+        return facts;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let manifest_path = entry.path().join("manifest.json");
+        if !manifest_path.is_file() {
+            continue;
+        }
+        let Ok(manifest) = crate::manifest::WorkspaceManifest::read_from(&manifest_path) else {
+            continue;
+        };
+        facts.manifest_projects.insert(manifest.project_id.clone());
+        if let Some(repo_id) = manifest.repo_id {
+            facts
+                .repo_by_project
+                .insert(manifest.project_id.clone(), repo_id);
+        }
+        if manifest
+            .canonical_path
+            .as_deref()
+            .is_some_and(|p| !Path::new(p).exists())
+        {
+            facts.dangling_projects.insert(manifest.project_id);
+        }
+    }
+    facts
 }
 
 fn scan_inactive_snapshots(
@@ -583,10 +694,81 @@ fn scan_inactive_snapshots(
     walk_for_inactive(&mat_dir, &active_prefixes, project_filter, totals, files);
 }
 
+fn scan_observed_dir(
+    edges_dir: &Path,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+) -> Vec<ObservedProjectUsage> {
+    let observed_dir = edges_dir.join("observed");
+    let mut usage: HashMap<String, ObservedProjectUsage> = HashMap::new();
+    scan_observed_lane_dir(&observed_dir, project_filter, totals, files, &mut usage);
+    let mut out: Vec<ObservedProjectUsage> = usage.into_values().collect();
+    out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then(a.project_id.cmp(&b.project_id)));
+    out
+}
+
+fn scan_observed_lane_dir(
+    dir: &Path,
+    project_filter: Option<&str>,
+    totals: &mut StorageHealthTotals,
+    files: &mut Vec<StorageFileInfo>,
+    usage: &mut HashMap<String, ObservedProjectUsage>,
+) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_observed_lane_dir(&path, project_filter, totals, files, usage);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Some(project_id) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        if !project_filter_matches(Some(&project_id), project_filter) {
+            continue;
+        }
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
+        let bytes = meta.len();
+        let path_str = path.display().to_string();
+        totals.accumulate(FileKind::Observed, bytes);
+        files.push(StorageFileInfo {
+            path: path_str.clone(),
+            kind: FileKind::Observed,
+            project_id: Some(project_id.clone()),
+            bytes,
+            reason: Some("observed history lane; retained by keep/no-cap policy".into()),
+        });
+        usage
+            .entry(project_id.clone())
+            .and_modify(|u| u.bytes += bytes)
+            .or_insert(ObservedProjectUsage {
+                project_id,
+                path: path_str,
+                bytes,
+            });
+    }
+}
+
 fn extract_project_from_workspace_path(path: &Path) -> Option<String> {
     let mut components = path.components().rev();
     let _filename = components.next()?;
-    let _snapshots = components.next()?;
+    let _snapshot_id = components.next()?;
+    let snapshots = components.next()?;
+    if snapshots.as_os_str() != "snapshots" {
+        return None;
+    }
     let project = components.next()?;
     let workspace = components.next()?;
     if workspace.as_os_str() == "workspace" {
@@ -676,12 +858,107 @@ pub struct GcParams {
     pub keep_newest_backup_per_source: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GcPolicy {
+    pub materialized_snapshots: SnapshotRetentionPolicy,
+    pub backups: BackupRetentionPolicy,
+    pub orphans: OrphanRetentionPolicy,
+    pub observed: ObservedRetentionPolicy,
+}
+
+impl Default for GcPolicy {
+    fn default() -> Self {
+        Self {
+            materialized_snapshots: SnapshotRetentionPolicy::default(),
+            backups: BackupRetentionPolicy::default(),
+            orphans: OrphanRetentionPolicy::default(),
+            observed: ObservedRetentionPolicy::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotRetentionPolicy {
+    pub keep_active: bool,
+    pub keep_recent_per_workspace: u64,
+    pub keep_recent_per_repo: u64,
+    pub branch_switch_grace_minutes: u64,
+    pub max_age_days: Option<u64>,
+}
+
+impl Default for SnapshotRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            keep_active: true,
+            keep_recent_per_workspace: 3,
+            keep_recent_per_repo: 10,
+            branch_switch_grace_minutes: 60,
+            max_age_days: Some(14),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupRetentionPolicy {
+    pub max_total_bytes: Option<u64>,
+}
+
+impl Default for BackupRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_total_bytes: Some(2 * 1024 * 1024 * 1024),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrphanRetentionPolicy {
+    pub auto_prune_after_days: u64,
+    pub prune_explicitly_unregistered: bool,
+}
+
+impl Default for OrphanRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            auto_prune_after_days: 30,
+            prune_explicitly_unregistered: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ObservedRetentionPolicy {
+    pub max_bytes_per_project: Option<u64>,
+}
+
+impl Default for ObservedRetentionPolicy {
+    fn default() -> Self {
+        Self {
+            max_bytes_per_project: None,
+        }
+    }
+}
+
 const TEMP_GRACE_SECS: u64 = 24 * 3600;
 
 pub fn plan_gc(
     edges_dir: &Path,
     registered_project_ids: &HashSet<String>,
     params: &GcParams,
+) -> Result<Vec<GcCandidate>> {
+    plan_gc_with_policy(
+        edges_dir,
+        registered_project_ids,
+        params,
+        &GcPolicy::default(),
+    )
+}
+
+pub fn plan_gc_with_policy(
+    edges_dir: &Path,
+    registered_project_ids: &HashSet<String>,
+    params: &GcParams,
+    policy: &GcPolicy,
 ) -> Result<Vec<GcCandidate>> {
     let report = scan_storage_health(
         edges_dir,
@@ -725,48 +1002,88 @@ pub fn plan_gc(
     }
 
     if params.prune_backups {
-        let mut backups_by_source: std::collections::HashMap<String, Vec<&StorageFileInfo>> =
-            std::collections::HashMap::new();
-        for f in &report.files {
-            if f.kind != FileKind::Backup {
-                continue;
-            }
-            let source_key = f
-                .project_id
-                .clone()
-                .unwrap_or_else(|| path_source_key(&f.path));
-            backups_by_source.entry(source_key).or_default().push(f);
+        plan_backup_gc(&report.files, params, &policy.backups, &mut candidates);
+    }
+
+    if params.prune_orphans {
+        let before = candidates.len();
+        plan_orphan_gc(&report.files, &policy.orphans, &mut candidates);
+        if candidates.len() == before {
+            candidates.push(GcCandidate {
+                path: String::new(),
+                kind: FileKind::OrphanLegacyUnknown,
+                bytes: 0,
+                project_id: None,
+                rule: "orphan_none_found".to_string(),
+                deletable: false,
+            });
         }
+    }
 
-        for (source, mut backups) in backups_by_source {
-            backups.sort_by(|a, b| backup_recency_key(a).cmp(&backup_recency_key(b)));
-            let keep = params.keep_newest_backup_per_source as usize;
-            for (i, f) in backups.iter().enumerate() {
-                let is_retained = i < keep;
+    if params.prune_inactive_snapshots {
+        let project_facts = collect_project_storage_facts(edges_dir);
+        plan_snapshot_gc(
+            &report.files,
+            &project_facts,
+            &policy.materialized_snapshots,
+            &mut candidates,
+        );
+    }
 
-                if is_retained {
-                    candidates.push(GcCandidate {
-                        path: f.path.clone(),
-                        kind: f.kind,
-                        bytes: f.bytes,
-                        project_id: f.project_id.clone(),
-                        rule: format!("backup_retained(#{},source={})", i + 1, source),
-                        deletable: false,
-                    });
-                    continue;
-                }
+    plan_observed_gc(&report.observed, &policy.observed, &mut candidates);
 
-                let age_note = if let Some(max_days) = params.max_backup_age_days {
-                    let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
-                    if age_secs > max_days * 86400 {
-                        format!("+past_max_age({}d)", max_days)
-                    } else {
-                        String::new()
-                    }
+    candidates.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.path.cmp(&b.path)));
+    Ok(candidates)
+}
+
+fn plan_backup_gc(
+    files: &[StorageFileInfo],
+    params: &GcParams,
+    policy: &BackupRetentionPolicy,
+    candidates: &mut Vec<GcCandidate>,
+) {
+    let mut backups_by_source: HashMap<String, Vec<&StorageFileInfo>> = HashMap::new();
+    for f in files {
+        if f.kind != FileKind::Backup {
+            continue;
+        }
+        let source_key = f
+            .project_id
+            .clone()
+            .unwrap_or_else(|| path_source_key(&f.path));
+        backups_by_source.entry(source_key).or_default().push(f);
+    }
+
+    let mut retained_backup_bytes = 0u64;
+    let mut prunable_backup_refs: Vec<&StorageFileInfo> = Vec::new();
+    for (source, mut backups) in backups_by_source {
+        backups.sort_by(|a, b| backup_recency_key(a).cmp(&backup_recency_key(b)));
+        let keep = params.keep_newest_backup_per_source as usize;
+        for (i, f) in backups.iter().enumerate() {
+            let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
+            let past_max_age = params
+                .max_backup_age_days
+                .is_some_and(|max_days| age_secs > max_days * 86400);
+            if i < keep {
+                retained_backup_bytes += f.bytes;
+                candidates.push(GcCandidate {
+                    path: f.path.clone(),
+                    kind: f.kind,
+                    bytes: f.bytes,
+                    project_id: f.project_id.clone(),
+                    rule: format!("backup_retained(#{},source={})", i + 1, source),
+                    deletable: false,
+                });
+            } else {
+                prunable_backup_refs.push(f);
+                let age_note = if past_max_age {
+                    format!(
+                        "+past_max_age({}d)",
+                        params.max_backup_age_days.unwrap_or_default()
+                    )
                 } else {
                     String::new()
                 };
-
                 candidates.push(GcCandidate {
                     path: f.path.clone(),
                     kind: f.kind,
@@ -785,51 +1102,251 @@ pub fn plan_gc(
         }
     }
 
-    if params.prune_orphans {
-        let mut found = false;
-        for f in &report.files {
-            if f.kind == FileKind::Orphan {
-                found = true;
-                candidates.push(GcCandidate {
-                    path: f.path.clone(),
-                    kind: f.kind,
-                    bytes: f.bytes,
-                    project_id: f.project_id.clone(),
-                    rule: "orphan_phase1_report_only".to_string(),
-                    deletable: false,
-                });
-            }
-        }
-        if !found {
+    if let Some(max_total) = policy.max_total_bytes {
+        let total_backup_bytes =
+            retained_backup_bytes + prunable_backup_refs.iter().map(|f| f.bytes).sum::<u64>();
+        if total_backup_bytes > max_total && retained_backup_bytes > max_total {
             candidates.push(GcCandidate {
                 path: String::new(),
-                kind: FileKind::Orphan,
-                bytes: 0,
+                kind: FileKind::Backup,
+                bytes: retained_backup_bytes - max_total,
                 project_id: None,
-                rule: "orphan_none_found".to_string(),
+                rule: format!(
+                    "backup_total_cap_exceeded_by_retained_newest(max_total_bytes={max_total})"
+                ),
                 deletable: false,
             });
         }
     }
+}
 
-    if params.prune_inactive_snapshots {
-        for f in &report.files {
-            if f.kind != FileKind::InactiveSnapshot {
-                continue;
-            }
+fn plan_orphan_gc(
+    files: &[StorageFileInfo],
+    policy: &OrphanRetentionPolicy,
+    candidates: &mut Vec<GcCandidate>,
+) {
+    let grace_secs = policy.auto_prune_after_days * 86400;
+    for f in files {
+        let is_auto_class = matches!(
+            f.kind,
+            FileKind::OrphanDanglingPath | FileKind::OrphanLegacyUnknown
+        );
+        let is_explicit = f.kind == FileKind::OrphanExplicitlyUnregistered;
+        if !is_auto_class && !is_explicit && f.kind != FileKind::Orphan {
+            continue;
+        }
+
+        let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
+        let deletable = if is_explicit {
+            policy.prune_explicitly_unregistered && age_secs >= grace_secs
+        } else {
+            age_secs >= grace_secs
+        };
+        let rule = if is_explicit && !policy.prune_explicitly_unregistered {
+            "orphan_explicitly_unregistered_operator_decision".to_string()
+        } else if age_secs < grace_secs {
+            format!(
+                "orphan_within_grace(class={:?},age={}s,need={}s)",
+                f.kind, age_secs, grace_secs
+            )
+        } else {
+            format!(
+                "orphan_auto_prune(class={:?},after_days={})",
+                f.kind, policy.auto_prune_after_days
+            )
+        };
+        candidates.push(GcCandidate {
+            path: f.path.clone(),
+            kind: f.kind,
+            bytes: f.bytes,
+            project_id: f.project_id.clone(),
+            rule,
+            deletable,
+        });
+    }
+}
+
+#[derive(Debug)]
+struct SnapshotFileRef<'a> {
+    file: &'a StorageFileInfo,
+    snapshot_dir: String,
+    project_id: String,
+    repo_id: String,
+    age_secs: u64,
+}
+
+fn plan_snapshot_gc(
+    files: &[StorageFileInfo],
+    project_facts: &ProjectStorageFacts,
+    policy: &SnapshotRetentionPolicy,
+    candidates: &mut Vec<GcCandidate>,
+) {
+    let mut snapshots: Vec<SnapshotFileRef<'_>> = Vec::new();
+    for file in files {
+        if file.kind != FileKind::InactiveSnapshot {
+            continue;
+        }
+        let Some((project_id, snapshot_dir)) = inactive_snapshot_key(&file.path) else {
+            continue;
+        };
+        let repo_id = project_facts
+            .repo_by_project
+            .get(&project_id)
+            .cloned()
+            .unwrap_or_else(|| project_id.clone());
+        snapshots.push(SnapshotFileRef {
+            file,
+            snapshot_dir,
+            project_id,
+            repo_id,
+            age_secs: file_age_secs(Path::new(&file.path)).unwrap_or(0),
+        });
+    }
+
+    let retain_by_workspace = retained_snapshot_dirs(
+        snapshots
+            .iter()
+            .map(|s| (&s.snapshot_dir, &s.project_id, s.age_secs)),
+        policy.keep_recent_per_workspace,
+    );
+    let retain_by_repo = retained_snapshot_dirs(
+        snapshots
+            .iter()
+            .map(|s| (&s.snapshot_dir, &s.repo_id, s.age_secs)),
+        policy.keep_recent_per_repo,
+    );
+    let grace_secs = policy.branch_switch_grace_minutes * 60;
+
+    for snapshot in snapshots {
+        let retained_reason = if policy.keep_active { None } else { None }
+            .or_else(|| {
+                retain_by_workspace
+                    .contains(&snapshot.snapshot_dir)
+                    .then(|| "snapshot_retained_recent_workspace".to_string())
+            })
+            .or_else(|| {
+                retain_by_repo
+                    .contains(&snapshot.snapshot_dir)
+                    .then(|| "snapshot_retained_recent_repo".to_string())
+            })
+            .or_else(|| {
+                (snapshot.age_secs < grace_secs).then(|| {
+                    format!(
+                        "snapshot_retained_branch_switch_grace(age={}s,need={}s)",
+                        snapshot.age_secs, grace_secs
+                    )
+                })
+            })
+            .or_else(|| {
+                policy.max_age_days.and_then(|max_days| {
+                    (snapshot.age_secs < max_days * 86400).then(|| {
+                        format!(
+                            "snapshot_retained_under_max_age(age={}s,max_days={})",
+                            snapshot.age_secs, max_days
+                        )
+                    })
+                })
+            });
+
+        if let Some(rule) = retained_reason {
             candidates.push(GcCandidate {
-                path: f.path.clone(),
-                kind: f.kind,
-                bytes: f.bytes,
-                project_id: f.project_id.clone(),
-                rule: "inactive_snapshot".to_string(),
+                path: snapshot.file.path.clone(),
+                kind: snapshot.file.kind,
+                bytes: snapshot.file.bytes,
+                project_id: snapshot.file.project_id.clone(),
+                rule,
+                deletable: false,
+            });
+        } else {
+            candidates.push(GcCandidate {
+                path: snapshot.file.path.clone(),
+                kind: snapshot.file.kind,
+                bytes: snapshot.file.bytes,
+                project_id: snapshot.file.project_id.clone(),
+                rule: format!(
+                    "snapshot_prunable(max_age_days={:?},keep_recent_per_workspace={},keep_recent_per_repo={})",
+                    policy.max_age_days,
+                    policy.keep_recent_per_workspace,
+                    policy.keep_recent_per_repo
+                ),
                 deletable: true,
             });
         }
     }
+}
 
-    candidates.sort_by(|a, b| a.rule.cmp(&b.rule).then(a.path.cmp(&b.path)));
-    Ok(candidates)
+fn retained_snapshot_dirs<'a>(
+    items: impl Iterator<Item = (&'a String, &'a String, u64)>,
+    keep: u64,
+) -> HashSet<String> {
+    if keep == 0 {
+        return HashSet::new();
+    }
+    let mut by_bucket: HashMap<String, Vec<(String, u64)>> = HashMap::new();
+    for (snapshot_dir, bucket, age_secs) in items {
+        by_bucket
+            .entry(bucket.clone())
+            .or_default()
+            .push((snapshot_dir.clone(), age_secs));
+    }
+    let mut retained = HashSet::new();
+    for (_bucket, mut dirs) in by_bucket {
+        dirs.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+        for (snapshot_dir, _) in dirs.into_iter().take(keep as usize) {
+            retained.insert(snapshot_dir);
+        }
+    }
+    retained
+}
+
+fn inactive_snapshot_key(path: &str) -> Option<(String, String)> {
+    let path = Path::new(path);
+    let mut components = path.components().rev();
+    let _filename = components.next()?;
+    let snapshot_id = components.next()?;
+    let snapshots = components.next()?;
+    if snapshots.as_os_str() != "snapshots" {
+        return None;
+    }
+    let project = components.next()?;
+    let workspace = components.next()?;
+    if workspace.as_os_str() != "workspace" {
+        return None;
+    }
+    let project_id = project.as_os_str().to_str()?.to_string();
+    let snapshot_dir = path
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| snapshot_id.as_os_str().to_string_lossy().into_owned());
+    Some((project_id, snapshot_dir))
+}
+
+fn plan_observed_gc(
+    observed: &[ObservedProjectUsage],
+    policy: &ObservedRetentionPolicy,
+    candidates: &mut Vec<GcCandidate>,
+) {
+    for usage in observed {
+        match policy.max_bytes_per_project {
+            Some(max) if usage.bytes > max => candidates.push(GcCandidate {
+                path: usage.path.clone(),
+                kind: FileKind::Observed,
+                bytes: usage.bytes - max,
+                project_id: Some(usage.project_id.clone()),
+                rule: format!("observed_over_cap_operator_review(max_bytes_per_project={max})"),
+                deletable: false,
+            }),
+            None if usage.bytes > 0 => candidates.push(GcCandidate {
+                path: usage.path.clone(),
+                kind: FileKind::Observed,
+                bytes: usage.bytes,
+                project_id: Some(usage.project_id.clone()),
+                rule: "observed_keep_no_cap".to_string(),
+                deletable: false,
+            }),
+            _ => {}
+        }
+    }
 }
 
 pub fn apply_gc(candidates: &[GcCandidate]) -> (Vec<String>, Vec<String>) {
@@ -891,6 +1408,70 @@ mod tests {
         fs::write(dir.join(name), content).unwrap();
     }
 
+    fn set_mtime_days_old(path: &Path, days: i64) {
+        filetime::set_file_mtime(
+            path,
+            filetime::FileTime::from_unix_time(1_700_000_000 - days * 86_400, 0),
+        )
+        .unwrap();
+    }
+
+    fn write_snapshot_jsonl(edges_dir: &Path, project_id: &str, snapshot_id: &str) -> PathBuf {
+        let path = crate::manifest::materialized_dir(edges_dir)
+            .join("workspace")
+            .join(project_id)
+            .join("snapshots")
+            .join(snapshot_id)
+            .join("project.jsonl");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"{\"edge\":1}\n").unwrap();
+        path
+    }
+
+    fn write_workspace_manifest(
+        edges_dir: &Path,
+        project_id: &str,
+        repo_id: Option<&str>,
+        canonical_path: Option<&Path>,
+        active_snapshot_id: &str,
+    ) {
+        crate::manifest::WorkspaceManifest::write_to(
+            edges_dir,
+            &crate::manifest::WorkspaceManifest {
+                version: 1,
+                project_id: project_id.to_string(),
+                repo_id: repo_id.map(str::to_string),
+                canonical_path: canonical_path.map(|p| p.display().to_string()),
+                git_common_dir: None,
+                git_worktree_dir: None,
+                branch: Some("main".into()),
+                head_sha: Some(active_snapshot_id.into()),
+                dirty: false,
+                dirty_fingerprint: None,
+                active_snapshot_id: Some(active_snapshot_id.into()),
+                active_dirty_overlay_id: None,
+                updated_at: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn write_manifest_index(edges_dir: &Path, project_id: &str, active_snapshot_id: &str) {
+        let mut idx = crate::manifest::ManifestIndex::new();
+        idx.upsert_workspace(
+            project_id,
+            crate::manifest::WorkspaceIndexEntry {
+                manifest: format!("workspace/{project_id}/manifest.json"),
+                active_snapshot: Some(format!(
+                    "workspace/{project_id}/snapshots/{active_snapshot_id}"
+                )),
+                dirty_overlay: None,
+                repo_materialization: None,
+            },
+        );
+        idx.write_atomic(edges_dir).unwrap();
+    }
+
     #[test]
     fn classifies_active_legacy_sidecar() {
         let dir = setup_edges_dir();
@@ -922,10 +1503,10 @@ mod tests {
         let report = scan_storage_health(&edges_dir, &registered, None, true).unwrap();
         assert_eq!(report.totals.orphan_files, 1);
         assert_eq!(report.totals.orphan_bytes, content.len() as u64);
-        assert_eq!(report.files[0].kind, FileKind::Orphan);
+        assert_eq!(report.files[0].kind, FileKind::OrphanLegacyUnknown);
         assert_eq!(
             report.files[0].reason.as_deref(),
-            Some("unregistered project sidecar")
+            Some("legacy_unknown project sidecar")
         );
     }
 
@@ -998,13 +1579,13 @@ mod tests {
         let registered = HashSet::new();
         let report = scan_storage_health(&edges_dir, &registered, None, true).unwrap();
         assert_eq!(report.totals.orphan_files, 1);
-        assert_eq!(report.files[0].kind, FileKind::Orphan);
+        assert_eq!(report.files[0].kind, FileKind::OrphanLegacyUnknown);
         assert!(
             report.files[0]
                 .reason
                 .as_ref()
                 .unwrap()
-                .contains("unregistered managed derived")
+                .contains("legacy_unknown")
         );
     }
 
@@ -1438,8 +2019,10 @@ mod tests {
         )
         .unwrap();
         assert!(
-            candidates_report.iter().any(|c| c.rule.contains("phase1")),
-            "orphans must be reported with Phase 1 limitation"
+            candidates_report
+                .iter()
+                .any(|c| c.rule.contains("orphan_within_grace")),
+            "recent legacy_unknown orphans must be reported but retained within grace"
         );
 
         let (deleted, _) = apply_gc(&candidates_report);
@@ -1448,5 +2031,223 @@ mod tests {
             edges_dir.join("orphan99.jsonl").exists(),
             "orphan file must survive apply"
         );
+    }
+
+    #[test]
+    fn observed_history_is_reported_per_project_and_cap_warns_without_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        let observed_dir = edges_dir.join("observed");
+        fs::create_dir_all(&observed_dir).unwrap();
+        write_file(&observed_dir, "proj1234.jsonl", b"observed history\n");
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+
+        let report = scan_storage_health(&edges_dir, &registered, None, true).unwrap();
+        assert_eq!(report.totals.observed_files, 1);
+        assert_eq!(report.observed.len(), 1);
+        assert_eq!(report.observed[0].project_id, "proj1234");
+        assert!(report.observed_policy_warning.is_some());
+
+        let candidates = plan_gc_with_policy(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &GcPolicy {
+                observed: ObservedRetentionPolicy {
+                    max_bytes_per_project: Some(4),
+                },
+                ..GcPolicy::default()
+            },
+        )
+        .unwrap();
+
+        let observed = candidates
+            .iter()
+            .find(|c| c.kind == FileKind::Observed)
+            .expect("observed over-cap candidate expected");
+        assert!(observed.rule.contains("observed_over_cap"));
+        assert!(!observed.deletable);
+    }
+
+    #[test]
+    fn inactive_snapshot_policy_retains_recent_and_prunes_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+
+        let active = write_snapshot_jsonl(&edges_dir, "p1", "head-active");
+        let recent = write_snapshot_jsonl(&edges_dir, "p1", "head-recent");
+        let old = write_snapshot_jsonl(&edges_dir, "p1", "head-old");
+        set_mtime_days_old(&active, 0);
+        set_mtime_days_old(&recent, 1);
+        set_mtime_days_old(&old, 10);
+        write_workspace_manifest(
+            &edges_dir,
+            "p1",
+            Some("repo1"),
+            Some(dir.path()),
+            "head-active",
+        );
+        write_manifest_index(&edges_dir, "p1", "head-active");
+
+        let registered: HashSet<String> = ["p1".to_string()].into_iter().collect();
+        let candidates = plan_gc_with_policy(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: true,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &GcPolicy {
+                materialized_snapshots: SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: 1,
+                    keep_recent_per_repo: 0,
+                    branch_switch_grace_minutes: 0,
+                    max_age_days: Some(0),
+                },
+                ..GcPolicy::default()
+            },
+        )
+        .unwrap();
+
+        assert!(
+            !candidates.iter().any(|c| c.path.contains("head-active")),
+            "active snapshot path must not become a candidate"
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.path.contains("head-recent") && !c.deletable)
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.path.contains("head-old") && c.deletable)
+        );
+    }
+
+    #[test]
+    fn orphan_classes_have_separate_delete_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        write_file(&edges_dir, "legacy_unknown.jsonl", b"legacy\n");
+        let legacy_path = edges_dir.join("legacy_unknown.jsonl");
+        set_mtime_days_old(&legacy_path, 40);
+
+        let missing_path = dir.path().join("missing-project");
+        write_workspace_manifest(
+            &edges_dir,
+            "dangling",
+            Some("repo1"),
+            Some(&missing_path),
+            "head-active",
+        );
+        write_file(&edges_dir, "dangling.jsonl", b"dangling\n");
+        let dangling_path = edges_dir.join("dangling.jsonl");
+        set_mtime_days_old(&dangling_path, 40);
+
+        let existing_path = dir.path().join("existing-project");
+        fs::create_dir_all(&existing_path).unwrap();
+        write_workspace_manifest(
+            &edges_dir,
+            "explicit",
+            Some("repo1"),
+            Some(&existing_path),
+            "head-active",
+        );
+        write_file(&edges_dir, "explicit.jsonl", b"explicit\n");
+        let explicit_path = edges_dir.join("explicit.jsonl");
+        set_mtime_days_old(&explicit_path, 40);
+
+        let registered = HashSet::new();
+        let candidates = plan_gc(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: false,
+                prune_orphans: true,
+                prune_temps: false,
+                prune_inactive_snapshots: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            candidates
+                .iter()
+                .any(|c| { c.kind == FileKind::OrphanLegacyUnknown && c.deletable })
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| { c.kind == FileKind::OrphanDanglingPath && c.deletable })
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| { c.kind == FileKind::OrphanExplicitlyUnregistered && !c.deletable })
+        );
+    }
+
+    #[test]
+    fn backup_total_cap_reports_retained_newest_over_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path().join("edges");
+        fs::create_dir_all(&edges_dir).unwrap();
+        write_file(&edges_dir, "proj1234.jsonl.bak-1000", b"large backup\n");
+
+        let mut registered = HashSet::new();
+        registered.insert("proj1234".to_string());
+
+        let candidates = plan_gc_with_policy(
+            &edges_dir,
+            &registered,
+            &GcParams {
+                dry_run: true,
+                project_filter: None,
+                prune_backups: true,
+                prune_orphans: false,
+                prune_temps: false,
+                prune_inactive_snapshots: false,
+                max_backup_age_days: None,
+                keep_newest_backup_per_source: 1,
+            },
+            &GcPolicy {
+                backups: BackupRetentionPolicy {
+                    max_total_bytes: Some(1),
+                },
+                ..GcPolicy::default()
+            },
+        )
+        .unwrap();
+
+        assert!(candidates.iter().any(|c| {
+            c.kind == FileKind::Backup
+                && c.rule.contains("backup_total_cap_exceeded")
+                && !c.deletable
+        }));
     }
 }
