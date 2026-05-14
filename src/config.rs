@@ -171,7 +171,7 @@ fn default_index_reindex_interval_secs() -> u64 {
     120
 }
 fn default_index_edge_index_boot_rebuild() -> bool {
-    true
+    false
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -999,7 +999,7 @@ mod tests {
         assert_eq!(config.daemon.poller_min_interval_secs, 5);
 
         assert_eq!(config.index.reindex_interval_secs, 120);
-        assert!(config.index.edge_index_boot_rebuild);
+        assert!(!config.index.edge_index_boot_rebuild);
 
         assert_eq!(config.lsp.idle_timeout_secs, 600);
         assert_eq!(config.lsp.request_timeout_secs, 30);

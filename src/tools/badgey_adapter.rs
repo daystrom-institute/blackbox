@@ -7,7 +7,8 @@ pub(crate) struct BadgeyAgentAdapter {
 pub(crate) fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
     let mut thread_badgey_ids: HashMap<String, orchestration::badgey::types::BadgeyId> =
         HashMap::new();
-    for thread in state.threads.read().all() {
+    let threads = state.threads.read().all().to_vec();
+    for thread in threads {
         if let Some(name) = thread.name.as_deref() {
             if let Some(raw) = name.strip_prefix("badgey:") {
                 if let Ok(id) = raw.parse() {
@@ -29,7 +30,8 @@ pub(crate) fn restore_badgey_registry_from_notes(state: &Arc<SharedState>) {
     > = HashMap::new();
     let mut latest_dismissed: HashMap<orchestration::badgey::types::BadgeyId, String> =
         HashMap::new();
-    for note in state.notes.read().all() {
+    let notes = state.notes.read().all().to_vec();
+    for note in notes {
         let Some(thread_id) = note.thread_id.as_deref() else {
             continue;
         };
