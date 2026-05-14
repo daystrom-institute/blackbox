@@ -177,6 +177,12 @@ pub struct ThreadStore {
     pub threads: Vec<Thread>,
 }
 
+pub struct ThreadMutation {
+    pub message: String,
+    pub changed_thread: Option<Thread>,
+    pub changed_edges: bool,
+}
+
 impl ThreadStore {
     pub fn new() -> Self {
         Self {
@@ -270,8 +276,16 @@ impl Threads {
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
 
     pub fn thread(&mut self, p: &ThreadParams) -> Result<String> {
+        Ok(self.thread_mutation(p)?.message)
+    }
+
+    pub fn thread_mutation(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         if p.action == "get" {
-            return self.thread_get(p);
+            return Ok(ThreadMutation {
+                message: self.thread_get(p)?,
+                changed_thread: None,
+                changed_edges: false,
+            });
         }
         let path = self.store_path.clone();
         crate::json_store::with_store_lock(&path, || {
@@ -290,7 +304,7 @@ impl Threads {
         })
     }
 
-    fn thread_open(&mut self, p: &ThreadParams) -> Result<String> {
+    fn thread_open(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         let topic = p.topic.as_deref().context("'topic' is required")?;
         let project = p.project.as_deref().unwrap_or("");
 
@@ -338,11 +352,16 @@ impl Threads {
             resolved_at: None,
         };
 
+        let changed_edges = !thread.sessions.is_empty();
         self.store.threads.push(thread.clone());
         self.save()?;
         crate::embed_queue::enqueue_thread(&thread);
 
-        Ok(format!("Thread created: {} — \"{}\"", id, topic))
+        Ok(ThreadMutation {
+            message: format!("Thread created: {} — \"{}\"", id, topic),
+            changed_thread: Some(thread),
+            changed_edges,
+        })
     }
 
     fn thread_get(&self, p: &ThreadParams) -> Result<String> {
@@ -465,7 +484,7 @@ impl Threads {
         Ok(out)
     }
 
-    fn thread_link(&mut self, p: &ThreadParams) -> Result<String> {
+    fn thread_link(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
         let target = p
             .target
@@ -522,9 +541,11 @@ impl Threads {
         self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
-        Ok(format!(
-            "Thread {id} ({topic}) — added {kind_str} edge to {target}"
-        ))
+        Ok(ThreadMutation {
+            message: format!("Thread {id} ({topic}) — added {kind_str} edge to {target}"),
+            changed_thread: Some(thread_for_embed),
+            changed_edges: true,
+        })
     }
 
     /// Resolve a thread by `id` or `name` in the params. Accepts bare
@@ -560,7 +581,7 @@ impl Threads {
         anyhow::bail!("'id' or 'name' is required");
     }
 
-    fn thread_continue(&mut self, p: &ThreadParams) -> Result<String> {
+    fn thread_continue(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
 
         let thread = self
@@ -572,6 +593,7 @@ impl Threads {
 
         let now = Self::now_iso();
 
+        let mut changed_edges = false;
         if let Some(sid) = p.session_id.as_deref() {
             thread.sessions.push(SessionLink {
                 session_id: sid.to_string(),
@@ -579,6 +601,7 @@ impl Threads {
                 name: p.session_name.clone(),
                 linked_at: now.clone(),
             });
+            changed_edges = true;
         }
         if let Some(note) = p.note.as_deref() {
             thread.notes.push(note.to_string());
@@ -598,10 +621,14 @@ impl Threads {
         self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
-        Ok(format!("Thread {id} continued — \"{topic}\""))
+        Ok(ThreadMutation {
+            message: format!("Thread {id} continued — \"{topic}\""),
+            changed_thread: Some(thread_for_embed),
+            changed_edges,
+        })
     }
 
-    fn thread_resolve(&mut self, p: &ThreadParams) -> Result<String> {
+    fn thread_resolve(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
 
         let thread = self
@@ -626,10 +653,14 @@ impl Threads {
         self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
-        Ok(format!("Thread {id} resolved — \"{topic}\""))
+        Ok(ThreadMutation {
+            message: format!("Thread {id} resolved — \"{topic}\""),
+            changed_thread: Some(thread_for_embed),
+            changed_edges: false,
+        })
     }
 
-    fn thread_promote(&mut self, p: &ThreadParams) -> Result<String> {
+    fn thread_promote(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
         let promoted_to = p
             .promoted_to
@@ -659,12 +690,14 @@ impl Threads {
         self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
-        Ok(format!(
-            "Thread {id} promoted to {promoted_to} — \"{topic}\""
-        ))
+        Ok(ThreadMutation {
+            message: format!("Thread {id} promoted to {promoted_to} — \"{topic}\""),
+            changed_thread: Some(thread_for_embed),
+            changed_edges: false,
+        })
     }
 
-    fn thread_rename(&mut self, p: &ThreadParams) -> Result<String> {
+    fn thread_rename(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
         // For rename, 'id' is lookup and 'name' is the new name.
         let id = p.id.as_deref().context("'id' is required for rename")?;
         let new_name = p.name.as_deref().context("'name' is required for rename")?;
@@ -687,9 +720,11 @@ impl Threads {
         self.save()?;
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
-        Ok(format!(
-            "Thread {id} renamed to \"{new_name}\" (topic: {topic})"
-        ))
+        Ok(ThreadMutation {
+            message: format!("Thread {id} renamed to \"{new_name}\" (topic: {topic})"),
+            changed_thread: Some(thread_for_embed),
+            changed_edges: false,
+        })
     }
 
     // ── blackbox_thread_list (query) ───────────────────────────────

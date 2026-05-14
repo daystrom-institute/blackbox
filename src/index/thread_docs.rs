@@ -150,6 +150,22 @@ pub(crate) fn upsert_threads_store(
     Ok(())
 }
 
+pub(crate) fn upsert_thread(
+    index: &Index,
+    f: FieldHandles,
+    threads_path: &Path,
+    thread: &Thread,
+) -> Result<()> {
+    let mut writer = index.writer(50_000_000)?;
+    writer.delete_term(Term::from_field_text(
+        f.entity_id,
+        &thread_entity_id(&thread.id),
+    ));
+    writer.add_document(build_thread_doc(thread, threads_path, f))?;
+    writer.commit()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

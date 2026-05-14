@@ -13,19 +13,20 @@ impl BlackboxServer {
     )]
     pub(crate) fn bbox_thread(&self, Parameters(p): Parameters<ThreadParams>) -> CallToolResult {
         Self::run("bbox_thread", || {
-            let result = { self.state.threads.write().thread(&p) }?;
-            if p.action != "get" {
-                if let Err(err) = self
-                    .state
-                    .idx
-                    .write()
-                    .index_threads_store(&self.state.threads.read())
-                {
-                    tracing::warn!(error = %err, "thread index sync failed after bbox_thread mutation");
+            let mutation = { self.state.threads.write().thread_mutation(&p) }?;
+            if let Some(thread) = mutation.changed_thread.as_ref() {
+                if let Err(err) = self.state.idx.write().index_thread(thread) {
+                    tracing::warn!(
+                        thread_id = %thread.id,
+                        error = %err,
+                        "thread index sync failed after bbox_thread mutation"
+                    );
                 }
+            }
+            if mutation.changed_edges {
                 self.rebuild_edge_index_from_stores();
             }
-            Ok(result)
+            Ok(mutation.message)
         })
     }
 

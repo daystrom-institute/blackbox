@@ -319,6 +319,13 @@ impl TranscriptIndex {
         Ok(())
     }
 
+    pub(crate) fn index_thread(&mut self, thread: &crate::threads::Thread) -> Result<()> {
+        thread_docs::upsert_thread(&self.index, self.fields, &self.config.threads_path, thread)?;
+        self.reader.reload()?;
+        *self.stats_cache.lock() = None;
+        Ok(())
+    }
+
     pub fn is_empty(&self) -> bool {
         let searcher = self.reader.searcher();
         searcher.num_docs() == 0
