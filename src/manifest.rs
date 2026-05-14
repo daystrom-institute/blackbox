@@ -3,21 +3,18 @@
 // ---------------------------------------------------------------------------
 //
 // Observed retention gate (phase_3_policy_gate):
-//   DECISION: retain observed history indefinitely for now. Observed lanes
-//   (tool edges, provenance) are append-only and do not participate in
-//   snapshot/branch mechanics. Health warnings for excessive observed bytes
-//   per project should be added in a follow-up. Cap, archive, and prune
-//   options remain available for future policy without schema changes.
+//   DECISION: retain observed history indefinitely. Observed lanes (tool
+//   edges, provenance) are append-only and do not participate in
+//   snapshot/branch mechanics. Storage health reports observed bytes per
+//   project and warns when policy caps are exceeded; deletion is explicit.
 //
 // P1 observed backfill consideration:
 //   `bbox_project_register` post-step will retroactively walk transcripts
 //   and emit EDITED_FILE/READ_FILE/RAN_BASH edges for the newly registered
 //   project (see design/proposed/agentic-corpus-followups.md §P1). This
 //   will grow observed history for every project that gets registered after
-//   initial transcript indexing. Storage health must surface observed bytes
-//   per project before that lands so operators can see growth. The observed
-//   byte accounting in storage_health.rs (tool_bytes in StorageHealthTotals)
-//   is the foundation; per-project breakdown is a follow-up.
+//   initial transcript indexing. Storage health surfaces observed bytes per
+//   project so operators can see that growth.
 // ---------------------------------------------------------------------------
 
 use std::collections::HashSet;

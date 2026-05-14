@@ -248,6 +248,10 @@ pub fn rebuild(route: &str) -> Result<()> {
     global().rebuild(route)
 }
 
+pub fn compact_partitions(max_partitions: Option<usize>) -> Result<Vec<RouteCompactionStats>> {
+    global().compact_partitions(max_partitions)
+}
+
 pub fn metrics() -> BTreeMap<String, PartitionMetrics> {
     global().metrics()
 }

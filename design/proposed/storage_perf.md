@@ -182,10 +182,9 @@ Observed edges are useful for provenance and blame. They should be queryable as
 history, but not automatically folded into current schema counts unless the
 caller asks for historical mode.
 
-This does not require a new `EdgeProvenance` variant on day one. Current
-`Tool` provenance maps naturally into the observed lane. A future `Observed`
-variant may be useful if non-tool observations appear, but the lane is a
-storage/query lifecycle first, not an enum requirement.
+This does not require a new `EdgeProvenance` variant. Current `Tool`
+provenance maps naturally into the observed lane. The observed lane is the
+storage/query lifecycle for event-derived facts.
 
 ### Materialized Edges
 
@@ -228,8 +227,8 @@ snapshot_id repo/project/indexer/chunker/head identity
 Do not add a second `workspace_id` field that is merely an alias for
 `project_id`. That would make the data model look more precise without changing
 behavior. In this design, `project_id` remains the public compatibility id and
-is documented as "workspace id" semantically. A later breaking ref cleanup can
-rename it, but the migration should not carry two names for the same hash.
+is documented as "workspace id" semantically. Snapshot-specific precision is
+provided by the v2 ref types.
 
 Proposed fields:
 
@@ -282,21 +281,21 @@ The dirty fingerprint is an invalidation/check field for that overlay, not part
 of `snapshot_id`. The overlay is rewritten when dirty state changes and is
 dropped when the workspace returns to a clean `HEAD`.
 
-The dirty fingerprint can start coarse and improve over time:
+The dirty fingerprint uses a coarse-to-precise ladder:
 
 1. `git status --porcelain=v1 -z` hash plus tracked file mtimes/sizes;
-2. later, content hash for changed files only;
-3. later, full tree hash if needed.
+2. content hash for changed files only;
+3. full tree hash when the caller needs maximum precision.
 
 Querying an active dirty workspace reads the clean `HEAD` snapshot plus the
 dirty overlay, with overlay facts winning for files it covers. This avoids
 snapshot churn while still making dirty state visible.
 
-Overlay merge granularity is per file in v1. If a dirty overlay contains any
+Overlay merge granularity is per file. If a dirty overlay contains any
 materialized facts for a relative path, those facts replace the clean snapshot's
 workspace materialized facts for that path. Unchanged paths continue to read
-from the clean snapshot. Per-chunk merging is deliberately out of scope for v1;
-it is harder to reason about and risks mixing incompatible chunk boundaries.
+from the clean snapshot. Per-file replacement is the supported merge unit
+because chunk boundaries can change between clean and dirty states.
 
 ## Query Semantics
 
@@ -441,7 +440,7 @@ fingerprint changed:
 5. if the worktree is clean, remove any stale dirty overlay for the workspace;
 6. atomically update the workspace manifest's `active_snapshot_id`, dirty flag,
    and overlay metadata;
-7. schedule deferred GC for inactive snapshots.
+7. schedule retention-policy GC for inactive snapshots.
 
 No legacy append sidecar should be touched for derived current-state edges.
 
@@ -535,17 +534,17 @@ That is the model users expect.
 
 ### Phase 5: Tighten Entity Refs
 
-Optional later change:
+Snapshot-specific refs are implemented as explicit v2 types:
 
 ```text
 project_file_v2:<project_id>:<snapshot_id>:<rel_path_hash>:<chunk_hash>:<idx>
 symbol_v2:<project_id>:<snapshot_id>:<qualified_name>:<defn_hash>
 ```
 
-This is not required for the first migration. It is a correctness upgrade once
-snapshot storage exists. The explicit `_v2` type is noisier than overloading
-segment counts, but safer for stored knowledge, notes, git notes, and
-transcripts that already contain old refs.
+New project indexing emits these refs when `BBOX_PROJECT_REFS_V2=1`. Old refs
+continue to parse and resolve through the active snapshot. The explicit `_v2`
+type is noisier than overloading segment counts, but safer for stored
+knowledge, notes, git notes, and transcripts that already contain old refs.
 
 ## Compatibility
 
@@ -591,16 +590,18 @@ The final system should maintain these invariants:
    per save.
 10. Startup loads active manifests, not every cached snapshot.
 
-## Open Questions
+## Resolved Policy
 
-- Should commit docs be global per `repo_id` rather than duplicated through
-  project indexing?
-- Should explicit project edges be stored by `project_id` or `repo_id` by
-  default?
-- Do we need a "pin this snapshot" operation for long-running investigations?
-- Should backups be compressed immediately, or is bounded retention enough?
-- Should observed event history eventually get byte caps, or should it be
-  retained indefinitely because it is the provenance substrate?
+- Commit docs are shared by `repo_id` when repo materialization exists; current
+  workspace chunk-to-commit facts remain workspace-scoped.
+- Explicit project edges are stored by `project_id`; repo-derived facts use
+  `repo_id` materialization only where the fact is truly workspace-independent.
+- Snapshot retention is policy-driven GC, with active snapshots and dirty
+  overlays protected. Long-running investigations should use retained snapshot
+  ids in v2 refs rather than mutating the active workspace.
+- Backups use bounded retention rather than mandatory compression.
+- Observed event history is retained as provenance substrate. Storage health
+  reports observed bytes so operators can see growth.
 
 ## Recommendation
 

@@ -6,6 +6,7 @@
     "vector_status": { "kind": "object" },
     "search_quiesced": { "kind": "bool" },
     "rebuild_started": { "kind": "bool" },
+    "compaction_result": { "kind": "object" },
     "swapped": { "kind": "bool" },
     "notified": { "kind": "bool" }
   },
@@ -52,8 +53,9 @@
       "actor": "",
       "on_enter": [
         {
-          "op": "rebuild_hnsw",
-          "args": { "route": "${vars.vector_status.max_deleted_route}" }
+          "op": "compact_vector_partitions",
+          "into_var": "compaction_result",
+          "args": {}
         },
         {
           "op": "set_var",

@@ -4,12 +4,12 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
-    truncate_label,
+    NextHop, ProviderContext, empty_neighborhood_view, expected, next_hops, schema, truncate_label,
 };
 use crate::entity_ref::{EntityRef, EntityType};
 
 pub struct SymbolProvider;
+pub struct SymbolV2Provider;
 
 impl InspectableEntityProvider for SymbolProvider {
     fn entity_type(&self) -> EntityType {
@@ -21,28 +21,7 @@ impl InspectableEntityProvider for SymbolProvider {
     }
 
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
-        ensure_type(r, self.entity_type())?;
-        let EntityRef::Symbol {
-            project_id,
-            qualified_name,
-            defn_hash,
-        } = r
-        else {
-            unreachable!();
-        };
-        let mut properties = BTreeMap::new();
-        properties.insert("project_id".into(), project_id.clone());
-        properties.insert("qualified_name".into(), qualified_name.clone());
-        properties.insert("defn_hash".into(), defn_hash.clone());
-        if let Some(state) = ctx.state() {
-            let indexed = state
-                .idx
-                .read()
-                .entity_properties(&r.to_string())?
-                .ok_or_else(|| anyhow::anyhow!("symbol entity {r} not found"))?;
-            properties.extend(indexed);
-        }
-        Ok(empty_neighborhood_view(r, properties))
+        symbol_entity(ctx, r)
     }
 
     fn schema(&self) -> EntitySchemaView {
@@ -85,9 +64,86 @@ impl InspectableEntityProvider for SymbolProvider {
     }
 
     fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
-        let EntityRef::Symbol { qualified_name, .. } = r else {
-            return None;
-        };
+        let (_, _, qualified_name, _) = symbol_parts(r)?;
         Some(truncate_label(qualified_name))
     }
+}
+
+impl InspectableEntityProvider for SymbolV2Provider {
+    fn entity_type(&self) -> EntityType {
+        EntityType::SymbolV2
+    }
+
+    fn owns_ref(&self, r: &EntityRef) -> bool {
+        matches!(r, EntityRef::SymbolV2 { .. })
+    }
+
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
+        symbol_entity(ctx, r)
+    }
+
+    fn schema(&self) -> EntitySchemaView {
+        let mut view = SymbolProvider.schema();
+        view.entity_type = EntityType::SymbolV2;
+        view.properties.insert(1, "snapshot_id".into());
+        view.filterable_fields.insert(1, "snapshot_id".into());
+        view
+    }
+
+    fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
+        SymbolProvider.expected_edge_families(r)
+    }
+
+    fn recommended_next_hops(
+        &self,
+        entity: &EntityView,
+        full_neighborhood: &Neighborhood,
+    ) -> Vec<NextHop> {
+        SymbolProvider.recommended_next_hops(entity, full_neighborhood)
+    }
+
+    fn compact_label(&self, _ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
+        let (_, snapshot_id, qualified_name, _) = symbol_parts(r)?;
+        let suffix = snapshot_id.map(|id| format!("@{id}")).unwrap_or_default();
+        Some(truncate_label(format!("{qualified_name}{suffix}")))
+    }
+}
+
+fn symbol_parts(r: &EntityRef) -> Option<(&str, Option<&str>, &str, &str)> {
+    match r {
+        EntityRef::Symbol {
+            project_id,
+            qualified_name,
+            defn_hash,
+        } => Some((project_id, None, qualified_name, defn_hash)),
+        EntityRef::SymbolV2 {
+            project_id,
+            snapshot_id,
+            qualified_name,
+            defn_hash,
+        } => Some((project_id, Some(snapshot_id), qualified_name, defn_hash)),
+        _ => None,
+    }
+}
+
+fn symbol_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
+    let Some((project_id, snapshot_id, qualified_name, defn_hash)) = symbol_parts(r) else {
+        unreachable!();
+    };
+    let mut properties = BTreeMap::new();
+    properties.insert("project_id".into(), project_id.to_string());
+    if let Some(snapshot_id) = snapshot_id {
+        properties.insert("snapshot_id".into(), snapshot_id.to_string());
+    }
+    properties.insert("qualified_name".into(), qualified_name.to_string());
+    properties.insert("defn_hash".into(), defn_hash.to_string());
+    if let Some(state) = ctx.state() {
+        let indexed = state
+            .idx
+            .read()
+            .entity_properties(&r.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("symbol entity {r} not found"))?;
+        properties.extend(indexed);
+    }
+    Ok(empty_neighborhood_view(r, properties))
 }

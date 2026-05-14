@@ -1014,14 +1014,21 @@ fn chunk_from_embedding_doc(doc: &EmbeddingSourceDoc) -> Option<Chunk> {
         .entity_id
         .as_deref()
         .and_then(|id| EntityRef::parse(id).ok())?;
-    let EntityRef::ProjectFile {
-        project_id,
-        rel_path_hash,
-        chunk_hash,
-        occurrence_idx,
-    } = entity
-    else {
-        return None;
+    let (project_id, rel_path_hash, chunk_hash, occurrence_idx) = match entity {
+        EntityRef::ProjectFile {
+            project_id,
+            rel_path_hash,
+            chunk_hash,
+            occurrence_idx,
+        }
+        | EntityRef::ProjectFileV2 {
+            project_id,
+            rel_path_hash,
+            chunk_hash,
+            occurrence_idx,
+            ..
+        } => (project_id, rel_path_hash, chunk_hash, occurrence_idx),
+        _ => return None,
     };
     let byte_end = doc.byte_offset.saturating_add(doc.content.len() as u64);
     Some(Chunk {

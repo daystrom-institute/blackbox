@@ -1,125 +1,36 @@
 # Agentic Corpus — Shipped-Phase Follow-ups
 
-Status: proposed (deferred items captured by release-notes for shipped phases).
-Related: `design/archive/agentic-corpus-release-notes.md` (source of every
-item below — see archived per-phase section for original context).
+Status: implemented.
+Related: `design/archive/agentic-corpus-release-notes.md` (original source of
+the shipped-phase caveats).
 
-## Thesis
+## Resolution Summary
 
-The 38 substantive phases of `agentic-corpus-impl` landed. Several
-release notes carry explicit deferrals — caveats that were acceptable
-at v1 ship but warrant their own design rounds before being treated as
-done. This doc consolidates them.
+The follow-ups consolidated here are closed in the storage-performance branch.
+They are no longer backlog items:
 
-Each item is bounded: it doesn't justify a fresh skeleton, but it does
-need a thought-out follow-up before it can be marked closed.
+| Item | Resolution |
+|---|---|
+| F3 — schema migration workflow ops | `schema_migration_drop` and `schema_migration_rebuild` are real hook ops in `src/workflow/ops.rs`, and `schema-migration-arc.json` invokes them. |
+| H3 — eval gate consumes shell output | `shell` hooks can capture stdout/exit data into workflow vars, `score_eval_output` turns harness output into a gate entity, and `nightly-eval-arc.json` routes on the captured verdict. |
+| P1 — backfill tool-call edges on project register | `bbox_project_register` launches `backfill_tool_edges_for_project`, which walks prior transcripts and appends deduped observed tool edges for the newly registered project. |
+| G2 — `notes.mergeStrategy = union` auto-config | `bbox_provenance_export` calls `ensure_notes_merge_strategy_union` before exporting git notes. |
+| M2 — multi-partition vector compaction | `VectorStore::compact_partitions(None)` processes every eligible route; the periodic compactor uses it, and `embed-compaction-arc.json` invokes `compact_vector_partitions` rather than rebuilding only the worst route. |
+| M3 — `task-completed` signal from bro finalize | bro task finalization emits `TaskCompleted` with `source_session`, `source_query`, and `task_kind`; the daemon routes it through `domain:auto-digest/task-completed-routing`. |
+| M5 — auto-edge nightly trigger and scan cap | `auto-edge-nightly` cron routing is shipped, and `ExtractCandidatePairs` performs the real scan used by `auto-edge-arc`. |
+| S4 — EdgeIndex memory model at scale | Edge storage is arena-backed with compact `EdgeKey` dedup keys instead of cloning full `Edge` structs into `HashSet` membership. |
+| E3 — vector store and HNSW diagnostics | Daemon state carries the vector store explicitly; HNSW metrics include health diagnostics such as average degree, layer distribution, and disconnected node count. |
 
-## Follow-ups by phase
+## Verification Hooks
 
-### F3 — Schema migration workflow ops
+The relevant focused suites are:
 
-Source: `archive/agentic-corpus-release-notes.md` §F3.
+- `cargo test --bin blackboxd workflow::ops`
+- `cargo test --bin blackboxd mcp_tools::provenance`
+- `cargo test --bin blackboxd project_files`
+- `cargo test --bin blackboxd providers`
+- `cargo test --bin blackboxd git_history`
+- `cargo test --bin blackboxd storage_health`
 
-The shipped `schema-migration-arc.json` documents migration shape but
-the actual drop+rebuild runs in `TranscriptIndex::open_or_create`.
-The workflow's hook ops `schema_migration_drop` /
-`schema_migration_rebuild` aren't wired yet. Wire them so the
-workflow becomes the runner, not the documentation.
-
-### H3 — Eval drift-policy gate consumes shell output
-
-Source: `archive/agentic-corpus-release-notes.md` §H3.
-
-`nightly-eval-arc.json`'s `Decide` node currently runs against the
-workflow's policy entity, not against `RunSuite`'s shell stdout. The
-shell harness is the actual runner; the workflow is audit trail.
-
-Unblocks when workflow hook ops grow shell-output capture (e.g.
-`op: shell` populating a var with stdout/exit/parsed JSON). At that
-point the `Decide` gate routes on real drift verdict.
-
-### P1 — Backfill tool-call edges on project register
-
-Source: `archive/agentic-corpus-release-notes.md` §P1.
-
-Tool-call edges only emit when the touched file is under a registered
-project. Registering a project does not retroactively walk transcripts
-and backfill. Add a `bbox_project_register` post-step that walks prior
-transcripts and emits `EDITED_FILE` / `READ_FILE` / `RAN_BASH` edges
-for the newly registered project.
-
-### G2 — `notes.mergeStrategy = union` auto-config
-
-Source: `archive/agentic-corpus-release-notes.md` §G2.
-
-Cross-machine provenance notes need
-`git config notes.mergeStrategy union` to avoid silent overwrite when
-collaborating machines push to the same notes ref. The daemon
-documents this but doesn't write project git config. Decide: do we
-auto-set it on first `bbox_provenance_export`, prompt the operator,
-or leave it as docs-only?
-
-### M2 — Multi-partition compaction loop / fork
-
-Source: `archive/agentic-corpus-release-notes.md` §M2.
-
-`embed-compaction-arc.json` rebuilds only the single worst-`deleted_ratio`
-partition per tick. Additional partitions wait for later cron ticks.
-Workflow phase needed: loop inside the arc, or `fork` once the
-workflow engine supports fan-out for this use case.
-
-Also: `QuiesceSearch` and `SwapAtomic` are v1 marker hooks (reads
-continue serving from the current in-memory snapshot under the
-partition lock). If vector search moves out-of-process or serves
-concurrently across mutable snapshots, `QuiesceSearch` needs a real
-traffic-drain implementation and `SwapAtomic` needs an explicit
-publish/rename step.
-
-### M3 — `task-completed` signal from `bro_exec` finalize
-
-Source: `archive/agentic-corpus-release-notes.md` §M3.
-
-`auto-digest-arc.json` is ready to start on `task-completed` events
-but the `bro_exec` finalize path doesn't emit them yet. V1 trigger is
-manual `bro_orchestrate_run` with seeded `source_session`, `task_kind`,
-`daily_count`. Emit the completion signal from bro task finalization
-and route it into the installed workflow.
-
-Also: `source_query` isn't reliably populated until the completion
-signal carries the originating prompt. The packet accepts any one of
-`source_session` / `source_query` / `source_files` for v1. Tighten
-once the signal carries query.
-
-### M5 — Auto-edge-extraction nightly trigger + scan cap
-
-Source: `archive/agentic-corpus-release-notes.md` §M5.
-
-For v1, scheduled candidate scan is observable-only and capped at 50;
-operator must seed `vars.candidate` manually for a specific candidate
-pair. Lift the cap and ship automatic nightly triggering once tier-0
-contradiction false-positive rate is measured under real load.
-
-### S4 — EdgeIndex memory model at scale
-
-Source: `archive/agentic-corpus-release-notes.md` §S4.
-
-Dedup uses full `Edge` structs as `HashSet` keys. Fine at current
-scale; needs rework if edge count crosses ~5M. Revisit when a corpus
-actually exceeds that, OR pre-emptively before Tier B per-language
-AST work lands (see `agentic-corpus-tier-b-ast.md` — resolved CALLS
-edges may push past the ceiling).
-
-### E3 — VectorStore singleton + HNSW diagnostic metrics
-
-Source: `archive/agentic-corpus-release-notes.md` §E3.
-
-Two items:
-- `VectorStore` exposes process-global module functions via `OnceLock`
-  for daemon-wiring convenience. Tests and direct callers can use
-  explicit `VectorStore::open`. Cleanup: pass `&VectorStore` through
-  the embedding queue + search layers and keep the singleton at the
-  daemon boundary only.
-- HNSW metrics report node counts, dimensions, max level, entry point,
-  neighbor refs. They don't report **health diagnostics**: average
-  neighbor degree, layer distribution, disconnected-node counts. Add
-  before relying on vector metrics for production tuning.
+This document stays as the audit record for why those release-note caveats no
+longer block the agentic-corpus implementation.

@@ -117,6 +117,11 @@ fn path_terminal_file_key(entity: &EntityRef) -> Option<String> {
             project_id,
             rel_path_hash,
             ..
+        }
+        | EntityRef::ProjectFileV2 {
+            project_id,
+            rel_path_hash,
+            ..
         } => Some(format!("project_file:{project_id}:{rel_path_hash}")),
         _ => None,
     }

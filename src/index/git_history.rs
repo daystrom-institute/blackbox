@@ -276,7 +276,16 @@ fn save_git_meta(path: &Path, meta: &GitIngestMeta) -> Result<()> {
     Ok(())
 }
 
-fn chunk_ref(chunk: &Chunk) -> EntityRef {
+fn chunk_ref(chunk: &Chunk, snapshot_id: Option<&str>) -> EntityRef {
+    if let Some(snapshot_id) = snapshot_id {
+        return EntityRef::ProjectFileV2 {
+            project_id: chunk.project_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            rel_path_hash: chunk.rel_path_hash.clone(),
+            chunk_hash: chunk.chunk_hash.clone(),
+            occurrence_idx: chunk.occurrence_idx,
+        };
+    }
     EntityRef::ProjectFile {
         project_id: chunk.project_id.clone(),
         rel_path_hash: chunk.rel_path_hash.clone(),
@@ -285,11 +294,16 @@ fn chunk_ref(chunk: &Chunk) -> EntityRef {
     }
 }
 
-pub(super) fn current_chunk_targets(chunks: &[Chunk]) -> HashMap<String, EntityRef> {
+pub(super) fn current_chunk_targets(
+    chunks: &[Chunk],
+    snapshot_id: Option<&str>,
+) -> HashMap<String, EntityRef> {
     let mut targets = HashMap::new();
     for chunk in chunks {
         let rel = chunk.file_path.to_string_lossy().to_string();
-        targets.entry(rel).or_insert_with(|| chunk_ref(chunk));
+        targets
+            .entry(rel)
+            .or_insert_with(|| chunk_ref(chunk, snapshot_id));
     }
     targets
 }
@@ -357,7 +371,7 @@ mod tests {
             byte_start: 0,
             byte_end: 4,
         };
-        let targets = current_chunk_targets(&[chunk]);
+        let targets = current_chunk_targets(&[chunk], None);
         assert!(targets.contains_key("src/main.rs"));
     }
 

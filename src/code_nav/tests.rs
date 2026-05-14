@@ -743,6 +743,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
             &project,
             &abs_path,
             None,
+            None,
             index.field_handles(),
         ))
         .unwrap();
@@ -751,6 +752,7 @@ fn indexed_lane_item_kinds_matches_both_synthetic_and_raw_for_rust_impl_method()
             &toplevel_chunk,
             &project,
             &abs_path,
+            None,
             None,
             index.field_handles(),
         ))

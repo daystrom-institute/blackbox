@@ -4,12 +4,12 @@ use anyhow::Result;
 
 use super::{
     EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
-    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, expected, next_hops, schema,
-    truncate_label,
+    NextHop, ProviderContext, empty_neighborhood_view, expected, next_hops, schema, truncate_label,
 };
 use crate::entity_ref::{EntityRef, EntityType};
 
 pub struct ProjectFileProvider;
+pub struct ProjectFileV2Provider;
 
 impl InspectableEntityProvider for ProjectFileProvider {
     fn entity_type(&self) -> EntityType {
@@ -21,30 +21,7 @@ impl InspectableEntityProvider for ProjectFileProvider {
     }
 
     fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
-        ensure_type(r, self.entity_type())?;
-        let EntityRef::ProjectFile {
-            project_id,
-            rel_path_hash,
-            chunk_hash,
-            occurrence_idx,
-        } = r
-        else {
-            unreachable!();
-        };
-        let mut properties = BTreeMap::new();
-        properties.insert("project_id".into(), project_id.clone());
-        properties.insert("rel_path_hash".into(), rel_path_hash.clone());
-        properties.insert("chunk_hash".into(), chunk_hash.clone());
-        properties.insert("occurrence_idx".into(), occurrence_idx.to_string());
-        if let Some(state) = ctx.state() {
-            let indexed = state
-                .idx
-                .read()
-                .entity_properties(&r.to_string())?
-                .ok_or_else(|| anyhow::anyhow!("project file entity {r} not found"))?;
-            properties.extend(indexed);
-        }
-        Ok(empty_neighborhood_view(r, properties))
+        project_file_entity(ctx, r)
     }
 
     fn schema(&self) -> EntitySchemaView {
@@ -136,24 +113,112 @@ impl InspectableEntityProvider for ProjectFileProvider {
     }
 
     fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
-        let EntityRef::ProjectFile {
+        project_file_label(ctx, r)
+    }
+}
+
+impl InspectableEntityProvider for ProjectFileV2Provider {
+    fn entity_type(&self) -> EntityType {
+        EntityType::ProjectFileV2
+    }
+
+    fn owns_ref(&self, r: &EntityRef) -> bool {
+        matches!(r, EntityRef::ProjectFileV2 { .. })
+    }
+
+    fn get_entity(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
+        project_file_entity(ctx, r)
+    }
+
+    fn schema(&self) -> EntitySchemaView {
+        let mut view = ProjectFileProvider.schema();
+        view.entity_type = EntityType::ProjectFileV2;
+        view.properties.insert(1, "snapshot_id".into());
+        view.filterable_fields.insert(1, "snapshot_id".into());
+        view
+    }
+
+    fn expected_edge_families(&self, r: &EntityRef) -> Vec<EdgeFamilyExpectation> {
+        ProjectFileProvider.expected_edge_families(r)
+    }
+
+    fn recommended_next_hops(
+        &self,
+        entity: &EntityView,
+        full_neighborhood: &Neighborhood,
+    ) -> Vec<NextHop> {
+        ProjectFileProvider.recommended_next_hops(entity, full_neighborhood)
+    }
+
+    fn compact_label(&self, ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
+        project_file_label(ctx, r)
+    }
+}
+
+fn project_file_parts(r: &EntityRef) -> Option<(&str, Option<&str>, &str, &str, u32)> {
+    match r {
+        EntityRef::ProjectFile {
+            project_id,
             rel_path_hash,
+            chunk_hash,
             occurrence_idx,
-            ..
-        } = r
-        else {
-            return None;
-        };
-        if let Some(state) = ctx.state() {
-            if let Ok(Some(properties)) = state.idx.read().entity_properties(&r.to_string()) {
-                if let Some(path) = properties.get("file_path") {
-                    return Some(truncate_label(path));
-                }
-                if let Some(preview) = properties.get("content_preview") {
-                    return Some(truncate_label(preview));
-                }
+        } => Some((project_id, None, rel_path_hash, chunk_hash, *occurrence_idx)),
+        EntityRef::ProjectFileV2 {
+            project_id,
+            snapshot_id,
+            rel_path_hash,
+            chunk_hash,
+            occurrence_idx,
+        } => Some((
+            project_id,
+            Some(snapshot_id),
+            rel_path_hash,
+            chunk_hash,
+            *occurrence_idx,
+        )),
+        _ => None,
+    }
+}
+
+fn project_file_entity(ctx: &ProviderContext<'_>, r: &EntityRef) -> Result<EntityView> {
+    let Some((project_id, snapshot_id, rel_path_hash, chunk_hash, occurrence_idx)) =
+        project_file_parts(r)
+    else {
+        unreachable!();
+    };
+    let mut properties = BTreeMap::new();
+    properties.insert("project_id".into(), project_id.to_string());
+    if let Some(snapshot_id) = snapshot_id {
+        properties.insert("snapshot_id".into(), snapshot_id.to_string());
+    }
+    properties.insert("rel_path_hash".into(), rel_path_hash.to_string());
+    properties.insert("chunk_hash".into(), chunk_hash.to_string());
+    properties.insert("occurrence_idx".into(), occurrence_idx.to_string());
+    if let Some(state) = ctx.state() {
+        let indexed = state
+            .idx
+            .read()
+            .entity_properties(&r.to_string())?
+            .ok_or_else(|| anyhow::anyhow!("project file entity {r} not found"))?;
+        properties.extend(indexed);
+    }
+    Ok(empty_neighborhood_view(r, properties))
+}
+
+fn project_file_label(ctx: &ProviderContext<'_>, r: &EntityRef) -> Option<String> {
+    let (_, snapshot_id, rel_path_hash, _, occurrence_idx) = project_file_parts(r)?;
+    if let Some(state) = ctx.state() {
+        if let Ok(Some(properties)) = state.idx.read().entity_properties(&r.to_string()) {
+            if let Some(path) = properties.get("file_path") {
+                return Some(truncate_label(path));
+            }
+            if let Some(preview) = properties.get("content_preview") {
+                return Some(truncate_label(preview));
             }
         }
-        Some(truncate_label(format!("{rel_path_hash}#{occurrence_idx}")))
     }
+    let suffix = snapshot_id.map(|id| format!("@{id}")).unwrap_or_default();
+    Some(truncate_label(format!(
+        "{rel_path_hash}#{occurrence_idx}{suffix}"
+    )))
 }

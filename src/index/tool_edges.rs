@@ -200,7 +200,8 @@ impl ToolEdgeContext {
             return Ok(0);
         };
         let project_id = match &edge.target {
-            crate::entity_ref::EntityRef::ProjectFile { project_id, .. } => project_id.clone(),
+            crate::entity_ref::EntityRef::ProjectFile { project_id, .. }
+            | crate::entity_ref::EntityRef::ProjectFileV2 { project_id, .. } => project_id.clone(),
             _ => return Ok(0),
         };
         crate::edge_index::append_observed_edges(&self.edges_dir, &project_id, &[edge])?;

@@ -107,6 +107,9 @@ pub enum OpKind {
     QuiesceSearch,
     /// Rebuild one vector partition's HNSW from WAL.
     RebuildHnsw,
+    /// Compact every vector partition whose deleted-ratio policy says it is
+    /// eligible. `args.max_partitions` can cap the batch for operator-run arcs.
+    CompactVectorPartitions,
     /// Marker hook for the atomic swap step.
     ///
     /// V1 is intentionally observable-only: `vectors::rebuild(route)` already
@@ -210,6 +213,9 @@ pub async fn execute_op(
         }
         OpKind::QuiesceSearch => Ok(OpEffect::None),
         OpKind::RebuildHnsw => exec_rebuild_hnsw(&rendered_args),
+        OpKind::CompactVectorPartitions => {
+            exec_compact_vector_partitions(&rendered_args, hook.into_var.as_deref())
+        }
         OpKind::SwapAtomic => Ok(OpEffect::None),
         OpKind::ReadSession => {
             exec_read_session(&rendered_args, hook.into_var.as_deref(), ctx).await
@@ -595,9 +601,10 @@ fn required_str<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
 
 fn project_id_from_ref(r: &EntityRef) -> Option<String> {
     match r {
-        EntityRef::ProjectFile { project_id, .. } | EntityRef::Symbol { project_id, .. } => {
-            Some(project_id.clone())
-        }
+        EntityRef::ProjectFile { project_id, .. }
+        | EntityRef::ProjectFileV2 { project_id, .. }
+        | EntityRef::Symbol { project_id, .. }
+        | EntityRef::SymbolV2 { project_id, .. } => Some(project_id.clone()),
         _ => None,
     }
 }
@@ -727,6 +734,58 @@ fn exec_rebuild_hnsw(args: &Value) -> Result<OpEffect> {
         .filter(|route| !route.trim().is_empty())
         .ok_or_else(|| anyhow!("RebuildHnsw requires args.route"))?;
     crate::vectors::rebuild(route)?;
+    Ok(OpEffect::None)
+}
+
+fn exec_compact_vector_partitions(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
+    let max_partitions = args
+        .get("max_partitions")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let deleted_ratio_threshold = args
+        .get("deleted_ratio_threshold")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.30) as f32;
+    let mut candidates = crate::vectors::metrics()
+        .into_iter()
+        .filter(|(_, metrics)| metrics.deleted_ratio >= deleted_ratio_threshold)
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        b.1.deleted_ratio
+            .total_cmp(&a.1.deleted_ratio)
+            .then_with(|| a.0.cmp(&b.0))
+    });
+    let limit = max_partitions.unwrap_or(usize::MAX);
+    let mut stats = Vec::new();
+    for (route, before) in candidates.into_iter().take(limit) {
+        let started = std::time::Instant::now();
+        crate::vectors::rebuild(&route)?;
+        let after = crate::vectors::metrics()
+            .remove(&route)
+            .unwrap_or(before.clone());
+        stats.push(json!({
+            "route": route,
+            "before_wal_records": before.wal_records,
+            "after_wal_records": after.wal_records,
+            "before_slab_entries": before.active_count + before.deleted_count,
+            "after_slab_entries": after.active_count + after.deleted_count,
+            "elapsed_ms": started.elapsed().as_millis(),
+        }));
+    }
+    let value = json!({
+        "count": stats.len(),
+        "routes": stats
+            .iter()
+            .filter_map(|stat| stat.get("route").and_then(Value::as_str))
+            .collect::<Vec<_>>(),
+        "stats": stats,
+    });
+    if let Some(key) = into_var {
+        return Ok(OpEffect::SetVar {
+            key: key.to_string(),
+            value,
+        });
+    }
     Ok(OpEffect::None)
 }
 

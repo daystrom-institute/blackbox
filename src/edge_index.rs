@@ -1377,10 +1377,14 @@ pub(crate) fn read_managed_derived_edges(
 pub(crate) fn rel_path_hashes_of(edges: &[crate::chunker::Edge]) -> HashSet<String> {
     let mut hashes = HashSet::new();
     for e in edges {
-        if let EntityRef::ProjectFile { rel_path_hash, .. } = &e.source {
+        if let EntityRef::ProjectFile { rel_path_hash, .. }
+        | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &e.source
+        {
             hashes.insert(rel_path_hash.clone());
         }
-        if let EntityRef::ProjectFile { rel_path_hash, .. } = &e.target {
+        if let EntityRef::ProjectFile { rel_path_hash, .. }
+        | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &e.target
+        {
             hashes.insert(rel_path_hash.clone());
         }
     }
@@ -1390,7 +1394,9 @@ pub(crate) fn rel_path_hashes_of(edges: &[crate::chunker::Edge]) -> HashSet<Stri
 fn edge_touches_any_path_hash(edge: &Edge, stale_hashes: &HashSet<String>) -> bool {
     match (&edge.source, &edge.target) {
         (EntityRef::ProjectFile { rel_path_hash, .. }, _)
+        | (EntityRef::ProjectFileV2 { rel_path_hash, .. }, _)
         | (_, EntityRef::ProjectFile { rel_path_hash, .. }) => stale_hashes.contains(rel_path_hash),
+        (_, EntityRef::ProjectFileV2 { rel_path_hash, .. }) => stale_hashes.contains(rel_path_hash),
         _ => false,
     }
 }

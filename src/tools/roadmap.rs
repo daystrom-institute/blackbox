@@ -586,7 +586,11 @@ impl BlackboxServer {
                 }
             }
             roadmap::RoadmapEdgeKind::DesignedIn => {
-                if !matches!(target_ref, crate::entity_ref::EntityRef::ProjectFile { .. }) {
+                if !matches!(
+                    target_ref,
+                    crate::entity_ref::EntityRef::ProjectFile { .. }
+                        | crate::entity_ref::EntityRef::ProjectFileV2 { .. }
+                ) {
                     anyhow::bail!("designed_in link target must be a project_file entity ref");
                 }
             }

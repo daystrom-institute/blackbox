@@ -28,10 +28,10 @@ JSON specs the workflow engine compiles + dispatches. Install via
 
 | File | Purpose |
 |---|---|
-| `project-bootstrap-arc.json` | Skeleton arc fired by `bbox_project_register`. **Currently a stub** — each node sets a bool and goes to next. Real chunking is wired into the auto-reindex thread (this stub may be replaced once the bootstrap-arc gap closes; see `thread-3cfbf9e0`). |
+| `project-bootstrap-arc.json` | Coordination arc fired by `bbox_project_register`; chunking and indexing remain owned by the auto-reindex thread. |
 | `schema-migration-arc.json` | Drains compaction targets after a schema bump |
 | `embed-compaction-arc.json` | Re-embed + WAL compaction sweep — pairs with `crons/embed-compaction-nightly.json` |
-| `nightly-eval-arc.json` | Skeleton for an eval harness gate; relies on the deferred `op: shell` engine primitive — see `thread-3cfbf9e0` |
+| `nightly-eval-arc.json` | Eval harness gate that captures shell output and routes on scored drift verdict |
 | `auto-digest-arc.json` | Distill a session into knowledge candidates via the `digest-extractor` brofile, gate via `domain:auto-digest/entry-quality` packet |
 | `auto-edge-arc.json` | Propose new knowledge↔knowledge / knowledge↔file edges via the auto-edge brofiles + `domain:auto-edge/vote-aggregate` packet |
 | `contradiction-review-arc.json` | Tier-0 cosine-similarity-detected contradiction review — opens a whiteboard, spins three specialist brofiles, synthesizes a verdict |
@@ -51,7 +51,7 @@ the loop). Each domain is a directory of versioned packet JSONs +
 | `auto-edge/` | `vote-aggregate.json` | auto-edge-arc Aggregate node |
 | `bro-trust/` | `bro-trust.json` | gates whether to auto-apply or hold-for-review based on the originating brofile's trust class |
 | `contradiction/` | `review-synthesis.json` | contradiction-review-arc ApplyVerdict node |
-| `cron-routing/` | `task-completed-routing.json` | routes `task-completed` signals to the auto-digest arc (gated on the engine emitting that signal — currently deferred) |
+| `cron-routing/` | `task-completed-routing.json` | routes `task-completed` signals to the auto-digest arc |
 | `embed/` | `compaction-trigger.json` | nightly compaction trigger gate |
 | `eval/` | `parity-strictness.json` | eval-suite per-class checker |
 | `workflow-policy/` | `arc-budget.json` | universal arc-step + retry budget |
@@ -111,22 +111,19 @@ The daemon does NOT auto-install everything in this tree on startup
 3. **Inspection**: `bbox_artifact_list` shows what's currently installed
    (kind / name / version / source path / superseded_by).
 
-## Status / known gaps
+## Status
 
-These artifacts are functional but several arcs depend on engine
-primitives that are still deferred:
+The shipped artifacts have their required engine primitives:
 
-- `auto-digest-arc` → needs the `task-completed` signal which `bro_exec`
-  doesn't emit yet (tracked in `thread-3cfbf9e0`).
-- `auto-edge-arc` → processes ONE candidate per invocation; full batch
-  should be rewritten onto native workflow fanout (tracked in
-  `thread-cba8bfa1`).
-- `nightly-eval-arc` → workflow gates can't consume subprocess stdout
-  yet; arc records that the harness ran but can't route on actual drift
-  (tracked in `thread-3cfbf9e0`).
-- `contradiction-review-arc` → the team
-  `contradiction-specialists` must exist before dispatch
-  (`scripts/install-teams.sh`).
+- `auto-digest-arc` is triggered by `task-completed` signals from bro task
+  finalization.
+- `auto-edge-arc` runs against real extracted candidate pairs and is reachable
+  through the bundled nightly cron routing.
+- `nightly-eval-arc` can capture subprocess output and route on the scored
+  drift verdict.
+- `embed-compaction-arc` compacts every eligible vector partition in one pass.
+- `contradiction-review-arc` still requires the operator to install the
+  `contradiction-specialists` team before dispatching that workflow.
 
 Pull the deeper runbook for any of these via `bbox_knowledge(query="sm-...")`:
 

@@ -120,11 +120,13 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
         vec![
             Box::new(knowledge::KnowledgeProvider),
             Box::new(project_file::ProjectFileProvider),
+            Box::new(project_file::ProjectFileV2Provider),
             Box::new(transcript::TranscriptProvider),
             Box::new(session::SessionProvider),
             Box::new(thread::ThreadProvider),
             Box::new(note::NoteProvider),
             Box::new(symbol::SymbolProvider),
+            Box::new(symbol::SymbolV2Provider),
             Box::new(brofile::BrofileProvider),
             Box::new(whiteboard::WhiteboardProvider),
             Box::new(commit::CommitProvider),

@@ -16,10 +16,12 @@ pub enum EntityType {
     Knowledge,
     Transcript,
     ProjectFile,
+    ProjectFileV2,
     Session,
     Thread,
     Note,
     Symbol,
+    SymbolV2,
     Brofile,
     Whiteboard,
     Commit,
@@ -30,14 +32,16 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 14] = [
+    pub const ALL: [EntityType; 16] = [
         EntityType::Knowledge,
         EntityType::Transcript,
         EntityType::ProjectFile,
+        EntityType::ProjectFileV2,
         EntityType::Session,
         EntityType::Thread,
         EntityType::Note,
         EntityType::Symbol,
+        EntityType::SymbolV2,
         EntityType::Brofile,
         EntityType::Whiteboard,
         EntityType::Commit,
@@ -52,10 +56,12 @@ impl EntityType {
             EntityType::Knowledge => "knowledge",
             EntityType::Transcript => "transcript",
             EntityType::ProjectFile => "project_file",
+            EntityType::ProjectFileV2 => "project_file_v2",
             EntityType::Session => "session",
             EntityType::Thread => "thread",
             EntityType::Note => "note",
             EntityType::Symbol => "symbol",
+            EntityType::SymbolV2 => "symbol_v2",
             EntityType::Brofile => "brofile",
             EntityType::Whiteboard => "whiteboard",
             EntityType::Commit => "commit",
@@ -75,10 +81,16 @@ impl EntityType {
             EntityType::ProjectFile => {
                 "project_file:<project_id>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>"
             }
+            EntityType::ProjectFileV2 => {
+                "project_file_v2:<project_id>:<snapshot_id>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>"
+            }
             EntityType::Session => "session:<provider>:<session_id>",
             EntityType::Thread => "thread:<thread_id>",
             EntityType::Note => "note:<note_id>",
             EntityType::Symbol => "symbol:<project_id>:<qualified_name>:<defn_hash>",
+            EntityType::SymbolV2 => {
+                "symbol_v2:<project_id>:<snapshot_id>:<qualified_name>:<defn_hash>"
+            }
             EntityType::Brofile => "brofile:<name>",
             EntityType::Whiteboard => "whiteboard:<board_id>",
             EntityType::Commit => "commit:<repo_id>:<sha>",
@@ -129,6 +141,13 @@ pub enum EntityRef {
         chunk_hash: String,
         occurrence_idx: u32,
     },
+    ProjectFileV2 {
+        project_id: String,
+        snapshot_id: String,
+        rel_path_hash: String,
+        chunk_hash: String,
+        occurrence_idx: u32,
+    },
     Session {
         provider: String,
         session_id: String,
@@ -141,6 +160,12 @@ pub enum EntityRef {
     },
     Symbol {
         project_id: String,
+        qualified_name: String,
+        defn_hash: String,
+    },
+    SymbolV2 {
+        project_id: String,
+        snapshot_id: String,
         qualified_name: String,
         defn_hash: String,
     },
@@ -197,6 +222,7 @@ impl EntityRef {
             }),
             EntityType::Transcript => parse_transcript(input, rest),
             EntityType::ProjectFile => parse_project_file(input, rest),
+            EntityType::ProjectFileV2 => parse_project_file_v2(input, rest),
             EntityType::Session => parse_session(input, rest),
             EntityType::Thread => parse_single(input, rest, EntityType::Thread, |thread_id| {
                 EntityRef::Thread { thread_id }
@@ -205,6 +231,7 @@ impl EntityRef {
                 EntityRef::Note { note_id }
             }),
             EntityType::Symbol => parse_symbol(input, rest),
+            EntityType::SymbolV2 => parse_symbol_v2(input, rest),
             EntityType::Brofile => parse_single(input, rest, EntityType::Brofile, |name| {
                 EntityRef::Brofile { name }
             }),
@@ -252,6 +279,15 @@ impl EntityRef {
             } => Ok(format!(
                 "project_file:{project_id}:{rel_path_hash}:{chunk_hash}:{occurrence_idx}"
             )),
+            EntityRef::ProjectFileV2 {
+                project_id,
+                snapshot_id,
+                rel_path_hash,
+                chunk_hash,
+                occurrence_idx,
+            } => Ok(format!(
+                "project_file_v2:{project_id}:{snapshot_id}:{rel_path_hash}:{chunk_hash}:{occurrence_idx}"
+            )),
             EntityRef::Session {
                 provider,
                 session_id,
@@ -266,6 +302,14 @@ impl EntityRef {
                 qualified_name,
                 defn_hash,
             } => Ok(format!("symbol:{project_id}:{qualified_name}:{defn_hash}")),
+            EntityRef::SymbolV2 {
+                project_id,
+                snapshot_id,
+                qualified_name,
+                defn_hash,
+            } => Ok(format!(
+                "symbol_v2:{project_id}:{snapshot_id}:{qualified_name}:{defn_hash}"
+            )),
             EntityRef::Brofile { name } => Ok(format!("brofile:{name}")),
             EntityRef::Whiteboard { board_id } => Ok(format!("whiteboard:{board_id}")),
             EntityRef::Commit { repo_id, sha } => Ok(format!("commit:{repo_id}:{sha}")),
@@ -292,10 +336,12 @@ impl EntityRef {
             EntityRef::Knowledge { .. } => EntityType::Knowledge,
             EntityRef::Transcript { .. } => EntityType::Transcript,
             EntityRef::ProjectFile { .. } => EntityType::ProjectFile,
+            EntityRef::ProjectFileV2 { .. } => EntityType::ProjectFileV2,
             EntityRef::Session { .. } => EntityType::Session,
             EntityRef::Thread { .. } => EntityType::Thread,
             EntityRef::Note { .. } => EntityType::Note,
             EntityRef::Symbol { .. } => EntityType::Symbol,
+            EntityRef::SymbolV2 { .. } => EntityType::SymbolV2,
             EntityRef::Brofile { .. } => EntityType::Brofile,
             EntityRef::Whiteboard { .. } => EntityType::Whiteboard,
             EntityRef::Commit { .. } => EntityType::Commit,
@@ -495,6 +541,21 @@ fn parse_project_file(input: &str, rest: &str) -> Result<EntityRef, EntityRefPar
     })
 }
 
+fn parse_project_file_v2(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    let parts = exact_parts(input, rest, EntityType::ProjectFileV2, 5)?;
+    Ok(EntityRef::ProjectFileV2 {
+        project_id: non_empty(input, parts[0], EntityType::ProjectFileV2, "project_id")?
+            .to_string(),
+        snapshot_id: non_empty(input, parts[1], EntityType::ProjectFileV2, "snapshot_id")?
+            .to_string(),
+        rel_path_hash: non_empty(input, parts[2], EntityType::ProjectFileV2, "rel_path_hash")?
+            .to_string(),
+        chunk_hash: non_empty(input, parts[3], EntityType::ProjectFileV2, "chunk_hash")?
+            .to_string(),
+        occurrence_idx: parse_u32(input, parts[4], EntityType::ProjectFileV2, "occurrence_idx")?,
+    })
+}
+
 fn parse_session(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
     let (provider, session_id) = split_first(input, rest, EntityType::Session, "session_id")?;
     Ok(EntityRef::Session {
@@ -511,6 +572,25 @@ fn parse_symbol(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseErro
         qualified_name: non_empty(input, qualified_name, EntityType::Symbol, "qualified_name")?
             .to_string(),
         defn_hash: non_empty(input, defn_hash, EntityType::Symbol, "defn_hash")?.to_string(),
+    })
+}
+
+fn parse_symbol_v2(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    let (project_id, tail) = split_first(input, rest, EntityType::SymbolV2, "snapshot_id")?;
+    let (snapshot_id, tail) = split_first(input, tail, EntityType::SymbolV2, "qualified_name")?;
+    let (qualified_name, defn_hash) = split_last(input, tail, EntityType::SymbolV2, "defn_hash")?;
+    Ok(EntityRef::SymbolV2 {
+        project_id: non_empty(input, project_id, EntityType::SymbolV2, "project_id")?.to_string(),
+        snapshot_id: non_empty(input, snapshot_id, EntityType::SymbolV2, "snapshot_id")?
+            .to_string(),
+        qualified_name: non_empty(
+            input,
+            qualified_name,
+            EntityType::SymbolV2,
+            "qualified_name",
+        )?
+        .to_string(),
+        defn_hash: non_empty(input, defn_hash, EntityType::SymbolV2, "defn_hash")?.to_string(),
     })
 }
 
@@ -921,6 +1001,22 @@ mod tests {
         assert!(bad.try_render().is_err());
     }
 
+    #[test]
+    fn project_file_v2_ref_round_trips() {
+        let rendered = "project_file_v2:proj1234:head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:relhash:chunkhash:7";
+        let parsed = EntityRef::parse(rendered).unwrap();
+        assert_eq!(parsed.render(), rendered);
+        assert_eq!(parsed.entity_type(), EntityType::ProjectFileV2);
+    }
+
+    #[test]
+    fn symbol_v2_ref_round_trips_with_colons_in_qualified_name() {
+        let rendered = "symbol_v2:proj1234:head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:crate::module::Type::method:defhash";
+        let parsed = EntityRef::parse(rendered).unwrap();
+        assert_eq!(parsed.render(), rendered);
+        assert_eq!(parsed.entity_type(), EntityType::SymbolV2);
+    }
+
     #[derive(Clone)]
     struct Lcg(u64);
 
@@ -987,17 +1083,24 @@ mod tests {
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            3 => EntityRef::Session {
+            3 => EntityRef::ProjectFileV2 {
+                project_id: rng.hex(8),
+                snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
+                rel_path_hash: rng.hex(8),
+                chunk_hash: rng.hex(64),
+                occurrence_idx: rng.next() as u32,
+            },
+            4 => EntityRef::Session {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("sub-")),
             },
-            4 => EntityRef::Thread {
+            5 => EntityRef::Thread {
                 thread_id: rng.token("thread-"),
             },
-            5 => EntityRef::Note {
+            6 => EntityRef::Note {
                 note_id: rng.token("note-"),
             },
-            6 => EntityRef::Symbol {
+            7 => EntityRef::Symbol {
                 project_id: rng.hex(8),
                 qualified_name: format!(
                     "{}::{}::{}",
@@ -1007,28 +1110,39 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            7 => EntityRef::Brofile {
+            8 => EntityRef::SymbolV2 {
+                project_id: rng.hex(8),
+                snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
+                qualified_name: format!(
+                    "{}::{}::{}",
+                    rng.token("crate"),
+                    rng.token("mod"),
+                    rng.token("Type")
+                ),
+                defn_hash: rng.hex(64),
+            },
+            9 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            8 => EntityRef::Whiteboard {
+            10 => EntityRef::Whiteboard {
                 board_id: rng.token("board-"),
             },
-            9 => EntityRef::Commit {
+            11 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            10 => EntityRef::Task {
+            12 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            11 => EntityRef::BashCall {
+            13 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            12 => EntityRef::Agent {
+            14 => EntityRef::Agent {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            13 => EntityRef::RoadmapItem {
+            15 => EntityRef::RoadmapItem {
                 id: rng.token("roadmap-"),
             },
             _ => unreachable!(),

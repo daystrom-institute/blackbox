@@ -394,6 +394,23 @@ pub(crate) fn enqueue_transcript(
 }
 
 pub(crate) fn project_file_entity_id(chunk: &Chunk) -> String {
+    project_file_entity_id_for_snapshot(chunk, None)
+}
+
+pub(crate) fn project_file_entity_id_for_snapshot(
+    chunk: &Chunk,
+    snapshot_id: Option<&str>,
+) -> String {
+    if let Some(snapshot_id) = snapshot_id {
+        return EntityRef::ProjectFileV2 {
+            project_id: chunk.project_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            rel_path_hash: chunk.rel_path_hash.clone(),
+            chunk_hash: chunk.chunk_hash.clone(),
+            occurrence_idx: chunk.occurrence_idx,
+        }
+        .to_string();
+    }
     EntityRef::ProjectFile {
         project_id: chunk.project_id.clone(),
         rel_path_hash: chunk.rel_path_hash.clone(),

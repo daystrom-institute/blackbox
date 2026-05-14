@@ -7,12 +7,12 @@ Status: implementation proposal
 This plan turns the storage design into incremental, testable cuts. The order
 is intentional: first make storage visible and pruneable, then stop new
 append-only damage, then introduce manifests and snapshots. The early phases
-reduce user pain even if later snapshot work slips.
+reduce user pain while snapshot work lands.
 
 ```
 Phase 1 ──▶ Phase 2 ──▶ Phase 3 ──▶ Phase 4 ──▶ Phase 5 ──▶ Phase 6
    │           │           │           │           │
-   │           │           │           │           └── optional v2 refs
+   │           │           │           │           └── v2 refs behind emission flag
    │           │           │           └── dirty overlay + branch behavior
    │           │           └── manifest-index loader
    │           └── lane split + derived append audit
@@ -605,9 +605,9 @@ project can restore the old sidecar if needed. Migration backups are pinned from
 normal backup GC until the migration has survived at least one release cycle or
 the operator explicitly unpins them.
 
-## Phase 6: Optional V2 Entity Refs
+## Phase 6: V2 Entity Refs
 
-**Prerequisites:** Phase 5. Optional.
+**Prerequisites:** Phase 5.
 
 **Goal:** make snapshot-specific refs explicit without breaking old refs.
 
@@ -643,11 +643,10 @@ BBOX_PROJECT_REFS_V2=1
 
 Do not rewrite old transcripts, notes, or knowledge entries.
 
-This phase should remain optional indefinitely. Snapshot ids improve exact
-historical resolution, but they also make refs less portable across machines
-and across retained-snapshot GC boundaries. Do not enable v2 emission by
-default unless a concrete caller needs exact snapshot refs and accepts stale-ref
-handling.
+Snapshot ids improve exact historical resolution, but they also make refs less
+portable across machines and across retained-snapshot GC boundaries. The parser
+and providers are always installed; producer emission remains gated by
+`BBOX_PROJECT_REFS_V2=1`.
 
 ### 6.4 Tests
 
@@ -693,7 +692,8 @@ Recommended shipping cuts:
    `BBOX_STORAGE_SNAPSHOTS=1`.
 5. Phase 5 migration dry-run only.
 6. Phase 5 apply after at least one release cycle of dry-run reports.
-7. Phase 6 only if exact snapshot refs prove necessary.
+7. enable Phase 6 emission with `BBOX_PROJECT_REFS_V2=1` only for callers that
+   require exact snapshot refs.
 
 ## Operational Metrics
 

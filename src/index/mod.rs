@@ -149,7 +149,8 @@ impl EdgeProjectionDoc {
     pub fn project_file_occurrence_idx(&self) -> Option<u32> {
         let entity = self.entity_id.as_deref()?;
         match crate::entity_ref::EntityRef::parse(entity).ok()? {
-            crate::entity_ref::EntityRef::ProjectFile { occurrence_idx, .. } => {
+            crate::entity_ref::EntityRef::ProjectFile { occurrence_idx, .. }
+            | crate::entity_ref::EntityRef::ProjectFileV2 { occurrence_idx, .. } => {
                 Some(occurrence_idx)
             }
             _ => None,
@@ -783,6 +784,7 @@ mod tests {
             &project,
             Path::new("/tmp/repo/src/lib.rs"),
             Some("a".repeat(40).as_str()),
+            None,
             index.field_handles(),
         );
         let mut writer = index.index_handle().writer(50_000_000).unwrap();
@@ -853,6 +855,7 @@ mod tests {
             &chunk,
             &project,
             Path::new("/tmp/repo/src/lib.rs"),
+            None,
             None,
             index.field_handles(),
         );

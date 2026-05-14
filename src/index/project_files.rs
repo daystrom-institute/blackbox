@@ -45,6 +45,43 @@ struct ProjectIndexContext<'a> {
     force_git_full: bool,
 }
 
+fn project_refs_v2_enabled() -> bool {
+    std::env::var("BBOX_PROJECT_REFS_V2")
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
+fn ref_snapshot_id(
+    project: &ProjectRecord,
+    root: &Path,
+    files: &[(String, u64, u64)],
+    commit_sha: Option<&str>,
+) -> Option<String> {
+    if !project_refs_v2_enabled() {
+        return None;
+    }
+    if let (Some(repo_id), Some(head_sha)) = (project.repo_id.as_deref(), commit_sha) {
+        return Some(crate::snapshot::clean_snapshot_id(
+            repo_id,
+            &project.project_id,
+            head_sha,
+        ));
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(root.to_string_lossy().as_bytes());
+    for (path, mtime, size) in files {
+        hasher.update(path.as_bytes());
+        hasher.update(mtime.to_le_bytes());
+        hasher.update(size.to_le_bytes());
+    }
+    let fingerprint = hex::encode(hasher.finalize());
+    Some(crate::snapshot::nongit_snapshot_id(
+        &project.project_id,
+        &fingerprint,
+    ))
+}
+
 pub(super) fn scan_registered_project_files(
     config: &ReindexConfig,
 ) -> Result<Vec<(String, u64, u64)>> {
@@ -99,9 +136,10 @@ pub(crate) fn build_project_file_doc(
     project: &ProjectRecord,
     absolute_path: &Path,
     commit_sha: Option<&str>,
+    snapshot_id: Option<&str>,
     f: FieldHandles,
 ) -> TantivyDocument {
-    let entity_id = crate::embed_queue::project_file_entity_id(chunk);
+    let entity_id = crate::embed_queue::project_file_entity_id_for_snapshot(chunk, snapshot_id);
     let mut doc = TantivyDocument::new();
     doc.add_text(f.doc_type, "project_file");
     doc.add_text(f.parser_version, entity_ref::PARSER_VERSION);
@@ -211,6 +249,7 @@ fn index_project(
     let mut pending = Vec::new();
     let mut project_edges = Vec::new();
     scan_project_files(root, &mut files)?;
+    let snapshot_id = ref_snapshot_id(project, root, &files, commit_sha.as_deref());
     for (path_str, mtime, size) in files {
         if let Some(prev) = ctx.meta.get(path_str.as_str()) {
             if prev.mtime == mtime && prev.size == size {
@@ -247,7 +286,7 @@ fn index_project(
         let rel_path = path.strip_prefix(root).unwrap_or(&path);
         let chunks = finalize_chunks(project, rel_path, chunks);
         let bounded_chunks = bound_chunks(&chunks);
-        let edges = derive_edges(&bounded_chunks, edges);
+        let edges = derive_edges(&bounded_chunks, edges, snapshot_id.as_deref());
         ctx.stats.emitted_edges += edges.len() as u64;
         project_edges.extend(edges);
         pending.push(PendingProjectFile {
@@ -259,22 +298,34 @@ fn index_project(
         });
     }
 
-    let symbol_table = build_symbol_table(&pending);
+    let symbol_table = build_symbol_table(&pending, snapshot_id.as_deref());
     let mut current_chunk_targets = HashMap::new();
     for file in pending {
-        let code_edges = derive_code_edges(&file.chunks, &symbol_table, ctx.stats);
+        let code_edges = derive_code_edges(
+            &file.chunks,
+            &symbol_table,
+            ctx.stats,
+            snapshot_id.as_deref(),
+        );
         ctx.stats.emitted_edges += code_edges.len() as u64;
         project_edges.extend(code_edges);
-        current_chunk_targets.extend(super::git_history::current_chunk_targets(&file.chunks));
+        current_chunk_targets.extend(super::git_history::current_chunk_targets(
+            &file.chunks,
+            snapshot_id.as_deref(),
+        ));
         for chunk in file.chunks {
             let doc = build_project_file_doc(
                 &chunk,
                 project,
                 &file.absolute_path,
                 commit_sha.as_deref(),
+                snapshot_id.as_deref(),
                 ctx.f,
             );
-            let entity_id = crate::embed_queue::project_file_entity_id(&chunk);
+            let entity_id = crate::embed_queue::project_file_entity_id_for_snapshot(
+                &chunk,
+                snapshot_id.as_deref(),
+            );
             crate::embed_queue::enqueue_project_file(&chunk, &entity_id);
             ctx.writer.add_document(doc)?;
             ctx.stats.indexed_docs += 1;
@@ -440,22 +491,25 @@ fn bound_chunks(chunks: &[Chunk]) -> Vec<Chunk> {
         .collect()
 }
 
-fn derive_edges(chunks: &[Chunk], mut edges: Vec<Edge>) -> Vec<Edge> {
+fn derive_edges(chunks: &[Chunk], mut edges: Vec<Edge>, snapshot_id: Option<&str>) -> Vec<Edge> {
     for pair in chunks.windows(2) {
         edges.push(Edge {
-            source: chunk_ref(&pair[0]),
+            source: chunk_ref(&pair[0], snapshot_id),
             kind: "NEXT_SECTION".to_string(),
-            target: chunk_ref(&pair[1]),
+            target: chunk_ref(&pair[1], snapshot_id),
             provenance: EdgeProvenance::Derived,
             confidence: EdgeConfidence::Exact,
         });
     }
-    // TODO(S4+): emit LINKS_TO_FILE/SECTION + EMBEDS_CODE_FENCE with resolved
-    // targets when EdgeIndex provides chunk lookup by (file, hash).
+    // Markdown file/section link extraction is separate from storage lifecycle:
+    // this pass indexes current project-file chunks and code-symbol edges.
     edges
 }
 
-fn build_symbol_table(files: &[PendingProjectFile]) -> HashMap<String, EntityRef> {
+fn build_symbol_table(
+    files: &[PendingProjectFile],
+    snapshot_id: Option<&str>,
+) -> HashMap<String, EntityRef> {
     let mut symbols = HashMap::new();
     for chunk in files.iter().flat_map(|file| file.chunks.iter()) {
         if chunk.chunk_kind != "code_block" {
@@ -464,7 +518,7 @@ fn build_symbol_table(files: &[PendingProjectFile]) -> HashMap<String, EntityRef
         let Some(qualified_name) = &chunk.symbol else {
             continue;
         };
-        let symbol = symbol_ref(chunk, qualified_name);
+        let symbol = symbol_ref(chunk, qualified_name, snapshot_id);
         symbols
             .entry(qualified_name.clone())
             .or_insert(symbol.clone());
@@ -479,15 +533,16 @@ fn derive_code_edges(
     chunks: &[Chunk],
     symbols: &HashMap<String, EntityRef>,
     stats: &mut ProjectIndexStats,
+    snapshot_id: Option<&str>,
 ) -> Vec<Edge> {
     let mut edges = Vec::new();
     for chunk in chunks
         .iter()
         .filter(|chunk| chunk.chunk_kind == "code_block")
     {
-        let file_ref = chunk_ref(chunk);
+        let file_ref = chunk_ref(chunk, snapshot_id);
         if let Some(qualified_name) = &chunk.symbol {
-            let symbol = symbol_ref(chunk, qualified_name);
+            let symbol = symbol_ref(chunk, qualified_name, snapshot_id);
             edges.push(edge(
                 symbol.clone(),
                 "DEFINED_IN",
@@ -539,7 +594,15 @@ fn edge(source: EntityRef, kind: &str, target: EntityRef, confidence: EdgeConfid
     }
 }
 
-fn symbol_ref(chunk: &Chunk, qualified_name: &str) -> EntityRef {
+fn symbol_ref(chunk: &Chunk, qualified_name: &str, snapshot_id: Option<&str>) -> EntityRef {
+    if let Some(snapshot_id) = snapshot_id {
+        return EntityRef::SymbolV2 {
+            project_id: chunk.project_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            qualified_name: qualified_name.to_string(),
+            defn_hash: chunk.chunk_hash.clone(),
+        };
+    }
     EntityRef::Symbol {
         project_id: chunk.project_id.clone(),
         qualified_name: qualified_name.to_string(),
@@ -701,7 +764,16 @@ const CALL_KEYWORDS: &[&str] = &[
     "yield",
 ];
 
-fn chunk_ref(chunk: &Chunk) -> EntityRef {
+fn chunk_ref(chunk: &Chunk, snapshot_id: Option<&str>) -> EntityRef {
+    if let Some(snapshot_id) = snapshot_id {
+        return EntityRef::ProjectFileV2 {
+            project_id: chunk.project_id.clone(),
+            snapshot_id: snapshot_id.to_string(),
+            rel_path_hash: chunk.rel_path_hash.clone(),
+            chunk_hash: chunk.chunk_hash.clone(),
+            occurrence_idx: chunk.occurrence_idx,
+        };
+    }
     EntityRef::ProjectFile {
         project_id: chunk.project_id.clone(),
         rel_path_hash: chunk.rel_path_hash.clone(),
@@ -835,6 +907,7 @@ mod tests {
             &project,
             Path::new("/tmp/repo/design/agentic-corpus.md"),
             Some(commit_sha.as_str()),
+            None,
             fields,
         );
 
@@ -845,6 +918,55 @@ mod tests {
         assert_eq!(
             first_text(&doc, fields.entity_id),
             format!("project_file:proj1234:abcd1234:{}:0", "f".repeat(64))
+        );
+    }
+
+    #[test]
+    fn project_file_doc_can_emit_snapshot_specific_entity_id() {
+        let (_schema, fields) = build_schema();
+        let project = ProjectRecord {
+            project_id: "proj1234".into(),
+            repo_id: Some("repo1234".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+        };
+        let chunk = Chunk {
+            project_id: "proj1234".into(),
+            file_path: PathBuf::from("src/lib.rs"),
+            rel_path_hash: "abcd1234".into(),
+            chunk_kind: "code_block".into(),
+            chunk_hash: "f".repeat(64),
+            occurrence_idx: 3,
+            language: Some("rust".into()),
+            symbol: Some("helper".into()),
+            symbol_exact: Some("crate::helper".into()),
+            symbol_kind: Some("function".into()),
+            parent_kind: None,
+            line_start: Some(1),
+            line_end: Some(4),
+            content: "fn helper() {}".into(),
+            byte_start: 0,
+            byte_end: 14,
+        };
+
+        let commit_sha = "a".repeat(40);
+        let doc = build_project_file_doc(
+            &chunk,
+            &project,
+            Path::new("/tmp/repo/src/lib.rs"),
+            Some(commit_sha.as_str()),
+            Some("head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            fields,
+        );
+
+        assert_eq!(
+            first_text(&doc, fields.entity_id),
+            format!(
+                "project_file_v2:proj1234:head-repo1234-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:abcd1234:{}:3",
+                "f".repeat(64)
+            )
         );
     }
 
@@ -902,9 +1024,9 @@ mod tests {
             size: 39,
             chunks,
         }];
-        let symbols = build_symbol_table(&pending);
+        let symbols = build_symbol_table(&pending, None);
         let mut stats = ProjectIndexStats::default();
-        let edges = derive_code_edges(&pending[0].chunks, &symbols, &mut stats);
+        let edges = derive_code_edges(&pending[0].chunks, &symbols, &mut stats, None);
         assert!(edges.iter().any(|edge| edge.kind == "CALLS"));
         assert!(stats.call_edges >= 1);
         assert_eq!(stats.resolved_call_edges, stats.call_edges);
@@ -964,9 +1086,9 @@ mod tests {
             size: 72,
             chunks,
         }];
-        let symbols = build_symbol_table(&pending);
+        let symbols = build_symbol_table(&pending, None);
         let mut stats = ProjectIndexStats::default();
-        let edges = derive_code_edges(&pending[0].chunks, &symbols, &mut stats);
+        let edges = derive_code_edges(&pending[0].chunks, &symbols, &mut stats, None);
 
         assert!(edges.iter().any(|edge| edge.kind == "IMPLEMENTS_TRAIT"));
         assert!(!edges.iter().any(|edge| edge.kind == "IMPORTS"));

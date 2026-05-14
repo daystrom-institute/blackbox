@@ -129,10 +129,14 @@ pub fn write_dirty_overlay(
     let mut covered_hashes = std::collections::HashSet::new();
     for (_filename, edges) in files {
         for edge in *edges {
-            if let EntityRef::ProjectFile { rel_path_hash, .. } = &edge.source {
+            if let EntityRef::ProjectFile { rel_path_hash, .. }
+            | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.source
+            {
                 covered_hashes.insert(rel_path_hash.clone());
             }
-            if let EntityRef::ProjectFile { rel_path_hash, .. } = &edge.target {
+            if let EntityRef::ProjectFile { rel_path_hash, .. }
+            | EntityRef::ProjectFileV2 { rel_path_hash, .. } = &edge.target
+            {
                 covered_hashes.insert(rel_path_hash.clone());
             }
         }

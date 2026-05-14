@@ -106,7 +106,10 @@ fn resolve_target(
         .filter(|value| !value.trim().is_empty())
     {
         let r = EntityRef::parse(entity_ref)?;
-        if !matches!(r, EntityRef::ProjectFile { .. }) {
+        if !matches!(
+            r,
+            EntityRef::ProjectFile { .. } | EntityRef::ProjectFileV2 { .. }
+        ) {
             bail!("entity_ref must be a project_file ref");
         }
         let entity = entity_loader::load(ctx, &r)
