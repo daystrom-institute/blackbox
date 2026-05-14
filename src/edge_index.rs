@@ -51,10 +51,11 @@ impl Edge {
 
 #[derive(Default)]
 pub struct EdgeIndex {
-    forward: HashMap<EntityRef, Vec<Edge>>,
-    reverse: HashMap<EntityRef, Vec<Edge>>,
-    commit_anchor_index: HashMap<String, Vec<Edge>>,
-    session_tool_calls: HashMap<(String, String), Vec<Edge>>,
+    edges: Vec<Edge>,
+    forward: HashMap<EntityRef, Vec<usize>>,
+    reverse: HashMap<EntityRef, Vec<usize>>,
+    commit_anchor_index: HashMap<String, Vec<usize>>,
+    session_tool_calls: HashMap<(String, String), Vec<usize>>,
 }
 
 pub struct EdgeStoreRefs<'a> {
@@ -160,19 +161,33 @@ impl EdgeIndex {
     }
 
     #[allow(dead_code)]
-    pub fn forward_edges(&self, source: &EntityRef) -> &[Edge] {
-        self.forward.get(source).map(Vec::as_slice).unwrap_or(&[])
+    pub fn forward_edges(&self, source: &EntityRef) -> Vec<&Edge> {
+        let Some(indices) = self.forward.get(source) else {
+            return Vec::new();
+        };
+        let mut edges = Vec::with_capacity(indices.len());
+        for edge_id in indices {
+            edges.push(&self.edges[*edge_id]);
+        }
+        edges
     }
 
     #[allow(dead_code)]
-    pub fn reverse_edges(&self, target: &EntityRef) -> &[Edge] {
-        self.reverse.get(target).map(Vec::as_slice).unwrap_or(&[])
+    pub fn reverse_edges(&self, target: &EntityRef) -> Vec<&Edge> {
+        let Some(indices) = self.reverse.get(target) else {
+            return Vec::new();
+        };
+        let mut edges = Vec::with_capacity(indices.len());
+        for edge_id in indices {
+            edges.push(&self.edges[*edge_id]);
+        }
+        edges
     }
 
     #[allow(dead_code)]
     pub fn forward_edges_filtered(&self, source: &EntityRef, kinds: &[&str]) -> Vec<&Edge> {
         self.forward_edges(source)
-            .iter()
+            .into_iter()
             .filter(|edge| kinds.iter().any(|kind| *kind == edge.kind))
             .collect()
     }
@@ -180,13 +195,13 @@ impl EdgeIndex {
     #[allow(dead_code)]
     pub fn reverse_edges_filtered(&self, target: &EntityRef, kinds: &[&str]) -> Vec<&Edge> {
         self.reverse_edges(target)
-            .iter()
+            .into_iter()
             .filter(|edge| kinds.iter().any(|kind| *kind == edge.kind))
             .collect()
     }
 
     pub fn edge_count(&self) -> usize {
-        self.forward.values().map(Vec::len).sum()
+        self.edges.len()
     }
 
     pub fn known_refs(&self) -> Vec<EntityRef> {
@@ -212,20 +227,32 @@ impl EdgeIndex {
     }
 
     pub(crate) fn all_edges(&self) -> impl Iterator<Item = &Edge> {
-        self.forward.values().flat_map(|edges| edges.iter())
+        self.edges.iter()
     }
 
     pub(crate) fn edges_with_anchor_commit(&self, commit_sha: &str) -> Vec<&Edge> {
         self.commit_anchor_index
             .get(commit_sha)
-            .map(|edges| edges.iter().collect())
+            .map(|indices| {
+                let mut edges = Vec::with_capacity(indices.len());
+                for edge_id in indices {
+                    edges.push(&self.edges[*edge_id]);
+                }
+                edges
+            })
             .unwrap_or_default()
     }
 
     pub(crate) fn session_tool_call_edges(&self, provider: &str, session_id: &str) -> Vec<&Edge> {
         self.session_tool_calls
             .get(&(provider.to_string(), session_id.to_string()))
-            .map(|edges| edges.iter().collect())
+            .map(|indices| {
+                let mut edges = Vec::with_capacity(indices.len());
+                for edge_id in indices {
+                    edges.push(&self.edges[*edge_id]);
+                }
+                edges
+            })
             .unwrap_or_default()
     }
 
@@ -233,12 +260,15 @@ impl EdgeIndex {
         if !seen.insert(edge.dedup_key()) {
             return;
         }
+        let edge_id = self.edges.len();
+        self.edges.push(edge);
+        let edge = &self.edges[edge_id];
         if edge.kind == "EDITED_FILE" {
             if let Some(commit_sha) = edge.metadata.get("anchor.commit_sha_at_edit") {
                 self.commit_anchor_index
                     .entry(commit_sha.clone())
                     .or_default()
-                    .push(edge.clone());
+                    .push(edge_id);
             }
         }
         if matches!(edge.kind.as_str(), "EDITED_FILE" | "READ_FILE" | "RAN_BASH") {
@@ -251,17 +281,17 @@ impl EdgeIndex {
                 self.session_tool_calls
                     .entry((provider.clone(), session_id.clone()))
                     .or_default()
-                    .push(edge.clone());
+                    .push(edge_id);
             }
         }
         self.reverse
             .entry(edge.target.clone())
             .or_default()
-            .push(edge.clone());
+            .push(edge_id);
         self.forward
             .entry(edge.source.clone())
             .or_default()
-            .push(edge);
+            .push(edge_id);
     }
 
     #[cfg(test)]

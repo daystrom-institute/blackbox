@@ -51,11 +51,17 @@ pub fn blame(
     let session = selected.and_then(session_from_edge);
     let brofiles = session
         .as_ref()
-        .map(|session| edge_targets(edge_index.forward_edges(session), "SESSION_USED_BROFILE"))
+        .map(|session| {
+            let edges = edge_index.forward_edges(session);
+            edge_targets(&edges, "SESSION_USED_BROFILE")
+        })
         .unwrap_or_default();
     let threads = session
         .as_ref()
-        .map(|session| edge_sources(edge_index.reverse_edges(session), "THREAD_HAS_SESSION"))
+        .map(|session| {
+            let edges = edge_index.reverse_edges(session);
+            edge_sources(&edges, "THREAD_HAS_SESSION")
+        })
         .unwrap_or_default();
     let text = render_text(RenderInput {
         target: &target,
@@ -259,7 +265,7 @@ fn session_from_edge(edge: &Edge) -> Option<EntityRef> {
     })
 }
 
-fn edge_targets(edges: &[Edge], kind: &str) -> Vec<EntityRef> {
+fn edge_targets(edges: &[&Edge], kind: &str) -> Vec<EntityRef> {
     edges
         .iter()
         .filter(|edge| edge.kind == kind)
@@ -267,7 +273,7 @@ fn edge_targets(edges: &[Edge], kind: &str) -> Vec<EntityRef> {
         .collect()
 }
 
-fn edge_sources(edges: &[Edge], kind: &str) -> Vec<EntityRef> {
+fn edge_sources(edges: &[&Edge], kind: &str) -> Vec<EntityRef> {
     edges
         .iter()
         .filter(|edge| edge.kind == kind)

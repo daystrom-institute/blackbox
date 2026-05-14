@@ -140,8 +140,16 @@ fn notable_edges(
     edge_index: &EdgeIndex,
     entity_ref: &EntityRef,
 ) -> Vec<NotableEdge> {
-    let forward = edge_index.forward_edges(entity_ref).to_vec();
-    let reverse = edge_index.reverse_edges(entity_ref).to_vec();
+    let forward = edge_index
+        .forward_edges(entity_ref)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let reverse = edge_index
+        .reverse_edges(entity_ref)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
     if forward.is_empty() && reverse.is_empty() {
         return Vec::new();
     }

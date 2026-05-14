@@ -212,8 +212,8 @@ fn parse_edge_filter(raw: Option<&str>) -> Option<HashSet<String>> {
 
 fn full_neighborhood(edge_index: &EdgeIndex, r: &EntityRef) -> Neighborhood {
     Neighborhood {
-        forward: edge_index.forward_edges(r).to_vec(),
-        reverse: edge_index.reverse_edges(r).to_vec(),
+        forward: edge_index.forward_edges(r).into_iter().cloned().collect(),
+        reverse: edge_index.reverse_edges(r).into_iter().cloned().collect(),
     }
 }
 
