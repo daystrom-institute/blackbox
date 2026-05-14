@@ -1,7 +1,7 @@
 # System Events — Implementation Plan
 
 Date: 2026-05-13
-Status: design proposal v1 implementation plan
+Status: shipped
 Companion to: [System Events](system-events.md)
 
 Related:

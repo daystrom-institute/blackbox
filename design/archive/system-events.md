@@ -1,7 +1,7 @@
 # System Events
 
 Date: 2026-05-13
-Status: design proposal v1
+Status: shipped
 
 Related:
 - [WORKFLOWS](../../WORKFLOWS.md) - current workflow hooks, inbound
