@@ -13,7 +13,10 @@ use serde_json::{Map, Value};
 pub struct NoteParams {
     /// One of: dispute, assumption, surprise, followup, blocked, learned, done
     pub kind: String,
-    /// Short note body (1–3 sentences)
+    /// Short note body (1–3 sentences). For substrate gap reports, pass a
+    /// `blackbox.gap_note.v1` JSON object here with `kind="followup"`; required
+    /// fields are `type`, `title`, `gap_kind`, `domain`, and
+    /// `wanted_capability`.
     pub body: String,
     /// Dispatch task ID — copy from the `task:` value in the ambient
     /// [scope] prefix to link this note to the dispatch. Stable across
@@ -200,6 +203,25 @@ const GAP_NOTE_FIELD_BLOCKING_LEVEL: &str = "blocking_level";
 const GAP_NOTE_FIELD_DEDUPE_KEY: &str = "dedupe_key";
 const GAP_NOTE_FIELD_WANTED_CAPABILITY: &str = "wanted_capability";
 
+const GAP_NOTE_KINDS: &[&str] = &[
+    "packet_ast",
+    "tooling",
+    "agent",
+    "workflow",
+    "refactor_primitive",
+    "mcp_surface",
+    "ontology",
+    "eval_coverage",
+    "docs_runbook",
+];
+const GAP_NOTE_IMPACTS: &[&str] = &["low", "medium", "high", "critical"];
+const GAP_NOTE_BLOCKING_LEVELS: &[&str] = &[
+    "none",
+    "workaround_available",
+    "blocks_task",
+    "blocks_class_of_work",
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum GapImpact {
     Low,
@@ -323,6 +345,94 @@ fn string_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<St
         .map(ToOwned::to_owned)
 }
 
+fn validate_gap_note_submission(kind: NoteKind, body: &str) -> Result<()> {
+    let trimmed = body.trim();
+    let mentions_gap_note = trimmed.contains(GAP_NOTE_TYPE);
+    let parsed = match serde_json::from_str::<Value>(trimmed) {
+        Ok(value) => value,
+        Err(err) => {
+            if mentions_gap_note {
+                anyhow::bail!("invalid {GAP_NOTE_TYPE} JSON body: {err}");
+            }
+            return Ok(());
+        }
+    };
+
+    let Some(object) = parsed.as_object() else {
+        if mentions_gap_note {
+            anyhow::bail!("{GAP_NOTE_TYPE} body must be a JSON object");
+        }
+        return Ok(());
+    };
+
+    let Some(note_type) = object.get(GAP_NOTE_FIELD_TYPE).and_then(Value::as_str) else {
+        if mentions_gap_note {
+            anyhow::bail!("{GAP_NOTE_TYPE} body must include `type`");
+        }
+        return Ok(());
+    };
+
+    if note_type != GAP_NOTE_TYPE {
+        return Ok(());
+    }
+    if kind != NoteKind::Followup {
+        anyhow::bail!("{GAP_NOTE_TYPE} reports must use kind=\"followup\"");
+    }
+
+    let required = [
+        GAP_NOTE_FIELD_TITLE,
+        GAP_NOTE_FIELD_GAP_KIND,
+        GAP_NOTE_FIELD_DOMAIN,
+        GAP_NOTE_FIELD_WANTED_CAPABILITY,
+    ];
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|field| string_field(object, field).is_none())
+        .collect();
+    if !missing.is_empty() {
+        anyhow::bail!(
+            "{GAP_NOTE_TYPE} missing required field(s): {}",
+            missing.join(", ")
+        );
+    }
+
+    validate_gap_note_enum(object, GAP_NOTE_FIELD_GAP_KIND, GAP_NOTE_KINDS)?;
+    validate_gap_note_enum(object, GAP_NOTE_FIELD_IMPACT, GAP_NOTE_IMPACTS)?;
+    validate_gap_note_enum(
+        object,
+        GAP_NOTE_FIELD_BLOCKING_LEVEL,
+        GAP_NOTE_BLOCKING_LEVELS,
+    )?;
+
+    if let Some(dedupe_key) = string_field(object, GAP_NOTE_FIELD_DEDUPE_KEY) {
+        let segments: Vec<&str> = dedupe_key.split('/').collect();
+        if segments.len() < 3 || segments.iter().any(|segment| segment.trim().is_empty()) {
+            anyhow::bail!("{GAP_NOTE_TYPE} dedupe_key must use `<gap_kind>/<domain>/<slug>`");
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_gap_note_enum(
+    object: &serde_json::Map<String, Value>,
+    field: &str,
+    allowed: &[&str],
+) -> Result<()> {
+    let Some(value) = string_field(object, field) else {
+        return Ok(());
+    };
+    if allowed.contains(&value.as_str()) {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "{GAP_NOTE_TYPE} field `{field}` must be one of: {}",
+            allowed.join(", ")
+        )
+    }
+}
+
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
@@ -433,6 +543,7 @@ impl Notes {
         if p.body.trim().is_empty() {
             anyhow::bail!("'body' is required and cannot be empty");
         }
+        validate_gap_note_submission(kind, &p.body)?;
 
         let now = Self::now_iso();
         let id = Self::gen_id();
@@ -805,6 +916,107 @@ mod tests {
         let view = GapNoteView::parse(&note).unwrap();
 
         assert_eq!(view.impact, GapImpact::Medium);
+    }
+
+    #[test]
+    fn create_accepts_valid_gap_note_followup() {
+        let (_tmp, mut notes) = mk_store();
+        let body = serde_json::json!({
+            "type": "blackbox.gap_note.v1",
+            "title": "Need section extract",
+            "gap_kind": "refactor_primitive",
+            "domain": "rust",
+            "wanted_capability": "Extract a bounded Rust section.",
+            "impact": "high",
+            "blocking_level": "workaround_available",
+            "dedupe_key": "refactor_primitive/rust/section-extract"
+        })
+        .to_string();
+
+        notes
+            .create(&NoteParams {
+                kind: "followup".into(),
+                body,
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn create_rejects_malformed_gap_note_body() {
+        let (_tmp, mut notes) = mk_store();
+        let err = notes
+            .create(&NoteParams {
+                kind: "followup".into(),
+                body: r#"{"type":"blackbox.gap_note.v1""#.into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid blackbox.gap_note.v1 JSON body"));
+    }
+
+    #[test]
+    fn create_rejects_gap_note_missing_required_fields() {
+        let (_tmp, mut notes) = mk_store();
+        let err = notes
+            .create(&NoteParams {
+                kind: "followup".into(),
+                body: r#"{"type":"blackbox.gap_note.v1","title":"Need thing"}"#.into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("missing required field"));
+        assert!(err.contains("gap_kind"));
+        assert!(err.contains("domain"));
+        assert!(err.contains("wanted_capability"));
+    }
+
+    #[test]
+    fn create_rejects_gap_note_with_wrong_kind() {
+        let (_tmp, mut notes) = mk_store();
+        let body = serde_json::json!({
+            "type": "blackbox.gap_note.v1",
+            "title": "Need section extract",
+            "gap_kind": "refactor_primitive",
+            "domain": "rust",
+            "wanted_capability": "Extract a bounded Rust section."
+        })
+        .to_string();
+
+        let err = notes
+            .create(&NoteParams {
+                kind: "surprise".into(),
+                body,
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("must use kind=\"followup\""));
     }
 
     #[test]
