@@ -200,6 +200,19 @@ fn allocator_status_runtime_request(
     exec_params_runtime_request(&exec_like, None)
 }
 
+fn parse_allocator_probe_enum<T>(field: &str, value: &Option<String>) -> Result<Option<T>, String>
+where
+    T: serde::de::DeserializeOwned,
+{
+    value
+        .as_ref()
+        .map(|value| {
+            serde_json::from_value::<T>(serde_json::Value::String(value.clone()))
+                .map_err(|_| format!("error.bad_probe_state: invalid {field} value `{value}`"))
+        })
+        .transpose()
+}
+
 impl BlackboxServer {
     pub(crate) fn dispatch_fresh_bro_task(
         &self,
@@ -696,6 +709,118 @@ impl BlackboxServer {
                 p.selection_trace_id
             )),
         }
+    }
+
+    #[tool(
+        name = "bro_allocator_probe",
+        description = "Read, update, or clear allocator probe state for a provider/account lane."
+    )]
+    pub(crate) fn bro_allocator_probe(
+        &self,
+        Parameters(p): Parameters<AllocatorProbeParams>,
+    ) -> CallToolResult {
+        let provider = match p.provider.parse::<Provider>() {
+            Ok(provider) => provider,
+            Err(_) => return Self::err_text(&format!("Unknown provider: {}", p.provider)),
+        };
+        let lane_key = format!(
+            "{}:{}",
+            provider.as_str(),
+            p.account.as_deref().unwrap_or("default")
+        );
+        let mut probes = orchestration::allocator::probe_store_load(&self.state.store_dir);
+        if p.clear == Some(true) {
+            let removed = probes.records.remove(&lane_key);
+            orchestration::allocator::probe_store_save(&self.state.store_dir, &probes);
+            return Self::ok_json(&json!({
+                "lane_key": lane_key,
+                "cleared": removed.is_some(),
+                "probe": serde_json::Value::Null,
+            }));
+        }
+
+        let credential_status = match parse_allocator_probe_enum::<
+            orchestration::allocator::CredentialStatus,
+        >("credential_status", &p.credential_status)
+        {
+            Ok(status) => status,
+            Err(err) => return Self::err_text(&err),
+        };
+        let quota_status = match parse_allocator_probe_enum::<orchestration::allocator::QuotaStatus>(
+            "quota_status",
+            &p.quota_status,
+        ) {
+            Ok(status) => status,
+            Err(err) => return Self::err_text(&err),
+        };
+        let quota_confidence = match parse_allocator_probe_enum::<
+            orchestration::allocator::QuotaConfidence,
+        >("quota_confidence", &p.quota_confidence)
+        {
+            Ok(confidence) => confidence,
+            Err(err) => return Self::err_text(&err),
+        };
+        let has_update = credential_status.is_some()
+            || quota_status.is_some()
+            || quota_confidence.is_some()
+            || p.five_hour_utilization.is_some()
+            || p.seven_day_utilization.is_some()
+            || p.balance_capacity.is_some()
+            || p.cooldown_until.is_some()
+            || p.cooldown_ms.is_some()
+            || p.raw_summary.is_some();
+        if has_update {
+            let now = orchestration::now_ms();
+            let record = probes.records.entry(lane_key.clone()).or_insert_with(|| {
+                orchestration::allocator::ProbeRecord {
+                    provider,
+                    account: p.account.clone(),
+                    credential_status: Default::default(),
+                    quota_status: Default::default(),
+                    quota_confidence: Default::default(),
+                    five_hour_utilization: None,
+                    seven_day_utilization: None,
+                    balance_capacity: None,
+                    cooldown_until: None,
+                    last_probe_at: None,
+                    last_runtime_observation_at: None,
+                    raw_summary: None,
+                }
+            });
+            if let Some(status) = credential_status {
+                record.credential_status = status;
+            }
+            if let Some(status) = quota_status {
+                record.quota_status = status;
+            }
+            if let Some(confidence) = quota_confidence {
+                record.quota_confidence = confidence;
+            }
+            if p.five_hour_utilization.is_some() {
+                record.five_hour_utilization = p.five_hour_utilization;
+            }
+            if p.seven_day_utilization.is_some() {
+                record.seven_day_utilization = p.seven_day_utilization;
+            }
+            if p.balance_capacity.is_some() {
+                record.balance_capacity = p.balance_capacity;
+            }
+            if let Some(until) = p.cooldown_until {
+                record.cooldown_until = Some(until);
+            } else if let Some(ms) = p.cooldown_ms {
+                record.cooldown_until = Some(now.saturating_add(ms));
+            }
+            if p.raw_summary.is_some() {
+                record.raw_summary = p.raw_summary;
+            }
+            record.last_probe_at = Some(now);
+            orchestration::allocator::probe_store_save(&self.state.store_dir, &probes);
+        }
+        let probe = probes.records.get(&lane_key).cloned();
+        Self::ok_json(&json!({
+            "lane_key": lane_key,
+            "probe": probe,
+        }))
     }
 
     #[tool(

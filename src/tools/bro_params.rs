@@ -367,6 +367,46 @@ pub(crate) struct AllocatorTraceParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AllocatorProbeParams {
+    /// Provider alias whose allocator probe state should be read or updated.
+    pub(crate) provider: String,
+    /// Optional account name; omitted means the provider default lane.
+    #[serde(default)]
+    pub(crate) account: Option<String>,
+    /// Remove this provider/account probe record.
+    #[serde(default)]
+    pub(crate) clear: Option<bool>,
+    /// Credential status: present, missing, expired, or unknown.
+    #[serde(default)]
+    pub(crate) credential_status: Option<String>,
+    /// Quota status: known, exhausted, probe_failed, or unknown.
+    #[serde(default)]
+    pub(crate) quota_status: Option<String>,
+    /// Quota confidence: quota_probe, runtime_rate_limit, payg_balance,
+    /// active_acceptance, credential_only, or none.
+    #[serde(default)]
+    pub(crate) quota_confidence: Option<String>,
+    /// Fractional 5-hour quota utilization, where 1.0 means exhausted.
+    #[serde(default)]
+    pub(crate) five_hour_utilization: Option<f64>,
+    /// Fractional 7-day quota utilization, where 1.0 means exhausted.
+    #[serde(default)]
+    pub(crate) seven_day_utilization: Option<f64>,
+    /// Fractional PAYG/balance capacity, where 1.0 means fully available.
+    #[serde(default)]
+    pub(crate) balance_capacity: Option<f64>,
+    /// Absolute cooldown deadline in epoch milliseconds.
+    #[serde(default)]
+    pub(crate) cooldown_until: Option<u64>,
+    /// Relative cooldown duration in milliseconds from now.
+    #[serde(default)]
+    pub(crate) cooldown_ms: Option<u64>,
+    /// Short raw probe or observation summary for audit/debugging.
+    #[serde(default)]
+    pub(crate) raw_summary: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct DashboardParams {
     #[serde(default)]
     pub(crate) provider: Option<String>,

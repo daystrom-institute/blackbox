@@ -704,6 +704,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bro_allocator_trace(selection_trace_id="alloc-0123abcd")"#),
     },
     ToolDoc {
+        name: "bro_allocator_probe",
+        category: ToolCategory::Orchestration,
+        summary: "Read, update, or clear allocator probe state for a provider/account lane.",
+        when_to_use: "Use to record credential, quota, cooldown, and probe-confidence observations consumed by allocator scoring and bro_allocator_status previews. This mutates allocator/probes.json; use bro_allocator_status for read-only inspection.",
+        example: Some(
+            r#"bro_allocator_probe(provider="codex", quota_status="exhausted", quota_confidence="runtime_rate_limit", cooldown_ms=300000)"#,
+        ),
+    },
+    ToolDoc {
         name: "badgey_exec",
         category: ToolCategory::Orchestration,
         summary: "Start a Badgey consultant instance for a project scope and return its badgey_id, provider session, task, and thread-of-record ids.",
