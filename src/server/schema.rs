@@ -61,13 +61,17 @@ impl BlackboxServer {
             return Vec::new();
         };
         let registry = AgentRegistry::new(&catalog);
-        let filter = orchestration::agents::registry::ListFilter::default();
-        let Ok(summaries) = registry.list(&filter) else {
+        let params = artifacts::ArtifactListParams {
+            kind: Some(artifacts::ArtifactKind::Agent),
+            name: None,
+            include_superseded: false,
+        };
+        let Ok(entries) = catalog.list(&params) else {
             return Vec::new();
         };
-        summaries
+        entries
             .into_iter()
-            .filter(|s| s.active)
+            .filter(|entry| entry.active)
             .filter_map(|s| {
                 let (manifest, _) = registry.load_manifest_degraded(&s.name);
                 let manifest = manifest?;
