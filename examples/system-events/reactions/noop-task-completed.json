@@ -1,0 +1,23 @@
+{
+  "_contract": "reaction/v1",
+  "name": "noop-task-completed",
+  "version": 1,
+  "enabled": true,
+  "event_kinds": ["task.completed"],
+  "action": {
+    "op": "emit_event",
+    "args": {
+      "kind": "task.completed",
+      "producer": "noop-task-completed",
+      "payload": {
+        "echo": "${event.id}",
+        "source_producer": "${event.producer}"
+      }
+    }
+  },
+  "retry": {
+    "max_attempts": 1,
+    "backoff": "exponential"
+  },
+  "on_failure": "dead_letter"
+}

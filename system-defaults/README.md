@@ -10,6 +10,7 @@ The daemon does not auto-install this tree. Install only the defaults you want:
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/workflows/atoms/echo-review.json")
+bbox_artifact_install(kind="cron", source="system-defaults/maintenance/crons/daily-compaction.json")
 bbox_compile(path="system-defaults/mcp-surfaces/routing.json", scope="global")
 ```
 
@@ -23,6 +24,7 @@ bbox_compile(path="system-defaults/mcp-surfaces/routing.json", scope="global")
 | `brofiles/` | Personas used by default atoms and legacy agents. |
 | `badgey/` | Badgey manifests, brofiles, workflows, packets, and crons. |
 | `agentic-corpus/` | Producer-side knowledge/index maintenance workflows, packets, brofiles, and crons. |
+| `maintenance/` | Cross-store maintenance workflows, packets, and crons such as daily compaction. |
 | `mcp-surfaces/` | Default MCP surface routing packet. |
 
 `examples/` is now reserved for tutorial specs, skills, and full integration

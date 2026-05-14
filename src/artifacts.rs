@@ -20,6 +20,7 @@ pub enum ArtifactKind {
     Agent,
     Atom,
     Team,
+    Cron,
 }
 
 impl ArtifactKind {
@@ -31,6 +32,7 @@ impl ArtifactKind {
             Self::Agent => "agent",
             Self::Atom => "atom",
             Self::Team => "team",
+            Self::Cron => "cron",
         }
     }
 }
@@ -355,6 +357,7 @@ impl ArtifactCatalog {
                 ArtifactKind::Agent,
                 ArtifactKind::Atom,
                 ArtifactKind::Team,
+                ArtifactKind::Cron,
             ],
         };
         for kind in kinds {
@@ -1093,6 +1096,7 @@ pub fn artifact_kind_from_dir_pub(component: &str) -> Option<ArtifactKind> {
         "agents" => Some(ArtifactKind::Agent),
         "atoms" => Some(ArtifactKind::Atom),
         "teams" => Some(ArtifactKind::Team),
+        "crons" => Some(ArtifactKind::Cron),
         _ => None,
     }
 }
@@ -1103,7 +1107,8 @@ fn artifact_name(kind: ArtifactKind, value: &Value) -> Option<String> {
         | ArtifactKind::Brofile
         | ArtifactKind::Agent
         | ArtifactKind::Atom
-        | ArtifactKind::Team => value.get("name")?.as_str().map(str::to_string),
+        | ArtifactKind::Team
+        | ArtifactKind::Cron => value.get("name")?.as_str().map(str::to_string),
         ArtifactKind::Packet => value.get("domain")?.as_str().map(str::to_string),
     }
 }
@@ -1602,7 +1607,14 @@ mod tests {
         let bbox = dir.path().join(".bbox");
 
         // committed
-        for subdir in &["brofiles", "workflows", "packets", "agents", "teams"] {
+        for subdir in &[
+            "brofiles",
+            "workflows",
+            "packets",
+            "agents",
+            "teams",
+            "crons",
+        ] {
             let d = bbox.join(subdir);
             fs::create_dir_all(&d).unwrap();
             fs::write(d.join("artifact.json"), "{}").unwrap();
@@ -1621,8 +1633,8 @@ mod tests {
         let local_count = discovered.iter().filter(|d| d.local).count();
 
         assert_eq!(
-            committed_count, 5,
-            "should find one committed artifact per kind dir (brofiles/workflows/packets/agents/teams)"
+            committed_count, 6,
+            "should find one committed artifact per kind dir (brofiles/workflows/packets/agents/teams/crons)"
         );
         assert_eq!(local_count, 2, "should find 2 local artifacts");
 
@@ -1631,6 +1643,11 @@ mod tests {
             discovered
                 .iter()
                 .any(|d| d.kind == ArtifactKind::Team && !d.local)
+        );
+        assert!(
+            discovered
+                .iter()
+                .any(|d| d.kind == ArtifactKind::Cron && !d.local)
         );
     }
 

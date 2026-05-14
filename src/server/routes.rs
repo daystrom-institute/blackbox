@@ -987,6 +987,19 @@ pub(crate) async fn install_artifact_value(
         artifacts::ArtifactKind::Team => {
             // Teams are stored as artifacts but have no additional validation at install time.
         }
+        artifacts::ArtifactKind::Cron => {
+            let spec: crons::CronSpec = serde_json::from_value(value.clone())?;
+            crons::validate_schedule(&spec.schedule)?;
+            let dir = state.store_dir.join("crons");
+            std::fs::create_dir_all(&dir)?;
+            std::fs::write(
+                dir.join(format!("{}.json", spec.name)),
+                serde_json::to_string_pretty(&spec).unwrap_or_default(),
+            )?;
+            state.crons.install(spec.clone());
+            let handle = crons::spawn_loop(state.clone(), spec.clone());
+            state.crons.track_handle(&spec.name, handle);
+        }
         artifacts::ArtifactKind::Agent => {
             if !value.is_object() {
                 anyhow::bail!("agent artifact must be a JSON object");
@@ -1225,6 +1238,15 @@ pub(crate) fn deactivate_artifact(
         }
         artifacts::ArtifactKind::Team => {
             // Teams are stored purely as artifacts; no separate registry to deactivate.
+        }
+        artifacts::ArtifactKind::Cron => {
+            state.crons.remove(name);
+            let path = state.store_dir.join("crons").join(format!("{name}.json"));
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err.into()),
+            }
         }
     }
     Ok(())

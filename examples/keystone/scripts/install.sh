@@ -85,8 +85,20 @@ team_body=$(jq -nc \
 post_admin /admin/team/upsert "${team_body}" >/dev/null
 
 # ── 3. Workflows ─────────────────────────────────────────────
+# Base set (env.FORGEJO_TOKEN auth) and identity extension (per-bro
+# Forgejo identities via require_identity + secret_headers). The base
+# set must remain installed even when the identity extension is in use
+# because issue-to-merged-pr-with-identity reuses implementer-feedback-arc
+# unchanged (no Forgejo HTTP surface to identity-extend).
 log "installing workflow specs"
-for wf in implementer-arc implementer-feedback-arc reviewer-arc issue-to-merged-pr; do
+for wf in \
+    implementer-arc \
+    implementer-feedback-arc \
+    reviewer-arc \
+    issue-to-merged-pr \
+    implementer-arc-with-identity \
+    reviewer-arc-with-identity \
+    issue-to-merged-pr-with-identity; do
     file="${ROOT}/workflows/${wf}.json"
     log "  ${wf}"
     body=$(jq -nc --arg id "${wf}" --slurpfile spec "${file}" \

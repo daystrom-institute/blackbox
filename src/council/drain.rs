@@ -273,6 +273,7 @@ async fn process_envelope(
         shared.tail_tx.clone(),
         None,
         None,
+        Some(shared.system_events.clone()),
     );
     task.inner.lock().bro_label = Some(format!("{}::{}", council_id, bro_id));
     crate::cleanup_policy_file_when_done(task.clone(), dispatch._policy_file);

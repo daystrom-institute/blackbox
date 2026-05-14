@@ -757,6 +757,10 @@ pub struct SpawnTaskParams {
     pub tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     pub bro_label: Option<String>,
     pub agent_label: Option<String>,
+    /// System event hub for emitting task lifecycle events. Task events
+    /// are observation-only: emit failures are logged but do not affect
+    /// task dispatch.
+    pub system_events: Option<crate::system_events::SharedEventHub>,
 }
 
 pub fn spawn_with_pre_minted_id(
@@ -818,6 +822,7 @@ pub fn spawn_in_process_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     bro_label: Option<String>,
     agent_label: Option<String>,
+    system_events: Option<crate::system_events::SharedEventHub>,
 ) -> Arc<Task> {
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
@@ -882,11 +887,38 @@ pub fn spawn_in_process_task(
         return failed;
     }
     task_store.read().persist(&store_dir);
+    let task_id_ev = task_id.clone();
+    let bro_ev = task.inner.lock().bro_label.clone();
+    let provider_str = provider.to_string();
     let _ = tail_tx.send(tail::TailEvent::TaskStarted {
         task_id,
         provider,
         bro_name: None,
     });
+    // Emit task.started system event. Observation-only: failures logged, not propagated.
+    if let Some(hub) = system_events {
+        tokio::spawn(async move {
+            let mut correlation = serde_json::Map::new();
+            correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
+            let draft = crate::system_events::SystemEventDraft {
+                kind: crate::system_events::types::SystemEventKind::TaskStarted,
+                producer: "orchestration.dispatch".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation,
+                causation_id: None,
+                payload: serde_json::json!({
+                    "task_id": task_id_ev,
+                    "provider": provider_str,
+                    "bro": bro_ev,
+                }),
+            };
+            if let Err(e) = hub.emit(draft).await {
+                tracing::warn!("task.started (in-process) system event emit failed: {e:#}");
+            }
+        });
+    }
     task
 }
 
@@ -903,6 +935,7 @@ pub fn finish_in_process_task(
     task_store: &RwLock<TaskStore>,
     store_dir: &std::path::Path,
     tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    system_events: Option<crate::system_events::SharedEventHub>,
 ) {
     let mut inner = task.inner.lock();
     if let Some(result) = result {
@@ -924,8 +957,8 @@ pub fn finish_in_process_task(
     match status {
         TaskStatus::Completed => {
             let _ = tail_tx.send(tail::TailEvent::TaskCompleted {
-                task_id,
-                elapsed,
+                task_id: task_id.clone(),
+                elapsed: elapsed.clone(),
                 cost,
                 source_session,
                 task_kind,
@@ -933,18 +966,94 @@ pub fn finish_in_process_task(
         }
         TaskStatus::Failed => {
             let _ = tail_tx.send(tail::TailEvent::TaskFailed {
-                task_id,
-                elapsed,
-                error,
+                task_id: task_id.clone(),
+                elapsed: elapsed.clone(),
+                error: error.clone(),
             });
         }
         TaskStatus::Cancelled => {
-            let _ = tail_tx.send(tail::TailEvent::TaskCancelled { task_id, elapsed });
+            let _ = tail_tx.send(tail::TailEvent::TaskCancelled {
+                task_id: task_id.clone(),
+                elapsed: elapsed.clone(),
+            });
         }
         TaskStatus::Running => {}
     }
+    // Emit terminal system event. Observation-only: failures logged, not propagated.
+    if let Some(hub) = system_events {
+        let task_id_ev = task_id.clone();
+        let elapsed_ev = elapsed.clone();
+        let (kind, payload) = match status {
+            TaskStatus::Completed => (
+                crate::system_events::types::SystemEventKind::TaskCompleted,
+                serde_json::json!({"task_id": task_id_ev, "elapsed": elapsed_ev, "cost_usd": cost}),
+            ),
+            TaskStatus::Failed => (
+                crate::system_events::types::SystemEventKind::TaskFailed,
+                serde_json::json!({"task_id": task_id_ev, "elapsed": elapsed_ev, "error": error}),
+            ),
+            TaskStatus::Cancelled => (
+                crate::system_events::types::SystemEventKind::TaskCancelled,
+                serde_json::json!({"task_id": task_id_ev, "elapsed": elapsed_ev}),
+            ),
+            TaskStatus::Running => {
+                // No terminal event for running state.
+                task_store.read().persist(store_dir);
+                task.notify.notify_waiters();
+                return;
+            }
+        };
+        let mut correlation = serde_json::Map::new();
+        correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
+        let draft = crate::system_events::SystemEventDraft {
+            kind,
+            producer: "orchestration.dispatch".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation,
+            causation_id: None,
+            payload,
+        };
+        tokio::spawn(async move {
+            if let Err(e) = hub.emit(draft).await {
+                tracing::warn!("task terminal (in-process) system event emit failed: {e:#}");
+            }
+        });
+    }
     task_store.read().persist(store_dir);
     task.notify.notify_waiters();
+}
+
+/// Emit a `task.progress` system event for one deduplicated snippet.
+/// Spawns a background task; observation-only — failures are logged but do not
+/// affect streaming.
+pub(crate) fn emit_task_progress_event(
+    hub: &crate::system_events::SharedEventHub,
+    task_id: String,
+    activity: String,
+) {
+    let hub = hub.clone();
+    tokio::spawn(async move {
+        let mut correlation = serde_json::Map::new();
+        correlation.insert("task_id".into(), serde_json::json!(task_id));
+        let draft = crate::system_events::SystemEventDraft {
+            kind: crate::system_events::types::SystemEventKind::TaskProgress,
+            producer: "orchestration.dispatch".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation,
+            causation_id: None,
+            payload: serde_json::json!({
+                "task_id": task_id,
+                "activity": activity,
+            }),
+        };
+        if let Err(e) = hub.emit(draft).await {
+            tracing::warn!("task.progress system event emit failed: {e:#}");
+        }
+    });
 }
 
 /// Spawn a provider CLI process and return a tracked Task.
@@ -966,6 +1075,7 @@ pub fn spawn_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     bro_label: Option<String>,
     agent_label: Option<String>,
+    system_events: Option<crate::system_events::SharedEventHub>,
 ) -> Arc<Task> {
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
@@ -993,6 +1103,7 @@ pub fn spawn_task(
         tail_tx,
         bro_label,
         agent_label,
+        system_events,
     };
 
     spawn_task_reserved(task_id, params)
@@ -1010,6 +1121,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         tail_tx,
         bro_label,
         agent_label,
+        system_events,
     } = params;
     let id = task_id;
 
@@ -1139,6 +1251,34 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         provider,
         bro_name: None,
     });
+    // Emit task.started system event. Observation-only: failures logged, not propagated.
+    if let Some(ref hub) = system_events {
+        let task_id_ev = id.clone();
+        let bro_ev = task.inner.lock().bro_label.clone();
+        let provider_str = provider.to_string();
+        let hub_clone = hub.clone();
+        tokio::spawn(async move {
+            let mut correlation = serde_json::Map::new();
+            correlation.insert("task_id".into(), serde_json::json!(task_id_ev));
+            let draft = crate::system_events::SystemEventDraft {
+                kind: crate::system_events::types::SystemEventKind::TaskStarted,
+                producer: "orchestration.dispatch".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation,
+                causation_id: None,
+                payload: serde_json::json!({
+                    "task_id": task_id_ev,
+                    "provider": provider_str,
+                    "bro": bro_ev,
+                }),
+            };
+            if let Err(e) = hub_clone.emit(draft).await {
+                tracing::warn!("task.started system event emit failed: {e:#}");
+            }
+        });
+    }
 
     if provider == Provider::Gemini && session_id == "pending" {
         if let Some(cwd_clone) = cwd.clone() {
@@ -1174,6 +1314,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                         if discovered {
                             team::propagate_session_id(&task_id_watch, &sid, &store_dir_watch);
                             task_store_watch.read().persist(&store_dir_watch);
+                            // Empty activity: session-id discovery notification,
+                            // not meaningful task progress — skip system event.
                             let _ = tail_tx_watch.send(tail::TailEvent::TaskProgress {
                                 task_id: task_id_watch.clone(),
                                 activity: String::new(),
@@ -1198,6 +1340,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     let task_id_clone = id.clone();
     let env_overrides_export = env_overrides.clone();
     let cwd_export = cwd.clone();
+    let system_events_progress = system_events.clone();
 
     let (stdout_done_tx, stdout_done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1265,6 +1408,14 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                                 task_id: task_id_clone.clone(),
                                 activity: snippet.clone(),
                             });
+                            // Emit task.progress system event. Observation-only: failures logged.
+                            if let Some(ref hub) = system_events_progress {
+                                emit_task_progress_event(
+                                    hub,
+                                    task_id_clone.clone(),
+                                    snippet.clone(),
+                                );
+                            }
                             last_emitted_snippet = Some(snippet);
                         }
                     }
@@ -1334,6 +1485,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     let task_ref_wait = task.clone();
     let task_id_wait = id.clone();
     let tail_tx_wait = tail_tx;
+    let system_events_wait = system_events;
     tokio::spawn(async move {
         let status = child.wait().await;
         // Wait for stdout reader to finish before processing results —
@@ -1382,7 +1534,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             }
         }
 
-        {
+        let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind) = {
             let mut inner = task_ref_wait.inner.lock();
             inner.exit_code = code;
             // Preserve terminal states set during stream parsing (Cancelled
@@ -1396,28 +1548,72 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
                 };
             }
             inner.completed_at = Some(now_ms());
-
             let elapsed = format_elapsed(inner.started_at, inner.completed_at);
-            let source_session_w = inner.session_id.clone();
-            let task_kind_w = inner.bro_label.clone();
-            match inner.status {
-                TaskStatus::Completed => {
-                    let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
-                        task_id: task_id_wait.clone(),
-                        elapsed,
-                        cost: inner.cost_usd,
-                        source_session: source_session_w,
-                        task_kind: task_kind_w,
-                    });
-                }
-                TaskStatus::Failed => {
-                    let _ = tail_tx_wait.send(tail::TailEvent::TaskFailed {
-                        task_id: task_id_wait.clone(),
-                        elapsed,
-                        error: inner.stderr.chars().take(200).collect(),
-                    });
-                }
-                _ => {}
+            let terminal_status = inner.status;
+            let cost = inner.cost_usd;
+            let error_snippet: String = inner.stderr.chars().take(200).collect();
+            let source_session = inner.session_id.clone();
+            let task_kind = inner.bro_label.clone();
+            (
+                terminal_status,
+                elapsed,
+                cost,
+                error_snippet,
+                source_session,
+                task_kind,
+            )
+        };
+        match terminal_status {
+            TaskStatus::Completed => {
+                let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
+                    task_id: task_id_wait.clone(),
+                    elapsed: elapsed.clone(),
+                    cost,
+                    source_session,
+                    task_kind,
+                });
+            }
+            TaskStatus::Failed => {
+                let _ = tail_tx_wait.send(tail::TailEvent::TaskFailed {
+                    task_id: task_id_wait.clone(),
+                    elapsed: elapsed.clone(),
+                    error: error_snippet.clone(),
+                });
+            }
+            _ => {}
+        }
+        // Emit terminal system event. Observation-only: failures logged, not propagated.
+        // MutexGuard dropped above so the async emit is safe to await.
+        if let Some(ref hub) = system_events_wait {
+            let mut correlation = serde_json::Map::new();
+            correlation.insert("task_id".into(), serde_json::json!(task_id_wait));
+            let (kind, payload) = match terminal_status {
+                TaskStatus::Completed => (
+                    crate::system_events::types::SystemEventKind::TaskCompleted,
+                    serde_json::json!({"task_id": task_id_wait, "elapsed": elapsed, "cost_usd": cost}),
+                ),
+                TaskStatus::Failed => (
+                    crate::system_events::types::SystemEventKind::TaskFailed,
+                    serde_json::json!({"task_id": task_id_wait, "elapsed": elapsed, "error": error_snippet}),
+                ),
+                TaskStatus::Cancelled => (
+                    crate::system_events::types::SystemEventKind::TaskCancelled,
+                    serde_json::json!({"task_id": task_id_wait, "elapsed": elapsed}),
+                ),
+                TaskStatus::Running => unreachable!("terminal state check above"),
+            };
+            let draft = crate::system_events::SystemEventDraft {
+                kind,
+                producer: "orchestration.dispatch".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation,
+                causation_id: None,
+                payload,
+            };
+            if let Err(e) = hub.emit(draft).await {
+                tracing::warn!("task terminal system event emit failed: {e:#}");
             }
         }
 
@@ -1912,6 +2108,7 @@ mod tests {
                 tail_tx,
                 bro_label: None,
                 agent_label: None,
+                system_events: None,
             },
         )
         .unwrap();

@@ -1,5 +1,6 @@
 {
   "name": "auto-edge-nightly",
+  "version": 1,
   "schedule": "0 0 2 * * *",
   "payload": {},
   "concurrency": 1,

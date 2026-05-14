@@ -1,5 +1,6 @@
 {
   "name": "badgey-close-loops-weekly",
+  "version": 1,
   "schedule": "0 0 9 * * 0",
   "payload": {
     "tool": "badgey_close_loops",

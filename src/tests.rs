@@ -84,6 +84,12 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
             crate::vectors::VectorStore::open(tmp.path().join("vectors"))
                 .expect("test vector store should open"),
         ),
+        system_events: Arc::new(system_events::EventHub::new(
+            system_events::EventStore::new_at(tmp.path().join("events").join("journal")),
+            system_events::OutboxStore::new(tmp.path().join("events").join("outbox")).unwrap(),
+            tmp.path().join("reactions"),
+            tmp.path().join("identities"),
+        )),
     });
     BlackboxServer::new(state)
 }
@@ -594,6 +600,133 @@ async fn artifact_install_wires_m2_compaction_arc_and_packets() {
             .load("domain:cron-routing/embed-compaction")
             .is_ok()
     );
+}
+
+#[tokio::test]
+async fn artifact_install_wires_daily_compaction_flow() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let workflow_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/maintenance/workflows/daily-compaction-arc.json"
+    ))
+    .unwrap();
+    let arc_budget_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json"
+    ))
+    .unwrap();
+    let embed_policy_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/agentic-corpus/packets/embed/compaction-policy.json"
+    ))
+    .unwrap();
+    let cron_routing_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/maintenance/packets/cron-routing/daily-compaction.json"
+    ))
+    .unwrap();
+    let cron_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/maintenance/crons/daily-compaction.json"
+    ))
+    .unwrap();
+
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Workflow,
+            source: "system-defaults/maintenance/workflows/daily-compaction-arc.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        workflow_value,
+    )
+    .await
+    .unwrap();
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Packet,
+            source: "system-defaults/agentic-corpus/packets/workflow-policy/arc-budget.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        arc_budget_value,
+    )
+    .await
+    .unwrap();
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Packet,
+            source: "system-defaults/agentic-corpus/packets/embed/compaction-policy.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        embed_policy_value,
+    )
+    .await
+    .unwrap();
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Packet,
+            source: "system-defaults/maintenance/packets/cron-routing/daily-compaction.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        cron_routing_value,
+    )
+    .await
+    .unwrap();
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Cron,
+            source: "system-defaults/maintenance/crons/daily-compaction.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        cron_value,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("daily-compaction-arc")
+    );
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:cron-routing/daily-compaction")
+            .is_ok()
+    );
+    assert!(
+        server
+            .state
+            .crons
+            .list()
+            .iter()
+            .any(|spec| spec.name == "daily-compaction")
+    );
+    let rows = server
+        .state
+        .artifacts
+        .read()
+        .list(&ArtifactListParams {
+            kind: Some(artifacts::ArtifactKind::Cron),
+            name: Some("daily-compaction".into()),
+            include_superseded: false,
+        })
+        .unwrap();
+    assert_eq!(rows.len(), 1);
 }
 
 #[tokio::test]
@@ -6530,4 +6663,451 @@ fn example_surface_packet_parses_and_compiles() {
             threshold_table: None,
         })
         .expect("example packet compiles");
+}
+
+#[test]
+fn example_surface_packet_system_event_tool_visibility() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("system-defaults/mcp-surfaces/routing.json");
+    let raw = std::fs::read_to_string(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    let domain = value["domain"].as_str().unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let packets = packets::Packets::open(tmp.path()).unwrap();
+    packets
+        .compile(&packets::CompileParams {
+            domain: domain.to_string(),
+            rules: value["rules"].clone(),
+            classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
+            prefix_inference: Some(Default::default()),
+            scope: Some("global".into()),
+            project: None,
+            source_ids: None,
+            rank_lookup_key: None,
+            rank_table: None,
+            threshold_lookup_key: None,
+            threshold_table: None,
+        })
+        .expect("packet compiles");
+    drop(packets);
+
+    let state = crate::server::state::SharedState::for_test(tmp.path());
+    let packets = state.packets.read();
+    let emit = "mcp__blackbox__system_event_emit";
+    let compact = "mcp__blackbox__system_event_compact";
+    let list = "mcp__blackbox__system_event_list";
+    let open = "mcp__blackbox__system_event_open";
+    let r_install = "mcp__blackbox__reaction_install";
+    let r_list = "mcp__blackbox__reaction_list";
+    let r_replay = "mcp__blackbox__reaction_replay";
+    let r_execute = "mcp__blackbox__reaction_execute";
+    let r_deliveries = "mcp__blackbox__reaction_deliveries";
+    let r_retry = "mcp__blackbox__reaction_retry";
+    let universe: Vec<String> = vec![
+        emit.into(),
+        compact.into(),
+        list.into(),
+        open.into(),
+        r_install.into(),
+        r_list.into(),
+        r_replay.into(),
+        r_execute.into(),
+        r_deliveries.into(),
+        r_retry.into(),
+    ];
+
+    let check = |surface: &str, expect_visible: &[&str], expect_hidden: &[&str]| {
+        let entity = crate::server::surface::build_surface_entity(surface, None);
+        let decision = crate::server::surface::evaluate_tool_surface(&packets, entity, None);
+        for tool in expect_visible {
+            assert!(
+                crate::server::surface::tool_visible(tool, &decision, &universe),
+                "{surface}: {tool} should be visible",
+            );
+        }
+        for tool in expect_hidden {
+            assert!(
+                !crate::server::surface::tool_visible(tool, &decision, &universe),
+                "{surface}: {tool} should be hidden",
+            );
+        }
+    };
+
+    check(
+        "readonly",
+        &[list, open, r_list, r_replay, r_deliveries],
+        &[emit, compact, r_install, r_execute, r_retry],
+    );
+    check(
+        "default",
+        &[list, open, r_list, r_replay, r_deliveries],
+        &[emit, compact, r_install, r_execute, r_retry],
+    );
+    check(
+        "agent-internal",
+        &[list, open, r_list, r_replay, r_deliveries],
+        &[emit, compact, r_install, r_execute, r_retry],
+    );
+    check(
+        "ops",
+        &[
+            emit,
+            compact,
+            list,
+            open,
+            r_install,
+            r_list,
+            r_replay,
+            r_execute,
+            r_deliveries,
+            r_retry,
+        ],
+        &[],
+    );
+}
+
+// ── Phase 6 real emit site tests ─────────────────────────────────────────────
+
+#[tokio::test]
+async fn system_events_task_lifecycle_started_and_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let hub = server.state.system_events.clone();
+
+    let (tail_tx, _) = tokio::sync::broadcast::channel::<TailEvent>(16);
+    let task_id = "test-task-se-001".to_string();
+    let task = orchestration::spawn_in_process_task(
+        task_id.clone(),
+        orchestration::providers::Provider::Workflow,
+        "arc-test-001".to_string(),
+        None,
+        tmp.path().join("bro"),
+        server.state.task_store.clone(),
+        tail_tx.clone(),
+        Some("test-bro".to_string()),
+        None,
+        Some(hub.clone()),
+    );
+
+    // Yield so the spawned emit task can run
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let started: Vec<_> = hub
+        .list_events(None, Some("task.started"), None, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.payload.get("task_id").and_then(|v| v.as_str()) == Some(&task_id))
+        .collect();
+    assert_eq!(started.len(), 1, "expected one task.started event");
+
+    orchestration::finish_in_process_task(
+        &task,
+        orchestration::TaskStatus::Completed,
+        Some("ok".to_string()),
+        None,
+        &server.state.task_store,
+        &tmp.path().join("bro"),
+        &tail_tx,
+        Some(hub.clone()),
+    );
+
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let completed: Vec<_> = hub
+        .list_events(None, Some("task.completed"), None, None)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.payload.get("task_id").and_then(|v| v.as_str()) == Some(&task_id))
+        .collect();
+    assert_eq!(completed.len(), 1, "expected one task.completed event");
+}
+
+#[tokio::test]
+async fn system_events_workflow_arc_started_and_completed() {
+    use crate::workflow::{compile, engine, load_workflow};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let hub = server.state.system_events.clone();
+
+    let json = r#"{
+        "name": "se-smoke",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "Only": {
+                "actor": "",
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Only"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+    let result = engine::run_workflow_with_initial_vars(
+        &server,
+        &compiled,
+        None,
+        Some(5),
+        serde_json::Map::new(),
+    )
+    .await;
+    assert_eq!(result.status, "completed");
+
+    let started = hub
+        .list_events(None, Some("workflow.arc.started"), None, None)
+        .unwrap();
+    assert!(!started.is_empty(), "expected workflow.arc.started event");
+
+    let completed = hub
+        .list_events(None, Some("workflow.arc.completed"), None, None)
+        .unwrap();
+    assert!(
+        !completed.is_empty(),
+        "expected workflow.arc.completed event"
+    );
+
+    let arc_id = result.arc_id;
+    assert!(
+        started
+            .iter()
+            .any(|e| e.payload.get("arc_id").and_then(|v| v.as_str()) == Some(&arc_id)),
+        "started event should carry arc_id"
+    );
+}
+
+#[tokio::test]
+async fn system_events_workflow_wait_registered_and_signal_received() {
+    use crate::workflow::{compile, engine, load_workflow};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let hub = server.state.system_events.clone();
+
+    // Arc parks on a Wait, we fire the matching signal, confirm both events.
+    let json = r#"{
+        "name": "se-wait-signal",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "Park": {
+                "actor": "",
+                "wait": {
+                    "any_of": [{"signal": "test-signal"}]
+                },
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Park"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+
+    let server_state = server.state.clone();
+    let hub_clone = hub.clone();
+    let run_handle = tokio::spawn(async move {
+        let srv = BlackboxServer::new(server_state);
+        engine::run_workflow_with_initial_vars(
+            &srv,
+            &compiled,
+            None,
+            Some(5),
+            serde_json::Map::new(),
+        )
+        .await
+    });
+
+    // Wait until wait_registered event appears in the hub.
+    let mut registered = false;
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let evts = hub_clone
+            .list_events(None, Some("workflow.arc.wait_registered"), None, None)
+            .unwrap_or_default();
+        if !evts.is_empty() {
+            registered = true;
+            break;
+        }
+    }
+    assert!(
+        registered,
+        "wait_registered event should appear before signal"
+    );
+
+    // Fire signal via match_and_take to unblock the arc.
+    let snaps = server.wait_store().snapshot();
+    assert!(!snaps.is_empty(), "expected a pending wait in the store");
+    let w = &snaps[0];
+    if let Some((slot, notify, _, _)) = server
+        .wait_store()
+        .match_and_take(&w.signal, &serde_json::Map::new())
+    {
+        *slot.lock() = Some(workflow::context::SignalRef {
+            name: w.signal.clone(),
+            payload: serde_json::Value::Null,
+            correlation: serde_json::Map::new(),
+            received_at: crate::util::now_iso(),
+        });
+        notify.notify_waiters();
+    }
+
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), run_handle)
+        .await
+        .expect("arc did not complete within 5s")
+        .expect("runner panicked");
+    assert_eq!(result.status, "completed");
+
+    let received = hub
+        .list_events(None, Some("workflow.arc.signal_received"), None, None)
+        .unwrap();
+    assert!(
+        !received.is_empty(),
+        "expected workflow.arc.signal_received event"
+    );
+}
+
+#[tokio::test]
+async fn system_events_whiteboard_transition_emits_phase_changed() {
+    // Exercises the real whiteboard_transition tool path end-to-end.
+    // Registers a pending wait matching the board-transitioned signal so both
+    // routing and event emission are proved with one call: the routing dispatch
+    // must resolve the wait (SignalRef written to the resolved slot) AND the
+    // system event must land in the hub.
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let hub = server.state.system_events.clone();
+
+    let board_id = "board-se-01";
+
+    server
+        .state
+        .whiteboards
+        .open(
+            board_id,
+            "Phase 6 test board",
+            "",
+            None,
+            "facilitator-agent",
+        )
+        .expect("open board");
+    server
+        .state
+        .whiteboards
+        .register(
+            board_id,
+            "facilitator-agent",
+            whiteboards::Role::Facilitator,
+            "test-domain",
+        )
+        .expect("register facilitator");
+
+    // Register a pending wait for the board-transitioned signal so the routing
+    // call inside the spawned task has something to resolve.
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let resolved: Arc<parking_lot::Mutex<Option<workflow::context::SignalRef>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+    {
+        let mut corr = serde_json::Map::new();
+        corr.insert("board".into(), serde_json::json!(board_id));
+        corr.insert("phase".into(), serde_json::json!("read"));
+        server.wait_store().register(workflow::wait::PendingWait {
+            arc_id: "test-arc-wb-01".into(),
+            wait_id: "w1".into(),
+            signal: "board-transitioned".into(),
+            correlation: corr,
+            notify: notify.clone(),
+            resolved: resolved.clone(),
+        });
+    }
+
+    // Call the real tool handler — this is the path under test.
+    let result = server
+        .whiteboard_transition(Parameters(WhiteboardTransitionParams {
+            board_id: board_id.into(),
+            agent_name: "facilitator-agent".into(),
+            target_phase: "read".into(),
+            summary: None,
+        }))
+        .await;
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "transition tool returned error"
+    );
+
+    // Yield enough for the spawned task (routing + system event emit) to complete.
+    for _ in 0..40 {
+        tokio::task::yield_now().await;
+    }
+
+    // Routing must have resolved the registered wait — proves signal routing fired.
+    let sig = resolved.lock().clone();
+    assert!(
+        sig.is_some(),
+        "wait was not resolved — routing did not fire"
+    );
+    assert_eq!(sig.unwrap().name, "board-transitioned");
+
+    // The system event must also have been emitted.
+    let phase_events = hub
+        .list_events(None, Some("whiteboard.phase_changed"), None, None)
+        .unwrap();
+    assert!(
+        !phase_events.is_empty(),
+        "expected whiteboard.phase_changed system event"
+    );
+    let ev = &phase_events[0];
+    assert_eq!(
+        ev.payload.get("board_id").and_then(|v| v.as_str()),
+        Some(board_id)
+    );
+    assert_eq!(
+        ev.payload.get("to_phase").and_then(|v| v.as_str()),
+        Some("read")
+    );
+    assert_eq!(ev.producer, "whiteboard.transition");
+}
+
+#[tokio::test]
+async fn system_events_task_progress() {
+    // Exercises the production task.progress emission path by calling
+    // orchestration::emit_task_progress_event — the same helper the streaming
+    // loop uses on every new deduplicated snippet. This proves the contract
+    // (kind, correlation, payload fields) through production code rather than
+    // a duplicate manual hub.emit.
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let hub = server.state.system_events.clone();
+
+    let task_id = "test-task-progress-001";
+    let activity = "Analyzing the codebase for refactor candidates…";
+
+    orchestration::emit_task_progress_event(&hub, task_id.to_string(), activity.to_string());
+
+    // Yield for the spawned background task to complete.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+
+    let evts = hub
+        .list_events(None, Some("task.progress"), None, None)
+        .unwrap();
+    assert_eq!(evts.len(), 1, "expected exactly one task.progress event");
+    let ev = &evts[0];
+    assert_eq!(
+        ev.correlation.get("task_id").and_then(|v| v.as_str()),
+        Some(task_id),
+        "task_id must be in correlation"
+    );
+    assert_eq!(
+        ev.payload.get("task_id").and_then(|v| v.as_str()),
+        Some(task_id),
+        "task_id must be in payload"
+    );
+    assert_eq!(
+        ev.payload.get("activity").and_then(|v| v.as_str()),
+        Some(activity),
+        "activity must be in payload"
+    );
+    assert_eq!(ev.producer, "orchestration.dispatch");
 }

@@ -22,7 +22,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::context::{ArcContext, ArcMeta, SignalRef, resolve_arg_value};
-use super::ops::{HookOp, OnFailure, OpEffect, execute_op};
+use super::ops::{HookOp, OnFailure, OpEffect, execute_op_with_hub};
 use super::wait::{PendingWait, ProviderEventWait, WaitSpec, canonicalize_correlation};
 use super::{
     ActorFailureMode, ActorKind, ActorSpec, AtomBinding, CompiledWorkflow, ForeachSpec, GateMode,
@@ -299,12 +299,24 @@ async fn run_workflow_streaming_with_vars_inner(
                 runner.arc_note("blocked", "workflow cancelled");
                 let status_str = "cancelled".to_string();
                 runner.update_arc_snapshot(&status_str, "(cancelled)", None);
+                runner
+                    .emit_arc_system_event(
+                        crate::system_events::types::SystemEventKind::WorkflowArcCancelled,
+                        json!({"arc_id": runner.ctx.meta.arc_id}),
+                    )
+                    .await;
                 status_str
             } else {
                 runner.log_event("error", json!({"message": msg.clone()}));
                 runner.arc_note("blocked", &format!("workflow errored: {msg}"));
                 let status_str = format!("error: {msg}");
                 runner.update_arc_snapshot(&status_str, "(error)", None);
+                runner
+                    .emit_arc_system_event(
+                        crate::system_events::types::SystemEventKind::WorkflowArcFailed,
+                        json!({"arc_id": runner.ctx.meta.arc_id, "error": msg}),
+                    )
+                    .await;
                 status_str
             }
         }
@@ -490,12 +502,24 @@ async fn run_workflow_at_depth_with_cancel(
                 runner.arc_note("blocked", "workflow cancelled");
                 let status_str = "cancelled".to_string();
                 runner.update_arc_snapshot(&status_str, "(cancelled)", None);
+                runner
+                    .emit_arc_system_event(
+                        crate::system_events::types::SystemEventKind::WorkflowArcCancelled,
+                        json!({"arc_id": runner.ctx.meta.arc_id}),
+                    )
+                    .await;
                 status_str
             } else {
                 runner.log_event("error", json!({"message": msg.clone()}));
                 runner.arc_note("blocked", &format!("workflow errored: {msg}"));
                 let status_str = format!("error: {msg}");
                 runner.update_arc_snapshot(&status_str, "(error)", None);
+                runner
+                    .emit_arc_system_event(
+                        crate::system_events::types::SystemEventKind::WorkflowArcFailed,
+                        json!({"arc_id": runner.ctx.meta.arc_id, "error": msg}),
+                    )
+                    .await;
                 status_str
             }
         }
@@ -824,7 +848,14 @@ impl<'a> WorkflowRunner<'a> {
                 }
             }
             let op_kind = format!("{:?}", hook.op);
-            match execute_op(hook, &self.ctx, self.compiled.spec.vars_schema.as_ref()).await {
+            match execute_op_with_hub(
+                hook,
+                &self.ctx,
+                self.compiled.spec.vars_schema.as_ref(),
+                Some(&self.server.state.system_events),
+            )
+            .await
+            {
                 Ok(effect) => {
                     if let Err(e) = self.apply_op_effect(effect) {
                         match hook.on_failure {
@@ -1049,6 +1080,15 @@ impl<'a> WorkflowRunner<'a> {
                 "entry_node": entry,
             }),
         );
+        self.emit_arc_system_event(
+            crate::system_events::types::SystemEventKind::WorkflowArcStarted,
+            json!({
+                "arc_id": self.ctx.meta.arc_id,
+                "workflow": self.compiled.spec.name,
+                "version": self.compiled.spec.version,
+            }),
+        )
+        .await;
         self.update_arc_snapshot("running", "(start)", Some(&entry));
         let mut current = entry;
         let mut steps = 0usize;
@@ -1079,6 +1119,11 @@ impl<'a> WorkflowRunner<'a> {
             current = next;
         }
         self.log_event("complete", json!({"steps": steps}));
+        self.emit_arc_system_event(
+            crate::system_events::types::SystemEventKind::WorkflowArcCompleted,
+            json!({"arc_id": self.ctx.meta.arc_id, "steps": steps}),
+        )
+        .await;
         self.update_arc_snapshot("completed", "(end)", None);
         Ok(())
     }
@@ -2552,6 +2597,16 @@ impl<'a> WorkflowRunner<'a> {
                 notify: notify.clone(),
                 resolved: resolved_slot.clone(),
             });
+            self.emit_arc_system_event(
+                crate::system_events::types::SystemEventKind::WorkflowArcWaitRegistered,
+                json!({
+                    "arc_id": arc_id,
+                    "wait_id": wait_id,
+                    "node": node_id,
+                    "signal": wait_signal.signal,
+                }),
+            )
+            .await;
             registered_ids.push((arc_id.clone(), wait_id));
         }
 
@@ -2642,6 +2697,15 @@ impl<'a> WorkflowRunner<'a> {
                 "correlation": sig.correlation,
             }),
         );
+        self.emit_arc_system_event(
+            crate::system_events::types::SystemEventKind::WorkflowArcSignalReceived,
+            json!({
+                "arc_id": self.ctx.meta.arc_id,
+                "node": node_id,
+                "signal": sig.name,
+            }),
+        )
+        .await;
         self.record_output(node_id, serde_json::to_string(&sig).unwrap_or_default());
         self.ctx.record_signal(sig.clone());
         self.arc_note(
@@ -2845,6 +2909,31 @@ impl<'a> WorkflowRunner<'a> {
             let _ = tx.send(ev.clone());
         }
         self.events.push(ev);
+    }
+
+    /// Emit a workflow arc system event. Observation-only: emit failures are
+    /// logged with tracing::warn and never propagate to the calling arc.
+    async fn emit_arc_system_event(
+        &self,
+        kind: crate::system_events::types::SystemEventKind,
+        payload: Value,
+    ) {
+        let arc_id = self.ctx.meta.arc_id.clone();
+        let mut correlation = serde_json::Map::new();
+        correlation.insert("arc_id".into(), serde_json::json!(arc_id));
+        let draft = crate::system_events::SystemEventDraft {
+            kind,
+            producer: "workflow.engine".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation,
+            causation_id: None,
+            payload,
+        };
+        if let Err(e) = self.server.state.system_events.emit(draft).await {
+            tracing::warn!("workflow arc system event emit failed: {e:#}");
+        }
     }
 }
 

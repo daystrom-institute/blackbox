@@ -502,10 +502,13 @@ ${BRO_HOME}/reactions/<name>.json
 ${BRO_HOME}/identities/<scope>/<instance>.json
 ```
 
-The first implementation can use append-only JSONL plus periodic compaction,
-matching the rest of the daemon's file-backed bias. If event volume becomes
-large, move the journal/outbox to SQLite or another embedded store behind the
-same trait.
+The first implementation uses append-only JSONL plus copy-forward compaction,
+matching the rest of the daemon's file-backed bias. Startup runs the same
+compaction once, `system_event_compact` exposes the manual ops surface, and the
+installable `daily-compaction` system-default cron runs system-event compaction
+as part of the cross-store maintenance flow. If event volume becomes large,
+move the journal/outbox to SQLite or another embedded store behind the same
+trait.
 
 Retention defaults:
 
@@ -517,6 +520,10 @@ Retention defaults:
 JSONL compaction is copy-forward: write a compacted temp file containing the
 retained records/summaries, fsync, then rename over the old segment. Do not
 rewrite in place.
+
+The bundled daily maintenance flow (`system-defaults/maintenance`) starts
+`daily-compaction-arc`, which runs system-event compaction, edge storage GC, and
+vector partition compaction through the existing embed compaction policy.
 
 ## Reaction Action Catalog
 
@@ -574,7 +581,7 @@ MCP surface policy:
 |---|---|
 | `reaction_install` | `ops` |
 | `reaction_retry` | `ops` |
-| `reaction_replay execute/force` | `ops` |
+| `reaction_execute` | `ops` |
 | `system_event_emit` | `ops` |
 | `reaction_replay dry_run` | `default` |
 | `reaction_list` / `reaction_deliveries` | `default` |
@@ -592,6 +599,7 @@ system_event_open        # one event + derived/caused records
 reaction_install         # install reaction spec
 reaction_list            # installed reactions
 reaction_replay          # evaluate one event against one reaction, dry-run by default
+reaction_execute         # execute one event/reaction through an audited outbox row
 reaction_deliveries      # recent outbox attempts/results
 reaction_retry           # retry a dead-lettered delivery
 identity_list            # list known external principals
@@ -601,11 +609,17 @@ identity_get             # inspect one mapping
 HTTP equivalents can exist under `/admin/reaction/*`, but MCP tools should be
 the primary operator surface.
 
-Replay modes:
+Replay and execute modes:
 
-- `dry_run`: render templates, evaluate gate, do not execute action.
-- `execute`: execute action with same idempotency key unless overridden.
-- `force`: bypass succeeded-idempotency suppression, admin-only.
+- `reaction_replay`: render templates, evaluate gate, do not execute action.
+- `reaction_execute(force=false)`: execute action with the rendered
+  idempotency key and normal succeeded-idempotency suppression.
+- `reaction_execute(force=true)`: bypass succeeded-idempotency suppression,
+  admin-only. Gates, causation guards, redaction, and outbox audit still apply.
+
+The side-effecting operation is a separate ops-only tool because MCP surfaces
+are tool-level, not parameter-level; exposing `execute` as a mode on the
+default-visible dry-run tool would leak writes to read-only callers.
 
 ## Implementation Sketch
 

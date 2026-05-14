@@ -235,7 +235,7 @@ The daemon does not auto-install these on startup. Install what you want:
 ```
 bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/auto-digest-arc.json")
 bbox_artifact_install(kind="packet",   source="system-defaults/agentic-corpus/packets/auto-digest/entry-quality.json")
-bro_cron_install(spec=<contents of system-defaults/agentic-corpus/crons/embed-compaction-nightly.json>)
+bbox_artifact_install(kind="cron",     source="system-defaults/agentic-corpus/crons/embed-compaction-nightly.json")
 ```
 
 Use `bbox_artifact_list` to inspect what's installed.

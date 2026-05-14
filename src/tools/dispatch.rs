@@ -105,6 +105,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             None,
             None,
+            Some(self.state.system_events.clone()),
         );
 
         // Register Gemini policy-file cleanup once the task terminates.
@@ -250,6 +251,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             None,
             None,
+            Some(self.state.system_events.clone()),
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task.clone(), resume_lease);
@@ -626,6 +628,7 @@ impl BlackboxServer {
                         self.state.tail_tx.clone(),
                         None,
                         None,
+                        Some(self.state.system_events.clone()),
                     );
                     cleanup_policy_file_when_done(t.clone(), df.policy_file);
                     release_resume_lease_when_done(t.clone(), resume_lease);
@@ -676,6 +679,7 @@ impl BlackboxServer {
                     self.state.tail_tx.clone(),
                     None,
                     None,
+                    Some(self.state.system_events.clone()),
                 );
                 cleanup_policy_file_when_done(t.clone(), df.policy_file);
                 updated_team.members[i].session_id = Some(t.inner.lock().session_id.clone());

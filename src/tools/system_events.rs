@@ -1,0 +1,1099 @@
+use crate::server::*;
+use crate::*;
+use rmcp::schemars;
+
+pub(crate) fn router() -> ToolRouter<BlackboxServer> {
+    BlackboxServer::system_events_tools()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SystemEventEmitParams {
+    pub kind: String,
+    pub producer: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub causation_id: Option<String>,
+    /// Optional `EventPrincipal` JSON: `{"kind": "...", "bro": "...", "provider": "...", "model": "...", "effort": "..."}`.
+    /// Only `kind` is required. Parsed to the typed `EventPrincipal` struct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<serde_json::Value>,
+    /// Optional `EventSubject` JSON: `{"kind": "...", "id": "..."}`. Both fields required when set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<serde_json::Value>,
+    /// Optional correlation map. Free-form keys; values may be any JSON.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<serde_json::Map<String, serde_json::Value>>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SystemEventListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SystemEventOpenParams {
+    pub event_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SystemEventCompactParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub now: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReactionInstallParams {
+    pub spec: serde_json::Value,
+    #[serde(default)]
+    pub replace: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReactionListParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReactionReplayParams {
+    #[serde(default = "default_dry_run")]
+    pub mode: String,
+    pub event_id: String,
+    pub reaction: String,
+}
+
+fn default_dry_run() -> String {
+    "dry_run".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReactionExecuteParams {
+    pub event_id: String,
+    pub reaction: String,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReactionDeliveriesParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct ReactionRetryParams {
+    pub outbox_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct IdentityListParams {}
+
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct IdentityGetParams {
+    pub scope: String,
+    pub instance: String,
+    pub subject: String,
+    pub provider: String,
+    pub model: String,
+}
+
+/// Convert `SystemEventEmitParams` into a typed `SystemEventDraft`.
+/// Parses optional `principal`/`subject` JSON Values into the typed structs,
+/// defaults correlation to empty, and preserves the rest verbatim.
+pub(crate) fn draft_from_emit_params(
+    p: SystemEventEmitParams,
+) -> anyhow::Result<system_events::SystemEventDraft> {
+    let principal = match p.principal {
+        Some(v) => Some(
+            serde_json::from_value::<system_events::types::EventPrincipal>(v)
+                .map_err(|e| anyhow::anyhow!("invalid principal: {e}"))?,
+        ),
+        None => None,
+    };
+    let subject = match p.subject {
+        Some(v) => Some(
+            serde_json::from_value::<system_events::types::EventSubject>(v)
+                .map_err(|e| anyhow::anyhow!("invalid subject: {e}"))?,
+        ),
+        None => None,
+    };
+    Ok(system_events::SystemEventDraft {
+        kind: system_events::types::SystemEventKind::from_wire(&p.kind),
+        producer: p.producer,
+        project: p.project,
+        principal,
+        subject,
+        correlation: p.correlation.unwrap_or_default(),
+        causation_id: p.causation_id,
+        payload: p.payload,
+    })
+}
+
+#[tool_router(router = system_events_tools)]
+impl BlackboxServer {
+    #[tool(
+        name = "system_event_emit",
+        description = "Emit a synthetic system event into the journal and broadcast. Ops-only; surface-enforced."
+    )]
+    pub(crate) fn tool_system_event_emit(
+        &self,
+        Parameters(p): Parameters<SystemEventEmitParams>,
+    ) -> CallToolResult {
+        Self::run("system_event_emit", || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let draft = draft_from_emit_params(p)?;
+                let outcome = self.state.system_events.emit(draft).await?;
+                Ok(serde_json::to_string_pretty(&outcome)?)
+            })
+        })
+    }
+
+    #[tool(
+        name = "system_event_list",
+        description = "List recent system events with optional filters. Readonly."
+    )]
+    pub(crate) fn tool_system_event_list(
+        &self,
+        Parameters(p): Parameters<SystemEventListParams>,
+    ) -> CallToolResult {
+        Self::run("system_event_list", || {
+            let events = self.state.system_events.list_events(
+                p.limit,
+                p.kind.as_deref(),
+                p.producer.as_deref(),
+                p.project.as_deref(),
+            )?;
+            Ok(serde_json::to_string_pretty(&events)?)
+        })
+    }
+
+    #[tool(
+        name = "system_event_open",
+        description = "Open a single system event with causation chain and derived event links. Readonly."
+    )]
+    pub(crate) fn tool_system_event_open(
+        &self,
+        Parameters(p): Parameters<SystemEventOpenParams>,
+    ) -> CallToolResult {
+        Self::run("system_event_open", || {
+            let event = self.state.system_events.open_event(&p.event_id)?;
+            let Some(event) = event else {
+                anyhow::bail!("event '{}' not found", p.event_id);
+            };
+            let causation = self.state.system_events.causation_chain_for(&p.event_id)?;
+            let derived = self.state.system_events.derived_events(&p.event_id)?;
+            let result = serde_json::json!({
+                "event": event,
+                "causation_chain": causation,
+                "derived_events": derived,
+            });
+            Ok(serde_json::to_string_pretty(&result)?)
+        })
+    }
+
+    #[tool(
+        name = "system_event_compact",
+        description = "Apply system-event journal and outbox retention compaction. Ops-only; surface-enforced."
+    )]
+    pub(crate) fn tool_system_event_compact(
+        &self,
+        Parameters(p): Parameters<SystemEventCompactParams>,
+    ) -> CallToolResult {
+        Self::run("system_event_compact", || {
+            let now = p.now.unwrap_or_else(crate::util::now_iso);
+            let report = self.state.system_events.compact_with_now(&now)?;
+            Ok(serde_json::to_string_pretty(&report)?)
+        })
+    }
+
+    #[tool(
+        name = "reaction_install",
+        description = "Install a reaction spec. Ops-only. Validates and persists to disk."
+    )]
+    pub(crate) fn tool_reaction_install(
+        &self,
+        Parameters(p): Parameters<ReactionInstallParams>,
+    ) -> CallToolResult {
+        Self::run("reaction_install", || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let spec: system_events::types::ReactionSpec = serde_json::from_value(p.spec)?;
+                self.state
+                    .system_events
+                    .install_reaction(spec, p.replace)
+                    .await?;
+                Ok("installed".to_string())
+            })
+        })
+    }
+
+    #[tool(name = "reaction_list", description = "List installed reactions.")]
+    pub(crate) fn tool_reaction_list(
+        &self,
+        Parameters(_p): Parameters<ReactionListParams>,
+    ) -> CallToolResult {
+        Self::run("reaction_list", || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let result = self
+                    .state
+                    .system_events
+                    .list_reactions_with_warnings()
+                    .await;
+                Ok(serde_json::to_string_pretty(&result)?)
+            })
+        })
+    }
+
+    #[tool(
+        name = "reaction_replay",
+        description = "Dry-run replay a reaction against an event. Returns rendered outputs without executing side effects."
+    )]
+    pub(crate) fn tool_reaction_replay(
+        &self,
+        Parameters(p): Parameters<ReactionReplayParams>,
+    ) -> CallToolResult {
+        Self::run("reaction_replay", || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                if p.mode != "dry_run" {
+                    anyhow::bail!("only mode='dry_run' is supported in this phase");
+                }
+                let event = self.state.system_events.open_event(&p.event_id)?;
+                let Some(event) = event else {
+                    anyhow::bail!("event '{}' not found", p.event_id);
+                };
+                let reaction = self.state.system_events.get_reaction(&p.reaction).await;
+                let Some(reaction) = reaction else {
+                    anyhow::bail!("reaction '{}' not found", p.reaction);
+                };
+                let outbox_records = self.state.system_events.outbox_store().load_all()?;
+                let packets = self.state.packets.read();
+                let result =
+                    system_events::dry_run_replay(&reaction, &event, &packets, &outbox_records)?;
+                Ok(serde_json::to_string_pretty(&result)?)
+            })
+        })
+    }
+
+    #[tool(
+        name = "reaction_execute",
+        description = "Execute a reaction once against an event through the audited outbox path. Ops-only. Set force=true to bypass succeeded-idempotency suppression."
+    )]
+    pub(crate) fn tool_reaction_execute(
+        &self,
+        Parameters(p): Parameters<ReactionExecuteParams>,
+    ) -> CallToolResult {
+        Self::run("reaction_execute", || {
+            let rt = tokio::runtime::Handle::current();
+            rt.block_on(async {
+                let event = self.state.system_events.open_event(&p.event_id)?;
+                let Some(event) = event else {
+                    anyhow::bail!("event '{}' not found", p.event_id);
+                };
+                let reaction = self.state.system_events.get_reaction(&p.reaction).await;
+                let Some(reaction) = reaction else {
+                    anyhow::bail!("reaction '{}' not found", p.reaction);
+                };
+                let result = system_events::worker::execute_reaction_once(
+                    self.state.clone(),
+                    &event,
+                    &reaction,
+                    p.force,
+                )
+                .await?;
+                Ok(serde_json::to_string_pretty(&result)?)
+            })
+        })
+    }
+
+    #[tool(
+        name = "reaction_deliveries",
+        description = "List outbox delivery records with optional filters."
+    )]
+    pub(crate) fn tool_reaction_deliveries(
+        &self,
+        Parameters(p): Parameters<ReactionDeliveriesParams>,
+    ) -> CallToolResult {
+        Self::run("reaction_deliveries", || {
+            let mut records = self.state.system_events.outbox_store().load_all()?;
+            if let Some(ref event_id) = p.event_id {
+                records.retain(|r| r.event_id == *event_id);
+            }
+            if let Some(ref status) = p.status {
+                records.retain(|r| {
+                    let s = serde_json::to_value(&r.status)
+                        .unwrap_or_default()
+                        .as_str()
+                        .unwrap_or("")
+                        .to_string();
+                    s == *status
+                });
+            }
+            records.reverse();
+            if let Some(limit) = p.limit {
+                records.truncate(limit);
+            }
+            Ok(serde_json::to_string_pretty(&records)?)
+        })
+    }
+
+    #[tool(
+        name = "reaction_retry",
+        description = "Retry a dead-lettered outbox record. Ops-only. Requires explicit outbox id."
+    )]
+    pub(crate) fn tool_reaction_retry(
+        &self,
+        Parameters(p): Parameters<ReactionRetryParams>,
+    ) -> CallToolResult {
+        Self::run("reaction_retry", || {
+            let found = self
+                .state
+                .system_events
+                .outbox_store()
+                .retry_dead_lettered(&p.outbox_id)?;
+            if found {
+                Ok(format!("requeued {}", p.outbox_id))
+            } else {
+                anyhow::bail!(
+                    "outbox record '{}' not found or not dead-lettered",
+                    p.outbox_id
+                )
+            }
+        })
+    }
+
+    #[tool(
+        name = "identity_list",
+        description = "List all durable external identity mappings. Readonly."
+    )]
+    pub(crate) fn tool_identity_list(
+        &self,
+        Parameters(_p): Parameters<IdentityListParams>,
+    ) -> CallToolResult {
+        Self::run("identity_list", || {
+            let ids = self.state.system_events.identity_registry().list_all();
+            Ok(serde_json::to_string_pretty(&ids)?)
+        })
+    }
+
+    #[tool(
+        name = "identity_get",
+        description = "Get a single external identity mapping by (scope, instance, subject, provider, model). Readonly."
+    )]
+    pub(crate) fn tool_identity_get(
+        &self,
+        Parameters(p): Parameters<IdentityGetParams>,
+    ) -> CallToolResult {
+        Self::run("identity_get", || {
+            let reg = self.state.system_events.identity_registry();
+            match reg.lookup(&p.scope, &p.instance, &p.subject, &p.provider, &p.model) {
+                Some(id) => Ok(serde_json::to_string_pretty(&id)?),
+                None => anyhow::bail!(
+                    "identity not found: scope={} instance={} subject={} provider={} model={}",
+                    p.scope,
+                    p.instance,
+                    p.subject,
+                    p.provider,
+                    p.model
+                ),
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn test_hub() -> (Arc<system_events::EventHub>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (
+            Arc::new(system_events::EventHub::new(
+                system_events::EventStore::new_at(dir.path().join("journal")),
+                system_events::OutboxStore::new(dir.path().join("outbox")).unwrap(),
+                dir.path().join("reactions"),
+                dir.path().join("identities"),
+            )),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn tool_emit_via_hub_appends_and_returns() {
+        let (hub, _dir) = test_hub();
+        let draft = system_events::SystemEventDraft {
+            kind: system_events::types::SystemEventKind::TaskStarted,
+            producer: "test-tool".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation: serde_json::Map::new(),
+            causation_id: None,
+            payload: json!({"note": "synthetic"}),
+        };
+        let outcome = hub.emit(draft).await.unwrap();
+        assert!(outcome.event.id.starts_with("evt-"));
+        assert!(outcome.journal_appended);
+    }
+
+    #[tokio::test]
+    async fn tool_list_via_hub_returns_emitted_events() {
+        let (hub, _dir) = test_hub();
+        hub.emit(system_events::SystemEventDraft {
+            kind: system_events::types::SystemEventKind::TaskCompleted,
+            producer: "list-test".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation: serde_json::Map::new(),
+            causation_id: None,
+            payload: json!({}),
+        })
+        .await
+        .unwrap();
+
+        let events = hub.list_events(None, None, None, None).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].producer, "list-test");
+    }
+
+    #[tokio::test]
+    async fn tool_open_via_hub_returns_event_with_links() {
+        let (hub, _dir) = test_hub();
+        let outcome = hub
+            .emit(system_events::SystemEventDraft {
+                kind: system_events::types::SystemEventKind::TaskStarted,
+                producer: "open-test".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: serde_json::Map::new(),
+                causation_id: None,
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let event = hub.open_event(&outcome.event.id).unwrap().unwrap();
+        assert_eq!(event.id, outcome.event.id);
+
+        let chain = hub.causation_chain_for(&outcome.event.id).unwrap();
+        assert_eq!(chain.len(), 1);
+        assert_eq!(chain[0].id, outcome.event.id);
+
+        let derived = hub.derived_events(&outcome.event.id).unwrap();
+        assert!(derived.is_empty());
+    }
+
+    fn valid_reaction_spec(name: &str) -> system_events::types::ReactionSpec {
+        system_events::types::ReactionSpec {
+            contract: "reaction/v1".to_string(),
+            name: name.to_string(),
+            version: 1,
+            enabled: true,
+            event_kinds: vec!["task.completed".to_string()],
+            when: None,
+            idempotency_key: Some("key:${event.id}".to_string()),
+            action: system_events::types::ReactionAction::EmitEvent {
+                args: json!({"kind": "derived.event"}),
+            },
+            retry: system_events::types::RetryPolicy::default(),
+            on_failure: system_events::types::FailurePolicy::DeadLetter,
+        }
+    }
+
+    #[tokio::test]
+    async fn reaction_install_rejects_invalid_spec() {
+        let (hub, _dir) = test_hub();
+        let mut spec = valid_reaction_spec("bad");
+        spec.contract = "wrong/v1".to_string();
+        let result = hub.install_reaction(spec, false).await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unsupported contract")
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_install_requires_replace_when_name_exists() {
+        let (hub, _dir) = test_hub();
+        hub.install_reaction(valid_reaction_spec("dup-test"), false)
+            .await
+            .unwrap();
+        let result = hub
+            .install_reaction(valid_reaction_spec("dup-test"), false)
+            .await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("already exists"));
+
+        hub.install_reaction(valid_reaction_spec("dup-test"), true)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn reaction_install_persists_to_disk() {
+        let (hub, _dir) = test_hub();
+        hub.install_reaction(valid_reaction_spec("persist-test"), false)
+            .await
+            .unwrap();
+
+        let reactions_dir = hub.reactions_dir().to_path_buf();
+        let path = reactions_dir.join("persist-test.json");
+        assert!(path.exists(), "reaction file should exist on disk");
+        let loaded: system_events::types::ReactionSpec =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(loaded.name, "persist-test");
+    }
+
+    #[tokio::test]
+    async fn dry_run_renders_event_payload_instance() {
+        let (hub, _dir) = test_hub();
+        let outcome = hub
+            .emit(system_events::SystemEventDraft {
+                kind: system_events::types::SystemEventKind::TaskCompleted,
+                producer: "dry-run-test".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: serde_json::Map::new(),
+                causation_id: None,
+                payload: json!({"instance": "forgejo-bro-reviewer"}),
+            })
+            .await
+            .unwrap();
+
+        let spec = system_events::types::ReactionSpec {
+            contract: "reaction/v1".to_string(),
+            name: "payload-render-test".to_string(),
+            version: 1,
+            enabled: true,
+            event_kinds: vec!["task.completed".to_string()],
+            when: None,
+            idempotency_key: Some("${event.payload.instance}".to_string()),
+            action: system_events::types::ReactionAction::EmitEvent {
+                args: json!({"kind": "derived.event", "ref": "${event.payload.instance}"}),
+            },
+            retry: system_events::types::RetryPolicy::default(),
+            on_failure: system_events::types::FailurePolicy::DeadLetter,
+        };
+        hub.install_reaction(spec, false).await.unwrap();
+
+        let reaction = hub.get_reaction("payload-render-test").await.unwrap();
+        let event = hub.open_event(&outcome.event.id).unwrap().unwrap();
+        let outbox = hub.outbox_store().load_all().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        let result = system_events::dry_run_replay(&reaction, &event, &packets, &outbox).unwrap();
+
+        assert_eq!(
+            result.rendered_idempotency_key,
+            Some("forgejo-bro-reviewer".to_string())
+        );
+        let args = result.rendered_action_args.as_object().unwrap();
+        assert_eq!(args["ref"], "forgejo-bro-reviewer");
+    }
+
+    #[tokio::test]
+    async fn dry_run_unresolved_template_hard_errors() {
+        let (hub, _dir) = test_hub();
+        let outcome = hub
+            .emit(system_events::SystemEventDraft {
+                kind: system_events::types::SystemEventKind::TaskCompleted,
+                producer: "test".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: serde_json::Map::new(),
+                causation_id: None,
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let spec = system_events::types::ReactionSpec {
+            contract: "reaction/v1".to_string(),
+            name: "unresolved-test".to_string(),
+            version: 1,
+            enabled: true,
+            event_kinds: vec!["task.completed".to_string()],
+            when: None,
+            idempotency_key: Some("${event.nonexistent.field}".to_string()),
+            action: system_events::types::ReactionAction::EmitEvent { args: json!({}) },
+            retry: system_events::types::RetryPolicy::default(),
+            on_failure: system_events::types::FailurePolicy::DeadLetter,
+        };
+        hub.install_reaction(spec, false).await.unwrap();
+
+        let reaction = hub.get_reaction("unresolved-test").await.unwrap();
+        let event = hub.open_event(&outcome.event.id).unwrap().unwrap();
+        let outbox = hub.outbox_store().load_all().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        let result = system_events::dry_run_replay(&reaction, &event, &packets, &outbox);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unresolved"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_redacts_authorization_and_secret_refs() {
+        let (hub, _dir) = test_hub();
+        let outcome = hub
+            .emit(system_events::SystemEventDraft {
+                kind: system_events::types::SystemEventKind::TaskCompleted,
+                producer: "redact-test".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: serde_json::Map::new(),
+                causation_id: None,
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let spec = system_events::types::ReactionSpec {
+            contract: "reaction/v1".to_string(),
+            name: "redact-test".to_string(),
+            version: 1,
+            enabled: true,
+            event_kinds: vec!["task.completed".to_string()],
+            when: None,
+            idempotency_key: Some("static-key".to_string()),
+            action: system_events::types::ReactionAction::HttpJson {
+                args: json!({
+                    "url": "https://example.com",
+                    "headers": {
+                        "Authorization": "Bearer secret:forgejo-admin-token",
+                        "X-Custom": "safe-value"
+                    },
+                    "body": {
+                        "token": "secret:another-secret"
+                    }
+                }),
+            },
+            retry: system_events::types::RetryPolicy::default(),
+            on_failure: system_events::types::FailurePolicy::DeadLetter,
+        };
+        hub.install_reaction(spec, false).await.unwrap();
+
+        let reaction = hub.get_reaction("redact-test").await.unwrap();
+        let event = hub.open_event(&outcome.event.id).unwrap().unwrap();
+        let outbox = hub.outbox_store().load_all().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        let result = system_events::dry_run_replay(&reaction, &event, &packets, &outbox).unwrap();
+
+        let args_str = serde_json::to_string(&result.rendered_action_args).unwrap();
+        assert!(
+            args_str.contains("[REDACTED]"),
+            "should contain redacted values"
+        );
+        assert!(
+            !args_str.contains("secret:forgejo-admin-token"),
+            "secret ref should be redacted"
+        );
+        assert!(
+            !args_str.contains("secret:another-secret"),
+            "secret ref should be redacted"
+        );
+        assert!(
+            !args_str.contains("Bearer"),
+            "authorization should be redacted"
+        );
+        assert!(
+            args_str.contains("safe-value"),
+            "non-secret values should pass through"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_write_outbox_records() {
+        let (hub, _dir) = test_hub();
+        let outcome = hub
+            .emit(system_events::SystemEventDraft {
+                kind: system_events::types::SystemEventKind::TaskCompleted,
+                producer: "no-write-test".to_string(),
+                project: None,
+                principal: None,
+                subject: None,
+                correlation: serde_json::Map::new(),
+                causation_id: None,
+                payload: json!({}),
+            })
+            .await
+            .unwrap();
+
+        let before_count = hub.outbox_store().load_all().unwrap().len();
+
+        let reaction = hub.get_reaction("redact-test").await;
+        assert!(reaction.is_none(), "no reaction installed for this test");
+
+        let spec = system_events::types::ReactionSpec {
+            contract: "reaction/v1".to_string(),
+            name: "no-write-reaction".to_string(),
+            version: 1,
+            enabled: true,
+            event_kinds: vec!["task.completed".to_string()],
+            when: None,
+            idempotency_key: Some("key".to_string()),
+            action: system_events::types::ReactionAction::EmitEvent { args: json!({}) },
+            retry: system_events::types::RetryPolicy::default(),
+            on_failure: system_events::types::FailurePolicy::DeadLetter,
+        };
+        hub.install_reaction(spec, false).await.unwrap();
+        let reaction = hub.get_reaction("no-write-reaction").await.unwrap();
+        let event = hub.open_event(&outcome.event.id).unwrap().unwrap();
+        let outbox = hub.outbox_store().load_all().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+
+        let _ = system_events::dry_run_replay(&reaction, &event, &packets, &outbox).unwrap();
+
+        let after_count = hub.outbox_store().load_all().unwrap().len();
+        assert_eq!(
+            before_count, after_count,
+            "dry-run must not write outbox records"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaction_list_returns_warnings_shape() {
+        let (hub, _dir) = test_hub();
+        hub.install_reaction(valid_reaction_spec("list-test"), false)
+            .await
+            .unwrap();
+
+        let result = hub.list_reactions_with_warnings().await;
+        assert_eq!(result.reactions.len(), 1);
+        assert_eq!(result.reactions[0].name, "list-test");
+        assert!(
+            result.warnings.is_empty(),
+            "no warnings expected for valid spec"
+        );
+
+        let bad_path = hub.reactions_dir().join("broken.json");
+        std::fs::write(&bad_path, "not json").unwrap();
+
+        let result_with_warnings = hub.list_reactions_with_warnings().await;
+        assert_eq!(result_with_warnings.reactions.len(), 1);
+        assert_eq!(result_with_warnings.warnings.len(), 1);
+        assert!(
+            result_with_warnings.warnings[0]
+                .reason
+                .contains("parse error"),
+            "expected parse error warning"
+        );
+    }
+
+    #[test]
+    fn deliveries_returns_outbox_records() {
+        let (hub, _dir) = test_hub();
+        hub.outbox_store()
+            .create_record("evt-1", "react-a", Some("key-a".to_string()))
+            .unwrap();
+        hub.outbox_store()
+            .create_record("evt-2", "react-b", None)
+            .unwrap();
+
+        let all = hub.outbox_store().load_all().unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn deliveries_filter_by_event_id() {
+        let (hub, _dir) = test_hub();
+        hub.outbox_store()
+            .create_record("evt-1", "react-a", Some("key-a".to_string()))
+            .unwrap();
+        hub.outbox_store()
+            .create_record("evt-2", "react-b", None)
+            .unwrap();
+
+        let mut records = hub.outbox_store().load_all().unwrap();
+        records.retain(|r| r.event_id == "evt-1");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_id, "evt-1");
+    }
+
+    #[test]
+    fn deliveries_filter_by_status() {
+        let (hub, _dir) = test_hub();
+        let rec = hub
+            .outbox_store()
+            .create_record("evt-1", "react", Some("key".to_string()))
+            .unwrap();
+        hub.outbox_store()
+            .mark_dead_lettered(&rec.id, "test", None)
+            .unwrap();
+
+        let records = hub.outbox_store().load_all().unwrap();
+        let dead: Vec<_> = records
+            .iter()
+            .filter(|r| {
+                serde_json::to_value(&r.status)
+                    .unwrap_or_default()
+                    .as_str()
+                    .unwrap_or("")
+                    == "dead_lettered"
+            })
+            .collect();
+        assert_eq!(dead.len(), 1);
+    }
+
+    #[test]
+    fn retry_requeues_dead_lettered_record() {
+        let (hub, _dir) = test_hub();
+        let rec = hub
+            .outbox_store()
+            .create_record("evt-1", "react", Some("key".to_string()))
+            .unwrap();
+        hub.outbox_store()
+            .mark_dead_lettered(&rec.id, "test reason", None)
+            .unwrap();
+
+        let found = hub.outbox_store().retry_dead_lettered(&rec.id).unwrap();
+        assert!(found);
+
+        let loaded = hub.outbox_store().get_record(&rec.id).unwrap().unwrap();
+        assert_eq!(loaded.status, system_events::types::OutboxStatus::Pending);
+        assert!(loaded.dead_letter_reason.is_none());
+    }
+
+    #[test]
+    fn retry_rejects_non_dead_lettered() {
+        let (hub, _dir) = test_hub();
+        let rec = hub
+            .outbox_store()
+            .create_record("evt-1", "react", Some("key".to_string()))
+            .unwrap();
+
+        let found = hub.outbox_store().retry_dead_lettered(&rec.id).unwrap();
+        assert!(!found, "pending record should not be retryable");
+    }
+
+    #[test]
+    fn retry_rejects_unknown_id() {
+        let (hub, _dir) = test_hub();
+        let found = hub
+            .outbox_store()
+            .retry_dead_lettered("nonexistent")
+            .unwrap();
+        assert!(!found);
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8 follow-up: synthetic emit accepts principal/subject/correlation
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn synthetic_emit_via_params_persists_principal_subject_correlation() {
+        // Deserialize SystemEventEmitParams from the exact JSON shape an MCP
+        // client would send, route through draft_from_emit_params (the helper
+        // tool_system_event_emit uses), then emit. This exercises the params
+        // → draft path that the prior test bypassed.
+        let raw_params = json!({
+            "kind": "bro.identity.required",
+            "producer": "manual-test",
+            "project": "/repo/test",
+            "principal": {
+                "kind": "bro",
+                "bro": "keystone-review",
+                "provider": "claude",
+                "model": "haiku-4.5",
+                "effort": "medium"
+            },
+            "subject": {
+                "kind": "bro",
+                "id": "bro:keystone-review"
+            },
+            "correlation": {
+                "arc_id": "arc-test-123"
+            },
+            "payload": {"identity_scope": "forgejo"}
+        });
+        let params: SystemEventEmitParams =
+            serde_json::from_value(raw_params).expect("SystemEventEmitParams should deserialize");
+
+        let draft =
+            draft_from_emit_params(params).expect("draft_from_emit_params must accept the params");
+
+        let (hub, _dir) = test_hub();
+        let outcome = hub.emit(draft).await.unwrap();
+        let event_id = outcome.event.id.clone();
+        let opened = hub.open_event(&event_id).unwrap().expect("event present");
+
+        assert!(matches!(
+            opened.kind,
+            system_events::types::SystemEventKind::BroIdentityRequired
+        ));
+        assert_eq!(opened.producer, "manual-test");
+        assert_eq!(opened.project.as_deref(), Some("/repo/test"));
+        let principal = opened.principal.as_ref().expect("principal preserved");
+        assert_eq!(principal.kind, "bro");
+        assert_eq!(principal.bro.as_deref(), Some("keystone-review"));
+        assert_eq!(principal.provider.as_deref(), Some("claude"));
+        assert_eq!(principal.model.as_deref(), Some("haiku-4.5"));
+        assert_eq!(principal.effort.as_deref(), Some("medium"));
+        let subject = opened.subject.as_ref().expect("subject preserved");
+        assert_eq!(subject.kind, "bro");
+        assert_eq!(subject.id, "bro:keystone-review");
+        assert_eq!(
+            opened.correlation.get("arc_id"),
+            Some(&json!("arc-test-123"))
+        );
+        assert_eq!(
+            opened
+                .payload
+                .get("identity_scope")
+                .and_then(|v| v.as_str()),
+            Some("forgejo")
+        );
+    }
+
+    #[test]
+    fn draft_from_emit_params_rejects_malformed_subject() {
+        // subject missing required `id` — EventSubject has both kind and id required.
+        let params: SystemEventEmitParams = serde_json::from_value(json!({
+            "kind": "task.started",
+            "producer": "test",
+            "subject": {"kind": "bro"},
+            "payload": {}
+        }))
+        .unwrap();
+        let err = draft_from_emit_params(params).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid subject"),
+            "error must call out subject: {err}"
+        );
+    }
+
+    #[test]
+    fn draft_from_emit_params_rejects_malformed_principal() {
+        // principal must be an object, not a scalar.
+        let params: SystemEventEmitParams = serde_json::from_value(json!({
+            "kind": "task.started",
+            "producer": "test",
+            "principal": "not-an-object",
+            "payload": {}
+        }))
+        .unwrap();
+        let err = draft_from_emit_params(params).unwrap_err().to_string();
+        assert!(
+            err.contains("invalid principal"),
+            "error must call out principal: {err}"
+        );
+    }
+
+    #[test]
+    fn draft_from_emit_params_defaults_correlation_to_empty() {
+        let params: SystemEventEmitParams = serde_json::from_value(json!({
+            "kind": "task.started",
+            "producer": "test",
+            "payload": {}
+        }))
+        .unwrap();
+        let draft = draft_from_emit_params(params).unwrap();
+        assert!(draft.principal.is_none());
+        assert!(draft.subject.is_none());
+        assert!(draft.correlation.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Phase 8 follow-up: dry-run example reaction against synthetic emit
+    // produces a fully-resolved idempotency key (no null segments).
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn example_forgejo_reaction_dry_run_renders_full_idempotency_key() {
+        // Construct the synthetic emit from the same JSON shape an operator
+        // would pass to `system_event_emit`, route through the helper so
+        // this test exercises the params → draft → emit path the README
+        // documents.
+        let params: SystemEventEmitParams = serde_json::from_value(json!({
+            "kind": "bro.identity.required",
+            "producer": "manual-test",
+            "principal": {
+                "kind": "bro",
+                "bro": "keystone-review",
+                "provider": "claude",
+                "model": "haiku-4.5"
+            },
+            "subject": {"kind": "bro", "id": "bro:keystone-review"},
+            "payload": {
+                "identity_scope": "forgejo",
+                "instance": "local-forgejo15",
+                "bro": "keystone-review",
+                "provider": "claude",
+                "model": "haiku-4.5",
+                "username": "bro-keystone-review-claude-haiku45",
+                "display_name": "keystone-review / claude haiku-4.5",
+                "email": "bro-keystone-review@blackbox.local"
+            }
+        }))
+        .unwrap();
+        let draft = draft_from_emit_params(params).unwrap();
+
+        let (hub, _dir) = test_hub();
+        let outcome = hub.emit(draft).await.unwrap();
+        let event = outcome.event.clone();
+
+        let spec_src =
+            include_str!("../../examples/system-events/reactions/forgejo-ensure-bro-user.json");
+        let spec: system_events::types::ReactionSpec = serde_json::from_str(spec_src).unwrap();
+
+        // The reaction's `when` references a gate packet; compile it so dry-run can resolve.
+        let packet_src =
+            include_str!("../../examples/system-events/packets/forgejo-identity-required.json");
+        let packet_params: crate::packets::CompileParams =
+            serde_json::from_str(packet_src).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        packets.compile(&packet_params).unwrap();
+
+        let result = system_events::dry_run_replay(&spec, &event, &packets, &[])
+            .expect("dry-run should not hard-error on the example reaction");
+
+        let key = result
+            .rendered_idempotency_key
+            .expect("idempotency key must render");
+        assert!(
+            key.contains("bro:keystone-review"),
+            "rendered key must include subject id: {key}"
+        );
+        assert!(
+            key.contains("claude"),
+            "rendered key must include provider: {key}"
+        );
+        assert!(
+            key.contains("haiku-4.5"),
+            "rendered key must include model: {key}"
+        );
+        assert!(
+            !key.contains("null"),
+            "rendered key must not contain null segments: {key}"
+        );
+        assert!(
+            !key.contains("${"),
+            "rendered key must not contain raw template heads: {key}"
+        );
+    }
+}

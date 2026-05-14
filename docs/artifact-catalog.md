@@ -1,7 +1,7 @@
 # Artifact Catalog And System Defaults
 
 The artifact catalog is the versioned install path for blackbox-owned machinery:
-workflows, packets, brofiles, agents, atoms, and teams.
+workflows, packets, brofiles, agents, atoms, teams, and crons.
 
 `system-defaults/` is the shipped catalog source. `examples/` is for tutorial
 material and full demos users copy to learn a pattern.
@@ -14,11 +14,13 @@ Install from a local file or URL:
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/basic/echo.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/workflows/atoms/echo-review.json")
+bbox_artifact_install(kind="cron", source="system-defaults/maintenance/crons/daily-compaction.json")
 ```
 
 The installer validates the artifact through its native path before recording
 metadata. Atom installs validate atom manifests. Workflow installs validate
-workflow shape. Packet installs compile packet artifacts.
+workflow shape. Packet installs compile packet artifacts. Cron installs validate
+the schedule, persist the spec, and start the cron loop.
 
 ## List And Supersede
 
@@ -46,6 +48,7 @@ lists by default.
 | `system-defaults/agents/` | Legacy registered-agent manifests and agent-composition workflows. |
 | `system-defaults/badgey/` | Badgey agents, workflows, packets, brofiles, and crons. |
 | `system-defaults/agentic-corpus/` | Producer-side knowledge/index maintenance workflows and packets. |
+| `system-defaults/maintenance/` | Cross-store maintenance workflows, packets, and crons. |
 | `system-defaults/mcp-surfaces/` | Default MCP surface routing packet. |
 
 The daemon does not auto-install this tree. Install only what you intend to run.

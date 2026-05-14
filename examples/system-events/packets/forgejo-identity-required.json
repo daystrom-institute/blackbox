@@ -1,0 +1,26 @@
+{
+  "domain": "system-event/forgejo-identity-required",
+  "scope": "global",
+  "classification_lattice": ["allow", "skip"],
+  "rules": [
+    {
+      "id": "allow_forgejo_identity_required",
+      "classification": "allow",
+      "antecedent": {
+        "op": "Eq",
+        "field": "payload.identity_scope",
+        "value": "forgejo"
+      },
+      "consequent": "allow"
+    },
+    {
+      "id": "skip_other_scopes",
+      "classification": "skip",
+      "antecedent": {
+        "op": "Not",
+        "arg": { "op": "Eq", "field": "payload.identity_scope", "value": "forgejo" }
+      },
+      "consequent": "skip"
+    }
+  ]
+}

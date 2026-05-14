@@ -579,8 +579,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_install",
         category: ToolCategory::Artifacts,
-        summary: "Install a workflow, packet, brofile, agent, atom, or team artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
-        when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, or team path, then records version/source/supersession metadata in the catalog.",
+        summary: "Install a workflow, packet, brofile, agent, atom, team, or cron artifact from a local JSON file path or http(s) URL into the versioned artifact catalog.",
+        when_to_use: "Use for producer-side artifacts shipped under system-defaults/agentic-corpus, system-defaults/atoms, system-defaults/maintenance, or project-local .bbox directories. The installer validates and activates the artifact through the existing workflow, packet, brofile, agent, atom, team, or cron path, then records version/source/supersession metadata in the catalog.",
         example: Some(
             r#"bbox_artifact_install(kind="workflow", source="system-defaults/agentic-corpus/workflows/schema-migration-arc.json")"#,
         ),
@@ -588,7 +588,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_artifact_list",
         category: ToolCategory::Artifacts,
-        summary: "List installed workflow, packet, brofile, agent, atom, and team artifacts with version, source, active status, and supersession metadata.",
+        summary: "List installed workflow, packet, brofile, agent, atom, team, and cron artifacts with version, source, active status, and supersession metadata.",
         when_to_use: "Inventory check before installing or superseding producer machinery. Use kind/name filters to inspect a specific artifact family.",
         example: Some(r#"bbox_artifact_list(kind="packet")"#),
     },
@@ -1370,6 +1370,103 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Migrating pre-Phase-2 legacy sidecars into lane-split storage.",
         example: None,
     },
+    // ── System Events ────────────────────────────────────────────────
+    ToolDoc {
+        name: "system_event_emit",
+        category: ToolCategory::Orchestration,
+        summary: "Emit a synthetic system event into the journal and broadcast. Ops-only; surface-enforced.",
+        when_to_use: "Use for testing, manual event injection, or operational triggers. Accepts kind, producer, optional project, causation_id, principal, subject, correlation, and payload — same shape as the typed SystemEvent. Production identity events come from `require_identity`, not this tool. Requires ops surface.",
+        example: Some(
+            r#"system_event_emit(kind="bro.identity.required", producer="manual-test", principal={"kind":"bro","bro":"keystone-review","provider":"claude","model":"claude-haiku-4-5-20251001"}, subject={"kind":"bro","id":"bro:keystone-review"}, payload={"identity_scope":"forgejo","instance":"local-forgejo15"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "system_event_compact",
+        category: ToolCategory::Orchestration,
+        summary: "Apply system-event journal and outbox retention compaction. Ops-only; surface-enforced.",
+        when_to_use: "Use for manual ops compaction or from the daily-compaction workflow. Applies the same retention as startup compaction: event journal age/count retention plus succeeded-outbox retention, and returns before/after/drop counts.",
+        example: Some(r#"system_event_compact()"#),
+    },
+    ToolDoc {
+        name: "system_event_list",
+        category: ToolCategory::Orchestration,
+        summary: "List recent system events with optional filters. Readonly.",
+        when_to_use: "Use to inspect recent events, filter by kind/producer/project. Does not leak resolved secret values.",
+        example: Some(r#"system_event_list(kind="task.completed", limit=10)"#),
+    },
+    ToolDoc {
+        name: "system_event_open",
+        category: ToolCategory::Orchestration,
+        summary: "Open a single system event with causation chain and derived event links. Readonly.",
+        when_to_use: "Use to inspect a specific event and its causal ancestry or derived children.",
+        example: Some(r#"system_event_open(event_id="evt-abc123")"#),
+    },
+    // ── Reactions ──────────────────────────────────────────────────
+    ToolDoc {
+        name: "reaction_install",
+        category: ToolCategory::Orchestration,
+        summary: "Install a reaction spec. Ops-only. Validates and persists to disk.",
+        when_to_use: "Use to register a new reaction that subscribes to system event kinds and triggers actions. Requires replace=true to overwrite.",
+        example: Some(
+            r#"reaction_install(spec={"_contract":"reaction/v1","name":"my-react",...}, replace=false)"#,
+        ),
+    },
+    ToolDoc {
+        name: "reaction_list",
+        category: ToolCategory::Orchestration,
+        summary: "List installed reactions.",
+        when_to_use: "Use to see which reactions are installed and their event_kinds, action, and enabled status.",
+        example: Some(r#"reaction_list()"#),
+    },
+    ToolDoc {
+        name: "reaction_replay",
+        category: ToolCategory::Orchestration,
+        summary: "Dry-run replay a reaction against an event. Returns rendered outputs without executing side effects.",
+        when_to_use: "Use to preview what a reaction would do: rendered idempotency key, gate decision, action args with secrets redacted.",
+        example: Some(
+            r#"reaction_replay(mode="dry_run", event_id="evt-abc123", reaction="my-react")"#,
+        ),
+    },
+    ToolDoc {
+        name: "reaction_execute",
+        category: ToolCategory::Orchestration,
+        summary: "Execute a reaction once against an event through the audited outbox path. Ops-only. Set force=true to bypass succeeded-idempotency suppression.",
+        when_to_use: "Use after a dry-run when an operator needs to execute or force-reexecute a reaction against a specific event. The tool creates and claims an outbox row, runs normal gates/guards/action execution, and persists the final delivery status.",
+        example: Some(
+            r#"reaction_execute(event_id="evt-abc123", reaction="my-react", force=false)"#,
+        ),
+    },
+    ToolDoc {
+        name: "reaction_deliveries",
+        category: ToolCategory::Orchestration,
+        summary: "List outbox delivery records with optional filters.",
+        when_to_use: "Use to inspect outbox records — pending, claimed, succeeded, retry, dead-lettered. Filter by event_id or status.",
+        example: Some(r#"reaction_deliveries(status="dead_lettered")"#),
+    },
+    ToolDoc {
+        name: "reaction_retry",
+        category: ToolCategory::Orchestration,
+        summary: "Retry a dead-lettered outbox record. Ops-only. Requires explicit outbox id.",
+        when_to_use: "Use to requeue a specific dead-lettered record after investigating and fixing the root cause.",
+        example: Some(r#"reaction_retry(outbox_id="outbox-abc123")"#),
+    },
+    // ── Identity ─────────────────────────────────────────────────────
+    ToolDoc {
+        name: "identity_list",
+        category: ToolCategory::Orchestration,
+        summary: "List all durable external identity mappings. Readonly.",
+        when_to_use: "Use to inspect provisioned bro-to-external-user mappings across all scopes and instances.",
+        example: Some(r#"identity_list()"#),
+    },
+    ToolDoc {
+        name: "identity_get",
+        category: ToolCategory::Orchestration,
+        summary: "Get a single external identity mapping by (scope, instance, subject, provider, model). Readonly.",
+        when_to_use: "Use to look up the provisioned external identity for a specific bro/provider/model triple on a given instance.",
+        example: Some(
+            r#"identity_get(scope="forgejo", instance="local-forgejo15", subject="bro:keystone-review", provider="claude", model="claude-haiku-4-5-20251001")"#,
+        ),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -1854,6 +1951,9 @@ mod tests {
                     || n.starts_with("whiteboard_")
                     || n.starts_with("work_")
                     || n.starts_with("atom_")
+                    || n.starts_with("system_event_")
+                    || n.starts_with("reaction_")
+                    || n.starts_with("identity_")
                 {
                     out.push((n, d));
                 }

@@ -830,6 +830,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(bro_label.clone()),
             Some(bro_label.clone()),
+            Some(self.state.system_events.clone()),
         );
 
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);

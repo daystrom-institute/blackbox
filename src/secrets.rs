@@ -189,6 +189,57 @@ pub fn resolve_with_sources(name: &str, sources: SecretSources) -> Result<Secret
     bail!("Secret '{}' not found in any source", name);
 }
 
+static WRITE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn write_file_secret(name: &str, value: &str, sources: &SecretSources) -> Result<()> {
+    validate_secret_name(name)?;
+
+    fs::create_dir_all(&sources.secrets_dir)
+        .with_context(|| format!("creating secrets dir {}", sources.secrets_dir.display()))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&sources.secrets_dir)?.permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&sources.secrets_dir, perms)?;
+    }
+
+    let target = sources.secrets_dir.join(name);
+    let tmp_name = format!(
+        ".{}.tmp.{}.{}",
+        name,
+        std::process::id(),
+        WRITE_NONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+    );
+    let tmp_path = sources.secrets_dir.join(&tmp_name);
+
+    {
+        let f = fs::File::create(&tmp_path)
+            .with_context(|| format!("creating temp secret file {}", tmp_path.display()))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = f.metadata()?.permissions();
+            perms.set_mode(0o600);
+            f.set_permissions(perms)?;
+        }
+
+        use std::io::Write;
+        let mut writer = std::io::BufWriter::new(&f);
+        writer.write_all(value.as_bytes())?;
+        writer.flush()?;
+        drop(writer);
+        f.sync_all()?;
+    }
+
+    fs::rename(&tmp_path, &target)
+        .with_context(|| format!("renaming {} to {}", tmp_path.display(), target.display()))?;
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,6 +634,107 @@ mod tests {
             unsafe { env::set_var("BLACKBOX_SECRET_NONEXISTENT", v) };
         } else {
             unsafe { env::remove_var("BLACKBOX_SECRET_NONEXISTENT") };
+        }
+    }
+
+    #[test]
+    fn write_file_secret_creates_0600_file_in_0700_dir() {
+        let _guard = crate::util::test_env_lock();
+        let dir = tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let sources = SecretSources {
+            credentials_dir: None,
+            secrets_dir: secrets_dir.clone(),
+            env_prefix: "BLACKBOX_SECRET_".to_string(),
+        };
+        write_file_secret("test-write", "secret-value-123", &sources).unwrap();
+        let secret_path = secrets_dir.join("test-write");
+        assert!(secret_path.exists());
+        assert_eq!(
+            fs::read_to_string(&secret_path).unwrap(),
+            "secret-value-123"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&secret_path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(&secrets_dir).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn write_file_secret_rejects_path_separators() {
+        let dir = tempdir().unwrap();
+        let sources = SecretSources {
+            credentials_dir: None,
+            secrets_dir: dir.path().join("secrets"),
+            env_prefix: "BLACKBOX_SECRET_".to_string(),
+        };
+        assert!(
+            write_file_secret("forgejo/foo", "v", &sources)
+                .unwrap_err()
+                .to_string()
+                .contains("path separators")
+        );
+        assert!(
+            write_file_secret("forgejo\\bar", "v", &sources)
+                .unwrap_err()
+                .to_string()
+                .contains("path separators")
+        );
+    }
+
+    #[test]
+    fn write_file_secret_overwrites_existing() {
+        let _guard = crate::util::test_env_lock();
+        let dir = tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let sources = SecretSources {
+            credentials_dir: None,
+            secrets_dir: secrets_dir.clone(),
+            env_prefix: "BLACKBOX_SECRET_".to_string(),
+        };
+        write_file_secret("test-ow", "old", &sources).unwrap();
+        write_file_secret("test-ow", "new", &sources).unwrap();
+        assert_eq!(
+            fs::read_to_string(secrets_dir.join("test-ow")).unwrap(),
+            "new"
+        );
+    }
+
+    #[test]
+    fn write_file_secret_roundtrips_via_resolve() {
+        let _guard = crate::util::test_env_lock();
+        let orig_creds = env::var("CREDENTIALS_DIRECTORY").ok();
+        unsafe {
+            env::remove_var("CREDENTIALS_DIRECTORY");
+        }
+        let dir = tempdir().unwrap();
+        let secrets_dir = dir.path().join("secrets");
+        let sources = SecretSources {
+            credentials_dir: None,
+            secrets_dir: secrets_dir.clone(),
+            env_prefix: "BLACKBOX_SECRET_".to_string(),
+        };
+        write_file_secret("rt-key", "rt-value", &sources).unwrap();
+        assert_eq!(
+            resolve_with_sources("rt-key", sources).unwrap().expose(),
+            "rt-value"
+        );
+        if let Some(v) = orig_creds {
+            unsafe {
+                env::set_var("CREDENTIALS_DIRECTORY", v);
+            }
+        } else {
+            unsafe {
+                env::remove_var("CREDENTIALS_DIRECTORY");
+            }
         }
     }
 }

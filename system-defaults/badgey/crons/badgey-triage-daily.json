@@ -1,5 +1,6 @@
 {
   "name": "badgey-triage-daily",
+  "version": 1,
   "schedule": "0 0 8 * * *",
   "tz": "Local",
   "payload": {},

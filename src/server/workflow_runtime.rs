@@ -119,6 +119,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             None,
             None,
+            Some(self.state.system_events.clone()),
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(lease) = resume_lease {

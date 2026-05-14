@@ -835,6 +835,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(atom_label.clone()),
             Some(atom_label.clone()),
+            Some(self.state.system_events.clone()),
         );
 
         crate::server::progress::cleanup_policy_file_when_done(
@@ -1342,6 +1343,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some(inv.atom_ref.clone()),
             Some(inv.atom_ref.clone()),
+            Some(self.state.system_events.clone()),
         );
 
         crate::server::progress::cleanup_policy_file_when_done(

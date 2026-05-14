@@ -277,29 +277,29 @@ impl ArcContext {
     /// references are visible in the dispatched prompt rather than
     /// silently turning into the empty string.
     pub fn render_template(&self, template: &str) -> String {
-        let mut out = String::with_capacity(template.len());
-        let bytes = template.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
-                if let Some(close) = find_close_brace(template, i + 2) {
-                    let expr = &template[i + 2..close];
-                    match self.resolve(expr) {
-                        Some(v) => out.push_str(&value_to_template_string(&v)),
-                        None => {
-                            out.push_str("${");
-                            out.push_str(expr);
-                            out.push('}');
-                        }
-                    }
-                    i = close + 1;
-                    continue;
-                }
-            }
-            out.push(bytes[i] as char);
-            i += 1;
+        let mut roots = serde_json::Map::new();
+        roots.insert("vars".to_string(), json!(self.vars));
+        roots.insert("outputs".to_string(), json!(self.outputs));
+        roots.insert("actor_results".to_string(), json!(self.actor_results));
+        roots.insert(
+            "meta".to_string(),
+            serde_json::to_value(&self.meta).unwrap_or_default(),
+        );
+        if let Some(ref sig) = self.last_signal {
+            roots.insert(
+                "last_signal".to_string(),
+                serde_json::to_value(sig).unwrap_or_default(),
+            );
         }
-        out
+        crate::system_events::template::render_template_with_roots(
+            template,
+            &roots,
+            crate::system_events::template::UnresolvedPolicy::LeaveVerbatim,
+        )
+        .unwrap_or_else(|e| {
+            tracing::warn!("template render error (LeaveVerbatim should not error): {e}");
+            template.to_string()
+        })
     }
 
     /// Resolve one path expression to a value. Public so hook arg
@@ -381,17 +381,6 @@ fn find_close_brace(s: &str, start: usize) -> Option<usize> {
     None
 }
 
-/// Render a Value into the form a template substitution should produce.
-/// Strings come out as their content (no surrounding quotes); other
-/// types come out as compact JSON.
-fn value_to_template_string(v: &Value) -> String {
-    match v {
-        Value::String(s) => s.clone(),
-        Value::Null => String::new(),
-        other => other.to_string(),
-    }
-}
-
 fn value_kind_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -404,20 +393,9 @@ fn value_kind_name(v: &Value) -> &'static str {
     }
 }
 
-/// Resolve a `${expr}` template to a structured Value (not a string).
-/// Used by op argument rendering when the target type matters
-/// (`SetVar` needs to write a number, not the string "42"). Bare
-/// strings without templating come back as `Value::String`.
 pub fn resolve_arg_value(ctx: &ArcContext, raw: &Value) -> Result<Value> {
     match raw {
         Value::String(s) => {
-            // Whole-string templating: a string that is EXACTLY one
-            // `${expr}` resolves to the typed value (so `${vars.n}`
-            // where n is an int yields Value::Number, not "42"). Any
-            // string with surrounding chars OR multiple interpolations
-            // renders as text — `${a}/x/${b}` must NOT be parsed as a
-            // single expression even though it starts/ends with the
-            // template delimiters.
             let trimmed = s.trim();
             let is_whole_string_template = trimmed.starts_with("${")
                 && trimmed.ends_with('}')
@@ -427,7 +405,6 @@ pub fn resolve_arg_value(ctx: &ArcContext, raw: &Value) -> Result<Value> {
                 ctx.resolve(expr)
                     .ok_or_else(|| anyhow!("template expr '{expr}' did not resolve"))
             } else {
-                // Mixed string — render as text via the templater.
                 Ok(Value::String(ctx.render_template(s)))
             }
         }

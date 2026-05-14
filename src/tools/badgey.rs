@@ -188,6 +188,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             bro_label.clone(),
             bro_label,
+            Some(self.state.system_events.clone()),
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         Ok((task, provider, session_id, effective_filters))
@@ -572,6 +573,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             Some("badgey".to_string()),
             Some("agent:badgey@v1".to_string()),
+            Some(self.state.system_events.clone()),
         );
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         let completed = orch::wait_for_task_with_timeout(&task, timeout_seconds).await;
@@ -1296,6 +1298,7 @@ impl BlackboxServer {
                 tail_tx: self.state.tail_tx.clone(),
                 bro_label: label.clone(),
                 agent_label: label,
+                system_events: Some(self.state.system_events.clone()),
             },
         )
         .map_err(|e| e.to_string())?;

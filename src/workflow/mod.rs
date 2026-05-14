@@ -1691,6 +1691,10 @@ mod tests {
                 include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
             ),
             (
+                "keystone-reviewer-arc-with-identity",
+                include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json"),
+            ),
+            (
                 "agent-chain",
                 include_str!("../../system-defaults/agents/workflows/chain.json"),
             ),
@@ -1802,6 +1806,10 @@ mod tests {
             (
                 "keystone-implementer-feedback-arc",
                 include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
+            ),
+            (
+                "keystone-reviewer-arc-with-identity",
+                include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json"),
             ),
             (
                 "agent-chain",
@@ -2247,5 +2255,551 @@ mod tests {
         .expect("fallback should pass");
         assert_eq!(pass.classification, "pass");
         assert_eq!(pass.consequent.to_json(), serde_json::json!("Done"));
+    }
+
+    // ── reviewer-arc-with-identity structural tests ───────────────────────────
+
+    #[test]
+    fn reviewer_arc_with_identity_compiles() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let spec = load_workflow(src).unwrap();
+        compile(spec).expect("reviewer-arc-with-identity should compile");
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_contains_require_identity_op() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let spec = load_workflow(src).unwrap();
+        let request_node = spec
+            .nodes
+            .get("RequestIdentity")
+            .expect("RequestIdentity node must exist");
+        let has_require_identity = request_node
+            .on_enter
+            .iter()
+            .any(|h| matches!(h.op, super::ops::OpKind::RequireIdentity));
+        assert!(
+            has_require_identity,
+            "RequestIdentity.on_enter must include a require_identity op"
+        );
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_no_env_forgejo_token() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        assert!(
+            !src.contains("env.FORGEJO_TOKEN"),
+            "reviewer-arc-with-identity must not use ${{env.FORGEJO_TOKEN}} — \
+             use the mapped identity token_ref via secret_headers instead"
+        );
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_await_identity_wait_node() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let spec = load_workflow(src).unwrap();
+        let await_node = spec
+            .nodes
+            .get("AwaitIdentity")
+            .expect("AwaitIdentity node must exist");
+        let wait = await_node
+            .wait
+            .as_ref()
+            .expect("AwaitIdentity must have a wait spec");
+        let has_provisioned_signal = wait
+            .any_of
+            .iter()
+            .any(|w| w.signal == "bro.identity.provisioned");
+        assert!(
+            has_provisioned_signal,
+            "AwaitIdentity.wait must listen for bro.identity.provisioned"
+        );
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_preserves_base_node_topology() {
+        // Identity extension must NOT collapse the reviewer arc into a
+        // Review→PostFeedback shortcut. The control flow after identity
+        // readiness mirrors the base reviewer-arc: FetchDiff → Review →
+        // Aggregate → PostReview.
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let spec = load_workflow(src).unwrap();
+        for required in ["FetchDiff", "Review", "Aggregate", "PostReview"] {
+            assert!(
+                spec.nodes.contains_key(required),
+                "reviewer-arc-with-identity must contain node '{required}'"
+            );
+        }
+        // No PostFeedback shortcut.
+        assert!(
+            !spec.nodes.contains_key("PostFeedback"),
+            "reviewer-arc-with-identity must not contain a PostFeedback shortcut node"
+        );
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_fetch_diff_captures_pr_diff_via_secret_headers() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let v: serde_json::Value = serde_json::from_str(src).unwrap();
+        let fetch = v
+            .pointer("/nodes/FetchDiff")
+            .expect("FetchDiff node must exist");
+        let hooks = fetch
+            .get("on_enter")
+            .and_then(|v| v.as_array())
+            .expect("FetchDiff.on_enter");
+        let http_op = hooks
+            .iter()
+            .find(|h| h.get("op").and_then(|v| v.as_str()) == Some("http_json"))
+            .expect("FetchDiff must have http_json op");
+        assert_eq!(
+            http_op.get("into_var").and_then(|v| v.as_str()),
+            Some("pr_diff"),
+            "FetchDiff must capture into 'pr_diff'"
+        );
+        let args = http_op.get("args").unwrap();
+        assert_eq!(
+            args.get("response_kind").and_then(|v| v.as_str()),
+            Some("text"),
+            "FetchDiff must request text response for the .diff URL"
+        );
+        assert_eq!(
+            args.get("allow_empty_body").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        let secret_hdrs = args
+            .get("secret_headers")
+            .expect("FetchDiff must use secret_headers for auth");
+        let auth = secret_hdrs
+            .get("Authorization")
+            .and_then(|v| v.as_str())
+            .expect("Authorization in secret_headers");
+        assert!(
+            auth.contains("identity_result"),
+            "FetchDiff Authorization must reference vars.identity_result.identity.token_ref"
+        );
+        // Review prompt must consume the captured diff.
+        let prompt = v
+            .pointer("/nodes/Review/prompt")
+            .and_then(|p| p.as_str())
+            .expect("Review.prompt");
+        assert!(
+            prompt.contains("${vars.pr_diff}"),
+            "Review.prompt must reference ${{vars.pr_diff}} from FetchDiff capture"
+        );
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_post_review_parses_aggregator_output() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let v: serde_json::Value = serde_json::from_str(src).unwrap();
+        let post_review = v
+            .pointer("/nodes/PostReview")
+            .expect("PostReview node must exist");
+        let hooks = post_review
+            .get("on_enter")
+            .and_then(|v| v.as_array())
+            .expect("PostReview.on_enter");
+        let parse = hooks
+            .iter()
+            .find(|h| h.get("op").and_then(|v| v.as_str()) == Some("parse_json"))
+            .expect("PostReview must include parse_json before HTTP calls");
+        assert_eq!(
+            parse
+                .get("args")
+                .and_then(|a| a.get("from"))
+                .and_then(|v| v.as_str()),
+            Some("${Aggregate.output}"),
+            "parse_json.from must be ${{Aggregate.output}}"
+        );
+        assert_eq!(
+            parse.get("into_var").and_then(|v| v.as_str()),
+            Some("review_payload"),
+            "parse_json must capture into review_payload"
+        );
+        // feedback_posted must be set at the tail.
+        let sets_flag = hooks.iter().any(|h| {
+            h.get("op").and_then(|v| v.as_str()) == Some("set_var")
+                && h.pointer("/args/key").and_then(|v| v.as_str()) == Some("feedback_posted")
+        });
+        assert!(sets_flag, "PostReview must set feedback_posted=true");
+    }
+
+    #[test]
+    fn reviewer_arc_with_identity_all_http_json_uses_secret_headers() {
+        let src = include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let v: serde_json::Value = serde_json::from_str(src).unwrap();
+        let nodes = v.get("nodes").and_then(|n| n.as_object()).unwrap();
+        let mut http_op_count = 0usize;
+        for (node_name, node) in nodes {
+            let hooks = match node.get("on_enter").and_then(|v| v.as_array()) {
+                Some(h) => h,
+                None => continue,
+            };
+            for hook in hooks {
+                if hook.get("op").and_then(|v| v.as_str()) != Some("http_json") {
+                    continue;
+                }
+                http_op_count += 1;
+                let args = hook.get("args").unwrap();
+                assert!(
+                    args.get("headers")
+                        .and_then(|h| h.get("Authorization"))
+                        .is_none(),
+                    "node {node_name}: http_json must not put Authorization in plain headers"
+                );
+                let secret_hdrs = args.get("secret_headers").unwrap_or_else(|| {
+                    panic!("node {node_name}: http_json must use secret_headers")
+                });
+                let auth = secret_hdrs
+                    .get("Authorization")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("node {node_name}: Authorization in secret_headers"));
+                assert!(
+                    auth.contains("identity_result"),
+                    "node {node_name}: Authorization must reference vars.identity_result.identity.token_ref, got '{auth}'"
+                );
+            }
+        }
+        // FetchDiff, PostReview review POST, PostReview merge POST = 3 http_json ops.
+        assert!(
+            http_op_count >= 3,
+            "reviewer-arc-with-identity must have at least 3 http_json ops (FetchDiff, review POST, merge POST), found {http_op_count}"
+        );
+    }
+
+    // ── Phase 7 acceptance: implementer + top-level identity workflows ─────
+
+    #[test]
+    fn implementer_arc_with_identity_compiles_and_includes_require_identity() {
+        let src =
+            include_str!("../../examples/keystone/workflows/implementer-arc-with-identity.json");
+        let spec = load_workflow(src).expect("implementer-arc-with-identity must parse");
+        assert_eq!(spec.name, "implementer-arc-with-identity");
+        let request = spec
+            .nodes
+            .get("RequestIdentity")
+            .expect("RequestIdentity node must exist");
+        let has_require_identity = request
+            .on_enter
+            .iter()
+            .any(|h| matches!(h.op, super::ops::OpKind::RequireIdentity));
+        assert!(
+            has_require_identity,
+            "RequestIdentity.on_enter must include a require_identity op"
+        );
+    }
+
+    #[test]
+    fn implementer_arc_with_identity_no_env_forgejo_token() {
+        let src =
+            include_str!("../../examples/keystone/workflows/implementer-arc-with-identity.json");
+        assert!(
+            !src.contains("env.FORGEJO_TOKEN"),
+            "implementer-arc-with-identity must not use ${{env.FORGEJO_TOKEN}} — \
+             use the mapped identity token_ref via secret_headers instead"
+        );
+    }
+
+    #[test]
+    fn implementer_arc_with_identity_await_node_listens_for_provisioned() {
+        let src =
+            include_str!("../../examples/keystone/workflows/implementer-arc-with-identity.json");
+        let spec = load_workflow(src).unwrap();
+        let await_node = spec
+            .nodes
+            .get("AwaitIdentity")
+            .expect("AwaitIdentity node must exist");
+        let wait = await_node
+            .wait
+            .as_ref()
+            .expect("AwaitIdentity must have a wait spec");
+        assert!(
+            wait.any_of
+                .iter()
+                .any(|w| w.signal == "bro.identity.provisioned"),
+            "AwaitIdentity.wait must listen for bro.identity.provisioned"
+        );
+    }
+
+    #[test]
+    fn implementer_arc_with_identity_http_calls_use_secret_headers() {
+        let src =
+            include_str!("../../examples/keystone/workflows/implementer-arc-with-identity.json");
+        let v: serde_json::Value = serde_json::from_str(src).unwrap();
+        let nodes = v.get("nodes").and_then(|n| n.as_object()).unwrap();
+        for (node_name, node) in nodes {
+            let on_enter = match node.get("on_enter").and_then(|v| v.as_array()) {
+                Some(arr) => arr,
+                None => continue,
+            };
+            for hook in on_enter {
+                if hook.get("op").and_then(|v| v.as_str()) != Some("http_json") {
+                    continue;
+                }
+                let args = hook.get("args").expect("http_json args");
+                // No raw Authorization in plain headers.
+                let plain_auth = args.get("headers").and_then(|h| h.get("Authorization"));
+                assert!(
+                    plain_auth.is_none(),
+                    "node {node_name}: http_json must not put Authorization in plain headers"
+                );
+                let secret_hdrs = args
+                    .get("secret_headers")
+                    .expect("node http_json must use secret_headers for auth");
+                let auth = secret_hdrs
+                    .get("Authorization")
+                    .and_then(|v| v.as_str())
+                    .expect("Authorization in secret_headers");
+                assert!(
+                    auth.contains("identity_result"),
+                    "node {node_name}: Authorization must reference vars.identity_result.identity.token_ref, got '{auth}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn issue_to_merged_pr_with_identity_compiles_and_wires_identity_subworkflows() {
+        let src =
+            include_str!("../../examples/keystone/workflows/issue-to-merged-pr-with-identity.json");
+        let spec = load_workflow(src).expect("identity top-level workflow must parse");
+        assert_eq!(spec.name, "issue-to-merged-pr-with-identity");
+
+        let v: serde_json::Value = serde_json::from_str(src).unwrap();
+        let nodes = v.get("nodes").and_then(|n| n.as_object()).unwrap();
+
+        let implement_ref = nodes
+            .get("Implement")
+            .and_then(|n| n.get("subworkflow_ref"))
+            .and_then(|v| v.as_str())
+            .expect("Implement.subworkflow_ref");
+        assert_eq!(implement_ref, "implementer-arc-with-identity");
+
+        let review_ref = nodes
+            .get("Review")
+            .and_then(|n| n.get("subworkflow_ref"))
+            .and_then(|v| v.as_str())
+            .expect("Review.subworkflow_ref");
+        assert_eq!(review_ref, "reviewer-arc-with-identity");
+
+        // Both subworkflows must receive forgejo_instance via imports.
+        for node_name in ["Implement", "Review"] {
+            let imports = nodes
+                .get(node_name)
+                .and_then(|n| n.get("imports"))
+                .and_then(|v| v.as_array())
+                .unwrap_or_else(|| panic!("{node_name}.imports"));
+            let strs: Vec<&str> = imports.iter().filter_map(|v| v.as_str()).collect();
+            assert!(
+                strs.contains(&"forgejo_instance"),
+                "{node_name}.imports must include forgejo_instance, got {strs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn issue_to_merged_pr_with_identity_declares_forgejo_instance_var() {
+        let src =
+            include_str!("../../examples/keystone/workflows/issue-to-merged-pr-with-identity.json");
+        let spec = load_workflow(src).unwrap();
+        let schema = spec
+            .vars_schema
+            .as_ref()
+            .expect("vars_schema must be declared");
+        assert!(
+            schema.contains_key("forgejo_instance"),
+            "top-level identity workflow must declare forgejo_instance in vars_schema"
+        );
+    }
+
+    #[test]
+    fn identity_smoke_script_exists_and_asserts_distinct_principals() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/keystone/scripts/identity-smoke.sh"
+        );
+        let content = std::fs::read_to_string(path)
+            .expect("identity-smoke.sh must exist alongside install.sh");
+        assert!(content.starts_with("#!"), "script must have a shebang");
+        // The acceptance contract: the script must explicitly fail when the
+        // implementer and reviewer Forgejo principals are the same user.
+        assert!(
+            content.contains("PR_AUTHOR") && content.contains("REVIEW_AUTHOR"),
+            "script must compare PR_AUTHOR and REVIEW_AUTHOR"
+        );
+        assert!(
+            content.contains("same Forgejo user") || content.contains("self-approval"),
+            "script must mention self-approval / same-user failure mode"
+        );
+        // Must verify the typed identity mappings exist for both bros.
+        for bro in ["keystone-impl", "keystone-review"] {
+            assert!(
+                content.contains(bro),
+                "smoke script must check identity mapping for {bro}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_smoke_script_uses_only_real_daemon_surfaces() {
+        // Negative coverage: the script must NOT reference any of the
+        // non-existent admin endpoints that were in the first draft. The
+        // daemon does not expose these — see src/main.rs admin routes.
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/keystone/scripts/identity-smoke.sh"
+        );
+        let content = std::fs::read_to_string(path).unwrap();
+        for nonexistent in [
+            "/admin/workflow/list",
+            "/admin/reaction/list",
+            "/admin/workflow/start",
+            "/admin/identity/list",
+        ] {
+            assert!(
+                !content.contains(nonexistent),
+                "smoke script must not reference nonexistent endpoint {nonexistent}"
+            );
+        }
+        // Positive coverage: the script must use the real dispatch endpoint
+        // with the real request shape documented in src/server/routes.rs.
+        for required in [
+            "/orchestrate/by-id",
+            "workflow_id",
+            "project_dir",
+            "initial_vars",
+            "PROJECT_DIR",
+        ] {
+            assert!(
+                content.contains(required),
+                "smoke script must reference real dispatch surface fragment {required}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_script_installs_identity_workflows() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/keystone/scripts/install.sh"
+        );
+        let content = std::fs::read_to_string(path).expect("install.sh must exist");
+        for wf in [
+            "implementer-arc-with-identity",
+            "reviewer-arc-with-identity",
+            "issue-to-merged-pr-with-identity",
+        ] {
+            assert!(
+                content.contains(wf),
+                "install.sh must install identity workflow {wf}"
+            );
+        }
+        // Base workflows must remain because implementer-feedback-arc is
+        // identity-agnostic and is still referenced by the identity wrapper.
+        for wf in [
+            "implementer-arc",
+            "reviewer-arc",
+            "issue-to-merged-pr",
+            "implementer-feedback-arc",
+        ] {
+            assert!(
+                content.contains(wf),
+                "install.sh must continue to install base workflow {wf}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_workflow_model_ids_match_installer_catalog() {
+        // The Keystone install.sh creates the brofiles with the catalog
+        // model IDs `claude-sonnet-4-6` and `claude-haiku-4-5-20251001`.
+        // Identity keys are `(scope, instance, subject, provider, model)`,
+        // so the `require_identity.model` field MUST match the brofile's
+        // catalog id — otherwise the workflow checks a different identity
+        // from the one the dispatch will actually run with.
+        let impl_src =
+            include_str!("../../examples/keystone/workflows/implementer-arc-with-identity.json");
+        let v: serde_json::Value = serde_json::from_str(impl_src).unwrap();
+        let req = v
+            .pointer("/nodes/RequestIdentity/on_enter/0/args/model")
+            .and_then(|m| m.as_str())
+            .expect("implementer require_identity model");
+        assert_eq!(
+            req, "claude-sonnet-4-6",
+            "implementer-arc-with-identity must request the claude-sonnet-4-6 brofile identity"
+        );
+
+        let rev_src =
+            include_str!("../../examples/keystone/workflows/reviewer-arc-with-identity.json");
+        let v: serde_json::Value = serde_json::from_str(rev_src).unwrap();
+        let req = v
+            .pointer("/nodes/RequestIdentity/on_enter/0/args/model")
+            .and_then(|m| m.as_str())
+            .expect("reviewer require_identity model");
+        assert_eq!(
+            req, "claude-haiku-4-5-20251001",
+            "reviewer-arc-with-identity must request the claude-haiku-4-5-20251001 brofile identity"
+        );
+
+        // And those catalog IDs must actually be wired in install.sh —
+        // a one-shot belt-and-suspenders check that future installer edits
+        // do not silently desync.
+        let install = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/keystone/scripts/install.sh"
+        ))
+        .unwrap();
+        assert!(
+            install.contains("claude-sonnet-4-6"),
+            "install.sh must upsert a brofile with model claude-sonnet-4-6"
+        );
+        assert!(
+            install.contains("claude-haiku-4-5-20251001"),
+            "install.sh must upsert a brofile with model claude-haiku-4-5-20251001"
+        );
+    }
+
+    #[test]
+    fn existing_non_identity_keystone_workflows_still_compile() {
+        for src in [
+            include_str!("../../examples/keystone/workflows/implementer-arc.json"),
+            include_str!("../../examples/keystone/workflows/reviewer-arc.json"),
+            include_str!("../../examples/keystone/workflows/issue-to-merged-pr.json"),
+            include_str!("../../examples/keystone/workflows/implementer-feedback-arc.json"),
+        ] {
+            load_workflow(src).expect("base keystone workflow must still parse");
+        }
+    }
+
+    #[test]
+    fn gate_identity_status_packet_compiles() {
+        let src = include_str!("../../examples/keystone/packets/gate-identity-status.json");
+        let params: crate::packets::CompileParams = serde_json::from_str(src)
+            .expect("gate-identity-status.json should parse as CompileParams");
+        let tmp = tempfile::tempdir().unwrap();
+        let packets = crate::packets::Packets::open(tmp.path()).unwrap();
+        packets
+            .compile(&params)
+            .expect("gate-identity-status packet should compile");
+        let loaded = packets
+            .load("domain:workflow-gate/identity-status")
+            .expect("should load compiled gate");
+
+        // ready verdict when status == "ready"
+        let ready = crate::packets::apply(
+            &loaded,
+            &serde_json::json!({"vars": {"identity_result": {"status": "ready"}}}),
+        )
+        .expect("ready entity should match");
+        assert_eq!(ready.classification, "ready");
+
+        // pending verdict on fallback
+        let pending = crate::packets::apply(
+            &loaded,
+            &serde_json::json!({"vars": {"identity_result": {"status": "pending"}}}),
+        )
+        .expect("pending entity should match");
+        assert_eq!(pending.classification, "pending");
     }
 }

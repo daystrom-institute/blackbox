@@ -186,12 +186,26 @@ impl AtomRunner for BadgeyAdapterRunner {
     }
 }
 
+// Registered so the atom artifact validates against the schema; the actual
+// execution is intercepted by system_events::executors before this runner runs.
+struct ForgejoEnsureUserRunner;
+
+impl AtomRunner for ForgejoEnsureUserRunner {
+    fn run(&self, _args: &serde_json::Value) -> RunnerResult {
+        RunnerResult::fail(vec![
+            "forgejo-ensure-user must be invoked via the system_events reaction path, not directly"
+                .into(),
+        ])
+    }
+}
+
 pub fn default_registry() -> RunnerRegistry {
     let mut reg = RunnerRegistry::new();
     reg.register_deterministic("echo", Box::new(EchoRunner));
     reg.register_deterministic("noop", Box::new(NoopRunner));
     reg.register_deterministic("validate-schema", Box::new(ValidateSchemaRunner));
     reg.register_deterministic("refactor-plan-validate", Box::new(ValidateSchemaRunner));
+    reg.register_deterministic("forgejo-ensure-user", Box::new(ForgejoEnsureUserRunner));
     reg.register_adapter("badgey", Box::new(BadgeyAdapterRunner));
     reg
 }

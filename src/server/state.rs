@@ -130,6 +130,7 @@ pub(crate) struct SharedState {
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
     pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
+    pub(crate) system_events: system_events::SharedEventHub,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -318,7 +319,16 @@ impl SharedState {
                     store_dir.join("atom-invocations.json"),
                 ),
             )),
-            vector_store: crate::vectors::global(),
+            vector_store: Arc::new(
+                crate::vectors::VectorStore::open(store_dir.join("vectors"))
+                    .expect("test vector store should open"),
+            ),
+            system_events: Arc::new(system_events::EventHub::new(
+                system_events::EventStore::new_at(store_dir.join("events").join("journal")),
+                system_events::OutboxStore::new(store_dir.join("events").join("outbox")).unwrap(),
+                store_dir.join("reactions"),
+                store_dir.join("identities"),
+            )),
         }
     }
 }

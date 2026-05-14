@@ -62,6 +62,7 @@ mod slack_proposal_links;
 mod slack_thread_store;
 mod snapshot;
 mod storage_health;
+mod system_events;
 mod system_memory;
 mod template;
 #[cfg(test)]
@@ -164,7 +165,8 @@ impl BlackboxServer {
                 + tools::storage_health::router()
                 + tools::storage_gc::router()
                 + tools::storage_migration::router()
-                + tools::workspace::router(),
+                + tools::workspace::router()
+                + tools::system_events::router(),
             surface: std::sync::OnceLock::new(),
         }
     }
@@ -558,6 +560,13 @@ async fn main() -> anyhow::Result<()> {
             ),
         )),
         vector_store: vectors::global(),
+        system_events: Arc::new(system_events::EventHub::new(
+            system_events::EventStore::new(&store_dir),
+            system_events::OutboxStore::new(store_dir.join("events").join("outbox"))
+                .unwrap_or_else(|e| panic!("opening outbox store at {store_dir:?}: {e}")),
+            store_dir.join("reactions"),
+            store_dir.join("identities"),
+        )),
     });
     shared
         .agent_adapter_registry
@@ -769,6 +778,62 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    // Reactions — restore installed reaction specs from disk so they
+    // survive daemon restart. Bad specs are logged and skipped; warnings
+    // are available via reaction_list.
+    let reaction_warnings = shared.system_events.restore_reactions_from_disk().await;
+    if !reaction_warnings.is_empty() {
+        tracing::warn!("reaction restore: {} warning(s)", reaction_warnings.len());
+    }
+
+    // Outbox crash recovery — requeue stale claimed records with
+    // idempotency keys, dead-letter non-idempotent stale claims.
+    let recovery = shared.system_events.outbox_store().recover_stale_claims();
+    if recovery.requeued > 0 || recovery.dead_lettered > 0 {
+        tracing::info!(
+            "outbox recovery: {} requeued, {} dead-lettered",
+            recovery.requeued,
+            recovery.dead_lettered
+        );
+    }
+
+    // Startup compaction — drop events older than 7 days / cap at 10k,
+    // and drop succeeded outbox records older than 7 days. Failures
+    // log and continue; the worker still starts.
+    {
+        let now = crate::util::now_iso();
+        match shared.system_events.compact_with_now(&now) {
+            Ok(report)
+                if report.event_journal.dropped_by_age > 0
+                    || report.event_journal.dropped_by_count > 0
+                    || report.outbox.dropped_succeeded > 0 =>
+            {
+                tracing::info!(
+                    "event journal compaction: kept {} (dropped {} by age, {} by count)",
+                    report.event_journal.after,
+                    report.event_journal.dropped_by_age,
+                    report.event_journal.dropped_by_count
+                );
+                tracing::info!(
+                    "outbox compaction: kept {} (dropped {} succeeded)",
+                    report.outbox.after,
+                    report.outbox.dropped_succeeded
+                );
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("system event compaction failed: {e:#}"),
+        }
+    }
+
+    // Outbox worker — background task that claims due records, evaluates
+    // gates, executes supported actions, and marks succeeded/retry/dead-lettered.
+    {
+        let worker_state = shared.clone();
+        tokio::spawn(async move {
+            crate::system_events::worker::run_worker(worker_state).await;
+        });
     }
 
     // Packet self-heal scanner — off by default. Walks recent

@@ -231,8 +231,8 @@ bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/
 # Routing packet
 bbox_artifact_install(kind="packet", source="system-defaults/badgey/packets/badgey-cron-routing.json")
 
-# Cron (no artifact catalog for crons - install directly)
-bro_cron_install(spec=<contents of system-defaults/badgey/crons/badgey-triage-daily.json>)
+# Cron
+bbox_artifact_install(kind="cron", source="system-defaults/badgey/crons/badgey-triage-daily.json")
 ```
 
 Then bind your channels:

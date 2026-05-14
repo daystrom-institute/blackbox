@@ -1,0 +1,15 @@
+{
+  "mode": "first",
+  "dataset": [
+    {
+      "name": "daily compaction starts",
+      "entity": { "cron_name": "daily-compaction" },
+      "expected": "start_arc"
+    },
+    {
+      "name": "other cron ignored",
+      "entity": { "cron_name": "embed-compaction-nightly" },
+      "expected": "ignore"
+    }
+  ]
+}

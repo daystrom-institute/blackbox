@@ -232,7 +232,7 @@ impl BlackboxServer {
         name = "whiteboard_transition",
         description = "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate is a legal skip. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes."
     )]
-    async fn whiteboard_transition(
+    pub(crate) async fn whiteboard_transition(
         &self,
         Parameters(p): Parameters<WhiteboardTransitionParams>,
     ) -> CallToolResult {
@@ -275,8 +275,33 @@ impl BlackboxServer {
                         correlate,
                         payload: Some(entity.clone()),
                     };
-                    let _ =
-                        dispatch_routing_verdict_direct(state, "whiteboard", verdict, entity).await;
+                    let _ = dispatch_routing_verdict_direct(
+                        state.clone(),
+                        "whiteboard",
+                        verdict,
+                        entity,
+                    )
+                    .await;
+                    // Emit whiteboard.phase_changed system event. Observation-only.
+                    let mut correlation = serde_json::Map::new();
+                    correlation.insert("board_id".into(), serde_json::json!(board_id));
+                    let draft = crate::system_events::SystemEventDraft {
+                        kind: crate::system_events::types::SystemEventKind::WhiteboardPhaseChanged,
+                        producer: "whiteboard.transition".to_string(),
+                        project: None,
+                        principal: None,
+                        subject: None,
+                        correlation,
+                        causation_id: None,
+                        payload: serde_json::json!({
+                            "board_id": board_id,
+                            "from_phase": from_str,
+                            "to_phase": to_str,
+                        }),
+                    };
+                    if let Err(e) = state.system_events.emit(draft).await {
+                        tracing::warn!("whiteboard.phase_changed system event emit failed: {e:#}");
+                    }
                 });
                 Self::ok_json(&serde_json::json!({
                     "status": "transitioned",

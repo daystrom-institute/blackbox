@@ -1,0 +1,169 @@
+{
+  "name": "implementer-arc-with-identity",
+  "version": 2,
+  "vars_schema": {
+    "issue_number":     { "kind": "int",    "required": true },
+    "issue_title":      { "kind": "string", "required": false },
+    "issue_body":       { "kind": "string", "required": false },
+    "issue_data":       { "kind": "object", "required": false },
+    "repo":             { "kind": "string", "required": true },
+    "owner":            { "kind": "string", "required": true },
+    "forgejo_instance": { "kind": "string", "required": true },
+    "branch":           { "kind": "string", "required": false },
+    "worktree_path":    { "kind": "string", "required": true },
+    "all_open_prs":     { "kind": "array",  "required": false },
+    "existing_pr":      { "kind": "any",    "required": false },
+    "pr_data":          { "kind": "object", "required": false },
+    "pr_number":        { "kind": "int",    "required": false },
+    "identity_result":  { "kind": "object", "required": false }
+  },
+  "actors": {
+    "implementer": {
+      "kind": "executor",
+      "brofile": "keystone-impl",
+      "durable": true,
+      "compaction_anchor": true,
+      "requires": []
+    }
+  },
+  "start": "RequestIdentity",
+  "nodes": {
+    "RequestIdentity": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "require_identity",
+          "args": {
+            "scope":    "forgejo",
+            "instance": "${vars.forgejo_instance}",
+            "bro":      "keystone-impl",
+            "provider": "claude",
+            "model":    "claude-sonnet-4-6",
+            "effort":   "medium",
+            "project":  "${meta.project_dir}"
+          },
+          "into_var": "identity_result",
+          "on_failure": "halt"
+        }
+      ],
+      "prompt": "Checking Forgejo identity readiness for bro keystone-impl.",
+      "gate": "domain:workflow-gate/identity-status",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "ready":   "FetchIssue",
+          "pending": "AwaitIdentity"
+        }
+      }
+    },
+    "AwaitIdentity": {
+      "actor": "",
+      "prompt": "Waiting for bro.identity.provisioned signal (reaction is provisioning the Forgejo account for keystone-impl).",
+      "wait": {
+        "any_of": [
+          { "signal": "bro.identity.provisioned" }
+        ]
+      },
+      "next": { "type": "goto", "to": "RequestIdentity" }
+    },
+    "FetchIssue": {
+      "actor": "implementer",
+      "on_enter": [
+        {
+          "op": "http_json",
+          "args": {
+            "method": "GET",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/issues/${vars.issue_number}",
+            "headers": {
+              "Accept": "application/json"
+            },
+            "secret_headers": {
+              "Authorization": "token ${vars.identity_result.identity.token_ref}"
+            }
+          },
+          "into_var": "issue_data",
+          "on_failure": "halt"
+        },
+        { "op": "set_var", "args": { "key": "issue_title", "value": "${vars.issue_data.title}" } },
+        { "op": "set_var", "args": { "key": "issue_body",  "value": "${vars.issue_data.body}" } },
+        { "op": "set_var", "args": { "key": "branch", "value": "fix/issue-${vars.issue_number}" } }
+      ],
+      "prompt": "You are an implementer working in worktree ${vars.worktree_path} on branch ${vars.branch}.\n\nIssue #${vars.issue_number}: ${vars.issue_title}\n\n${vars.issue_body}\n\nUnderstand the bug, fix it, write or update tests so the existing tests pass. Stage changes and commit with a clear message.\n\nDo NOT push and do NOT open the PR — those are mechanical follow-ups handled by the workflow engine, not by you.\n\nReturn a one-line summary of what you changed (no markdown). Keep edits minimal and focused on the issue.",
+      "next": { "type": "goto", "to": "PushAndOpenPr" }
+    },
+    "PushAndOpenPr": {
+      "actor": "",
+      "prompt": "Push branch + open-or-reuse PR (mechanical, no LLM dispatch). The git push uses the daemon's local git config (typically a deploy key or SSH agent), not the per-bro Forgejo token — the token is for HTTP API calls only. PR create/list goes through the mapped per-bro identity so the PR author shows as bro-keystone-impl-claude-*, distinct from the reviewer principal.",
+      "on_enter": [
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "push", "-u", "origin", "${vars.branch}"],
+            "cwd": "${vars.worktree_path}"
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "GET",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls?state=open&limit=50",
+            "headers": {
+              "Accept": "application/json"
+            },
+            "secret_headers": {
+              "Authorization": "token ${vars.identity_result.identity.token_ref}"
+            }
+          },
+          "into_var": "all_open_prs",
+          "on_failure": "halt"
+        },
+        {
+          "op": "find_first",
+          "args": {
+            "from": "${vars.all_open_prs}",
+            "where": { "head.ref": "${vars.branch}" }
+          },
+          "into_var": "existing_pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "http_json",
+          "args": {
+            "method": "POST",
+            "url": "${env.FORGEJO_BASE_URL}/api/v1/repos/${vars.owner}/${vars.repo}/pulls",
+            "headers": {
+              "Accept": "application/json",
+              "Content-Type": "application/json"
+            },
+            "secret_headers": {
+              "Authorization": "token ${vars.identity_result.identity.token_ref}"
+            },
+            "body": {
+              "title": "Fix #${vars.issue_number}: ${vars.issue_title}",
+              "head": "${vars.branch}",
+              "base": "main",
+              "body": "Closes #${vars.issue_number}"
+            },
+            "expect_status": [200, 201]
+          },
+          "into_var": "pr_data",
+          "when": "domain:hook-when/no-existing-pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "pr_data", "value": "${vars.existing_pr}" },
+          "when": "domain:hook-when/has-existing-pr",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "pr_number", "value": "${vars.pr_data.number}" },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

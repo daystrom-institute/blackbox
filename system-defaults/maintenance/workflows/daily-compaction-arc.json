@@ -1,0 +1,140 @@
+{
+  "name": "daily-compaction-arc",
+  "version": 1,
+  "policy_packet": "domain:workflow-policy/arc-budget",
+  "vars_schema": {
+    "system_event_compaction_result": { "kind": "object" },
+    "storage_gc_result": { "kind": "object" },
+    "vector_status": { "kind": "object" },
+    "search_quiesced": { "kind": "bool" },
+    "vector_compaction_result": { "kind": "object" },
+    "swapped": { "kind": "bool" },
+    "notified": { "kind": "bool" }
+  },
+  "actors": {},
+  "start": "SystemEvents",
+  "nodes": {
+    "SystemEvents": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "system_event_compact",
+          "into_var": "system_event_compaction_result",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "StorageGc" }
+    },
+    "StorageGc": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "into_var": "storage_gc_result",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_storage_gc",
+            "arguments": {
+              "dry_run": false,
+              "prune_backups": true,
+              "prune_orphans": true,
+              "prune_temps": true,
+              "prune_inactive_snapshots": true,
+              "max_backup_age_days": 7,
+              "keep_newest_backup_per_source": 1
+            }
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "ReadVectorStatus" }
+    },
+    "ReadVectorStatus": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "read_vector_status",
+          "into_var": "vector_status"
+        }
+      ],
+      "next": { "type": "goto", "to": "DecideVectorCompaction" }
+    },
+    "DecideVectorCompaction": {
+      "actor": "",
+      "gate": "domain:embed/compaction-policy",
+      "prompt": "max_deleted_ratio=${vars.vector_status.max_deleted_ratio} route=${vars.vector_status.max_deleted_route}",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "compact": "QuiesceSearch",
+          "notify": "SurfaceVectorFollowup"
+        },
+        "default": "Done"
+      }
+    },
+    "QuiesceSearch": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "quiesce_search"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "search_quiesced", "value": true }
+        }
+      ],
+      "next": { "type": "goto", "to": "CompactVectors" }
+    },
+    "CompactVectors": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "compact_vector_partitions",
+          "into_var": "vector_compaction_result",
+          "args": {}
+        }
+      ],
+      "next": { "type": "goto", "to": "SwapAtomic" }
+    },
+    "SwapAtomic": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "swap_atomic"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "swapped", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "SurfaceVectorFollowup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "bbox_note",
+            "arguments": {
+              "kind": "followup",
+              "project": "${meta.project_dir}",
+              "body": "Vector partition ${vars.vector_status.max_deleted_route} deleted_ratio=${vars.vector_status.max_deleted_ratio}; compaction recommended but below automatic threshold."
+            }
+          },
+          "on_failure": "warn"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "notified", "value": true }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "Done": {
+      "actor": "",
+      "next": { "type": "terminal" }
+    }
+  }
+}

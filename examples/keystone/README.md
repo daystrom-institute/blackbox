@@ -303,6 +303,75 @@ For most external API calls, `http_json` is the primitive: workflow author write
 4. Set `default_project_dir` if any arcs the webhook spawns will use `WorktreeCreate`.
 5. Install via `bro_webhook_install` or `POST /admin/webhook/install`; persisted to `${BRO_HOME}/webhooks/<name>.json` and restored on daemon restart.
 
+## Identity extension (Phase 7 acceptance)
+
+The base workflows (`implementer-arc`, `reviewer-arc`, `issue-to-merged-pr`)
+authenticate every Forgejo API call with `${env.FORGEJO_TOKEN}` — a single
+operator-supplied admin token. That works for a single-user demo, but it
+means **Forgejo sees one principal for both the PR author and the
+reviewer**, which on a multi-user host gets rejected as self-approval.
+
+The identity extension adds three artifacts and wires them as a parallel
+top-level workflow:
+
+| Identity artifact | Role |
+|---|---|
+| `workflows/implementer-arc-with-identity.json` | Same shape as `implementer-arc.json`, but starts with `RequestIdentity` → `require_identity` (scope=forgejo, bro=keystone-impl), branches `ready`/`pending` on `domain:workflow-gate/identity-status`, loops via `AwaitIdentity` on `bro.identity.provisioned`. All Forgejo HTTP calls use `secret_headers` from `vars.identity_result.identity.token_ref` — no `${env.FORGEJO_TOKEN}`. |
+| `workflows/reviewer-arc-with-identity.json` | Same shape, bro=keystone-review. Reviews post via the mapped reviewer token. |
+| `workflows/issue-to-merged-pr-with-identity.json` | Top-level wrapper that calls the two identity subworkflows and threads `forgejo_instance` through their imports. |
+
+`implementer-feedback-arc.json` is identity-agnostic: it issues a single
+`git push` (using the daemon's local git config) and makes no Forgejo
+API calls, so it has no token surface to swap. The identity wrapper
+keeps using the base feedback arc unchanged.
+
+Per-bro token storage lives in the reaction. `forgejo-ensure-bro-user`
+provisions one Forgejo user per (bro, provider, model) triple, writes
+its token to a `secret:<name>` slot, and persists the mapping via
+`IdentityRegistry`. Workflows resolve `${vars.identity_result.identity.token_ref}`
+to a `secret:<name>` reference, which `secret_headers` expands at HTTP
+request time. The raw token never enters vars, outbox rows, replay
+output, or daemon logs.
+
+### Smoke
+
+`scripts/identity-smoke.sh` is an operator-runnable acceptance check
+(not a unit test — it touches a real Forgejo). It:
+
+1. Verifies the four required workflows and the `forgejo-ensure-bro-user`
+   reaction are installed by reading their on-disk JSON files under
+   `${BRO_HOME}/workflows/` and `${BRO_HOME}/reactions/` — there is no
+   HTTP list endpoint for workflows, reactions, or identity mappings on
+   the current daemon, so the script verifies the persisted store
+   directly.
+2. Dispatches `issue-to-merged-pr-with-identity` against
+   `${FORGEJO_OWNER}/${FORGEJO_REPO}` issue `${ISSUE_NUMBER}` on
+   instance `${FORGEJO_INSTANCE}` via the real
+   `POST /orchestrate/by-id` endpoint with `{workflow_id, project_dir,
+   initial_vars}` (same shape `scripts/run.sh --dispatch` uses).
+3. Polls the Forgejo API for the resulting PR and its first review.
+4. **Fails non-zero** if the PR author and the review author are the
+   same Forgejo login (i.e. the identity mapping did not separate
+   principals), or if the on-disk identity file
+   `${BRO_HOME}/identities/forgejo/${FORGEJO_INSTANCE}.json` lacks an
+   exact `(subject, provider, model)` row for both `bro:keystone-impl`
+   (`claude` / `claude-sonnet-4-6`) and `bro:keystone-review` (`claude`
+   / `claude-haiku-4-5-20251001`).
+
+Run it with `$PROJECT_DIR` (local clone path, like `run.sh`),
+`$FORGEJO_BASE_URL`, `$FORGEJO_ADMIN_TOKEN` (admin token used for
+verification reads only, never for the workflow itself),
+`$FORGEJO_OWNER`, `$FORGEJO_REPO`, `$FORGEJO_INSTANCE`, and
+`$ISSUE_NUMBER` set in the environment. `jq` and `curl` are required
+on the operator's PATH. The base `bootstrap.sh` / `install.sh` flow
+under this directory writes the operator token and webhook secret;
+the smoke adds the identity-side checks on top.
+
+I have not run this script end-to-end against a live Forgejo as part of
+authoring it — it is wired to fail loudly on every assertion gap, but
+the actual Forgejo-side acceptance must be confirmed in your operator
+environment.
+
 ## Tear-down
 
 ```sh

@@ -630,6 +630,23 @@ events with deterministic rendered outputs.
 - packet entity contains payload and correlation fields
 - dry-run redacts `Authorization` and `secret:` values
 
+3.7 **Operator execute/force replay.**
+
+Add:
+
+- `reaction_execute(event_id, reaction, force=false)`
+
+Execution creates an outbox record with the same rendered idempotency key,
+claims that exact record, runs the normal worker prechecks/action path, and
+persists the resulting delivery status. `force=false` preserves normal
+succeeded-idempotency suppression. `force=true` bypasses only that suppression;
+gates, recursion/causation guards, redaction, retries, and dead-letter handling
+still apply.
+
+This is a separate ops-only tool because MCP surfaces are tool-level, not
+parameter-level. Do not expose side-effecting replay as a mode on the
+default-visible dry-run tool.
+
 **Estimated size:** 500-800 lines Rust.
 
 ---
@@ -1085,7 +1102,7 @@ Surface policy:
 |---|---|
 | `reaction_install` | `ops` |
 | `reaction_retry` | `ops` |
-| `reaction_replay execute/force` | `ops` |
+| `reaction_execute` | `ops` |
 | `system_event_emit` | `ops` |
 | `reaction_replay dry_run` | `default` |
 | `reaction_list` / `reaction_deliveries` | `default` |
@@ -1123,7 +1140,7 @@ Document operational loops:
 Each loop should name the MCP tools in order:
 
 ```text
-system_event_open -> reaction_deliveries -> reaction_replay dry_run -> reaction_retry
+system_event_open -> reaction_deliveries -> reaction_replay dry_run -> reaction_execute / reaction_retry
 ```
 
 8.4 **Redaction audit.**
@@ -1144,6 +1161,9 @@ Implement or verify:
 - successful outbox compaction after 7 days
 - all non-success records retained
 - copy-forward temp file + fsync + rename
+- `system_event_compact` ops tool returning journal/outbox compaction reports
+- `system-defaults/maintenance` daily-compaction workflow + cron artifact that
+  runs system-event compaction, edge storage GC, and vector compaction
 
 Compaction tests must simulate an interrupted compaction by leaving a partial
 temp file next to the current segment. On restore, the store must ignore the

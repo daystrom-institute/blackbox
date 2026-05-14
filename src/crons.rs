@@ -100,6 +100,14 @@ impl CronRegistry {
         self.by_name.read().values().cloned().collect()
     }
 
+    pub fn remove(&self, name: &str) {
+        self.by_name.write().remove(name);
+        self.state.write().remove(name);
+        if let Some(handle) = self.handles.write().remove(name) {
+            handle.abort();
+        }
+    }
+
     pub fn rename_project_refs(&self, old_project: &str, new_project: &str) -> Vec<CronSpec> {
         let mut updated = Vec::new();
         let mut by_name = self.by_name.write();

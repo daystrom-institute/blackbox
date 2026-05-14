@@ -814,6 +814,7 @@ Next step: <one concrete steering suggestion>\n",
                     self.state.tail_tx.clone(),
                     None,
                     None,
+                    Some(self.state.system_events.clone()),
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 release_resume_lease_when_done(task.clone(), resume_lease);
@@ -879,6 +880,7 @@ Next step: <one concrete steering suggestion>\n",
                     self.state.tail_tx.clone(),
                     None,
                     None,
+                    Some(self.state.system_events.clone()),
                 );
                 cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
                 task

@@ -66,13 +66,7 @@ bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-triage-channel-arc.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-triage-fanout-arc.json")
 bbox_artifact_install(kind="packet",   source="system-defaults/badgey/packets/badgey-cron-routing.json")
-```
-
-The cron itself still installs via `bro_cron_install` (no artifact
-catalog for crons today):
-
-```text
-bro_cron_install(spec=<contents of system-defaults/badgey/crons/badgey-triage-daily.json>)
+bbox_artifact_install(kind="cron",     source="system-defaults/badgey/crons/badgey-triage-daily.json")
 ```
 
 ## Bind a channel

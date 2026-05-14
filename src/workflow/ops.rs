@@ -62,6 +62,15 @@ pub enum OpKind {
     WorktreeCreate,
     WorktreeRemove,
     SetMeta,
+    /// Request an external identity mapping for a bro through the EventHub.
+    /// Calls `EventHub::require_identity`; emits `bro.identity.required` once
+    /// per daemon lifetime per key when the mapping is missing (pending dedup).
+    /// Writes `{ "status": "ready", "identity": <ExternalIdentity> }` or
+    /// `{ "status": "pending", "identity": null }` into `vars[into_var]`.
+    RequireIdentity,
+    /// Apply system-event journal and outbox retention compaction through the
+    /// EventHub. Writes the compaction report into `vars[into_var]`.
+    SystemEventCompact,
     /// Generic HTTP request → JSON-decoded response body. Workflow
     /// authors compose URL/headers/body from `${env.X}` + `${vars.X}`
     /// to express any code-host integration (issue fetch, PR create,
@@ -182,15 +191,26 @@ pub enum OpEffect {
     SetProjectDir(Option<String>),
 }
 
-/// Execute one HookOp against the given context. The context is
-/// passed by mutable reference SOLELY so the op can read live state
-/// for arg rendering — it must not be mutated here. Mutations are
-/// returned as `OpEffect` and applied by the runner so logging /
-/// schema validation / event emission stays centralized.
+/// Execute one HookOp against the given context. Stateless variant —
+/// ops that require daemon state (e.g. `require_identity`) will error.
+/// Use `execute_op_with_hub` from the engine where state is available.
 pub async fn execute_op(
     hook: &HookOp,
     ctx: &ArcContext,
     schema: Option<&VarsSchema>,
+) -> Result<OpEffect> {
+    execute_op_with_hub(hook, ctx, schema, None).await
+}
+
+/// State-aware variant of `execute_op`. The `hub` parameter is
+/// `Some` when called from the engine (which has access to
+/// `SharedState`) and `None` in stateless test/preview contexts.
+/// Ops that require the hub return an error when it is absent.
+pub async fn execute_op_with_hub(
+    hook: &HookOp,
+    ctx: &ArcContext,
+    schema: Option<&VarsSchema>,
+    hub: Option<&crate::system_events::SharedEventHub>,
 ) -> Result<OpEffect> {
     let _ = schema;
     let rendered_args = resolve_arg_value(ctx, &hook.args)
@@ -244,7 +264,42 @@ pub async fn execute_op(
             exec_score_eval_output(&rendered_args, hook.into_var.as_deref(), ctx)
         }
         OpKind::PickFirst => exec_pick_first(&rendered_args, hook.into_var.as_deref(), ctx),
+        OpKind::SystemEventCompact => {
+            let hub = hub.ok_or_else(|| {
+                anyhow!(
+                    "system_event_compact op requires EventHub — not available in stateless context"
+                )
+            })?;
+            exec_system_event_compact(&rendered_args, hook.into_var.as_deref(), hub)
+        }
+        OpKind::RequireIdentity => {
+            let hub = hub.ok_or_else(|| {
+                anyhow!(
+                    "require_identity op requires EventHub — not available in stateless context"
+                )
+            })?;
+            exec_require_identity(&rendered_args, hook.into_var.as_deref(), hub).await
+        }
     }
+}
+
+fn exec_system_event_compact(
+    args: &Value,
+    into_var: Option<&str>,
+    hub: &crate::system_events::SharedEventHub,
+) -> Result<OpEffect> {
+    let now = args
+        .get("now")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(crate::util::now_iso);
+    let report = hub.compact_with_now(&now)?;
+    Ok(OpEffect::SetVar {
+        key: into_var
+            .unwrap_or("system_event_compaction_result")
+            .to_string(),
+        value: serde_json::to_value(report)?,
+    })
 }
 
 async fn exec_read_session(
@@ -889,7 +944,21 @@ async fn exec_http_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect
     // the daemon-level poller consumes. The op is a thin wrapper that
     // also handles `into_var` capture; everything else (request build,
     // status classification, response decoding) lives in http_fetch.
-    let spec = crate::orchestration::http_fetch::HttpFetchSpec::from_args(args)?;
+    let mut spec = crate::orchestration::http_fetch::HttpFetchSpec::from_args(args)?;
+    // `secret_headers` resolves `secret:<name>` refs at request time so
+    // raw token values never appear in vars, logs, or JSON artifacts.
+    // Values are merged into spec.headers AFTER from_args so they override
+    // any same-named key in the normal `headers` field.
+    if let Some(secret_hdrs) = args.get("secret_headers").and_then(|v| v.as_object()) {
+        for (header_name, raw_val) in secret_hdrs {
+            let raw_str = raw_val
+                .as_str()
+                .ok_or_else(|| anyhow!("secret_headers.{header_name} must be a string"))?;
+            let resolved = resolve_secret_header_value(raw_str)
+                .map_err(|e| anyhow!("secret_headers.{header_name}: {e}"))?;
+            spec.headers.insert(header_name.clone(), resolved);
+        }
+    }
     let result = spec.execute().await?;
     match into_var {
         Some(k) => Ok(OpEffect::SetVar {
@@ -897,6 +966,89 @@ async fn exec_http_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect
             value: result.value,
         }),
         None => Ok(OpEffect::None),
+    }
+}
+
+/// Resolve a header value that contains a `secret:<name>` reference.
+/// The `secret:<name>` substring is replaced with the resolved secret value.
+/// Example: `"token secret:my-token"` → `"token <actual-value>"`.
+/// Rejects values that contain no `secret:` reference — use the normal
+/// `headers` field for static values.
+fn resolve_secret_header_value(value: &str) -> Result<String> {
+    let Some(start) = value.find("secret:") else {
+        bail!(
+            "secret_headers value must contain a 'secret:<name>' reference; \
+             use the 'headers' field for static values"
+        )
+    };
+    let rest = &value[start + "secret:".len()..];
+    let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
+    let name = &rest[..end];
+    // resolve() validates the name and returns an error without exposing the value.
+    let secret = blackbox::secrets::resolve(name)
+        .map_err(|_| anyhow!("secret_headers: secret '{name}' could not be resolved"))?;
+    let prefix = &value[..start];
+    let suffix = &rest[end..];
+    Ok(format!("{}{}{}", prefix, secret.expose(), suffix))
+}
+
+async fn exec_require_identity(
+    args: &Value,
+    into_var: Option<&str>,
+    hub: &crate::system_events::SharedEventHub,
+) -> Result<OpEffect> {
+    let scope = args
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("require_identity requires args.scope"))?;
+    let instance = args
+        .get("instance")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("require_identity requires args.instance"))?;
+    let bro = args
+        .get("bro")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("require_identity requires args.bro"))?;
+    let provider = args
+        .get("provider")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("require_identity requires args.provider"))?;
+    let model = args
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("require_identity requires args.model"))?;
+    let effort = args
+        .get("effort")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let project = args
+        .get("project")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let req = crate::system_events::identity::IdentityRequest {
+        scope: scope.to_string(),
+        instance: instance.to_string(),
+        bro: bro.to_string(),
+        provider: provider.to_string(),
+        model: model.to_string(),
+        effort,
+        project,
+    };
+
+    let into = into_var.unwrap_or("identity_result");
+    match hub.require_identity(&req).await? {
+        Some(identity) => Ok(OpEffect::SetVar {
+            key: into.to_string(),
+            value: json!({
+                "status": "ready",
+                "identity": serde_json::to_value(&identity)?
+            }),
+        }),
+        None => Ok(OpEffect::SetVar {
+            key: into.to_string(),
+            value: json!({ "status": "pending", "identity": null }),
+        }),
     }
 }
 
@@ -2078,5 +2230,199 @@ mod tests {
         };
         let effect = execute_op(&hook, &ctx, None).await.unwrap();
         assert!(matches!(effect, OpEffect::None));
+    }
+
+    // ── require_identity ─────────────────────────────────────────────────────
+
+    fn test_hub_for_ops() -> (crate::system_events::SharedEventHub, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let es = crate::system_events::EventStore::new_at(dir.path().join("journal"));
+        let os = crate::system_events::OutboxStore::new(dir.path().join("outbox")).unwrap();
+        let rd = dir.path().join("reactions");
+        let id = dir.path().join("identities");
+        (
+            std::sync::Arc::new(crate::system_events::EventHub::new(es, os, rd, id)),
+            dir,
+        )
+    }
+
+    #[tokio::test]
+    async fn system_event_compact_op_writes_report() {
+        let (hub, _dir) = test_hub_for_ops();
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::SystemEventCompact,
+            args: json!({"now": "2026-05-14T00:00:00Z"}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("compaction".into()),
+        };
+        let effect = execute_op_with_hub(&hook, &ctx, None, Some(&hub))
+            .await
+            .unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "compaction");
+                assert_eq!(value["now"], "2026-05-14T00:00:00Z");
+                assert_eq!(value["event_journal"]["before"], 0);
+                assert_eq!(value["outbox"]["before"], 0);
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_identity_pending_on_miss() {
+        let (hub, _dir) = test_hub_for_ops();
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::RequireIdentity,
+            args: json!({
+                "scope":    "forgejo",
+                "instance": "local-forgejo15",
+                "bro":      "keystone-review",
+                "provider": "claude",
+                "model":    "haiku-4.5"
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("identity_result".into()),
+        };
+        let effect = execute_op_with_hub(&hook, &ctx, None, Some(&hub))
+            .await
+            .unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "identity_result");
+                assert_eq!(value["status"], "pending");
+                assert!(value["identity"].is_null());
+            }
+            _ => panic!("expected SetVar"),
+        }
+        let events = hub
+            .list_events(None, Some("bro.identity.required"), None, None)
+            .unwrap();
+        assert_eq!(events.len(), 1, "should have emitted bro.identity.required");
+    }
+
+    #[tokio::test]
+    async fn require_identity_ready_after_upsert() {
+        let (hub, _dir) = test_hub_for_ops();
+        let identity = crate::system_events::identity::ExternalIdentity {
+            scope: "forgejo".to_string(),
+            instance: "local-forgejo15".to_string(),
+            subject: "bro:keystone-review".to_string(),
+            provider: "claude".to_string(),
+            model: "haiku-4.5".to_string(),
+            external_user_id: "42".to_string(),
+            username: "bro-keystone-review-claude-haiku45".to_string(),
+            token_ref: "secret:forgejo-bro-keystone-review".to_string(),
+            created_at: crate::util::now_iso(),
+            last_verified_at: None,
+        };
+        hub.identity_registry().upsert(&identity).unwrap();
+
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::RequireIdentity,
+            args: json!({
+                "scope":    "forgejo",
+                "instance": "local-forgejo15",
+                "bro":      "keystone-review",
+                "provider": "claude",
+                "model":    "haiku-4.5"
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("identity_result".into()),
+        };
+        let effect = execute_op_with_hub(&hook, &ctx, None, Some(&hub))
+            .await
+            .unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "identity_result");
+                assert_eq!(value["status"], "ready");
+                assert_eq!(
+                    value["identity"]["token_ref"],
+                    "secret:forgejo-bro-keystone-review"
+                );
+            }
+            _ => panic!("expected SetVar"),
+        }
+        let events = hub
+            .list_events(None, Some("bro.identity.required"), None, None)
+            .unwrap();
+        assert!(
+            events.is_empty(),
+            "no event expected when identity is ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn require_identity_without_hub_errors() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::RequireIdentity,
+            args: json!({
+                "scope": "forgejo", "instance": "x", "bro": "y",
+                "provider": "claude", "model": "haiku-4.5"
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("EventHub"),
+            "expected EventHub error, got: {err}"
+        );
+    }
+
+    // ── secret_headers / resolve_secret_header_value ─────────────────────────
+
+    #[test]
+    fn resolve_secret_header_value_with_env_fallback() {
+        // Use the env var fallback (BLACKBOX_SECRET_TEST_HTTP_TOKEN).
+        // SAFETY: single-threaded test context; no other threads access this var.
+        unsafe { std::env::set_var("BLACKBOX_SECRET_TEST_HTTP_TOKEN", "tok-abc123") };
+        let result = resolve_secret_header_value("token secret:test-http-token").unwrap();
+        assert_eq!(result, "token tok-abc123");
+        // SAFETY: same as above.
+        unsafe { std::env::remove_var("BLACKBOX_SECRET_TEST_HTTP_TOKEN") };
+    }
+
+    #[test]
+    fn resolve_secret_header_value_rejects_no_secret_ref() {
+        let err = resolve_secret_header_value("static-plain-value").unwrap_err();
+        assert!(
+            err.to_string().contains("secret:"),
+            "expected rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_secret_header_value_missing_secret_errors_without_value() {
+        let err = resolve_secret_header_value("Bearer secret:definitely-not-set-xyz").unwrap_err();
+        let msg = err.to_string();
+        // Must not contain any resolved value (there is none), but must name the key.
+        assert!(
+            msg.contains("definitely-not-set-xyz"),
+            "expected secret name in error: {msg}"
+        );
+        assert!(
+            !msg.contains("Bearer"),
+            "error must not expose header prefix: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_secret_header_value_bare_secret_ref() {
+        // SAFETY: single-threaded test context; no other threads access this var.
+        unsafe { std::env::set_var("BLACKBOX_SECRET_BARE_TOKEN", "raw-value") };
+        let result = resolve_secret_header_value("secret:bare-token").unwrap();
+        assert_eq!(result, "raw-value");
+        // SAFETY: same as above.
+        unsafe { std::env::remove_var("BLACKBOX_SECRET_BARE_TOKEN") };
     }
 }

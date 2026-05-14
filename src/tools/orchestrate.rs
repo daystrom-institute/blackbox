@@ -142,6 +142,7 @@ Constraints:\n\
             self.state.tail_tx.clone(),
             Some(format!("workflow::{workflow_name}")),
             None,
+            Some(self.state.system_events.clone()),
         );
         orch::push_in_process_event(
             &task,
@@ -208,6 +209,7 @@ Constraints:\n\
                 &state.task_store,
                 &state.store_dir,
                 &state.tail_tx,
+                Some(state.system_events.clone()),
             );
         });
         (task, arc_id)

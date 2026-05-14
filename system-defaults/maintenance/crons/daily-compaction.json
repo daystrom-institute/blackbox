@@ -1,0 +1,8 @@
+{
+  "name": "daily-compaction",
+  "version": 1,
+  "schedule": "0 15 3 * * *",
+  "payload": {},
+  "concurrency": 1,
+  "routing_packet": "domain:cron-routing/daily-compaction"
+}

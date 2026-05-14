@@ -324,6 +324,13 @@ The longer backup checklist lives in [Operations](operations.md).
 | Disk grows under `vectors/` | journal compaction lines | Usually wait; re-embed only after provider/data issues |
 | Disk grows under `edges/` | sidecar size, project id | Dry-run `bbox_edge_compact` |
 | Provider markdown stale | `bbox_lint`, rendered files | `bbox_render(scope="global")` |
+| Reaction dead-lettered / no reaction ran / identity missing | `system_event_open` → `reaction_deliveries` → `reaction_replay dry_run` → `reaction_retry` | See [System events](system-events.md) — operational loops. |
+
+System events are journalled separately from the transcript index and have
+their own retention/compaction. The transcript-side `bbox_*` reindex tools
+do not touch the system-event journal or the outbox. For the system-event
+runbook (dead-lettered reactions, missing identities, missing token
+secrets, replay), see [System events](system-events.md).
 
 ## Key paths
 
@@ -341,3 +348,5 @@ The longer backup checklist lives in [Operations](operations.md).
 | `~/.local/state/blackbox/` | Durable JSON stores plus rebuildable projections |
 | `~/.bro/mcp.json` | Global MCP server config |
 | `<project>/.bro/mcp.json` | Project MCP overlay |
+| `~/.bro/events/journal/current.jsonl` | System-event journal (compacts at 10k events / 7 days) |
+| `~/.bro/events/outbox/current.jsonl` | Reaction outbox (succeeded rows compact at 7 days; all other statuses retained) |

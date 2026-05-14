@@ -1432,4 +1432,73 @@ mod tests {
             "expected at least one shipped atom artifact under system-defaults/atoms/"
         );
     }
+
+    // ── Phase 7 artifact validation ─────────────────────────────
+
+    #[test]
+    fn forgejo_ensure_user_atom_artifact_parses_and_validates() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/forgejo/atoms/forgejo-ensure-user.json"),
+        )
+        .expect("examples/forgejo/atoms/forgejo-ensure-user.json exists");
+        let v: serde_json::Value =
+            serde_json::from_str(&src).expect("forgejo-ensure-user.json parses as JSON");
+        assert_eq!(
+            v.get("_contract").and_then(|v| v.as_str()),
+            Some("atom/v1"),
+            "must use atom/v1 contract"
+        );
+        assert_eq!(
+            v.get("kind").and_then(|v| v.as_str()),
+            Some("atom"),
+            "must be kind=atom"
+        );
+        assert_eq!(
+            v.get("name").and_then(|v| v.as_str()),
+            Some("forgejo-ensure-user"),
+            "name must match"
+        );
+        let impl_kind = v
+            .pointer("/manifest/implementation/kind")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            impl_kind,
+            Some("deterministic"),
+            "implementation must be deterministic (builtin path handled by system_events::executors)"
+        );
+        let runner = v
+            .pointer("/manifest/implementation/runner")
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            runner,
+            Some("forgejo-ensure-user"),
+            "runner must be forgejo-ensure-user"
+        );
+        validate_atom_install(&v, &noop_ctx())
+            .expect("forgejo-ensure-user.json must pass atom validation");
+    }
+
+    #[test]
+    fn forgejo_reaction_example_has_atom_invoke_for_builtin() {
+        let src = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("examples/forgejo/reactions/ensure-bro-user.json"),
+        )
+        .expect("examples/forgejo/reactions/ensure-bro-user.json exists");
+        let v: serde_json::Value =
+            serde_json::from_str(&src).expect("ensure-bro-user.json parses as JSON");
+        let op = v.pointer("/action/op").and_then(|v| v.as_str());
+        assert_eq!(
+            op,
+            Some("atom_invoke"),
+            "reaction action op must be atom_invoke"
+        );
+        let atom = v.pointer("/action/args/atom").and_then(|v| v.as_str());
+        assert_eq!(
+            atom,
+            Some("atom:forgejo-ensure-user@v1"),
+            "reaction must invoke the forgejo built-in atom ref"
+        );
+    }
 }
