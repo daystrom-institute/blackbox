@@ -3108,7 +3108,10 @@ mod tests {
         use crate::snapshot::{
             clean_snapshot_id, snapshot_dir, switch_to_clean_snapshot, switch_to_dirty_overlay,
         };
-        use crate::storage_health::{GcParams, plan_gc, scan_storage_health};
+        use crate::storage_health::{
+            GcParams, GcPolicy, SnapshotRetentionPolicy, plan_gc, plan_gc_with_policy,
+            scan_storage_health,
+        };
 
         fn derived_edge(source: &str, kind: &str, target: &str) -> Edge {
             Edge {
@@ -3357,7 +3360,16 @@ mod tests {
             .unwrap();
 
             let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
-            let candidates = plan_gc(
+            let mut policy = GcPolicy::default();
+            policy.materialized_snapshots = SnapshotRetentionPolicy {
+                keep_active: true,
+                keep_recent_per_workspace: 0,
+                keep_recent_per_repo: 0,
+                branch_switch_grace_minutes: 0,
+                max_age_days: None,
+            };
+
+            let candidates = plan_gc_with_policy(
                 edges_dir,
                 &registered,
                 &GcParams {
@@ -3370,10 +3382,11 @@ mod tests {
                     max_backup_age_days: None,
                     keep_newest_backup_per_source: 1,
                 },
+                &policy,
             )
             .unwrap();
 
-            let overlay_path = format!("workspace/{}/dirty-overlay", project_id);
+            let overlay_path = format!("workspace/{}/dirty-current", project_id);
             let active_snap_id = clean_snapshot_id(repo_id, project_id, head_sha);
             let snap_path = format!("workspace/{}/snapshots/{}", project_id, active_snap_id);
 
@@ -3437,7 +3450,15 @@ mod tests {
             );
 
             let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
-            let candidates = plan_gc(
+            let mut policy = GcPolicy::default();
+            policy.materialized_snapshots = SnapshotRetentionPolicy {
+                keep_active: true,
+                keep_recent_per_workspace: 0,
+                keep_recent_per_repo: 0,
+                branch_switch_grace_minutes: 0,
+                max_age_days: None,
+            };
+            let candidates = plan_gc_with_policy(
                 edges_dir,
                 &registered,
                 &GcParams {
@@ -3450,22 +3471,25 @@ mod tests {
                     max_backup_age_days: None,
                     keep_newest_backup_per_source: 1,
                 },
+                &policy,
             )
             .unwrap();
 
             let inactive_snap_id = clean_snapshot_id(repo_id, project_id, sha_b);
             let inactive_path = format!("workspace/{}/snapshots/{}", project_id, inactive_snap_id);
 
-            let inactive_candidate = candidates
-                .iter()
-                .find(|c| c.path.contains(&inactive_path) && c.rule == "inactive_snapshot");
+            let inactive_candidate = candidates.iter().find(|c| {
+                c.path.contains(&inactive_path)
+                    && c.rule.starts_with("snapshot_prunable")
+                    && c.deletable
+            });
             assert!(
                 inactive_candidate.is_some(),
                 "inactive branch B snapshot must be a GC candidate: {:?}",
                 candidates
                     .iter()
-                    .filter(|c| c.rule == "inactive_snapshot")
-                    .map(|c| &c.path)
+                    .filter(|c| c.rule.starts_with("snapshot_"))
+                    .map(|c| (&c.rule, &c.path, c.deletable))
                     .collect::<Vec<_>>()
             );
         }
