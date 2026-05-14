@@ -1,17 +1,58 @@
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: partially implemented; moved from `design/proposed/` on 2026-05-12; refreshed 2026-05-14
-Related: `design/partial/restructure-ast.md`
+Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; refreshed 2026-05-14
+Related: `design/archive/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
 target, `src/packets/`, `src/server/`, `src/tools/`, and first-pass child
-splits under `src/tools/badgey/` and `src/workflow/engine/`. In the
-`restructure-aggressive` worktree, `src/main.rs` is now only the binary entry
-point, module declarations are owned by `src/lib.rs`, and daemon bootstrap has
-moved to `src/server/run.rs`. Keep this in `design/partial/` until the crate
-topology work is closed or superseded because the lib root still carries a
-compatibility prelude and `server/run.rs` remains a large bootstrap module.
+splits under `src/tools/badgey/` and `src/workflow/engine/`. `src/main.rs` is
+now only the binary entry point, module declarations are owned by `src/lib.rs`,
+and daemon bootstrap has moved to `src/server/run.rs`. Keep this in
+`design/partial/` until the remaining live work below is either implemented or
+moved to roadmap/thread entries; then archive this doc as the completed topology
+design.
+
+## Remaining Work Before Archive
+
+The original crate-topology goal is implemented. The doc remains live only for
+the decomposition cleanup that the topology move exposed:
+
+1. **Pay down the `src/lib.rs` compatibility prelude.**
+   - Replace broad `use crate::*` dependencies with explicit imports when
+     editing touched modules.
+   - Remove root-level imports/re-exports from `src/lib.rs` once no module
+     depends on them implicitly.
+   - Prefer small compile-checked batches over a whole-crate import rewrite.
+
+2. **Split `src/server/run.rs` by startup concern.**
+   - Candidate modules: `server/startup.rs` for logging/config/transcript-root
+     discovery, `server/restore.rs` for registry restoration, and
+     `server/http.rs` or `server/mcp.rs` for router/MCP service assembly.
+   - Keep `server/run.rs` as orchestration glue; do not replace it with another
+     catch-all startup file.
+
+3. **Continue large-module decomposition where there is a cohesive boundary.**
+   - `src/tools/atoms.rs`: keep public tool wrappers in the facade and move
+     private implementation clusters into child modules.
+   - `src/workflow/engine.rs`: continue extracting runner subsystems after the
+     landed `engine/fanout.rs` split.
+   - `src/workflow/ops.rs`: split hook/action families when changing nearby
+     code.
+   - `src/orchestration/providers.rs`: split catalog, credentials, and provider
+     resolution when touching that area.
+
+4. **Improve test locality opportunistically.**
+   - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
+     as packet modules change.
+   - Move daemon-startup-shaped tests to integration tests using `blackbox::`
+     imports.
+
+Archive criteria: this doc can move to `design/archive/` once these follow-ups
+are either complete or represented as accepted roadmap/thread items with enough
+detail that agents do not need this historical proposal to proceed. The
+companion AST execution plan was a checkpoint artifact for the old mechanized
+sequence and now lives at `design/archive/restructure-ast.md`.
 
 ## Original Problem
 
@@ -468,7 +509,10 @@ Next useful cuts:
 
 2. **Split daemon bootstrap by startup concern.**
    - Candidate boundaries: transcript root discovery, config/state opening,
-     MCP service construction, background task spawning, and shutdown wiring.
+     registry restoration, MCP service construction, background task spawning,
+     and shutdown wiring.
+   - Likely target files: `server/startup.rs`, `server/restore.rs`, and
+     `server/http.rs` or `server/mcp.rs`.
    - Keep `server/run.rs` as orchestration glue rather than moving everything
      into another catch-all file.
 

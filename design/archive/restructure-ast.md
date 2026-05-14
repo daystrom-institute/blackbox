@@ -1,7 +1,7 @@
 # AST-Grounded Restructure Execution Plan
 
 Date: 2026-05-07
-Status: partially executed checkpoint plan; moved from `design/proposed/` on 2026-05-12
+Status: archived checkpoint plan; moved from `design/proposed/` on 2026-05-12 and archived on 2026-05-14
 Related: `design/partial/restructure.md`
 
 ## Purpose
