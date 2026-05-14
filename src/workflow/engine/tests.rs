@@ -135,6 +135,29 @@ fn branch_with_default_handles_missing_verdict() {
     assert_eq!(runner.next_node("Decide").unwrap(), "Fallback");
 }
 
+#[test]
+fn structured_exit_prefers_private_var() {
+    let mut vars = Map::new();
+    vars.insert("structured_exit".into(), json!({"status": "public"}));
+    vars.insert("_structured_exit".into(), json!({"status": "private"}));
+
+    assert_eq!(
+        workflow_structured_exit(&vars),
+        Some(json!({"status": "private"}))
+    );
+}
+
+#[test]
+fn structured_exit_falls_back_to_public_var() {
+    let mut vars = Map::new();
+    vars.insert("structured_exit".into(), json!({"status": "public"}));
+
+    assert_eq!(
+        workflow_structured_exit(&vars),
+        Some(json!({"status": "public"}))
+    );
+}
+
 fn runner_for(compiled: &CompiledWorkflow) -> DummyRunner<'_> {
     DummyRunner {
         compiled,

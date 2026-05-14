@@ -795,6 +795,7 @@ mod tests {
                         on_enter: Vec::new(),
                         on_exit: Vec::new(),
                         wait: None,
+                        sleep: None,
                         wait_for: Vec::new(),
                         foreach: None,
                         matrix: None,

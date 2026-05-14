@@ -1126,6 +1126,234 @@ impl BlackboxServer {
         }
     }
 
+    fn bounded_tail(&self, text: &str, max_bytes: usize) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        if max_bytes == 0 {
+            return String::new();
+        }
+        if text.len() <= max_bytes {
+            return text.to_string();
+        }
+        let mut start = text.len().saturating_sub(max_bytes);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        text[start..].to_string()
+    }
+
+    fn resolve_attachment_for_poll(
+        &self,
+        primary_invocation_id: &str,
+        attempt: Option<u64>,
+    ) -> Result<orchestration::atoms::invocation::SupervisionAttachment, String> {
+        let store = self.state.atom_invocation_store.read();
+        let attachments = store.attachments_for_primary(primary_invocation_id);
+        if attachments.is_empty() {
+            return Err(format!(
+                "attachment not found for primary invocation: {primary_invocation_id}"
+            ));
+        }
+        match attempt {
+            Some(expected) => attachments
+                .iter()
+                .find(|attached| attached.attempt == expected)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "attachment not found for primary invocation {primary_invocation_id} attempt {expected}"
+                    )
+                }),
+            None => attachments
+                .into_iter()
+                .max_by_key(|attached| attached.attempt)
+                .ok_or_else(|| {
+                    format!(
+                        "attachment not found for primary invocation: {primary_invocation_id}"
+                    )
+                }),
+        }
+    }
+
+    fn authorize_attachment_read(
+        &self,
+        attachment: &orchestration::atoms::invocation::SupervisionAttachment,
+        owner: &str,
+    ) -> Result<(), String> {
+        let store = self.state.atom_invocation_store.read();
+        let lineage = [
+            attachment.primary_invocation_id.as_str(),
+            attachment.classifier_invocation_id.as_deref().unwrap_or(""),
+            attachment.advisor_invocation_id.as_deref().unwrap_or(""),
+        ];
+        for inv_id in lineage {
+            if inv_id.is_empty() {
+                continue;
+            }
+            match store.get(inv_id) {
+                Some(inv) if inv.is_owner(owner) => return Ok(()),
+                Some(_) => {}
+                None => {}
+            }
+        }
+        Err("error.forbidden: caller is not authorized for this attachment lineage".into())
+    }
+
+    pub(crate) fn attached_supervision_poll_value(
+        &self,
+        primary_invocation_id: &str,
+        owner: &str,
+        attempt: Option<u64>,
+    ) -> Result<serde_json::Value, String> {
+        self.attached_supervision_poll_value_with_tail(primary_invocation_id, owner, attempt, None)
+    }
+
+    pub(crate) fn attached_supervision_poll_value_with_tail(
+        &self,
+        primary_invocation_id: &str,
+        owner: &str,
+        attempt: Option<u64>,
+        tail_policy: Option<&orchestration::atoms::types::SupervisionTailPolicy>,
+    ) -> Result<serde_json::Value, String> {
+        use orchestration::atoms::types::SupervisionTailPolicy;
+
+        let default_limits = SupervisionTailPolicy::default();
+        let limits = tail_policy.unwrap_or(&default_limits);
+        let event_limit = usize::try_from(limits.events).unwrap_or(usize::MAX);
+        let note_limit = usize::try_from(limits.notes).unwrap_or(usize::MAX);
+        let text_limit = usize::try_from(limits.assistant_bytes).unwrap_or(usize::MAX);
+        let report_limit = usize::try_from(limits.reports).unwrap_or(usize::MAX);
+        let attachment = self.resolve_attachment_for_poll(primary_invocation_id, attempt)?;
+        self.authorize_attachment_read(&attachment, owner)?;
+
+        let store = self.state.atom_invocation_store.read();
+        let Some(mut primary_invocation) = store.get(&attachment.primary_invocation_id).cloned()
+        else {
+            return Err(format!(
+                "attachment references missing primary invocation: {}",
+                attachment.primary_invocation_id
+            ));
+        };
+        drop(store);
+
+        self.refresh_atom_invocation_from_task(&mut primary_invocation);
+        let _ = self
+            .state
+            .atom_invocation_store
+            .write()
+            .update(primary_invocation.clone());
+
+        let task_id = primary_invocation.task_id().ok_or_else(|| {
+            "error.internal: primary invocation has no associated task_id".to_string()
+        })?;
+
+        let task = {
+            let task_store = self.state.task_store.read();
+            task_store.get(&task_id)
+        };
+        let (
+            task_status,
+            supervision_snapshot,
+            assistant_tail,
+            latest_report,
+            provider_events,
+            task_notes,
+            elapsed_ms,
+        ) = if let Some(task) = task {
+            let now_ms = orchestration::now_ms();
+            {
+                let mut inner = task.inner.lock();
+                inner.supervision.observe_stall(now_ms);
+            }
+            let mut task_status = orchestration::task_status_json(&task, event_limit);
+            let inner = task.inner.lock();
+            let elapsed_ms = now_ms.saturating_sub(inner.started_at);
+            if let Some(obj) = task_status.as_object_mut() {
+                obj.insert(
+                    "supervision".to_string(),
+                    inner.supervision.snapshot(now_ms),
+                );
+            }
+
+            let task_event_start = inner.events.len().saturating_sub(event_limit);
+            let helper_events = inner.events[task_event_start..].to_vec();
+            let notes = self
+                .state
+                .notes
+                .read()
+                .all()
+                .iter()
+                .rev()
+                .filter(|note| note.task_id.as_deref() == Some(&task_id))
+                .take(note_limit)
+                .map(|note| {
+                    serde_json::json!({
+                        "id": note.id,
+                        "kind": note.kind.as_ref(),
+                        "created_at": note.created_at,
+                        "body": self.bounded_tail(&note.body, text_limit),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let latest_report = if report_limit > 0 {
+                inner.report.as_ref().map(orchestration::BroReport::to_json)
+            } else {
+                None
+            };
+            let assistant_tail = inner
+                .last_assistant_message
+                .as_deref()
+                .map(|m| self.bounded_tail(m, text_limit))
+                .unwrap_or_default();
+            (
+                task_status,
+                inner.supervision.snapshot(now_ms),
+                assistant_tail,
+                latest_report,
+                helper_events,
+                notes,
+                elapsed_ms,
+            )
+        } else {
+            let attached_task = serde_json::json!({
+                "taskId": task_id,
+                "status": "missing",
+                "error": "linked task record not found",
+                "supervision": serde_json::json!({"ok": false, "event_count": 0}),
+            });
+            let snapshot = orchestration::supervision::SupervisionState::default()
+                .snapshot(orchestration::now_ms());
+            (
+                attached_task,
+                snapshot,
+                String::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+                0,
+            )
+        };
+        Ok(serde_json::json!({
+            "invocation": primary_invocation.to_trace_envelope(),
+            "task": task_status,
+            "attempt_metadata": {
+                "supervision_run_id": attachment.supervision_run_id,
+                "primary_invocation_id": attachment.primary_invocation_id,
+                "primary_task_id": attachment.primary_task_id,
+                "classifier_invocation_id": attachment.classifier_invocation_id,
+                "advisor_invocation_id": attachment.advisor_invocation_id,
+                "attempt": attachment.attempt,
+            },
+            "supervision": supervision_snapshot,
+            "elapsed_ms": elapsed_ms,
+            "recent_provider_events": serde_json::Value::Array(provider_events),
+            "task_notes": serde_json::Value::Array(task_notes),
+            "latest_bro_report": latest_report,
+            "assistant_tail": assistant_tail,
+        }))
+    }
+
     #[tool(
         name = "atom_status",
         description = "Read the status of an atom invocation. Ownership-gated: only owners can read status. Returns a normalized trace envelope with state, timestamps, effects observed, cost, and summary."
@@ -1636,6 +1864,35 @@ fn iso_from_millis(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    fn make_task(
+        server: &BlackboxServer,
+        task_id: &str,
+        events: Vec<serde_json::Value>,
+        last_message: Option<&str>,
+        report: Option<orchestration::BroReport>,
+    ) -> Arc<orchestration::Task> {
+        let task = orchestration::spawn_in_process_task(
+            task_id.to_string(),
+            crate::orchestration::providers::Provider::Codex,
+            "session-primary".to_string(),
+            None,
+            server.state.store_dir.clone(),
+            server.state.task_store.clone(),
+            server.state.tail_tx.clone(),
+            None,
+            None,
+            None,
+        );
+        {
+            let mut inner = task.inner.lock();
+            inner.events = events;
+            inner.last_assistant_message = last_message.map(str::to_string);
+            inner.report = report;
+        }
+        task
+    }
 
     #[test]
     fn atom_ref_allowed_accepts_exact_and_latest_refs() {
@@ -1669,5 +1926,141 @@ mod tests {
     #[test]
     fn default_atom_owner_is_stable_for_omitted_owner_tools() {
         assert_eq!(default_atom_owner(), "operator:local");
+    }
+
+    #[test]
+    fn attached_supervision_poll_value_authorizes_lineage_and_denies_unrelated() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(Arc::new(crate::server::state::SharedState::for_test(
+            dir.path(),
+        )));
+
+        let primary = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-primary".into(),
+            "atom:test@v1".into(),
+            None,
+            "operator:primary".into(),
+            "claude".into(),
+            "session-primary".into(),
+            None,
+            "task-primary".into(),
+        );
+        let classifier = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-classifier".into(),
+            "atom:test@v1".into(),
+            None,
+            "operator:classifier".into(),
+            "claude".into(),
+            "session-classifier".into(),
+            None,
+            "task-classifier".into(),
+        );
+
+        {
+            let mut store = server.state.atom_invocation_store.write();
+            store.insert(primary);
+            store.insert(classifier);
+            store.insert_attachment(orchestration::atoms::invocation::SupervisionAttachment {
+                supervision_run_id: "run-1".into(),
+                primary_invocation_id: "inv-primary".into(),
+                primary_task_id: "task-primary".into(),
+                classifier_invocation_id: Some("inv-classifier".into()),
+                advisor_invocation_id: None,
+                attempt: 1,
+            });
+        }
+
+        make_task(&server, "task-primary", vec![], Some("still running"), None);
+
+        assert!(
+            server
+                .attached_supervision_poll_value("inv-primary", "operator:classifier", Some(1))
+                .is_ok()
+        );
+        let missing_attempt =
+            server.attached_supervision_poll_value("inv-primary", "operator:classifier", Some(2));
+        assert!(missing_attempt.is_err());
+        let denied =
+            server.attached_supervision_poll_value("inv-primary", "operator:stranger", Some(1));
+        assert!(denied.is_err());
+    }
+
+    #[test]
+    fn attached_supervision_poll_value_bounds_note_and_tail_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(Arc::new(crate::server::state::SharedState::for_test(
+            dir.path(),
+        )));
+
+        let primary = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-primary".into(),
+            "atom:test@v1".into(),
+            None,
+            "operator:primary".into(),
+            "claude".into(),
+            "session-primary".into(),
+            None,
+            "task-primary".into(),
+        );
+
+        {
+            let mut store = server.state.atom_invocation_store.write();
+            store.insert(primary);
+            store.insert_attachment(orchestration::atoms::invocation::SupervisionAttachment {
+                supervision_run_id: "run-1".into(),
+                primary_invocation_id: "inv-primary".into(),
+                primary_task_id: "task-primary".into(),
+                classifier_invocation_id: None,
+                advisor_invocation_id: None,
+                attempt: 1,
+            });
+        }
+
+        let mut events = Vec::new();
+        for i in 0..40 {
+            events.push(serde_json::json!({ "i": i }));
+        }
+        make_task(
+            &server,
+            "task-primary",
+            events,
+            Some(&"x".repeat(5000)),
+            None,
+        );
+
+        for i in 0..25 {
+            let _ = server
+                .state
+                .notes
+                .write()
+                .create(&crate::NoteParams {
+                    kind: "assumption".into(),
+                    body: format!("note-{} {}", i, "y".repeat(5000)),
+                    task_id: Some("task-primary".into()),
+                    session_id: None,
+                    project: None,
+                    thread_id: None,
+                    provider: None,
+                    bro: None,
+                })
+                .unwrap();
+        }
+
+        let snapshot = server
+            .attached_supervision_poll_value("inv-primary", "operator:primary", Some(1))
+            .unwrap();
+        assert_eq!(
+            snapshot["attempt_metadata"]["attempt"],
+            serde_json::json!(1)
+        );
+        assert_eq!(
+            snapshot["recent_provider_events"].as_array().unwrap().len(),
+            20
+        );
+        assert_eq!(snapshot["task_notes"].as_array().unwrap().len(), 20);
+        assert!(snapshot["assistant_tail"].as_str().unwrap().len() <= 4000);
+        for note in snapshot["task_notes"].as_array().unwrap() {
+            assert!(note["body"].as_str().unwrap().len() <= 4000);
+        }
     }
 }

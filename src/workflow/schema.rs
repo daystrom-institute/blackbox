@@ -126,6 +126,12 @@ pub struct AtomBindingLimits {
     pub uses_network: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SleepSpec {
+    /// Duration to sleep in milliseconds.
+    pub duration_ms: u64,
+}
+
 /// Engine-level actor kinds. Two values: `executor` for single-bro
 /// dispatch, `ensemble` for team broadcast. Persona / role / contract
 /// (advisor, planner, triager, facilitator, specialist, reviewer, …)
@@ -242,6 +248,11 @@ pub struct NodeSpec {
     /// exclusive with `actor` and `subworkflow`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitSpec>,
+    /// Sleep declaration — deterministic timer node for polling loops.
+    /// Mutually exclusive with actor, atom, wait, subworkflow, foreach,
+    /// and matrix. Cancellation is observed while sleeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleep: Option<SleepSpec>,
     /// Names of nodes whose in-flight outputs must be joined before
     /// this node's body runs. Used for fork → fan-in. The engine
     /// awaits each listed node's task (single or ensemble), records

@@ -15,6 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
@@ -64,6 +65,11 @@ pub struct WorkflowRunResult {
     /// SetVar / IncVar / Forgejo ops, plus subworkflow imports.
     #[serde(default, skip_serializing_if = "Map::is_empty")]
     pub vars: Map<String, Value>,
+    /// Optional machine-readable final output for workflow-backed atoms.
+    /// Workflows set `vars._structured_exit` or `vars.structured_exit`;
+    /// the engine records and surfaces it without parsing node prose.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_exit: Option<Value>,
     /// Final arc id (for resume / signal targeting on suspended arcs).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub arc_id: String,
@@ -84,6 +90,12 @@ pub struct WorkflowRunResult {
     /// can persist them keyed by an external correlation.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub actor_sessions: HashMap<String, String>,
+}
+
+fn workflow_structured_exit(vars: &Map<String, Value>) -> Option<Value> {
+    vars.get("_structured_exit")
+        .or_else(|| vars.get("structured_exit"))
+        .cloned()
 }
 
 /// Absolute ceiling on nested sub-workflow composition. The depth is
@@ -260,6 +272,7 @@ async fn run_workflow_streaming_with_vars_inner(
             })],
             node_outputs: HashMap::new(),
             vars: Map::new(),
+            structured_exit: None,
             arc_id: runner.ctx.meta.arc_id.clone(),
             plan: None,
             arc_thread_id: None,
@@ -278,6 +291,7 @@ async fn run_workflow_streaming_with_vars_inner(
                 events: vec![json!({"kind": "error", "data": {"message": msg.clone()}})],
                 node_outputs: HashMap::new(),
                 vars: Map::new(),
+                structured_exit: None,
                 arc_id: runner.ctx.meta.arc_id.clone(),
                 plan: None,
                 arc_thread_id: None,
@@ -362,11 +376,16 @@ async fn run_workflow_streaming_with_vars_inner(
     // WorkflowRunResult below).
     server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
     let actor_sessions = runner.actor_sessions.clone();
+    let structured_exit = workflow_structured_exit(&runner.ctx.vars);
+    if let Some(value) = &structured_exit {
+        runner.log_event("structured_exit", json!({ "value": value }));
+    }
     WorkflowRunResult {
         status,
         events: runner.events,
         node_outputs: runner.node_outputs,
         vars: runner.ctx.vars,
+        structured_exit,
         arc_id: runner.ctx.meta.arc_id,
         plan: None,
         arc_thread_id,
@@ -428,6 +447,7 @@ async fn run_workflow_at_depth_with_cancel(
             events: Vec::new(),
             node_outputs: HashMap::new(),
             vars: Map::new(),
+            structured_exit: None,
             arc_id: String::new(),
             plan: None,
             arc_thread_id: None,
@@ -464,6 +484,7 @@ async fn run_workflow_at_depth_with_cancel(
             })],
             node_outputs: HashMap::new(),
             vars: Map::new(),
+            structured_exit: None,
             arc_id: runner.ctx.meta.arc_id.clone(),
             plan: None,
             arc_thread_id: None,
@@ -481,6 +502,7 @@ async fn run_workflow_at_depth_with_cancel(
                 events: vec![json!({"kind": "error", "data": {"message": msg.clone()}})],
                 node_outputs: HashMap::new(),
                 vars: Map::new(),
+                structured_exit: None,
                 arc_id: runner.ctx.meta.arc_id.clone(),
                 plan: None,
                 arc_thread_id: None,
@@ -561,11 +583,16 @@ async fn run_workflow_at_depth_with_cancel(
     }
     server.unregister_arc_cancel_token(&runner.ctx.meta.arc_id);
     let actor_sessions = runner.actor_sessions.clone();
+    let structured_exit = workflow_structured_exit(&runner.ctx.vars);
+    if let Some(value) = &structured_exit {
+        runner.log_event("structured_exit", json!({ "value": value }));
+    }
     WorkflowRunResult {
         status,
         events: runner.events,
         node_outputs: runner.node_outputs,
         vars: runner.ctx.vars,
+        structured_exit,
         arc_id: runner.ctx.meta.arc_id,
         plan: None,
         arc_thread_id,
@@ -582,6 +609,7 @@ pub fn dry_run(compiled: &CompiledWorkflow) -> WorkflowRunResult {
         events: Vec::new(),
         node_outputs: HashMap::new(),
         vars: Map::new(),
+        structured_exit: None,
         arc_id: String::new(),
         plan: Some(compiled.summarize()),
         arc_thread_id: None,
@@ -1317,6 +1345,13 @@ impl<'a> WorkflowRunner<'a> {
         // with subworkflow + actor.
         if let Some(wait_spec) = spec.wait.clone() {
             self.run_wait_node(node_id, &wait_spec).await?;
+            self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
+            self.apply_node_gate(node_id, &spec).await;
+            return Ok(());
+        }
+
+        if let Some(sleep_spec) = spec.sleep.clone() {
+            self.run_sleep_node(node_id, sleep_spec.duration_ms).await?;
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
             self.apply_node_gate(node_id, &spec).await;
             return Ok(());
@@ -2549,6 +2584,46 @@ impl<'a> WorkflowRunner<'a> {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    async fn run_sleep_node(&mut self, node_id: &str, duration_ms: u64) -> Result<()> {
+        let duration = Duration::from_millis(duration_ms);
+        self.log_event(
+            "sleep_started",
+            json!({
+                "node": node_id,
+                "duration_ms": duration_ms,
+            }),
+        );
+
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {
+                let output = json!({
+                    "kind": "sleep",
+                    "duration_ms": duration_ms,
+                    "status": "elapsed",
+                });
+                self.record_output(node_id, output.to_string());
+                self.log_event(
+                    "sleep_elapsed",
+                    json!({
+                        "node": node_id,
+                        "duration_ms": duration_ms,
+                    }),
+                );
+                Ok(())
+            }
+            _ = self.cancel_token.cancelled() => {
+                self.log_event(
+                    "sleep_cancelled",
+                    json!({
+                        "node": node_id,
+                        "duration_ms": duration_ms,
+                    }),
+                );
+                bail!("arc cancelled")
             }
         }
     }

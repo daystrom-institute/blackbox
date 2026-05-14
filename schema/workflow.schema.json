@@ -265,6 +265,7 @@
         "on_enter":         { "type": "array", "items": { "$ref": "#/definitions/HookOp" } },
         "on_exit":          { "type": "array", "items": { "$ref": "#/definitions/HookOp" } },
         "wait":             { "$ref": "#/definitions/WaitSpec" },
+        "sleep":            { "$ref": "#/definitions/SleepSpec" },
         "wait_for": {
           "type": "array",
           "items": { "type": "string" },
@@ -486,6 +487,19 @@
         "timeout": {
           "description": "Duration string (e.g. \"24h\", \"7d\"). Absent = wait indefinitely.",
           "type": ["string", "null"]
+        }
+      }
+    },
+
+    "SleepSpec": {
+      "type": "object",
+      "required": ["duration_ms"],
+      "additionalProperties": false,
+      "properties": {
+        "duration_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Duration to sleep in milliseconds."
         }
       }
     },

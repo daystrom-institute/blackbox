@@ -114,8 +114,32 @@ fn cross_validate(spec: &Workflow) -> Result<()> {
             if node.wait.is_some() {
                 bail!("node '{node_id}' cannot combine atom binding with wait");
             }
+            if node.sleep.is_some() {
+                bail!("node '{node_id}' cannot combine atom binding with sleep");
+            }
             if node.foreach.is_some() || node.matrix.is_some() {
                 bail!("node '{node_id}' cannot combine atom binding with foreach/matrix");
+            }
+        }
+
+        if let Some(sleep) = &node.sleep {
+            if sleep.duration_ms == 0 {
+                bail!("node '{node_id}' sleep.duration_ms must be greater than zero");
+            }
+            if !node.atom.is_empty() {
+                bail!("node '{node_id}' cannot combine atom binding with sleep");
+            }
+            if !node.actor.is_empty() {
+                bail!("node '{node_id}' cannot combine actor with sleep");
+            }
+            if node.wait.is_some() {
+                bail!("node '{node_id}' cannot combine wait with sleep");
+            }
+            if node.subworkflow.is_some() || node.subworkflow_ref.is_some() {
+                bail!("node '{node_id}' cannot combine subworkflow with sleep");
+            }
+            if node.foreach.is_some() || node.matrix.is_some() {
+                bail!("node '{node_id}' cannot combine sleep with foreach/matrix");
             }
         }
 
@@ -1562,6 +1586,66 @@ mod tests {
     }
 
     #[test]
+    fn sleep_node_without_actor_accepted() {
+        let spec_json = r#"{
+            "name": "sleep-loop",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Sleep": {
+                    "sleep": {"duration_ms": 1},
+                    "next": {"type": "terminal"}
+                }
+            },
+            "start": "Sleep"
+        }"#;
+        let spec = load_workflow(spec_json).unwrap();
+        compile(spec).expect("sleep node without actor should compile");
+    }
+
+    #[test]
+    fn sleep_node_rejects_zero_duration() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-sleep",
+                "version": 1,
+                "actors": {},
+                "nodes": {
+                    "Sleep": {
+                        "sleep": {"duration_ms": 0},
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Sleep"
+            }"#,
+        );
+        assert!(err.contains("sleep.duration_ms"), "err: {err}");
+    }
+
+    #[test]
+    fn sleep_node_rejects_actor_combo() {
+        let err = compile_err(
+            r#"{
+                "name": "bad-sleep",
+                "version": 1,
+                "actors": {"e": {"kind": "executor", "brofile": "x"}},
+                "nodes": {
+                    "Sleep": {
+                        "actor": "e",
+                        "sleep": {"duration_ms": 1},
+                        "next": {"type": "terminal"}
+                    }
+                },
+                "start": "Sleep"
+            }"#,
+        );
+        assert!(
+            err.contains("cannot combine actor with sleep"),
+            "err: {err}"
+        );
+    }
+
+    #[test]
     fn fork_with_no_branches_fails_validation() {
         let spec_json = r#"{
             "name": "broken",
@@ -1686,6 +1770,34 @@ mod tests {
         assert!(
             !compiled.is_valid(&invalid_child_xor),
             "workflow.schema.json should reject foreach child workflow XOR violations"
+        );
+
+        let valid_sleep: serde_json::Value = serde_json::json!({
+            "name": "sleep-workflow",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Sleep": { "sleep": { "duration_ms": 1 }, "next": { "type": "terminal" } }
+            },
+            "start": "Sleep"
+        });
+        assert!(
+            compiled.is_valid(&valid_sleep),
+            "workflow.schema.json should accept sleep nodes"
+        );
+
+        let invalid_sleep: serde_json::Value = serde_json::json!({
+            "name": "bad-sleep-workflow",
+            "version": 1,
+            "actors": {},
+            "nodes": {
+                "Sleep": { "sleep": { "duration_ms": 0 }, "next": { "type": "terminal" } }
+            },
+            "start": "Sleep"
+        });
+        assert!(
+            !compiled.is_valid(&invalid_sleep),
+            "workflow.schema.json should reject zero-duration sleep nodes"
         );
 
         let valid_supervision_override: serde_json::Value = serde_json::json!({

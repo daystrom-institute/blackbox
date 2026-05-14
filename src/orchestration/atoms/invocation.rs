@@ -6,6 +6,18 @@ use anyhow::Result;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SupervisionAttachment {
+    pub supervision_run_id: String,
+    pub primary_invocation_id: String,
+    pub primary_task_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier_invocation_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisor_invocation_id: Option<String>,
+    pub attempt: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum InvocationStatus {
@@ -108,6 +120,19 @@ pub struct AtomInvocation {
     pub children: Vec<String>,
     pub errors: Vec<String>,
     pub artifacts: Vec<String>,
+}
+
+impl AtomInvocation {
+    pub fn task_id(&self) -> Option<String> {
+        match &self.handle {
+            AtomHandle::Profile { task_id, .. } => Some(task_id.clone()),
+            AtomHandle::Workflow {
+                root_task_id: Some(task_id),
+                ..
+            } => Some(task_id.clone()),
+            _ => None,
+        }
+    }
 }
 
 impl AtomInvocation {
@@ -263,6 +288,7 @@ fn now_iso() -> String {
 
 pub struct InvocationStore {
     invocations: HashMap<String, AtomInvocation>,
+    attachments: HashMap<String, Vec<SupervisionAttachment>>,
     path: PathBuf,
 }
 
@@ -270,6 +296,7 @@ impl InvocationStore {
     pub fn new(path: PathBuf) -> Self {
         let mut store = Self {
             invocations: HashMap::new(),
+            attachments: HashMap::new(),
             path,
         };
         store.load();
@@ -294,13 +321,73 @@ impl InvocationStore {
         let _ = self.persist();
     }
 
+    pub fn insert_attachment(&mut self, attachment: SupervisionAttachment) {
+        let primary_id = attachment.primary_invocation_id.clone();
+        let bucket = self.attachments.entry(primary_id).or_default();
+        if let Some(existing) = bucket
+            .iter_mut()
+            .find(|attached| attached.attempt == attachment.attempt)
+        {
+            *existing = attachment;
+        } else {
+            bucket.push(attachment);
+            bucket.sort_by_key(|a| a.attempt);
+        }
+        let _ = self.persist();
+    }
+
+    pub fn attachments_for_primary(
+        &self,
+        primary_invocation_id: &str,
+    ) -> Vec<SupervisionAttachment> {
+        self.attachments
+            .get(primary_invocation_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn attachment_for_primary_attempt(
+        &self,
+        primary_invocation_id: &str,
+        attempt: u64,
+    ) -> Option<SupervisionAttachment> {
+        self.attachments
+            .get(primary_invocation_id)?
+            .iter()
+            .find(|attached| attached.attempt == attempt)
+            .cloned()
+    }
+
+    pub fn latest_attachment_for_primary(
+        &self,
+        primary_invocation_id: &str,
+    ) -> Option<SupervisionAttachment> {
+        self.attachments
+            .get(primary_invocation_id)?
+            .iter()
+            .max_by_key(|attached| attached.attempt)
+            .cloned()
+    }
+
     fn load(&mut self) {
         if !self.path.exists() {
             return;
         }
         if let Ok(data) = std::fs::read_to_string(&self.path) {
+            #[derive(Deserialize)]
+            struct PersistedInvocationStore {
+                invocations: HashMap<String, AtomInvocation>,
+                #[serde(default)]
+                attachments: HashMap<String, Vec<SupervisionAttachment>>,
+            }
+            if let Ok(loaded) = serde_json::from_str::<PersistedInvocationStore>(&data) {
+                self.invocations = loaded.invocations;
+                self.attachments = loaded.attachments;
+                return;
+            }
             if let Ok(loaded) = serde_json::from_str::<HashMap<String, AtomInvocation>>(&data) {
                 self.invocations = loaded;
+                self.persist().ok();
             }
         }
     }
@@ -310,7 +397,15 @@ impl InvocationStore {
             std::fs::create_dir_all(parent)?;
         }
         let tmp = self.path.with_extension("tmp");
-        let data = serde_json::to_string(&self.invocations)?;
+        #[derive(Serialize)]
+        struct PersistedInvocationStore {
+            invocations: HashMap<String, AtomInvocation>,
+            attachments: HashMap<String, Vec<SupervisionAttachment>>,
+        }
+        let data = serde_json::to_string(&PersistedInvocationStore {
+            invocations: self.invocations.clone(),
+            attachments: self.attachments.clone(),
+        })?;
         std::fs::write(&tmp, &data)?;
         std::fs::rename(&tmp, &self.path)?;
         Ok(())
@@ -391,6 +486,60 @@ mod tests {
         let store2 = InvocationStore::new(path);
         assert!(store2.get("inv-001").is_some());
         assert_eq!(store2.get("inv-001").unwrap().atom_ref, "atom:test@v1");
+    }
+
+    #[test]
+    fn attachment_records_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invocations.json");
+        let mut store = InvocationStore::new(path.clone());
+        let mut inv = sample_invocation();
+        inv.invocation_id = "parent-1".into();
+        store.insert(inv);
+        store.insert_attachment(SupervisionAttachment {
+            supervision_run_id: "run-1".into(),
+            primary_invocation_id: "parent-1".into(),
+            primary_task_id: "task-1".into(),
+            classifier_invocation_id: Some("classifier-1".into()),
+            advisor_invocation_id: None,
+            attempt: 1,
+        });
+
+        let loaded = InvocationStore::new(path);
+        let attachment = loaded
+            .attachment_for_primary_attempt("parent-1", 1)
+            .expect("attachment should be loaded");
+        assert_eq!(attachment.primary_task_id, "task-1");
+        assert_eq!(
+            attachment.classifier_invocation_id.as_deref(),
+            Some("classifier-1")
+        );
+    }
+
+    #[test]
+    fn latest_attachment_respects_attempt_number() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invocations.json");
+        let mut store = InvocationStore::new(path);
+        store.insert_attachment(SupervisionAttachment {
+            supervision_run_id: "run-1".into(),
+            primary_invocation_id: "primary-1".into(),
+            primary_task_id: "task-1".into(),
+            classifier_invocation_id: Some("classifier-1".into()),
+            advisor_invocation_id: None,
+            attempt: 1,
+        });
+        store.insert_attachment(SupervisionAttachment {
+            supervision_run_id: "run-1".into(),
+            primary_invocation_id: "primary-1".into(),
+            primary_task_id: "task-2".into(),
+            classifier_invocation_id: Some("classifier-1".into()),
+            advisor_invocation_id: None,
+            attempt: 2,
+        });
+
+        let latest = store.latest_attachment_for_primary("primary-1").unwrap();
+        assert_eq!(latest.attempt, 2);
     }
 
     #[test]
