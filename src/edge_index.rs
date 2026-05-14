@@ -28,6 +28,27 @@ pub struct Edge {
     pub metadata: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct EdgeKey {
+    source: EntityRef,
+    kind: String,
+    target: EntityRef,
+    provenance: EdgeProvenance,
+    confidence: EdgeConfidence,
+}
+
+impl Edge {
+    fn dedup_key(&self) -> EdgeKey {
+        EdgeKey {
+            source: self.source.clone(),
+            kind: self.kind.clone(),
+            target: self.target.clone(),
+            provenance: self.provenance,
+            confidence: self.confidence,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct EdgeIndex {
     forward: HashMap<EntityRef, Vec<Edge>>,
@@ -110,7 +131,7 @@ impl EdgeIndex {
         &mut self,
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
-        seen: &mut HashSet<Edge>,
+        seen: &mut HashSet<EdgeKey>,
     ) {
         match crate::manifest::try_load_manifest_index(edges_dir) {
             Ok(manifest_index) => {
@@ -208,17 +229,8 @@ impl EdgeIndex {
             .unwrap_or_default()
     }
 
-    fn insert(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
-        // Dedupe on the logical edge identity (source, kind, target,
-        // provenance, confidence) — metadata varies per emission instance
-        // (anchor.byte_start, anchor.commit_sha_at_edit, etc.) so leaving it
-        // in the dedup key produces an N-way duplicate of the same logical
-        // relationship. Symptom: a session that wrote a file 7 times shows
-        // 7 identical EDITED_BY_SESSION edges in inspect/find_paths/notable.
-        // First emission wins for the metadata-bearing storage.
-        let mut key = edge.clone();
-        key.metadata.clear();
-        if !seen.insert(key) {
+    fn insert(&mut self, edge: Edge, seen: &mut HashSet<EdgeKey>) {
+        if !seen.insert(edge.dedup_key()) {
             return;
         }
         if edge.kind == "EDITED_FILE" {
@@ -262,7 +274,7 @@ impl EdgeIndex {
         index
     }
 
-    fn project_knowledge_edges(&mut self, knowledge: &Knowledge, seen: &mut HashSet<Edge>) {
+    fn project_knowledge_edges(&mut self, knowledge: &Knowledge, seen: &mut HashSet<EdgeKey>) {
         for entry in knowledge.all_entries() {
             if let Some(target) = &entry.supersedes {
                 self.insert(
@@ -315,7 +327,7 @@ impl EdgeIndex {
         }
     }
 
-    fn project_thread_edges(&mut self, threads: &Threads, seen: &mut HashSet<Edge>) {
+    fn project_thread_edges(&mut self, threads: &Threads, seen: &mut HashSet<EdgeKey>) {
         let session_providers = threads
             .all()
             .iter()
@@ -373,7 +385,7 @@ impl EdgeIndex {
         }
     }
 
-    fn project_note_edges(&mut self, notes: &Notes, seen: &mut HashSet<Edge>) {
+    fn project_note_edges(&mut self, notes: &Notes, seen: &mut HashSet<EdgeKey>) {
         for note in notes.all() {
             let note_ref = EntityRef::Note {
                 note_id: note.id.clone(),
@@ -424,7 +436,7 @@ impl EdgeIndex {
         }
     }
 
-    fn project_task_edges(&mut self, task_store: &TaskStore, seen: &mut HashSet<Edge>) {
+    fn project_task_edges(&mut self, task_store: &TaskStore, seen: &mut HashSet<EdgeKey>) {
         for task in task_store.all_tasks() {
             let inner = task.inner.lock();
             let Some(label) = inner.bro_label.as_ref() else {
@@ -450,7 +462,7 @@ impl EdgeIndex {
         }
     }
 
-    fn project_roadmap_edges(&mut self, roadmap: &Roadmap, seen: &mut HashSet<Edge>) {
+    fn project_roadmap_edges(&mut self, roadmap: &Roadmap, seen: &mut HashSet<EdgeKey>) {
         for edge in roadmap.all_edges() {
             let source = match EntityRef::parse(&edge.from) {
                 Ok(r) => r,
@@ -477,7 +489,7 @@ impl EdgeIndex {
         }
     }
 
-    fn project_tantivy_edges(&mut self, docs: &[EdgeProjectionDoc], seen: &mut HashSet<Edge>) {
+    fn project_tantivy_edges(&mut self, docs: &[EdgeProjectionDoc], seen: &mut HashSet<EdgeKey>) {
         let mut by_file: HashMap<String, Vec<&EdgeProjectionDoc>> = HashMap::new();
         for doc in docs {
             if doc.doc_type == "transcript" && !doc.session_id.is_empty() {
@@ -551,7 +563,7 @@ impl EdgeIndex {
         &mut self,
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
-        seen: &mut HashSet<Edge>,
+        seen: &mut HashSet<EdgeKey>,
     ) {
         let managed_derived_dir = managed_derived_edges_dir(edges_dir);
         let projects_with_managed = scan_managed_derived_project_ids(&managed_derived_dir);
@@ -594,7 +606,7 @@ impl EdgeIndex {
         &mut self,
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
-        seen: &mut HashSet<Edge>,
+        seen: &mut HashSet<EdgeKey>,
         skip_derived_for: &HashSet<String>,
     ) {
         let Ok(entries) = fs::read_dir(edges_dir) else {
@@ -619,7 +631,7 @@ impl EdgeIndex {
     fn project_sidecar_edges_file(
         &mut self,
         path: &Path,
-        seen: &mut HashSet<Edge>,
+        seen: &mut HashSet<EdgeKey>,
         skip_derived: bool,
     ) {
         let Ok(file) = fs::File::open(path) else {
@@ -645,7 +657,7 @@ impl EdgeIndex {
         }
     }
 
-    fn insert_sidecar_edge(&mut self, edge: Edge, seen: &mut HashSet<Edge>) {
+    fn insert_sidecar_edge(&mut self, edge: Edge, seen: &mut HashSet<EdgeKey>) {
         let derived = derived_tool_projection(&edge);
         self.insert(edge, seen);
         if let Some(edge) = derived {
@@ -653,7 +665,7 @@ impl EdgeIndex {
         }
     }
 
-    fn load_manifest_active_paths(&mut self, paths: &[PathBuf], seen: &mut HashSet<Edge>) {
+    fn load_manifest_active_paths(&mut self, paths: &[PathBuf], seen: &mut HashSet<EdgeKey>) {
         for path in paths {
             self.project_sidecar_edges_file(path, seen, false);
         }
@@ -663,7 +675,7 @@ impl EdgeIndex {
         &mut self,
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
-        seen: &mut HashSet<Edge>,
+        seen: &mut HashSet<EdgeKey>,
     ) {
         let explicit_dir = edges_dir.join("explicit");
         let observed_dir = edges_dir.join("observed");
