@@ -201,3 +201,105 @@ pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
         }
     }
 }
+
+impl orchestration::agents::adapter::AgentDispatchAdapter for BadgeyAgentAdapter {
+    fn name(&self) -> &'static str {
+        "badgey"
+    }
+
+    fn dispatch(
+        &self,
+        _manifest: &orchestration::agents::types::AgentManifest,
+        args: Value,
+        ctx: orchestration::agents::adapter::DispatchContext,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<
+                        orchestration::agents::adapter::AgentDispatchResult,
+                        orchestration::agents::adapter::AgentDispatchError,
+                    >,
+                > + Send
+                + '_,
+        >,
+    > {
+        let state = self.state.clone();
+        Box::pin(async move {
+            use orchestration::agents::adapter::{
+                AgentDispatchError, AgentDispatchResult, DispatchDegraded,
+            };
+            use orchestration::agents::types::{AgentRef, AgentSession, MergedFilters};
+
+            let server = BlackboxServer::new(state);
+            let project_dir = args
+                .get("project_dir")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or(ctx.project_dir);
+            let result = if let Some(badgey_id) = args.get("badgey_id").and_then(Value::as_str) {
+                let prompt = args
+                    .get("prompt")
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if prompt.trim().is_empty() {
+                    return Err(AgentDispatchError::BadInput {
+                        message: "badgey adapter resume requires args.prompt or args.question"
+                            .to_string(),
+                    });
+                }
+                server
+                    .badgey_resume_internal(badgey_id, prompt, None)
+                    .await
+                    .map_err(|message| AgentDispatchError::AdapterFailed { message })?
+            } else {
+                let brief = args
+                    .get("brief")
+                    .or_else(|| args.get("prompt"))
+                    .or_else(|| args.get("question"))
+                    .and_then(Value::as_str)
+                    .map(String::from);
+                server
+                    .badgey_exec_internal(project_dir.clone(), brief, ctx.bro_label_prefix.clone())
+                    .await
+                    .map_err(|message| AgentDispatchError::AdapterFailed { message })?
+            };
+            let session_id = result
+                .get("session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let provider = result
+                .get("provider")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown")
+                .to_string();
+            let task_id = result
+                .get("task_id")
+                .and_then(Value::as_str)
+                .map(String::from);
+            let degraded = result.get("degraded").map(|_| DispatchDegraded {
+                reasons: vec!["badgey reported degraded status".to_string()],
+            });
+            let merged_filters = result
+                .get("merged_filters")
+                .and_then(|value| serde_json::from_value::<MergedFilters>(value.clone()).ok())
+                .unwrap_or_default();
+            Ok(AgentDispatchResult {
+                session: AgentSession {
+                    session_id,
+                    provider,
+                    project_dir,
+                    agent: AgentRef {
+                        name: "badgey".to_string(),
+                        version: 1,
+                    },
+                    task_id,
+                },
+                resolved_brofile: Some("badgey-persona".to_string()),
+                merged_filters,
+                degraded,
+            })
+        })
+    }
+}

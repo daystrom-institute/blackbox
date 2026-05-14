@@ -143,7 +143,7 @@ pub fn resolve_entity_template(entity: &Value, raw: &Value) -> Value {
             }
             let is_whole = trimmed.starts_with("${")
                 && trimmed.ends_with('}')
-                && find_close_brace(trimmed, 2) == Some(trimmed.len() - 1);
+                && find_template_close_brace(trimmed, 2) == Some(trimmed.len() - 1);
             if is_whole {
                 let expr = &trimmed[2..trimmed.len() - 1];
                 resolve_one(entity, expr).unwrap_or_else(|| raw.clone())
@@ -197,7 +197,7 @@ fn render_string(entity: &Value, template: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
-            if let Some(close) = find_close_brace(template, i + 2) {
+            if let Some(close) = find_template_close_brace(template, i + 2) {
                 let expr = &template[i + 2..close];
                 match resolve_one(entity, expr) {
                     Some(Value::String(s)) => out.push_str(&s),
@@ -219,7 +219,7 @@ fn render_string(entity: &Value, template: &str) -> String {
     out
 }
 
-fn find_close_brace(s: &str, start: usize) -> Option<usize> {
+fn find_template_close_brace(s: &str, start: usize) -> Option<usize> {
     let bytes = s.as_bytes();
     let mut i = start;
     while i < bytes.len() {

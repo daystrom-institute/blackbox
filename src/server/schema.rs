@@ -1,0 +1,93 @@
+use crate::*;
+
+impl BlackboxServer {
+    pub(crate) fn describe_schema_counts(&self) -> BTreeMap<String, usize> {
+        let mut counts = match self.state.edge_index.try_read() {
+            Some(edge_index) => edge_index.entity_type_counts_active(),
+            None => {
+                tracing::warn!(
+                    target: "blackbox::tool",
+                    tool = "bbox_describe_schema",
+                    "EdgeIndex is busy; returning schema with store-backed counts only"
+                );
+                BTreeMap::new()
+            }
+        };
+        counts.insert("knowledge".into(), self.state.kb.read().all_entries().len());
+        counts.insert("thread".into(), self.state.threads.read().all().len());
+        counts.insert("note".into(), self.state.notes.read().all().len());
+        counts.insert("whiteboard".into(), self.state.whiteboards.list_ids().len());
+        // Brofile and agent vertices live in the artifact catalog. They
+        // don't naturally appear in EdgeIndex entity counts until a
+        // DERIVED_FROM / SUPERSEDES edge points at them; until that
+        // wire-up matures (design/agent-system.md §8.1), seed the
+        // counts directly from the catalog so describe_schema reflects
+        // installed artifacts.
+        let Some(catalog) = self.state.artifacts.try_read() else {
+            tracing::warn!(
+                target: "blackbox::tool",
+                tool = "bbox_describe_schema",
+                "artifact catalog is busy; omitting brofile/agent counts"
+            );
+            return counts;
+        };
+        for (kind, key) in [
+            (artifacts::ArtifactKind::Brofile, "brofile"),
+            (artifacts::ArtifactKind::Agent, "agent"),
+        ] {
+            let params = artifacts::ArtifactListParams {
+                kind: Some(kind),
+                name: None,
+                include_superseded: false,
+            };
+            if let Ok(entries) = catalog.list(&params) {
+                let active = entries.iter().filter(|e| e.active).count();
+                counts.insert(key.into(), active);
+            }
+        }
+        counts
+    }
+
+    pub(crate) fn build_agent_schema_entries(
+        &self,
+    ) -> Vec<mcp_tools::describe_schema::AgentSchemaEntry> {
+        use orchestration::agents::registry::AgentRegistry;
+        let Some(catalog) = self.state.artifacts.try_read() else {
+            tracing::warn!(
+                target: "blackbox::tool",
+                tool = "bbox_describe_schema",
+                "artifact catalog is busy; omitting installed-agent details"
+            );
+            return Vec::new();
+        };
+        let registry = AgentRegistry::new(&catalog);
+        let filter = orchestration::agents::registry::ListFilter::default();
+        let Ok(summaries) = registry.list(&filter) else {
+            return Vec::new();
+        };
+        summaries
+            .into_iter()
+            .filter(|s| s.active)
+            .filter_map(|s| {
+                let (manifest, _) = registry.load_manifest_degraded(&s.name);
+                let manifest = manifest?;
+                let cost_str = match manifest.cost_class {
+                    orchestration::agents::types::AgentCostClass::Cheap => "cheap",
+                    orchestration::agents::types::AgentCostClass::Normal => "normal",
+                    orchestration::agents::types::AgentCostClass::Expensive => "expensive",
+                };
+                let example = format!("bro_agent_dispatch(agent=\"{}\", args={{...}})", s.name);
+                Some(mcp_tools::describe_schema::AgentSchemaEntry {
+                    name: s.name,
+                    version: s.version,
+                    description: manifest.description,
+                    when_to_use: manifest.when_to_use,
+                    anti_patterns: manifest.anti_patterns,
+                    cost_class: cost_str.to_string(),
+                    dispatch_adapter: manifest.dispatch_adapter,
+                    example_invocation: example,
+                })
+            })
+            .collect()
+    }
+}
