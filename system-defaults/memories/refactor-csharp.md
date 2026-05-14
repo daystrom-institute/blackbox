@@ -1,3 +1,9 @@
++++
+title = "C# refactor mechanization — tree-sitter inventory and Roslyn validation workflow"
+tags = ["refactor", "refactoring", "mechanization", "restructure", "csharp", "c#", "cs", "roslyn", "omnisharp", "tree-sitter", "bbox_refactor_status", "symbol", "rename", "move", "extract", "dotnet"]
+order = 10
+template = false
++++
 # C# Refactor Mechanization Runbook
 
 Use this memory before operating on C# files with blackbox refactor tools.

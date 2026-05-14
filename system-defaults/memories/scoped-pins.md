@@ -1,3 +1,9 @@
++++
+title = "Scoped pins — hot context for one active execution lane"
+tags = ["pin", "pins", "scoped", "ambient", "session", "bro", "thread", "work_item", "active-arc", "runbook"]
+order = 4
+template = false
++++
 # Scoped pins — hot context for one active execution lane
 
 `bbox_pin` is for context that should stay hot across turns without becoming standing repo policy.

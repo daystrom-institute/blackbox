@@ -1,3 +1,9 @@
++++
+title = "Design packets — rank proposals against shared criteria"
+tags = ["packets", "design", "iteration", "ensemble", "proposals", "blocker", "concern", "classification", "domain", "runbook", "rank-proposals", "evaluate-proposals", "compare-proposals", "score", "rubric", "evaluator", "tradeoff", "which-should-we-pick", "decision", "mechanism"]
+order = 23
+template = false
++++
 # Design packets — ensemble design-iteration via rule-packets
 
 A design packet encodes the criteria for evaluating DESIGN PROPOSALS against a shared set of standards. The workflow is specifically orchestrator-led ensemble iteration: bros propose design variants, each proposal becomes an entity, the packet classifies each proposal against the criteria, the orchestrator sorts by verdict profile.

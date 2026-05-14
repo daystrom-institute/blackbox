@@ -234,6 +234,8 @@ struct RawTranscriptConfig {
 struct RawPathsConfig {
     pub state_dir: Option<PathBuf>,
     pub bro_home: Option<PathBuf>,
+    pub defaults_dir: Option<PathBuf>,
+    pub memory_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -281,6 +283,8 @@ pub struct ResolvedPathConfig {
     pub global_claude_md: PathBuf,
     pub global_codex_md: PathBuf,
     pub global_gemini_md: PathBuf,
+    pub defaults_memories_dir: PathBuf,
+    pub user_memories_dir: Option<PathBuf>,
 }
 
 /// Daemon configuration (final resolved values)
@@ -411,6 +415,8 @@ impl Config {
             paths: RawPathsConfig {
                 state_dir: Some(util::blackbox_state_dir(home)),
                 bro_home: None,
+                defaults_dir: None,
+                memory_dir: None,
             },
             roadmap: RawRoadmapConfig {
                 write_path: None,
@@ -624,7 +630,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
     raw = apply_flag_overrides(raw, options.flag_overrides);
 
     // Resolve paths
-    let paths = resolve_paths(&raw, &home)?;
+    let paths = resolve_paths(&raw, &home, config_path.as_deref())?;
 
     // Build final config
     Ok(Config {
@@ -814,7 +820,11 @@ fn expand_tilde(s: &str, home: &Path) -> Result<PathBuf> {
 }
 
 /// Resolve all path configurations from raw inputs and home directory.
-fn resolve_paths(raw: &RawConfig, home: &Path) -> Result<ResolvedPathConfig> {
+fn resolve_paths(
+    raw: &RawConfig,
+    home: &Path,
+    config_path: Option<&Path>,
+) -> Result<ResolvedPathConfig> {
     // Start with state_dir from config or default
     let state_dir = raw
         .paths
@@ -929,6 +939,50 @@ fn resolve_paths(raw: &RawConfig, home: &Path) -> Result<ResolvedPathConfig> {
         .map(PathBuf::from)
         .unwrap_or_else(|| home_path.join(".gemini").join("GEMINI.md"));
 
+    // defaults_memories_dir: 4-tier resolution
+    //   1. BLACKBOX_DEFAULTS_DIR env var → $VAR/memories
+    //   2. [paths].defaults_dir config field → $FIELD/memories
+    //   3. <exe_dir>/../share/blackbox/memories (installed binary layout)
+    //   4. CARGO_MANIFEST_DIR/system-defaults/memories (dev fallback)
+    let defaults_memories_dir = if let Ok(env) = std::env::var("BLACKBOX_DEFAULTS_DIR")
+        && !env.trim().is_empty()
+    {
+        PathBuf::from(env).join("memories")
+    } else if let Some(ref d) = raw.paths.defaults_dir {
+        expand_tilde(&d.to_string_lossy(), home)?.join("memories")
+    } else if let Ok(exe) = std::env::current_exe() {
+        let exe_relative = exe
+            .parent()
+            .and_then(|bin| bin.parent())
+            .map(|prefix| prefix.join("share").join("blackbox").join("memories"));
+        match exe_relative {
+            Some(p) if p.exists() => p,
+            _ => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("system-defaults")
+                .join("memories"),
+        }
+    } else {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("system-defaults")
+            .join("memories")
+    };
+
+    // user_memories_dir: 3-tier resolution, None when config path is unavailable
+    //   1. BLACKBOX_MEMORY_DIR env var
+    //   2. [paths].memory_dir config field
+    //   3. <config_dir>/memories derived from active config.toml path
+    let user_memories_dir = if let Ok(env) = std::env::var("BLACKBOX_MEMORY_DIR")
+        && !env.trim().is_empty()
+    {
+        Some(PathBuf::from(env))
+    } else if let Some(ref m) = raw.paths.memory_dir {
+        Some(expand_tilde(&m.to_string_lossy(), home)?)
+    } else {
+        config_path
+            .and_then(|p| p.parent())
+            .map(|config_dir| config_dir.join("memories"))
+    };
+
     Ok(ResolvedPathConfig {
         state_dir,
         knowledge_path,
@@ -946,6 +1000,8 @@ fn resolve_paths(raw: &RawConfig, home: &Path) -> Result<ResolvedPathConfig> {
         global_claude_md,
         global_codex_md,
         global_gemini_md,
+        defaults_memories_dir,
+        user_memories_dir,
     })
 }
 
@@ -1591,6 +1647,185 @@ port = 8000
         unsafe {
             env::remove_var("BRO_STORE");
         }
+    }
+
+    #[test]
+    fn defaults_memories_dir_from_env() {
+        let _guard = crate::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe { env::set_var("HOME", home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BLACKBOX_CONFIG") };
+        unsafe { env::remove_var("BBOX_PORT") };
+
+        let custom_defaults = dir.path().join("my-defaults");
+        unsafe { env::set_var("BLACKBOX_DEFAULTS_DIR", &custom_defaults) };
+
+        let config = load().unwrap();
+        assert_eq!(
+            config.paths.defaults_memories_dir,
+            custom_defaults.join("memories")
+        );
+
+        unsafe { env::remove_var("BLACKBOX_DEFAULTS_DIR") };
+    }
+
+    #[test]
+    fn defaults_memories_dir_dev_fallback() {
+        let _guard = crate::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe { env::set_var("HOME", home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BLACKBOX_CONFIG") };
+        unsafe { env::remove_var("BBOX_PORT") };
+        unsafe { env::remove_var("BLACKBOX_DEFAULTS_DIR") };
+
+        let config = load().unwrap();
+        // Should resolve to something ending in system-defaults/memories (dev fallback)
+        // or <exe>/../share/blackbox/memories (install layout).
+        let resolved = config.paths.defaults_memories_dir.to_string_lossy();
+        assert!(
+            resolved.ends_with("system-defaults/memories")
+                || resolved.ends_with("share/blackbox/memories"),
+            "unexpected defaults_memories_dir: {resolved}"
+        );
+    }
+
+    #[test]
+    fn defaults_memories_dir_from_config_field_expands_tilde() {
+        let _guard = crate::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe { env::set_var("HOME", home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BLACKBOX_DEFAULTS_DIR") };
+        unsafe { env::remove_var("BLACKBOX_MEMORY_DIR") };
+        unsafe { env::remove_var("BBOX_PORT") };
+
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "[paths]\ndefaults_dir = \"~/defaults\"\n").unwrap();
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &config_path.to_string_lossy().into_owned(),
+            )
+        };
+
+        let config = load().unwrap();
+        assert_eq!(
+            config.paths.defaults_memories_dir,
+            home.join("defaults").join("memories")
+        );
+    }
+
+    #[test]
+    fn user_memories_dir_derived_from_config_path() {
+        let _guard = crate::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe { env::set_var("HOME", home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BLACKBOX_MEMORY_DIR") };
+        unsafe { env::remove_var("BBOX_PORT") };
+
+        // Write a config file at a known path so config_path is set.
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "[daemon]\n").unwrap();
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &config_path.to_string_lossy().into_owned(),
+            )
+        };
+
+        let config = load().unwrap();
+        assert_eq!(
+            config.paths.user_memories_dir,
+            Some(config_dir.join("memories")),
+            "user_memories_dir should be derived from config file's parent directory"
+        );
+    }
+
+    #[test]
+    fn user_memories_dir_from_env_wins_over_config_path() {
+        let _guard = crate::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe { env::set_var("HOME", home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BBOX_PORT") };
+
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "[daemon]\n").unwrap();
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &config_path.to_string_lossy().into_owned(),
+            )
+        };
+
+        let custom_overlay = dir.path().join("custom-overlay");
+        unsafe { env::set_var("BLACKBOX_MEMORY_DIR", &custom_overlay) };
+
+        let config = load().unwrap();
+        assert_eq!(config.paths.user_memories_dir, Some(custom_overlay));
+
+        unsafe { env::remove_var("BLACKBOX_MEMORY_DIR") };
+    }
+
+    #[test]
+    fn user_memories_dir_from_config_field_expands_tilde() {
+        let _guard = crate::util::test_env_lock();
+
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        unsafe { env::set_var("HOME", home) };
+        unsafe { env::set_var("XDG_CONFIG_HOME", home.join(".config")) };
+        unsafe { env::set_var("XDG_DATA_HOME", home.join(".local/share")) };
+        unsafe { env::set_var("XDG_STATE_HOME", home.join(".local/state")) };
+        unsafe { env::remove_var("BLACKBOX_DEFAULTS_DIR") };
+        unsafe { env::remove_var("BLACKBOX_MEMORY_DIR") };
+        unsafe { env::remove_var("BBOX_PORT") };
+
+        let config_dir = home.join(".config").join("blackbox");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let config_path = config_dir.join("config.toml");
+        std::fs::write(&config_path, "[paths]\nmemory_dir = \"~/memory-overlay\"\n").unwrap();
+        unsafe {
+            env::set_var(
+                "BLACKBOX_CONFIG",
+                &config_path.to_string_lossy().into_owned(),
+            )
+        };
+
+        let config = load().unwrap();
+        assert_eq!(
+            config.paths.user_memories_dir,
+            Some(home.join("memory-overlay"))
+        );
     }
 
     #[test]

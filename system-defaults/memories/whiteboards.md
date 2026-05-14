@@ -1,3 +1,9 @@
++++
+title = "Whiteboards — multi-agent deliberation boards"
+tags = ["whiteboard", "whiteboards", "deliberation", "multi-agent", "phase", "phases", "blind", "validate", "debate", "resolve", "facilitator", "claims", "concerns", "votes", "annotations", "workflow", "runbook"]
+order = 25
+template = false
++++
 # Whiteboards — multi-agent deliberation boards
 
 Whiteboards are the shared deliberation surface for agents participating in a workflow or an external review. They are not a replacement for `bbox_thread`; use threads for durable work-item state and whiteboards for phase-based claims, challenges, corroboration, validation, and votes during a deliberation.

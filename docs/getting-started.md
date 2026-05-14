@@ -21,6 +21,8 @@ install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro       ~/.local/bin/bro
 install -m 755 target/release/bro-slack ~/.local/bin/bro-slack
 install -m 755 target/release/bro-irc   ~/.local/bin/bro-irc
+install -d ~/.local/share/blackbox/memories
+cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 ```
 
 ## 2. Run `blackboxd` as a systemd user service

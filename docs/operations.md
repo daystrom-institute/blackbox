@@ -68,7 +68,7 @@ repos. Don't waste backup space on them.
 ~/.local/bin/bro
 ```
 
-Built from source: `cargo build --release && install -m 755 target/release/{blackboxd,bro} ~/.local/bin/`.
+Built from source: `cargo build --release && install -m 755 target/release/{blackboxd,bro} ~/.local/bin/ && install -d ~/.local/share/blackbox/memories && cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/`.
 
 ## Configuration
 
@@ -157,7 +157,8 @@ old inode until systemd restarts it.
 │   ├── blackboxd-dev           # dev daemon binary
 │   └── bro                     # terminal TUI client
 ├── share/blackbox/
-│   └── index/                  # Tantivy index + schema_version.txt  ← REBUILD
+│   ├── index/                  # Tantivy index + schema_version.txt  ← REBUILD
+│   └── memories/               # Shipped system memories and runbooks ← REBUILD
 └── state/blackbox/
     ├── blackbox-knowledge.json  ← PROTECT
     ├── blackbox-notes.json      ← PROTECT
@@ -218,6 +219,8 @@ cargo build --release
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro ~/.local/bin/bro
+install -d ~/.local/share/blackbox/memories
+cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 systemctl --user restart blackbox.service blackbox-dev.service
 ```
 

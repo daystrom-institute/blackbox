@@ -1,3 +1,9 @@
++++
+title = "Persistence taxonomy — learn vs remember vs decide vs note"
+tags = ["persistence", "taxonomy", "learn", "remember", "decide", "note", "memory", "runbook"]
+order = 3
+template = false
++++
 # Persistence taxonomy — learn vs remember vs decide vs note
 
 Use the persistence layer that matches the durability, audience, and speaker of the information. Most confusion here comes from mixing up "what the user told us," "what should stay hot for the current arc," and "what I observed while working."

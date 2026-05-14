@@ -36,6 +36,8 @@ cargo build --release
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro       ~/.local/bin/bro
+install -d ~/.local/share/blackbox/memories
+cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 ```
 
 ### 2. Run `blackboxd` as a systemd user service

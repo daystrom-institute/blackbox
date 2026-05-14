@@ -1,3 +1,9 @@
++++
+title = "Review packets — reusable judge from example PRs/changes"
+tags = ["packets", "review", "code-review", "classification", "lattice", "domain", "runbook", "pr-review", "pr-triage", "judge", "rubric", "mechanism", "evaluator", "triage", "accept-reject-flag", "change-quality", "decision"]
+order = 21
+template = false
++++
 # Review packets — code review via rule-packets
 
 A review packet encodes "what good looks like" for a change as a set of rules. Apply the packet in `mode="all"` to a feature entity and the packet produces a list of findings + an aggregate verdict. The packet's rules ARE the review criteria — making them inspectable, mergeable, and mechanically re-runnable.

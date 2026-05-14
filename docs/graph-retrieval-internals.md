@@ -171,7 +171,7 @@ and uses MCP tools.
 
 ## System memories
 
-The detailed agent runbooks are code-embedded memories fetched on
+The detailed agent runbooks are runtime-loaded system memories fetched on
 demand:
 
 ```text

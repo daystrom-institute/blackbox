@@ -1,3 +1,9 @@
++++
+title = "Auth packets — compress an access table into a reusable policy"
+tags = ["packets", "auth", "authorization", "allow", "deny", "classification", "domain", "runbook", "access-control", "access-table", "permissions", "rbac", "policy", "role", "resource", "mechanism", "decide-at-request-time", "compress-matrix"]
+order = 22
+template = false
++++
 # Auth packets — authorization matrices via rule-packets
 
 An auth packet encodes an authorization policy: given a `(role, method, resource)` tuple (or similar subject × action × object triple), the packet returns ALLOW or DENY. Apply in `mode="first"` — authorization is classification, not multi-finding.

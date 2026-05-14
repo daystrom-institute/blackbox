@@ -1,3 +1,9 @@
++++
+title = "Workflow orchestration — mermaid-shaped arcs dispatched by the daemon"
+tags = ["workflow", "workflows", "orchestrate", "orchestration", "arc", "arcs", "mermaid", "state-diagram", "runbook", "protocol", "state-machine", "phase", "phases", "multi-phase", "pipeline", "sequencer", "choreography", "process", "loop", "crucible", "overmind", "gate", "gates", "choice", "fork", "late-inject", "late_inject", "fire-and-forget", "subworkflow", "compose", "composition", "arc-thread", "compaction-anchor", "policy-packet", "advisor-as-packet", "branch", "branching", "retry", "retry-loop", "back-edge", "back-edges", "dispatch-workflow", "bro-orchestrate", "bro_orchestrate"]
+order = 24
+template = false
++++
 # Workflow orchestration — JSON arcs dispatched by the daemon
 
 The workflow engine lets you describe a protocol between actors — executor, ensemble, advisor, user — as a JSON spec where each node carries a typed `next` transition (`goto` / `branch` / `fork` / `terminal`), and the daemon walks the transitions deterministically. The LLM stops cosplaying a state machine; the daemon owns the loop.

@@ -45,6 +45,8 @@ cargo build --release
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
 install -m 755 target/release/bro ~/.local/bin/bro
+install -d ~/.local/share/blackbox/memories
+cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 systemctl --user restart blackbox.service
 ```
 
@@ -342,6 +344,7 @@ secrets, replay), see [System events](system-events.md).
 | `~/.config/systemd/user/blackbox.service` | Prod systemd unit |
 | `~/.config/systemd/user/blackbox.service.d/*.conf` | Drop-in env and secrets |
 | `~/.local/share/blackbox/index/` | Rebuildable Tantivy index |
+| `~/.local/share/blackbox/memories/` | Shipped system memories and runbooks |
 | `~/.local/state/blackbox/vectors/` | Rebuildable vector partitions |
 | `~/.local/state/blackbox/edges/` | Rebuildable graph sidecars |
 | `~/.local/state/blackbox/git_meta/` | Rebuildable git fingerprints |

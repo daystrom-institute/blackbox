@@ -84,6 +84,8 @@ Install templates at `deploy/blackbox.service` and `deploy/blackbox-dev.service`
 ```bash
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
 install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
+install -d ~/.local/share/blackbox/memories
+cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 cp deploy/blackbox.service ~/.config/systemd/user/
 cp deploy/blackbox-dev.service ~/.config/systemd/user/
 systemctl --user daemon-reload

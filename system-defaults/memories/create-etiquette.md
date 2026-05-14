@@ -1,3 +1,9 @@
++++
+title = "Create etiquette — list before create"
+tags = ["create", "dedupe", "list", "knowledge", "threads", "bro", "runbook"]
+order = 6
+template = false
++++
 # Create etiquette — list before create
 
 Duplication bugs in Blackbox are usually not parser bugs. They are workflow bugs: creating new objects without checking whether the object already exists in a slightly different spelling or scope.

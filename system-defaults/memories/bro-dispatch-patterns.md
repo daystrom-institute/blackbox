@@ -1,3 +1,9 @@
++++
+title = "Bro dispatch patterns — exec, resume, wait, race, deliberate"
+tags = ["bro", "dispatch", "resume", "wait", "orchestration", "patterns", "runbook"]
+order = 5
+template = false
++++
 # Bro dispatch patterns — exec, resume, wait, race, deliberate
 
 The orchestration surface is small, but the workflow shapes are different enough that putting all of them inline in tool docs bloats hot context. This runbook is the compact mental model.

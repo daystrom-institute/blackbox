@@ -17,7 +17,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         // Load the runbook + a reference example.
         let runbook = match system_memory::get("sm-workflow-orchestration") {
-            Some(sm) => sm.content,
+            Some(sm) => sm.content.as_str(),
             None => {
                 return Self::err_text(
                     "sm-workflow-orchestration runbook not found — internal error",

@@ -1,3 +1,9 @@
++++
+title = "Go refactor mechanization — tree-sitter inventory and gopls validation workflow"
+tags = ["refactor", "refactoring", "mechanization", "restructure", "go", "golang", "gopls", "gofmt", "goimports", "go-test", "tree-sitter", "bbox_refactor_status", "symbol", "rename", "move", "extract"]
+order = 15
+template = false
++++
 # Go Refactor Mechanization Runbook
 
 Use this memory before operating on Go files with blackbox refactor tools.

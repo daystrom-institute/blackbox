@@ -23,6 +23,7 @@ bbox_compile(path="system-defaults/mcp-surfaces/routing.json", scope="global")
 | `agents/` | Legacy registered-agent manifests and agent-composition workflows kept for compatibility. Prefer atoms for new public capabilities. |
 | `brofiles/` | Personas used by default atoms and legacy agents. |
 | `badgey/` | Badgey manifests, brofiles, workflows, packets, and crons. |
+| `memories/` | System-level memories and runbooks. Files use bare slugs such as `rule-packets.md`; runtime IDs use the `sm-` prefix. These are loaded by the daemon at runtime to provide specialized expert guidance. |
 | `agentic-corpus/` | Producer-side knowledge/index maintenance workflows, packets, brofiles, and crons. |
 | `maintenance/` | Cross-store maintenance workflows, packets, and crons such as daily compaction. |
 | `mcp-surfaces/` | Default MCP surface routing packet. |

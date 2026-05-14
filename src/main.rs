@@ -382,6 +382,24 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("Tool reference sync failed: {e:#}"),
     }
 
+    // Load system memory catalog from disk before SharedState construction.
+    // Fails closed if the defaults directory is missing or any file is malformed.
+    {
+        let memory_ctx = serde_json::json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "mcp_name": &cfg.daemon.mcp_name,
+        });
+        system_memory::init(
+            &cfg.paths.defaults_memories_dir,
+            cfg.paths.user_memories_dir.as_deref(),
+            &memory_ctx,
+        )?;
+        tracing::info!(
+            "System memory catalog loaded from {}",
+            cfg.paths.defaults_memories_dir.display()
+        );
+    }
+
     let bbox_url = dispatch_mcp_url(&cfg.daemon.bind, cfg.daemon.port);
     let bbox_mcp_name = cfg.daemon.mcp_name.clone();
     // Export for provider arg-builders so they can inject `--mcp-config`

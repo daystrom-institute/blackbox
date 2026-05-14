@@ -1,3 +1,9 @@
++++
+title = "Render lifecycle — render, absorb, review, lint"
+tags = ["render", "absorb", "review", "lint", "knowledge", "lifecycle", "runbook"]
+order = 20
+template = false
++++
 # Render lifecycle — render, absorb, review, lint
 
 The render path is easy to misuse because the verbs are adjacent in the UI but operate on different parts of the lifecycle.

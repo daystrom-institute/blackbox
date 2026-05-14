@@ -1,3 +1,9 @@
++++
+title = "Transcript retrieval — search, cite, context, session, messages"
+tags = ["transcripts", "search", "cite", "context", "session", "messages", "retrieval", "runbook"]
+order = 19
+template = false
++++
 # Transcript retrieval — search, cite, context, session, messages
 
 The transcript tools are individually simple, but agents often need the same multi-step workflow:

@@ -1,3 +1,9 @@
++++
+title = "Atoms — public reusable capability contracts"
+tags = ["atoms", "atom", "atom_search", "atom_describe", "atom_invoke", "atom_status", "atom_resume", "atom_delegate", "atom_bindings", "capability", "contract", "manifest", "effects", "composition", "profile", "workflow-backed", "deterministic", "adapter", "refactor/v1"]
+order = 1
+template = false
++++
 # Atoms — Public Reusable Capability Contracts
 
 Use this memory when you are choosing, invoking, authoring, or debugging atoms.

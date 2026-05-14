@@ -1,3 +1,9 @@
++++
+title = "Java extract_java_class — composite class extraction, capture analysis, FIXME catalog"
+tags = ["refactor", "refactoring", "mechanization", "java", "extract", "extract_java_class", "extract_java_methods", "move_java_fields", "move_java_constant", "add_java_fields", "add_java_constructor", "add_java_delegate_field", "rewrite_java_calls_to_delegate", "tree-sitter", "bbox_refactor_plan", "bbox_refactor_apply", "capture-analysis", "captured_variables", "callback_externals", "wiring_mode", "source_delegate_wrappers", "propagate_class_annotations", "rewrite_remaining_accessors", "deep_analysis", "external_calls", "inherited_dependencies", "remaining_source_accessors", "remaining_source_constant_refs", "FIXME", "delegate", "validation_failed", "mutable_capture_with_write", "method_overload_ambiguous", "guice_field_inject"]
+order = 13
+template = false
++++
 # Java `extract_java_class` — Composite Class Extraction
 
 Use this memory when planning `extract_java_class` runs. The plan kind

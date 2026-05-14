@@ -1,3 +1,9 @@
++++
+title = "Java lombokify_java_class — hand-rolled POJO boilerplate to Lombok annotations"
+tags = ["refactor", "refactoring", "mechanization", "java", "lombok", "lombokify", "lombokify_java_class", "POJO", "tree-sitter", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "@Data", "@Value", "@Getter", "@Setter", "@EqualsAndHashCode", "@ToString", "@Slf4j", "@NoArgsConstructor", "@AllArgsConstructor", "@RequiredArgsConstructor", "boolean_getter_strategy", "ToStringBuilder", "EqualsBuilder", "HashCodeBuilder", "bulk_mode", "output_path", "annotation-processor"]
+order = 14
+template = false
++++
 # Java Lombokify — Hand-Rolled POJO Boilerplate to Lombok Annotations
 
 Use this memory when planning `lombokify_java_class` runs. The plan kind

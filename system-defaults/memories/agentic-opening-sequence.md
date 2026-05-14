@@ -1,3 +1,9 @@
++++
+title = "Agentic opening sequence — orient, search, inspect, traverse, answer"
+tags = ["opening", "opening-sequence", "grounding", "first-step", "first-loop", "agentic", "agentic-tools", "discover", "discover-seed", "inspect", "inspect-entity", "find-paths", "bundle-evidence", "bundle", "describe-schema", "where", "what", "why", "who", "how", "when", "trace", "chain", "blast-radius", "impact", "lineage", "history", "provenance", "navigate", "search-quality", "graph-walk", "answer-protocol", "verification", "self-check", "answer"]
+order = 0
+template = false
++++
 # Agentic opening sequence — orient, search, inspect, traverse, answer
 
 This is the **default first-loop pattern** for any task that touches the

@@ -1,3 +1,9 @@
++++
+title = "Rule-packets — compile a reusable mechanism from examples"
+tags = ["packets", "rule-packets", "compile", "apply", "audit", "review", "procedure", "runbook", "mechanism", "evaluator", "judge", "rubric", "classifier", "classify", "decision-function", "examples-to-rules", "reusable", "derive"]
+order = 2
+template = false
++++
 # Rule-packets — compile a reusable mechanism from examples
 
 **If your task looks like this, compile a packet:**

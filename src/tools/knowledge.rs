@@ -6,16 +6,32 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
-    p.category.is_some()
-        || p.scope.is_some()
+    p.scope.is_some()
         || p.project.is_some()
         || p.provider.is_some()
         || p.status.is_some()
         || p.approval.is_some()
 }
 
+fn matches_system_memory_catalog(category: Option<&str>) -> bool {
+    matches!(
+        category,
+        Some("system_memory") | Some("system-memory") | Some("system_memories")
+    )
+}
+
+fn format_system_memory_catalog(query: Option<&str>) -> String {
+    system_memory::format_catalog_summary(query)
+}
+
 fn exact_system_memory_response(p: &KnowledgeListParams) -> Option<String> {
     if has_runtime_knowledge_filter(p) {
+        return None;
+    }
+    if matches_system_memory_catalog(p.category.as_deref()) {
+        return Some(format_system_memory_catalog(p.query.as_deref()));
+    }
+    if p.category.is_some() {
         return None;
     }
     let memory = system_memory::exact_query(p.query.as_deref())?;
@@ -122,7 +138,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (code-embedded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. For structured packet discovery + filtering, use bbox_packet_list."
+        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (file-loaded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. Pass `category=\"system_memory\"` to list all system memories (metadata only). For structured packet discovery + filtering, use bbox_packet_list."
     )]
     pub(crate) fn bbox_knowledge(
         &self,
@@ -182,9 +198,9 @@ impl BlackboxServer {
                 );
             }
 
-            // Also surface matching code-embedded memories. See
-            // src/system_memory/ — these are static runbooks baked into the
-            // binary via include_str!, queryable but never rendered.
+            // Also surface matching system memories. See
+            // system-defaults/memories/ — these are file-loaded runbooks
+            // read at startup, queryable but never rendered.
             let memories = system_memory::search(p.query.as_deref());
             if !memories.is_empty() {
                 if !combined.ends_with('\n') {
@@ -231,8 +247,13 @@ impl BlackboxServer {
 mod tests {
     use super::*;
 
+    fn init_system_memory() {
+        system_memory::init_for_tests();
+    }
+
     #[test]
     fn exact_system_memory_response_returns_only_exact_memory() {
+        init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
             query: Some("sm-refactor".into()),
             ..Default::default()
@@ -247,12 +268,70 @@ mod tests {
 
     #[test]
     fn exact_system_memory_response_respects_runtime_filters() {
+        init_system_memory();
         let out = exact_system_memory_response(&KnowledgeListParams {
-            category: Some("tool".into()),
+            scope: Some("project".into()),
             query: Some("sm-refactor".into()),
             ..Default::default()
         });
 
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn system_memory_catalog_returns_all_memories() {
+        init_system_memory();
+        let out = exact_system_memory_response(&KnowledgeListParams {
+            category: Some("system_memory".into()),
+            ..Default::default()
+        })
+        .expect("system_memory category should return catalog");
+
+        assert!(out.contains("── System memories"));
+        assert!(out.contains("[system] sm-rule-packets"));
+        assert!(out.contains("[system] sm-refactor"));
+        assert!(out.contains("[system] sm-agentic-opening-sequence"));
+        assert!(
+            !out.contains("bbox_compile"),
+            "catalog listing should not include full body"
+        );
+    }
+
+    #[test]
+    fn system_memory_catalog_accepts_hyphenated_and_plural_forms() {
+        init_system_memory();
+        for form in &["system_memory", "system-memory", "system_memories"] {
+            let out = exact_system_memory_response(&KnowledgeListParams {
+                category: Some(form.to_string()),
+                ..Default::default()
+            });
+            assert!(out.is_some(), "category={} should match", form);
+        }
+    }
+
+    #[test]
+    fn system_memory_catalog_supports_query_filter() {
+        init_system_memory();
+        let out = exact_system_memory_response(&KnowledgeListParams {
+            category: Some("system_memory".into()),
+            query: Some("refactor".into()),
+            ..Default::default()
+        })
+        .expect("system_memory + query should return filtered catalog");
+
+        assert!(out.contains("[system] sm-refactor"));
+        assert!(out.contains("[system] sm-refactor-rust"));
+        assert!(!out.contains("[system] sm-rule-packets"));
+    }
+
+    #[test]
+    fn system_memory_category_does_not_match_memory() {
+        init_system_memory();
+        let out = exact_system_memory_response(&KnowledgeListParams {
+            category: Some("memory".into()),
+            query: Some("sm-refactor".into()),
+            ..Default::default()
+        });
         assert!(out.is_none());
     }
 }

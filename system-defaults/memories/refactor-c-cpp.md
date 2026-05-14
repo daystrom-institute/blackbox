@@ -1,3 +1,9 @@
++++
+title = "C and C++ refactor mechanization — tree-sitter inventory and clang validation workflow"
+tags = ["refactor", "refactoring", "mechanization", "restructure", "c", "cpp", "c++", "clangd", "clang-rename", "clang-tidy", "clang-format", "cmake", "ninja", "tree-sitter", "bbox_refactor_status", "symbol", "rename", "move", "extract"]
+order = 16
+template = false
++++
 # C and C++ Refactor Mechanization Runbook
 
 Use this memory before operating on C or C++ files with blackbox refactor tools.

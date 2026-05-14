@@ -1,3 +1,9 @@
++++
+title = "Gap notes — report substrate gaps via bbox_note"
+tags = ["gap", "gap-note", "gap-notes", "blackbox.gap_note.v1", "substrate", "substrate-gap", "missing-primitive", "missing-capability", "field-report", "bbox_note", "followup", "note-backed-gap-log", "packet_ast", "tooling", "agent-gap", "workflow-gap", "refactor_primitive", "mcp_surface", "ontology", "eval_coverage", "docs_runbook", "dedupe_key", "impact", "blocking_level", "addresses-gap-note", "close-out", "runbook"]
+order = 18
+template = false
++++
 # Gap notes — report substrate gaps via `bbox_note`
 
 When the blocker is in the blackbox substrate or shared agent workflow — not in the current product codebase — file a gap note.

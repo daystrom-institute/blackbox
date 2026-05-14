@@ -1,3 +1,9 @@
++++
+title = "TypeScript and JavaScript refactor mechanization — tree-sitter inventory and validation workflow"
+tags = ["refactor", "refactoring", "mechanization", "restructure", "typescript", "javascript", "tsx", "jsx", "tsserver", "tree-sitter", "bbox_refactor_status", "symbol", "rename", "move", "extract", "typecheck"]
+order = 9
+template = false
++++
 # TypeScript and JavaScript Refactor Mechanization Runbook
 
 Use this memory before operating on TypeScript, TSX, JavaScript, JSX, MJS, or CJS

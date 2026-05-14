@@ -715,6 +715,19 @@ fn validate_refactor_subcontract(manifest: &AtomManifest) -> Result<(), Validati
 mod tests {
     use super::*;
 
+    fn strip_toml_front_matter(raw: &str) -> &str {
+        let mut parts = raw.splitn(3, "+++");
+        parts.next();
+        parts.next();
+        match parts.next() {
+            Some(body) => body
+                .strip_prefix('\n')
+                .or_else(|| body.strip_prefix("\r\n"))
+                .unwrap_or(body),
+            None => raw,
+        }
+    }
+
     fn noop_ctx() -> InstallCtx<impl Fn(&str) -> bool, impl Fn(&str) -> bool> {
         InstallCtx {
             brofile_exists: |_| true,
@@ -1296,8 +1309,9 @@ mod tests {
     #[test]
     fn sm_refactor_uses_signposts_not_atom_ledger() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let catalog = std::fs::read_to_string(crate_root.join("src/system_memory/refactor.md"))
-            .expect("read sm-refactor");
+        let raw = std::fs::read_to_string(crate_root.join("system-defaults/memories/refactor.md"))
+            .expect("read sm-refactor from system-defaults");
+        let catalog = strip_toml_front_matter(&raw);
 
         assert!(
             catalog.contains("atom_search(query=\"<intent phrase>\")")

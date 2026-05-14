@@ -1,3 +1,9 @@
++++
+title = "Python refactor mechanization — tree-sitter inventory and Pyright/Rope validation workflow"
+tags = ["refactor", "refactoring", "mechanization", "restructure", "python", "py", "pyright", "jedi", "rope", "ruff", "pytest", "tree-sitter", "bbox_refactor_status", "symbol", "rename", "move", "extract"]
+order = 11
+template = false
++++
 # Python Refactor Mechanization Runbook
 
 Use this memory before operating on Python files with blackbox refactor tools.

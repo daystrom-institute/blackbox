@@ -1,3 +1,9 @@
++++
+title = "Side-channel notes — what to emit and why"
+tags = ["notes", "bbox_note", "orchestrator", "executor", "done", "workflow", "runbook"]
+order = 17
+template = false
++++
 # Side-channel notes — what to emit and why
 
 `bbox_note` is not a diary. It is a structured signal channel that lets the orchestrator inspect a workstream without re-reading the whole transcript.
