@@ -216,6 +216,8 @@ impl BlackboxServer {
         prompt: &str,
         project_dir: Option<&str>,
         existing_session_ids: &std::collections::HashMap<String, String>,
+        existing_task_ids: &std::collections::HashMap<String, String>,
+        actor_runtime: Option<orchestration::allocator::RuntimeRequest>,
     ) -> Result<Vec<(String, Arc<orch::Task>)>, String> {
         // Scope the team lock narrowly — we only need it to read the
         // team's current roster. Holding a parking_lot guard across
@@ -237,14 +239,15 @@ impl BlackboxServer {
         let mut launched = Vec::new();
         for (member_name, brofile) in &members {
             let existing = existing_session_ids.get(member_name).cloned();
+            let existing_task_id = existing_task_ids.get(member_name).cloned();
             let task = self
                 .workflow_dispatch_executor(
                     brofile,
                     prompt,
                     cwd.as_deref(),
                     existing.as_deref(),
-                    None,
-                    None,
+                    existing_task_id.as_deref(),
+                    actor_runtime.clone(),
                 )
                 .await
                 .map_err(|e| format!("member {member_name}: {e}"))?;

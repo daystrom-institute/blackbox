@@ -606,6 +606,7 @@ struct WorkflowRunner<'a> {
     /// `<actor_name>::<member_name>`. Populated when the ensemble
     /// actor is durable.
     ensemble_sessions: HashMap<String, HashMap<String, String>>,
+    ensemble_tasks: HashMap<String, HashMap<String, String>>,
     /// Nodes dispatched asynchronously by a prior fork — keyed by the
     /// async target's node id. Consumed by later `late_inject` at the
     /// downstream node's entry.
@@ -668,6 +669,7 @@ impl<'a> WorkflowRunner<'a> {
             actor_tasks: HashMap::new(),
             atom_invocations: HashMap::new(),
             ensemble_sessions: HashMap::new(),
+            ensemble_tasks: HashMap::new(),
             in_flight: HashMap::new(),
             visit_counts: HashMap::new(),
             last_verdict: None,
@@ -1916,6 +1918,14 @@ impl<'a> WorkflowRunner<'a> {
                 } else {
                     HashMap::new()
                 };
+                let existing_tasks = if actor.durable {
+                    self.ensemble_tasks
+                        .get(&actor_name)
+                        .cloned()
+                        .unwrap_or_default()
+                } else {
+                    HashMap::new()
+                };
                 let tasks = self
                     .server
                     .workflow_dispatch_ensemble(
@@ -1923,6 +1933,8 @@ impl<'a> WorkflowRunner<'a> {
                         &prompt,
                         self.project_dir.as_deref(),
                         &existing,
+                        &existing_tasks,
+                        self.runtime_for_actor(actor),
                     )
                     .await
                     .map_err(|e| anyhow!("fire-and-forget ensemble dispatch '{target_id}': {e}"))?;
@@ -2037,20 +2049,24 @@ impl<'a> WorkflowRunner<'a> {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
-                        let session_id = task.inner.lock().session_id.clone();
-                        (member, completed, output, session_id)
+                        let inner = task.inner.lock();
+                        let session_id = inner.session_id.clone();
+                        let task_id = inner.id.clone();
+                        (member, completed, output, session_id, task_id)
                     });
                 }
                 let mut outs: Vec<(String, String)> = Vec::new();
                 let mut sessions: HashMap<String, String> = HashMap::new();
+                let mut task_ids: HashMap<String, String> = HashMap::new();
                 let mut timed_out = false;
                 while let Some(res) = joinset.join_next().await {
-                    let (member, completed, output, session_id) =
+                    let (member, completed, output, session_id, task_id) =
                         res.map_err(|e| anyhow!("ensemble join: {e}"))?;
                     if !completed {
                         timed_out = true;
                     }
                     sessions.insert(member.clone(), session_id);
+                    task_ids.insert(member.clone(), task_id);
                     outs.push((member, output));
                 }
                 if timed_out {
@@ -2063,7 +2079,8 @@ impl<'a> WorkflowRunner<'a> {
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 if durable {
-                    self.ensemble_sessions.insert(actor_name, sessions);
+                    self.ensemble_sessions.insert(actor_name.clone(), sessions);
+                    self.ensemble_tasks.insert(actor_name, task_ids);
                 }
                 self.record_output(source, merged);
             }
@@ -2091,6 +2108,14 @@ impl<'a> WorkflowRunner<'a> {
         } else {
             HashMap::new()
         };
+        let existing_tasks = if actor.durable {
+            self.ensemble_tasks
+                .get(&ensemble_key)
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            HashMap::new()
+        };
         self.log_event(
             "node_dispatch",
             json!({
@@ -2109,6 +2134,8 @@ impl<'a> WorkflowRunner<'a> {
                 prompt,
                 self.project_dir.as_deref(),
                 &existing_sessions,
+                &existing_tasks,
+                self.runtime_for_actor(actor),
             )
             .await
             .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?;
@@ -2133,6 +2160,7 @@ impl<'a> WorkflowRunner<'a> {
         }
         let mut member_outputs: Vec<(String, String)> = Vec::new();
         let mut member_sessions: HashMap<String, String> = HashMap::new();
+        let mut member_tasks: HashMap<String, String> = HashMap::new();
         let mut any_timeout = false;
         while let Some(res) = joinset.join_next().await {
             let (member, completed, output, session_id, task_id) =
@@ -2149,6 +2177,7 @@ impl<'a> WorkflowRunner<'a> {
                 );
             }
             member_sessions.insert(member.clone(), session_id.clone());
+            member_tasks.insert(member.clone(), task_id.clone());
             let preview: String = output.chars().take(160).collect();
             self.log_event(
                 "ensemble_member_complete",
@@ -2179,7 +2208,9 @@ impl<'a> WorkflowRunner<'a> {
         // executor + ensemble + in-flight-join all use the same path).
         self.record_output(node_id, merged.clone());
         if actor.durable {
-            self.ensemble_sessions.insert(ensemble_key, member_sessions);
+            self.ensemble_sessions
+                .insert(ensemble_key.clone(), member_sessions);
+            self.ensemble_tasks.insert(ensemble_key, member_tasks);
         }
         let member_names: Vec<String> = member_outputs.iter().map(|(m, _)| m.clone()).collect();
         self.log_event(
