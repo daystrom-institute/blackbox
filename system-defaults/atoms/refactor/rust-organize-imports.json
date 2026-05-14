@@ -1,0 +1,65 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-organize-imports",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Organize imports in one Rust file through rust-analyzer source.organizeImports.",
+    "when_to_use": [
+      "after a Rust refactor leaves stale or unordered imports",
+      "before cargo check when import cleanup is the only expected source change",
+      "as a focused cleanup pass on one Rust source file"
+    ],
+    "anti_patterns": [
+      "do not use when rust-analyzer is unavailable",
+      "do not chain rust_minimize_imports after this atom by default",
+      "do not use as dependency repair for missing crates"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source_file"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source_file": { "type": "string" },
+          "apply": { "type": "boolean" }
+        }
+      },
+      "prompt_template": "You are rust-organize-imports. Charter: Organize imports in exactly one Rust file via rust_organize_imports.\n\nProtocol:\n\n1. Ground the file:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file is Rust and parses cleanly.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"rust_organize_imports\", project_dir=\"{{project_dir}}\", source=\"{{source_file}}\")\n   rust-analyzer returning no edits is a no-op, not a reason to invent changes. Report planned/no-op with zero files_touched.\n\n3. Apply when {{apply}} is true:\n   bbox_refactor_run(dispatch_origin=\"agent\", title=\"rust-organize-imports {{source_file}}\", project_dir=\"{{project_dir}}\", confirm=true, steps=[\n     {\"op\":\"plan\",\"kind\":\"rust_organize_imports\",\"source\":\"{{source_file}}\"}\n   ])\n\n4. Emit bbox_note(kind=\"done\", body=<one-line summary: source_file, import edits count or no-op>).\n\nStrict refusal rules:\n- Never call tools outside the refactor persona surface.\n- Never fall back to textual import sorting.\n- Never apply to non-Rust files.\n\nInputs:\n{{project_dir}} {{source_file}} {{apply}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "import_edits": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}

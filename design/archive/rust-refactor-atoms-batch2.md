@@ -20,15 +20,23 @@ see "Blocked atoms" below). This doc covers only the atoms we can build today.
 
 ## Scope
 
-### Ships in this batch (5 atoms, no new plan kinds)
+### Ships in this batch (4 atoms + 2 small substrate deltas)
 
 | # | Atom | Cost | Primitive composition |
 |---|------|------|----------------------|
 | 1 | `rust-rename-symbol` | normal | `rust_lsp_rename` + `rust_public_api_guard` preflight + `cargo check` post-flight |
 | 2 | `rust-extract-to-submodule` | normal | `extract_rust_items_to_submodule` + `cargo check --message-format=json` + `rust_compile_fix_round` + `cargo check` |
 | 3 | `rust-organize-imports` | cheap | `rust_organize_imports` (LSP) alone; no `rust_minimize_imports` (redundant per review) |
-| 4 | `rust-doc-harden` | cheap | `bbox_refactor_status` walk of pub items + analysis report; no new plan kind |
-| 5 | `rust-cargo-add-dep` | cheap | `ensure_toml_table` for `[dependencies]` + structured TOML key insertion |
+| 4 | `rust-cargo-add-dep` | cheap | `ensure_toml_table` for `[dependencies]` + structured TOML key insertion |
+
+Small deltas added inline because they are load-bearing for the atoms and do
+not require a new refactor primitive family:
+
+- `rust_compile_fix_round` now applies its returned repair edits inside
+  `bbox_refactor_run` instead of only consuming the repair obligation.
+- `ensure_toml_table` now supports JSON object values by rendering TOML inline
+  tables, enabling Cargo entries like
+  `serde = { version = "1", features = ["derive"] }`.
 
 ### Non-goals
 
@@ -39,20 +47,24 @@ see "Blocked atoms" below). This doc covers only the atoms we can build today.
 - Atoms that need `super::` depth rebasing across directory trees
   (`rust-promote-module-to-crate`, `rust-restructure-crate`).
 - Atoms that need type resolution for derive safety (`rust-audit-derivable`).
+- `rust-doc-harden` as a mutating atom. The audit is useful, but a non-halfbaked
+  apply path should be backed by a doc-comment-aware status/plan primitive rather
+  than prompt-only source slicing.
 
 ## Design
 
 ### Common patterns
 
-All five atoms share the profile-atom shape from refactor-agents v1:
+All four atoms share the profile-atom shape from refactor-agents v1:
 
 - `implementation.kind = "profile"`
 - `implementation.brofile_ref = "brofile:rust-refactor-persona@v1"`
 - `composition.may_invoke_atoms.kind = "none"`
-- `effects.writes_files = true` (except `rust-doc-harden` plan-only mode)
+- `effects.writes_files = true`
 - `effects.dispatches_runs = 1`, `effects.max_depth = 0`,
   `effects.uses_network = false`
-- `supervision.oracle = "default"`, `supervision.advisor = "none"`
+- `supervision.oracle = "default"`; advisor is omitted unless a manifest
+  needs a non-default review path.
 
 The atom prompt template follows the five-step protocol:
 ground → plan → decide → apply → done-note.
@@ -66,7 +78,8 @@ public-API preflight, and post-flight validation.
 
 ```
 required: project_dir, source_file, old_name, new_name
-optional: apply (bool), validation_bin (string)
+optional: item_kinds (array), apply (bool), validation_bin (string),
+          acknowledge_public_api_change (bool; no default)
 ```
 
 **Protocol:**
@@ -74,20 +87,21 @@ optional: apply (bool), validation_bin (string)
 1. Ground: `bbox_refactor_status(file, project_dir)` to confirm `old_name`
    resolves in `source_file`. Copy exact name and kind.
 
-2. Preflight: `bbox_refactor_plan(kind="rust_public_api_guard", source=source_file,
-   toml_entries={"proposed_changes": [{"item": old_name, "action": "rename",
-   "new_name": new_name}]})`. If severity is `"breaking"`, emit
+2. Preflight: `bbox_refactor_plan(kind="rust_public_api_guard",
+   source=source_file, toml_entries={"proposed_changes": [{"file": source_file,
+   "item_name": old_name, "change_kind": "modify"}]})`. The current guard
+   returns severities `info | warning | breaking`. If severity is `"breaking"`
+   and `acknowledge_public_api_change` is not explicitly true, emit
    `bbox_note(kind="blocked")` with the report and return `status="blocked"`.
-   If `"caution"`, surface in the plan but proceed (operator opted in by
-   invoking the atom).
+   If `"warning"`, surface in the plan but proceed.
 
-3. Apply: `bbox_refactor_run(confirm=true, steps=[`
+3. Apply: `bbox_refactor_run(dispatch_origin="agent", confirm=true, steps=[`
    - `{"op":"plan","kind":"rust_lsp_rename","source":source_file,
       "item_names":[old_name],"new_text":new_name}`
    - `{"op":"command","command":"cargo","args":["check",
       "--message-format=json"],"capture":"rustc_json",
       "on_failure":"continue_for_repair"}`
-   - `{"op":"plan","kind":"rust_compile_fix_round"}`
+   - `{"op":"plan","kind":"rust_compile_fix_round","source":"last"}`
    - `{"op":"command","command":"cargo","args":["check"],"required":true}`
    - `{"op":"command","command":"cargo","args":["test","--bin",
       validation_bin],"required":true}`
@@ -100,8 +114,9 @@ optional: apply (bool), validation_bin (string)
 
 - Do not use for literal text replacement — use `replace_text` for that.
 - Do not rename items in `std`/`core`/external crate surfaces.
-- Do not skip the `rust_public_api_guard` preflight — it catches
+- Do not skip the `rust_public_api_guard` preflight — it flags
   cross-crate breaks that `rust_lsp_rename` silently commits.
+- Do not default `acknowledge_public_api_change`.
 
 **When to use:**
 
@@ -137,16 +152,17 @@ optional: item_kinds (array), visibility (string, default "pub(super)"),
    visibility, module_name, target_prelude, project_dir)`. Inspect the plan
    for items selected, visibility transforms, and use-decl contents.
 
-3. Decide: if the plan reports `leftovers` that reference moved items
-   (meaning the parent still needs them but they weren't re-exported), surface
-   as a caution. Proceed unless blocked.
+3. Decide: inspect generated mod declaration, source-side use declaration,
+   target prelude, and visibility bumps. Block on unsupported shapes such as
+   `impl_method`, source equal to target, mismatched `module_name`/target stem,
+   or non-empty target without explicit `merge_into_existing_target=true`.
 
-4. Apply: `bbox_refactor_run(confirm=true, steps=[`
+4. Apply: `bbox_refactor_run(dispatch_origin="agent", confirm=true, steps=[`
    - `{"op":"plan","kind":"extract_rust_items_to_submodule",...}`
    - `{"op":"command","command":"cargo","args":["check",
       "--message-format=json"],"capture":"rustc_json",
       "on_failure":"continue_for_repair"}`
-   - `{"op":"plan","kind":"rust_compile_fix_round"}`
+   - `{"op":"plan","kind":"rust_compile_fix_round","source":"last"}`
    - `{"op":"command","command":"cargo","args":["check"],"required":true}`
    - `{"op":"command","command":"cargo","args":["test","--bin",
       validation_bin],"required":true}`
@@ -192,7 +208,8 @@ optional: apply (bool)
 2. Plan: `bbox_refactor_plan(kind="rust_organize_imports",
    source=source_file, project_dir)`.
 
-3. Apply (if `apply=true`): `bbox_refactor_apply(confirm=true)`.
+3. Apply (if `apply=true`): `bbox_refactor_run(dispatch_origin="agent",
+   confirm=true, steps=[{"op":"plan","kind":"rust_organize_imports",...}])`.
 
 4. Done: `bbox_note(kind="done", body=<file, edits count>)`.
 
@@ -212,63 +229,18 @@ optional: apply (bool)
 
 ---
 
-### 4. `rust-doc-harden` (cheap)
+### Deferred: `rust-doc-harden`
 
-**Description:** Audit undocumented `pub` and `pub(crate)` items in a Rust
-file and return a structured report. Optionally insert doc-stub comments.
-
-**Inputs:**
-
-```
-required: project_dir, source_file
-optional: apply (bool, default false — analysis-only),
-          scope (string: "pub" | "pub_and_pub_crate", default "pub"),
-          allow_list (array of item names to skip),
-          stub_style (string: "todo" | "allow", default "todo")
-```
-
-**Protocol:**
-
-1. Ground: `bbox_refactor_status(file=source_file, project_dir,
-   include_attributes=true)` to get all items with their attributes.
-
-2. Analyze: walk returned items. For each with visibility containing `pub`
-   (or `pub(crate)` when `scope="pub_and_pub_crate"`):
-   - Check if the item has a `///` or `//!` doc comment attribute.
-   - If missing and not in `allow_list`, add to `undocumented` report.
-
-3. If `apply=false` (default): return the `undocumented` list as analysis.
-
-4. If `apply=true`: for each undocumented item, emit a `replace_text` step
-   that inserts `/// TODO: document` above the item (when `stub_style="todo"`,
-   the default). Apply via `bbox_refactor_run`.
-
-5. Done: `bbox_note(kind="done", body=<total_pub_items, undocumented count,
-   stubs_inserted count>)`.
-
-**Note:** This atom does NOT need a new plan kind. It composes
-`bbox_refactor_status` (which returns items with attribute info) with
-`replace_text` for stub insertion. The analysis pass is pure computation
-over the status response.
-
-**Anti-patterns:**
-
-- Do not use as a CI gate — use `#![warn(missing_docs)]` for that.
-- Do not overwrite existing doc comments.
-- Do not use `stub_style="allow"` without operator intent — `#[allow(missing_docs)]`
-  permanently hides the item from future audits. The `todo` default creates
-  visible, grep-able debt instead of suppressing it.
-- Do not use on non-Rust files.
-
-**When to use:**
-
-- Before enabling `#![warn(missing_docs)]` on a crate — assess scope first.
-- After a batch of agent-authored pub items that likely lack docs.
-- As a pre-commit hygiene check.
+The atom is not shipped in this batch. The original analysis-only shape is
+useful, but `bbox_refactor_status(include_attributes=true)` currently returns
+Rust `#[...]` attributes, not doc comments, and prompt-only slicing plus
+`replace_text` would be too brittle for automatic stub insertion. Ship this
+once a small `rust_doc_harden`/`rust_doc_stub_missing` plan kind or
+doc-comment-aware status fields exist.
 
 ---
 
-### 5. `rust-cargo-add-dep` (cheap)
+### 4. `rust-cargo-add-dep` (cheap)
 
 **Description:** Add a dependency entry to a Rust project's `Cargo.toml`
 with structured TOML editing.
@@ -276,21 +248,23 @@ with structured TOML editing.
 **Inputs:**
 
 ```
-required: project_dir, crate_name, version
+required: project_dir, crate_name, and one of version/git/path
 optional: features (array of feature flags),
           optional (bool, default false),
+          default_features (bool),
           git (string, git URL override),
-          branch (string, git branch),
+          branch/tag/rev (string, git selectors),
           path (string, local path override),
+          package (string, package rename),
           toml_table (string: "dependencies" | "dev-dependencies" |
                       "build-dependencies", default "dependencies"),
-          apply (bool)
+          apply (bool), skip_validation (bool)
 ```
 
 **Protocol:**
 
 1. Ground: read `Cargo.toml` at `project_dir/Cargo.toml`. Parse existing
-   `[dependencies]` table. Reject if `crate_name` already present (idempotent
+   selected dependency table. Reject if `crate_name` already present (idempotent
    guard — operator should use `bbox_refactor_plan(kind="ensure_toml_table")`
    to update instead).
 
@@ -298,22 +272,28 @@ optional: features (array of feature flags),
    source="Cargo.toml", project_dir,
    toml_table=<toml_table>,
    toml_entries={<crate_name>: <value>})` where `<value>` is:
-   - Just `version` string for simple deps
-   - `{ version = version, features = [...], optional = true }` for complex deps
-   - `{ git = url, branch = branch }` for git deps
-   - `{ path = path }` for local deps
+   - Just `version` string for simple registry deps.
+   - JSON object for complex registry deps. `ensure_toml_table` renders this
+     as an inline TOML table.
+   - JSON object with `git`/`branch`/`tag`/`rev` for git deps.
+   - JSON object with `path` for local deps.
+   Omit absent optional keys; never emit JSON null.
 
-3. Apply: `bbox_refactor_apply(confirm=true)`.
+3. Apply: `bbox_refactor_run(dispatch_origin="agent", confirm=true, steps=[`
+   - `{"op":"plan","kind":"ensure_toml_table",...}`
+   - optional `{"op":"command","command":"cargo","args":["check"],
+      "required":true}` unless `skip_validation=true`
+   `])`.
 
-4. Validate: `{"op":"command","command":"cargo","args":["check"],
-   "required":true}` confirms the dependency resolves.
-
-5. Done: `bbox_note(kind="done", body=<crate_name, version, cargo check result>)`.
+4. Done: `bbox_note(kind="done", body=<crate_name, table, entry shape,
+   cargo check result or skipped validation>)`.
 
 **Anti-patterns:**
 
 - Do not use to update an existing dependency — reject with clear message.
 - Do not use on non-Rust projects.
+- Do not run validation if dependency resolution intentionally needs offline or
+  credentialed follow-up; require `skip_validation=true` and say so.
 
 **When to use:**
 
@@ -350,9 +330,8 @@ Gap notes are filed as `bbox_note(kind="followup")` with
 
 ### File locations
 
-Atom manifests go in `examples/agents/rust-refactor/` following the existing
-convention (see `examples/agents/` for the Java refactor agent manifests).
-Each atom is a single JSON file with the manifest schema from
+Atom manifests go in `system-defaults/atoms/refactor/`, next to the existing
+shipped refactor atoms. Each atom is a single JSON file with the manifest schema from
 `src/orchestration/atoms/types.rs`.
 
 ### Registration
@@ -362,14 +341,16 @@ The daemon picks them up on next restart or hot-reload.
 
 ### Validation
 
-Each atom's prompt template references only plan kinds that exist in
-`plan_dispatch()` at `src/refactor/mod.rs:1110-1178`. The atom validation
-suite (`src/orchestration/atoms/validate.rs`) will confirm this on install.
+Each atom should be installed in a catalog that already has
+`brofile:rust-refactor-persona@v1`; the atom schema validator checks shape,
+declared placeholders, references, and supervision fields on install. It does
+not parse prompt prose to prove every named refactor plan kind exists, so this
+batch also has targeted tests for the two substrate deltas it depends on.
 
 ### Cost class rationale
 
 - **cheap**: single plan call, no compile cycle, analysis-only or trivial
-  TOML edit (`rust-organize-imports`, `rust-doc-harden`, `rust-cargo-add-dep`).
+  TOML edit (`rust-organize-imports`, `rust-cargo-add-dep`).
 - **normal**: compound run with compile-fix loop and test validation
   (`rust-rename-symbol`, `rust-extract-to-submodule`).
 
@@ -389,11 +370,9 @@ suite (`src/orchestration/atoms/validate.rs`) will confirm this on install.
 
 ## Resolved design decisions
 
-- **`rust-doc-harden` stub style:** Default `/// TODO` stubs, not
-  `#[allow(missing_docs)]`. Stubs are grep-able, show up in `cargo doc`,
-  and create accountable debt. `#[allow]` permanently hides items from
-  future audits. The `stub_style` input lets operators opt into `allow`
-  when they have a genuine reason to suppress.
+- **`rust-doc-harden` deferral:** Do not ship prompt-only doc stub insertion.
+  `bbox_refactor_status(include_attributes=true)` is not a doc-comment
+  inventory, and automatic insertion should wait for a doc-aware primitive.
 
 - **`rust-cargo-add-dep` table scope:** Support `"dependencies"`,
   `"dev-dependencies"`, and `"build-dependencies"` from the start via a

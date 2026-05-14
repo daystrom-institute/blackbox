@@ -3343,6 +3343,63 @@ mod tests {
         updated.parse::<toml::Value>().unwrap();
     }
 
+    #[test]
+    fn ensure_toml_table_supports_inline_table_dependency_specs() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Cargo.toml");
+        fs::write(
+            &source,
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n\n[dependencies]\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "ensure_toml_table".into(),
+            source: path_string(&source),
+            toml_table: Some("dependencies".into()),
+            toml_entries: Some(BTreeMap::from([(
+                "serde".into(),
+                serde_json::json!({
+                    "version": "1",
+                    "features": ["derive"],
+                    "optional": true
+                }),
+            )])),
+            project_dir: None,
+            ..Default::default()
+        })
+        .unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::from_str(&plan_text).unwrap(),
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let updated = fs::read_to_string(&source).unwrap();
+        let parsed: toml::Value = updated.parse().unwrap();
+        assert_eq!(
+            parsed["dependencies"]["serde"]["version"].as_str(),
+            Some("1")
+        );
+        assert_eq!(
+            parsed["dependencies"]["serde"]["features"][0].as_str(),
+            Some("derive")
+        );
+        assert_eq!(
+            parsed["dependencies"]["serde"]["optional"].as_bool(),
+            Some(true)
+        );
+    }
+
     // Cold-start rust-analyzer against a fresh tempdir is timing-fragile in
     // CI: cargo metadata + crate-graph build runs silently for several
     // seconds before rust-analyzer starts emitting serverStatus or

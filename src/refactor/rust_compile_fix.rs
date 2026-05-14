@@ -897,6 +897,21 @@ mod tests {
         script
     }
 
+    fn make_compile_fix_script_with_lines(
+        dir: &std::path::Path,
+        name: &str,
+        lines: Vec<String>,
+    ) -> std::path::PathBuf {
+        let data_file = dir.join(format!("{name}_data.txt"));
+        let script = dir.join(format!("{name}.sh"));
+        std::fs::write(&data_file, lines.join("\n")).unwrap();
+        let script_body = format!("#!/bin/sh\ncat {}\nexit 1", data_file.display());
+        std::fs::write(&script, script_body).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
     fn project_record_for(path: &std::path::Path) -> crate::projects::ProjectRecord {
         crate::projects::ProjectRecord {
             project_id: "test-project".to_string(),
@@ -985,6 +1000,97 @@ mod tests {
             "obligation should be left_over when all diagnostics → leftovers: {response}"
         );
         assert_eq!(resp.obligations[0].leftover_count, 2);
+    }
+
+    /// Integration: machine-applicable suggestions from rust_compile_fix_round
+    /// are applied inside the compound run before the final validation step.
+    #[test]
+    fn integration_compile_fix_round_applies_repair_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir(state_dir.path());
+        let file = write_rust_file(dir.path(), "lib.rs", "fn main() { foo(1); }\n");
+        let source = std::fs::read_to_string(&file).unwrap();
+        let start = source.find("foo(1)").unwrap() as u64;
+        let end = start + "foo(1)".len() as u64;
+        let line = serde_json::json!({
+            "reason": "compiler-message",
+            "message": {
+                "level": "error",
+                "code": {"code": "E0061"},
+                "message": "this function takes 0 arguments but 1 argument was supplied",
+                "spans": [file_span(&file)],
+                "children": [{
+                    "suggestion_applicability": "MachineApplicable",
+                    "spans": [{
+                        "file_name": &file,
+                        "byte_start": start,
+                        "byte_end": end,
+                        "is_primary": true,
+                        "suggested_replacement": "foo()"
+                    }]
+                }]
+            }
+        })
+        .to_string();
+        let script = make_compile_fix_script_with_lines(dir.path(), "check_repair", vec![line]);
+
+        let response = run(
+            &RefactorRunParams {
+                title: "compile_fix applies repairs".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Command {
+                        command: path_string(&script),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "rust_compile_fix_round".into(),
+                            source: "last".into(),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    RefactorRunStep::Command {
+                        command: "true".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[project_record_for(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "ok", "{response}");
+        assert_eq!(resp.obligations.len(), 1);
+        assert_eq!(resp.obligations[0].status, "consumed");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn main() { foo(); }\n"
+        );
+        assert!(
+            resp.steps.iter().any(
+                |step| step.kind.as_deref() == Some("rust_compile_fix_round")
+                    && step.files.iter().any(|path| path == &file)
+            ),
+            "repair step should report the edited file: {response}"
+        );
     }
 
     /// Integration: no repair step → obligation stays Open → run rolls back.

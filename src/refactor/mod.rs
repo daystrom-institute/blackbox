@@ -1704,9 +1704,13 @@ pub fn run_with_ctx(
                     step_params.project_dir = Some(path_string(&project_dir));
                 }
 
+                let mut repair_obligation: Option<(String, usize)> = None;
+
                 // RX-C1: rust_compile_fix_round — read diagnostics from capture context,
-                // classify them, mark the obligation consumed/leftover.
-                if step_params.kind == "rust_compile_fix_round" {
+                // classify them, then apply any proposed edits through the normal
+                // plan application path below. Leftover-only reports are valid
+                // no-op repair steps and still consume/acknowledge the obligation.
+                let plan_text = if step_params.kind == "rust_compile_fix_round" {
                     let ref_name = step_params
                         .toml_entries
                         .as_ref()
@@ -1768,43 +1772,16 @@ pub fn run_with_ctx(
                                 })?);
                             }
                         };
-                    // Mark the obligation consumed or leftover based on plan's leftover count.
-                    let leftover_count = serde_json::from_str::<RefactorPlan>(&plan_json)
-                        .map(|plan| plan.leftovers.len())
-                        .unwrap_or(0);
-                    capture_ctx.mark_obligation_consumed(&ref_name, leftover_count);
-                    reports.push(RefactorRunStepReport {
-                        index: idx,
-                        op: "plan".to_string(),
-                        status: "ok".to_string(),
-                        kind: Some(step_params.kind.clone()),
-                        title: Some("rust_compile_fix_round: diagnostics classified".to_string()),
-                        files: Vec::new(),
-                        validations: Vec::new(),
-                        error: None,
-                        captured_diagnostics_summary: None,
-                    });
-                    continue;
-                }
-
-                // Test-only stub plan kinds for obligation consumption (RX-F2b).
-                // These are handled before calling plan_with_ctx so they never
-                // reach production plan dispatch. Compiled in only under #[cfg(test)].
-                #[cfg(test)]
-                {
-                    let ref_name = if step_params.source.is_empty() {
-                        "last".to_string()
-                    } else {
-                        step_params.source.clone()
-                    };
-                    if step_params.kind == "test_consume_obligation" {
-                        capture_ctx.mark_obligation_consumed(&ref_name, 0);
+                    let repair_plan: RefactorPlan = serde_json::from_str(&plan_json)?;
+                    let leftover_count = repair_plan.leftovers.len();
+                    if repair_plan.edits.is_empty() && repair_plan.file_moves.is_empty() {
+                        capture_ctx.mark_obligation_consumed(&ref_name, leftover_count);
                         reports.push(RefactorRunStepReport {
                             index: idx,
                             op: "plan".to_string(),
-                            status: "ok".to_string(),
-                            kind: Some(step_params.kind.clone()),
-                            title: Some("stub: consume obligation".to_string()),
+                            status: if confirmed { "ok" } else { "planned" }.to_string(),
+                            kind: Some(repair_plan.kind),
+                            title: Some(repair_plan.title),
                             files: Vec::new(),
                             validations: Vec::new(),
                             error: None,
@@ -1812,70 +1789,99 @@ pub fn run_with_ctx(
                         });
                         continue;
                     }
-                    if step_params.kind == "test_leftover_obligation" {
-                        capture_ctx.mark_obligation_consumed(&ref_name, 1);
-                        reports.push(RefactorRunStepReport {
-                            index: idx,
-                            op: "plan".to_string(),
-                            status: "ok".to_string(),
-                            kind: Some(step_params.kind.clone()),
-                            title: Some("stub: leftover obligation".to_string()),
-                            files: Vec::new(),
-                            validations: Vec::new(),
-                            error: None,
-                            captured_diagnostics_summary: None,
-                        });
-                        continue;
+                    repair_obligation = Some((ref_name, leftover_count));
+                    plan_json
+                } else {
+                    // Test-only stub plan kinds for obligation consumption (RX-F2b).
+                    // These are handled before calling plan_with_ctx so they never
+                    // reach production plan dispatch. Compiled in only under #[cfg(test)].
+                    #[cfg(test)]
+                    {
+                        let ref_name = if step_params.source.is_empty() {
+                            "last".to_string()
+                        } else {
+                            step_params.source.clone()
+                        };
+                        if step_params.kind == "test_consume_obligation" {
+                            capture_ctx.mark_obligation_consumed(&ref_name, 0);
+                            reports.push(RefactorRunStepReport {
+                                index: idx,
+                                op: "plan".to_string(),
+                                status: "ok".to_string(),
+                                kind: Some(step_params.kind.clone()),
+                                title: Some("stub: consume obligation".to_string()),
+                                files: Vec::new(),
+                                validations: Vec::new(),
+                                error: None,
+                                captured_diagnostics_summary: None,
+                            });
+                            continue;
+                        }
+                        if step_params.kind == "test_leftover_obligation" {
+                            capture_ctx.mark_obligation_consumed(&ref_name, 1);
+                            reports.push(RefactorRunStepReport {
+                                index: idx,
+                                op: "plan".to_string(),
+                                status: "ok".to_string(),
+                                kind: Some(step_params.kind.clone()),
+                                title: Some("stub: leftover obligation".to_string()),
+                                files: Vec::new(),
+                                validations: Vec::new(),
+                                error: None,
+                                captured_diagnostics_summary: None,
+                            });
+                            continue;
+                        }
                     }
-                }
 
-                let plan_text = match plan_with_ctx(&step_params, ctx) {
-                    Ok(plan_text) => plan_text,
-                    Err(err) if *optional => {
-                        // Optional step — log as skipped, keep prior writes,
-                        // continue to the next step. This is the bulk-batch
-                        // path: many files where a subset has nothing to
-                        // lombokify shouldn't kill the whole batch.
-                        reports.push(RefactorRunStepReport {
-                            index: idx,
-                            op: "plan".to_string(),
-                            status: "skipped".to_string(),
-                            kind: Some(step_params.kind),
-                            title: None,
-                            files: Vec::new(),
-                            validations: Vec::new(),
-                            error: Some(err.to_string()),
-                            captured_diagnostics_summary: None,
-                        });
-                        continue;
-                    }
-                    Err(err) => {
-                        let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
-                        return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
-                            status: "step_failed".to_string(),
-                            title: p.title.clone(),
-                            dry_run: !confirmed,
-                            steps: append_report(
-                                reports,
-                                RefactorRunStepReport {
-                                    index: idx,
-                                    op: "plan".to_string(),
-                                    status: "plan_failed".to_string(),
-                                    kind: Some(step_params.kind),
-                                    title: None,
-                                    files: Vec::new(),
-                                    validations: Vec::new(),
-                                    error: Some(err.to_string()),
-                                    captured_diagnostics_summary: None,
-                                },
-                            ),
-                            files_written,
-                            rolled_back: rollback_errors.is_empty(),
-                            error: Some(err.to_string()),
-                            rollback_errors,
-                            obligations: capture_ctx.obligation_reports(),
-                        })?);
+                    match plan_with_ctx(&step_params, ctx) {
+                        Ok(plan_text) => plan_text,
+                        Err(err) if *optional => {
+                            // Optional step — log as skipped, keep prior writes,
+                            // continue to the next step. This is the bulk-batch
+                            // path: many files where a subset has nothing to
+                            // lombokify shouldn't kill the whole batch.
+                            reports.push(RefactorRunStepReport {
+                                index: idx,
+                                op: "plan".to_string(),
+                                status: "skipped".to_string(),
+                                kind: Some(step_params.kind),
+                                title: None,
+                                files: Vec::new(),
+                                validations: Vec::new(),
+                                error: Some(err.to_string()),
+                                captured_diagnostics_summary: None,
+                            });
+                            continue;
+                        }
+                        Err(err) => {
+                            let cursor = capture_ctx.first_soft_fail_snapshot_idx();
+                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
+                                status: "step_failed".to_string(),
+                                title: p.title.clone(),
+                                dry_run: !confirmed,
+                                steps: append_report(
+                                    reports,
+                                    RefactorRunStepReport {
+                                        index: idx,
+                                        op: "plan".to_string(),
+                                        status: "plan_failed".to_string(),
+                                        kind: Some(step_params.kind),
+                                        title: None,
+                                        files: Vec::new(),
+                                        validations: Vec::new(),
+                                        error: Some(err.to_string()),
+                                        captured_diagnostics_summary: None,
+                                    },
+                                ),
+                                files_written,
+                                rolled_back: rollback_errors.is_empty(),
+                                error: Some(err.to_string()),
+                                rollback_errors,
+                                obligations: capture_ctx.obligation_reports(),
+                            })?);
+                        }
                     }
                 };
                 let plan_value: serde_json::Value = serde_json::from_str(&plan_text)?;
@@ -2045,6 +2051,9 @@ pub fn run_with_ctx(
                             obligations: capture_ctx.obligation_reports(),
                         })?);
                     }
+                    if let Some((ref_name, leftover_count)) = &repair_obligation {
+                        capture_ctx.mark_obligation_consumed(ref_name, *leftover_count);
+                    }
                 } else {
                     reports.push(RefactorRunStepReport {
                         index: idx,
@@ -2057,6 +2066,9 @@ pub fn run_with_ctx(
                         error: None,
                         captured_diagnostics_summary: None,
                     });
+                    if let Some((ref_name, leftover_count)) = &repair_obligation {
+                        capture_ctx.mark_obligation_consumed(ref_name, *leftover_count);
+                    }
                 }
             }
             RefactorRunStep::Command {
@@ -3867,8 +3879,19 @@ fn toml_literal(value: &serde_json::Value) -> Result<String> {
                 .collect::<Result<Vec<_>>>()?;
             format!("[{}]", values.join(", "))
         }
-        serde_json::Value::Null | serde_json::Value::Object(_) => {
-            bail!("unsupported TOML value {value}; use string, bool, number, or array")
+        serde_json::Value::Object(map) => {
+            let mut pairs = Vec::new();
+            for (key, value) in map {
+                validate_toml_key(key)?;
+                if value.is_null() {
+                    bail!("unsupported TOML inline-table value null for key `{key}`");
+                }
+                pairs.push(format!("{key} = {}", toml_literal(value)?));
+            }
+            format!("{{ {} }}", pairs.join(", "))
+        }
+        serde_json::Value::Null => {
+            bail!("unsupported TOML value null; use string, bool, number, array, or object")
         }
     })
 }

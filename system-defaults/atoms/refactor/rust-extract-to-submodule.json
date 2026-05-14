@@ -1,0 +1,90 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-extract-to-submodule",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Extract named top-level Rust items into a child submodule file, adding mod/use wiring and widening visibility.",
+    "when_to_use": [
+      "moving a cluster of top-level Rust structs, enums, functions, constants, statics, traits, or type aliases into a child module",
+      "incrementally decomposing a growing Rust source file",
+      "preparing a module for further domain-specific extraction"
+    ],
+    "anti_patterns": [
+      "do not use for impl_method items; use rust-split-god-impl or split_rust_impl_methods_to_submodule",
+      "do not use when each moved item needs a different visibility",
+      "do not pre-create placeholder target files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source_file", "target_file", "item_names"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source_file": { "type": "string" },
+          "target_file": { "type": "string" },
+          "item_names": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "item_kinds": { "type": "array", "items": { "type": "string" } },
+          "visibility": {
+            "type": "string",
+            "description": "Visibility floor applied to moved items and named struct fields. Defaults to pub(super)."
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Must match target_file stem when supplied."
+          },
+          "target_prelude": {
+            "type": "string",
+            "description": "Defaults to use super::*; for a new target."
+          },
+          "use_decl_visibility": {
+            "enum": ["private", "pub", "pub(crate)", "pub(super)"],
+            "description": "Optional source-side use declaration visibility, passed through toml_entries."
+          },
+          "use_decl_items": { "type": "array", "items": { "type": "string" } },
+          "merge_into_existing_target": { "type": "boolean" },
+          "apply": { "type": "boolean" },
+          "validation_bin": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are rust-extract-to-submodule. Charter: Move named top-level Rust items into a child submodule using extract_rust_items_to_submodule.\n\nProtocol:\n\n1. Ground the source:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\",\n                         item_names={{item_names}}, item_kinds={{item_kinds}})\n   Confirm every requested item resolves and no selected item has kind impl_method.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"extract_rust_items_to_submodule\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      target=\"{{target_file}}\", item_names={{item_names}},\n                      item_kinds={{item_kinds}}, visibility=\"{{visibility}}\",\n                      module_name=\"{{module_name}}\", target_prelude=\"{{target_prelude}}\",\n                      toml_entries={\"use_decl_visibility\":\"{{use_decl_visibility}}\",\"use_decl_items\":{{use_decl_items}},\"merge_into_existing_target\":{{merge_into_existing_target}}})\n   Inspect selected items, generated mod declaration, source-side use declaration, target prelude, and visibility bumps.\n\n3. Decide:\n   - If the planner refuses because target exists, only proceed when merge_into_existing_target is explicitly true.\n   - If source_file == target_file or module_name does not match target_file stem, block.\n   - Otherwise proceed.\n\n4. Apply when {{apply}} is true; otherwise return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", title=\"rust-extract-to-submodule {{source_file}} to {{target_file}}\", project_dir=\"{{project_dir}}\", confirm=true, steps=[\n     {\"op\":\"plan\",\"kind\":\"extract_rust_items_to_submodule\",\"source\":\"{{source_file}}\",\"target\":\"{{target_file}}\",\"item_names\":{{item_names}},\"item_kinds\":{{item_kinds}},\"visibility\":\"{{visibility}}\",\"module_name\":\"{{module_name}}\",\"target_prelude\":\"{{target_prelude}}\",\"toml_entries\":{\"use_decl_visibility\":\"{{use_decl_visibility}}\",\"use_decl_items\":{{use_decl_items}},\"merge_into_existing_target\":{{merge_into_existing_target}}}},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"source\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true}\n   ])\n   If validation_bin is supplied, append {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true} before running.\n\n5. Emit bbox_note(kind=\"done\", body=<one-line summary: item count, target_file, visibility, files touched, cargo result>).\n\nStrict refusal rules:\n- Never call tools outside the refactor persona surface.\n- Never move impl_method items with this atom.\n- Never broaden item_names beyond the operator request.\n- Never apply after a blocked plan.\n\nInputs:\n{{project_dir}} {{source_file}} {{target_file}} {{item_names}} {{item_kinds}} {{visibility}} {{module_name}} {{target_prelude}} {{use_decl_visibility}} {{use_decl_items}} {{merge_into_existing_target}} {{apply}} {{validation_bin}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "cargo_result": { "type": "object", "additionalProperties": true },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "target_file": { "type": "string" },
+          "items_moved": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}

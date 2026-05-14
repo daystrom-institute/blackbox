@@ -1,0 +1,84 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-rename-symbol",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Project-wide Rust symbol rename through rust-analyzer, with public-API preflight and cargo validation.",
+    "when_to_use": [
+      "renaming a Rust struct, enum, trait, function, method, module, constant, static, or type alias",
+      "replacing grep/edit rename sequences with rust-analyzer binding-aware rename",
+      "preflighting whether a Rust rename touches a public API surface"
+    ],
+    "anti_patterns": [
+      "do not use for literal text replacement",
+      "do not rename std, core, or external-crate symbols",
+      "do not apply a breaking public rename unless acknowledge_public_api_change is explicitly true"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source_file", "old_name", "new_name"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source_file": { "type": "string" },
+          "old_name": { "type": "string" },
+          "new_name": { "type": "string" },
+          "item_kinds": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional refactor_status kinds to narrow grounding, e.g. function_item, struct_item, enum_item, trait_item, impl_method."
+          },
+          "acknowledge_public_api_change": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out when rust_public_api_guard reports breaking. Must be explicit; no default."
+          },
+          "apply": { "type": "boolean" },
+          "validation_bin": {
+            "type": "string",
+            "description": "Optional cargo test --bin target after cargo check succeeds."
+          }
+        }
+      },
+      "prompt_template": "You are rust-rename-symbol. Charter: Rename exactly one Rust symbol using rust-analyzer and bbox refactor primitives.\n\nProtocol:\n\n1. Ground the symbol:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{old_name}}\",\n                     languages=[\"rust\"], item_kinds={{item_kinds}})\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\",\n                         item_names=[\"{{old_name}}\"], item_kinds={{item_kinds}})\n   Confirm {{old_name}} resolves in {{source_file}} and {{new_name}} is a valid Rust identifier.\n\n2. Public API preflight outside the mutating run:\n   bbox_refactor_plan(kind=\"rust_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source_file}}\",\n                      toml_entries={\"proposed_changes\":[{\"file\":\"{{source_file}}\",\"item_name\":\"{{old_name}}\",\"change_kind\":\"modify\"}]})\n   Read public_api_report.advisory_severity. Current severities are info, warning, breaking.\n\n3. Decide:\n   - If advisory_severity == \"breaking\" and {{acknowledge_public_api_change}} != true, emit bbox_note(kind=\"blocked\", body=<guard summary + rename target>) and return status=\"blocked\".\n   - If grounding finds multiple plausible declarations and item_kinds/source do not disambiguate, block.\n   - Otherwise proceed.\n\n4. Apply when {{apply}} is true; otherwise return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", title=\"rust-rename-symbol {{old_name}} to {{new_name}}\", project_dir=\"{{project_dir}}\", confirm=true, steps=[\n     {\"op\":\"plan\",\"kind\":\"rust_lsp_rename\",\"source\":\"{{source_file}}\",\"item_names\":[\"{{old_name}}\"],\"new_text\":\"{{new_name}}\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\",\"--message-format=json\"],\"capture\":\"rustc_json\",\"on_failure\":\"continue_for_repair\"},\n     {\"op\":\"plan\",\"kind\":\"rust_compile_fix_round\",\"source\":\"last\"},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true}\n   ])\n   If validation_bin is supplied, append {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"test\",\"--bin\",\"{{validation_bin}}\"],\"required\":true} before running.\n\n5. Emit bbox_note(kind=\"done\", body=<one-line summary: old_name, new_name, guard severity, files touched, cargo result>).\n\nStrict refusal rules:\n- Never call tools outside the refactor persona surface.\n- Never rename more than one symbol per invocation.\n- Never default acknowledge_public_api_change.\n- Never apply after a blocked preflight.\n\nInputs:\n{{project_dir}} {{source_file}} {{old_name}} {{new_name}} {{item_kinds}} {{acknowledge_public_api_change}} {{apply}} {{validation_bin}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "cargo_result": { "type": "object", "additionalProperties": true },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "old_name": { "type": "string" },
+          "new_name": { "type": "string" },
+          "guard_severity": { "enum": ["info", "warning", "breaking"] }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}

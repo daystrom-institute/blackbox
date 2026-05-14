@@ -61,6 +61,38 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-rust-rename-symbol",
+      "query": "rename a rust function or type through rust analyzer and check public api impact",
+      "expected_atoms": [
+        "rust-rename-symbol"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-extract-to-submodule",
+      "query": "move rust structs or functions into a sibling submodule file",
+      "expected_atoms": [
+        "rust-extract-to-submodule"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-organize-imports",
+      "query": "organize imports in one rust file with rust analyzer",
+      "expected_atoms": [
+        "rust-organize-imports"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-cargo-add-dep",
+      "query": "add a cargo dependency entry to Cargo.toml and validate cargo check",
+      "expected_atoms": [
+        "rust-cargo-add-dep"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-extract-cohesive-class",
       "query": "extract a cohesive java cluster with methods fields delegate wiring",
       "expected_atoms": [

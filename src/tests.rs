@@ -1682,6 +1682,74 @@ async fn shipped_refactor_atom_installs_after_persona_brofile() {
 }
 
 #[tokio::test]
+async fn shipped_rust_batch2_atoms_install_after_persona_brofile() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let brofile: serde_json::Value = serde_json::from_str(include_str!(
+        "../system-defaults/brofiles/refactor/rust-refactor-persona.json"
+    ))
+    .unwrap();
+
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Brofile,
+            source: "system-defaults/brofiles/refactor/rust-refactor-persona.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        brofile,
+    )
+    .await
+    .unwrap();
+
+    let atoms = [
+        (
+            "system-defaults/atoms/refactor/rust-rename-symbol.json",
+            "rust-rename-symbol",
+            include_str!("../system-defaults/atoms/refactor/rust-rename-symbol.json"),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-extract-to-submodule.json",
+            "rust-extract-to-submodule",
+            include_str!("../system-defaults/atoms/refactor/rust-extract-to-submodule.json"),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-organize-imports.json",
+            "rust-organize-imports",
+            include_str!("../system-defaults/atoms/refactor/rust-organize-imports.json"),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-cargo-add-dep.json",
+            "rust-cargo-add-dep",
+            include_str!("../system-defaults/atoms/refactor/rust-cargo-add-dep.json"),
+        ),
+    ];
+
+    for (source, expected_name, body) in atoms {
+        let atom: serde_json::Value = serde_json::from_str(body).unwrap();
+        let meta = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: source.into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            atom,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.kind, artifacts::ArtifactKind::Atom);
+        assert_eq!(meta.name, expected_name);
+        assert!(meta.active);
+    }
+}
+
+#[tokio::test]
 async fn atom_invoke_workflow_wrapper_returns_workflow_handle() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);

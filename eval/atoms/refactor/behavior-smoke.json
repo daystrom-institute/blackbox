@@ -93,6 +93,57 @@
       "done_note_required": true
     },
     {
+      "atom": "rust-rename-symbol",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:rust_public_api_guard",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "public-rust-symbol-rename-without-acknowledge",
+        "expected_block_reason_substring": "breaking"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-extract-to-submodule",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_rust_items_to_submodule",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "existing-target-without-merge",
+        "expected_block_reason_substring": "target"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-organize-imports",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:rust_organize_imports",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-cargo-add-dep",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:ensure_toml_table",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "existing-dependency",
+        "expected_block_reason_substring": "already"
+      },
+      "done_note_required": true
+    },
+    {
       "atom": "rust-split-god-impl",
       "expected_plan_sequence": [
         "bbox_code_symbols",

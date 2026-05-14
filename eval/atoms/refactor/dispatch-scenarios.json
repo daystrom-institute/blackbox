@@ -133,6 +133,79 @@
       ]
     },
     {
+      "id": "dispatch-rust-rename-symbol-planonly",
+      "atom": "rust-rename-symbol",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/lib.rs",
+        "old_name": "old_name",
+        "new_name": "new_name",
+        "item_kinds": [
+          "function"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "old_name",
+        "new_name",
+        "guard_severity"
+      ]
+    },
+    {
+      "id": "dispatch-rust-extract-to-submodule-planonly",
+      "atom": "rust-extract-to-submodule",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/lib.rs",
+        "target_file": "src/extracted.rs",
+        "item_names": [
+          "Widget"
+        ],
+        "module_name": "extracted",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "target_file",
+        "items_moved"
+      ]
+    },
+    {
+      "id": "dispatch-rust-organize-imports-planonly",
+      "atom": "rust-organize-imports",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/lib.rs",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "files_touched",
+        "import_edits"
+      ]
+    },
+    {
+      "id": "dispatch-rust-cargo-add-dep-planonly",
+      "atom": "rust-cargo-add-dep",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "crate_name": "serde",
+        "version": "1",
+        "features": [
+          "derive"
+        ],
+        "apply": false,
+        "skip_validation": true
+      },
+      "expect_response_fields": [
+        "status",
+        "crate_name",
+        "toml_table",
+        "entry_shape"
+      ]
+    },
+    {
       "id": "dispatch-java-extract-cohesive-class-planonly",
       "atom": "java-extract-cohesive-class",
       "args": {

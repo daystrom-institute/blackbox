@@ -1,0 +1,92 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-cargo-add-dep",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Add a new Cargo dependency entry using structured TOML editing and cargo check validation.",
+    "when_to_use": [
+      "adding a new crate dependency to Cargo.toml",
+      "adding a dev-dependency or build-dependency without hand-editing TOML",
+      "adding a git or path dependency after the code already references a crate"
+    ],
+    "anti_patterns": [
+      "do not use to update an existing dependency",
+      "do not use on non-Cargo Rust projects",
+      "do not use when dependency resolution requires network access that the caller did not authorize"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "crate_name"],
+        "oneOf": [
+          { "required": ["version"] },
+          { "required": ["git"] },
+          { "required": ["path"] }
+        ],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "crate_name": { "type": "string" },
+          "version": { "type": "string" },
+          "features": { "type": "array", "items": { "type": "string" } },
+          "optional": { "type": "boolean" },
+          "default_features": { "type": "boolean" },
+          "git": { "type": "string" },
+          "branch": { "type": "string" },
+          "tag": { "type": "string" },
+          "rev": { "type": "string" },
+          "path": { "type": "string" },
+          "package": { "type": "string" },
+          "toml_table": {
+            "enum": ["dependencies", "dev-dependencies", "build-dependencies"],
+            "description": "Defaults to dependencies."
+          },
+          "apply": { "type": "boolean" },
+          "skip_validation": {
+            "type": "boolean",
+            "description": "When true, do not run cargo check after applying. Use only when dependency resolution intentionally needs offline follow-up."
+          }
+        }
+      },
+      "prompt_template": "You are rust-cargo-add-dep. Charter: Add one new Cargo dependency entry through ensure_toml_table.\n\nProtocol:\n\n1. Ground Cargo.toml:\n   Read {{project_dir}}/Cargo.toml. Parse the relevant table (default dependencies when toml_table is absent). If {{crate_name}} already exists in that table, emit bbox_note(kind=\"blocked\", body=<existing entry>) and return status=\"blocked\". Do not update existing dependencies.\n\n2. Build toml_entries:\n   - Simple registry dep with only version: {\"{{crate_name}}\":\"{{version}}\"}\n   - Complex registry dep: {\"{{crate_name}}\":{\"version\":\"{{version}}\",\"features\":{{features}},\"optional\":{{optional}},\"default-features\":{{default_features}},\"package\":\"{{package}}\"}}\n   - Git dep: {\"{{crate_name}}\":{\"git\":\"{{git}}\",\"branch\":\"{{branch}}\",\"tag\":\"{{tag}}\",\"rev\":\"{{rev}}\",\"features\":{{features}},\"package\":\"{{package}}\"}}\n   - Path dep: {\"{{crate_name}}\":{\"path\":\"{{path}}\",\"features\":{{features}},\"package\":\"{{package}}\"}}\n   Omit absent optional keys instead of emitting null. The ensure_toml_table plan supports inline-table values in this branch.\n\n3. Plan:\n   bbox_refactor_plan(kind=\"ensure_toml_table\", project_dir=\"{{project_dir}}\", source=\"Cargo.toml\", toml_table=\"{{toml_table}}\", toml_entries=<built map>)\n   Inspect the TOML edit and confirm it parses.\n\n4. Apply when {{apply}} is true:\n   bbox_refactor_run(dispatch_origin=\"agent\", title=\"rust-cargo-add-dep {{crate_name}}\", project_dir=\"{{project_dir}}\", confirm=true, steps=[\n     {\"op\":\"plan\",\"kind\":\"ensure_toml_table\",\"source\":\"Cargo.toml\",\"toml_table\":\"{{toml_table}}\",\"toml_entries\":<built map>},\n     {\"op\":\"command\",\"command\":\"cargo\",\"args\":[\"check\"],\"required\":true}\n   ])\n   If skip_validation is true, omit the cargo check command and state that validation was skipped.\n\n5. Emit bbox_note(kind=\"done\", body=<one-line summary: table, crate_name, entry shape, cargo result or skipped validation>).\n\nStrict refusal rules:\n- Never update or replace an existing dependency.\n- Never emit null TOML values.\n- Never add more than one crate per invocation.\n\nInputs:\n{{project_dir}} {{crate_name}} {{version}} {{features}} {{optional}} {{default_features}} {{git}} {{branch}} {{tag}} {{rev}} {{path}} {{package}} {{toml_table}} {{apply}} {{skip_validation}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "cargo_result": { "type": "object", "additionalProperties": true },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "crate_name": { "type": "string" },
+          "toml_table": { "type": "string" },
+          "entry_shape": { "enum": ["version", "registry_table", "git", "path"] }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:rust-refactor-persona@v1"
+    },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-13T00:00:00Z"
+    }
+  }
+}
