@@ -16,5 +16,8 @@
 
 pub mod config;
 pub mod json_store;
+pub mod render;
 pub mod secrets;
+pub mod slack_channel_bindings;
+pub mod slack_proposal_links;
 pub mod util;

@@ -34,7 +34,6 @@ mod gap_spool;
 mod git;
 mod inbox;
 mod index;
-mod json_store;
 mod knowledge;
 mod lsp;
 mod manifest;
@@ -52,13 +51,10 @@ mod projects;
 mod providers;
 mod query;
 mod refactor;
-mod render;
 mod roadmap;
 mod routing;
 mod search;
 mod server;
-mod slack_channel_bindings;
-mod slack_proposal_links;
 mod slack_thread_store;
 mod snapshot;
 mod storage_health;
@@ -179,6 +175,10 @@ impl BlackboxServer {
 use artifacts::{
     ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
+use blackbox::json_store;
+use blackbox::render;
+use blackbox::slack_channel_bindings;
+use blackbox::slack_proposal_links;
 pub(crate) use dispatch_mcp::dispatch_mcp_url;
 use embed::ReembedParams;
 use inbox::InboxParams;

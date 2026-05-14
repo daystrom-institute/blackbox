@@ -387,3 +387,204 @@ impl<'a> WorkflowRunner<'a> {
         Ok(plans)
     }
 }
+
+#[derive(Clone)]
+pub(super) struct FanoutRuntime {
+    pub(super) kind: &'static str,
+    pub(super) items: Vec<Value>,
+    pub(super) as_var: String,
+    pub(super) index_as: Option<String>,
+    pub(super) key_template: Option<String>,
+    pub(super) child_workflow: Workflow,
+    pub(super) imports: Vec<String>,
+    pub(super) import_renames: HashMap<String, String>,
+    pub(super) exports: Vec<String>,
+    pub(super) parallelism: usize,
+    pub(super) collect_into: String,
+    pub(super) failure_policy: ItemFailurePolicy,
+}
+
+#[derive(Clone)]
+pub(super) struct FanoutChildPlan {
+    pub(super) index: usize,
+    pub(super) key: String,
+    pub(super) item: Value,
+    pub(super) initial_vars: Map<String, Value>,
+}
+
+pub(super) struct FanoutChildOutcome {
+    pub(super) index: usize,
+    pub(super) key: String,
+    pub(super) item: Value,
+    pub(super) status: String,
+    pub(super) exports: Map<String, Value>,
+    pub(super) outputs: Map<String, Value>,
+    pub(super) arc_id: String,
+    pub(super) arc_thread_id: Option<String>,
+    pub(super) error: Option<String>,
+}
+
+pub(super) async fn run_fanout_child_owned(
+    state: Arc<crate::SharedState>,
+    compiled: CompiledWorkflow,
+    project_dir: Option<String>,
+    child_depth: u32,
+    seed_outputs: HashMap<String, String>,
+    parent_arc_id: String,
+    parent_cancel_token: CancellationToken,
+    plan: FanoutChildPlan,
+    exports: Vec<String>,
+) -> FanoutChildOutcome {
+    let server = BlackboxServer::new(state);
+    run_fanout_child(
+        &server,
+        compiled,
+        project_dir,
+        child_depth,
+        seed_outputs,
+        parent_arc_id,
+        parent_cancel_token,
+        plan,
+        exports,
+    )
+    .await
+}
+
+pub(super) async fn run_fanout_child(
+    server: &BlackboxServer,
+    compiled: CompiledWorkflow,
+    project_dir: Option<String>,
+    child_depth: u32,
+    seed_outputs: HashMap<String, String>,
+    parent_arc_id: String,
+    parent_cancel_token: CancellationToken,
+    plan: FanoutChildPlan,
+    exports: Vec<String>,
+) -> FanoutChildOutcome {
+    let result = Box::pin(run_workflow_at_depth_with_cancel(
+        server,
+        &compiled,
+        project_dir,
+        Some(25),
+        child_depth,
+        seed_outputs,
+        plan.initial_vars,
+        Some(parent_arc_id),
+        Some(parent_cancel_token),
+        None,
+    ))
+    .await;
+
+    let mut export_values = Map::new();
+    let mut error = None;
+    if result.status.starts_with("completed") {
+        for key in &exports {
+            match result.vars.get(key) {
+                Some(value) => {
+                    export_values.insert(key.clone(), value.clone());
+                }
+                None => {
+                    error = Some(format!(
+                        "child workflow '{}' did not export declared key '{key}'",
+                        compiled.spec.name
+                    ));
+                    break;
+                }
+            }
+        }
+    } else {
+        error = Some(result.status.clone());
+    }
+
+    let outputs = result
+        .node_outputs
+        .into_iter()
+        .map(|(key, value)| (key, Value::String(value)))
+        .collect();
+    let status = if error.is_some() {
+        if result.status == "cancelled" {
+            "cancelled".to_string()
+        } else {
+            "error".to_string()
+        }
+    } else {
+        "completed".to_string()
+    };
+    FanoutChildOutcome {
+        index: plan.index,
+        key: plan.key,
+        item: plan.item,
+        status,
+        exports: export_values,
+        outputs,
+        arc_id: result.arc_id,
+        arc_thread_id: result.arc_thread_id,
+        error,
+    }
+}
+
+pub(super) fn fanout_skipped_value(index: usize, plan: &FanoutChildPlan) -> Value {
+    json!({
+        "index": index,
+        "key": plan.key,
+        "item": plan.item,
+        "status": "skipped",
+        "exports": {},
+        "outputs": {},
+        "error": "not dispatched after earlier item failure"
+    })
+}
+
+pub(super) fn expand_matrix_items(
+    node_id: &str,
+    axes: &[(String, Vec<Value>)],
+) -> Result<Vec<Value>> {
+    let mut items: Vec<Map<String, Value>> = vec![Map::new()];
+    for (axis_name, values) in axes {
+        let projected = items
+            .len()
+            .checked_mul(values.len())
+            .ok_or_else(|| anyhow!("matrix node '{node_id}' item count overflow"))?;
+        if projected > MAX_FOREACH_ITEMS {
+            bail!(
+                "matrix node '{node_id}' would materialize {projected} items, above ceiling {MAX_FOREACH_ITEMS}"
+            );
+        }
+        let mut next = Vec::with_capacity(projected);
+        for base in &items {
+            for value in values {
+                let mut item = base.clone();
+                item.insert(axis_name.clone(), value.clone());
+                next.push(item);
+            }
+        }
+        items = next;
+    }
+    Ok(items.into_iter().map(Value::Object).collect())
+}
+
+impl FanoutChildOutcome {
+    fn is_failure(&self) -> bool {
+        self.status != "completed"
+    }
+
+    fn into_value(self) -> Value {
+        let mut out = Map::new();
+        out.insert("index".into(), json!(self.index));
+        out.insert("key".into(), Value::String(self.key));
+        out.insert("item".into(), self.item);
+        out.insert("status".into(), Value::String(self.status));
+        out.insert("exports".into(), Value::Object(self.exports));
+        out.insert("outputs".into(), Value::Object(self.outputs));
+        if !self.arc_id.is_empty() {
+            out.insert("arc_id".into(), Value::String(self.arc_id));
+        }
+        if let Some(thread_id) = self.arc_thread_id {
+            out.insert("arc_thread_id".into(), Value::String(thread_id));
+        }
+        if let Some(error) = self.error {
+            out.insert("error".into(), Value::String(error));
+        }
+        Value::Object(out)
+    }
+}
