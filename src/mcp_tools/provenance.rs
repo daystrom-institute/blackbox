@@ -89,11 +89,23 @@ pub fn export_provenance(
 
     let notes_ref = crate::git::notes_ref("provenance");
     let mut notes_written = 0u64;
+    // Track which roots we've already configured to avoid redundant git calls.
+    let mut configured_roots: std::collections::HashSet<String> = std::collections::HashSet::new();
     for ((project_id, commit), edges) in grouped {
         let Some(project) = project_map.get(&project_id) else {
             continue;
         };
         let root = Path::new(&project.canonical_path);
+        // Auto-configure notes.mergeStrategy=union once per repo so
+        // cross-machine provenance merges union rather than abort.
+        if configured_roots.insert(project.canonical_path.clone()) {
+            if let Err(e) = crate::git::ensure_notes_merge_strategy_union(root) {
+                tracing::warn!(
+                    path = %root.display(),
+                    "could not set notes.mergeStrategy union: {e:#}"
+                );
+            }
+        }
         let note = note_from_edges(&commit, &edges, edge_index);
         let body = serde_json::to_string_pretty(&note)? + "\n";
         crate::git::write_note(root, &notes_ref, &commit, &body)?;

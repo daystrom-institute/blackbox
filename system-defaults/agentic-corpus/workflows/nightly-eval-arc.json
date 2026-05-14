@@ -4,7 +4,9 @@
   "policy_packet": "domain:workflow-policy/arc-budget",
   "vars_schema": {
     "suite_started": { "kind": "bool" },
+    "suite_output": { "kind": "any" },
     "suite_complete": { "kind": "bool" },
+    "suite_score": { "kind": "any" },
     "score_complete": { "kind": "bool" },
     "published": { "kind": "bool" },
     "operator_alerted": { "kind": "bool" },
@@ -31,7 +33,9 @@
           "args": {
             "argv": ["bash", "eval/run-agentic-eval.sh", "all", "1", "1"],
             "cwd": "${meta.project_dir}"
-          }
+          },
+          "into_var": "suite_output",
+          "on_failure": "warn"
         },
         {
           "op": "set_var",
@@ -43,6 +47,11 @@
     "Score": {
       "actor": "",
       "on_enter": [
+        {
+          "op": "score_eval_output",
+          "args": { "from": "${vars.suite_output}" },
+          "into_var": "suite_score"
+        },
         {
           "op": "set_var",
           "args": { "key": "score_complete", "value": true }

@@ -245,6 +245,31 @@ pub(crate) fn write_note(root: &Path, notes_ref: &str, commit: &str, body: &str)
     Ok(())
 }
 
+/// Idempotently set `notes.mergeStrategy = union` in the repo at `root`.
+///
+/// Cross-machine provenance exports push to the same notes ref from multiple
+/// machines. Without this setting, `git notes merge` uses the default
+/// "manual" strategy which aborts on conflict rather than unioning the note
+/// bodies. Setting `union` once per repo makes concurrent provenance pushes
+/// safe; git config writes are idempotent so calling this on every export is
+/// harmless.
+pub(crate) fn ensure_notes_merge_strategy_union(root: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["config", "notes.mergeStrategy", "union"])
+        .output()
+        .with_context(|| format!("setting notes.mergeStrategy union in {}", root.display()))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git config notes.mergeStrategy union failed in {}: {}",
+            root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn show_note(root: &Path, notes_ref: &str, commit: &str) -> Result<Option<String>> {
     let Some(output) = git_output(
         root,

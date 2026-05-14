@@ -129,6 +129,7 @@ pub(crate) struct SharedState {
     pub(crate) lsp_sessions: lsp::LspSessionManager,
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
     pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
+    pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
 }
 
 pub(crate) const SIGNAL_LOG_CAP: usize = 200;
@@ -317,6 +318,7 @@ impl SharedState {
                     store_dir.join("atom-invocations.json"),
                 ),
             )),
+            vector_store: crate::vectors::global(),
         }
     }
 }

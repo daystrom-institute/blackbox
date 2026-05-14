@@ -7,7 +7,8 @@
     "candidate": { "kind": "object" },
     "votes": { "kind": "array" },
     "vote_aggregate": { "kind": "object" },
-    "semantic_edge": { "kind": "any" }
+    "semantic_edge": { "kind": "any" },
+    "scan_cap": { "kind": "int" }
   },
   "actors": {
     "classifiers": {
@@ -29,6 +30,11 @@
             "edge_kinds": ["DESCRIBES", "REFERENCES"]
           },
           "into_var": "candidate_pairs",
+          "on_failure": "warn"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "candidate", "value": "${vars.candidate_pairs.candidates.0}" },
           "on_failure": "warn"
         }
       ],

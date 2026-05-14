@@ -27,6 +27,14 @@ pub enum TailEvent {
         task_id: String,
         elapsed: String,
         cost: Option<f64>,
+        /// Session ID of the completed bro task. Carried into the
+        /// `task-completed` routing signal so auto-digest-arc can read
+        /// the session transcript without a separate lookup.
+        source_session: String,
+        /// Brofile / team context label from `TaskInner.bro_label`.
+        /// Populated as `task_kind` in the routing entity so downstream
+        /// packets can filter by bro type (executor vs. ensemble, etc.).
+        task_kind: Option<String>,
     },
     TaskFailed {
         task_id: String,

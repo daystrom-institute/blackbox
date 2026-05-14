@@ -1752,6 +1752,7 @@ async fn main() -> anyhow::Result<()> {
                 store_dir.join("atom-invocations.json"),
             ),
         )),
+        vector_store: vectors::global(),
     });
     shared
         .agent_adapter_registry
@@ -1781,6 +1782,53 @@ async fn main() -> anyhow::Result<()> {
     // land via the auto-reindex thread (60s poll interval is sufficient
     // since the reindex tick is 120s by default).
     spawn_edge_index_rebuild_watcher(shared.clone(), std::time::Duration::from_secs(60));
+
+    // Task-completed router: subscribe to tail events and forward each
+    // TaskCompleted as a `task-completed` signal through the installed
+    // routing packet (domain:auto-digest/task-completed-routing). When
+    // the packet is not installed the dispatch is a fast no_match
+    // dead-letter — no performance impact on normal operation.
+    {
+        let shared_for_router = shared.clone();
+        let mut tail_rx = tail_tx.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match tail_rx.recv().await {
+                    Ok(orchestration::tail::TailEvent::TaskCompleted {
+                        task_id,
+                        source_session,
+                        task_kind,
+                        ..
+                    }) => {
+                        let entity = serde_json::json!({
+                            "signal": "task-completed",
+                            "event_type": "task-completed",
+                            "kind": "task-completed",
+                            "task_id": task_id,
+                            "session_id": source_session,
+                            "task_kind": task_kind,
+                        });
+                        if let Err(e) = dispatch_routed_event(
+                            shared_for_router.clone(),
+                            "task-completed",
+                            "domain:auto-digest/task-completed-routing",
+                            entity,
+                            None,
+                        )
+                        .await
+                        {
+                            tracing::debug!("task-completed router: {e:#}");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("task-completed router: lagged {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
 
     // Start .bbox/ filesystem watcher for all registered projects.
     {

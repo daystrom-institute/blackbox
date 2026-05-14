@@ -8,6 +8,7 @@
     "search_quiesced": { "kind": "bool" },
     "index_dropped": { "kind": "bool" },
     "rebuild_started": { "kind": "bool" },
+    "rebuild_result": { "kind": "any" },
     "verified": { "kind": "bool" },
     "swapped": { "kind": "bool" }
   },
@@ -42,6 +43,9 @@
       "actor": "",
       "on_enter": [
         {
+          "op": "schema_migration_drop"
+        },
+        {
           "op": "set_var",
           "args": { "key": "index_dropped", "value": true }
         }
@@ -51,6 +55,11 @@
     "Rebuild": {
       "actor": "",
       "on_enter": [
+        {
+          "op": "schema_migration_rebuild",
+          "into_var": "rebuild_result",
+          "on_failure": "warn"
+        },
         {
           "op": "set_var",
           "args": { "key": "rebuild_started", "value": true }

@@ -80,6 +80,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
                 tmp.path().join("atom-invocations.json"),
             ),
         )),
+        vector_store: crate::vectors::global(),
     });
     BlackboxServer::new(state)
 }

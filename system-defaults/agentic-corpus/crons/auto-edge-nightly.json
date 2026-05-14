@@ -1,0 +1,7 @@
+{
+  "name": "auto-edge-nightly",
+  "schedule": "0 0 2 * * *",
+  "payload": {},
+  "concurrency": 1,
+  "routing_packet": "domain:cron-routing/auto-edge"
+}

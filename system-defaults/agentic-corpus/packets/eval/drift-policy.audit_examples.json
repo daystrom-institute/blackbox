@@ -4,9 +4,21 @@
   "dataset": [
     {
       "entity": {
-        "drift_pp": 7.0
+        "vars": { "suite_score": { "drift_pp": 7.0, "suite_exit_code": 1, "raw_stdout": "" } }
       },
       "expected": "drift_minor"
+    },
+    {
+      "entity": {
+        "vars": { "suite_score": { "drift_pp": 12.5, "suite_exit_code": 1, "raw_stdout": "" } }
+      },
+      "expected": "drift_major"
+    },
+    {
+      "entity": {
+        "vars": { "suite_score": { "drift_pp": 2.0, "suite_exit_code": 0, "raw_stdout": "" } }
+      },
+      "expected": "stable"
     }
   ]
 }

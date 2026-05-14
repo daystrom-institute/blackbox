@@ -916,6 +916,8 @@ pub fn finish_in_process_task(
     let task_id = inner.id.clone();
     let elapsed = format_elapsed(inner.started_at, inner.completed_at);
     let cost = inner.cost_usd;
+    let source_session = inner.session_id.clone();
+    let task_kind = inner.bro_label.clone();
     let error: String = inner.stderr.chars().take(200).collect();
     drop(inner);
 
@@ -925,6 +927,8 @@ pub fn finish_in_process_task(
                 task_id,
                 elapsed,
                 cost,
+                source_session,
+                task_kind,
             });
         }
         TaskStatus::Failed => {
@@ -1394,12 +1398,16 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             inner.completed_at = Some(now_ms());
 
             let elapsed = format_elapsed(inner.started_at, inner.completed_at);
+            let source_session_w = inner.session_id.clone();
+            let task_kind_w = inner.bro_label.clone();
             match inner.status {
                 TaskStatus::Completed => {
                     let _ = tail_tx_wait.send(tail::TailEvent::TaskCompleted {
                         task_id: task_id_wait.clone(),
                         elapsed,
                         cost: inner.cost_usd,
+                        source_session: source_session_w,
+                        task_kind: task_kind_w,
                     });
                 }
                 TaskStatus::Failed => {

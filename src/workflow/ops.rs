@@ -132,6 +132,25 @@ pub enum OpKind {
     SurfaceToInbox,
     /// Record an auto-digest rejection.
     LogReject,
+    /// Observable marker for the index-drop step of a schema migration.
+    /// Emits a structured trace event; actual document deletion happens in
+    /// the paired `SchemaMigrationRebuild` op which calls `bbox_reindex`.
+    SchemaMigrationDrop,
+    /// Run a full tantivy rebuild via `bbox_reindex(full=true)`. This is the
+    /// live runner for schema-migration-arc's Rebuild node — the workflow
+    /// owns the drop+rebuild lifecycle rather than relying on startup-time
+    /// `reset_index_on_schema_mismatch` alone.
+    SchemaMigrationRebuild,
+    /// Compute an eval drift score from captured shell output and write
+    /// `drift_pp` into `vars[into_var]`. Reads `args.suite_output` (the
+    /// `{exit_code, stdout, stderr, parsed}` blob captured by a Shell op)
+    /// and extracts a percentage-points drift figure for the drift-policy
+    /// gate in the nightly-eval-arc Decide node.
+    ScoreEvalOutput,
+    /// Pick the first element of a `vars[array_var]` array into
+    /// `vars[into_var]`. Writes `Value::Null` when the array is absent or
+    /// empty so downstream `IsNull` predicates can short-circuit cleanly.
+    PickFirst,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -179,7 +198,7 @@ pub async fn execute_op(
         OpKind::AppendVar => exec_append_var(&rendered_args, ctx),
         OpKind::MergeVar => exec_merge_var(&rendered_args, ctx),
         OpKind::ParseJson => exec_parse_json(&rendered_args, hook.into_var.as_deref()),
-        OpKind::Shell => exec_shell(&rendered_args, ctx).await,
+        OpKind::Shell => exec_shell(&rendered_args, hook.into_var.as_deref(), ctx).await,
         OpKind::WorktreeCreate => exec_worktree_create(&rendered_args, ctx).await,
         OpKind::WorktreeRemove => exec_worktree_remove(&rendered_args, ctx).await,
         OpKind::SetMeta => exec_set_meta(&rendered_args),
@@ -201,7 +220,7 @@ pub async fn execute_op(
             exec_append_knowledge_link(&rendered_args, hook.into_var.as_deref(), ctx).await
         }
         OpKind::ExtractCandidatePairs => {
-            exec_extract_candidate_pairs(&rendered_args, hook.into_var.as_deref())
+            exec_extract_candidate_pairs(&rendered_args, hook.into_var.as_deref(), ctx).await
         }
         OpKind::AggregateAutoEdgeVotes => {
             exec_aggregate_auto_edge_votes(&rendered_args, hook.into_var.as_deref())
@@ -211,6 +230,14 @@ pub async fn execute_op(
         }
         OpKind::SurfaceToInbox => exec_surface_to_inbox(&rendered_args, ctx).await,
         OpKind::LogReject => exec_log_reject(&rendered_args, ctx).await,
+        OpKind::SchemaMigrationDrop => Ok(exec_schema_migration_drop(ctx)),
+        OpKind::SchemaMigrationRebuild => {
+            exec_schema_migration_rebuild(hook.into_var.as_deref(), ctx).await
+        }
+        OpKind::ScoreEvalOutput => {
+            exec_score_eval_output(&rendered_args, hook.into_var.as_deref(), ctx)
+        }
+        OpKind::PickFirst => exec_pick_first(&rendered_args, hook.into_var.as_deref(), ctx),
     }
 }
 
@@ -371,16 +398,93 @@ async fn exec_append_knowledge_link(
     })
 }
 
-fn exec_extract_candidate_pairs(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
-    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50);
+/// Scan the knowledge corpus for entity pairs that may warrant a semantic
+/// edge (DESCRIBES or REFERENCES) but have no such edge yet.
+///
+/// Strategy:
+/// 1. Two staggered `bbox_hybrid_search` queries seed a pool of topically
+///    relevant entities.
+/// 2. Consecutive pairs from the merged, deduplicated pool become candidates,
+///    capped at `limit`.
+/// 3. Each candidate carries entity refs, labels, and excerpts so the
+///    downstream ClassifyVote actor can vote without extra lookups.
+async fn exec_extract_candidate_pairs(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
+    let edge_kinds: Vec<String> = args
+        .get("edge_kinds")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_else(|| vec!["DESCRIBES".to_string(), "REFERENCES".to_string()]);
+    let edge_kind = edge_kinds
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("REFERENCES");
+
+    // Two complementary queries to maximise variety in the candidate pool.
+    let queries = ["knowledge convention decision", "learned assumption rule"];
+    let mut pool: Vec<Value> = Vec::new();
+    for query in &queries {
+        let result = call_blackbox_tool(
+            "bbox_hybrid_search",
+            json!({ "query": query, "limit": limit }),
+            ctx,
+        )
+        .await
+        .unwrap_or(Value::Null);
+        if let Some(hits) = result.get("hits").and_then(Value::as_array) {
+            pool.extend(hits.iter().cloned());
+        }
+    }
+
+    // Deduplicate by entity_ref before pairing.
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    pool.retain(|hit| {
+        let r = hit
+            .get("entity_ref")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        seen.insert(r)
+    });
+
+    // Build consecutive pairs up to `limit`.
+    let candidates: Vec<Value> = pool
+        .chunks(2)
+        .take(limit)
+        .filter_map(|chunk| {
+            let src = chunk.first()?;
+            let tgt = chunk.get(1)?;
+            let src_ref = src.get("entity_ref").and_then(Value::as_str)?;
+            let tgt_ref = tgt.get("entity_ref").and_then(Value::as_str)?;
+            if src_ref == tgt_ref {
+                return None;
+            }
+            Some(json!({
+                "source": src_ref,
+                "target": tgt_ref,
+                "edge_kind": edge_kind,
+                "source_label": src.get("label").and_then(Value::as_str).unwrap_or(src_ref),
+                "target_label": tgt.get("label").and_then(Value::as_str).unwrap_or(tgt_ref),
+                "source_excerpt": src.get("excerpt").and_then(Value::as_str).unwrap_or(""),
+                "target_excerpt": tgt.get("excerpt").and_then(Value::as_str).unwrap_or(""),
+            }))
+        })
+        .collect();
+
     Ok(OpEffect::SetVar {
         key: into_var.unwrap_or("candidate_pairs").to_string(),
         value: json!({
             "limit": limit,
-            "candidates": [],
-            "degraded": {
-                "reason": "scheduled candidate scan is observable-only in v1; seed vars.candidate for manual runs"
-            }
+            "scanned": pool.len(),
+            "candidates": candidates,
         }),
     })
 }
@@ -884,7 +988,12 @@ fn strip_code_fence(s: &str) -> Option<String> {
     Some(lines[opener_idx + 1..closer_idx].join("\n"))
 }
 
-async fn exec_shell(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
+/// Execute a shell command. When `into_var` is provided the op captures
+/// `{exit_code, stdout, stderr, parsed}` into `vars[into_var]` and does NOT
+/// fail on a non-zero exit code — the caller decides what to do with the
+/// exit code via downstream ops or packet gates. Without `into_var` the
+/// original behaviour is preserved: non-zero exit aborts the op.
+async fn exec_shell(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> Result<OpEffect> {
     let argv = args
         .get("argv")
         .and_then(|v| v.as_array())
@@ -918,12 +1027,28 @@ async fn exec_shell(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
         .output()
         .await
         .map_err(|e| anyhow!("Shell spawn failed: {e}"))?;
+
+    let exit_code = output.status.code().unwrap_or(-1);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr_str = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // When into_var is set: always capture output, never fail on non-zero exit.
+    // Downstream ops (ScoreEvalOutput, packet gates) decide what to do with it.
+    if let Some(key) = into_var {
+        let parsed: Value = serde_json::from_str(stdout.trim()).unwrap_or(Value::Null);
+        return Ok(OpEffect::SetVar {
+            key: key.to_string(),
+            value: json!({
+                "exit_code": exit_code,
+                "stdout": stdout,
+                "stderr": stderr_str,
+                "parsed": parsed,
+            }),
+        });
+    }
+
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        bail!(
-            "Shell {strs:?} exited with {:?}: {stderr}",
-            output.status.code()
-        );
+        bail!("Shell {strs:?} exited with {exit_code}: {stderr_str}",);
     }
     Ok(OpEffect::None)
 }
@@ -1157,6 +1282,148 @@ fn exec_set_meta(args: &Value) -> Result<OpEffect> {
         }
         other => bail!("SetMeta: unsupported key '{other}' (mutable keys: worktree, project_dir)"),
     }
+}
+
+// ── Schema migration ops ─────────────────────────────────────────────────────
+
+/// Observable marker for the index-drop node. Logs intent and returns None;
+/// the actual document deletion is performed by the following
+/// `SchemaMigrationRebuild` op via a full `bbox_reindex`.
+fn exec_schema_migration_drop(ctx: &ArcContext) -> OpEffect {
+    tracing::info!(
+        arc_id = %ctx.meta.arc_id,
+        project = ?ctx.meta.project_dir,
+        "schema_migration_drop: marking index for full rebuild"
+    );
+    OpEffect::None
+}
+
+/// Full tantivy rebuild via `bbox_reindex(full=true)`. Captures a JSON
+/// summary into `vars[into_var]` when set.
+async fn exec_schema_migration_rebuild(
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let result = call_blackbox_tool("bbox_reindex", json!({"full": true}), ctx).await?;
+    tracing::info!(
+        arc_id = %ctx.meta.arc_id,
+        "schema_migration_rebuild: full reindex complete"
+    );
+    match into_var {
+        Some(k) => Ok(OpEffect::SetVar {
+            key: k.to_string(),
+            value: result,
+        }),
+        None => Ok(OpEffect::None),
+    }
+}
+
+// ── Eval score op ────────────────────────────────────────────────────────────
+
+/// Parse captured shell output from a `RunSuite` step and compute `drift_pp`.
+///
+/// Reads `args.from` (or `args.suite_output`) — a `{exit_code, stdout, stderr,
+/// parsed}` blob captured by the preceding Shell op — and extracts:
+///   1. `parsed.drift_pp`   if the script emitted a JSON summary
+///   2. Exit-code heuristic: non-zero exit → assume minor drift (5 pp)
+///   3. Default 0.0          when neither signal is present
+///
+/// Writes `{drift_pp, suite_exit_code, raw_stdout}` into `vars[into_var]`.
+fn exec_score_eval_output(
+    args: &Value,
+    into_var: Option<&str>,
+    ctx: &ArcContext,
+) -> Result<OpEffect> {
+    let into = into_var.unwrap_or("suite_score");
+    let suite_output = args
+        .get("from")
+        .or_else(|| args.get("suite_output"))
+        .or_else(|| ctx.vars.get("suite_output"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    let exit_code = suite_output
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let stdout = suite_output
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+
+    // Extract drift_pp from the parsed JSON block first, then from stdout as
+    // a last-resort inline search for `"drift_pp": N`.
+    let drift_pp: f64 = suite_output
+        .get("parsed")
+        .and_then(|p| p.get("drift_pp"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            // Try to parse stdout directly as JSON
+            serde_json::from_str::<Value>(&stdout)
+                .ok()
+                .and_then(|v| v.get("drift_pp").and_then(Value::as_f64))
+        })
+        .unwrap_or_else(|| {
+            // Exit-code heuristic: non-zero → minor drift signal
+            if exit_code != 0 { 5.0 } else { 0.0 }
+        });
+
+    Ok(OpEffect::SetVar {
+        key: into.to_string(),
+        value: json!({
+            "drift_pp": drift_pp,
+            "suite_exit_code": exit_code,
+            "raw_stdout": stdout,
+        }),
+    })
+}
+
+// ── PickFirst op ─────────────────────────────────────────────────────────────
+
+/// Pick the first element of an array into `vars[into_var]`.
+///
+/// Reads the array from:
+/// - `args.from` if it is already an array value (e.g. a rendered template),
+/// - `vars[args.array]` if `args.array` is a simple var name,
+/// - `vars[args.array.path.…]` via dotted-path walk when the var is a nested
+///   object (e.g. `"array": "candidate_pairs.candidates"`).
+///
+/// Writes `Value::Null` when the array is absent or empty.
+fn exec_pick_first(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> Result<OpEffect> {
+    let into = into_var.ok_or_else(|| anyhow!("PickFirst requires into_var"))?;
+    let resolved: Option<Value> = if let Some(from) = args.get("from") {
+        Some(from.clone())
+    } else if let Some(path) = args.get("array").and_then(Value::as_str) {
+        // Walk dotted path inside vars.
+        let mut cur = Value::Object(ctx.vars.clone());
+        for seg in path.split('.') {
+            cur = match cur {
+                Value::Object(m) => m.get(seg).cloned().unwrap_or(Value::Null),
+                Value::Array(a) => {
+                    if let Ok(i) = seg.parse::<usize>() {
+                        a.get(i).cloned().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    }
+                }
+                _ => Value::Null,
+            };
+        }
+        Some(cur)
+    } else {
+        None
+    };
+    let first = resolved
+        .as_ref()
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .cloned()
+        .unwrap_or(Value::Null);
+    Ok(OpEffect::SetVar {
+        key: into.to_string(),
+        value: first,
+    })
 }
 
 #[cfg(test)]
@@ -1483,5 +1750,274 @@ mod tests {
             }
             _ => panic!("expected SetVar"),
         }
+    }
+
+    // ── Shell with into_var captures output without failing on non-zero ────────
+
+    #[tokio::test]
+    async fn shell_into_var_captures_output_on_success() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::Shell,
+            args: json!({"argv": ["echo", "hello"]}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("out".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "out");
+                assert_eq!(value["exit_code"], json!(0));
+                assert!(value["stdout"].as_str().unwrap().contains("hello"));
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_into_var_captures_output_on_nonzero_exit() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::Shell,
+            args: json!({"argv": ["false"]}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("out".into()),
+        };
+        // Should NOT fail even though `false` exits non-zero
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "out");
+                assert_ne!(value["exit_code"], json!(0));
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_into_var_parses_json_stdout() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::Shell,
+            args: json!({"argv": ["echo", "{\"drift_pp\": 7.5]"]}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("out".into()),
+        };
+        // Malformed JSON → parsed should be null, but the op still succeeds
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        assert!(matches!(effect, OpEffect::SetVar { .. }));
+    }
+
+    // ── ScoreEvalOutput ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn score_eval_output_reads_drift_from_parsed() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::ScoreEvalOutput,
+            args: json!({
+                "from": {
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed": {"drift_pp": 9.5}
+                }
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("score".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "score");
+                assert_eq!(value["drift_pp"], json!(9.5));
+                assert_eq!(value["suite_exit_code"], json!(0));
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn score_eval_output_falls_back_to_stdout_json() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::ScoreEvalOutput,
+            args: json!({
+                "from": {
+                    "exit_code": 0,
+                    "stdout": "{\"drift_pp\": 3.2}",
+                    "stderr": "",
+                    "parsed": null
+                }
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "suite_score");
+                let dp = value["drift_pp"].as_f64().unwrap();
+                assert!((dp - 3.2).abs() < 0.001);
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn score_eval_output_exit_code_heuristic() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::ScoreEvalOutput,
+            args: json!({
+                "from": {
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": "",
+                    "parsed": null
+                }
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => {
+                let dp = value["drift_pp"].as_f64().unwrap();
+                assert!(
+                    (dp - 5.0).abs() < 0.001,
+                    "non-zero exit should yield 5pp heuristic"
+                );
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn score_eval_output_reads_from_ctx_vars() {
+        let mut ctx = ArcContext::new(ArcMeta::default());
+        ctx.vars.insert(
+            "suite_output".into(),
+            json!({
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+                "parsed": {"drift_pp": 1.5}
+            }),
+        );
+        let hook = HookOp {
+            op: OpKind::ScoreEvalOutput,
+            args: json!({}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("score".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => {
+                assert_eq!(value["drift_pp"], json!(1.5));
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    // ── PickFirst ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn pick_first_from_inline_array() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::PickFirst,
+            args: json!({"from": [{"id": "a"}, {"id": "b"}]}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("first".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "first");
+                assert_eq!(value["id"], json!("a"));
+            }
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_first_from_vars_array() {
+        let mut ctx = ArcContext::new(ArcMeta::default());
+        ctx.vars.insert("items".into(), json!([1, 2, 3]));
+        let hook = HookOp {
+            op: OpKind::PickFirst,
+            args: json!({"array": "items"}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("first".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => assert_eq!(value, json!(1)),
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_first_from_nested_vars_dotted_path() {
+        let mut ctx = ArcContext::new(ArcMeta::default());
+        ctx.vars.insert(
+            "candidate_pairs".into(),
+            json!({"candidates": [{"ref": "knowledge:abc"}, {"ref": "knowledge:def"}]}),
+        );
+        let hook = HookOp {
+            op: OpKind::PickFirst,
+            args: json!({"array": "candidate_pairs.candidates"}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("candidate".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => assert_eq!(value["ref"], json!("knowledge:abc")),
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pick_first_empty_array_yields_null() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::PickFirst,
+            args: json!({"from": []}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("first".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { value, .. } => assert_eq!(value, Value::Null),
+            _ => panic!("expected SetVar"),
+        }
+    }
+
+    // ── SchemaMigrationDrop is observable-only ─────────────────────────────────
+
+    #[tokio::test]
+    async fn schema_migration_drop_returns_none() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::SchemaMigrationDrop,
+            args: json!({}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        assert!(matches!(effect, OpEffect::None));
     }
 }
