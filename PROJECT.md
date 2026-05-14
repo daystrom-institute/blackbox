@@ -48,8 +48,8 @@ Source layout (`src/`):
 Maintained in `src/orchestration/providers.rs`:
 
 - **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6 [1m]/200K, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (xhigh default, Opus-4.7-only; max unsupported on Haiku).
-- **GLM**: Z.AI Coding Plan API models via OpenCode transport. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and variant tiers `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
-- **DeepSeek**: DeepSeek API models via OpenCode transport. Defaults to `deepseek/deepseek-v4-pro`, helper model `deepseek/deepseek-chat`, and variant tiers `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
+- **GLM**: Z.AI Coding Plan API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `glm-5.1`, helper model `glm-4.5-air`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-zai` by default). The old OpenCode `zai-coding-plan/...` model prefix is accepted only as a legacy brofile normalization input.
+- **DeepSeek**: DeepSeek API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `deepseek-v4-pro`, helper model `deepseek-v4-flash`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-ds` by default). The old OpenCode `deepseek/...` model prefix is accepted only as a legacy brofile normalization input.
 - **Inception**: Inception Mercury via OpenCode transport. Exposes only `inception/mercury-2` as the default/tool-capable model, and variant tiers `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
 - **Codex**: gpt-5.4 family. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot**: tracks Anthropic + OpenAI models. Effort tiers `low`/`medium`/`high`/`xhigh`.

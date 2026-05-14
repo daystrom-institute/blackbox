@@ -18,10 +18,6 @@ For `bbox_refactor_run` invocations dispatched from atomic refactor agents (desi
 
 The rust-analyzer-backed plan kinds `rust_lsp_rename`, `rust_organize_imports`, `rust_ra_move_item_to_module` (RX-R1), and `rust_ra_classify_callbacks` (RX-R2) require an active LspSessionManager. When rust-analyzer is unavailable (binary missing, init timeout, crashed mid-run), these plan kinds MUST fail closed with `error.lsp_unavailable` and the underlying cause. They MUST NOT silently downgrade to a syntax_only / indexed_hints approximation, because callers chose the LSP-backed kind specifically for semantic_status=lsp_verified. This is intentional asymmetry vs the Java side's documented tree-sitter fallback for rust_organize_imports — the Rust LSP-backed kinds in design/refactor-rust-expansion.md treat fallback as a silent semantic downgrade and refuse it.
 
-**Semantic OpenCode-backed providers**
-
-Bro provider names should be semantic: use `glm` for the Z.AI Coding Plan API and `deepseek` for the DeepSeek API. Both are OpenCode-backed transports, and their provider credentials/configuration are owned by OpenCode rather than generated through Claude-style account directories.
-
 **Workspace tools use work prefix**
 
 Workspace tool MCP handlers in transcript-search must use the `work_*` namespace, not `bbox_*`. This applies to docs, tool descriptions, ambient coercion guidance, and future workspace-tool additions so the workspace toolset remains distinct from core blackbox `bbox_*` tools.
@@ -38,6 +34,10 @@ For Forgejo-backed coordination, implementers and reviewers must use distinct ex
 **Do not expose mercury-edit-2**
 
 For the Inception provider catalog in blackbox, expose `inception/mercury-2` as the tool-capable model and do not make `inception/mercury-edit-2` available. Manual OpenCode smoke showed `mercury-2` can execute MCP tools, while `mercury-edit-2` rejects OpenAI-style tool schemas.
+
+**Semantic Claude-compatible GLM and DeepSeek providers**
+
+Bro provider names should remain semantic: use `glm` for the Z.AI Coding Plan API and `deepseek` for the DeepSeek API. Both are Claude Code CLI-backed Anthropic-compatible transports, with credentials/configuration owned by the selected Claude config directory (`~/.claude-zai` and `~/.claude-ds` by default). OpenCode remains available for Inception and future nonstandard provider transports.
 
 
 ### Render Hygiene

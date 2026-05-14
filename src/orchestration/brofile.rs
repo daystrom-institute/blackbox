@@ -228,14 +228,6 @@ struct OpencodeProfile {
 
 fn opencode_profile(provider: Provider) -> Option<OpencodeProfile> {
     match provider {
-        Provider::Glm => Some(OpencodeProfile {
-            default_model: "zai-coding-plan/glm-5.1",
-            small_model: "zai-coding-plan/glm-4.5-air",
-        }),
-        Provider::Deepseek => Some(OpencodeProfile {
-            default_model: "deepseek/deepseek-v4-pro",
-            small_model: "deepseek/deepseek-chat",
-        }),
         Provider::Inception => Some(OpencodeProfile {
             default_model: "inception/mercury-2",
             small_model: "inception/mercury-2",
@@ -300,6 +292,21 @@ fn default_opencode_env(
         config_path.to_string_lossy().into_owned(),
     );
     env
+}
+
+fn default_claude_compatible_env(
+    provider: Provider,
+    home_dir: &Path,
+) -> Option<HashMap<String, String>> {
+    let rel_path = match provider {
+        Provider::Glm => ".claude-zai",
+        Provider::Deepseek => ".claude-ds",
+        _ => return None,
+    };
+    Some(HashMap::from([(
+        "CLAUDE_CONFIG_DIR".to_string(),
+        home_dir.join(rel_path).to_string_lossy().into_owned(),
+    )]))
 }
 
 fn normalized_account_suffix(name: &str) -> Option<String> {
@@ -368,9 +375,11 @@ pub fn resolve_provider_env(
 ) -> Option<HashMap<String, String>> {
     let account_name = effective_account(provider, account_name, store_dir);
     let mut env = match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Inception => {
-            default_opencode_env(provider, store_dir, model)
-        }
+        Provider::Glm | Provider::Deepseek => dirs::home_dir()
+            .as_deref()
+            .and_then(|home| default_claude_compatible_env(provider, home))
+            .unwrap_or_default(),
+        Provider::Inception => default_opencode_env(provider, store_dir, model),
         _ => HashMap::new(),
     };
 
@@ -932,53 +941,49 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_provider_env_defaults_glm_opencode_config() {
+    fn test_resolve_provider_env_defaults_glm_claude_config() {
         let store = temp_store();
         let home = temp_store();
 
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Glm, None, None, store.path()).unwrap()
         });
-        assert!(!resolved.contains_key("ANTHROPIC_AUTH_TOKEN"));
-        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
-        assert!(config_path.ends_with("glm-opencode.json"));
-        let config = fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("\"model\": \"zai-coding-plan/glm-5.1\""));
-        assert!(config.contains("\"small_model\": \"zai-coding-plan/glm-4.5-air\""));
-        assert!(config.contains("\"blackbox_bro_*\": false"));
+        assert!(!resolved.contains_key("OPENCODE_CONFIG"));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        );
     }
 
     #[test]
-    fn test_resolve_provider_env_glm_model_override_updates_opencode_config() {
+    fn test_resolve_provider_env_glm_account_override_updates_claude_config() {
         let store = temp_store();
         let home = temp_store();
+        let mut config = load_config(store.path());
+        config.accounts.insert(
+            "zai2".into(),
+            Account {
+                env: Some(HashMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    home.path()
+                        .join(".claude-zai-account2")
+                        .to_string_lossy()
+                        .into_owned(),
+                )])),
+            },
+        );
+        save_config(&config, store.path());
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(
-                Provider::Glm,
-                Some("yoloz"),
-                Some("zai-coding-plan/glm-4.7"),
-                store.path(),
-            )
-            .unwrap()
+            resolve_provider_env(Provider::Glm, Some("zai2"), Some("glm-4.7"), store.path())
+                .unwrap()
         });
-        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
-        let config = fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("\"model\": \"zai-coding-plan/glm-4.7\""));
-    }
-
-    #[test]
-    fn test_build_opencode_config_defaults_deepseek_model() {
-        let config = build_opencode_config(Provider::Deepseek, None);
-        assert_eq!(
-            config.get("model").and_then(Value::as_str),
-            Some("deepseek/deepseek-v4-pro")
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai-account2"))
         );
-        assert_eq!(
-            config.get("small_model").and_then(Value::as_str),
-            Some("deepseek/deepseek-chat")
-        );
-        assert!(config.get("provider").is_none());
     }
 
     #[test]
@@ -989,7 +994,9 @@ mod tests {
         let blackbox_md = blackbox_dir.join("BLACKBOX.md");
         fs::write(&blackbox_md, "# global guidance").unwrap();
 
-        let config = with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
+        let config = with_fake_home(home.path(), || {
+            build_opencode_config(Provider::Inception, None)
+        });
         let instructions = config
             .get("instructions")
             .and_then(Value::as_array)
@@ -1004,7 +1011,9 @@ mod tests {
     #[test]
     fn test_build_opencode_config_omits_instructions_when_blackbox_md_missing() {
         let home = temp_store();
-        let config = with_fake_home(home.path(), || build_opencode_config(Provider::Glm, None));
+        let config = with_fake_home(home.path(), || {
+            build_opencode_config(Provider::Inception, None)
+        });
         assert!(
             config.get("instructions").is_none(),
             "instructions field should be absent when BLACKBOX.md does not exist"
@@ -1012,15 +1021,19 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_provider_env_defaults_deepseek_opencode_config() {
+    fn test_resolve_provider_env_defaults_deepseek_claude_config() {
         let store = temp_store();
+        let home = temp_store();
 
-        let resolved = resolve_provider_env(Provider::Deepseek, None, None, store.path()).unwrap();
-        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
-        assert!(config_path.ends_with("deepseek-opencode.json"));
-        let config = fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("\"model\": \"deepseek/deepseek-v4-pro\""));
-        assert!(config.contains("\"small_model\": \"deepseek/deepseek-chat\""));
+        let resolved = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Deepseek, None, None, store.path()).unwrap()
+        });
+        assert!(!resolved.contains_key("OPENCODE_CONFIG"));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-ds"))
+        );
     }
 
     #[test]

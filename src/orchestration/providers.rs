@@ -120,10 +120,8 @@ impl Provider {
 
     fn bin_with_env(&self) -> String {
         match self {
-            Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
-            Provider::Glm => std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into()),
-            Provider::Deepseek => {
-                std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+                std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
             }
             Provider::Inception => {
                 std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
@@ -138,16 +136,8 @@ impl Provider {
 
     pub fn bin_with_config(&self, cfg: &blackbox::config::ProviderConfig) -> String {
         match self {
-            Provider::Claude => cfg
+            Provider::Claude | Provider::Glm | Provider::Deepseek => cfg
                 .claude_bin
-                .clone()
-                .unwrap_or_else(|| self.bin_with_env()),
-            Provider::Glm => cfg
-                .opencode_bin
-                .clone()
-                .unwrap_or_else(|| self.bin_with_env()),
-            Provider::Deepseek => cfg
-                .opencode_bin
                 .clone()
                 .unwrap_or_else(|| self.bin_with_env()),
             Provider::Inception => cfg
@@ -210,9 +200,7 @@ impl Provider {
 
     pub fn efforts(&self) -> &'static [EffortInfo] {
         match self {
-            Provider::Claude => CLAUDE_EFFORTS,
-            Provider::Glm => OPENCODE_VARIANTS,
-            Provider::Deepseek => OPENCODE_VARIANTS,
+            Provider::Claude | Provider::Glm | Provider::Deepseek => CLAUDE_EFFORTS,
             Provider::Inception => OPENCODE_VARIANTS,
             Provider::Codex => CODEX_EFFORTS,
             Provider::Copilot => COPILOT_EFFORTS,
@@ -286,6 +274,17 @@ pub struct ExecOpts {
     pub effort: Option<String>,
 }
 
+fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
+    match provider {
+        Provider::Glm => model
+            .strip_prefix("zai-coding-plan/")
+            .unwrap_or(model)
+            .to_string(),
+        Provider::Deepseek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
+        _ => model.to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Arg builders
 // ---------------------------------------------------------------------------
@@ -298,11 +297,13 @@ impl Provider {
         cwd: Option<&str>,
         opts: Option<&ExecOpts>,
     ) -> Vec<String> {
-        let model = opts.and_then(|o| o.model.as_deref());
+        let model = opts
+            .and_then(|o| o.model.as_deref())
+            .map(|m| normalize_model_for_provider(*self, m));
         let effort = opts.and_then(|o| o.effort.as_deref());
 
         match self {
-            Provider::Claude => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
                 let mut args = vec![
                     "-p".into(),
                     prompt.into(),
@@ -315,7 +316,7 @@ impl Provider {
                 if !session_id.is_empty() && session_id != "pending" {
                     args.extend(["--session-id".into(), session_id.into()]);
                 }
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -332,14 +333,14 @@ impl Provider {
                 }
                 args
             }
-            Provider::Glm | Provider::Deepseek | Provider::Inception => {
+            Provider::Inception => {
                 let mut args = vec![
                     "run".into(),
                     "--format".into(),
                     "json".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -357,7 +358,7 @@ impl Provider {
                     "--dangerously-bypass-approvals-and-sandbox".into(),
                     "--json".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -380,7 +381,7 @@ impl Provider {
                     "--output-format".into(),
                     "json".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -407,7 +408,7 @@ impl Provider {
                     "-o".into(),
                     "json".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 args
@@ -422,8 +423,10 @@ impl Provider {
     /// when the session can't be found locally.
     pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
         match self {
-            Provider::Claude => resolve_claude_session_cwd(session_id),
-            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+                resolve_claude_session_cwd(session_id)
+            }
+            Provider::Inception => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),
             Provider::Copilot | Provider::Vibe | Provider::Workflow => None,
@@ -436,11 +439,13 @@ impl Provider {
         prompt: &str,
         opts: Option<&ExecOpts>,
     ) -> Vec<String> {
-        let model = opts.and_then(|o| o.model.as_deref());
+        let model = opts
+            .and_then(|o| o.model.as_deref())
+            .map(|m| normalize_model_for_provider(*self, m));
         let effort = opts.and_then(|o| o.effort.as_deref());
 
         match self {
-            Provider::Claude => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
                 let mut args = vec![
                     "--resume".into(),
                     session_id.into(),
@@ -452,7 +457,7 @@ impl Provider {
                     "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -464,7 +469,7 @@ impl Provider {
                 }
                 args
             }
-            Provider::Glm | Provider::Deepseek | Provider::Inception => {
+            Provider::Inception => {
                 let mut args = vec![
                     "run".into(),
                     "--format".into(),
@@ -473,7 +478,7 @@ impl Provider {
                     session_id.into(),
                     "--dangerously-skip-permissions".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -489,7 +494,7 @@ impl Provider {
                     "--dangerously-bypass-approvals-and-sandbox".into(),
                     "--json".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -511,7 +516,7 @@ impl Provider {
                     "--output-format".into(),
                     "json".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 if let Some(e) = effort {
@@ -542,7 +547,7 @@ impl Provider {
                     "-o".into(),
                     "json".into(),
                 ];
-                if let Some(m) = model {
+                if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
                 args
@@ -621,7 +626,7 @@ impl Provider {
         scope: &str,
     ) -> Option<Vec<String>> {
         match self {
-            Provider::Claude => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
                 let scope_flag = match scope {
                     "user" | "project" | "local" => scope,
                     _ => return None,
@@ -641,7 +646,7 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
-            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
+            Provider::Inception => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -715,7 +720,7 @@ impl Provider {
 
     pub fn build_mcp_remove_args_scoped(&self, name: &str, scope: &str) -> Option<Vec<String>> {
         match self {
-            Provider::Claude => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
                 let scope_flag = match scope {
                     "user" | "project" | "local" => scope,
                     _ => return None,
@@ -728,7 +733,7 @@ impl Provider {
                     name.into(),
                 ])
             }
-            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
+            Provider::Inception => None,
             Provider::Copilot => {
                 if scope != "user" {
                     return None;
@@ -767,8 +772,10 @@ impl Provider {
     /// Argv for `{provider} mcp list` (stdout will differ per provider).
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
         match self {
-            Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
-            Provider::Glm | Provider::Deepseek | Provider::Inception => None,
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+                Some(vec!["mcp".into(), "list".into()])
+            }
+            Provider::Inception => None,
             Provider::Copilot => Some(vec![
                 "copilot".into(),
                 "--".into(),
@@ -824,7 +831,7 @@ impl Provider {
         }
         let mut args = Vec::new();
         match self {
-            Provider::Claude => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
                 // Claude's --disallowedTools matches tool names exactly
                 // (or applies Bash-specific argument patterns inside
                 // parentheses). It does NOT accept glob patterns on the
@@ -842,7 +849,7 @@ impl Provider {
                     args.push(expanded_allow.join(" "));
                 }
             }
-            Provider::Glm | Provider::Deepseek | Provider::Inception => {}
+            Provider::Inception => {}
             Provider::Copilot => {
                 // Copilot's --deny-tool / --allow-tool expect
                 // `ServerName(tool_name)` format, not the MCP-prefixed
@@ -1113,10 +1120,8 @@ impl Provider {
     /// Parse a streaming JSON event and update the sink.
     pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
-            Provider::Claude => parse_claude_event(evt, sink),
-            Provider::Glm | Provider::Deepseek | Provider::Inception => {
-                parse_opencode_event(evt, sink)
-            }
+            Provider::Claude | Provider::Glm | Provider::Deepseek => parse_claude_event(evt, sink),
+            Provider::Inception => parse_opencode_event(evt, sink),
             Provider::Codex => parse_codex_event(evt, sink),
             Provider::Copilot => parse_copilot_event(evt, sink),
             Provider::Vibe => parse_vibe_event(evt, sink),
@@ -1136,9 +1141,7 @@ impl Provider {
 
     pub fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
         match self {
-            Provider::Glm | Provider::Deepseek | Provider::Inception => {
-                Some(vec!["export".into(), session_id.into()])
-            }
+            Provider::Inception => Some(vec!["export".into(), session_id.into()]),
             _ => None,
         }
     }
@@ -1961,91 +1964,91 @@ static CLAUDE_MODELS: &[ModelInfo] = &[
 
 static GLM_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "zai-coding-plan/glm-5.1",
-        description: "Z.AI Coding Plan flagship GLM model via OpenCode",
+        id: "glm-5.1",
+        description: "Z.AI Coding Plan flagship GLM model via Claude Code",
         default: true,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-5",
-        description: "General-purpose frontier GLM model via OpenCode",
+        id: "glm-5",
+        description: "General-purpose frontier GLM model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-5-turbo",
-        description: "Fast high-end GLM model via OpenCode",
+        id: "glm-5-turbo",
+        description: "Fast high-end GLM model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.7",
-        description: "Strong balanced GLM model via OpenCode",
+        id: "glm-4.7",
+        description: "Strong balanced GLM model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.7-flashx",
-        description: "Cheap accelerated GLM-4.7 variant via OpenCode",
+        id: "glm-4.7-flashx",
+        description: "Cheap accelerated GLM-4.7 variant via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.6",
-        description: "Previous balanced GLM model via OpenCode",
+        id: "glm-4.6",
+        description: "Previous balanced GLM model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.5",
-        description: "Balanced GLM-4.5 model via OpenCode",
+        id: "glm-4.5",
+        description: "Balanced GLM-4.5 model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.5-air",
-        description: "Low-cost helper model via OpenCode",
+        id: "glm-4.5-air",
+        description: "Low-cost helper model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.5v",
-        description: "Vision-capable GLM-4.5 model via OpenCode",
+        id: "glm-4.5v",
+        description: "Vision-capable GLM-4.5 model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.6v",
-        description: "Vision-capable GLM-4.6 model via OpenCode",
+        id: "glm-4.6v",
+        description: "Vision-capable GLM-4.6 model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.7-flash",
-        description: "Free GLM-4.7 flash model via OpenCode",
+        id: "glm-4.7-flash",
+        description: "Free GLM-4.7 flash model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-4.5-flash",
-        description: "Free GLM flash model via OpenCode",
+        id: "glm-4.5-flash",
+        description: "Free GLM flash model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "zai-coding-plan/glm-5v-turbo",
-        description: "Vision-capable GLM model via OpenCode",
+        id: "glm-5v-turbo",
+        description: "Vision-capable GLM model via Claude Code",
         default: false,
     },
 ];
 
 static DEEPSEEK_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "deepseek/deepseek-v4-pro",
-        description: "DeepSeek 4.1 Pro / V4 Pro reasoning model via OpenCode",
+        id: "deepseek-v4-pro",
+        description: "DeepSeek 4.1 Pro / V4 Pro reasoning model via Claude Code",
         default: true,
     },
     ModelInfo {
-        id: "deepseek/deepseek-v4-flash",
-        description: "Fast DeepSeek V4 model via OpenCode",
+        id: "deepseek-v4-flash",
+        description: "Fast DeepSeek V4 model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "deepseek/deepseek-reasoner",
-        description: "DeepSeek reasoning model via OpenCode",
+        id: "deepseek-reasoner",
+        description: "DeepSeek reasoning model via Claude Code",
         default: false,
     },
     ModelInfo {
-        id: "deepseek/deepseek-chat",
-        description: "DeepSeek chat model via OpenCode",
+        id: "deepseek-chat",
+        description: "DeepSeek chat model via Claude Code",
         default: false,
     },
 ];
@@ -2284,6 +2287,37 @@ mod tests {
     }
 
     #[test]
+    fn test_glm_and_deepseek_use_claude_print_args() {
+        let glm_opts = ExecOpts {
+            model: Some("zai-coding-plan/glm-5.1".into()),
+            effort: Some("high".into()),
+        };
+        let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
+        assert_eq!(glm[0], "-p");
+        assert!(glm.contains(&"--output-format".to_string()));
+        assert!(glm.contains(&"stream-json".to_string()));
+        assert!(glm.contains(&"--session-id".to_string()));
+        assert!(glm.contains(&"sid-1".to_string()));
+        assert!(glm.contains(&"--model".to_string()));
+        assert!(glm.contains(&"glm-5.1".to_string()));
+        assert!(!glm.contains(&"zai-coding-plan/glm-5.1".to_string()));
+        assert!(glm.contains(&"--effort".to_string()));
+        assert!(!glm.contains(&"--variant".to_string()));
+
+        let ds_opts = ExecOpts {
+            model: Some("deepseek/deepseek-v4-pro".into()),
+            effort: None,
+        };
+        let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&ds_opts));
+        assert!(deepseek.contains(&"--resume".to_string()));
+        assert!(deepseek.contains(&"sid-2".to_string()));
+        assert!(deepseek.contains(&"--model".to_string()));
+        assert!(deepseek.contains(&"deepseek-v4-pro".to_string()));
+        assert!(!deepseek.contains(&"deepseek/deepseek-v4-pro".to_string()));
+        assert!(!deepseek.contains(&"--variant".to_string()));
+    }
+
+    #[test]
     fn test_codex_exec_args_with_effort() {
         let opts = ExecOpts {
             model: Some("gpt-5.4".into()),
@@ -2349,6 +2383,9 @@ mod tests {
     #[test]
     fn test_streaming_json_classification() {
         assert!(Provider::Claude.is_streaming_json());
+        assert!(Provider::Glm.is_streaming_json());
+        assert!(Provider::Deepseek.is_streaming_json());
+        assert!(Provider::Inception.is_streaming_json());
         assert!(Provider::Codex.is_streaming_json());
         assert!(Provider::Copilot.is_streaming_json());
         assert!(!Provider::Vibe.is_streaming_json());
@@ -2739,6 +2776,17 @@ mod tests {
         assert!(c.contains(&"blackbox".to_string()));
         assert!(c.contains(&u.to_string()));
 
+        let glm = Provider::Glm
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .unwrap();
+        assert_eq!(&glm[..4], &["mcp", "add", "-s", "user"]);
+        assert!(glm.contains(&"--transport".to_string()));
+
+        let ds = Provider::Deepseek
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .unwrap();
+        assert_eq!(&ds[..4], &["mcp", "add", "-s", "user"]);
+
         let co = Provider::Copilot
             .build_mcp_add_http_args("blackbox", u, &[])
             .unwrap();
@@ -2758,6 +2806,11 @@ mod tests {
         assert!(g.iter().any(|a| a == "-s"));
         assert!(g.contains(&u.to_string()));
 
+        assert!(
+            Provider::Inception
+                .build_mcp_add_http_args("x", "y", &[])
+                .is_none()
+        );
         assert!(
             Provider::Vibe
                 .build_mcp_add_http_args("x", "y", &[])
@@ -3038,7 +3091,7 @@ mod tests {
 
     #[test]
     fn test_scoped_arg_builders_honor_scope_capability() {
-        // Claude + Gemini support both user and project.
+        // Claude-compatible providers + Gemini support both user and project.
         assert!(
             Provider::Claude
                 .build_mcp_add_http_args_scoped("x", "u", &[], "user")
@@ -3046,6 +3099,16 @@ mod tests {
         );
         assert!(
             Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Glm
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Deepseek
                 .build_mcp_add_http_args_scoped("x", "u", &[], "project")
                 .is_some()
         );
@@ -3080,6 +3143,11 @@ mod tests {
         );
 
         // Vibe never.
+        assert!(
+            Provider::Inception
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_none()
+        );
         assert!(
             Provider::Vibe
                 .build_mcp_add_http_args_scoped("x", "u", &[], "user")

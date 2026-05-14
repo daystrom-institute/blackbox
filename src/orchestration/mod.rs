@@ -1510,10 +1510,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             }
         }
 
-        if matches!(
-            provider,
-            Provider::Glm | Provider::Deepseek | Provider::Inception
-        ) {
+        if provider == Provider::Inception {
             let session_id = {
                 let inner = task_ref_wait.inner.lock();
                 (inner.session_id != "pending").then(|| inner.session_id.clone())

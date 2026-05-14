@@ -88,12 +88,13 @@ Current probe reality is asymmetric. Claude, Codex, and Z.AI Coding Plan expose
 rolling utilization percentages suitable for direct quota capacity:
 
 - Z.AI Coding Plan: `GET https://api.z.ai/api/monitor/usage/quota/limit` with
-  the OpenCode `zai-coding-plan` API key. `TOKENS_LIMIT number=5 unit=3` is the
-  five-hour window; `TOKENS_LIMIT number=1 unit=6` is the weekly/seven-day
-  window.
-- DeepSeek: `GET https://api.deepseek.com/user/balance` with the OpenCode
-  `deepseek` API key as bearer auth. This returns pay-as-you-go balance
-  availability, not rolling-window utilization.
+  `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir
+  (`~/.claude-zai` by default). `TOKENS_LIMIT number=5 unit=3` is the five-hour
+  window; `TOKENS_LIMIT number=1 unit=6` is the weekly/seven-day window.
+- DeepSeek: `GET https://api.deepseek.com/user/balance` with
+  `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir (`~/.claude-ds` by
+  default) as bearer auth. This returns pay-as-you-go balance availability, not
+  rolling-window utilization.
 
 Allocation policy must keep these signals distinct: Z.AI can be quota-probe
 confidence, while DeepSeek is balance-derived synthetic capacity.
@@ -136,20 +137,21 @@ parameters:
     "economy": {
       "claude": { "model": "claude-haiku-4-5-20251001", "effort": "low" },
       "codex": { "model": "gpt-5.5-mini", "effort": "low" },
-      "glm": { "model": "zai-coding-plan/glm-4.5-air", "effort": "low" },
+      "glm": { "model": "glm-4.5-air", "effort": "low" },
+      "deepseek": { "model": "deepseek-v4-flash", "effort": "low" },
       "gemini": { "model": "gemini-2.5-flash-lite" }
     },
     "standard": {
       "claude": { "model": "claude-sonnet-4-6", "effort": "medium" },
       "codex": { "model": "gpt-5.5", "effort": "medium" },
-      "glm": { "model": "zai-coding-plan/glm-5.1", "effort": "medium" },
-      "deepseek": { "model": "deepseek/deepseek-v4-pro", "effort": "medium" },
+      "glm": { "model": "glm-5.1", "effort": "medium" },
+      "deepseek": { "model": "deepseek-v4-pro", "effort": "medium" },
       "inception": { "model": "inception/mercury-2", "effort": "medium" },
       "gemini": { "model": "gemini-3-flash-preview" }
     },
     "super-el-cheapo-drones": {
       "codex": { "model": "gpt-5.3-codex-spark", "effort": "low", "weight": 1.0 },
-      "glm": { "model": "zai-coding-plan/glm-4.5-air", "effort": "minimal", "weight": 0.8 }
+      "glm": { "model": "glm-4.5-air", "effort": "low", "weight": 0.8 }
     }
   },
   "tier_ladders": {
