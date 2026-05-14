@@ -630,6 +630,21 @@ impl BlackboxServer {
             binding_limits,
         )?;
         let input_digest = Some(sha256_json_value(&args_to_validate));
+        let runtime_override = match &p.runtime {
+            Some(value) => {
+                match serde_json::from_value::<orchestration::allocator::RuntimeRequest>(
+                    value.clone(),
+                ) {
+                    Ok(runtime) => Some(runtime),
+                    Err(e) => {
+                        return Err(format!(
+                            "error.bad_input(code=invalid_runtime): runtime must be a RuntimeRequest object: {e}"
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
 
         match &manifest.implementation {
             AtomImplementation::Profile { brofile_ref } => {
@@ -644,10 +659,17 @@ impl BlackboxServer {
                     input_digest,
                     dispatch_cost,
                     effective_limits,
+                    runtime_override,
                 )
                 .await
             }
             AtomImplementation::Workflow { workflow_ref } => {
+                if runtime_override.is_some() {
+                    return Err(
+                        "error.unsupported(code=runtime_with_workflow_atom): runtime overrides require a profile-backed atom"
+                            .into(),
+                    );
+                }
                 self.atom_invoke_workflow(
                     &invocation_id,
                     &atom_ref,
@@ -661,30 +683,46 @@ impl BlackboxServer {
                 )
                 .await
             }
-            AtomImplementation::Deterministic { runner } => self.atom_invoke_runner(
-                &invocation_id,
-                &atom_ref,
-                &manifest,
-                RunnerInvocationKind::Deterministic(runner.clone()),
-                &p,
-                &args_to_validate,
-                &owner,
-                input_digest,
-                dispatch_cost,
-                effective_limits,
-            ),
-            AtomImplementation::Adapter { adapter_name } => self.atom_invoke_runner(
-                &invocation_id,
-                &atom_ref,
-                &manifest,
-                RunnerInvocationKind::Adapter(adapter_name.clone()),
-                &p,
-                &args_to_validate,
-                &owner,
-                input_digest,
-                dispatch_cost,
-                effective_limits,
-            ),
+            AtomImplementation::Deterministic { runner } => {
+                if runtime_override.is_some() {
+                    return Err(
+                        "error.unsupported(code=runtime_with_runner_atom): runtime overrides require a profile-backed atom"
+                            .into(),
+                    );
+                }
+                self.atom_invoke_runner(
+                    &invocation_id,
+                    &atom_ref,
+                    &manifest,
+                    RunnerInvocationKind::Deterministic(runner.clone()),
+                    &p,
+                    &args_to_validate,
+                    &owner,
+                    input_digest,
+                    dispatch_cost,
+                    effective_limits,
+                )
+            }
+            AtomImplementation::Adapter { adapter_name } => {
+                if runtime_override.is_some() {
+                    return Err(
+                        "error.unsupported(code=runtime_with_runner_atom): runtime overrides require a profile-backed atom"
+                            .into(),
+                    );
+                }
+                self.atom_invoke_runner(
+                    &invocation_id,
+                    &atom_ref,
+                    &manifest,
+                    RunnerInvocationKind::Adapter(adapter_name.clone()),
+                    &p,
+                    &args_to_validate,
+                    &owner,
+                    input_digest,
+                    dispatch_cost,
+                    effective_limits,
+                )
+            }
         }
     }
 
@@ -714,6 +752,7 @@ impl BlackboxServer {
         input_digest: Option<String>,
         dispatch_cost: u64,
         effective_limits: orchestration::atoms::invocation::InvocationLimits,
+        runtime_override: Option<orchestration::allocator::RuntimeRequest>,
     ) -> Result<serde_json::Value, String> {
         use orchestration::atoms::invocation::AtomInvocation;
 
@@ -772,6 +811,7 @@ impl BlackboxServer {
         let atom_label = atom_ref.to_string();
         let runtime =
             orchestration::allocator::merge_runtime_request(bf.runtime, manifest.runtime.clone());
+        let runtime = orchestration::allocator::merge_runtime_request(runtime, runtime_override);
         let dispatched =
             self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,

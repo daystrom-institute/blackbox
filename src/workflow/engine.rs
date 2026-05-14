@@ -1779,6 +1779,7 @@ impl<'a> WorkflowRunner<'a> {
                                 project_dir: self.effective_project_dir(),
                                 owner: Some(owner.clone()),
                                 parent_invocation_id,
+                                runtime: None,
                             },
                             binding.limits.as_ref(),
                         )
@@ -1796,6 +1797,7 @@ impl<'a> WorkflowRunner<'a> {
                         project_dir: self.effective_project_dir(),
                         owner: Some(owner.clone()),
                         parent_invocation_id,
+                        runtime: None,
                     },
                     binding.limits.as_ref(),
                 )

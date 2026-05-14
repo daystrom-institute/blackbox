@@ -257,6 +257,7 @@ async fn exec_atom_invoke(
         project_dir: project_dir.clone(),
         owner: Some(format!("reaction:{}", event.id)),
         parent_invocation_id: None,
+        runtime: None,
     };
 
     let server = crate::server::BlackboxServer::new(state.clone());

@@ -1721,6 +1721,7 @@ async fn atom_invoke_deterministic_runner_returns_terminal_trace() {
             project_dir: None,
             owner: Some("operator:test".into()),
             parent_invocation_id: None,
+            runtime: None,
         }))
         .await;
     assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
@@ -1766,6 +1767,7 @@ async fn atom_invoke_adapter_runner_returns_terminal_trace() {
             project_dir: None,
             owner: Some("operator:test".into()),
             parent_invocation_id: None,
+            runtime: None,
         }))
         .await;
     assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
@@ -1932,6 +1934,7 @@ async fn atom_invoke_workflow_wrapper_returns_workflow_handle() {
             project_dir: None,
             owner: Some("operator:test".into()),
             parent_invocation_id: None,
+            runtime: None,
         }))
         .await;
     assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
@@ -1994,6 +1997,7 @@ async fn workflow_atom_rejects_underdeclared_raw_actor_dispatch_budget() {
             project_dir: None,
             owner: Some("operator:test".into()),
             parent_invocation_id: None,
+            runtime: None,
         }))
         .await;
     assert_eq!(invoke.is_error, Some(true));
@@ -3310,6 +3314,7 @@ async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
             ambient: None,
             caller_provider: None,
             caller_session_id: None,
+            runtime: None,
         }))
         .await;
     assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
@@ -5098,6 +5103,7 @@ fn bro_agent_dispatch_agent_not_found() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5153,6 +5159,7 @@ fn bro_agent_dispatch_inactive_agent_error() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5195,6 +5202,7 @@ fn bro_agent_dispatch_adapter_unavailable_hard_fails() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5285,6 +5293,7 @@ async fn bro_agent_dispatch_noop_adapter_succeeds() {
             ambient: None,
             caller_provider: Some("claude".into()),
             caller_session_id: Some("caller-session-789".into()),
+            runtime: None,
         }))
         .await;
     assert_ne!(result.is_error, Some(true));
@@ -5369,6 +5378,7 @@ async fn bro_agent_dispatch_handle_shape_reference_agent_noop_adapter() {
             ambient: None,
             caller_provider: None,
             caller_session_id: None,
+            runtime: None,
         }))
         .await;
     assert!(
@@ -5471,6 +5481,7 @@ fn bro_agent_dispatch_unparseable_manifest_error() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5508,6 +5519,7 @@ fn bro_agent_dispatch_no_brofile_error() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5569,6 +5581,7 @@ fn bro_agent_dispatch_rejects_undeclared_operator_authority_arg() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5620,6 +5633,7 @@ fn bro_agent_dispatch_rejects_hardcoded_operator_authority_template_flag() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5672,6 +5686,7 @@ fn bro_agent_dispatch_rejects_compact_hardcoded_operator_authority_template_flag
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5728,6 +5743,7 @@ fn bro_agent_dispatch_accepts_declared_operator_authority_arg() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5770,6 +5786,7 @@ fn bro_agent_dispatch_invalid_inline_provider_error() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5818,6 +5835,7 @@ fn bro_agent_dispatch_args_validation_missing_required() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5869,6 +5887,7 @@ fn bro_agent_dispatch_args_type_mismatch_rejected() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -5926,6 +5945,7 @@ fn bro_agent_dispatch_schema_202012_prefix_items_rejected() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_eq!(result.is_error, Some(true));
     let text = extract_text(&result);
@@ -6052,6 +6072,7 @@ fn bro_agent_dispatch_bro_label_stamped_on_task() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_ne!(result.is_error, Some(true));
     let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -6108,6 +6129,7 @@ fn bro_agent_dispatch_with_bro_preserves_agent_label() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_ne!(result.is_error, Some(true));
     let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -6160,6 +6182,7 @@ fn bro_dashboard_emits_agent_label() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_ne!(result.is_error, Some(true));
     let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
@@ -6224,6 +6247,7 @@ fn bro_report_surfaces_latest_task_report() {
         ambient: None,
         caller_provider: None,
         caller_session_id: None,
+        runtime: None,
     })));
     assert_ne!(result.is_error, Some(true));
     let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();

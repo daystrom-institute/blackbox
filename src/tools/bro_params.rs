@@ -464,6 +464,9 @@ pub(crate) struct AgentDispatchParams {
     pub(crate) caller_provider: Option<String>,
     #[serde(default)]
     pub(crate) caller_session_id: Option<String>,
+    /// Optional RuntimeRequest overlay applied after brofile and manifest runtime.
+    #[serde(default)]
+    pub(crate) runtime: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -823,6 +826,9 @@ pub(crate) struct AtomInvokeParams {
     pub(crate) owner: Option<String>,
     #[serde(default)]
     pub(crate) parent_invocation_id: Option<String>,
+    /// Optional RuntimeRequest overlay for profile-backed atom dispatch.
+    #[serde(default)]
+    pub(crate) runtime: Option<serde_json::Value>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

@@ -589,6 +589,21 @@ impl BlackboxServer {
             let bro_label = format!("agent:{}@v{}", rec.name, rec.version);
             (manifest, agent_ref, bro_label)
         };
+        let runtime_override = match &p.runtime {
+            Some(value) => {
+                match serde_json::from_value::<orchestration::allocator::RuntimeRequest>(
+                    value.clone(),
+                ) {
+                    Ok(runtime) => Some(runtime),
+                    Err(e) => {
+                        return Self::err_text(&format!(
+                            "error.bad_input(code=invalid_runtime): runtime must be a RuntimeRequest object: {e}"
+                        ));
+                    }
+                }
+            }
+            None => None,
+        };
 
         if let Err(err) = Self::validate_operator_authority_inputs(&manifest, &p.args) {
             return Self::err_text(&err);
@@ -596,6 +611,11 @@ impl BlackboxServer {
 
         // Adapter path
         if let Some(ref adapter_name) = manifest.dispatch_adapter {
+            if runtime_override.is_some() {
+                return Self::err_text(
+                    "error.unsupported(code=runtime_with_dispatch_adapter): runtime overrides require the standard bro dispatch path",
+                );
+            }
             let adapter = {
                 let adapter_registry = self.state.agent_adapter_registry.read();
                 match adapter_registry.get(adapter_name) {
@@ -805,6 +825,7 @@ impl BlackboxServer {
         };
         let runtime =
             orchestration::allocator::merge_runtime_request(runtime, manifest.runtime.clone());
+        let runtime = orchestration::allocator::merge_runtime_request(runtime, runtime_override);
         let dispatched =
             match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
