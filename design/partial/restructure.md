@@ -6,10 +6,12 @@ Related: `design/partial/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
 target, `src/packets/`, `src/server/`, `src/tools/`, and first-pass child
-splits under `src/tools/badgey/` and `src/workflow/engine/`. `src/main.rs` is
-down to a daemon bootstrap/router shell, but it still owns many binary-local
-module declarations and `src/lib.rs` is still a small shell. Keep this in
-`design/partial/` until the crate topology work is closed or superseded.
+splits under `src/tools/badgey/` and `src/workflow/engine/`. In the
+`restructure-aggressive` worktree, `src/main.rs` is now only the binary entry
+point, module declarations are owned by `src/lib.rs`, and daemon bootstrap has
+moved to `src/server/run.rs`. Keep this in `design/partial/` until the crate
+topology work is closed or superseded because the lib root still carries a
+compatibility prelude and `server/run.rs` remains a large bootstrap module.
 
 ## Original Problem
 
@@ -21,35 +23,39 @@ The crate originally had two god files and no library target:
 | `src/packets.rs` | 6,353 | Complete rule engine: AST, compiler, evaluator, fidelity auditor, self-heal scanner — plus a 3,443-line `#[cfg(test)]` block |
 
 That is no longer the current tree: the `[lib]` target exists and `packets`,
-`server`, and `tools` have been split. The remaining issue is not "no lib";
-it is finishing ownership transfer from binary-local modules into the lib and
-continuing to split large domain modules into smaller implementation files.
+`server`, and `tools` have been split. The remaining issue is not "no lib" or
+"binary owns daemon modules"; it is reducing the broad compatibility imports
+needed by the lib-owned modules and continuing to split large domain modules
+into smaller implementation files.
 
 Routing-related concerns are now mostly split: `src/routing.rs`,
 `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, `src/workflow/wait.rs`,
 `src/server/routes.rs`, and `src/server/tail.rs` exist as separate files.
 `src/mcp_tools/` contains the agentic graph helper set. The remaining
 concentration has shifted away from `main.rs` and into a few large but more
-domain-specific modules, especially `src/workflow/engine.rs`,
-`src/workflow/ops.rs`, `src/tools/atoms.rs`, and `src/orchestration/providers.rs`.
+domain-specific modules, especially `src/server/run.rs`,
+`src/workflow/engine.rs`, `src/workflow/ops.rs`, `src/tools/atoms.rs`, and
+`src/orchestration/providers.rs`.
 
-## Current main.rs Breakdown
+## Current Topology Breakdown
 
-As of 2026-05-14, `src/main.rs` is 1,186 lines. It is no longer the 17K-line
-god file described above. Its current shape is:
+As of 2026-05-14 in the aggressive topology worktree, `src/main.rs` is 4
+lines. It is no longer the 17K-line god file described above or even the
+1.2K-line daemon shell from the first refactor pass. Its current shape is:
 
-| Lines | Size | Content |
-|-------|------|---------|
-| 1–75 | 75 | Binary-local `mod` declarations, including many modules that should eventually be lib-owned |
-| 76–127 | 52 | Imports and compatibility shim imports from `blackbox::...` |
-| 129–169 | 41 | `BlackboxServer::new` router sum |
-| 171–226 | 56 | Re-export/import glue plus now-empty legacy `bbox_tools` / `bro_tools` router impls |
-| 228–1186 | 959 | Daemon bootstrap: config, logging, state open, router assembly, background tasks, graceful shutdown |
+| File | Lines | Content |
+|------|-------|---------|
+| `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
+| `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
+| `src/server/mod.rs` | 63 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
+| `src/server/run.rs` | 998 | Daemon bootstrap: config, logging, state open, router assembly, background tasks, graceful shutdown |
 
-The highest-value remaining `main.rs` work is not more tool extraction; it is
-finishing the module ownership move into `lib.rs`, moving `BlackboxServer::new`
-and the bootstrap body into `server`, then deleting the empty legacy router impl
-blocks once their router names are no longer needed.
+The highest-value remaining topology work is no longer in `main.rs`. It is:
+
+1. Reduce the temporary lib-root prelude by replacing broad `use crate::*`
+   dependencies with explicit imports in touched modules.
+2. Split `server/run.rs` by startup concern once the bootstrap shape stabilizes.
+3. Continue domain-local decomposition in the remaining large modules.
 
 ## Current Packets Breakdown
 
@@ -85,13 +91,12 @@ Already landed additions: `src/lib.rs`, `src/server/`, `src/tools/`,
 Cargo.toml                      # [lib] exists; all [[bin]] targets depend on it
 
 src/
-  lib.rs                        # Exists, but still a small shell. Continue
-                                # migrating safe binary-local module
-                                # declarations here in small batches.
+  lib.rs                        # Owns daemon module declarations. Still carries
+                                # temporary compatibility imports/re-exports
+                                # while older modules use `crate::*`.
 
-  main.rs                       # Shrunk to ~1.2K lines. Remaining work:
-                                # move router construction + daemon bootstrap
-                                # into server, then keep only the binary entry.
+  main.rs                       # Tiny blackboxd entry point calling
+                                # blackbox::server::run().
   cli.rs                        # Unchanged ([[bin]] target for `bro`)
   irc_bridge.rs                 # Unchanged ([[bin]] target for `bro-irc`)
   slack_bridge.rs               # Unchanged ([[bin]] target for `bro-slack`)
@@ -105,6 +110,9 @@ src/
                                 # routers (~300-500 lines). Contains the
                                 # tiny ServerHandler impl (7 lines, just
                                 # `get_info`) — no need for its own file.
+    run.rs                      # Daemon bootstrap extracted from main.rs.
+                                # Split into startup submodules only when the
+                                # next edits justify the boundary.
     state.rs                    # SharedState struct + impl + build_app_state()
                                 # (extracted from main.rs lines 89-316)
     progress.rs                 # MCP progress-token plumbing for blocking
@@ -228,7 +236,7 @@ module simultaneously. The original rename had to be a single atomic git move:
 
 ### 1. Add a `[lib]` target
 
-The single highest-impact change. `Cargo.toml` gains:
+Landed. `Cargo.toml` has:
 
 ```toml
 [lib]
@@ -252,7 +260,9 @@ name = "bro-slack"
 path = "src/slack_bridge.rs"
 ```
 
-All four binaries depend on the lib. `src/lib.rs` declares the modules; the binaries `use blackbox::*` instead of declaring their own `mod foo;`:
+All four binaries depend on the lib. `src/lib.rs` declares the daemon modules;
+the `blackboxd` binary now calls into `blackbox::server::run()` instead of
+declaring its own module tree:
 
 ```rust
 // src/lib.rs
@@ -273,29 +283,23 @@ pub mod entity_ref;
 // ... etc
 ```
 
-**Mechanical clarification:** modules declared with `mod foo;` in `main.rs` are owned by the binary crate; `lib.rs` cannot "re-export" them — it must `pub mod foo;` directly, taking ownership of the module. So the move is: every `mod foo;` line currently in `main.rs` is *deleted from main.rs* and *added to lib.rs*. The file `src/foo.rs` stays put on disk. The binary crate then sees `foo` only via `use blackbox::foo`, not via its own `mod foo;`.
+**Mechanical clarification:** modules declared with `mod foo;` in `main.rs` are owned by the binary crate; `lib.rs` cannot "re-export" them — it must `pub mod foo;` directly, taking ownership of the module. So the move is: every `mod foo;` line formerly in `main.rs` was *deleted from main.rs* and *added to lib.rs*. The file `src/foo.rs` stays put on disk. The binary crate then sees `foo` only via `blackbox::foo`, not via its own `mod foo;`.
 
 This is a textual transformation, not a code move. The Rust compiler treats the file as belonging to whichever crate's `mod` declaration is active. Migrating the `mod` declarations from binary-owned to lib-owned is the actual content of step 1; the migration path's "move nothing" framing was misleading.
 
-### 2. `main.rs` shrinks to ~100 lines
+### 2. `main.rs` shrinks to the binary entry point
 
-Only: initialize logging, call `server::run()` / `server::build_app_state()`,
-bind the axum router, spawn the MCP listener, and handle graceful shutdown.
-`main.rs` is now much closer to this goal, but the bootstrap body and router
-construction still need to move into `server`.
+Landed more aggressively than the original target: `main.rs` is now only:
 
 ```rust
-use blackbox::server;
-
 #[tokio::main]
-async fn main() {
-    tracing_subscriber::init();
-    let state = server::build_app_state().await;
-    let app = server::router(state.clone());
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 7264)).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+async fn main() -> anyhow::Result<()> {
+    blackbox::server::run().await
 }
 ```
+
+The bootstrap body lives in `server/run.rs`; `BlackboxServer::new` and router
+construction live in `server/mod.rs`.
 
 ### 3. One tool domain per file
 
@@ -376,10 +380,10 @@ Each sub-module has a clear boundary:
 
 Routing is already split. The remaining concentration is now spread across
 large domain modules rather than one `main.rs` god-file. Current examples:
-`workflow/engine.rs` owns the core workflow runner, `workflow/ops.rs` owns hook
-ops, `tools/atoms.rs` owns atom-facing tools, and `orchestration/providers.rs`
-owns provider catalog/resolution. Split these by cohesive internal subsystem,
-not by creating a second god-module.
+`server/run.rs` owns daemon startup, `workflow/engine.rs` owns the core workflow
+runner, `workflow/ops.rs` owns hook ops, `tools/atoms.rs` owns atom-facing tools,
+and `orchestration/providers.rs` owns provider catalog/resolution. Split these
+by cohesive internal subsystem, not by creating a second god-module.
 
 Recent examples of the intended pattern:
 
@@ -447,23 +451,26 @@ Landed:
 3. Tool domains are already split under `tools/`; `tools/badgey.rs` is now a
    facade with `lifecycle`, `proposals`, and `reports` child modules.
 4. `workflow/engine/fanout.rs` owns fanout runner support.
+5. Binary-root daemon module ownership has moved to `src/lib.rs`.
+6. `src/main.rs` is a 4-line entry point.
+7. `BlackboxServer::new` and the tool-router sum live in `src/server/mod.rs`.
+8. Daemon bootstrap lives in `src/server/run.rs`.
+9. Empty legacy `bbox_tools` / `bro_tools` router impls were removed.
 
 Next useful cuts:
 
-1. **Continue safe module ownership moves into `lib.rs`.**
-   - Use the refactor runner's primitive sequence rather than ad hoc edits:
-     `copy_rust_mod_decls` from `main.rs` to `lib.rs`,
-     `delete_rust_items` in `main.rs`, `add_rust_use_decl` for the root alias,
-     then `cargo check --bin blackboxd`.
-   - Move modules in small batches where unqualified root aliases are enough
-     (`use blackbox::<module>;`). Avoid large batches while sibling `crate::*`
-     dependencies are still mixed between binary and lib ownership.
+1. **Pay down the lib-root compatibility prelude.**
+   - Prefer `rust_minimize_imports` or explicit hand fixes in touched modules
+     over broad mechanical churn across the whole crate.
+   - Replace `use crate::*` with local explicit imports when editing a module
+     anyway, then remove the corresponding root import/re-export from `lib.rs`.
+   - Keep each batch `cargo check --bin blackboxd` verified.
 
-2. **Move daemon bootstrap out of `main.rs`.**
-   - Move router construction and most of `main()` into `server`, leaving
-     `main.rs` as a small `#[tokio::main]` entry point.
-   - Delete the empty legacy `bbox_tools` / `bro_tools` router impls when the
-     constructor no longer needs them.
+2. **Split daemon bootstrap by startup concern.**
+   - Candidate boundaries: transcript root discovery, config/state opening,
+     MCP service construction, background task spawning, and shutdown wiring.
+   - Keep `server/run.rs` as orchestration glue rather than moving everything
+     into another catch-all file.
 
 3. **Keep splitting large domain modules by cohesive internals.**
    - `workflow/engine.rs`: continue with runner subsystems after fanout.

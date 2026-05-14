@@ -17,7 +17,10 @@ cargo test               # unit tests (159 tests, ~0.1s)
 cargo clippy             # lint
 ```
 
-`blackbox` is a bin-only crate right now (`[[bin]] blackboxd`, `[[bin]] bro`) with no `[lib]` target, so `cargo test --release --lib` fails with `no library targets found in package 'blackbox'`. For the unit tests in `#[cfg(test)]` blocks under `src/main.rs`, use `cargo test --release --bin blackboxd` (or `cargo test --bin blackboxd`) instead.
+`blackbox` has a `[lib]` target plus binary entry points. The daemon modules are
+owned by `src/lib.rs`; `src/main.rs` is only the `blackboxd` entry point calling
+`blackbox::server::run()`. Use `cargo test --lib` for library tests and
+`cargo test --bin blackboxd` for the daemon binary entry point.
 
 `blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused. The same built daemon artifact is installed under two names for service isolation: `~/.local/bin/blackboxd` for prod and `~/.local/bin/blackboxd-dev` for the dev unit.
 
@@ -25,7 +28,8 @@ cargo clippy             # lint
 
 Source layout (`src/`):
 
-- **main.rs** — HTTP server bootstrap (`axum`), MCP tool dispatcher (`#[tool]`-annotated handlers), HTTP routes: `/mcp` (streamable MCP), `/tail` (SSE for `bro tail`), `/roster` (team/bro snapshot). Transcript tools include `bbox_cite` (trace a claim back to its origin turn, role=user default, citations returned oldest-first).
+- **main.rs** — tiny `blackboxd` binary entry point that calls `blackbox::server::run()`.
+- **server/** — daemon bootstrap, shared state, HTTP routes, MCP transport wiring, tool-router construction, progress plumbing, `/tail` SSE, `/roster`, and workflow/runtime helpers.
 - **cli.rs** — `bro` binary. Connects to `blackboxd`'s `/tail` endpoint and renders colorized live task events.
 - **index/** — Tantivy index lifecycle, schema (account, project, role, session_id, content, timestamps, git_branch, agent_slug, is_subagent, cwd), search/browse handlers, incremental reindex thread.
 - **parser.rs** — Multi-format transcript parsing: Claude Code (`message.content` array), Codex CLI (`payload.content`), history.jsonl (`display`). Extracts roles, tool use/results, thinking blocks. Caps content at 12KB per document.
