@@ -1,7 +1,15 @@
 # acquire_drone - pooled ad hoc bro dispatch for external LLM sessions
 
 Date: 2026-05-14
-Status: design proposal
+Status: superseded design proposal
+
+Superseded by `design/proposed/runtime-allocation-tier-mapping.md`.
+
+The probe taxonomy, account health fusion, cooldown model, selection trace
+shape, and session/account/cwd continuity notes remain useful reference
+material. The dedicated `acquire_drone` MCP surface and drone-specific public
+vocabulary are superseded: pooled workers should be ordinary brofiles, agents,
+atoms, or workflow actors with runtime allocation defaults.
 
 ## 1. Problem
 
