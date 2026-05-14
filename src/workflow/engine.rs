@@ -23,7 +23,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use super::context::{ArcContext, ArcMeta, SignalRef, resolve_arg_value};
-use super::ops::{HookOp, OnFailure, OpEffect, execute_op_with_hub};
+use super::ops::{HookOp, OnFailure, OpEffect, OpKind, execute_op_with_hub};
 use super::wait::{
     PendingWait, ProviderEventWait, WaitSpec, canonicalize_correlation, matches_correlation,
 };
@@ -762,6 +762,108 @@ impl<'a> WorkflowRunner<'a> {
         Ok(())
     }
 
+    async fn execute_poll_attached_invocation_op(&self, hook: &HookOp) -> Result<OpEffect> {
+        let rendered_args = resolve_arg_value(&self.ctx, &hook.args)
+            .map_err(|e| anyhow!("op {:?}: arg render failed: {e}", hook.op))?;
+        let primary_invocation_id = rendered_args
+            .get("primary_invocation_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!("poll_attached_invocation requires args.primary_invocation_id")
+            })?;
+        let owner = rendered_args
+            .get("owner")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.ctx
+                    .vars
+                    .get("_atom_owner")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("workflow:{}", self.ctx.meta.arc_id));
+        let attempt = rendered_args.get("attempt").and_then(Value::as_u64);
+        let tail_policy = match rendered_args.get("tail_policy") {
+            Some(Value::Null) | None => None,
+            Some(Value::String(value)) if value.trim().is_empty() || value.starts_with("${") => {
+                None
+            }
+            Some(Value::String(value)) => Some(
+                serde_json::from_str::<orch::atoms::types::SupervisionTailPolicy>(value)
+                    .map_err(|e| anyhow!("poll_attached_invocation tail_policy: {e}"))?,
+            ),
+            Some(value) => Some(
+                serde_json::from_value::<orch::atoms::types::SupervisionTailPolicy>(value.clone())
+                    .map_err(|e| anyhow!("poll_attached_invocation tail_policy: {e}"))?,
+            ),
+        };
+        let value = self
+            .server
+            .attached_supervision_poll_value_with_tail(
+                primary_invocation_id,
+                &owner,
+                attempt,
+                tail_policy.as_ref(),
+            )
+            .map_err(|e| anyhow!("poll_attached_invocation: {e}"))?;
+        Ok(OpEffect::SetVar {
+            key: hook
+                .into_var
+                .as_deref()
+                .unwrap_or("attached_invocation")
+                .to_string(),
+            value,
+        })
+    }
+
+    async fn execute_supervision_action_op(&self, hook: &HookOp) -> Result<OpEffect> {
+        let rendered_args = resolve_arg_value(&self.ctx, &hook.args)
+            .map_err(|e| anyhow!("op {:?}: arg render failed: {e}", hook.op))?;
+        let primary_invocation_id = rendered_args
+            .get("primary_invocation_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                anyhow!("execute_supervision_action requires args.primary_invocation_id")
+            })?;
+        let owner = rendered_args
+            .get("owner")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                self.ctx
+                    .vars
+                    .get("_atom_owner")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| format!("workflow:{}", self.ctx.meta.arc_id));
+        let attempt = rendered_args.get("attempt").and_then(Value::as_u64);
+        let action = rendered_args
+            .get("action")
+            .cloned()
+            .ok_or_else(|| anyhow!("execute_supervision_action requires args.action"))?;
+        let value = self
+            .server
+            .execute_supervision_action_value(primary_invocation_id, &owner, attempt, action)
+            .await
+            .map_err(|e| anyhow!("execute_supervision_action: {e}"))?;
+        Ok(OpEffect::SetVar {
+            key: hook
+                .into_var
+                .as_deref()
+                .unwrap_or("supervision_action_result")
+                .to_string(),
+            value,
+        })
+    }
+
     /// Run a list of HookOps against the current ArcContext.
     /// Per-op `when` packet evaluates against the flattened entity;
     /// failure handled per `on_failure`.
@@ -835,14 +937,22 @@ impl<'a> WorkflowRunner<'a> {
                 }
             }
             let op_kind = format!("{:?}", hook.op);
-            match execute_op_with_hub(
-                hook,
-                &self.ctx,
-                self.compiled.spec.vars_schema.as_ref(),
-                Some(&self.server.state.system_events),
-            )
-            .await
-            {
+            let op_result = match hook.op {
+                OpKind::PollAttachedInvocation => {
+                    self.execute_poll_attached_invocation_op(hook).await
+                }
+                OpKind::ExecuteSupervisionAction => self.execute_supervision_action_op(hook).await,
+                _ => {
+                    execute_op_with_hub(
+                        hook,
+                        &self.ctx,
+                        self.compiled.spec.vars_schema.as_ref(),
+                        Some(&self.server.state.system_events),
+                    )
+                    .await
+                }
+            };
+            match op_result {
                 Ok(effect) => {
                     if let Err(e) = self.apply_op_effect(effect) {
                         match hook.on_failure {
@@ -1848,6 +1958,38 @@ impl<'a> WorkflowRunner<'a> {
         if binding.durable {
             self.atom_invocations
                 .insert(spec.atom.clone(), invocation_id.clone());
+        }
+
+        if let Some(task_id) = value.get("task_id").and_then(Value::as_str)
+            && value.get("arc_id").is_some()
+        {
+            let task = {
+                let task_store = self.server.state.task_store.read();
+                task_store.get(task_id)
+            };
+            if let Some(task) = task {
+                let should_wait = {
+                    let inner = task.inner.lock();
+                    matches!(inner.status, orch::TaskStatus::Running)
+                };
+                if should_wait {
+                    self.log_event(
+                        "node_atom_workflow_wait",
+                        json!({
+                            "node": node_id,
+                            "binding": spec.atom,
+                            "invocation_id": invocation_id,
+                            "task_id": task_id,
+                        }),
+                    );
+                    tokio::select! {
+                        _ = task.notify.notified() => {}
+                        _ = self.cancel_token.cancelled() => {
+                            bail!("arc cancelled")
+                        }
+                    }
+                }
+            }
         }
 
         let status_value = self

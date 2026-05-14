@@ -163,6 +163,13 @@ pub enum OpKind {
     /// `vars[into_var]`. Writes `Value::Null` when the array is absent or
     /// empty so downstream `IsNull` predicates can short-circuit cleanly.
     PickFirst,
+    /// Engine-state op handled by `WorkflowRunner`: poll a supervised primary
+    /// invocation through its wrapper-owned attachment lineage and write the
+    /// bounded snapshot into `vars[into_var]`.
+    PollAttachedInvocation,
+    /// Engine-state op handled by `WorkflowRunner`: apply a typed advisor
+    /// action through code-owned lineage and compatibility checks.
+    ExecuteSupervisionAction,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -264,6 +271,12 @@ pub async fn execute_op_with_hub(
             exec_score_eval_output(&rendered_args, hook.into_var.as_deref(), ctx)
         }
         OpKind::PickFirst => exec_pick_first(&rendered_args, hook.into_var.as_deref(), ctx),
+        OpKind::PollAttachedInvocation => {
+            bail!("poll_attached_invocation op requires workflow engine state")
+        }
+        OpKind::ExecuteSupervisionAction => {
+            bail!("execute_supervision_action op requires workflow engine state")
+        }
         OpKind::SystemEventCompact => {
             let hub = hub.ok_or_else(|| {
                 anyhow!(

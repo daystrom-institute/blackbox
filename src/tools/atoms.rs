@@ -1033,6 +1033,7 @@ impl BlackboxServer {
             input_digest,
             output_digest: Some(sha256_json_value(&result.data)),
             output_shape: Some(output_shape.clone()),
+            structured_output: None,
             effective_limits: Some(effective_limits),
             summary: Some(output_text.chars().take(500).collect()),
             effects_observed: EffectsObserved {
@@ -1117,6 +1118,13 @@ impl BlackboxServer {
         let end = inner.completed_at.unwrap_or_else(orchestration::now_ms);
         inv.cost.wall_time_ms = Some(end.saturating_sub(inner.started_at));
         if let Some(msg) = &inner.last_assistant_message {
+            if inv.structured_output.is_none()
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(msg)
+                && let Some(structured) = value.get("structured_exit")
+                && !structured.is_null()
+            {
+                inv.structured_output = Some(structured.clone());
+            }
             if inv.summary.is_none() {
                 inv.summary = Some(msg.chars().take(500).collect());
             }
@@ -1351,6 +1359,134 @@ impl BlackboxServer {
             "task_notes": serde_json::Value::Array(task_notes),
             "latest_bro_report": latest_report,
             "assistant_tail": assistant_tail,
+        }))
+    }
+
+    pub(crate) async fn execute_supervision_action_value(
+        &self,
+        primary_invocation_id: &str,
+        owner: &str,
+        attempt: Option<u64>,
+        action: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        use orchestration::atoms::invocation::{AtomHandle, InvocationStatus};
+
+        let attachment = self.resolve_attachment_for_poll(primary_invocation_id, attempt)?;
+        self.authorize_attachment_read(&attachment, owner)?;
+        let action_kind = action
+            .get("action")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "action.action must be a string".to_string())?;
+        let mut primary_invocation = {
+            let store = self.state.atom_invocation_store.read();
+            store
+                .get(&attachment.primary_invocation_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "attachment references missing primary invocation: {}",
+                        attachment.primary_invocation_id
+                    )
+                })?
+        };
+        self.refresh_atom_invocation_from_task(&mut primary_invocation);
+        let primary_owner = primary_invocation
+            .owners
+            .iter()
+            .next()
+            .cloned()
+            .ok_or_else(|| "primary invocation has no owner".to_string())?;
+        let task_id = primary_invocation.task_id();
+
+        let result = match action_kind {
+            "accept" | "continue_observing" | "escalate_human" | "bail" => {
+                serde_json::json!({
+                    "status": "recorded",
+                    "action": action_kind,
+                    "mutated_primary": false,
+                })
+            }
+            "steer_primary" => {
+                match &primary_invocation.handle {
+                    AtomHandle::Profile { .. } => {}
+                    _ => {
+                        return Err(
+                            "error.incompatible_action: steer_primary requires a profile-backed primary"
+                                .into(),
+                        );
+                    }
+                }
+                if !matches!(
+                    primary_invocation.status,
+                    InvocationStatus::Running
+                        | InvocationStatus::Succeeded
+                        | InvocationStatus::Failed
+                        | InvocationStatus::TimedOut
+                ) {
+                    return Err(
+                        "error.incompatible_action: primary invocation is not resumable".into(),
+                    );
+                }
+                let prompt = action
+                    .get("prompt")
+                    .or_else(|| action.get("message"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        "steer_primary requires action.prompt or action.message".to_string()
+                    })?;
+                let resume = self
+                    .atom_resume_value(crate::AtomResumeParams {
+                        invocation_id: attachment.primary_invocation_id.clone(),
+                        prompt: prompt.to_string(),
+                        owner: Some(primary_owner),
+                    })
+                    .await?;
+                serde_json::json!({
+                    "status": "steered",
+                    "action": action_kind,
+                    "mutated_primary": true,
+                    "resume": resume,
+                })
+            }
+            "cancel_and_retry" => {
+                let task_id = task_id.ok_or_else(|| {
+                    "error.incompatible_action: cancel_and_retry requires a task-backed primary"
+                        .to_string()
+                })?;
+                let task = {
+                    let task_store = self.state.task_store.read();
+                    task_store.get(&task_id).ok_or_else(|| {
+                        format!("error.not_found: primary task '{task_id}' not found")
+                    })?
+                };
+                orchestration::cancel_task(&task, &self.state.task_store, &self.state.store_dir)?;
+                serde_json::json!({
+                    "status": "cancelled",
+                    "action": action_kind,
+                    "mutated_primary": true,
+                    "task_id": task_id,
+                })
+            }
+            "replace_primary" => {
+                return Err(
+                    "error.unsupported_action: replace_primary requires replacement dispatch wiring"
+                        .into(),
+                );
+            }
+            other => {
+                return Err(format!(
+                    "error.invalid_action: unsupported supervision action '{other}'"
+                ));
+            }
+        };
+
+        Ok(serde_json::json!({
+            "supervision_run_id": attachment.supervision_run_id,
+            "primary_invocation_id": attachment.primary_invocation_id,
+            "attempt": attachment.attempt,
+            "decision": action,
+            "result": result,
         }))
     }
 
@@ -2062,5 +2198,132 @@ mod tests {
         for note in snapshot["task_notes"].as_array().unwrap() {
             assert!(note["body"].as_str().unwrap().len() <= 4000);
         }
+    }
+
+    #[tokio::test]
+    async fn execute_supervision_action_accept_records_without_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(Arc::new(crate::server::state::SharedState::for_test(
+            dir.path(),
+        )));
+        let primary = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-primary".into(),
+            "atom:test@v1".into(),
+            None,
+            "operator:primary".into(),
+            "claude".into(),
+            "session-primary".into(),
+            None,
+            "task-primary".into(),
+        );
+        let advisor = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-advisor".into(),
+            "atom:advisor@v1".into(),
+            None,
+            "operator:advisor".into(),
+            "claude".into(),
+            "session-advisor".into(),
+            None,
+            "task-advisor".into(),
+        );
+        {
+            let mut store = server.state.atom_invocation_store.write();
+            store.insert(primary);
+            store.insert(advisor);
+            store.insert_attachment(orchestration::atoms::invocation::SupervisionAttachment {
+                supervision_run_id: "run-1".into(),
+                primary_invocation_id: "inv-primary".into(),
+                primary_task_id: "task-primary".into(),
+                classifier_invocation_id: None,
+                advisor_invocation_id: Some("inv-advisor".into()),
+                attempt: 1,
+            });
+        }
+        make_task(&server, "task-primary", vec![], Some("done"), None);
+
+        let result = server
+            .execute_supervision_action_value(
+                "inv-primary",
+                "operator:advisor",
+                Some(1),
+                serde_json::json!({"action": "accept", "reason": "meets criteria"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["status"], serde_json::json!("recorded"));
+        assert_eq!(
+            result["result"]["mutated_primary"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_supervision_action_cancel_scopes_to_primary_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = BlackboxServer::new(Arc::new(crate::server::state::SharedState::for_test(
+            dir.path(),
+        )));
+        let primary = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-primary".into(),
+            "atom:test@v1".into(),
+            None,
+            "operator:primary".into(),
+            "claude".into(),
+            "session-primary".into(),
+            None,
+            "task-primary".into(),
+        );
+        let advisor = orchestration::atoms::invocation::AtomInvocation::new_profile(
+            "inv-advisor".into(),
+            "atom:advisor@v1".into(),
+            None,
+            "operator:advisor".into(),
+            "claude".into(),
+            "session-advisor".into(),
+            None,
+            "task-advisor".into(),
+        );
+        {
+            let mut store = server.state.atom_invocation_store.write();
+            store.insert(primary);
+            store.insert(advisor);
+            store.insert_attachment(orchestration::atoms::invocation::SupervisionAttachment {
+                supervision_run_id: "run-1".into(),
+                primary_invocation_id: "inv-primary".into(),
+                primary_task_id: "task-primary".into(),
+                classifier_invocation_id: None,
+                advisor_invocation_id: Some("inv-advisor".into()),
+                attempt: 1,
+            });
+        }
+        make_task(&server, "task-primary", vec![], Some("running"), None);
+        make_task(&server, "task-unrelated", vec![], Some("running"), None);
+
+        let result = server
+            .execute_supervision_action_value(
+                "inv-primary",
+                "operator:advisor",
+                Some(1),
+                serde_json::json!({"action": "cancel_and_retry", "reason": "retry"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["result"]["status"], serde_json::json!("cancelled"));
+
+        let primary_task = server.state.task_store.read().get("task-primary").unwrap();
+        assert!(matches!(
+            primary_task.inner.lock().status,
+            orchestration::TaskStatus::Cancelled
+        ));
+        let unrelated_task = server
+            .state
+            .task_store
+            .read()
+            .get("task-unrelated")
+            .unwrap();
+        assert!(matches!(
+            unrelated_task.inner.lock().status,
+            orchestration::TaskStatus::Running
+        ));
     }
 }

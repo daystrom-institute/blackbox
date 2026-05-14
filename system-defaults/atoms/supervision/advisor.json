@@ -1,0 +1,89 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "supervision-advisor",
+  "version": 1,
+  "subcontract": "supervision/advisor/v1",
+  "manifest": {
+    "description": "Workflow-backed advisor that emits typed supervision actions without executing them.",
+    "when_to_use": [
+      "judging a completed or alerted supervised atom attempt",
+      "choosing between accept, observe, steer, retry, escalate, and bail actions",
+      "normalizing advisor-only and classifier-plus-advisor supervision decisions"
+    ],
+    "anti_patterns": [
+      "do not use as a mutation executor",
+      "do not use without a primary invocation attachment",
+      "do not use when deterministic policy can accept the outcome without judgment"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["primary_invocation_id", "acceptance_criteria"],
+        "properties": {
+          "primary_invocation_id": { "type": "string" },
+          "attempt": { "type": "integer", "minimum": 1 },
+          "tail_policy": { "type": "object" },
+          "classifier_findings": { "type": "array" },
+          "acceptance_criteria": { "type": "string" },
+          "attempt_history": { "type": "array" },
+          "allowed_actions": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "recovery_policy": { "type": "object" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["action", "reason", "confidence", "evidence_keys"],
+        "properties": {
+          "action": {
+            "enum": [
+              "accept",
+              "continue_observing",
+              "steer_primary",
+              "cancel_and_retry",
+              "replace_primary",
+              "escalate_human",
+              "bail"
+            ]
+          },
+          "reason": { "type": "string" },
+          "confidence": { "type": "number" },
+          "prompt": { "type": "string" },
+          "evidence_keys": { "type": "array", "items": { "type": "string" } },
+          "checkpoint": { "type": "object" }
+        },
+        "additionalProperties": true
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 1,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": { "kind": "none" }
+    },
+    "implementation": {
+      "kind": "workflow",
+      "workflow_ref": "workflow:supervision-advisor@v1"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-system-defaults",
+      "created_at": "2026-05-14T00:00:00Z"
+    }
+  }
+}

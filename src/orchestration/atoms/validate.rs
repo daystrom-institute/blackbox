@@ -1413,6 +1413,32 @@ mod tests {
     }
 
     #[test]
+    fn supervision_atom_workflows_parse_and_compile() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("system-defaults/workflows/supervision");
+        let entries = std::fs::read_dir(&dir).expect("supervision workflows dir exists");
+        let mut found = 0usize;
+        for entry in entries {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            found += 1;
+            let src = std::fs::read_to_string(&path).expect("read workflow");
+            let spec: crate::workflow::Workflow = serde_json::from_str(&src)
+                .unwrap_or_else(|e| panic!("{name} did not parse as Workflow: {e}"));
+            crate::workflow::compile(spec)
+                .unwrap_or_else(|e| panic!("{name} failed to compile: {e}"));
+        }
+        assert!(
+            found >= 1,
+            "expected at least one supervision workflow under system-defaults/workflows/supervision/"
+        );
+    }
+
+    #[test]
     fn every_shipped_atom_artifact_passes_validation() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let dir = crate_root.join("system-defaults/atoms");

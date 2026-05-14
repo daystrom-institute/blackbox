@@ -113,6 +113,8 @@ pub struct AtomInvocation {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_shape: Option<OutputShapeStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_limits: Option<InvocationLimits>,
     pub summary: Option<String>,
     pub effects_observed: EffectsObserved,
@@ -165,6 +167,7 @@ impl AtomInvocation {
             input_digest: None,
             output_digest: None,
             output_shape: None,
+            structured_output: None,
             effective_limits: None,
             summary: None,
             effects_observed: EffectsObserved {
@@ -208,6 +211,7 @@ impl AtomInvocation {
             input_digest: None,
             output_digest: None,
             output_shape: None,
+            structured_output: None,
             effective_limits: None,
             summary: None,
             effects_observed: EffectsObserved {
@@ -270,6 +274,7 @@ impl AtomInvocation {
             "input_digest": self.input_digest,
             "output_digest": self.output_digest,
             "output_shape": self.output_shape.clone().unwrap_or_default(),
+            "structured_output": self.structured_output,
             "summary": self.summary,
             "decision_points": [],
             "children": self.children,

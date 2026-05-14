@@ -1,0 +1,46 @@
+{
+  "domain": "supervision/classifier-route",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["alert", "poll_again", "no_alert", "classifier_failed"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "classifier_schema_failure",
+      "classification": "classifier_failed",
+      "antecedent": { "op": "Eq", "field": "vars.classifier_result.classification", "value": "classifier_failed" },
+      "consequent": "classifier_failed"
+    },
+    {
+      "id": "alerting_classification",
+      "classification": "alert",
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.classifier_result.classification", "value": "stalled" },
+          { "op": "Eq", "field": "vars.classifier_result.classification", "value": "off_task" },
+          { "op": "Eq", "field": "vars.classifier_result.classification", "value": "needs_steer" }
+        ]
+      },
+      "consequent": "alert"
+    },
+    {
+      "id": "running_nominal_polls_again",
+      "classification": "poll_again",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "vars.snapshot.task.status", "value": "running" },
+          { "op": "Lt", "field": "vars.poll_count", "value": 3 }
+        ]
+      },
+      "consequent": "poll_again"
+    },
+    {
+      "id": "default_no_alert",
+      "classification": "no_alert",
+      "antecedent": { "op": "True" },
+      "consequent": "no_alert"
+    }
+  ]
+}

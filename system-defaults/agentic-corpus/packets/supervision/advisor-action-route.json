@@ -1,0 +1,66 @@
+{
+  "domain": "supervision/advisor-action-route",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": [
+    "accept",
+    "continue_observing",
+    "steer_primary",
+    "cancel_and_retry",
+    "replace_primary",
+    "escalate_human",
+    "bail",
+    "invalid_action"
+  ],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "accept",
+      "classification": "accept",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "accept" },
+      "consequent": "accept"
+    },
+    {
+      "id": "continue_observing",
+      "classification": "continue_observing",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "continue_observing" },
+      "consequent": "continue_observing"
+    },
+    {
+      "id": "steer_primary",
+      "classification": "steer_primary",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "steer_primary" },
+      "consequent": "steer_primary"
+    },
+    {
+      "id": "cancel_and_retry",
+      "classification": "cancel_and_retry",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "cancel_and_retry" },
+      "consequent": "cancel_and_retry"
+    },
+    {
+      "id": "replace_primary",
+      "classification": "replace_primary",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "replace_primary" },
+      "consequent": "replace_primary"
+    },
+    {
+      "id": "escalate_human",
+      "classification": "escalate_human",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "escalate_human" },
+      "consequent": "escalate_human"
+    },
+    {
+      "id": "bail",
+      "classification": "bail",
+      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "bail" },
+      "consequent": "bail"
+    },
+    {
+      "id": "invalid_default",
+      "classification": "invalid_action",
+      "antecedent": { "op": "True" },
+      "consequent": "invalid_action"
+    }
+  ]
+}
