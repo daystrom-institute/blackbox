@@ -97,7 +97,7 @@ fn default_orphan_after_days() -> u64 {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_gc",
-        description = "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule."
+        description = "Dry-run or apply edge sidecar garbage collection. Reports exact candidates with path, bytes, and rule for temps, backups, orphan classes, inactive snapshots, and observed cap warnings."
     )]
     pub(crate) fn bbox_storage_gc(
         &self,

@@ -9,7 +9,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bro_exec",
-        description = "Launch an agent task. Returns {taskId, sessionId} immediately."
+        description = "Launch a fresh agent task/session and return {taskId, sessionId} immediately; do not use for continuity."
     )]
     pub(crate) async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
@@ -125,7 +125,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_resume",
-        description = "Continue an existing session with a follow-up. Single-flight per provider session."
+        description = "Continue an existing session with a follow-up; single-flight per provider session and the continuity path after bro_exec."
     )]
     pub(crate) async fn bro_resume(
         &self,
@@ -268,7 +268,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_wait",
-        description = "Block until a single task completes."
+        description = "Block until one task completes; timeout returns a snapshot, not proof the task is dead."
     )]
     pub(crate) async fn bro_wait(
         &self,
@@ -319,7 +319,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_when_all",
-        description = "Block until ALL tasks / team members complete."
+        description = "Block until ALL tasks / team members complete; use for fan-out/fan-in instead of hand-rolled sequential waits."
     )]
     pub(crate) async fn bro_when_all(
         &self,
@@ -395,7 +395,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_when_any",
-        description = "Block until the FIRST task completes."
+        description = "Block until the FIRST task completes; use for races instead of polling each task yourself."
     )]
     pub(crate) async fn bro_when_any(
         &self,
@@ -694,7 +694,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_status",
-        description = "Non-blocking progress check on a task."
+        description = "Non-blocking progress check on a task; call before declaring a timeout dead or cancelling."
     )]
     pub(crate) fn bro_status(&self, Parameters(p): Parameters<StatusParams>) -> CallToolResult {
         match self.state.task_store.read().get(&p.task_id) {
@@ -790,7 +790,10 @@ impl BlackboxServer {
         }))
     }
 
-    #[tool(name = "bro_cancel", description = "Cancel a running task (SIGTERM).")]
+    #[tool(
+        name = "bro_cancel",
+        description = "Cancel a running task (SIGTERM); check bro_status first unless the user explicitly asked to stop."
+    )]
     pub(crate) fn bro_cancel(&self, Parameters(p): Parameters<CancelParams>) -> CallToolResult {
         let task = match self.state.task_store.read().get(&p.task_id) {
             Some(t) => t,

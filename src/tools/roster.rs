@@ -7,7 +7,10 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 
 #[tool_router(router = roster_tools)]
 impl BlackboxServer {
-    #[tool(name = "bro_dashboard", description = "List recent tasks / sessions.")]
+    #[tool(
+        name = "bro_dashboard",
+        description = "List recent tasks / sessions for lookup only; do not take over another operator's bro from the dashboard."
+    )]
     pub(crate) fn bro_dashboard(
         &self,
         Parameters(p): Parameters<DashboardParams>,

@@ -672,8 +672,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_exec",
         category: ToolCategory::Orchestration,
-        summary: "Launch an agent task. Returns {taskId, sessionId} immediately.",
-        when_to_use: "Use to start a fresh agent session. Prefer `bro:` over raw `provider:` so routing stays stable. Follow with `bro_wait`, `bro_when_all`, or `bro_status` depending on whether you need blocking completion. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        summary: "Launch a fresh agent task/session and return {taskId, sessionId} immediately; do not use for continuity.",
+        when_to_use: "Use to start a fresh agent session only. Prefer `bro:` over raw `provider:` so routing stays stable. Record the returned `taskId` and `sessionId` immediately; use those explicit handles for later waits/resumes. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_exec(bro="executor", prompt="refactor the tail module", project_dir="/repo/x")"#,
         ),
@@ -681,8 +681,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_resume",
         category: ToolCategory::Orchestration,
-        summary: "Continue an existing session with a follow-up. Single-flight per provider session.",
-        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. Named bro targeting auto-resolves the session ID. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        summary: "Continue an existing session with a follow-up; single-flight per provider session and the continuity path after bro_exec.",
+        when_to_use: "Use for follow-ups on an existing bro session. Do not use `bro_exec` again when you need continuity. Pass explicit `session_id` / `provider` when possible; named bro targeting is only safe when the session is unambiguous. Never call `bro_resume` on a session while its previous task is still running: first `bro_wait(task_id=...)`, or `bro_cancel(task_id=...)` if you are abandoning that turn. If a prior turn failed but the session is still useful, resume it with recovery context before starting a fresh `bro_exec`. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),
@@ -770,22 +770,22 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_wait",
         category: ToolCategory::Orchestration,
-        summary: "Block until a single task completes.",
-        when_to_use: "After `bro_exec`. USE MAXIMUM TIMEOUT. Returns the final task state.",
+        summary: "Block until one task completes; timeout returns a snapshot, not proof the task is dead.",
+        when_to_use: "After `bro_exec` or `bro_resume` when you need the result. USE MAXIMUM TIMEOUT for provider work. On timeout, call `bro_status` before deciding the task is stuck, cancelling it, or dispatching replacement work.",
         example: None,
     },
     ToolDoc {
         name: "bro_when_all",
         category: ToolCategory::Orchestration,
-        summary: "Block until ALL tasks / team members complete.",
-        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT.",
+        summary: "Block until ALL tasks / team members complete; use for fan-out/fan-in instead of hand-rolled sequential waits.",
+        when_to_use: "Fan-out/fan-in pattern. Pair with `bro_broadcast` for blind deliberation / provider comparison. USE MAXIMUM TIMEOUT. On timeout, inspect member status before cancelling or redispatching.",
         example: None,
     },
     ToolDoc {
         name: "bro_when_any",
         category: ToolCategory::Orchestration,
-        summary: "Block until the FIRST task completes.",
-        when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled.",
+        summary: "Block until the FIRST task completes; use for races instead of polling each task yourself.",
+        when_to_use: "Racing providers / fast-path resolution. First result wins, others keep running unless cancelled. Before cancelling laggards, check status and cancel only if the remaining work is truly no longer useful.",
         example: None,
     },
     ToolDoc {
@@ -798,15 +798,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_status",
         category: ToolCategory::Orchestration,
-        summary: "Non-blocking progress check on a task.",
-        when_to_use: "Peek at a running task without blocking. Prefer `bro_wait` with a timeout when you actually need the result.",
+        summary: "Non-blocking progress check on a task; call before declaring a timeout dead or cancelling.",
+        when_to_use: "Peek at a running task without blocking. Use after a timeout, before `bro_cancel`, and before replacing allegedly stuck work. Prefer `bro_wait` with a timeout when you actually need the result.",
         example: None,
     },
     ToolDoc {
         name: "bro_dashboard",
         category: ToolCategory::Orchestration,
-        summary: "List recent tasks / sessions.",
-        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team.",
+        summary: "List recent tasks / sessions for lookup only; do not take over another operator's bro from the dashboard.",
+        when_to_use: "Look up a taskId or sessionId when you don't already have it. Filter by provider, status, team. Treat dashboard rows as shared state, not ownership grants: prefer taskId/sessionId handles returned by your own dispatch, and do not resume/cancel/prune/dissolve work created by another external session unless the user explicitly asks.",
         example: None,
     },
     ToolDoc {
@@ -821,15 +821,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_cancel",
         category: ToolCategory::Orchestration,
-        summary: "Cancel a running task (SIGTERM).",
-        when_to_use: "Task is stuck, you raced another, or user asked to stop.",
+        summary: "Cancel a running task (SIGTERM); check bro_status first unless the user explicitly asked to stop.",
+        when_to_use: "Task is confirmed stuck, you intentionally abandon a lost race, or the user asked to stop. A wait timeout is not enough evidence by itself; call `bro_status` first and avoid cancelling tasks you did not create unless instructed.",
         example: None,
     },
     ToolDoc {
         name: "bro_prune",
         category: ToolCategory::Orchestration,
         summary: "Drop terminal tasks from the store + persisted tasks.json.",
-        when_to_use: "Stale failed/completed tasks are cluttering bro_dashboard or bbox_inbox. Defaults to status=failed. Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched.",
+        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard or bbox_inbox. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched.",
         example: Some(r#"bro_prune(status="failed", provider="gemini")"#),
     },
     ToolDoc {
@@ -850,7 +850,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_team",
         category: ToolCategory::Orchestration,
         summary: "Manage teamplates and instantiated teams.",
-        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. Before `save_template` or `create`, list existing objects first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
+        when_to_use: "Save templates, instantiate teams, inspect roster, or tear teams down. Before `save_template` or `create`, list existing objects first to avoid duplicates. Dissolve ad hoc teams you created after their work is terminal; do not dissolve another operator's team unless instructed. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(
             r#"bro_team(action="create", template="red-team", name="bbox-red", project_dir="/repo/x")"#,
         ),
@@ -1404,7 +1404,21 @@ from transcript history.
 ## Hot-path conventions
 
 - List before create.
-- `bro_exec` starts fresh; `bro_resume` continues.
+- `bro_exec` starts fresh; `bro_resume` continues. If you want continuity, \
+record the returned `taskId`/`sessionId` and resume that session explicitly; \
+do not call a second `bro_exec` and expect memory.
+- Treat `bro_dashboard` as shared lookup, not ownership transfer. Do not \
+resume, cancel, prune, or dissolve a bro/team/task created by another external \
+session unless the user explicitly asks. Prefer handles returned by your own \
+dispatch.
+- Before declaring a bro dead or cancelling after a timeout, call \
+`bro_status(task_id=..., tail=N)`. A timeout can mean thinking, tests running, \
+rate limiting, or failure; status/tail is the evidence.
+- Use `bro_when_all` for fan-out/fan-in and `bro_when_any` for races. Do not \
+hand-roll sequential wait/poll loops when the coordination primitive exists.
+- After external orchestration, clean up only what you created: prune terminal \
+tasks with `bro_prune` and dissolve ad hoc teams after all member tasks are \
+terminal.
 - Memory lanes: `bbox_thread` (investigation state), \
 `bbox_learn`/`bbox_decide` (standing rules / commitments), \
 `bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \

@@ -24,7 +24,7 @@ pub(crate) struct StorageHealthParams {
 impl BlackboxServer {
     #[tool(
         name = "bbox_storage_health",
-        description = "Read-only edge sidecar inventory. Totals by kind; include_files=true for rows."
+        description = "Read-only edge sidecar inventory. Totals active legacy, managed derived, backups, temps, orphan classes, inactive snapshots, and observed history; include_files=true for exact rows."
     )]
     pub(crate) fn bbox_storage_health(
         &self,
