@@ -68,6 +68,10 @@ pub struct EdgeStoreRefs<'a> {
     pub edges_dir: PathBuf,
     pub registered_project_ids: Option<HashSet<String>>,
     pub include_tantivy_projection: bool,
+    /// When false, observed lane edges (EDITED_FILE/READ_FILE/RAN_BASH) are
+    /// excluded from the rebuilt index. Default graph queries (describe_schema,
+    /// hybrid search) use Active mode; provenance/blame callers use Historical.
+    pub include_observed: bool,
 }
 
 fn count_materialized_jsonl_files(edges_dir: &Path) -> usize {
@@ -115,6 +119,7 @@ impl EdgeIndex {
             &stores.edges_dir,
             stores.registered_project_ids.as_ref(),
             &mut seen,
+            stores.include_observed,
         );
 
         tracing::info!(
@@ -133,16 +138,22 @@ impl EdgeIndex {
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
         seen: &mut HashSet<EdgeKey>,
+        include_observed: bool,
     ) {
         match crate::manifest::try_load_manifest_index(edges_dir) {
             Ok(manifest_index) => {
-                let active_paths = manifest_index.active_materialized_paths(edges_dir);
+                let loadable = manifest_index.active_paths_for_loader(edges_dir);
                 let total_materialized_files = count_materialized_jsonl_files(edges_dir);
-                let skipped_inactive = total_materialized_files.saturating_sub(active_paths.len());
-                self.load_manifest_active_paths(&active_paths, seen);
-                self.load_legacy_explicit_edges(edges_dir, registered_project_ids, seen);
+                let skipped_inactive = total_materialized_files.saturating_sub(loadable.len());
+                self.load_manifest_active_paths(&loadable, seen);
+                self.load_legacy_explicit_edges(
+                    edges_dir,
+                    registered_project_ids,
+                    seen,
+                    include_observed,
+                );
                 tracing::info!(
-                    active_paths = active_paths.len(),
+                    active_paths = loadable.len(),
                     skipped_inactive_refs = skipped_inactive,
                     total_materialized_files,
                     "loaded edges via manifest-index"
@@ -155,7 +166,12 @@ impl EdgeIndex {
                 ) {
                     tracing::warn!(?reason, "manifest-index fallback to legacy sidecar loading");
                 }
-                self.project_sidecar_edges(edges_dir, registered_project_ids, seen);
+                self.project_sidecar_edges(
+                    edges_dir,
+                    registered_project_ids,
+                    seen,
+                    include_observed,
+                );
             }
         }
     }
@@ -221,6 +237,25 @@ impl EdgeIndex {
                 *counts
                     .entry(r.entity_type().as_str().to_string())
                     .or_insert(0) += 1;
+            }
+        }
+        counts
+    }
+
+    /// Like `entity_type_counts` but excludes entity types that only appear
+    /// via observed history lanes (transcript, bash_call). Used by
+    /// `bbox_describe_schema` to show the active knowledge graph without
+    /// flooding counts with raw provenance observations.
+    pub fn entity_type_counts_active(&self) -> BTreeMap<String, usize> {
+        const OBSERVED_TYPES: &[&str] = &["transcript", "bash_call"];
+        let mut seen = HashSet::new();
+        let mut counts = BTreeMap::new();
+        for r in self.forward.keys().chain(self.reverse.keys()) {
+            if seen.insert(r) {
+                let ty = r.entity_type().as_str().to_string();
+                if !OBSERVED_TYPES.contains(&ty.as_str()) {
+                    *counts.entry(ty).or_insert(0) += 1;
+                }
             }
         }
         counts
@@ -594,6 +629,7 @@ impl EdgeIndex {
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
         seen: &mut HashSet<EdgeKey>,
+        include_observed: bool,
     ) {
         let managed_derived_dir = managed_derived_edges_dir(edges_dir);
         let projects_with_managed = scan_managed_derived_project_ids(&managed_derived_dir);
@@ -603,7 +639,12 @@ impl EdgeIndex {
             seen,
             &projects_with_managed,
         );
-        for sub in &["derived", "explicit", "observed"] {
+        let subdirs: &[&str] = if include_observed {
+            &["derived", "explicit", "observed"]
+        } else {
+            &["derived", "explicit"]
+        };
+        for sub in subdirs {
             let sub_dir = edges_dir.join(sub);
             if !sub_dir.is_dir() {
                 continue;
@@ -695,9 +736,56 @@ impl EdgeIndex {
         }
     }
 
-    fn load_manifest_active_paths(&mut self, paths: &[PathBuf], seen: &mut HashSet<EdgeKey>) {
-        for path in paths {
-            self.project_sidecar_edges_file(path, seen, false);
+    fn load_manifest_active_paths(
+        &mut self,
+        paths: &[crate::manifest::LoadablePath],
+        seen: &mut HashSet<EdgeKey>,
+    ) {
+        for loadable in paths {
+            match &loadable.mode {
+                crate::manifest::PathLoadMode::Full => {
+                    self.project_sidecar_edges_file(&loadable.path, seen, false);
+                }
+                crate::manifest::PathLoadMode::FilteredByHash { suppressed_hashes } => {
+                    self.project_sidecar_edges_file_with_hash_filter(
+                        &loadable.path,
+                        seen,
+                        suppressed_hashes,
+                    );
+                }
+            }
+        }
+    }
+
+    fn project_sidecar_edges_file_with_hash_filter(
+        &mut self,
+        path: &Path,
+        seen: &mut HashSet<EdgeKey>,
+        suppressed_hashes: &HashSet<String>,
+    ) {
+        let Ok(file) = fs::File::open(path) else {
+            return;
+        };
+        let reader = std::io::BufReader::new(file);
+        for line in reader.lines().map_while(Result::ok) {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            match serde_json::from_str::<Edge>(trimmed) {
+                Ok(edge) => {
+                    if !edge_touches_any_path_hash(&edge, suppressed_hashes) {
+                        self.insert_sidecar_edge(edge, seen);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %err,
+                        "failed to parse edge sidecar line (hash-filtered load)"
+                    );
+                }
+            }
         }
     }
 
@@ -706,6 +794,7 @@ impl EdgeIndex {
         edges_dir: &Path,
         registered_project_ids: Option<&HashSet<String>>,
         seen: &mut HashSet<EdgeKey>,
+        include_observed: bool,
     ) {
         let explicit_dir = edges_dir.join("explicit");
         let observed_dir = edges_dir.join("observed");
@@ -729,7 +818,7 @@ impl EdgeIndex {
                     self.project_sidecar_edges_file(&path, seen, false);
                 }
             }
-            if observed_lane_projects.contains(project_id) {
+            if include_observed && observed_lane_projects.contains(project_id) {
                 let path = observed_dir.join(format!("{project_id}.jsonl"));
                 if path.exists() {
                     self.project_sidecar_edges_file(&path, seen, false);
@@ -1665,7 +1754,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert_eq!(index.forward_edges(&source).len(), 1);
         assert_eq!(index.reverse_edges(&target).len(), 1);
@@ -1770,7 +1859,7 @@ mod tests {
         registered.insert("proj1234".to_string());
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen);
+        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen, true);
 
         assert_eq!(index.forward_edges(&registered_source).len(), 1);
         assert!(index.forward_edges(&orphan_source).is_empty());
@@ -1804,7 +1893,7 @@ mod tests {
         let registered = HashSet::new();
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen);
+        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen, true);
 
         assert_eq!(index.forward_edges(&source).len(), 1);
     }
@@ -1867,7 +1956,7 @@ mod tests {
         registered.insert("proj1234".to_string());
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen);
+        index.project_sidecar_edges(dir.path(), Some(&registered), &mut seen, true);
 
         assert_eq!(index.forward_edges(&registered_source).len(), 1);
         assert!(index.forward_edges(&orphan_source).is_empty());
@@ -1923,7 +2012,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert!(
             index
@@ -1979,7 +2068,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert!(
             index
@@ -2057,7 +2146,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert!(
             index
@@ -2106,7 +2195,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert!(
             index
@@ -2239,7 +2328,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert_eq!(
             index.forward_edges(&source).len(),
@@ -2335,7 +2424,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.project_sidecar_edges(dir.path(), None, &mut seen);
+        index.project_sidecar_edges(dir.path(), None, &mut seen, true);
 
         assert!(
             index
@@ -2907,7 +2996,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
 
         let active_source = EntityRef::Knowledge {
             id: "k_active".into(),
@@ -2945,7 +3034,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
 
         let source = EntityRef::Knowledge {
             id: "k_legacy".into(),
@@ -2967,7 +3056,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
 
         let source = EntityRef::Knowledge {
             id: "k_explicit".into(),
@@ -3001,7 +3090,7 @@ mod tests {
 
         let mut index = EdgeIndex::default();
         let mut seen = HashSet::new();
-        index.load_sidecar_edges(edges_dir, None, &mut seen);
+        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
 
         let source = EntityRef::Knowledge {
             id: "k_stale_test".into(),
@@ -3070,7 +3159,7 @@ mod tests {
         fn load_active(edges_dir: &Path) -> EdgeIndex {
             let mut index = EdgeIndex::default();
             let mut seen = HashSet::new();
-            index.load_sidecar_edges(edges_dir, None, &mut seen);
+            index.load_sidecar_edges(edges_dir, None, &mut seen, true);
             index
         }
 
@@ -3507,7 +3596,7 @@ mod tests {
 
             let mut index = EdgeIndex::default();
             let mut seen = HashSet::new();
-            index.load_sidecar_edges(edges_dir, None, &mut seen);
+            index.load_sidecar_edges(edges_dir, None, &mut seen, true);
 
             let source = EntityRef::Knowledge {
                 id: "sym_active".into(),
@@ -3544,5 +3633,275 @@ mod tests {
             }
             count
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Focused tests for active/historical mode, per-file overlay, and observed
+    // -------------------------------------------------------------------------
+
+    fn project_file_edge(
+        project_id: &str,
+        rel_path_hash: &str,
+        kind: &str,
+        provenance: EdgeProvenance,
+    ) -> Edge {
+        let make = |occ: u32| EntityRef::ProjectFile {
+            project_id: project_id.into(),
+            rel_path_hash: rel_path_hash.into(),
+            chunk_hash: format!("{occ:0>64}"),
+            occurrence_idx: occ,
+        };
+        Edge {
+            source: make(0),
+            kind: kind.into(),
+            target: make(1),
+            provenance,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn observed_edge(session_id: &str, rel_path_hash: &str, project_id: &str) -> Edge {
+        Edge {
+            source: EntityRef::Transcript {
+                provider: "claude".into(),
+                session_id: session_id.into(),
+                line_offset: 0,
+                event_idx: 0,
+            },
+            kind: "EDITED_FILE".into(),
+            target: EntityRef::ProjectFile {
+                project_id: project_id.into(),
+                rel_path_hash: rel_path_hash.into(),
+                chunk_hash: "a".repeat(64),
+                occurrence_idx: 0,
+            },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Heuristic,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn entity_type_counts_active_excludes_transcript_and_bash_call() {
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+
+        // Insert a transcript->project_file EDITED_FILE edge
+        index.insert(observed_edge("sess-1", "hash1", "proj1"), &mut seen);
+        // Insert a bash_call edge
+        index.insert(
+            Edge {
+                source: EntityRef::Transcript {
+                    provider: "claude".into(),
+                    session_id: "sess-1".into(),
+                    line_offset: 10,
+                    event_idx: 0,
+                },
+                kind: "RAN_BASH".into(),
+                target: EntityRef::BashCall {
+                    session: "sess-1".into(),
+                    turn: 10,
+                },
+                provenance: EdgeProvenance::Explicit,
+                confidence: EdgeConfidence::Exact,
+                metadata: BTreeMap::new(),
+            },
+            &mut seen,
+        );
+        // Insert a regular knowledge edge
+        index.insert(
+            exact_edge(
+                EntityRef::Knowledge { id: "k1".into() },
+                "DESCRIBES",
+                EntityRef::Knowledge { id: "k2".into() },
+                EdgeProvenance::Explicit,
+            ),
+            &mut seen,
+        );
+
+        let all_counts = index.entity_type_counts();
+        assert!(
+            all_counts.contains_key("transcript"),
+            "entity_type_counts must include transcript"
+        );
+        assert!(
+            all_counts.contains_key("bash_call"),
+            "entity_type_counts must include bash_call"
+        );
+
+        let active_counts = index.entity_type_counts_active();
+        assert!(
+            !active_counts.contains_key("transcript"),
+            "entity_type_counts_active must exclude transcript"
+        );
+        assert!(
+            !active_counts.contains_key("bash_call"),
+            "entity_type_counts_active must exclude bash_call"
+        );
+        assert!(
+            active_counts.contains_key("knowledge"),
+            "entity_type_counts_active must still include knowledge"
+        );
+        assert!(
+            active_counts.contains_key("project_file"),
+            "entity_type_counts_active must still include project_file"
+        );
+    }
+
+    #[test]
+    fn per_file_overlay_suppresses_covered_snapshot_edges() {
+        use crate::manifest::{ManifestIndex, OverlayManifest, WorkspaceIndexEntry};
+        use crate::snapshot::{dirty_overlay_dir, snapshot_dir};
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let project_id = "proj_overlay";
+        let snap_id = "head-testsha-aabbccdd";
+
+        // Write snapshot: one edge for hash "h1" and one for "h2"
+        let snap_dir = snapshot_dir(edges_dir, project_id, snap_id);
+        fs::create_dir_all(&snap_dir).unwrap();
+        let edge_h1_snap = project_file_edge(project_id, "h1", "IN_FILE", EdgeProvenance::Derived);
+        let edge_h2_snap = project_file_edge(project_id, "h2", "IN_FILE", EdgeProvenance::Derived);
+        let mut snap_file = fs::File::create(snap_dir.join("project.jsonl")).unwrap();
+        for e in &[&edge_h1_snap, &edge_h2_snap] {
+            serde_json::to_writer(&mut snap_file, e).unwrap();
+            snap_file.write_all(b"\n").unwrap();
+        }
+
+        // Write overlay: replacement edge for hash "h1" only
+        let overlay_dir = dirty_overlay_dir(edges_dir, project_id);
+        fs::create_dir_all(&overlay_dir).unwrap();
+        let edge_h1_overlay =
+            project_file_edge(project_id, "h1", "DESCRIBES", EdgeProvenance::Derived);
+        let mut overlay_file = fs::File::create(overlay_dir.join("project.jsonl")).unwrap();
+        serde_json::to_writer(&mut overlay_file, &edge_h1_overlay).unwrap();
+        overlay_file.write_all(b"\n").unwrap();
+        drop(overlay_file);
+
+        // Write overlay_manifest.json covering only h1
+        let covered: std::collections::HashSet<String> = ["h1".to_string()].into();
+        OverlayManifest::write_to(&overlay_dir, &covered).unwrap();
+
+        // Write manifest-index
+        let snap_rel = format!("workspace/{project_id}/snapshots/{snap_id}");
+        let overlay_rel = format!("workspace/{project_id}/dirty-current");
+        let manifest_path_rel = format!("workspace/{project_id}/manifest.json");
+        // Create a stub workspace manifest so validation passes
+        let ws_manifest_path =
+            crate::manifest::materialized_dir(edges_dir).join(&manifest_path_rel);
+        fs::create_dir_all(ws_manifest_path.parent().unwrap()).unwrap();
+        fs::write(&ws_manifest_path, "{}").unwrap();
+
+        let mut idx = ManifestIndex::new();
+        idx.upsert_workspace(
+            project_id,
+            WorkspaceIndexEntry {
+                manifest: manifest_path_rel,
+                active_snapshot: Some(snap_rel),
+                dirty_overlay: Some(overlay_rel),
+                repo_materialization: None,
+            },
+        );
+        idx.write_atomic(edges_dir).unwrap();
+
+        let mut index = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index.load_sidecar_edges(edges_dir, None, &mut seen, true);
+
+        // h1 overlay edge (DESCRIBES) must win over snapshot edge (IN_FILE)
+        let h1_source = EntityRef::ProjectFile {
+            project_id: project_id.into(),
+            rel_path_hash: "h1".into(),
+            chunk_hash: "0".repeat(64),
+            occurrence_idx: 0,
+        };
+        let overlay_edges = index.forward_edges(&h1_source);
+        assert!(
+            overlay_edges.iter().any(|e| e.kind == "DESCRIBES"),
+            "overlay edge must be loaded for covered hash h1"
+        );
+        assert!(
+            !overlay_edges.iter().any(|e| e.kind == "IN_FILE"),
+            "snapshot edge for covered hash h1 must be suppressed"
+        );
+
+        // h2 snapshot edge (IN_FILE) must survive — not covered by overlay
+        let h2_source = EntityRef::ProjectFile {
+            project_id: project_id.into(),
+            rel_path_hash: "h2".into(),
+            chunk_hash: "0".repeat(64),
+            occurrence_idx: 0,
+        };
+        let snap_edges = index.forward_edges(&h2_source);
+        assert!(
+            snap_edges.iter().any(|e| e.kind == "IN_FILE"),
+            "snapshot edge for uncovered hash h2 must survive"
+        );
+    }
+
+    #[test]
+    fn include_observed_false_skips_observed_lane() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+
+        // Write an explicit edge to edges/explicit/p1.jsonl
+        let explicit_dir = edges_dir.join("explicit");
+        fs::create_dir_all(&explicit_dir).unwrap();
+        let explicit_edge = serde_json::to_string(&Edge {
+            source: EntityRef::Knowledge {
+                id: "k_explicit".into(),
+            },
+            kind: "SUPERSEDES".into(),
+            target: EntityRef::Knowledge { id: "k_old".into() },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: BTreeMap::new(),
+        })
+        .unwrap();
+        fs::write(explicit_dir.join("p1.jsonl"), format!("{explicit_edge}\n")).unwrap();
+
+        // Write an observed edge to edges/observed/p1.jsonl
+        let observed_dir = edges_dir.join("observed");
+        fs::create_dir_all(&observed_dir).unwrap();
+        let obs_edge = serde_json::to_string(&observed_edge("sess-obs", "hashX", "p1")).unwrap();
+        fs::write(observed_dir.join("p1.jsonl"), format!("{obs_edge}\n")).unwrap();
+
+        // Load with include_observed=false
+        let mut index_no_obs = EdgeIndex::default();
+        let mut seen = HashSet::new();
+        index_no_obs.load_sidecar_edges(edges_dir, None, &mut seen, false);
+
+        let explicit_source = EntityRef::Knowledge {
+            id: "k_explicit".into(),
+        };
+        let transcript_source = EntityRef::Transcript {
+            provider: "claude".into(),
+            session_id: "sess-obs".into(),
+            line_offset: 0,
+            event_idx: 0,
+        };
+        assert_eq!(
+            index_no_obs.forward_edges(&explicit_source).len(),
+            1,
+            "explicit edge must load even with include_observed=false"
+        );
+        assert_eq!(
+            index_no_obs.forward_edges(&transcript_source).len(),
+            0,
+            "observed edge must NOT load when include_observed=false"
+        );
+
+        // Load with include_observed=true — observed edge must appear
+        let mut index_with_obs = EdgeIndex::default();
+        let mut seen2 = HashSet::new();
+        index_with_obs.load_sidecar_edges(edges_dir, None, &mut seen2, true);
+        assert_eq!(
+            index_with_obs.forward_edges(&transcript_source).len(),
+            1,
+            "observed edge must load when include_observed=true"
+        );
     }
 }

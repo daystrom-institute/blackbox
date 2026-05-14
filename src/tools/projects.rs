@@ -185,6 +185,32 @@ impl BlackboxServer {
                     }
                 }
             }
+            // P1 backfill: retroactively emit observed tool-call edges for the
+            // newly registered project by walking all prior transcripts. Runs
+            // in a background thread so the registration response is immediate.
+            // Uses append_edges_dedup so re-running is safe.
+            {
+                let reindex_cfg = self.state.idx.read().reindex_config();
+                let project_for_backfill = record.clone();
+                std::thread::spawn(move || {
+                    match crate::index::backfill_tool_edges_for_project(
+                        &reindex_cfg,
+                        &project_for_backfill,
+                    ) {
+                        Ok(written) => tracing::info!(
+                            project_id = %project_for_backfill.project_id,
+                            edges_written = written,
+                            "P1 backfill complete"
+                        ),
+                        Err(err) => tracing::warn!(
+                            project_id = %project_for_backfill.project_id,
+                            error = %err,
+                            "P1 backfill failed"
+                        ),
+                    }
+                });
+            }
+
             trigger_project_bootstrap_arc(self.state.clone(), record.clone());
             let response = json!({
                 "record": record,

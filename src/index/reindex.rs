@@ -14,6 +14,7 @@ use super::project_files;
 use super::tool_edges::ToolEdgeContext;
 use super::{FieldHandles, FileMeta, ReindexConfig};
 use crate::orchestration::providers::Provider;
+use crate::projects::ProjectRecord;
 use crate::transcripts::adapters::{
     TranscriptAdapterRegistry, TranscriptReadAdapter, TranscriptScanTarget,
 };
@@ -600,6 +601,71 @@ fn index_adapter_location(
         writer.commit()?;
     }
     Ok(())
+}
+
+/// Walk all indexed transcripts and retroactively emit observed tool-call edges
+/// (EDITED_FILE / READ_FILE / RAN_BASH) for a newly registered project.
+///
+/// Idempotent: uses `append_edges_dedup` so re-running produces no duplicates.
+/// Returns the number of new edges written.
+pub(crate) fn backfill_tool_edges_for_project(
+    config: &ReindexConfig,
+    project: &ProjectRecord,
+) -> Result<usize> {
+    let edges_dir = crate::edge_index::edges_dir_from_projects_path(&config.projects_path);
+    let ctx = ToolEdgeContext::for_project(project.clone(), edges_dir.clone());
+    let registry = TranscriptAdapterRegistry::from_reindex_config(config);
+    let mut collected: Vec<crate::edge_index::Edge> = Vec::new();
+
+    for adapter in registry.adapters() {
+        for target in [
+            TranscriptScanTarget::Sessions,
+            TranscriptScanTarget::History,
+        ] {
+            let locations = match adapter.scan_locations(target) {
+                Ok(locs) => locs,
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "backfill: adapter scan failed, skipping"
+                    );
+                    continue;
+                }
+            };
+            for location in locations {
+                let provider_label = provider_label(location.provider);
+                let account = location.account.as_deref().unwrap_or(provider_label);
+                let snapshot = match adapter.load_snapshot(&location) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                for event in &snapshot.events {
+                    let Some(parsed) = event.to_parsed_event() else {
+                        continue;
+                    };
+                    let line_offset = event.raw.byte_offset.unwrap_or(0);
+                    let event_idx = event.raw.event_idx.unwrap_or(0);
+                    match ctx.build_event_edges(&parsed, account, line_offset, event_idx) {
+                        Ok(Some(edge)) => collected.push(edge),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::debug!(
+                                error = %err,
+                                "backfill: skipping event edge build error"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if collected.is_empty() {
+        return Ok(0);
+    }
+
+    let observed_dir = edges_dir.join("observed");
+    crate::edge_index::append_edges_dedup(&observed_dir, &project.project_id, &collected)
 }
 
 fn provider_label(provider: Provider) -> &'static str {

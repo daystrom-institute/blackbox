@@ -27,6 +27,16 @@ impl ToolEdgeContext {
         })
     }
 
+    /// Single-project context for backfill use — restricts edge resolution
+    /// to the given project so unrelated transcript paths are cheap to skip.
+    pub(super) fn for_project(project: ProjectRecord, edges_dir: PathBuf) -> Self {
+        Self {
+            projects: vec![project],
+            edges_dir,
+            emit_sidecars: true,
+        }
+    }
+
     pub(super) fn emit_event_edges(
         &self,
         event: &ParsedEvent,
@@ -50,16 +60,38 @@ impl ToolEdgeContext {
         }
     }
 
-    fn emit_file_tool_edge(
+    /// Build edges for a transcript event without writing them. Used by
+    /// backfill paths that collect all edges first and then write with dedup.
+    pub(super) fn build_event_edges(
+        &self,
+        event: &ParsedEvent,
+        provider: &str,
+        line_offset: u64,
+        event_idx: u32,
+    ) -> Result<Option<Edge>> {
+        let Some(tool_call) = event.tool_call.as_ref() else {
+            return Ok(None);
+        };
+        match tool_call.kind {
+            ToolCallKind::Read | ToolCallKind::Write | ToolCallKind::Edit => {
+                self.build_file_tool_edge(event, provider, line_offset, event_idx, tool_call)
+            }
+            ToolCallKind::Bash => {
+                self.build_bash_tool_edge(event, provider, line_offset, event_idx, tool_call)
+            }
+        }
+    }
+
+    fn build_file_tool_edge(
         &self,
         event: &ParsedEvent,
         provider: &str,
         line_offset: u64,
         event_idx: u32,
         tool_call: &ToolCallInfo,
-    ) -> Result<usize> {
+    ) -> Result<Option<Edge>> {
         let Some(raw_path) = parser::tool_call_file_path(tool_call) else {
-            return Ok(0);
+            return Ok(None);
         };
         let Some((project, root, absolute_path)) = self.resolve_project_path(event, raw_path)
         else {
@@ -68,13 +100,13 @@ impl ToolEdgeContext {
                 cwd = event.cwd.as_deref().unwrap_or(""),
                 "skipping tool-call file edge outside registered projects"
             );
-            return Ok(0);
+            return Ok(None);
         };
         let bytes = match fs::read(&absolute_path) {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::debug!(path = %absolute_path.display(), error = %err, "skipping tool-call edge for unreadable file");
-                return Ok(0);
+                return Ok(None);
             }
         };
         let byte_range = byte_range_for_tool(tool_call, &bytes);
@@ -86,7 +118,7 @@ impl ToolEdgeContext {
         )?
         else {
             tracing::debug!(path = %absolute_path.display(), "skipping tool-call edge; current chunk target unresolved");
-            return Ok(0);
+            return Ok(None);
         };
         let source = EntityRef::Transcript {
             provider: provider.to_string(),
@@ -94,7 +126,7 @@ impl ToolEdgeContext {
             line_offset,
             event_idx,
         };
-        let edge = Edge {
+        Ok(Some(Edge {
             source,
             kind: match tool_call.kind {
                 ToolCallKind::Read => "READ_FILE",
@@ -117,8 +149,61 @@ impl ToolEdgeContext {
                 byte_range,
                 &bytes,
             ),
+        }))
+    }
+
+    fn build_bash_tool_edge(
+        &self,
+        event: &ParsedEvent,
+        provider: &str,
+        line_offset: u64,
+        event_idx: u32,
+        tool_call: &ToolCallInfo,
+    ) -> Result<Option<Edge>> {
+        let Some((project, _root)) = self.project_for_cwd(event) else {
+            tracing::debug!(
+                cwd = event.cwd.as_deref().unwrap_or(""),
+                "skipping bash tool edge outside registered projects"
+            );
+            return Ok(None);
         };
-        crate::edge_index::append_observed_edges(&self.edges_dir, &project.project_id, &[edge])?;
+        let source = EntityRef::Transcript {
+            provider: provider.to_string(),
+            session_id: event.session_id.clone(),
+            line_offset,
+            event_idx,
+        };
+        Ok(Some(Edge {
+            source,
+            kind: "RAN_BASH".to_string(),
+            target: EntityRef::BashCall {
+                session: event.session_id.clone(),
+                turn: line_offset_to_turn(line_offset, event_idx),
+            },
+            provenance: EdgeProvenance::Explicit,
+            confidence: EdgeConfidence::Exact,
+            metadata: bash_metadata(event, tool_call, project, line_offset),
+        }))
+    }
+
+    fn emit_file_tool_edge(
+        &self,
+        event: &ParsedEvent,
+        provider: &str,
+        line_offset: u64,
+        event_idx: u32,
+        tool_call: &ToolCallInfo,
+    ) -> Result<usize> {
+        let Some(edge) =
+            self.build_file_tool_edge(event, provider, line_offset, event_idx, tool_call)?
+        else {
+            return Ok(0);
+        };
+        let project_id = match &edge.target {
+            crate::entity_ref::EntityRef::ProjectFile { project_id, .. } => project_id.clone(),
+            _ => return Ok(0),
+        };
+        crate::edge_index::append_observed_edges(&self.edges_dir, &project_id, &[edge])?;
         Ok(1)
     }
 

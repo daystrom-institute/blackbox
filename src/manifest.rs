@@ -20,6 +20,7 @@
 //   is the foundation; per-project breakdown is a follow-up.
 // ---------------------------------------------------------------------------
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -29,6 +30,66 @@ use serde::{Deserialize, Serialize};
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_INDEX_FILENAME: &str = "manifest-index.json";
+const OVERLAY_MANIFEST_FILENAME: &str = "overlay_manifest.json";
+const OVERLAY_MANIFEST_VERSION: u32 = 1;
+
+// ---------------------------------------------------------------------------
+// Per-file overlay manifest
+// ---------------------------------------------------------------------------
+
+/// Written alongside the overlay jsonl files so the loader knows which
+/// rel_path_hashes the overlay covers. When present, the loader suppresses
+/// snapshot edges whose source or target ProjectFile hash is in this set;
+/// when absent (legacy overlay), the overlay replaces the whole workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OverlayManifest {
+    pub version: u32,
+    /// rel_path_hash values whose workspace edges are replaced by the overlay.
+    pub covered_rel_path_hashes: Vec<String>,
+}
+
+impl OverlayManifest {
+    pub fn write_to(overlay_dir: &Path, hashes: &HashSet<String>) -> Result<()> {
+        let manifest = OverlayManifest {
+            version: OVERLAY_MANIFEST_VERSION,
+            covered_rel_path_hashes: hashes.iter().cloned().collect(),
+        };
+        let path = overlay_dir.join(OVERLAY_MANIFEST_FILENAME);
+        let tmp = path.with_extension("json.tmp");
+        let mut file = fs::File::create(&tmp)?;
+        serde_json::to_writer(&mut file, &manifest)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(tmp, path)?;
+        Ok(())
+    }
+
+    pub fn read_from(overlay_dir: &Path) -> Option<Self> {
+        let path = overlay_dir.join(OVERLAY_MANIFEST_FILENAME);
+        let data = fs::read_to_string(&path).ok()?;
+        serde_json::from_str(&data).ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Active path loader view
+// ---------------------------------------------------------------------------
+
+/// Describes how to load a sidecar path during EdgeIndex rebuild.
+pub enum PathLoadMode {
+    /// Load all edges without filtering.
+    Full,
+    /// Load edges, suppressing any that touch a ProjectFile with a
+    /// rel_path_hash in the given set (used for snapshot paths when an
+    /// overlay covers those files).
+    FilteredByHash { suppressed_hashes: HashSet<String> },
+}
+
+/// A path and the mode in which the edge loader should process it.
+pub struct LoadablePath {
+    pub path: PathBuf,
+    pub mode: PathLoadMode,
+}
 
 pub fn materialized_dir(edges_dir: &Path) -> PathBuf {
     edges_dir.join("materialized")
@@ -214,6 +275,104 @@ impl ManifestIndex {
         paths
     }
 
+    /// Like `active_materialized_paths` but returns `LoadablePath` entries
+    /// that carry hash-filter metadata for per-file overlay suppression.
+    ///
+    /// When a workspace has both a dirty overlay with an `overlay_manifest.json`
+    /// AND a clean snapshot, this method yields:
+    /// - overlay jsonl files as `Full` (load all edges)
+    /// - snapshot jsonl files as `FilteredByHash` (skip edges touching covered hashes)
+    ///
+    /// Legacy overlays (no overlay_manifest.json) replace the whole workspace
+    /// as before (only overlay files returned, `Full`).
+    pub fn active_paths_for_loader(&self, edges_dir: &Path) -> Vec<LoadablePath> {
+        let mut result = Vec::new();
+        for (project_id, entry) in &self.workspaces {
+            let has_overlay = entry.dirty_overlay.is_some()
+                && materialized_dir(edges_dir)
+                    .join(entry.dirty_overlay.as_ref().unwrap())
+                    .is_dir();
+
+            if has_overlay {
+                let overlay_dir =
+                    materialized_dir(edges_dir).join(entry.dirty_overlay.as_ref().unwrap());
+                let mut overlay_paths = Vec::new();
+                append_jsonl_files_excluding_overlay_manifest(&overlay_dir, &mut overlay_paths);
+                for path in overlay_paths {
+                    result.push(LoadablePath {
+                        path,
+                        mode: PathLoadMode::Full,
+                    });
+                }
+
+                // Per-file overlay: if overlay_manifest.json present and there
+                // is a clean snapshot, load snapshot filtered by covered hashes.
+                if let Some(om) = OverlayManifest::read_from(&overlay_dir) {
+                    if let Some(ref snapshot) = entry.active_snapshot {
+                        let snap_dir = materialized_dir(edges_dir).join(snapshot);
+                        if snap_dir.is_dir() {
+                            let suppressed: HashSet<String> =
+                                om.covered_rel_path_hashes.into_iter().collect();
+                            if !suppressed.is_empty() {
+                                let mut snap_paths = Vec::new();
+                                append_jsonl_files(&snap_dir, &mut snap_paths);
+                                for path in snap_paths {
+                                    result.push(LoadablePath {
+                                        path,
+                                        mode: PathLoadMode::FilteredByHash {
+                                            suppressed_hashes: suppressed.clone(),
+                                        },
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+                // Legacy overlay (no overlay_manifest): snapshot is completely
+                // replaced, nothing else to add for this project.
+            } else if let Some(ref snapshot) = entry.active_snapshot {
+                let snapshot_dir = materialized_dir(edges_dir).join(snapshot);
+                if snapshot_dir.is_dir() {
+                    let mut snap_paths = Vec::new();
+                    append_jsonl_files(&snapshot_dir, &mut snap_paths);
+                    for path in snap_paths {
+                        result.push(LoadablePath {
+                            path,
+                            mode: PathLoadMode::Full,
+                        });
+                    }
+                }
+            }
+
+            if let Some(ref repo_mat) = entry.repo_materialization {
+                let repo_dir = materialized_dir(edges_dir).join(repo_mat);
+                if repo_dir.is_dir() {
+                    let mut repo_paths = Vec::new();
+                    append_jsonl_files(&repo_dir, &mut repo_paths);
+                    for path in repo_paths {
+                        result.push(LoadablePath {
+                            path,
+                            mode: PathLoadMode::Full,
+                        });
+                    }
+                }
+            }
+            if entry.active_snapshot.is_none() && !has_overlay {
+                let managed_path = edges_dir
+                    .join("derived")
+                    .join("project")
+                    .join(format!("{}.jsonl", project_id));
+                if managed_path.exists() {
+                    result.push(LoadablePath {
+                        path: managed_path,
+                        mode: PathLoadMode::Full,
+                    });
+                }
+            }
+        }
+        result
+    }
+
     pub fn protected_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         for (project_id, entry) in &self.workspaces {
@@ -303,6 +462,13 @@ fn append_jsonl_files(dir: &Path, paths: &mut Vec<PathBuf>) {
             paths.push(path);
         }
     }
+}
+
+/// Like `append_jsonl_files` but also skips the overlay_manifest.json
+/// (a JSON file, not JSONL, so the extension filter already excludes it —
+/// this helper exists for clarity and future-proofing).
+fn append_jsonl_files_excluding_overlay_manifest(dir: &Path, paths: &mut Vec<PathBuf>) {
+    append_jsonl_files(dir, paths);
 }
 
 // ---------------------------------------------------------------------------

@@ -8,7 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::chunker::EdgeProvenance;
 use crate::edge_index::Edge;
-use crate::manifest::{ManifestIndex, WorkspaceIndexEntry, WorkspaceManifest, materialized_dir};
+use crate::entity_ref::EntityRef;
+use crate::manifest::{
+    ManifestIndex, OverlayManifest, WorkspaceIndexEntry, WorkspaceManifest, materialized_dir,
+};
 
 const INDEXER_VERSION: &str = "project-index-v1";
 const CHUNKER_VERSION: &str = "chunker-v1";
@@ -120,6 +123,21 @@ pub fn write_dirty_overlay(
     }
 
     fs::create_dir_all(&tmp_dir)?;
+
+    // Collect covered rel_path_hashes from all overlay edges so the loader
+    // can merge snapshot + overlay at per-file granularity.
+    let mut covered_hashes = std::collections::HashSet::new();
+    for (_filename, edges) in files {
+        for edge in *edges {
+            if let EntityRef::ProjectFile { rel_path_hash, .. } = &edge.source {
+                covered_hashes.insert(rel_path_hash.clone());
+            }
+            if let EntityRef::ProjectFile { rel_path_hash, .. } = &edge.target {
+                covered_hashes.insert(rel_path_hash.clone());
+            }
+        }
+    }
+
     for (filename, edges) in files {
         if edges.is_empty() {
             continue;
@@ -132,7 +150,9 @@ pub fn write_dirty_overlay(
         }
         file.sync_all()?;
     }
-    drop(files);
+
+    // Write overlay_manifest.json so the loader knows which hashes are covered.
+    OverlayManifest::write_to(&tmp_dir, &covered_hashes)?;
 
     if overlay_dir.is_dir() {
         let _ = fs::remove_dir_all(&overlay_dir);

@@ -1257,6 +1257,7 @@ pub(crate) fn rebuild_edge_index_from_shared(
         edges_dir,
         registered_project_ids: Some(registered_project_ids),
         include_tantivy_projection,
+        include_observed: true,
     });
     *state.edge_index.write() = rebuilt;
 }
