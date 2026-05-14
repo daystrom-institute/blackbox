@@ -817,9 +817,12 @@ fn read_rich_jsonl_since(
                 event_idx as u32,
                 line.len(),
             );
-            if let Some(event) =
+            if let Some(mut event) =
                 NormalizedTranscriptEvent::from_transcript_event(provider, &rich, raw)
             {
+                if event.cwd.is_none() {
+                    event.cwd = location.cwd.clone();
+                }
                 events.push(event);
             }
         }
@@ -946,6 +949,7 @@ fn gemini_location(path: &Path) -> TranscriptLocation {
 }
 
 fn copilot_location(path: &Path, session_id: String) -> TranscriptLocation {
+    let cwd = read_copilot_cwd(path);
     TranscriptLocation {
         provider: Provider::Copilot,
         storage: TranscriptStorage::JsonlFile,
@@ -953,12 +957,18 @@ fn copilot_location(path: &Path, session_id: String) -> TranscriptLocation {
         account: Some("copilot".to_string()),
         session_id: Some(session_id),
         project: None,
-        cwd: None,
+        cwd,
         is_subagent: false,
     }
 }
 
 fn vibe_location(path: &Path, session_id: Option<String>) -> TranscriptLocation {
+    let meta = read_vibe_meta(path);
+    let session_id = session_id.or_else(|| {
+        meta.as_ref()
+            .and_then(|value| value["session_id"].as_str().map(String::from))
+    });
+    let cwd = meta.as_ref().and_then(vibe_meta_working_directory);
     TranscriptLocation {
         provider: Provider::Vibe,
         storage: TranscriptStorage::JsonlFile,
@@ -966,7 +976,7 @@ fn vibe_location(path: &Path, session_id: Option<String>) -> TranscriptLocation 
         account: Some("vibe".to_string()),
         session_id,
         project: None,
-        cwd: None,
+        cwd,
         is_subagent: false,
     }
 }
@@ -1006,6 +1016,22 @@ fn extract_codex_cwd(path: &Path) -> Option<String> {
     None
 }
 
+fn read_copilot_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let reader = BufReader::new(file);
+    for line in reader.lines().take(8) {
+        let line = line.ok()?;
+        let value: Value = serde_json::from_str(&line).ok()?;
+        if value["type"].as_str() == Some("session.start") {
+            return value["data"]["context"]["cwd"]
+                .as_str()
+                .or_else(|| value["data"]["cwd"].as_str())
+                .map(String::from);
+        }
+    }
+    None
+}
+
 fn gemini_chat_paths(tmp_root: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let Ok(projects) = fs::read_dir(tmp_root) else {
@@ -1040,10 +1066,20 @@ fn read_gemini_session_id(path: &Path) -> Option<String> {
 }
 
 fn extract_vibe_session_id(messages_path: &Path) -> Option<String> {
+    let value = read_vibe_meta(messages_path)?;
+    value["session_id"].as_str().map(String::from)
+}
+
+fn read_vibe_meta(messages_path: &Path) -> Option<Value> {
     let meta_path = messages_path.parent()?.join("meta.json");
     let raw = fs::read_to_string(meta_path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    value["session_id"].as_str().map(String::from)
+    serde_json::from_str(&raw).ok()
+}
+
+fn vibe_meta_working_directory(value: &Value) -> Option<String> {
+    value["environment"]["working_directory"]
+        .as_str()
+        .map(String::from)
 }
 
 #[cfg(test)]
@@ -1330,6 +1366,17 @@ mod tests {
         let session_dir = dir.path().join("sess-copilot");
         fs::create_dir_all(&session_dir).unwrap();
         let path = session_dir.join("events.jsonl");
+        let session_start = json!({
+            "type": "session.start",
+            "timestamp": "2026-05-12T00:00:00Z",
+            "data": {
+                "model": "gpt-test",
+                "context": {
+                    "cwd": "/tmp/copilot-project"
+                }
+            }
+        })
+        .to_string();
         let assistant = json!({
             "type": "assistant.message",
             "timestamp": "2026-05-12T00:00:00Z",
@@ -1359,18 +1406,27 @@ mod tests {
             }
         })
         .to_string();
-        fs::write(&path, format!("{assistant}\n{tool_start}\n{tool_done}\n")).unwrap();
+        fs::write(
+            &path,
+            format!("{session_start}\n{assistant}\n{tool_start}\n{tool_done}\n"),
+        )
+        .unwrap();
 
         let adapter = CopilotTranscriptAdapter::new(dir.path().to_path_buf());
         let location = adapter.locate("sess-copilot").unwrap().unwrap();
         let snapshot = adapter.load_snapshot(&location).unwrap();
 
+        assert_eq!(location.cwd.as_deref(), Some("/tmp/copilot-project"));
         assert_eq!(snapshot.events.len(), 4);
         assert_eq!(snapshot.events[0].content, "thinking");
+        assert_eq!(
+            snapshot.events[0].cwd.as_deref(),
+            Some("/tmp/copilot-project")
+        );
         assert_eq!(snapshot.events[1].content, "answer");
         assert_eq!(
             snapshot.events[2].raw.byte_offset,
-            Some(assistant.len() as u64 + 1)
+            Some(session_start.len() as u64 + assistant.len() as u64 + 2)
         );
         assert!(snapshot.events[2].tool_call.is_some());
         assert_eq!(
@@ -1386,7 +1442,13 @@ mod tests {
         fs::create_dir_all(&session_dir).unwrap();
         fs::write(
             session_dir.join("meta.json"),
-            json!({"session_id": "12345678-aaaa-bbbb-cccc-dddddddddddd"}).to_string(),
+            json!({
+                "session_id": "12345678-aaaa-bbbb-cccc-dddddddddddd",
+                "environment": {
+                    "working_directory": "/tmp/vibe-project"
+                }
+            })
+            .to_string(),
         )
         .unwrap();
         let path = session_dir.join("messages.jsonl");
@@ -1422,8 +1484,10 @@ mod tests {
             location.session_id.as_deref(),
             Some("12345678-aaaa-bbbb-cccc-dddddddddddd")
         );
+        assert_eq!(location.cwd.as_deref(), Some("/tmp/vibe-project"));
         assert_eq!(snapshot.events.len(), 3);
         assert_eq!(snapshot.events[0].content, "using tool");
+        assert_eq!(snapshot.events[0].cwd.as_deref(), Some("/tmp/vibe-project"));
         assert!(snapshot.events[1].tool_call.is_some());
         assert_eq!(
             snapshot.events[2].role,

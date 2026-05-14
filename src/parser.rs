@@ -777,7 +777,10 @@ pub fn parse_copilot_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEv
     match event_type {
         "session.start" => {
             let model = data["model"].as_str().unwrap_or("?");
-            let cwd = data["cwd"].as_str().unwrap_or("?");
+            let cwd = data["context"]["cwd"]
+                .as_str()
+                .or_else(|| data["cwd"].as_str())
+                .unwrap_or("?");
             vec![make_rich(
                 MessageRole::Developer,
                 EventDetail::SystemSignal {
@@ -959,6 +962,16 @@ pub fn parse_vibe_line_rich(line: &str, session_id: &str) -> Vec<TranscriptEvent
         }
         "assistant" => {
             let mut out = Vec::new();
+            let reasoning = v["reasoning_content"].as_str().unwrap_or("");
+            if !reasoning.is_empty() {
+                out.push(make_rich(
+                    MessageRole::Thinking,
+                    EventDetail::Thinking {
+                        text: reasoning.into(),
+                    },
+                    &base,
+                ));
+            }
             let content = v["content"].as_str().unwrap_or("");
             if !content.is_empty() {
                 out.push(make_rich(
@@ -1700,6 +1713,7 @@ mod tests {
     fn test_rich_vibe_assistant_with_tool_calls() {
         let line = json!({
             "role": "assistant",
+            "reasoning_content": "thinking",
             "content": "Calling shell",
             "message_id": "m1",
             "tool_calls": [{
@@ -1712,9 +1726,10 @@ mod tests {
         })
         .to_string();
         let events = parse_vibe_line_rich(&line, "sess-vibe-1");
-        assert_eq!(events.len(), 2);
-        assert!(matches!(events[0].detail, EventDetail::Text { .. }));
-        match &events[1].detail {
+        assert_eq!(events.len(), 3);
+        assert!(matches!(events[0].detail, EventDetail::Thinking { .. }));
+        assert!(matches!(events[1].detail, EventDetail::Text { .. }));
+        match &events[2].detail {
             EventDetail::ToolUse { name, target, .. } => {
                 assert_eq!(name, "shell");
                 assert_eq!(target, "echo hi");

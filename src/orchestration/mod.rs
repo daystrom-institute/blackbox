@@ -1330,6 +1330,52 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         }
     }
 
+    if provider == Provider::Vibe && session_id == "pending" {
+        let task_ref_watch = task.clone();
+        let task_store_watch = task_store.clone();
+        let tail_tx_watch = tail_tx.clone();
+        let store_dir_watch = store_dir.clone();
+        let task_id_watch = id.clone();
+        let cwd_clone = cwd.clone().unwrap_or_default();
+        let started_at = task.inner.lock().started_at;
+        tokio::spawn(async move {
+            loop {
+                {
+                    let inner = task_ref_watch.inner.lock();
+                    if inner.status != TaskStatus::Running || inner.session_id != "pending" {
+                        break;
+                    }
+                }
+
+                if let Some(sid) = providers::discover_vibe_session(started_at, &cwd_clone) {
+                    let discovered = {
+                        let mut inner = task_ref_watch.inner.lock();
+                        if inner.session_id == "pending" {
+                            inner.session_id = sid.clone();
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if discovered {
+                        populate_transcript_handle(&task_ref_watch);
+                        team::propagate_session_id(&task_id_watch, &sid, &store_dir_watch);
+                        task_store_watch.read().persist(&store_dir_watch);
+                        // Empty activity: session-id discovery notification,
+                        // not meaningful task progress — skip system event.
+                        let _ = tail_tx_watch.send(tail::TailEvent::TaskProgress {
+                            task_id: task_id_watch.clone(),
+                            activity: String::new(),
+                        });
+                    }
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            }
+        });
+    }
+
     // Spawn stdout reader — signals completion via oneshot so the process
     // waiter can ensure all output is consumed before marking the task done.
     let stdout = child.stdout.take().unwrap();
@@ -1913,7 +1959,8 @@ fn populate_transcript_handle(task: &Task) {
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let mut obj = task_result_json(task);
     let inner = task.inner.lock();
-    obj["eventCount"] = Value::from(inner.events.len());
+    let event_count = observed_event_count(&inner);
+    obj["eventCount"] = Value::from(event_count);
     if tail > 0 && !inner.events.is_empty() {
         let start = inner.events.len().saturating_sub(tail);
         obj["recentEvents"] = Value::Array(inner.events[start..].to_vec());
@@ -1924,7 +1971,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
 pub fn timeout_snapshot_json(task: &Task) -> Value {
     let mut inner = task.inner.lock();
     let elapsed = format_elapsed(inner.started_at, None);
-    let event_count = inner.events.len();
+    let event_count = observed_event_count(&inner);
     let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
         let clean = msg.replace('\n', " ");
         if clean.len() > 80 {
@@ -1955,6 +2002,11 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "lastAssistantSnippet": last_activity,
         "supervision": inner.supervision.snapshot_for_response(now_ms()),
     })
+}
+
+fn observed_event_count(inner: &TaskInner) -> usize {
+    let supervision_count = usize::try_from(inner.supervision.event_count).unwrap_or(usize::MAX);
+    inner.events.len().max(supervision_count)
 }
 
 // ---------------------------------------------------------------------------

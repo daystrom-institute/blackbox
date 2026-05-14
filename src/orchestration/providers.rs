@@ -429,7 +429,9 @@ impl Provider {
             Provider::Inception => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),
-            Provider::Copilot | Provider::Vibe | Provider::Workflow => None,
+            Provider::Copilot => resolve_copilot_session_cwd(session_id),
+            Provider::Vibe => resolve_vibe_session_cwd(session_id),
+            Provider::Workflow => None,
         }
     }
 
@@ -1795,6 +1797,69 @@ fn extract_codex_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
         .and_then(|c| c.as_str())
         .filter(|s| !s.is_empty())
         .map(std::path::PathBuf::from)
+}
+
+pub fn resolve_copilot_session_cwd(session_id: &str) -> Option<std::path::PathBuf> {
+    if session_id.is_empty() || session_id == "pending" {
+        return None;
+    }
+    let session_root = dirs::home_dir()?
+        .join(".copilot")
+        .join("session-state")
+        .join(session_id);
+    let events_path = session_root.join("events.jsonl");
+    extract_copilot_cwd(&events_path)
+}
+
+fn extract_copilot_cwd(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::io::{BufRead, BufReader};
+    let f = std::fs::File::open(path).ok()?;
+    let reader = BufReader::new(f);
+    for line in reader.lines().take(8).map_while(Result::ok) {
+        let v: Value = serde_json::from_str(&line).ok()?;
+        if v["type"].as_str() != Some("session.start") {
+            continue;
+        }
+        return v["data"]["context"]["cwd"]
+            .as_str()
+            .or_else(|| v["data"]["cwd"].as_str())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+    }
+    None
+}
+
+pub fn resolve_vibe_session_cwd(session_id: &str) -> Option<std::path::PathBuf> {
+    if session_id.len() < 8 {
+        return None;
+    }
+    let session_dir = std::env::var("VIBE_SESSION_DIR")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".vibe/logs/session")
+        });
+    let prefix = &session_id[..8];
+    let needle = format!("_{prefix}");
+    for entry in std::fs::read_dir(session_dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with("session_") || !name.ends_with(&needle) {
+            continue;
+        }
+        let meta_path = entry.path().join("meta.json");
+        let value: Value = serde_json::from_str(&std::fs::read_to_string(meta_path).ok()?).ok()?;
+        if value["session_id"].as_str() != Some(session_id) {
+            continue;
+        }
+        return value["environment"]["working_directory"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+    }
+    None
 }
 
 /// Testable form of `resolve_gemini_session_cwd` — scoped to an explicit
@@ -3611,7 +3676,7 @@ mod tests {
 
     #[test]
     fn resolve_session_cwd_dispatches_per_provider() {
-        // Copilot + Vibe have no cwd-aware store and should return None.
+        // Missing sessions still resolve to None for cwd-aware providers.
         assert!(Provider::Copilot.resolve_session_cwd("any").is_none());
         assert!(Provider::Vibe.resolve_session_cwd("any").is_none());
     }
