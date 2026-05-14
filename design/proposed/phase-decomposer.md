@@ -95,10 +95,11 @@ measuring it mechanically, and routing accordingly.
 ```
 
 Each implementer runs inside a **supervised subworkflow**
-(`design/supervision.md` §6): daemon-side counters + oracle observe the
-implementer; advisor evaluates at completion (always) or on anomaly
-signal (conditionally); verdict routes to acceptance gate, recovery bro,
-or replacement.
+(`design/partial/supervision.md`): implemented mechanical telemetry observes
+the implementer; an optional workflow-backed classifier atom can poll that
+telemetry and task state; an optional advisor atom evaluates turn-end or alert
+checkpoints and routes to acceptance, steering, recovery, replacement, human
+escalation, or bail.
 
 The recomposition council is a **durable ensemble** — it persists across
 epochs, maintaining context about what succeeded, what failed, and what
@@ -146,6 +147,11 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
    mechanical MCP tool that resolves refs to their byte payload and
    returns the aggregate size. No LLM estimation. No eyeball compaction
    factors. A number.
+
+   Acceptance-coverage lint is not a pure packet gate today. The packet AST can
+   quantify over one array path, but cannot correlate `acceptance_criteria[*]`
+   against `sub_units[*].acceptance_subset[*]`; use a mechanical hook/tool for
+   that coverage check.
 
 5. **Produce the triage verdict.** If the measured manifest fits in the
    target model's context window → `fit_direct`. If it exceeds →
@@ -264,8 +270,8 @@ coverage. No typed coverage-lint op exists in the engine today
 ### 4.4 Implementer dispatch
 
 `foreach` over DAG sub-units (`schema.rs:193`). Each sub-unit is a
-**supervised subworkflow** (`design/supervision.md` §6): the implementer
-runs inside a subworkflow with daemon-side counters + oracle observation
+**supervised subworkflow** (`design/partial/supervision.md`): the implementer
+runs inside a subworkflow with mechanical telemetry plus optional classifier
 and advisor-gated completion. The implementer is seeded with its evidence
 subset (the refs from the DAG for that sub-unit). No exploration, no
 re-grepping. The evidence was already loaded by scouts and measured by the
@@ -298,6 +304,8 @@ fresh arc or subworkflow boundary (`engine.rs:600, 720`).
    describing the remaining work, scoped to what's left, with the prior
    batch's outcomes as context. This packet re-enters the pipeline:
    inlet → decomposer → dispatch → advisor gate → council re-evaluates.
+   This loop is a `Goto` inside the same workflow arc, not a fresh arc
+   dispatch, so durable council actor context survives across epochs.
 
 3. **Untenable?** Repeated failures on the same sub-unit, impossible
    acceptance criteria, budget exhausted. The council halts with an
@@ -315,29 +323,31 @@ If the council can't converge after a configurable epoch ceiling
 
 ## 5. Supervision layers (separate infrastructure)
 
-The phase-decomposer pipeline composes supervision — it does not own it.
+The phase-decomposer pipeline composes supervision - it does not own it.
 Each implementer dispatch (single or fan-out) runs inside a supervised
-subworkflow defined in `design/supervision.md` §6:
-daemon-side counters + oracle co-session observe the implementer;
-advisor evaluates at completion (always) or on anomaly signal
-(conditionally); verdict routes to acceptance gate, recovery bro, or
-replacement. N implementers = N advisors.
+subworkflow defined in `design/partial/supervision.md`: mechanical telemetry
+is available for every task; a workflow-backed classifier atom may poll the
+primary; an advisor atom may evaluate turn-end or alert checkpoints; verdicts
+route to acceptance, steering, recovery, replacement, human escalation, or
+bail. N implementers = N advisors when advisor supervision is enabled.
 
 The supervision layers are separate infrastructure. See
-`design/supervision.md` for the full specification.
+`design/partial/supervision.md` for the full specification.
 
 ## 6. Fault handling: two distinct paths
 
 ### 6.1 Pre-recompose: sub-unit failure
 
-A sub-unit fails (implementer looped, recovery bro couldn't fix it, advisor
-said ESCALATE too many times). The foreach collects a failed outcome. The
-council reads it. The council produces a **remediation packet** — a new
-phase doc scoped to that sub-unit's remaining work — and pushes it through
-the inlet → decomposer → dispatch → advisor gate → council re-evaluates.
+A sub-unit fails (implementer looped, `replace_primary` / `cancel_and_retry`
+could not recover, advisor escalated too many times). The foreach collects a
+failed outcome. The council reads it. The council produces a **remediation
+packet** — a new phase doc scoped to that sub-unit's remaining work — and
+pushes it through the inlet → decomposer → dispatch → advisor gate → council
+re-evaluates.
 
-Re-dispatch is the escalator: recovery bro first, then remediation packet
-if recovery also fails or the advisor declares the sub-unit untenable.
+Re-dispatch is the first escalator: advisor action `replace_primary` or
+`cancel_and_retry` before a remediation packet. The remediation packet is used
+when recovery also fails or the advisor declares the sub-unit untenable.
 
 ### 6.2 Post-recompose: integration conflict
 
@@ -414,27 +424,27 @@ debates. The council decides.
 
 | Primitive | Location | Status |
 |---|---|---|
-| Actor kinds (2: Executor, Ensemble) | `src/workflow/schema.rs:79-105` | implemented |
-| NodeSpec (prompt, gate, on_exit, wait_for, late_inject, foreach, subworkflow) | `src/workflow/schema.rs:107-220` | implemented |
-| Foreach fanout | `src/workflow/schema.rs:193-276`, `engine.rs:1662-1874` | implemented |
-| Subworkflow + imports/exports | `engine.rs:2401-2580` | implemented |
-| Branch transition (gate verdict routing) | `schema.rs:389-395` | implemented |
-| Fork (parallel fire-and-forget) | `schema.rs:396-403` | implemented |
+| Actor kinds (Executor, Ensemble) | `src/workflow/schema.rs` | implemented |
+| NodeSpec (prompt, gate, on_exit, wait_for, late_inject, foreach, subworkflow) | `src/workflow/schema.rs` | implemented |
+| Foreach fanout | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
+| Subworkflow + imports/exports | `src/workflow/engine.rs` | implemented |
+| Branch transition (gate verdict routing) | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
+| Fork (parallel fire-and-forget) | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Wait (signal suspension) | `src/workflow/wait.rs` | implemented |
-| Signal dispatch | `src/server/routes.rs:1871-1934` | implemented |
-| cancel_task (SIGTERM) | `src/orchestration/mod.rs:1414-1439` | implemented |
-| Per-event hook seam | `src/orchestration/mod.rs:1097-1109` | implemented |
+| Signal dispatch | `src/server/routes.rs` | implemented |
+| cancel_task (SIGTERM) | `src/orchestration/mod.rs` | implemented |
+| Per-event hook seam | `src/orchestration/mod.rs`, `src/orchestration/supervision.rs` | implemented |
 | Whiteboard deliberation | `src/whiteboards.rs`, `examples/whiteboard/` | implemented |
-| Policy packet (arc-level gate) | `schema.rs:34`, `engine.rs:1098-1165` | implemented |
-| Compaction anchor (rolling summary) | `engine.rs:1173-1189` | implemented |
-| Durable actor sessions | `schema.rs:64`, `engine.rs:2064-2068` | implemented |
+| Policy packet (arc-level gate) | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
+| Compaction anchor (rolling summary) | `src/workflow/engine.rs` | implemented |
+| Durable actor sessions | `src/workflow/schema.rs`, `src/workflow/engine.rs` | implemented |
 | Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
-| Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs:607-1099` | implemented (team-scoped) |
-| Mechanical anomaly counters | — | **aspirational** |
-| Oracle agent manifest | — | **aspirational** |
-| Advisor as workflow verb (rehoused from team) | — | **aspirational** |
+| Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
+| Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
+| Classifier workflow-backed atom pattern | `design/partial/supervision-classifier-cosession.md` | **aspirational** |
+| Advisor workflow-backed atom pattern | `design/partial/supervision-turn-end-advisor.md` | **aspirational** |
 | `bbox_ref_size` MCP tool (ref→bytes measurement) | — | **aspirational** |
-| Verdict consumers (REPLACE_BRO, ESCALATE routing) | — | **aspirational** |
+| Typed advisor action executor | — | **aspirational** |
 | Mediation agent manifests | — | **aspirational** |
 
 ## 8. What this design does NOT do

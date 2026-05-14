@@ -95,6 +95,9 @@ rolling utilization percentages suitable for direct quota capacity:
   `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir (`~/.claude-ds` by
   default) as bearer auth. This returns pay-as-you-go balance availability, not
   rolling-window utilization.
+- Inception currently has no quota endpoint in this design; it uses the
+  OpenCode-backed active-probe donor path described in
+  `design/proposed/acquire-drone.md` §6.
 
 Allocation policy must keep these signals distinct: Z.AI can be quota-probe
 confidence, while DeepSeek is balance-derived synthetic capacity.
@@ -172,6 +175,13 @@ Tier mappings are runtime configuration, not compiled constants. Operators
 should be able to change provider/model/effort mappings without restarting the
 daemon. Allocation should read from the current effective mapping snapshot and
 status/trace surfaces should report which mapping version or revision was used.
+
+The mapping example is illustrative. Eligibility still applies after tier
+expansion. In current code, only Claude and Codex advertise
+`structured_output`; GLM, DeepSeek, Inception, Gemini, and Vibe tier entries are
+ineligible for workloads that hard-require structured output until their
+capability tags or runtime support change. Tier membership is not a capability
+grant.
 
 Tier ordering is not intrinsic. The conventional built-ins may have a default
 ladder, but user-defined keys are unordered unless the operator places them in a

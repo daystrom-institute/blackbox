@@ -1,9 +1,10 @@
 # Phase Decomposer — Implementation Plan
 
 Date: 2026-05-10
-Companion to: `design/phase-decomposer.md` (pure design — this is the build plan).
-Depends on: `design/supervision-impl.md` (supervised subworkflows must exist
-before Phase 6 foreach implementer dispatch).
+Companion to: `design/proposed/phase-decomposer.md` (pure design - this is the build plan).
+Depends on: `design/partial/supervision-phased-implementation.md` (supervised atom
+orchestration primitives must exist before Phase 6 foreach implementer
+dispatch).
 
 The decomposer is mostly **configuration** on top of existing workflow
 engine primitives. The engine already has `foreach`, `subworkflow`,
@@ -20,8 +21,9 @@ Phase 1 ──┐
 Phase 2 ──┘              │              ├──▶ Phase 6 ──▶ Phase 7
                          └──▶ Phase 5 ──┘
 
-supervision-impl.md Phases 1-6 must complete before decomposer Phase 6
-(foreach implementers run inside supervised subworkflows).
+The reusable supervision primitives in
+`design/partial/supervision-phased-implementation.md` must exist before
+decomposer Phase 6 (foreach implementers run inside supervised subworkflows).
 ```
 
 ---
@@ -167,8 +169,9 @@ branches correctly on `fit_direct` vs `needs_decompose`.
 ## Phase 4: Single-implementer path (fit_direct)
 
 **Prerequisites:** Phase 3 (discovery subworkflow produces evidence
-bundle + triage verdict). Supervision phases 1-5 must exist (counters,
-packet eval, oracle, advisor extraction, verdict consumers).
+bundle + triage verdict). Supervision plan normalization, polling,
+classifier/advisor workflow-backed atom patterns, and typed advisor action
+execution must exist.
 
 **What gets built:**
 
@@ -177,10 +180,9 @@ packet eval, oracle, advisor extraction, verdict consumers).
    Imports: `vars.brofile`, `vars.prompt`, `vars.evidence_manifest`,
    `vars.acceptance_criteria`. Inside:
    - Implementer dispatch (fire-and-forget)
-   - Wait for anomaly signals (post-completion, per
-     `design/supervision-impl.md` Phase 6.1)
-   - Advisor subworkflow (`subworkflow_ref: "advise"`)
-   - Branch on advisor verdict
+   - Optional classifier workflow-backed atom polling the implementer
+   - Advisor workflow-backed atom at turn end or classifier alert
+   - Branch on advisor action
 
 4.2 **Direct-implementer workflow node.** After the discovery
    subworkflow returns `fit_direct`, a node runs
@@ -373,10 +375,10 @@ lines), 1 gate packet for epoch ceiling (~20 lines). No new Rust code.
 | 1. bbox_ref_size | — | ~100-150 lines | — | Resolve ref → byte payload |
 | 2. Scout manifest | — | — | 1 agent JSON | bro_agent_dispatch returns structured leads |
 | 3. Inlet agent | 1, 2 | — | 1 brofile, 1 workflow, 1 packet | Phase doc → evidence bundle + triage verdict |
-| 4. Single-implementer | 3, supervision Phases 1-5 | — | 1 workflow | fit_direct → implementer → advisor → done |
+| 4. Single-implementer | 3, supervision P1, P2, P3a, P5, P6 subset | — | 1 workflow | fit_direct -> implementer -> advisor -> done |
 | 5. Ensemble decompose | 3 | — | 1 teamplate, 2-3 brofiles, 1 packet | needs_decompose → whiteboard → validated DAG |
-| 6. Foreach implementers | 4, 5, supervision Phase 6 | — | parent workflow nodes | DAG sub-units → foreach → collect outcomes |
-| 7. Recompose council | 6 | — | 1 teamplate, 2 brofiles, 1 packet | Conflict → mediate → converge or halt |
+| 6. Foreach implementers | 4, 5, supervision P4-P6 | — | parent workflow nodes | DAG sub-units -> foreach -> collect outcomes |
+| 7. Recompose council | 6, supervision P7 | — | 1 teamplate, 2 brofiles, 1 packet | Conflict → mediate → converge or halt |
 
 Total new Rust code: ~100-150 lines (Phase 1 only). Everything else is
 configuration artifacts on top of the existing workflow engine.
@@ -401,16 +403,19 @@ configuration artifacts on top of the existing workflow engine.
 | entity_ref::EntityRef | 1 | `src/entity_ref.rs` |
 | entity_loader::load | 1 | `src/entity_loader.rs` |
 
-## Dependency on supervision-impl.md
+## Dependency on supervision-phased-implementation.md
 
 Phases 4, 6, and 7 require the supervision infrastructure from
-`design/supervision-impl.md`:
-- Phase 4 needs counters + packet eval + oracle + advisor extraction +
-  verdict consumers (supervision Phases 1-5)
-- Phase 6 additionally needs foreach integration (supervision Phase 6)
-- Phase 7 additionally needs mediation patterns (M1-M4, which use
-  existing shell/Executor/whiteboard primitives)
+`design/partial/supervision-phased-implementation.md`:
+
+- Phase 4 needs advisor-only supervision: P1 plan normalization, P2
+  attachment/polling, P3a structured exits, P5 advisor atom, and the P6 action
+  subset for `accept`, `steer_primary`, and `bail`.
+- Phase 6 additionally needs P4 classifier support and P6 action execution
+  available inside foreach subworkflows.
+- Phase 7 additionally needs P7 runtime allocation/recovery and mediation
+  patterns (M1-M4, which use existing shell/Executor/whiteboard primitives).
 
 The decomposer implementation plan can begin Phases 1-3 in parallel
-with supervision Phases 1-4. Phase 4 onward must wait for supervision
+with supervision primitive work. Phase 4 onward must wait for supervision
 to be complete.

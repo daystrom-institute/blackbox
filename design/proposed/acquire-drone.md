@@ -312,6 +312,12 @@ to instantiate a team member.
 
 ## 6. Probe mechanisms from Daystrom
 
+This section remains donor material for
+`design/proposed/runtime-allocation-tier-mapping.md`. The `acquire_drone` MCP
+surface is superseded, but the probe taxonomy, quota-confidence vocabulary,
+cooldown behavior, and runtime observation fusion below are still intended to
+feed the allocator design.
+
 Daystrom already has the useful taxonomy and several concrete probes. These are
 not the whole accounting model. They seed and periodically refresh account
 state, then live provider responses from actual bro calls update the same
