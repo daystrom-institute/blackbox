@@ -1061,7 +1061,10 @@ mod tests {
         let snap = state.snapshot_for_response(1_000);
         assert_eq!(snap["ok"], true);
         assert_eq!(snap["event_count"], 0);
-        assert!(snap.get("alerts").is_none(), "green sentinel should not have alerts");
+        assert!(
+            snap.get("alerts").is_none(),
+            "green sentinel should not have alerts"
+        );
     }
 
     #[test]
@@ -1072,7 +1075,10 @@ mod tests {
         };
         let snap = state.snapshot_for_response(1_000);
         assert_eq!(snap["enabled"], false);
-        assert!(snap.get("ok").is_none(), "disabled should not get ok sentinel");
+        assert!(
+            snap.get("ok").is_none(),
+            "disabled should not get ok sentinel"
+        );
         assert!(snap.get("alerts").is_some());
     }
 
@@ -1089,7 +1095,10 @@ mod tests {
             1_000,
         );
         let snap = state.snapshot_for_response(2_000);
-        assert!(snap.get("ok").is_none(), "alerts should force full snapshot");
+        assert!(
+            snap.get("ok").is_none(),
+            "alerts should force full snapshot"
+        );
         assert!(snap.get("alerts").is_some());
         assert!(snap["alerts"].as_array().unwrap().len() > 0);
     }
@@ -1103,7 +1112,10 @@ mod tests {
         state.observe_event(&event, &sink_without_usage(), 1_010);
         assert_eq!(state.max_loop_count(), 2);
         let snap = state.snapshot_for_response(1_020);
-        assert_eq!(snap["ok"], true, "loop_max=2 (below amber=3) should be green");
+        assert_eq!(
+            snap["ok"], true,
+            "loop_max=2 (below amber=3) should be green"
+        );
     }
 
     #[test]
@@ -1116,7 +1128,10 @@ mod tests {
         state.observe_event(&event, &sink_without_usage(), 1_020);
         assert_eq!(state.max_loop_count(), 3);
         let snap = state.snapshot_for_response(1_030);
-        assert!(snap.get("ok").is_none(), "loop_max=3 (at amber threshold) should force full snapshot");
+        assert!(
+            snap.get("ok").is_none(),
+            "loop_max=3 (at amber threshold) should force full snapshot"
+        );
     }
 
     #[test]
@@ -1131,7 +1146,10 @@ mod tests {
 
         // At exactly stall_amber_ms it should go full
         let snap = state.snapshot_for_response(180_000);
-        assert!(snap.get("ok").is_none(), "at stall_amber_ms should force full snapshot");
+        assert!(
+            snap.get("ok").is_none(),
+            "at stall_amber_ms should force full snapshot"
+        );
     }
 
     #[test]
