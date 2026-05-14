@@ -172,6 +172,44 @@
       ]
     },
     {
+      "id": "dispatch-rust-extract-impl-methods-planonly",
+      "atom": "rust-extract-impl-methods",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/main.rs",
+        "target_file": "src/foo_methods.rs",
+        "impl_name": "impl Foo",
+        "method_names": [
+          "bar"
+        ],
+        "module_name": "foo_methods",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "files_touched",
+        "methods_extracted"
+      ]
+    },
+    {
+      "id": "dispatch-rust-bin-to-lib-migration-planonly",
+      "atom": "rust-bin-to-lib-migration",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "source_file": "src/main.rs",
+        "target_file": "src/lib.rs",
+        "module_names": [
+          "search"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "files_touched",
+        "modules_migrated"
+      ]
+    },
+    {
       "id": "dispatch-rust-organize-imports-planonly",
       "atom": "rust-organize-imports",
       "args": {

@@ -121,6 +121,32 @@
       "done_note_required": true
     },
     {
+      "atom": "rust-extract-impl-methods",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "missing-impl-method",
+        "expected_block_reason_substring": "method"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-bin-to-lib-migration",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "inline-mod-block",
+        "expected_block_reason_substring": "inline"
+      },
+      "done_note_required": true
+    },
+    {
       "atom": "rust-organize-imports",
       "expected_plan_sequence": [
         "bbox_refactor_status",

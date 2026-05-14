@@ -77,6 +77,22 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-rust-extract-impl-methods",
+      "query": "move named rust impl methods into a child module with module wiring and compile repair",
+      "expected_atoms": [
+        "rust-extract-impl-methods"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-bin-to-lib-migration",
+      "query": "move rust module declarations from main rs into lib rs and rewrite bin crate paths",
+      "expected_atoms": [
+        "rust-bin-to-lib-migration"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-rust-organize-imports",
       "query": "organize imports in one rust file with rust analyzer",
       "expected_atoms": [

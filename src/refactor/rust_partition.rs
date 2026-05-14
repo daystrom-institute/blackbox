@@ -569,18 +569,58 @@ mod tests {
     use super::*;
 
     #[test]
-    fn analyze_blackbox_server_impl() {
-        let source_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
-        let graph =
-            analyze_impl(&source_path, "BlackboxServer").expect("analyze_impl should succeed");
-        assert!(
-            graph.methods.len() >= 30,
-            "expected >= 30 methods in BlackboxServer impl, got {}",
-            graph.methods.len()
+    fn analyze_impl_merges_blocks_and_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("sample.rs");
+        std::fs::write(
+            &source_path,
+            r#"
+struct Widget {
+    state: usize,
+    count: usize,
+}
+
+impl Widget {
+    fn read(&self) -> usize {
+        self.state + self.helper()
+    }
+
+    fn helper(&self) -> usize {
+        1
+    }
+
+    fn write(&mut self) {
+        self.count = self.count + self.read();
+        self.external_callback();
+    }
+}
+
+#[tool_router(router = widget_tools)]
+impl Widget {
+    fn route(&self) {
+        self.read();
+    }
+}
+"#,
+        )
+        .unwrap();
+
+        let graph = analyze_impl(&source_path, "Widget").expect("analyze_impl should succeed");
+        let method_names: BTreeSet<_> = graph.methods.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            method_names,
+            BTreeSet::from(["read", "helper", "write", "route"])
         );
         assert!(
             !graph.edges.is_empty(),
-            "expected non-empty edges in BlackboxServer impl graph"
+            "expected non-empty edges in Widget impl graph"
+        );
+        assert!(
+            graph
+                .methods
+                .iter()
+                .any(|m| m.name == "route" && m.router.as_deref() == Some("widget_tools")),
+            "expected router metadata on second impl block"
         );
     }
 }
