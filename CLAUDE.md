@@ -3,191 +3,69 @@
 
 ## Conventions
 
-<!-- bb:entry=b12f4560 -->
-**LargeTalk inside-dispatch: use ./lt CLI, not MCP, in -p resume mode**
+**RX-V1: operator-authority opt-out invariant for refactor flags**
 
-When spawning `claude --resume <id> -p "prompt"` from inside the Pharo image (e.g., LTClaudeSession>>resume:), MCP tools appear as disconnected in the resumed session — this is a known Claude Code limitation. `--dangerously-skip-permissions` doesn't fix it. `--mcp-config <file>` doesn't fix it. Tools like mcp__largetalk__image_eval are unreachable.
+Operator-authority flags on Rust refactor plan kinds — `acknowledge_repr` (move_rust_struct_fields, RX-S1) and `acknowledge_public_api_change` (rewrite_rust_error_type RX-E1 and other public-surface kinds) — are operator authority, not agent discretion. Atomic agents from design/refactor-agents.md MAY pass these flags through from operator-supplied inputs but MUST NOT default them, MUST NOT infer them from context ("delta looks small" is not a reason), and MUST NOT set them silently after seeing a refusal. An atom that sets these flags on the operator's behalf is no longer atomic — it is a general executor with discretion. Plan responses carry an `operator_opt_outs_used` audit field listing flags actually consumed; this field lives on the durable RefactorPlan (not just the summary) so saved plans preserve the audit trail.
 
-**Correct path:** expose a Bash CLI wrapper to the live image — `/home/invidious/repos/largetalk-spike/lt` — and teach inside-claude to use it via `Bash(./lt ...)`. The wrapper just POSTs to the MCP HTTP endpoint directly (urllib); works the same as MCP tool calls but over Bash.
+**RX-V2: bbox_refactor_run cargo-only command allowlist for atom dispatches**
 
-Example inside-claude prompt preamble (now baked into LTClaudeSession>>resume:):
-```
-INSIDE-PREAMBLE: You are in -p mode resumed into a Pharo image. MCP shows "disconnected" — use Bash + ./lt instead:
-  cd /home/invidious/repos/largetalk-spike && ./lt eval "42 * 42"
-  cd /home/invidious/repos/largetalk-spike && ./lt compile Class "method ^ body"
-  cd /home/invidious/repos/largetalk-spike && ./lt whoami
-ZnServer is single-threaded; avoid parallel ./lt calls; back off on >10s hangs.
-```
+For `bbox_refactor_run` invocations dispatched from atomic refactor agents (design/refactor-agents.md), command steps are restricted to a narrow cargo allowlist: `cargo check` (any args, including --message-format=json and feature flags), `cargo test` (any args), `cargo clippy` (any args), `cargo fmt` only when `touches` is explicitly declared, `cargo build` (allowed but typically wasteful). Any other command in an atom-dispatched run is a prompt-discipline violation; the atom should refuse to compose it. v1 enforcement is via atom prompt templates + brofile Bash/Write/Edit denial. v2 path: runner inspects `dispatch_origin` flag (set by bro_agent_dispatch) and enforces server-side. Mutating commands not in the allowlist must declare `touches` so the runner can snapshot/rollback; an atom-dispatched run with an undeclared-touches mutating command is unsupported.
 
-**Verified behavior:** inside-claude correctly diagnosed the server saturation issue (reported "6 queued connections on :7270, ./lt calls timeout at 10s") — so the Bash path WORKS when the server is healthy. The saturation was self-inflicted by a chat-window bus-subscription firing on every event; fix: subscribe only to claude-home-reply/error, not claude-home-send.
+**RX-V3: RA-backed Rust refactor plan kinds fail closed on rust-analyzer unavailability**
 
-**Architecture note:** This means the inside/outside handoff is NOT via MCP-in-resumed-session. It's via Bash+HTTP. The session transcript (jsonl) stays the canonical shared record between inside and outside. Each side writes turns to it; the chat window seeds from it on open and refreshes on reply events.
+The rust-analyzer-backed plan kinds `rust_lsp_rename`, `rust_organize_imports`, `rust_ra_move_item_to_module` (RX-R1), and `rust_ra_classify_callbacks` (RX-R2) require an active LspSessionManager. When rust-analyzer is unavailable (binary missing, init timeout, crashed mid-run), these plan kinds MUST fail closed with `error.lsp_unavailable` and the underlying cause. They MUST NOT silently downgrade to a syntax_only / indexed_hints approximation, because callers chose the LSP-backed kind specifically for semantic_status=lsp_verified. This is intentional asymmetry vs the Java side's documented tree-sitter fallback for rust_organize_imports — the Rust LSP-backed kinds in design/refactor-rust-expansion.md treat fallback as a silent semantic downgrade and refuse it.
 
-Tags: largetalk-spike, inside-dispatch, claude-resume, mcp-p-mode-limitation, lt-cli-wrapper, session-handoff, 2026-04-20
+**Semantic OpenCode-backed providers**
 
-<!-- /bb:entry=b12f4560 -->
-<!-- bb:entry=a3a8c3c1 -->
-**Pharo self-heal pattern: provenance + routed exception repair**
+Bro provider names should be semantic: use `glm` for the Z.AI Coding Plan API and `deepseek` for the DeepSeek API. Both are OpenCode-backed transports, and their provider credentials/configuration are owned by OpenCode rather than generated through Claude-style account directories.
 
-Self-healing loop for Pharo live images with agent-authored code:
+**Workspace tools use work prefix**
 
-1. **Provenance on every install.** Every LTCompileMethodOp>>apply records {class, selector, patch_id, bro_id, session_id, provider, recorded_at} into LTProvenance registry. Keyed on 'Class>>#selector'. The LTPatch>>apply wraps op iteration with a class-side `current` so each op can resolve its owning patch (which carries `provenance: 'bro#N'` or 'dlg-K/turn-M/provider').
+Workspace tool MCP handlers in transcript-search must use the `work_*` namespace, not `bbox_*`. This applies to docs, tool descriptions, ambient coercion guidance, and future workspace-tool additions so the workspace toolset remains distinct from core blackbox `bbox_*` tools.
 
-2. **Hook: OupsDebuggerSystem>>#handleDebugRequest:.** This is the universal funnel for all unhandled exceptions in Pharo 12. Wrap by (a) stashing original as `originalHandleDebugRequest:`, (b) installing a new `handleDebugRequest:` that fires your healer then calls `self originalHandleDebugRequest: aDebugRequest`. Retains normal debugger; adds the parallel fix dispatch.
+### Forgejo Coordination Identity
 
-3. **Dual-route healing.** On exception, extract diagnostic {exc_class, message, class, selector, method_source}. Look up provenance for that method:
-   - If recorded AND session_id present → `bro_resume` the ORIGINATING bro with "your patch ... just raised this exception, here's current source, diagnose and fix" — the agent who wrote it now sees its downstream failure with their original context + intent intact. Much richer signal than a cold-start bro.
-   - Else → anonymous bro with full cold diagnostic.
-   Both paths return an LTPatch. Same judge-packet gate for both: structural checks (has CompileMethod op, matches class+selector of failing method, non-empty source, has ^ return, has 'self').
+**Distinct Forgejo Identities For Agent Audit Trail**
 
-4. **Guards that matter:**
-   - Per-(class,selector) retry budget: max 3 heals per rolling hour via LTProvenance countAttempt:/budgetOk:. Stops loop-bombs.
-   - Re-entry: `busy` flag on the healer prevents concurrent heal dispatches.
-   - Package allowlist: `LargeTalk-*` + LT-prefixed classes only. Never touch Kernel/Morphic/System code via auto-heal.
-   - autoApply toggle defaults false — proposals queue in `lastProposals` for manual review. Auto-apply is the full autonomy mode for when the judge-packet is trusted.
+For Forgejo-backed coordination, implementers and reviewers must use distinct external identities for auditability. Identity mappings should key at least by coordination instance, bro/role identity, provider, and model; per-dispatch metadata such as effort belongs on system events, audit comments, and performance records rather than multiplying durable external users.
 
-5. **Patch-target gate:** before applying a heal proposal, verify the patch's CompileMethod op targets the SAME class+selector that threw. Agents sometimes hallucinate different selectors; this rejects them cleanly.
 
-Insight that unlocks the design (credit: user): "when an exception occurs, it needs to route one of two ways — to an anonymous bro that has no context, OR back to the bro that originated the change." The second path is the pedagogical one. The agent gets feedback on its own mistake with full intent preserved. Every method carries its authoring context so downstream failures can route backward along that chain.
+### Provider Catalog
 
-See r-provenance-healer.st in largetalk-spike for the full installation file.
+**Do not expose mercury-edit-2**
 
-Tags: pharo, self-heal, provenance, exception-routing, originator-resume, bro_resume, LTExceptionHealer, LTProvenance, OupsDebuggerSystem, largetalk-spike
+For the Inception provider catalog in blackbox, expose `inception/mercury-2` as the tool-capable model and do not make `inception/mercury-edit-2` available. Manual OpenCode smoke showed `mercury-2` can execute MCP tools, while `mercury-edit-2` rejects OpenAI-style tool schemas.
 
-<!-- /bb:entry=a3a8c3c1 -->
+
+### Render Hygiene
+
+**Deep docs belong in system memories**
+
+In transcript-search/blackbox, deep tool and workflow documentation must stay out of always-rendered provider memory. Use scoped/deferred surfaces and code-owned system memories for role-specific or cold docs. When adding a new tool category, do not trim unrelated hot docs or raise the prompt-size budget to compensate; put the tool behind the appropriate surface/deferred memory boundary unless it is genuinely hot-path guidance.
+
+
+### System Memory
+
+**System memories are invariants, not ledgers**
+
+System memories must state current system invariants and operational runbooks, not serve as release ledgers or artifact inventories. Do not mirror atom names, versions, statuses, costs, eval fixtures, supersession history, or implementation chronology in SMs. Mention atoms only as contextual signposts to `atom_search` / `atom_describe` when an atom should replace a manual tool sequence; put deeper atom mechanics in `sm-atoms`, and keep shipped artifact inventory in manifests/artifact tooling.
+
+
 
 ## Workflow
 
-<!-- bb:entry=aac35492 -->
 **List Before Create**
 
 Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, teamplates/teams, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.
 
-<!-- /bb:entry=aac35492 -->
+### Shared Infrastructure Safety
 
-<!-- bb:project-md -->
-## Project
+**Ask Before Mutating Shared Services**
 
-**Blackbox** — MCP server that indexes Claude Code, Codex CLI, Copilot, Vibe, and Gemini transcripts into a tantivy full-text search index, manages a unified knowledge store across providers, tracks long-running work threads, and orchestrates multi-provider agent execution.
+Before restarting, stopping, reloading, replacing, or otherwise mutating shared services or containers that active agents may depend on, first perform a read-only scope check and get explicit operator approval for the named service/container. Applies to blackbox.service, Forgejo, runners, Docker Compose stacks, and other coordination infrastructure.
 
-The crate is `blackbox` (`Cargo.toml`); it produces two binaries:
-- `blackboxd` — the MCP server daemon (`src/main.rs`)
-- `bro` — terminal client for tailing live orchestration events (`src/cli.rs`)
 
-MCP tools are prefixed `bbox_*` (transcript/knowledge/threads) and `bro_*` (orchestration).
 
-## Build & Run
+Read @PROJECT.md fully before acting; it contains the shared project context and instructions.
 
-```bash
-cargo build --release    # release binaries at target/release/{blackboxd,bro}
-cargo build              # debug build
-cargo test               # unit tests (159 tests, ~0.1s)
-cargo clippy             # lint
-```
-
-`blackbox` is a bin-only crate right now (`[[bin]] blackboxd`, `[[bin]] bro`) with no `[lib]` target, so `cargo test --release --lib` fails with `no library targets found in package 'blackbox'`. For the unit tests in `#[cfg(test)]` blocks under `src/main.rs`, use `cargo test --release --bin blackboxd` (or `cargo test --bin blackboxd`) instead.
-
-`blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused. The same built daemon artifact is installed under two names for service isolation: `~/.local/bin/blackboxd` for prod and `~/.local/bin/blackboxd-dev` for the dev unit.
-
-## Architecture
-
-Source layout (`src/`):
-
-- **main.rs** — HTTP server bootstrap (`axum`), MCP tool dispatcher (`#[tool]`-annotated handlers), HTTP routes: `/mcp` (streamable MCP), `/tail` (SSE for `bro tail`), `/roster` (team/bro snapshot). Transcript tools include `bbox_cite` (trace a claim back to its origin turn, role=user default, citations returned oldest-first).
-- **cli.rs** — `bro` binary. Connects to `blackboxd`'s `/tail` endpoint and renders colorized live task events.
-- **index/** — Tantivy index lifecycle, schema (account, project, role, session_id, content, timestamps, git_branch, agent_slug, is_subagent, cwd), search/browse handlers, incremental reindex thread.
-- **parser.rs** — Multi-format transcript parsing: Claude Code (`message.content` array), Codex CLI (`payload.content`), history.jsonl (`display`). Extracts roles, tool use/results, thinking blocks. Caps content at 12KB per document.
-- **knowledge.rs** — Knowledge entry CRUD (`~/.claude-shared/blackbox-knowledge.json`). Three write verbs: `bbox_learn` (rendered rules/conventions), `bbox_remember` (indexed-only notes), `bbox_decide` (durable commitments with required rationale + supersession chain). Render pipeline emits provider-specific markdown (CLAUDE.md, AGENTS.md, GEMINI.md) with three layers: steerage → shared memory → PROJECT.md. Git-based absorption imports external edits to rendered files as unverified entries.
-- **threads.rs** — Work thread tracker for non-dispatchable, multi-session efforts. Friendly names with rename support; typed graph edges between threads/sessions. Thread `kind` distinguishes `work_item` (propose→execute→review→refine loops) from `investigation`.
-- **notes.rs** — Side-channel note store (`bbox_note`). Structured records executors emit during work — kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Scan-friendly trail so the orchestrator can query instead of re-parsing prose. Filterable by kind/project/session/thread/resolution.
-- **inbox.rs** — Attention layer (`bbox_inbox`). Cross-store aggregator that surfaces unresolved notes (disputes/blocked/surprises), deferred followups, stale threads, unverified knowledge, and failed bro tasks in one ranked view.
-- **tool_docs.rs** — Single source of truth for the agent-facing tool reference. Per-tool stanzas (`name`, `summary`, `when_to_use`, `example`) grouped by category plus cross-tool `WORKFLOW_NOTES`. Rendered into a fixed-ID global knowledge entry (`bb-tool-reference`) by `sync_into_knowledge`, which runs automatically on every daemon startup. A compile-time unit test asserts every `#[tool]`-registered name has a matching stanza — adding a tool without docs fails the build.
-- **orchestration/** — Multi-provider agent dispatch (Claude, OpenCode, Codex, Copilot, Vibe, Gemini). Provider catalogs (models, effort tiers), exec/resume arg builders, brofile/team management, task lifecycle, tail event stream. Two orthogonal prompt layers: **ambient** (`apply_ambient`, per-turn) prepends a scope block with pre-bound `session`/`project`/`bro`/`thread`/`work_item` IDs + optional `completion_contract`; **brofile lens** (`apply_brofile_lens`, persona/system-prompt layer) composes on top. Only the ambient layer is gated by `allow_recursion`.
-  - `orchestration/mcp.rs` — MCP registry + filter layer. `McpServerConfig` (Http/Sse/Stdio), `McpFilters` (allow/disallow glob patterns), `McpStore` (JSON-backed). Global at `~/.bro/mcp.json`, project overlay at `<project>/.bro/mcp.json`. `self_register_blackbox(url)` runs on daemon startup and upserts a `blackbox` HTTP entry in every installed provider's MCP config (Claude / Copilot / Codex / Gemini via their native `mcp add/list/remove` CLIs). `bro_mcp` tool exposes list/get/add/remove/allow/disallow/clear_filters/sync — global-scope writes fan out to every provider CLI, project-scope writes stay local until `sync`.
-  - **Mechanical recursion guard, universal.** Every dispatch-capable provider applies the default `mcp__blackbox__bro_*` disallow filter mechanically at argv construction. Translation per provider: Claude `--disallowedTools`, Copilot `--deny-tool=`, Codex `-c mcp_servers.blackbox.disabled_tools=[...]` (with glob expansion via `tool_docs::orchestration_tool_names`), Gemini `--policy <tempfile>` (per-dispatch TOML written to `~/.bro/gemini-policies/dispatch-<id>.toml`, cleaned up when the task terminates, orphan sweep on daemon startup). Vibe has no MCP and no bro_* surface to recurse through. The text recursion guard is retired — `allow_recursion=true` on exec/resume is the only bypass.
-- **render.rs** — Markdown emitter shared by knowledge render and other tooling.
-
-## Provider Catalog
-
-Maintained in `src/orchestration/providers.rs`:
-
-- **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6 [1m]/200K, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (xhigh default, Opus-4.7-only; max unsupported on Haiku).
-- **OpenCode**: native `provider/model` routing with Z.AI Coding Plan GLM models exposed directly. Defaults to `zai-coding-plan/glm-5.1`, helper model `zai-coding-plan/glm-4.5-air`, and variant tiers `minimal`/`low`/`medium`/`high`/`max`.
-- **Codex**: gpt-5.4 family. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
-- **Copilot**: tracks Anthropic + OpenAI models. Effort tiers `low`/`medium`/`high`/`xhigh`.
-- **Vibe**, **Gemini**: model lists only, no effort tier.
-
-## Key Design Decisions
-
-- **One tantivy doc per content block** — enables role-based filtering and precise excerpt generation rather than one doc per session.
-- **Field-based filtering** — account, project, role, subagent, branch, cwd filters all happen at the tantivy query level, no post-filtering.
-- **Response cap** — 80KB max MCP response. 12KB max per indexed document.
-- **Multi-account auto-detection** — scans `~/` for `.claude-*` dirs with `projects/` subdirs; always includes `~/.claude` as `claude` account; includes `~/.codex` if sessions dir exists.
-- **Tokio runtime** — async only where needed (MCP transport, HTTP `/tail`, orchestration child processes); synchronous I/O for tantivy and JSON storage.
-
-## Environment Variables
-
-- `TRANSCRIPT_SEARCH_ROOTS` — override account roots (`name=/path,name2=/path2`)
-- `TRANSCRIPT_SEARCH_CODEX_ROOT` — override Codex data dir
-- `TRANSCRIPT_SEARCH_INDEX_PATH` — override tantivy index location
-- `BLACKBOX_REINDEX_INTERVAL_SECS` — background reindex interval (default: 120)
-- `BBOX_PORT` — HTTP listener port for `/mcp`, `/tail`, `/roster` (default: 7264; 7263 is retired and avoided)
-- `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
-- `RUST_LOG` — tracing filter (default: `transcript_search=info`)
-
-## Deployment
-
-`blackboxd` is designed to run as a single long-lived user service, not a
-per-session stdio child. It exposes HTTP MCP on `127.0.0.1:${BBOX_PORT:-7264}/mcp`
-so every Claude/Codex/Gemini CLI on the host connects to one daemon with one
-shared knowledge store + tantivy index. The bundled `deploy/blackbox.service`
-unit and the daemon default both pin port 7264 — 7263 is retired (old
-`bro.service`) and intentionally avoided. Client config examples below use
-7264 accordingly.
-
-Install templates at `deploy/blackbox.service` and `deploy/blackbox-dev.service`:
-
-```bash
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-cp deploy/blackbox.service ~/.config/systemd/user/
-cp deploy/blackbox-dev.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now blackbox.service
-systemctl --user enable --now blackbox-dev.service
-```
-
-Prod and dev intentionally run different installed daemon paths even when both
-come from the same release build: `blackbox.service` uses
-`~/.local/bin/blackboxd`, while `blackbox-dev.service` uses
-`~/.local/bin/blackboxd-dev`. That keeps dev binary swaps and restarts from
-mutating the prod service executable in place.
-
-Upgrades: build, install both daemon names plus `bro`, then restart whichever
-service you actually changed. The `install` is atomic (unlink + write) so the
-running process keeps the old inode until systemd restarts it.
-
-Client config (all point to the same daemon):
-- Claude Code: `mcpServers.blackbox = { type: "http", url: "http://127.0.0.1:7264/mcp" }` in each `~/.claude*/.claude.json`
-- Codex: `[mcp_servers.blackbox] url = "http://127.0.0.1:7264/mcp"` in `~/.codex/config.toml`
-
-## Render Pipeline
-
-`bbox_render` has two scopes:
-
-- **`scope=global`** — surgical patch of each provider's global-memory file
-  (`~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`)
-  between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers.
-  Snapshots the original to `~/.local/state/blackbox/backups/<ISO-ts>/`
-  before writing. RTK `@imports` and user-authored content outside the
-  markers are preserved. Copilot (greedy reader of project files) and Vibe
-  (unsupported) are intentionally skipped — `global_target_path` returns
-  `None` for them.
-- **`scope=project`** — writes `<project>/{CLAUDE,AGENTS,GEMINI}.md` with
-  **only** project-scope entries + verbatim `PROJECT.md` content. No global
-  entries duplicated per project (use `scope=both` if you need first-time
-  install or a re-sync).
-
-## Design Docs
-
-- `design/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.
+@PROJECT.md
