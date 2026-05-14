@@ -23,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 
 use super::context::{ArcContext, ArcMeta, SignalRef, resolve_arg_value};
 use super::ops::{HookOp, OnFailure, OpEffect, execute_op_with_hub};
-use super::wait::{PendingWait, ProviderEventWait, WaitSpec, canonicalize_correlation};
+use super::wait::{
+    PendingWait, ProviderEventWait, WaitSpec, canonicalize_correlation, matches_correlation,
+};
 use super::{
     ActorFailureMode, ActorKind, ActorSpec, AtomBinding, CompiledWorkflow, ForeachSpec, GateMode,
     ItemFailurePolicy, MatrixSpec, NodeMode, NodeSpec, NodeTransition, Workflow,
@@ -2563,6 +2565,7 @@ impl<'a> WorkflowRunner<'a> {
         self.ctx.clear_last_signal();
 
         let mut registered_ids: Vec<(String, String)> = Vec::new();
+        let mut registered_waits: Vec<(String, String, String, Map<String, Value>)> = Vec::new();
         let resolved_slot: Arc<parking_lot::Mutex<Option<SignalRef>>> =
             Arc::new(parking_lot::Mutex::new(None));
         let notify = Arc::new(Notify::new());
@@ -2593,7 +2596,7 @@ impl<'a> WorkflowRunner<'a> {
                 arc_id: arc_id.clone(),
                 wait_id: wait_id.clone(),
                 signal: wait_signal.signal.clone(),
-                correlation,
+                correlation: correlation.clone(),
                 notify: notify.clone(),
                 resolved: resolved_slot.clone(),
             });
@@ -2608,6 +2611,50 @@ impl<'a> WorkflowRunner<'a> {
             )
             .await;
             registered_ids.push((arc_id.clone(), wait_id));
+            registered_waits.push((
+                arc_id.clone(),
+                format!("{node_id}#{idx}"),
+                wait_signal.signal.clone(),
+                correlation,
+            ));
+        }
+
+        // A reaction can emit the signal immediately after the preceding hook
+        // returns, before this Wait node has had a chance to register. Catch up
+        // against the durable system-event journal using the same correlation
+        // semantics as live signal routing.
+        for (arc, wait_id, signal, correlation) in &registered_waits {
+            let Ok(events) =
+                self.server
+                    .state
+                    .system_events
+                    .list_events(Some(128), Some(signal), None, None)
+            else {
+                continue;
+            };
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| matches_correlation(correlation, &event.correlation))
+            {
+                if let Some((resolved, notify, _, _)) =
+                    self.server.wait_store().take_exact(arc, wait_id)
+                {
+                    *resolved.lock() = Some(SignalRef {
+                        name: signal.clone(),
+                        payload: serde_json::to_value(&event).unwrap_or_else(|e| {
+                            json!({
+                                "event_id": event.id,
+                                "kind": signal,
+                                "serialization_error": e.to_string(),
+                            })
+                        }),
+                        correlation: event.correlation,
+                        received_at: crate::util::now_iso(),
+                    });
+                    notify.notify_one();
+                    break;
+                }
+            }
         }
 
         // Block on Notify with optional timeout, OR an arc-cancel

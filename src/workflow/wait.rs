@@ -156,6 +156,27 @@ impl WaitStore {
         Some((p.resolved, p.notify, p.arc_id, p.wait_id))
     }
 
+    /// Pop one exact wait by `(arc_id, wait_id)`. Used by local catch-up
+    /// paths that already know the current runner owns the wait and only need
+    /// to resolve it against a recently persisted event.
+    pub fn take_exact(
+        &self,
+        arc_id: &str,
+        wait_id: &str,
+    ) -> Option<(
+        Arc<parking_lot::Mutex<Option<SignalRef>>>,
+        Arc<Notify>,
+        String,
+        String,
+    )> {
+        let mut pending = self.pending.write();
+        let idx = pending
+            .iter()
+            .position(|p| p.arc_id == arc_id && p.wait_id == wait_id)?;
+        let p = pending.remove(idx);
+        Some((p.resolved, p.notify, p.arc_id, p.wait_id))
+    }
+
     /// Cancel a wait by (arc_id, wait_id). Used on arc cancel /
     /// timeout cleanup.
     pub fn cancel(&self, arc_id: &str, wait_id: &str) -> bool {

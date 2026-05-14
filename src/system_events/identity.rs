@@ -16,6 +16,8 @@ pub struct IdentityRequest {
     pub model: String,
     pub effort: Option<String>,
     pub project: Option<String>,
+    pub owner: Option<String>,
+    pub repo: Option<String>,
 }
 
 /// Forgejo/Gitea cap usernames at 40 characters; we stay one under for
@@ -88,6 +90,22 @@ impl IdentityRequest {
 
     pub fn subject(&self) -> String {
         format!("bro:{}", self.bro)
+    }
+
+    pub fn correlation(&self) -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::from_iter([
+            ("scope".to_string(), serde_json::json!(self.scope.clone())),
+            (
+                "instance".to_string(),
+                serde_json::json!(self.instance.clone()),
+            ),
+            ("bro".to_string(), serde_json::json!(self.bro.clone())),
+            (
+                "provider".to_string(),
+                serde_json::json!(self.provider.clone()),
+            ),
+            ("model".to_string(), serde_json::json!(self.model.clone())),
+        ])
     }
 }
 
@@ -513,6 +531,8 @@ mod tests {
             model: model.to_string(),
             effort: None,
             project: None,
+            owner: None,
+            repo: None,
         }
     }
 

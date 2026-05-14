@@ -15,7 +15,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="${ROOT}/.env"
+BLACKBOX_SECRETS_DIR="${BLACKBOX_SECRETS_DIR:-${HOME}/.local/share/blackbox/secrets}"
 FORGEJO_HOST="${FORGEJO_HOST:-http://127.0.0.1:3000}"
+FORGEJO_CONTAINER="${FORGEJO_CONTAINER:-keystone-forgejo15}"
 ADMIN_USER="${ADMIN_USER:-keystone-admin}"
 ADMIN_PASS="${ADMIN_PASS:-keystone-demo-pass-1234}"
 ADMIN_EMAIL="${ADMIN_EMAIL:-admin@keystone.local}"
@@ -32,6 +34,14 @@ WEBHOOK_TARGET="${WEBHOOK_TARGET//host.docker.internal/$HOST_GATEWAY}"
 log() { printf '\033[36m[bootstrap]\033[0m %s\n' "$*"; }
 warn() { printf '\033[33m[bootstrap]\033[0m %s\n' "$*" >&2; }
 
+write_blackbox_secret() {
+    local name="$1" value="$2"
+    mkdir -p "${BLACKBOX_SECRETS_DIR}"
+    chmod 700 "${BLACKBOX_SECRETS_DIR}"
+    printf '%s' "${value}" >"${BLACKBOX_SECRETS_DIR}/${name}"
+    chmod 600 "${BLACKBOX_SECRETS_DIR}/${name}"
+}
+
 wait_for_forgejo() {
     log "waiting for Forgejo to come up at ${FORGEJO_HOST}…"
     for i in {1..60}; do
@@ -46,13 +56,13 @@ wait_for_forgejo() {
 }
 
 create_admin() {
-    if docker exec keystone-forgejo su-exec git forgejo admin user list 2>/dev/null \
+    if docker exec "${FORGEJO_CONTAINER}" su-exec git forgejo admin user list 2>/dev/null \
         | awk 'NR>1 {print $2}' \
         | grep -qx "${ADMIN_USER}"; then
         log "admin user '${ADMIN_USER}' already exists"
     else
         log "creating admin user '${ADMIN_USER}'"
-        docker exec keystone-forgejo su-exec git forgejo admin user create \
+        docker exec "${FORGEJO_CONTAINER}" su-exec git forgejo admin user create \
             --admin \
             --username "${ADMIN_USER}" \
             --password "${ADMIN_PASS}" \
@@ -89,6 +99,12 @@ issue_token() {
     } >"${ENV_FILE}"
     log "wrote ${ENV_FILE}"
     export FORGEJO_TOKEN
+}
+
+write_blackbox_secrets() {
+    log "writing blackbox Forgejo admin secrets"
+    write_blackbox_secret forgejo-admin-token "${FORGEJO_TOKEN}"
+    write_blackbox_secret forgejo-admin-password "${ADMIN_PASS}"
 }
 
 create_repo() {
@@ -208,6 +224,7 @@ main() {
     wait_for_forgejo
     create_admin
     issue_token
+    write_blackbox_secrets
     create_repo
     seed_bug
     seed_issue

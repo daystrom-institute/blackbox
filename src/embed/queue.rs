@@ -111,6 +111,16 @@ impl EmbedQueueHandle {
     }
 
     pub fn start_default_with_store(vector_store: Arc<crate::vectors::VectorStore>) -> Self {
+        Self::start_default_with_optional_store(Some(vector_store))
+    }
+
+    pub fn start_default_without_store() -> Self {
+        Self::start_default_with_optional_store(None)
+    }
+
+    fn start_default_with_optional_store(
+        vector_store: Option<Arc<crate::vectors::VectorStore>>,
+    ) -> Self {
         match EmbeddingRouter::load_default() {
             Ok(router) => Self::from_router(
                 router,
@@ -129,7 +139,7 @@ impl EmbedQueueHandle {
         router: EmbeddingRouter,
         debounce: Duration,
         retry_backoff: Duration,
-        vector_store: Arc<crate::vectors::VectorStore>,
+        vector_store: Option<Arc<crate::vectors::VectorStore>>,
     ) -> Self {
         let mut providers: Vec<ProviderSpec> = Vec::new();
         for bucket in Bucket::ALL {
@@ -178,7 +188,7 @@ impl EmbedQueueHandle {
             debounce,
             retry_backoff,
             Some(router),
-            Some(vector_store),
+            vector_store,
         )
     }
 

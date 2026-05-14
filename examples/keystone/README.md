@@ -45,13 +45,14 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 
 - Docker (or Podman with `alias docker=podman`)
 - `jq`, `curl`, `git`, `python3` (for HMAC signature when you replay manually)
-- `blackboxd` running (default port `7264`; the dev daemon at `7265` works too — see `BBOX_PORT`)
-- Daemon listener bound to `0.0.0.0` so the Docker'd Forgejo can deliver webhooks. The shipped `deploy/blackbox-dev.service` already does this; the prod template is loopback by default. See [`../../WORKFLOWS.md` § Operator-blessed registries](../../WORKFLOWS.md#operator-blessed-registries).
+- Forgejo 15 available on `FORGEJO_BASE_URL` (the bundled compose file starts `codeberg.org/forgejo/forgejo:15` on `http://127.0.0.1:3000`)
+- `blackboxd` running (default port `7264`; override with `BBOX_PORT`)
+- For webhook delivery from Docker, the daemon listener must be reachable from the Forgejo container. On Linux that usually means binding the daemon to `0.0.0.0` or using the poller/direct-dispatch path instead of webhooks. See [`../../WORKFLOWS.md` § Operator-blessed registries](../../WORKFLOWS.md#operator-blessed-registries).
 - Daemon environment must include:
   - `FORGEJO_BASE_URL`, `FORGEJO_TOKEN` — for the implementer/reviewer to call the Forgejo API
   - `FORGEJO_WEBHOOK_SECRET` — for the daemon to verify inbound webhook signatures
 
-  Add via systemd drop-in (`~/.config/systemd/user/blackbox-dev.service.d/keystone-secrets.conf`) or whatever envsetup pattern your daemon uses. `scripts/bootstrap.sh` writes the values to `.env`; copy them into the drop-in.
+  Add via systemd drop-in or whatever envsetup pattern your daemon uses. `scripts/bootstrap.sh` writes the values to `.env`; copy them into the daemon environment before running arcs that use `${env.FORGEJO_*}`.
 - Brofiles configured. The shipped install creates two:
   - `keystone-impl`   → Claude Sonnet 4.6
   - `keystone-review` (×2 instances `keystone-review` + `keystone-review-b`) → Claude Haiku 4.5
@@ -127,7 +128,7 @@ examples/keystone/
 
 ### What happens when the webhook arrives
 
-1. Forgejo POSTs `issues.opened` to `http://172.17.0.1:7265/webhook/forgejo` with `X-Gitea-Event: issues` + `X-Gitea-Signature: <hex>`.
+1. Forgejo POSTs `issues.opened` to `http://172.17.0.1:${BBOX_PORT:-7264}/webhook/forgejo` with `X-Gitea-Event: issues` + `X-Gitea-Signature: <hex>`.
 2. Daemon verifies the HMAC against `${FORGEJO_WEBHOOK_SECRET}`.
 3. Idempotency dedup against the `X-Gitea-Delivery` UUID (resends are dropped silently).
 4. **Extractor** projects the body + headers into a flat entity:
@@ -216,10 +217,10 @@ HTTP surfaces (when MCP isn't available — e.g. shell scripts):
 
 ```sh
 # stream every event the engine emits (SSE)
-curl -N http://127.0.0.1:7265/tail
+curl -N http://127.0.0.1:${BBOX_PORT:-7264}/tail
 
 # all in-flight arcs with current node + completed nodes + visit counts
-curl http://127.0.0.1:7265/orchestrate/peek | jq
+curl http://127.0.0.1:${BBOX_PORT:-7264}/orchestrate/peek | jq
 
 # arc-specific note trail (audit) + latest compaction anchor
 bro orchestrate status <arc_thread_id>
@@ -230,7 +231,7 @@ curl -X POST -H 'Content-Type: application/json' \
      -H 'X-Gitea-Event: issues' \
      -d '{"action":"opened","issue":{"number":42,"title":"x"},
           "repository":{"name":"r","owner":{"login":"o"}}}' \
-     http://127.0.0.1:7265/webhook/forgejo/replay | jq
+     http://127.0.0.1:${BBOX_PORT:-7264}/webhook/forgejo/replay | jq
 ```
 
 ## Customization
@@ -318,12 +319,11 @@ top-level workflow:
 |---|---|
 | `workflows/implementer-arc-with-identity.json` | Same shape as `implementer-arc.json`, but starts with `RequestIdentity` → `require_identity` (scope=forgejo, bro=keystone-impl), branches `ready`/`pending` on `domain:workflow-gate/identity-status`, loops via `AwaitIdentity` on `bro.identity.provisioned`. All Forgejo HTTP calls use `secret_headers` from `vars.identity_result.identity.token_ref` — no `${env.FORGEJO_TOKEN}`. |
 | `workflows/reviewer-arc-with-identity.json` | Same shape, bro=keystone-review. Reviews post via the mapped reviewer token. |
-| `workflows/issue-to-merged-pr-with-identity.json` | Top-level wrapper that calls the two identity subworkflows and threads `forgejo_instance` through their imports. |
+| `workflows/issue-to-merged-pr-with-identity.json` | Top-level wrapper that calls the two identity subworkflows and threads `forgejo_instance` through their imports. It terminates after the reviewer subworkflow because that subworkflow posts the review and performs the merge itself. |
 
-`implementer-feedback-arc.json` is identity-agnostic: it issues a single
-`git push` (using the daemon's local git config) and makes no Forgejo
-API calls, so it has no token surface to swap. The identity wrapper
-keeps using the base feedback arc unchanged.
+The base `implementer-feedback-arc.json` remains identity-agnostic. The
+identity acceptance wrapper does not use the feedback loop; it proves the
+Forgejo principal split on the implementer PR and reviewer review path.
 
 Per-bro token storage lives in the reaction. `forgejo-ensure-bro-user`
 provisions one Forgejo user per (bro, provider, model) triple, writes
@@ -367,10 +367,10 @@ on the operator's PATH. The base `bootstrap.sh` / `install.sh` flow
 under this directory writes the operator token and webhook secret;
 the smoke adds the identity-side checks on top.
 
-I have not run this script end-to-end against a live Forgejo as part of
-authoring it — it is wired to fail loudly on every assertion gap, but
-the actual Forgejo-side acceptance must be confirmed in your operator
-environment.
+Verified against local Forgejo 15.0.2 on May 14, 2026 with a fresh
+`FORGEJO_INSTANCE`: the implementer identity was provisioned before
+`AwaitIdentity` registered, the correlated system-event catch-up resolved
+the wait, and the smoke completed with distinct PR/review principals.
 
 ## Tear-down
 

@@ -53,6 +53,7 @@ pub(crate) struct SystemEventCompactParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReactionInstallParams {
+    #[schemars(with = "serde_json::Map<String, serde_json::Value>")]
     pub spec: serde_json::Value,
     #[serde(default)]
     pub replace: bool,
@@ -71,6 +72,14 @@ pub(crate) struct ReactionReplayParams {
 
 fn default_dry_run() -> String {
     "dry_run".to_string()
+}
+
+fn block_on_tool_future<F>(future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    let handle = tokio::runtime::Handle::current();
+    tokio::task::block_in_place(|| handle.block_on(future))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
@@ -151,8 +160,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<SystemEventEmitParams>,
     ) -> CallToolResult {
         Self::run("system_event_emit", || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
+            block_on_tool_future(async {
                 let draft = draft_from_emit_params(p)?;
                 let outcome = self.state.system_events.emit(draft).await?;
                 Ok(serde_json::to_string_pretty(&outcome)?)
@@ -227,8 +235,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<ReactionInstallParams>,
     ) -> CallToolResult {
         Self::run("reaction_install", || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
+            block_on_tool_future(async {
                 let spec: system_events::types::ReactionSpec = serde_json::from_value(p.spec)?;
                 self.state
                     .system_events
@@ -245,8 +252,7 @@ impl BlackboxServer {
         Parameters(_p): Parameters<ReactionListParams>,
     ) -> CallToolResult {
         Self::run("reaction_list", || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
+            block_on_tool_future(async {
                 let result = self
                     .state
                     .system_events
@@ -266,8 +272,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<ReactionReplayParams>,
     ) -> CallToolResult {
         Self::run("reaction_replay", || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
+            block_on_tool_future(async {
                 if p.mode != "dry_run" {
                     anyhow::bail!("only mode='dry_run' is supported in this phase");
                 }
@@ -297,8 +302,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<ReactionExecuteParams>,
     ) -> CallToolResult {
         Self::run("reaction_execute", || {
-            let rt = tokio::runtime::Handle::current();
-            rt.block_on(async {
+            block_on_tool_future(async {
                 let event = self.state.system_events.open_event(&p.event_id)?;
                 let Some(event) = event else {
                     anyhow::bail!("event '{}' not found", p.event_id);
@@ -561,6 +565,21 @@ mod tests {
         let loaded: system_events::types::ReactionSpec =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.name, "persist-test");
+    }
+
+    #[test]
+    fn reaction_install_schema_uses_explicit_spec_object() {
+        let schema =
+            serde_json::to_value(rmcp::schemars::schema_for!(ReactionInstallParams)).unwrap();
+        let spec_schema = &schema["properties"]["spec"];
+        assert!(
+            spec_schema.is_object(),
+            "spec schema must be an explicit schema object: {spec_schema}"
+        );
+        assert!(
+            !spec_schema.is_boolean(),
+            "MCP clients reject boolean subschemas for tool input properties"
+        );
     }
 
     #[tokio::test]
@@ -1046,7 +1065,9 @@ mod tests {
                 "model": "haiku-4.5",
                 "username": "bro-keystone-review-claude-haiku45",
                 "display_name": "keystone-review / claude haiku-4.5",
-                "email": "bro-keystone-review@blackbox.local"
+                "email": "bro-keystone-review@blackbox.local",
+                "owner": "keystone-admin",
+                "repo": "buggy"
             }
         }))
         .unwrap();

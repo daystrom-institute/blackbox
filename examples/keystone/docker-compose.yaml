@@ -1,4 +1,4 @@
-# Forgejo single-instance for keystone-arc demo.
+# Forgejo 15 single-instance for keystone-arc demo.
 #
 # Closed-network assumption: lenient HMAC, plain HTTP, runs on
 # 127.0.0.1 only. NOT production-shaped.
@@ -9,8 +9,8 @@
 
 services:
   forgejo:
-    image: codeberg.org/forgejo/forgejo:9
-    container_name: keystone-forgejo
+    image: codeberg.org/forgejo/forgejo:15
+    container_name: keystone-forgejo15
     environment:
       - USER_UID=1000
       - USER_GID=1000

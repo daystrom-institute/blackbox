@@ -28,6 +28,10 @@ struct ForgejoArgs {
     email: String,
     token_secret_name: String,
     admin_token_ref: String,
+    admin_username: Option<String>,
+    admin_password_ref: Option<String>,
+    owner: Option<String>,
+    repo: Option<String>,
     base_url: Option<String>,
     base_url_env: Option<String>,
 }
@@ -50,6 +54,22 @@ fn parse_args(args: &Value) -> Result<ForgejoArgs> {
         email: req_str(args, "email")?,
         token_secret_name: req_str(args, "token_secret_name")?,
         admin_token_ref: req_str(args, "admin_token_ref")?,
+        admin_username: args
+            .get("admin_username")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        admin_password_ref: args
+            .get("admin_password_ref")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        owner: args
+            .get("owner")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        repo: args
+            .get("repo")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
         base_url: args
             .get("base_url")
             .and_then(|v| v.as_str())
@@ -79,14 +99,22 @@ fn resolve_base_url(args: &ForgejoArgs) -> Result<String> {
     bail!("forgejo-ensure-user: base_url or base_url_env required")
 }
 
-fn resolve_admin_token(admin_token_ref: &str, sources: &SecretSources) -> Result<String> {
-    let name = admin_token_ref.strip_prefix("secret:").ok_or_else(|| {
-        anyhow::anyhow!("admin_token_ref must use 'secret:' prefix, got '{admin_token_ref}'")
+fn resolve_secret_ref(
+    secret_ref: &str,
+    field_name: &str,
+    sources: &SecretSources,
+) -> Result<String> {
+    let name = secret_ref.strip_prefix("secret:").ok_or_else(|| {
+        anyhow::anyhow!("{field_name} must use 'secret:' prefix, got '{secret_ref}'")
     })?;
     Ok(resolve_with_sources(name, sources.clone())
-        .with_context(|| format!("resolving admin token '{name}'"))?
+        .with_context(|| format!("resolving {field_name} '{name}'"))?
         .expose()
         .to_string())
+}
+
+fn resolve_admin_token(admin_token_ref: &str, sources: &SecretSources) -> Result<String> {
+    resolve_secret_ref(admin_token_ref, "admin_token_ref", sources)
 }
 
 fn build_client() -> Result<reqwest::Client> {
@@ -96,12 +124,25 @@ fn build_client() -> Result<reqwest::Client> {
         .context("building HTTP client")
 }
 
-async fn http_get_json(url: &str, auth_token: &str) -> Result<(u16, Value)> {
+#[derive(Clone, Copy)]
+enum ForgejoAuth<'a> {
+    Token(&'a str),
+    Basic {
+        username: &'a str,
+        password: &'a str,
+    },
+}
+
+fn apply_auth(req: reqwest::RequestBuilder, auth: ForgejoAuth<'_>) -> reqwest::RequestBuilder {
+    match auth {
+        ForgejoAuth::Token(token) => req.header("Authorization", format!("token {token}")),
+        ForgejoAuth::Basic { username, password } => req.basic_auth(username, Some(password)),
+    }
+}
+
+async fn http_get_json(url: &str, auth: ForgejoAuth<'_>) -> Result<(u16, Value)> {
     let client = build_client()?;
-    let resp = client
-        .get(url)
-        .header("Authorization", format!("token {auth_token}"))
-        .header("Accept", "application/json")
+    let resp = apply_auth(client.get(url).header("Accept", "application/json"), auth)
         .send()
         .await
         .with_context(|| format!("GET {url}"))?;
@@ -118,16 +159,18 @@ async fn http_get_json(url: &str, auth_token: &str) -> Result<(u16, Value)> {
     Ok((status, value))
 }
 
-async fn http_post_json(url: &str, auth_token: &str, body: &Value) -> Result<(u16, Value)> {
+async fn http_post_json(url: &str, auth: ForgejoAuth<'_>, body: &Value) -> Result<(u16, Value)> {
     let client = build_client()?;
-    let resp = client
-        .post(url)
-        .header("Authorization", format!("token {auth_token}"))
-        .header("Content-Type", "application/json")
-        .json(body)
-        .send()
-        .await
-        .with_context(|| format!("POST {url}"))?;
+    let resp = apply_auth(
+        client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .json(body),
+        auth,
+    )
+    .send()
+    .await
+    .with_context(|| format!("POST {url}"))?;
     let status = resp.status().as_u16();
     let body_text = resp
         .text()
@@ -141,21 +184,71 @@ async fn http_post_json(url: &str, auth_token: &str, body: &Value) -> Result<(u1
     Ok((status, value))
 }
 
-async fn http_delete(url: &str, auth_token: &str) -> Result<u16> {
+async fn http_put_json(url: &str, auth: ForgejoAuth<'_>, body: &Value) -> Result<(u16, Value)> {
     let client = build_client()?;
-    let resp = client
-        .delete(url)
-        .header("Authorization", format!("token {auth_token}"))
+    let resp = apply_auth(
+        client
+            .put(url)
+            .header("Content-Type", "application/json")
+            .json(body),
+        auth,
+    )
+    .send()
+    .await
+    .with_context(|| format!("PUT {url}"))?;
+    let status = resp.status().as_u16();
+    let body_text = resp
+        .text()
+        .await
+        .with_context(|| format!("reading body PUT {url}"))?;
+    let value = if body_text.trim().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_str(&body_text).unwrap_or(Value::String(body_text))
+    };
+    Ok((status, value))
+}
+
+async fn http_delete(url: &str, auth: ForgejoAuth<'_>) -> Result<u16> {
+    let client = build_client()?;
+    let resp = apply_auth(client.delete(url), auth)
         .send()
         .await
         .with_context(|| format!("DELETE {url}"))?;
     Ok(resp.status().as_u16())
 }
 
+async fn grant_repo_write(base_url: &str, admin_token: &str, args: &ForgejoArgs) -> Result<()> {
+    let (Some(owner), Some(repo)) = (args.owner.as_deref(), args.repo.as_deref()) else {
+        return Ok(());
+    };
+    let body = json!({"permission": "write"});
+    let (status, _body) = http_put_json(
+        &format!(
+            "{base_url}/api/v1/repos/{owner}/{repo}/collaborators/{}",
+            args.username
+        ),
+        ForgejoAuth::Token(admin_token),
+        &body,
+    )
+    .await?;
+    match status {
+        200 | 201 | 204 => Ok(()),
+        s if (500..600).contains(&s) => {
+            bail!("Forgejo server error granting repo collaborator: HTTP {s}")
+        }
+        s => bail!("grant repo collaborator HTTP {s}"),
+    }
+}
+
 /// Returns true when the token can authenticate against Forgejo.
 async fn verify_token(base_url: &str, token: &str) -> bool {
     matches!(
-        http_get_json(&format!("{base_url}/api/v1/user"), token).await,
+        http_get_json(
+            &format!("{base_url}/api/v1/user"),
+            ForgejoAuth::Token(token)
+        )
+        .await,
         Ok((200, _))
     )
 }
@@ -168,7 +261,7 @@ async fn find_or_create_user(
 ) -> Result<String> {
     let (status, body) = http_get_json(
         &format!("{base_url}/api/v1/users/{}", args.username),
-        admin_token,
+        ForgejoAuth::Token(admin_token),
     )
     .await?;
 
@@ -193,7 +286,7 @@ async fn find_or_create_user(
             });
             let (cs, cb) = http_post_json(
                 &format!("{base_url}/api/v1/admin/users"),
-                admin_token,
+                ForgejoAuth::Token(admin_token),
                 &create_body,
             )
             .await?;
@@ -206,7 +299,7 @@ async fn find_or_create_user(
                 // Race: another caller created the user between our GET and POST.
                 let (fs, fb) = http_get_json(
                     &format!("{base_url}/api/v1/users/{}", args.username),
-                    admin_token,
+                    ForgejoAuth::Token(admin_token),
                 )
                 .await?;
                 if fs == 200 {
@@ -229,12 +322,13 @@ async fn find_or_create_user(
 }
 
 /// Returns the Forgejo token id for the existing TOKEN_NAME token, if any.
-async fn find_token_id(base_url: &str, admin_token: &str, username: &str) -> Result<Option<u64>> {
-    let (status, body) = http_get_json(
-        &format!("{base_url}/api/v1/users/{username}/tokens"),
-        admin_token,
-    )
-    .await?;
+async fn find_token_id(
+    base_url: &str,
+    auth: ForgejoAuth<'_>,
+    username: &str,
+) -> Result<Option<u64>> {
+    let (status, body) =
+        http_get_json(&format!("{base_url}/api/v1/users/{username}/tokens"), auth).await?;
 
     if (500..600).contains(&status) {
         bail!("Forgejo server error listing tokens: HTTP {status}");
@@ -256,11 +350,11 @@ async fn find_token_id(base_url: &str, admin_token: &str, username: &str) -> Res
 
 /// Delete the existing TOKEN_NAME token if present, then create a fresh one.
 /// Returns the SHA1 token value (available only at creation time).
-async fn create_token(base_url: &str, admin_token: &str, username: &str) -> Result<String> {
-    if let Some(id) = find_token_id(base_url, admin_token, username).await? {
+async fn create_token(base_url: &str, auth: ForgejoAuth<'_>, username: &str) -> Result<String> {
+    if let Some(id) = find_token_id(base_url, auth, username).await? {
         let del_status = http_delete(
             &format!("{base_url}/api/v1/users/{username}/tokens/{id}"),
-            admin_token,
+            auth,
         )
         .await?;
         if (500..600).contains(&del_status) {
@@ -268,10 +362,10 @@ async fn create_token(base_url: &str, admin_token: &str, username: &str) -> Resu
         }
     }
 
-    let body = json!({"name": TOKEN_NAME});
+    let body = json!({"name": TOKEN_NAME, "scopes": ["all"]});
     let (cs, cb) = http_post_json(
         &format!("{base_url}/api/v1/users/{username}/tokens"),
-        admin_token,
+        auth,
         &body,
     )
     .await?;
@@ -373,6 +467,12 @@ async fn do_ensure_user(
 
     let admin_token = resolve_admin_token(&args.admin_token_ref, secret_sources)
         .map_err(|e| anyhow::anyhow!("permanent:{e}"))?;
+    let admin_password = args
+        .admin_password_ref
+        .as_deref()
+        .map(|r| resolve_secret_ref(r, "admin_password_ref", secret_sources))
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("permanent:{e}"))?;
 
     // If we already have a valid secret, verify it against Forgejo.
     // On success, re-upsert (refresh last_verified_at) and return early.
@@ -381,7 +481,7 @@ async fn do_ensure_user(
         if verify_token(&base_url, tok.expose()).await {
             let (status, body) = http_get_json(
                 &format!("{base_url}/api/v1/users/{}", args.username),
-                &admin_token,
+                ForgejoAuth::Token(&admin_token),
             )
             .await?;
             if status == 200 {
@@ -389,6 +489,7 @@ async fn do_ensure_user(
                     .as_i64()
                     .ok_or_else(|| anyhow::anyhow!("GET user: missing 'id'"))?
                     .to_string();
+                grant_repo_write(&base_url, &admin_token, &args).await?;
                 let token_ref = format!("secret:{}", args.token_secret_name);
                 upsert_and_emit_provisioned(&args, &user_id, &token_ref, event, state).await?;
                 return Ok(json!({
@@ -402,7 +503,17 @@ async fn do_ensure_user(
     }
 
     let user_id = find_or_create_user(&base_url, &admin_token, &args).await?;
-    let token_value = create_token(&base_url, &admin_token, &args.username).await?;
+    grant_repo_write(&base_url, &admin_token, &args).await?;
+    let token_auth = match (args.admin_username.as_deref(), admin_password.as_deref()) {
+        (Some(username), Some(password)) => ForgejoAuth::Basic { username, password },
+        (None, None) => ForgejoAuth::Token(&admin_token),
+        _ => {
+            return Err(anyhow::anyhow!(
+                "permanent:admin_username and admin_password_ref must be provided together for Forgejo token creation"
+            ));
+        }
+    };
+    let token_value = create_token(&base_url, token_auth, &args.username).await?;
 
     write_file_secret(&args.token_secret_name, &token_value, secret_sources)
         .with_context(|| format!("storing token secret '{}'", args.token_secret_name))

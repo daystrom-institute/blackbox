@@ -40,7 +40,9 @@
             "provider": "claude",
             "model":    "claude-sonnet-4-6",
             "effort":   "medium",
-            "project":  "${meta.project_dir}"
+            "project":  "${meta.project_dir}",
+            "owner":    "${vars.owner}",
+            "repo":     "${vars.repo}"
           },
           "into_var": "identity_result",
           "on_failure": "halt"
@@ -61,7 +63,16 @@
       "prompt": "Waiting for bro.identity.provisioned signal (reaction is provisioning the Forgejo account for keystone-impl).",
       "wait": {
         "any_of": [
-          { "signal": "bro.identity.provisioned" }
+          {
+            "signal": "bro.identity.provisioned",
+            "correlate": {
+              "scope":    { "kind": "const", "value": "forgejo" },
+              "instance": { "kind": "json_path", "path": "vars.forgejo_instance" },
+              "bro":      { "kind": "const", "value": "keystone-impl" },
+              "provider": { "kind": "const", "value": "claude" },
+              "model":    { "kind": "const", "value": "claude-sonnet-4-6" }
+            }
+          }
         ]
       },
       "next": { "type": "goto", "to": "RequestIdentity" }
@@ -93,13 +104,27 @@
     },
     "PushAndOpenPr": {
       "actor": "",
-      "prompt": "Push branch + open-or-reuse PR (mechanical, no LLM dispatch). The git push uses the daemon's local git config (typically a deploy key or SSH agent), not the per-bro Forgejo token — the token is for HTTP API calls only. PR create/list goes through the mapped per-bro identity so the PR author shows as bro-keystone-impl-claude-*, distinct from the reviewer principal.",
+      "prompt": "Push branch + open-or-reuse PR (mechanical, no LLM dispatch). Git push and PR create/list both use the mapped per-bro Forgejo identity so the PR author shows as bro-keystone-impl-claude-*, distinct from the reviewer principal.",
       "on_enter": [
         {
           "op": "shell",
           "args": {
-            "argv": ["git", "push", "-u", "origin", "${vars.branch}"],
-            "cwd": "${vars.worktree_path}"
+            "argv": [
+              "bash",
+              "-lc",
+              "set -euo pipefail\norig=$(git remote get-url origin)\nrestore() { git remote set-url origin \"$orig\" >/dev/null 2>&1 || true; }\ntrap restore EXIT\ncase \"$FORGEJO_BASE_URL\" in\n  http://*) remote=\"http://${FORGEJO_PUSH_USER}:${FORGEJO_PUSH_TOKEN}@${FORGEJO_BASE_URL#http://}/${FORGEJO_OWNER}/${FORGEJO_REPO}.git\" ;;\n  https://*) remote=\"https://${FORGEJO_PUSH_USER}:${FORGEJO_PUSH_TOKEN}@${FORGEJO_BASE_URL#https://}/${FORGEJO_OWNER}/${FORGEJO_REPO}.git\" ;;\n  *) echo \"unsupported FORGEJO_BASE_URL scheme\" >&2; exit 2 ;;\nesac\ngit remote set-url origin \"$remote\"\ngit push -u origin \"$FORGEJO_BRANCH\""
+            ],
+            "cwd": "${vars.worktree_path}",
+            "env": {
+              "FORGEJO_BASE_URL": "${env.FORGEJO_BASE_URL}",
+              "FORGEJO_OWNER": "${vars.owner}",
+              "FORGEJO_REPO": "${vars.repo}",
+              "FORGEJO_BRANCH": "${vars.branch}",
+              "FORGEJO_PUSH_USER": "${vars.identity_result.identity.username}"
+            },
+            "secret_env": {
+              "FORGEJO_PUSH_TOKEN": "${vars.identity_result.identity.token_ref}"
+            }
           },
           "on_failure": "halt"
         },

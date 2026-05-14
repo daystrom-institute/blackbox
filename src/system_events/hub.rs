@@ -154,6 +154,12 @@ impl EventHub {
         if let Some(ref effort) = req.effort {
             payload["effort"] = serde_json::Value::String(effort.clone());
         }
+        if let Some(ref owner) = req.owner {
+            payload["owner"] = serde_json::Value::String(owner.clone());
+        }
+        if let Some(ref repo) = req.repo {
+            payload["repo"] = serde_json::Value::String(repo.clone());
+        }
         let draft = SystemEventDraft {
             kind: SystemEventKind::BroIdentityRequired,
             producer: "system_events.identity".to_string(),
@@ -169,7 +175,7 @@ impl EventHub {
                 kind: "bro".to_string(),
                 id: subject,
             }),
-            correlation: Default::default(),
+            correlation: req.correlation(),
             causation_id: None,
             payload,
         };
@@ -936,6 +942,8 @@ mod tests {
             model: "haiku-4.5".to_string(),
             effort: Some("medium".to_string()),
             project: None,
+            owner: None,
+            repo: None,
         }
     }
 
@@ -1062,6 +1070,8 @@ mod tests {
             model: "haiku-4.5".to_string(),
             effort: Some("medium".to_string()),
             project: None,
+            owner: None,
+            repo: None,
         };
         assert_eq!(req.username(), "bro-keystone-review-claude-haiku45");
         assert_eq!(

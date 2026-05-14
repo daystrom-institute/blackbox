@@ -559,7 +559,10 @@ async fn main() -> anyhow::Result<()> {
                 store_dir.join("atom-invocations.json"),
             ),
         )),
-        vector_store: vectors::global(),
+        vector_store: Arc::new(
+            vectors::VectorStore::open_unloaded(vectors::default_vectors_dir())
+                .expect("default vector store placeholder should open"),
+        ),
         system_events: Arc::new(system_events::EventHub::new(
             system_events::EventStore::new(&store_dir),
             system_events::OutboxStore::new(store_dir.join("events").join("outbox"))
@@ -576,11 +579,18 @@ async fn main() -> anyhow::Result<()> {
         }));
     restore_badgey_registry_from_notes(&shared);
     recover_badgey_non_terminal_state(&shared);
+    embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
+    embed_queue::install_contradiction_state(shared.clone());
+    embed_queue::install(embed::queue::EmbedQueueHandle::start_default_without_store());
+
     std::thread::Builder::new()
         .name("blackbox-vectors-warmup".into())
         .spawn(|| {
             let started = std::time::Instant::now();
             let store = vectors::global();
+            embed_queue::install(embed::queue::EmbedQueueHandle::start_default_with_store(
+                store.clone(),
+            ));
             tracing::info!(
                 partitions = store.partition_count(),
                 elapsed_ms = started.elapsed().as_millis(),
@@ -588,9 +598,6 @@ async fn main() -> anyhow::Result<()> {
             );
         })
         .map_err(|e| anyhow::anyhow!("spawning vector store warmup thread: {e}"))?;
-    embed_queue::install_contradiction_threshold(tier0_cosine_threshold_from_env());
-    embed_queue::install_contradiction_state(shared.clone());
-    embed_queue::install(embed::queue::EmbedQueueHandle::start_default());
 
     // Watch the tantivy corpus and rebuild the EdgeIndex whenever new docs
     // land via the auto-reindex thread (60s poll interval is sufficient
@@ -643,6 +650,56 @@ async fn main() -> anyhow::Result<()> {
                     Ok(_) => {}
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!("task-completed router: lagged {n} events");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+    }
+
+    // System events are also workflow signals: a Wait on
+    // `bro.identity.provisioned` should resume when the durable event is
+    // emitted by a reaction. Only dispatch when a matching wait already exists
+    // so ordinary event traffic does not fill the signal log with idle entries.
+    {
+        let shared_for_system_event_signals = shared.clone();
+        let mut system_event_rx = shared.system_events.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match system_event_rx.recv().await {
+                    Ok(event) => {
+                        let signal = event.kind.to_wire().to_string();
+                        let has_wait = shared_for_system_event_signals
+                            .wait_store
+                            .snapshot()
+                            .into_iter()
+                            .any(|w| w.signal == signal);
+                        if !has_wait {
+                            continue;
+                        }
+                        let correlation = event.correlation.clone();
+                        let payload = serde_json::to_value(&event).unwrap_or_else(|e| {
+                            json!({
+                                "event_id": event.id,
+                                "kind": signal,
+                                "serialization_error": e.to_string(),
+                            })
+                        });
+                        let resolved = crate::server::routes::signal_arc_dispatch(
+                            &shared_for_system_event_signals,
+                            &signal,
+                            correlation,
+                            payload,
+                        )
+                        .await;
+                        tracing::debug!(
+                            signal,
+                            result = %resolved,
+                            "system event signal bridge dispatched"
+                        );
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::debug!("system event signal bridge lagged {n} events");
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }

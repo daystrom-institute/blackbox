@@ -291,6 +291,21 @@ impl VectorStore {
         Ok(store)
     }
 
+    /// Open the store root without loading existing partitions.
+    ///
+    /// This is for process state that only needs a placeholder handle while the
+    /// real global vector store warms asynchronously. Search/status callers use
+    /// `try_global` to degrade until that warmup completes.
+    pub fn open_unloaded(root: impl Into<PathBuf>) -> Result<Self> {
+        let root = root.into();
+        fs::create_dir_all(&root)
+            .with_context(|| format!("creating vector store {}", root.display()))?;
+        Ok(Self {
+            root,
+            partitions: RwLock::new(BTreeMap::new()),
+        })
+    }
+
     pub fn upsert(
         &self,
         route: &str,

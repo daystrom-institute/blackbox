@@ -39,7 +39,9 @@
             "provider": "claude",
             "model":    "claude-haiku-4-5-20251001",
             "effort":   "medium",
-            "project":  "${meta.project_dir}"
+            "project":  "${meta.project_dir}",
+            "owner":    "${vars.owner}",
+            "repo":     "${vars.repo}"
           },
           "into_var": "identity_result",
           "on_failure": "halt"
@@ -60,7 +62,16 @@
       "prompt": "Waiting for bro.identity.provisioned signal (reaction is provisioning the Forgejo account for keystone-review).",
       "wait": {
         "any_of": [
-          { "signal": "bro.identity.provisioned" }
+          {
+            "signal": "bro.identity.provisioned",
+            "correlate": {
+              "scope":    { "kind": "const", "value": "forgejo" },
+              "instance": { "kind": "json_path", "path": "vars.forgejo_instance" },
+              "bro":      { "kind": "const", "value": "keystone-review" },
+              "provider": { "kind": "const", "value": "claude" },
+              "model":    { "kind": "const", "value": "claude-haiku-4-5-20251001" }
+            }
+          }
         ]
       },
       "next": { "type": "goto", "to": "RequestIdentity" }

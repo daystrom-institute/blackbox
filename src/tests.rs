@@ -6967,6 +6967,68 @@ async fn system_events_workflow_wait_registered_and_signal_received() {
 }
 
 #[tokio::test]
+async fn workflow_wait_catches_recent_correlated_system_event() {
+    use crate::system_events::SystemEventDraft;
+    use crate::system_events::types::SystemEventKind;
+    use crate::workflow::{compile, engine, load_workflow};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let mut correlation = serde_json::Map::new();
+    correlation.insert("identity".to_string(), serde_json::json!("impl"));
+    server
+        .state
+        .system_events
+        .emit(SystemEventDraft {
+            kind: SystemEventKind::Unknown("bro.identity.provisioned".to_string()),
+            producer: "test".to_string(),
+            project: None,
+            principal: None,
+            subject: None,
+            correlation: correlation.clone(),
+            causation_id: None,
+            payload: serde_json::json!({"ok": true}),
+        })
+        .await
+        .unwrap();
+
+    let json = r#"{
+        "name": "se-wait-catch-up",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "Park": {
+                "actor": "",
+                "wait": {
+                    "any_of": [{
+                        "signal": "bro.identity.provisioned",
+                        "correlate": {
+                            "identity": {"kind": "const", "value": "impl"}
+                        }
+                    }]
+                },
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Park"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        engine::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            None,
+            Some(5),
+            serde_json::Map::new(),
+        ),
+    )
+    .await
+    .expect("arc did not catch up to system event");
+    assert_eq!(result.status, "completed");
+}
+
+#[tokio::test]
 async fn system_events_whiteboard_transition_emits_phase_changed() {
     // Exercises the real whiteboard_transition tool path end-to-end.
     // Registers a pending wait matching the board-transitioned signal so both

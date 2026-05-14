@@ -1025,6 +1025,14 @@ async fn exec_require_identity(
         .get("project")
         .and_then(|v| v.as_str())
         .map(str::to_string);
+    let owner = args
+        .get("owner")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let repo = args
+        .get("repo")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
 
     let req = crate::system_events::identity::IdentityRequest {
         scope: scope.to_string(),
@@ -1034,6 +1042,8 @@ async fn exec_require_identity(
         model: model.to_string(),
         effort,
         project,
+        owner,
+        repo,
     };
 
     let into = into_var.unwrap_or("identity_result");
@@ -1233,6 +1243,24 @@ async fn exec_shell(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> R
         .stderr(Stdio::piped());
     if let Some(d) = &cwd {
         cmd.current_dir(d);
+    }
+    if let Some(env) = args.get("env").and_then(|v| v.as_object()) {
+        for (key, value) in env {
+            let value = value
+                .as_str()
+                .ok_or_else(|| anyhow!("Shell env.{key} must be a string"))?;
+            cmd.env(key, value);
+        }
+    }
+    if let Some(secret_env) = args.get("secret_env").and_then(|v| v.as_object()) {
+        for (key, raw_value) in secret_env {
+            let raw_value = raw_value
+                .as_str()
+                .ok_or_else(|| anyhow!("Shell secret_env.{key} must be a string"))?;
+            let resolved = resolve_secret_header_value(raw_value)
+                .map_err(|e| anyhow!("Shell secret_env.{key}: {e}"))?;
+            cmd.env(key, resolved);
+        }
     }
     let output = cmd
         .output()

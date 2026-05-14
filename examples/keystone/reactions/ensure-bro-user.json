@@ -20,6 +20,10 @@
         "email": "${event.payload.email}",
         "token_secret_name": "forgejo-bro-${event.payload.username}",
         "admin_token_ref": "secret:forgejo-admin-token",
+        "admin_username": "keystone-admin",
+        "admin_password_ref": "secret:forgejo-admin-password",
+        "owner": "${event.payload.owner}",
+        "repo": "${event.payload.repo}",
         "base_url_env": "FORGEJO_BASE_URL"
       }
     }
