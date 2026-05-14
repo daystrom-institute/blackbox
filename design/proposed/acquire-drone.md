@@ -251,7 +251,7 @@ separate store.
         "model": "zai-coding-plan/glm-5.1",
         "effort": null,
         "accounts": ["default"],
-        "probe": "glm-active-probe"
+        "probe": "zai-usage-endpoint"
       },
       "deepseek": {
         "model": "deepseek/deepseek-v4-flash",
@@ -325,10 +325,38 @@ observations with runtime observations from spawned drone tasks.
 | `rate-limit-headers` | Claude | Minimal Anthropic `https://api.anthropic.com/v1/messages` call with Haiku probe model, `anthropic-version: 2023-06-01`, and `anthropic-beta: oauth-2025-04-20`; parse `anthropic-ratelimit-unified-5h-utilization`, `anthropic-ratelimit-unified-7d-utilization`, `anthropic-ratelimit-unified-status`, reset, overage status, and overage utilization headers. | `five_hour_utilization`, `seven_day_utilization`, `status`, `resets_at`, `overage_*` |
 | `usage-endpoint` | Codex | Read `auth.json` tokens and call `https://chatgpt.com/backend-api/wham/usage` with bearer token and optional `ChatGPT-Account-Id`; parse `rate_limit.primary_window.used_percent`, `primary_window.reset_at`, `secondary_window.used_percent`, `allowed`, `limit_reached`, and `plan_type`. | `five_hour_utilization`, `seven_day_utilization`, `status`, `resets_at`, `plan` |
 | `credential-freshness` | Gemini | Read `oauth_creds.json` from the Gemini home directory selected by account env, confirm `access_token`, and compare `expiry_date` milliseconds to now. Daystrom notes no public quota API. Drone-acquired Gemini sessions must store cwd in the drone registry (Section 8), because cwd/session lookup is provider-specific and should not be rediscovered on resume. | `credential_status`, `expires_at`; quota utilization is unknown |
-| `glm-active-probe` | GLM/Z.AI via OpenCode · Inception (both use same OpenCode binary) | Prefer a direct minimal provider API request when an account token can be extracted from the OpenCode auth/config store. If not, run a minimal OpenCode invocation against the configured model with the selected account env. A success proves the account is currently accepted for work but does not reveal a utilization percentage. Parse provider error codes into `quota_status`, `resets_at`, and cooldown fields (see error-code → state mapping table below). | `credential_status`, `quota_status`, `resets_at`, `provider_cooldown_until`; quota utilization is unknown on success |
-| `deepseek-balance` | DeepSeek via OpenCode | Prefer `https://api.deepseek.com/user/balance` with the account bearer token extracted from the selected OpenCode auth/config store. `is_available=false` marks the account unavailable; `is_available=true` with positive `balance_infos[0].total_balance` proves pay-as-you-go availability but does not map to 5h/7d utilization. If no direct token is extractable, fall back to a minimal OpenCode invocation and treat success as `active_acceptance`, not `payg_balance`. | `credential_status`, `quota_status`, `balance_available`, `balance_total`, `balance_currency`; quota utilization is unknown |
+| `zai-usage-endpoint` | GLM/Z.AI Coding Plan via OpenCode | Read the `zai-coding-plan` key from the selected OpenCode auth store and call `https://api.z.ai/api/monitor/usage/quota/limit` with `Authorization: <key>`, `Accept-Language: en-US,en`, and `Content-Type: application/json`. Parse `data.limits[]`: `type=TOKENS_LIMIT, number=5, unit=3` is the five-hour window; `type=TOKENS_LIMIT, number=1, unit=6` is the weekly/seven-day window. Use `percentage` as utilization and `nextResetTime` milliseconds as reset. If the quota endpoint fails, fall back to `glm-active-probe` behavior for launchability and error-code classification. | `five_hour_utilization`, `seven_day_utilization`, `resets_at`, `plan_level`, `provider_cooldown_until` |
+| `glm-active-probe` | GLM/Z.AI via OpenCode · Inception (both use same OpenCode binary) | Fallback probe for GLM/Z.AI when the usage endpoint cannot be called, and primary probe for Inception. Run a minimal provider API or OpenCode invocation against the configured model with the selected account env. A success proves the account is currently accepted for work but does not reveal a utilization percentage. Parse provider error codes into `quota_status`, `resets_at`, and cooldown fields (see error-code → state mapping table below). | `credential_status`, `quota_status`, `resets_at`, `provider_cooldown_until`; quota utilization is unknown on success |
+| `deepseek-balance` | DeepSeek via OpenCode | Call `https://api.deepseek.com/user/balance` with the `deepseek` key from the selected OpenCode auth store as `Authorization: Bearer <key>`. `is_available=false` marks the account unavailable; `is_available=true` with positive `balance_infos[0].total_balance` proves pay-as-you-go availability but does not map to 5h/7d utilization. If no direct token is extractable, fall back to a minimal OpenCode invocation and treat success as `active_acceptance`, not `payg_balance`. | `credential_status`, `quota_status`, `balance_available`, `balance_total`, `balance_currency`; quota utilization is unknown |
 | `file-presence` | OpenCode fallback only | Check provider account auth file presence when no active provider probe is configured or extractable. This is a launchability preflight, not a quota signal. | `credential_status`; quota utilization is unknown |
 | `none` | Vibe or unsupported providers | No active probe. Select only by task in-flight count and failure cooldown. | `status=unknown`; quota utilization is unknown |
+
+OpenCode auth stores API credentials in `~/.local/share/opencode/auth.json` for
+the default account. The default keys observed for these providers are
+`zai-coding-plan` and `deepseek`, each with `{ "type": "api", "key": "..." }`.
+Additional OpenCode-backed accounts need an explicit account-home/auth-store
+mapping before probes can select the corresponding key.
+
+Z.AI source anchors:
+
+- The official Z.AI `glm-plan-usage` plugin documents the user-facing
+  `/glm-plan-usage:usage-query` command for quota and usage statistics.
+- `zai-org/zai-coding-plugins` script
+  `plugins/glm-plan-usage/skills/usage-query-skill/scripts/query-usage.mjs`
+  calls `https://api.z.ai/api/monitor/usage/model-usage`,
+  `https://api.z.ai/api/monitor/usage/tool-usage`, and
+  `https://api.z.ai/api/monitor/usage/quota/limit`. For allocator probes,
+  `quota/limit` is the normalized quota source.
+- The script currently post-processes every `TOKENS_LIMIT` row as
+  `Token usage(5 Hour)`. Do not copy that label literally; discriminate by
+  `number` and `unit` so the weekly/seven-day row is not mislabeled.
+
+DeepSeek source anchors:
+
+- The official DeepSeek API reference documents `GET /user/balance` under
+  `https://api.deepseek.com`, returning `is_available` and `balance_infos[]`
+  with `currency`, `total_balance`, `granted_balance`, and
+  `topped_up_balance`.
 
 Daystrom source anchors:
 
@@ -445,9 +473,12 @@ Provider limits are not the same shape:
 - Claude exposes utilization percentages for unified five-hour and seven-day
   windows.
 - Codex exposes primary and secondary window usage percentages.
+- GLM/Z.AI Coding Plan exposes five-hour and seven-day utilization via
+  `https://api.z.ai/api/monitor/usage/quota/limit`.
 - DeepSeek exposes pay-as-you-go balance availability, not a rolling window.
-- GLM/Z.AI and Inception expose hard failures and reset times through active
-  calls, but no successful-call percentage.
+- Inception, and GLM/Z.AI when the usage endpoint is unavailable, expose hard
+  failures and reset times through active calls, but no successful-call
+  percentage.
 - Gemini and Vibe may only expose launchability.
 
 Each mechanism maps to quota_capacity via a fixed, mechanical derivation table
@@ -457,10 +488,11 @@ Each mechanism maps to quota_capacity via a fixed, mechanical derivation table
 |---|---|---|
 | `rate-limit-headers` · `usage-endpoint` (probe success) | `quota_probe` | `1.0 - max(5h, 7d)` |
 | `rate-limit-headers` · `usage-endpoint` (probe failed, runtime data exists) | `runtime_rate_limit` | `1.0 - max(5h, 7d, runtime_observed)` |
+| `zai-usage-endpoint` (probe success) | `quota_probe` | `1.0 - max(5h, 7d)` |
 | `deepseek-balance` (`is_available=true`, balance known) | `payg_balance` | `min(1.0, balance / ceiling) * payg_available_multiplier` |
 | `deepseek-balance` (direct token unavailable, minimal OpenCode call succeeds) | `active_acceptance` | `active_probe_success` bucket |
 | `glm-active-probe` (success) | `active_acceptance` | `active_probe_success` bucket |
-| `glm-active-probe` · `deepseek-balance` (probe failed) | — | lane excluded by cooldown, not scored |
+| `zai-usage-endpoint` · `glm-active-probe` · `deepseek-balance` (probe failed) | — | lane excluded by cooldown, not scored |
 | `credential-freshness` (present, not expired) | `credential_only` | `credential_only` bucket |
 | `file-presence` · `none` | `credential_only` · `none` | `credential_only` or `none` bucket |
 
@@ -480,9 +512,10 @@ Where:
   `preference_order` fallback. This is the steering knob for "favor GLM, then
   Claude, then Codex, then DeepSeek, then Gemini, then Vibe".
 - `quota_capacity` is `1.0 - max(five_hour_utilization, seven_day_utilization)`
-  when utilization is known. GLM/Z.AI active-probe success uses the configured
-  `active_probe_success` bucket. Credential-only and no-probe providers use the
-  lower `credential_only` or `none` buckets.
+  when utilization is known. GLM/Z.AI Coding Plan should use real utilization
+  from `zai-usage-endpoint`; only fallback active-probe success uses the
+  configured `active_probe_success` bucket. Credential-only and no-probe
+  providers use the lower `credential_only` or `none` buckets.
 
   DeepSeek PAYG: when `is_available=true` and `balance_available` is known,
   compute a balance-scaled capacity rather than using a flat bucket:
@@ -614,11 +647,18 @@ For `round_robin`, use the same eligibility filters but choose the next lane by
 pool cursor. Round-robin should still skip candidates with `capacity_score=0.0`
 unless every candidate in the caller's pinned pool is unknown/blind.
 
-### GLM/Z.AI hard-limit exhaustion mapping
+### GLM/Z.AI quota and hard-limit mapping
 
-GLM active probes only learn a quota limit when the call is rejected. The probe
-must parse provider error codes into exhaustion state for the selection
-eligibility filter at step 4:
+The preferred Z.AI Coding Plan probe calls `quota/limit` and stores the
+five-hour and seven-day `percentage` values directly. The `nextResetTime` value
+is milliseconds since Unix epoch. Store the five-hour reset separately from the
+weekly reset when both are present, and set the generic `resets_at` to the reset
+for the dominant utilization window used for scoring.
+
+GLM active probes are still needed when the usage endpoint cannot be called, and
+for provider errors emitted by real tasks. Active probes only learn a quota limit
+when the call is rejected. The probe must parse provider error codes into
+exhaustion state for the selection eligibility filter at step 4:
 
 | GLM/Z.AI signal | quota_status | resets_at |
 |---|---|---|
@@ -635,7 +675,8 @@ Hard exclusions (step 4) apply to `exhausted` with `resets_at` in the future or
 `resets_at=null` (permanent exhaustion). Temporarily-blocked accounts are not
 hard-excluded; they go through cooldown scoring. Active-probe success with
 `quota_status=unknown` follows the `active_probe_success` synthetic capacity
-bucket — it proves the account works now but says nothing about remaining quota.
+bucket only when there is no fresh `zai-usage-endpoint` record. It proves the
+account works now but says nothing about remaining quota.
 
 ## 8. Session/account continuity
 
@@ -731,6 +772,7 @@ pub fn acquire_drone(
 fn probe_claude_rate_limit(account: &str) -> Result<ProbeRecord>;
 fn probe_codex_usage(account: &str) -> Result<ProbeRecord>;
 fn probe_gemini_credential(account: &str) -> Result<ProbeRecord>;
+fn probe_zai_usage(account: &str) -> Result<ProbeRecord>;
 fn probe_glm_active(account: &str, model: &str) -> Result<ProbeRecord>;
 fn probe_deepseek_balance(account: &str) -> Result<ProbeRecord>;
 ```
@@ -765,12 +807,15 @@ Tests:
 - spawn failure rolls back in-flight
 - raw `bro_resume(session_id, provider)` recovers drone account env
 - probe parsers for Claude headers and Codex usage JSON
+- probe parser for Z.AI `quota/limit` maps `TOKENS_LIMIT number=5 unit=3` to
+  five-hour utilization and `TOKENS_LIMIT number=1 unit=6` to seven-day
+  utilization
 - probe parser for DeepSeek balance availability and balances
 - DeepSeek account with balance below `payg_min_balance_usd` is hard-excluded even
   when `is_available=true`
 - DeepSeek balance-tiered capacity: $50 balance scores higher than $0.50 balance
   under the same `payg_balance_ceiling_usd`
-- GLM/Z.AI active-probe parser maps usage exhausted, weekly/monthly exhausted,
+- GLM/Z.AI active-probe fallback maps usage exhausted, weekly/monthly exhausted,
   expired plan, unsupported model, temporary rate limit, and high-traffic
   responses into quota/cooldown state
 - weighted selection favors configured provider order when candidates have

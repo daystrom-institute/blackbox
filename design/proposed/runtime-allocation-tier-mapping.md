@@ -84,6 +84,20 @@ accounts advertise what they can satisfy.
 - No automatic semantic downgrade when a provider lacks a required capability.
 - No implementation phase plan in this document.
 
+Current probe reality is asymmetric. Claude, Codex, and Z.AI Coding Plan expose
+rolling utilization percentages suitable for direct quota capacity:
+
+- Z.AI Coding Plan: `GET https://api.z.ai/api/monitor/usage/quota/limit` with
+  the OpenCode `zai-coding-plan` API key. `TOKENS_LIMIT number=5 unit=3` is the
+  five-hour window; `TOKENS_LIMIT number=1 unit=6` is the weekly/seven-day
+  window.
+- DeepSeek: `GET https://api.deepseek.com/user/balance` with the OpenCode
+  `deepseek` API key as bearer auth. This returns pay-as-you-go balance
+  availability, not rolling-window utilization.
+
+Allocation policy must keep these signals distinct: Z.AI can be quota-probe
+confidence, while DeepSeek is balance-derived synthetic capacity.
+
 ## 5. Vocabulary
 
 **Runtime lane**
