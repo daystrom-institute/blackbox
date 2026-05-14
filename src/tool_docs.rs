@@ -673,7 +673,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_exec",
         category: ToolCategory::Orchestration,
         summary: "Launch a fresh agent task/session and return {taskId, sessionId}; can target a named bro/provider or request runtime allocation by tier/pool/capabilities.",
-        when_to_use: "Use to start a fresh agent session only. Prefer `bro:` over raw `provider:` so routing stays stable, or pass allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `durable`, `selection_policy`) when the dispatch should be pool-backed. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
+        when_to_use: "Use to start a fresh agent session only. Prefer `bro:` over raw `provider:` so routing stays stable, or pass allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `durable`, `selection_policy`, `pin_provider`, `pin_account`, `pin_model`, `pin_effort`, `prefer_provider`) when the dispatch should be pool-backed. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
         example: Some(
             r#"bro_exec(prompt="review this patch", project_dir="/repo/x", tier="standard", pool_name="coding", durable=true)"#,
         ),

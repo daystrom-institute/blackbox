@@ -595,6 +595,22 @@ fn score_candidate(
         candidate.exclusion_reason = Some("provider_binary_missing".into());
         return candidate;
     }
+    if let Some(model) = &lane.model {
+        if !lane.provider.models().is_empty()
+            && !lane.provider.models().iter().any(|info| info.id == model)
+        {
+            candidate.exclusion_reason = Some("provider_disallows_model".into());
+            return candidate;
+        }
+    }
+    if let Some(effort) = &lane.effort {
+        if !lane.provider.efforts().is_empty()
+            && !lane.provider.efforts().iter().any(|info| info.id == effort)
+        {
+            candidate.exclusion_reason = Some("provider_disallows_effort".into());
+            return candidate;
+        }
+    }
     if let Some(account) = lane
         .account
         .as_deref()
@@ -1252,6 +1268,85 @@ mod tests {
                 allocation.trace.error
             );
             assert!(allocation.trace.candidates.iter().all(|c| !c.eligible));
+        });
+    }
+
+    #[test]
+    fn operator_model_pin_overrides_tier_mapping_when_valid() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            let request = RuntimeRequest {
+                tier: Some("standard".into()),
+                pin: Some(RuntimePin {
+                    provider: Some(Provider::Codex),
+                    model: Some("gpt-5.3-codex-spark".into()),
+                    authority: PinAuthority::Operator,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let allocation = allocate(
+                request,
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                },
+            );
+            assert!(
+                allocation.trace.error.is_none(),
+                "{:?}",
+                allocation.trace.error
+            );
+            assert_eq!(allocation.lane.provider, Provider::Codex);
+            assert_eq!(
+                allocation.lane.model.as_deref(),
+                Some("gpt-5.3-codex-spark")
+            );
+        });
+    }
+
+    #[test]
+    fn invalid_operator_pin_fails_closed() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            let request = RuntimeRequest {
+                tier: Some("standard".into()),
+                pin: Some(RuntimePin {
+                    provider: Some(Provider::Codex),
+                    model: Some("not-a-real-codex-model".into()),
+                    authority: PinAuthority::Operator,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let allocation = allocate(
+                request,
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                },
+            );
+            assert!(
+                allocation
+                    .trace
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.exclusion_reason.as_deref()
+                        == Some("provider_disallows_model")),
+                "{:?}",
+                allocation.trace.candidates
+            );
+            assert!(
+                allocation
+                    .trace
+                    .error
+                    .as_deref()
+                    .is_some_and(|err| err.contains("no lane satisfied")),
+                "{:?}",
+                allocation.trace.error
+            );
         });
     }
 

@@ -66,6 +66,21 @@ pub(crate) struct ExecParams {
     /// Provider aliases that narrow the selected pool.
     #[serde(default)]
     pub(crate) pool_providers: Option<Vec<String>>,
+    /// Hard provider pin for runtime allocation.
+    #[serde(default)]
+    pub(crate) pin_provider: Option<String>,
+    /// Hard account pin for runtime allocation.
+    #[serde(default)]
+    pub(crate) pin_account: Option<String>,
+    /// Hard model pin for runtime allocation.
+    #[serde(default)]
+    pub(crate) pin_model: Option<String>,
+    /// Hard effort pin for runtime allocation.
+    #[serde(default)]
+    pub(crate) pin_effort: Option<String>,
+    /// Soft provider preference for runtime allocation scoring.
+    #[serde(default)]
+    pub(crate) prefer_provider: Option<String>,
     /// Explicit hard capability requirements.
     #[serde(default)]
     pub(crate) capabilities: Option<Vec<String>>,

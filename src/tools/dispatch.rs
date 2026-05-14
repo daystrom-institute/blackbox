@@ -13,6 +13,11 @@ fn exec_params_have_runtime(p: &ExecParams) -> bool {
         || p.max_tier.is_some()
         || p.pool_name.is_some()
         || p.pool_providers.as_ref().is_some_and(|v| !v.is_empty())
+        || p.pin_provider.is_some()
+        || p.pin_account.is_some()
+        || p.pin_model.is_some()
+        || p.pin_effort.is_some()
+        || p.prefer_provider.is_some()
         || p.capabilities.as_ref().is_some_and(|v| !v.is_empty())
         || p.durable.is_some()
         || p.selection_policy.is_some()
@@ -80,10 +85,56 @@ fn exec_params_runtime_request(
     if let Some(capabilities) = &p.capabilities {
         request.capabilities = orchestration::allocator::parse_capabilities(capabilities)?;
     }
+    if p.pin_provider.is_some()
+        || p.pin_account.is_some()
+        || p.pin_model.is_some()
+        || p.pin_effort.is_some()
+    {
+        let pin = request.pin.get_or_insert_with(Default::default);
+        if let Some(provider) = p.pin_provider.as_deref() {
+            pin.provider = Some(
+                provider
+                    .parse::<Provider>()
+                    .map_err(|_| format!("Unknown provider: {provider}"))?,
+            );
+        }
+        if let Some(account) = p.pin_account.clone() {
+            pin.account = Some(account);
+        }
+        if let Some(model) = p.pin_model.clone() {
+            pin.model = Some(model);
+        }
+        if let Some(effort) = p.pin_effort.clone() {
+            pin.effort = Some(effort);
+        }
+        pin.authority = orchestration::allocator::PinAuthority::Operator;
+    }
+    if let Some(provider) = p.prefer_provider.as_deref() {
+        request.prefer = Some(orchestration::allocator::RuntimePreference {
+            provider: Some(
+                provider
+                    .parse::<Provider>()
+                    .map_err(|_| format!("Unknown provider: {provider}"))?,
+            ),
+        });
+    }
     if let Some(durable) = p.durable {
         request.durable = durable;
     } else if exec_params_have_runtime(p) {
         request.durable = true;
+    }
+    if p.surface.is_some()
+        || p.allow_tools.as_ref().is_some_and(|v| !v.is_empty())
+        || p.disallow_tools.as_ref().is_some_and(|v| !v.is_empty())
+        || p.coerce_workspace == Some(true)
+    {
+        request
+            .derived_capabilities
+            .push(orchestration::providers::Capability::ToolUse);
+        request
+            .derived_capabilities
+            .sort_by_key(|cap| format!("{cap:?}"));
+        request.derived_capabilities.dedup();
     }
     if let Some(policy) = p.selection_policy.clone() {
         request.selection_policy = Some(policy);
@@ -1326,5 +1377,77 @@ impl BlackboxServer {
             return Ok(ids.to_vec());
         }
         Err("Provide either team or task_ids".into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params() -> ExecParams {
+        ExecParams {
+            prompt: "test".into(),
+            bro: None,
+            provider: None,
+            project_dir: None,
+            allow_recursion: None,
+            allow_tools: None,
+            disallow_tools: None,
+            surface: None,
+            coerce_workspace: None,
+            tier: None,
+            tier_ladder: None,
+            tier_mode: None,
+            min_tier: None,
+            max_tier: None,
+            pool_name: None,
+            pool_providers: None,
+            pin_provider: None,
+            pin_account: None,
+            pin_model: None,
+            pin_effort: None,
+            prefer_provider: None,
+            capabilities: None,
+            durable: None,
+            selection_policy: None,
+        }
+    }
+
+    #[test]
+    fn exec_params_runtime_request_parses_operator_pins_and_preferences() {
+        let mut params = params();
+        params.tier = Some("standard".into());
+        params.pin_provider = Some("codex".into());
+        params.pin_account = Some("codex-alt".into());
+        params.pin_model = Some("gpt-5.3-codex-spark".into());
+        params.pin_effort = Some("low".into());
+        params.prefer_provider = Some("glm".into());
+        let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
+        let pin = request.pin.unwrap();
+        assert_eq!(pin.provider, Some(Provider::Codex));
+        assert_eq!(pin.account.as_deref(), Some("codex-alt"));
+        assert_eq!(pin.model.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert_eq!(pin.effort.as_deref(), Some("low"));
+        assert_eq!(
+            pin.authority,
+            orchestration::allocator::PinAuthority::Operator
+        );
+        assert_eq!(
+            request.prefer.and_then(|prefer| prefer.provider),
+            Some(Provider::Glm)
+        );
+    }
+
+    #[test]
+    fn exec_params_runtime_request_derives_tool_use_from_tool_surface() {
+        let mut params = params();
+        params.tier = Some("standard".into());
+        params.surface = Some("readonly".into());
+        let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
+        assert!(
+            request
+                .derived_capabilities
+                .contains(&orchestration::providers::Capability::ToolUse)
+        );
     }
 }
