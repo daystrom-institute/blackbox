@@ -596,17 +596,15 @@ fn score_candidate(
         return candidate;
     }
     if let Some(model) = &lane.model {
-        if !lane.provider.models().is_empty()
-            && !lane.provider.models().iter().any(|info| info.id == model)
-        {
+        let models = lane.provider.models();
+        if models.is_empty() || !models.iter().any(|info| info.id == model) {
             candidate.exclusion_reason = Some("provider_disallows_model".into());
             return candidate;
         }
     }
     if let Some(effort) = &lane.effort {
-        if !lane.provider.efforts().is_empty()
-            && !lane.provider.efforts().iter().any(|info| info.id == effort)
-        {
+        let efforts = lane.provider.efforts();
+        if efforts.is_empty() || !efforts.iter().any(|info| info.id == effort) {
             candidate.exclusion_reason = Some("provider_disallows_effort".into());
             return candidate;
         }
@@ -705,10 +703,19 @@ fn score_candidate(
         provider_preference,
         concurrency_capacity,
     );
+    let runtime_preference = runtime_preference_score(request, lane.provider);
     candidate
         .score_components
         .insert("selection_policy".into(), policy_score);
-    candidate.score = provider_preference * 0.5 * concurrency_capacity * tier_fit * policy_score;
+    candidate
+        .score_components
+        .insert("runtime_preference".into(), runtime_preference);
+    candidate.score = provider_preference
+        * 0.5
+        * concurrency_capacity
+        * tier_fit
+        * policy_score
+        * runtime_preference;
     candidate.eligible = true;
     candidate
 }
@@ -760,6 +767,15 @@ fn selection_policy_score(
                 * tie_break_score(tie_break, lane.provider.as_str())
         }
     }
+}
+
+fn runtime_preference_score(request: &RuntimeRequest, provider: Provider) -> f64 {
+    request
+        .prefer
+        .as_ref()
+        .and_then(|prefer| prefer.provider)
+        .map(|preferred| if preferred == provider { 1.25 } else { 0.9 })
+        .unwrap_or(1.0)
 }
 
 fn tier_position_score(
@@ -1346,6 +1362,133 @@ mod tests {
                     .is_some_and(|err| err.contains("no lane satisfied")),
                 "{:?}",
                 allocation.trace.error
+            );
+        });
+    }
+
+    #[test]
+    fn hard_model_pin_fails_closed_when_provider_has_no_model_surface() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            let request = RuntimeRequest {
+                pin: Some(RuntimePin {
+                    provider: Some(Provider::Vibe),
+                    model: Some("ignored-model".into()),
+                    authority: PinAuthority::Operator,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let allocation = allocate(
+                request,
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                },
+            );
+            assert!(
+                allocation
+                    .trace
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.exclusion_reason.as_deref()
+                        == Some("provider_disallows_model")),
+                "{:?}",
+                allocation.trace.candidates
+            );
+            assert!(
+                allocation
+                    .trace
+                    .error
+                    .as_deref()
+                    .is_some_and(|err| err.contains("no lane satisfied")),
+                "{:?}",
+                allocation.trace.error
+            );
+        });
+    }
+
+    #[test]
+    fn hard_effort_pin_fails_closed_when_provider_has_no_effort_surface() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            let request = RuntimeRequest {
+                tier: Some("standard".into()),
+                pin: Some(RuntimePin {
+                    provider: Some(Provider::Gemini),
+                    effort: Some("high".into()),
+                    authority: PinAuthority::Operator,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            let allocation = allocate(
+                request,
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                },
+            );
+            assert!(
+                allocation
+                    .trace
+                    .candidates
+                    .iter()
+                    .any(|candidate| candidate.exclusion_reason.as_deref()
+                        == Some("provider_disallows_effort")),
+                "{:?}",
+                allocation.trace.candidates
+            );
+            assert!(
+                allocation
+                    .trace
+                    .error
+                    .as_deref()
+                    .is_some_and(|err| err.contains("no lane satisfied")),
+                "{:?}",
+                allocation.trace.error
+            );
+        });
+    }
+
+    #[test]
+    fn provider_preference_scores_availability_policy() {
+        with_provider_bins(|| {
+            let cfg = built_in_config();
+            let request = RuntimeRequest {
+                tier: Some("standard".into()),
+                pool: Some(PoolRef {
+                    name: Some("coding".into()),
+                    providers: vec![Provider::Glm, Provider::Claude],
+                }),
+                prefer: Some(RuntimePreference {
+                    provider: Some(Provider::Claude),
+                }),
+                ..Default::default()
+            };
+            let allocation = allocate(
+                request,
+                &cfg,
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                },
+            );
+            assert!(
+                allocation.trace.error.is_none(),
+                "{:?}",
+                allocation.trace.error
+            );
+            assert_eq!(allocation.lane.provider, Provider::Claude);
+            assert!(
+                allocation.trace.candidates.iter().any(|candidate| candidate
+                    .score_components
+                    .get("runtime_preference")
+                    .is_some_and(|score| *score != 1.0)),
+                "{:?}",
+                allocation.trace.candidates
             );
         });
     }

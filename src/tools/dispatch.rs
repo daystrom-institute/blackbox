@@ -1416,12 +1416,12 @@ mod tests {
     #[test]
     fn exec_params_runtime_request_parses_operator_pins_and_preferences() {
         let mut params = params();
-        params.tier = Some("standard".into());
         params.pin_provider = Some("codex".into());
         params.pin_account = Some("codex-alt".into());
         params.pin_model = Some("gpt-5.3-codex-spark".into());
         params.pin_effort = Some("low".into());
         params.prefer_provider = Some("glm".into());
+        assert!(exec_params_have_runtime(&params));
         let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
         let pin = request.pin.unwrap();
         assert_eq!(pin.provider, Some(Provider::Codex));
@@ -1436,6 +1436,22 @@ mod tests {
             request.prefer.and_then(|prefer| prefer.provider),
             Some(Provider::Glm)
         );
+    }
+
+    #[test]
+    fn exec_params_runtime_request_rejects_unknown_pin_provider() {
+        let mut params = params();
+        params.pin_provider = Some("not-a-provider".into());
+        let err = exec_params_runtime_request(&params, None).unwrap_err();
+        assert!(err.contains("Unknown provider: not-a-provider"), "{err}");
+    }
+
+    #[test]
+    fn exec_params_runtime_request_rejects_unknown_preferred_provider() {
+        let mut params = params();
+        params.prefer_provider = Some("not-a-provider".into());
+        let err = exec_params_runtime_request(&params, None).unwrap_err();
+        assert!(err.contains("Unknown provider: not-a-provider"), "{err}");
     }
 
     #[test]
