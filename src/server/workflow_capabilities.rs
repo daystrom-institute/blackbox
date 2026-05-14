@@ -18,6 +18,19 @@ pub(crate) fn validate_workflow_capabilities(
                 actor.requires
             ));
         }
+        if actor.runtime.is_some() {
+            let satisfied = providers.iter().any(|provider| {
+                let caps = provider.capabilities();
+                actor.requires.iter().all(|r| caps.contains(r))
+            });
+            if !satisfied {
+                return Err(format!(
+                    "actor '{actor_name}' requires {:?} but no runtime candidate provider satisfies them",
+                    actor.requires
+                ));
+            }
+            continue;
+        }
         for provider in &providers {
             let caps = provider.capabilities();
             let missing: Vec<_> = actor
@@ -45,6 +58,19 @@ pub(crate) fn validate_workflow_capabilities(
                 "atom binding '{binding_name}' requires {:?} but resolves to no providers",
                 binding.requires
             ));
+        }
+        if manifest.runtime.is_some() {
+            let satisfied = providers.iter().any(|provider| {
+                let caps = provider.capabilities();
+                binding.requires.iter().all(|r| caps.contains(r))
+            });
+            if !satisfied {
+                return Err(format!(
+                    "atom binding '{binding_name}' requires {:?} but no runtime candidate provider satisfies them",
+                    binding.requires
+                ));
+            }
+            continue;
         }
         for provider in &providers {
             let caps = provider.capabilities();
@@ -112,6 +138,12 @@ fn resolve_atom_binding_providers(
     manifest: &orchestration::atoms::types::AtomManifest,
     state: &Arc<SharedState>,
 ) -> Result<Vec<orchestration::providers::Provider>, String> {
+    if let Some(runtime) = &manifest.runtime {
+        let config = orchestration::allocator::load_effective_config(&state.store_dir, None);
+        return Ok(orchestration::allocator::provider_candidates_for_request(
+            runtime, &config,
+        ));
+    }
     match &manifest.implementation {
         orchestration::atoms::types::AtomImplementation::Profile { brofile_ref } => {
             let (name, _version) =
@@ -232,4 +264,79 @@ fn validate_binding_bool_limit(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    fn runtime_actor_workflow(
+        providers: Vec<orchestration::providers::Provider>,
+    ) -> workflow::CompiledWorkflow {
+        workflow::compile(workflow::Workflow {
+            name: "runtime-capabilities".into(),
+            version: 1,
+            actors: HashMap::from([(
+                "worker".into(),
+                workflow::ActorSpec {
+                    kind: workflow::ActorKind::Executor,
+                    brofile: None,
+                    team: None,
+                    durable: false,
+                    compaction_anchor: false,
+                    requires: vec![orchestration::providers::Capability::StructuredOutput],
+                    runtime: Some(orchestration::allocator::RuntimeRequest {
+                        pool: Some(orchestration::allocator::PoolRef {
+                            name: None,
+                            providers,
+                        }),
+                        ..Default::default()
+                    }),
+                },
+            )]),
+            atom_bindings: HashMap::new(),
+            nodes: HashMap::from([(
+                "run".into(),
+                workflow::NodeSpec {
+                    actor: "worker".into(),
+                    prompt: Some("work".into()),
+                    next: workflow::NodeTransition::Terminal,
+                    ..Default::default()
+                },
+            )]),
+            start: "run".into(),
+            policy_packet: None,
+            vars_schema: None,
+            on_arc_exit: Vec::new(),
+            on_arc_cancel: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn runtime_actor_capability_validation_accepts_mixed_pool_with_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        let compiled = runtime_actor_workflow(vec![
+            orchestration::providers::Provider::Gemini,
+            orchestration::providers::Provider::Codex,
+        ]);
+
+        validate_workflow_capabilities(&compiled, &state).unwrap();
+    }
+
+    #[test]
+    fn runtime_actor_capability_validation_fails_when_no_candidate_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        let compiled = runtime_actor_workflow(vec![orchestration::providers::Provider::Gemini]);
+
+        let err = validate_workflow_capabilities(&compiled, &state).unwrap_err();
+        assert!(
+            err.contains("no runtime candidate provider satisfies"),
+            "{err}"
+        );
+    }
 }

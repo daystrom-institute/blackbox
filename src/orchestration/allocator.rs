@@ -301,6 +301,14 @@ pub struct AllocationContext {
 }
 
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+pub fn allocation_lock() -> std::sync::MutexGuard<'static, ()> {
+    ALLOCATION_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 pub fn config_file(store_dir: &Path) -> PathBuf {
     store_dir.join("allocator.json")
@@ -1268,7 +1276,7 @@ pub fn lookup_lease_for_session(
     session_id: &str,
 ) -> Option<RuntimeLease> {
     let leases = lease_store_load(store_dir);
-    task_store
+    let live_task_lease = task_store
         .all_tasks()
         .into_iter()
         .filter_map(|task| {
@@ -1287,7 +1295,17 @@ pub fn lookup_lease_for_session(
             .flatten()
         })
         .max_by_key(|(started_at, _)| *started_at)
-        .map(|(_, lease)| lease)
+        .map(|(_, lease)| lease);
+    live_task_lease.or_else(|| {
+        leases
+            .leases
+            .values()
+            .filter(|lease| {
+                lease.durable && lease.provider == provider && lease.session_id == session_id
+            })
+            .max_by_key(|lease| (lease.last_seen_at, lease.created_at))
+            .cloned()
+    })
 }
 
 pub fn lookup_lease_for_task(store_dir: &Path, task_id: &str) -> Option<RuntimeLease> {
@@ -1383,6 +1401,26 @@ pub fn exec_opts_for_lane(lane: &RuntimeLane) -> Option<ExecOpts> {
         model: lane.model.clone(),
         effort: lane.effort.clone(),
     })
+}
+
+pub fn with_derived_capability(
+    mut request: Option<RuntimeRequest>,
+    capability: Capability,
+) -> Option<RuntimeRequest> {
+    let request = request.get_or_insert_with(RuntimeRequest::default);
+    request.derived_capabilities.push(capability);
+    request
+        .derived_capabilities
+        .sort_by_key(|cap| format!("{cap:?}"));
+    request.derived_capabilities.dedup();
+    Some(request.clone())
+}
+
+pub fn provider_candidates_for_request(
+    request: &RuntimeRequest,
+    config: &AllocatorConfig,
+) -> Vec<Provider> {
+    resolve_provider_pool(request, config)
 }
 
 #[cfg(test)]
@@ -1984,6 +2022,65 @@ mod tests {
     }
 
     #[test]
+    fn session_lease_lookup_falls_back_to_latest_durable_lease() {
+        let tmp = tempfile::tempdir().unwrap();
+        let older = RuntimeLease {
+            task_id: "task-1".into(),
+            session_id: "session-1".into(),
+            provider: Provider::Codex,
+            account: Some("codex-old".into()),
+            model: Some("gpt-5.4".into()),
+            effort: Some("low".into()),
+            tier: Some("economy".into()),
+            durable: true,
+            capabilities: Vec::new(),
+            project_dir: None,
+            cwd: None,
+            selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
+            created_at: 1,
+            last_seen_at: 1,
+        };
+        let newer = RuntimeLease {
+            task_id: "task-2".into(),
+            session_id: "session-1".into(),
+            provider: Provider::Codex,
+            account: Some("codex-new".into()),
+            model: Some("gpt-5.3-codex-spark".into()),
+            effort: Some("medium".into()),
+            tier: Some("standard".into()),
+            durable: true,
+            capabilities: vec![Capability::ToolUse],
+            project_dir: None,
+            cwd: None,
+            selection_trace_id: "alloc-fedcba9876543210fedcba9876543210".into(),
+            created_at: 2,
+            last_seen_at: 3,
+        };
+        let wrong_provider = RuntimeLease {
+            provider: Provider::Claude,
+            account: Some("claude".into()),
+            ..newer.clone()
+        };
+        lease_store_save(
+            tmp.path(),
+            &RuntimeLeaseStore {
+                leases: BTreeMap::from([
+                    (older.task_id.clone(), older),
+                    (newer.task_id.clone(), newer.clone()),
+                    ("task-3".into(), wrong_provider),
+                ]),
+            },
+        );
+
+        let loaded =
+            lookup_lease_for_session(tmp.path(), &TaskStore::new(), Provider::Codex, "session-1")
+                .unwrap();
+        assert_eq!(loaded.task_id, "task-2");
+        assert_eq!(loaded.account.as_deref(), Some("codex-new"));
+        assert_eq!(loaded.model.as_deref(), Some("gpt-5.3-codex-spark"));
+    }
+
+    #[test]
     fn resume_task_lease_preserves_selected_lane() {
         let previous = RuntimeLease {
             task_id: "task-1".into(),
@@ -2017,5 +2114,21 @@ mod tests {
         assert_eq!(resumed.project_dir.as_deref(), Some("/repo"));
         assert_eq!(resumed.cwd.as_deref(), Some("/repo/subdir"));
         assert!(!resumed.durable);
+    }
+
+    #[test]
+    fn with_derived_capability_adds_and_dedupes_capabilities() {
+        let request = RuntimeRequest {
+            derived_capabilities: vec![Capability::StructuredOutput],
+            ..Default::default()
+        };
+        let updated = with_derived_capability(Some(request), Capability::StructuredOutput).unwrap();
+        assert_eq!(
+            updated.derived_capabilities,
+            vec![Capability::StructuredOutput]
+        );
+
+        let created = with_derived_capability(None, Capability::ToolUse).unwrap();
+        assert_eq!(created.derived_capabilities, vec![Capability::ToolUse]);
     }
 }

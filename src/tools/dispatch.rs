@@ -219,6 +219,10 @@ impl BlackboxServer {
         mut request: FreshDispatchRequest,
     ) -> Result<FreshDispatchResult, String> {
         let store_dir = self.state.store_dir.clone();
+        let _allocation_guard = request
+            .allocation_request
+            .as_ref()
+            .map(|_| orchestration::allocator::allocation_lock());
         let mut allocation: Option<orchestration::allocator::Allocation> = None;
         if let Some(runtime_request) = request.allocation_request.take() {
             let allocator_config =

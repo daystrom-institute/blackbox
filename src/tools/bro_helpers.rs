@@ -6,6 +6,13 @@ pub(crate) fn resolve_actor_providers(
 ) -> Result<Vec<orchestration::providers::Provider>, String> {
     use std::collections::HashSet;
     let mut providers: HashSet<orchestration::providers::Provider> = HashSet::new();
+    if let Some(runtime) = &actor.runtime {
+        let config = orchestration::allocator::load_effective_config(&state.store_dir, None);
+        providers.extend(orchestration::allocator::provider_candidates_for_request(
+            runtime, &config,
+        ));
+        return Ok(providers.into_iter().collect());
+    }
     match actor.kind {
         workflow::schema::ActorKind::Executor => {
             let brofile_name = actor

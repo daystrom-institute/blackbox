@@ -826,6 +826,19 @@ impl BlackboxServer {
         let runtime =
             orchestration::allocator::merge_runtime_request(runtime, manifest.runtime.clone());
         let runtime = orchestration::allocator::merge_runtime_request(runtime, runtime_override);
+        let runtime = if manifest
+            .outputs
+            .as_ref()
+            .and_then(|outputs| outputs.schema.as_ref())
+            .is_some()
+        {
+            orchestration::allocator::with_derived_capability(
+                runtime,
+                orchestration::providers::Capability::StructuredOutput,
+            )
+        } else {
+            runtime
+        };
         let dispatched =
             match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
