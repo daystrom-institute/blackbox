@@ -1936,6 +1936,7 @@ pub(crate) async fn admin_brofile_upsert(
         effort: req.effort,
         filters: None,
         coerce_workspace: None,
+        runtime: None,
     };
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (

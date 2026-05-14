@@ -1,4 +1,5 @@
 pub mod agents;
+pub mod allocator;
 pub mod atoms;
 pub mod badgey;
 pub mod brofile;

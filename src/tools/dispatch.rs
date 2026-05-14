@@ -5,32 +5,180 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::dispatch_tools()
 }
 
+fn exec_params_have_runtime(p: &ExecParams) -> bool {
+    p.tier.is_some()
+        || p.tier_ladder.is_some()
+        || p.tier_mode.is_some()
+        || p.min_tier.is_some()
+        || p.max_tier.is_some()
+        || p.pool_name.is_some()
+        || p.pool_providers.as_ref().is_some_and(|v| !v.is_empty())
+        || p.capabilities.as_ref().is_some_and(|v| !v.is_empty())
+        || p.durable.is_some()
+        || p.selection_policy.is_some()
+}
+
+fn exec_params_runtime_request(
+    p: &ExecParams,
+    base: Option<orchestration::allocator::RuntimeRequest>,
+) -> Result<Option<orchestration::allocator::RuntimeRequest>, String> {
+    if !exec_params_have_runtime(p) && base.is_none() {
+        return Ok(None);
+    }
+    let mut request = base.unwrap_or_default();
+    if let Some(tier) = p.tier.clone() {
+        request.tier = Some(tier);
+    }
+    if request.tier.is_none()
+        && (p.tier_ladder.is_some()
+            || p.tier_mode.is_some()
+            || p.min_tier.is_some()
+            || p.max_tier.is_some())
+    {
+        return Err(
+            "error.bad_allocation_request: tier_ladder, tier_mode, min_tier, and max_tier require tier".into(),
+        );
+    }
+    if let Some(ladder) = p.tier_ladder.clone() {
+        request.tier_ladder = Some(ladder);
+    }
+    if let Some(mode) = p.tier_mode.as_deref() {
+        request.tier_mode = match mode {
+            "exact" => orchestration::allocator::TierMode::Exact,
+            "at_least" => orchestration::allocator::TierMode::AtLeast,
+            "bounded" => orchestration::allocator::TierMode::Bounded,
+            other => {
+                return Err(format!(
+                    "error.bad_allocation_request: unknown tier_mode `{other}`"
+                ));
+            }
+        };
+    }
+    if let Some(min_tier) = p.min_tier.clone() {
+        request.min_tier = Some(min_tier);
+    }
+    if let Some(max_tier) = p.max_tier.clone() {
+        request.max_tier = Some(max_tier);
+    }
+    if p.pool_name.is_some() || p.pool_providers.as_ref().is_some_and(|v| !v.is_empty()) {
+        let mut pool = request.pool.take().unwrap_or_default();
+        if let Some(name) = p.pool_name.clone() {
+            pool.name = Some(name);
+        }
+        if let Some(providers) = &p.pool_providers {
+            pool.providers = providers
+                .iter()
+                .map(|provider| {
+                    provider
+                        .parse::<Provider>()
+                        .map_err(|_| format!("Unknown provider: {provider}"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+        }
+        request.pool = Some(pool);
+    }
+    if let Some(capabilities) = &p.capabilities {
+        request.capabilities = orchestration::allocator::parse_capabilities(capabilities)?;
+    }
+    if let Some(durable) = p.durable {
+        request.durable = durable;
+    } else if exec_params_have_runtime(p) {
+        request.durable = true;
+    }
+    if let Some(policy) = p.selection_policy.clone() {
+        request.selection_policy = Some(policy);
+    }
+    Ok(Some(request))
+}
+
 #[tool_router(router = dispatch_tools)]
 impl BlackboxServer {
     #[tool(
         name = "bro_exec",
-        description = "Launch a fresh agent task/session and return {taskId, sessionId} immediately; do not use for continuity."
+        description = "Launch a fresh agent task/session and return {taskId, sessionId}; can target a named bro/provider or request runtime allocation by tier/pool/capabilities."
     )]
     pub(crate) async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let store_dir = self.state.store_dir.clone();
 
         let (
-            provider,
+            mut provider,
             lens,
-            exec_opts,
-            env_overrides,
+            mut exec_opts,
+            mut env_overrides,
             cwd,
             brofile_filters,
             brofile_coerce_workspace,
-        ) = match self.resolve_exec_target(
-            p.bro.as_deref(),
-            p.provider.as_deref(),
-            p.project_dir.as_deref(),
-        ) {
-            Ok(r) => r,
-            Err(e) => return Self::err_text(&e),
+        ) = if p.bro.is_some() || p.provider.is_some() {
+            match self.resolve_exec_target(
+                p.bro.as_deref(),
+                p.provider.as_deref(),
+                p.project_dir.as_deref(),
+            ) {
+                Ok(r) => r,
+                Err(e) => return Self::err_text(&e),
+            }
+        } else if exec_params_have_runtime(&p) {
+            (
+                Provider::Codex,
+                None,
+                None,
+                None,
+                p.project_dir.clone(),
+                None,
+                false,
+            )
+        } else {
+            return Self::err_text(
+                "Provide either bro, provider, or runtime allocation parameters",
+            );
         };
+        let brofile_runtime = p
+            .bro
+            .as_deref()
+            .and_then(|name| {
+                self.resolve_exec_brofile_for_allocator(name, p.project_dir.as_deref())
+            })
+            .and_then(|bf| bf.runtime);
+        let allocation_request = match exec_params_runtime_request(&p, brofile_runtime) {
+            Ok(request) => request,
+            Err(err) => return Self::err_text(&err),
+        };
+        let mut allocation: Option<orchestration::allocator::Allocation> = None;
+        if let Some(mut request) = allocation_request {
+            if let Some(raw_provider) = p.provider.as_deref() {
+                let pinned_provider = match raw_provider.parse::<Provider>() {
+                    Ok(provider) => provider,
+                    Err(_) => return Self::err_text(&format!("Unknown provider: {raw_provider}")),
+                };
+                let pin = request.pin.get_or_insert_with(Default::default);
+                pin.provider = Some(pinned_provider);
+                pin.authority = orchestration::allocator::PinAuthority::Operator;
+            }
+            let allocator_config =
+                orchestration::allocator::load_effective_config(&store_dir, cwd.as_deref());
+            let bro_config = orchestration::brofile::load_config(&store_dir);
+            let lease_store = orchestration::allocator::lease_store_load(&store_dir);
+            let ctx = orchestration::allocator::allocation_context(
+                &self.state.task_store.read(),
+                &lease_store,
+            );
+            let selected =
+                orchestration::allocator::allocate(request, &allocator_config, &bro_config, &ctx);
+            orchestration::allocator::save_trace(&store_dir, &selected.trace);
+            if let Some(err) = selected.trace.error.as_deref() {
+                return Self::err_text(err);
+            }
+            provider = selected.lane.provider;
+            exec_opts = orchestration::allocator::exec_opts_for_lane(&selected.lane);
+            env_overrides = orchestration::brofile::resolve_provider_env(
+                provider,
+                selected.lane.account.as_deref(),
+                selected.lane.model.as_deref(),
+                &store_dir,
+            );
+            allocation = Some(selected);
+        }
 
         // Pre-generate task_id so it lands in the ambient [scope] block
         // before subprocess launch — the primary correlation key for
@@ -100,13 +248,25 @@ impl BlackboxServer {
             session_id,
             cwd,
             env_overrides,
-            store_dir,
+            store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
             None,
             None,
             Some(self.state.system_events.clone()),
         );
+        if let Some(allocation) = &allocation {
+            orchestration::allocator::record_lease(
+                &store_dir,
+                orchestration::allocator::lease_from_allocation(
+                    task.inner.lock().id.clone(),
+                    task.inner.lock().session_id.clone(),
+                    allocation,
+                    p.project_dir.clone(),
+                    task.inner.lock().cwd.clone(),
+                ),
+            );
+        }
 
         // Register Gemini policy-file cleanup once the task terminates.
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
@@ -117,11 +277,20 @@ impl BlackboxServer {
         }
 
         let inner = task.inner.lock();
-        Self::ok_json(&json!({
+        let mut response = json!({
             "taskId": inner.id,
             "sessionId": inner.session_id,
             "status": "running",
-        }))
+        });
+        if let Some(allocation) = &allocation {
+            response["provider"] = json!(allocation.lane.provider);
+            response["account"] = json!(allocation.lane.account);
+            response["model"] = json!(allocation.lane.model);
+            response["effort"] = json!(allocation.lane.effort);
+            response["tier"] = json!(allocation.lane.tier);
+            response["selectionTraceId"] = json!(allocation.trace.id);
+        }
+        Self::ok_json(&response)
     }
 
     #[tool(
@@ -166,7 +335,7 @@ impl BlackboxServer {
         // through to the caller's cwd and let them surface the failure.
         let cwd = match provider.resolve_session_cwd(&session_id) {
             Some(p) => Some(p.to_string_lossy().into_owned()),
-            None if provider == Provider::Gemini => {
+            None if provider == Provider::Gemini && cwd.is_none() => {
                 return Self::err_text(&format!(
                     "Gemini session {session_id} not found in ~/.gemini/tmp/*/chats. Refusing to resume because Gemini silently forks a new session when the UUID isn't in the cwd's project folder (aliasing the resumed session). Verify the session ID or re-dispatch.",
                 ));
@@ -266,6 +435,50 @@ impl BlackboxServer {
             "sessionId": inner.session_id,
             "status": "running",
         }))
+    }
+
+    #[tool(
+        name = "bro_allocator_status",
+        description = "Read pool-backed runtime allocation config, active leases, and in-flight lane counts."
+    )]
+    pub(crate) fn bro_allocator_status(
+        &self,
+        Parameters(p): Parameters<AllocatorStatusParams>,
+    ) -> CallToolResult {
+        let cfg = orchestration::allocator::load_effective_config(
+            &self.state.store_dir,
+            p.project_dir.as_deref(),
+        );
+        let leases = orchestration::allocator::lease_store_load(&self.state.store_dir);
+        let ctx =
+            orchestration::allocator::allocation_context(&self.state.task_store.read(), &leases);
+        Self::ok_json(&json!({
+            "tiers": cfg.tiers,
+            "tier_ladders": cfg.tier_ladders,
+            "pools": cfg.pools,
+            "selection_policies": cfg.selection_policies,
+            "in_flight": ctx.in_flight,
+            "leases": leases.leases,
+        }))
+    }
+
+    #[tool(
+        name = "bro_allocator_trace",
+        description = "Read a previous runtime allocation selection trace by id."
+    )]
+    pub(crate) fn bro_allocator_trace(
+        &self,
+        Parameters(p): Parameters<AllocatorTraceParams>,
+    ) -> CallToolResult {
+        match orchestration::allocator::load_trace(&self.state.store_dir, &p.selection_trace_id) {
+            Some(trace) => {
+                Self::ok_json(&serde_json::to_value(trace).unwrap_or_else(|_| json!({})))
+            }
+            None => Self::err_text(&format!(
+                "Unknown allocation trace: {}",
+                p.selection_trace_id
+            )),
+        }
     }
 
     #[tool(
@@ -827,6 +1040,25 @@ impl BlackboxServer {
     }
 
     #[allow(clippy::type_complexity)]
+    pub(crate) fn resolve_exec_brofile_for_allocator(
+        &self,
+        bro_name: &str,
+        project_dir: Option<&str>,
+    ) -> Option<orchestration::brofile::Brofile> {
+        let store_dir = &self.state.store_dir;
+        let teams = orchestration::team::load_all_teams(store_dir);
+        if let Ok(Some(bro_match)) = orchestration::team::resolve_bro_selector(bro_name, &teams) {
+            let member = &bro_match.team.members[bro_match.member_idx];
+            return orchestration::brofile::resolve_brofile(
+                &member.brofile,
+                store_dir,
+                bro_match.team.project_dir.as_deref(),
+            );
+        }
+        orchestration::brofile::resolve_brofile(bro_name, store_dir, project_dir)
+    }
+
+    #[allow(clippy::type_complexity)]
     pub(crate) fn resolve_exec_target(
         &self,
         bro_name: Option<&str>,
@@ -1017,6 +1249,42 @@ impl BlackboxServer {
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
+            if let Some(lease) = orchestration::allocator::lookup_lease_for_session(
+                store_dir,
+                &self.state.task_store.read(),
+                provider,
+                sid,
+            ) {
+                let env = orchestration::brofile::resolve_provider_env(
+                    provider,
+                    lease.account.as_deref(),
+                    lease.model.as_deref(),
+                    store_dir,
+                );
+                let opts = orchestration::allocator::exec_opts_for_lane(
+                    &orchestration::allocator::RuntimeLane {
+                        provider,
+                        account: lease.account.clone(),
+                        tier: lease.tier.clone(),
+                        model: lease.model.clone(),
+                        effort: lease.effort.clone(),
+                        capabilities: lease.capabilities.clone(),
+                    },
+                );
+                return Ok((
+                    provider,
+                    sid.to_string(),
+                    None,
+                    opts,
+                    env,
+                    project_dir
+                        .map(String::from)
+                        .or(lease.cwd)
+                        .or(lease.project_dir),
+                    None,
+                    false,
+                ));
+            }
             let env = orchestration::brofile::resolve_provider_env(provider, None, None, store_dir);
             return Ok((
                 provider,

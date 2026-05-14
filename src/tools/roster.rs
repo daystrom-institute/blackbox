@@ -250,6 +250,7 @@ impl BlackboxServer {
                     effort: p.effort.clone(),
                     filters,
                     coerce_workspace: p.coerce_workspace,
+                    runtime: None,
                 };
                 if let Err(e) =
                     brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
@@ -292,9 +293,13 @@ impl BlackboxServer {
                     None => return Self::err_text("name is required"),
                 };
                 let mut config = brofile::load_config(store_dir);
-                config
-                    .accounts
-                    .insert(name.clone(), brofile::Account { env: p.env.clone() });
+                config.accounts.insert(
+                    name.clone(),
+                    brofile::Account {
+                        env: p.env.clone(),
+                        ..Default::default()
+                    },
+                );
                 brofile::save_config(&config, store_dir);
                 Self::ok_json(&json!({"account": name, "env": p.env}))
             }

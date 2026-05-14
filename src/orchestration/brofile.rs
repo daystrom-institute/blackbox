@@ -6,8 +6,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::allocator::RuntimeRequest;
 use super::mcp::McpFilters;
-use super::providers::Provider;
+use super::providers::{Capability, Provider};
 
 // ---------------------------------------------------------------------------
 // Brofile
@@ -38,16 +39,35 @@ pub struct Brofile {
     /// when workspace tools are unavailable. Default off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coerce_workspace: Option<bool>,
+    /// Optional late-bound runtime allocation defaults. When present,
+    /// dispatch resolves provider/account/model/effort through the
+    /// allocator before falling through to the normal spawn path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<RuntimeRequest>,
 }
 
 // ---------------------------------------------------------------------------
 // Account
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Account {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub env: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tiers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_models: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<Capability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<usize>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub disabled: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -445,6 +465,7 @@ mod tests {
             effort: None,
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -472,6 +493,7 @@ mod tests {
             effort: Some("medium".into()),
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -498,6 +520,7 @@ mod tests {
             effort: None,
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
@@ -510,6 +533,7 @@ mod tests {
             effort: None,
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(
             &project_bf,
@@ -541,6 +565,7 @@ mod tests {
                 effort: None,
                 filters: None,
                 coerce_workspace: None,
+                runtime: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -562,6 +587,7 @@ mod tests {
             effort: None,
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -580,6 +606,7 @@ mod tests {
                     "CLAUDE_HOME".into(),
                     "/home/user/.claude-work".into(),
                 )])),
+                ..Default::default()
             },
         );
         save_config(&config, dir.path());
@@ -608,6 +635,7 @@ mod tests {
                 disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(*)".into()],
             }),
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -796,6 +824,7 @@ mod tests {
             effort: Some("low".into()),
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
@@ -815,6 +844,7 @@ mod tests {
             effort: None,
             filters: None,
             coerce_workspace: Some(true),
+            runtime: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
@@ -829,6 +859,7 @@ mod tests {
             effort: None,
             filters: None,
             coerce_workspace: None,
+            runtime: None,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
         let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();
@@ -883,6 +914,7 @@ mod tests {
             "account2".into(),
             Account {
                 env: Some(HashMap::from([("EXTRA_FLAG".into(), "1".into())])),
+                ..Default::default()
             },
         );
         save_config(&config, store.path());
@@ -921,6 +953,7 @@ mod tests {
             "account2".into(),
             Account {
                 env: Some(HashMap::from([("EXTRA_FLAG".into(), "1".into())])),
+                ..Default::default()
             },
         );
         config.provider_defaults.insert(
@@ -971,6 +1004,7 @@ mod tests {
                         .to_string_lossy()
                         .into_owned(),
                 )])),
+                ..Default::default()
             },
         );
         save_config(&config, store.path());

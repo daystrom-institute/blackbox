@@ -672,10 +672,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_exec",
         category: ToolCategory::Orchestration,
-        summary: "Launch a fresh agent task/session and return {taskId, sessionId} immediately; do not use for continuity.",
-        when_to_use: "Use to start a fresh agent session only. Prefer `bro:` over raw `provider:` so routing stays stable. Record the returned `taskId` and `sessionId` immediately; use those explicit handles for later waits/resumes. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity. See `sm-bro-dispatch-patterns` via `bbox_knowledge` for workflow shapes.",
+        summary: "Launch a fresh agent task/session and return {taskId, sessionId}; can target a named bro/provider or request runtime allocation by tier/pool/capabilities.",
+        when_to_use: "Use to start a fresh agent session only. Prefer `bro:` over raw `provider:` so routing stays stable, or pass allocator fields (`tier`, `tier_ladder`, `tier_mode`, `min_tier`, `max_tier`, `pool_name`, `pool_providers`, `capabilities`, `durable`, `selection_policy`) when the dispatch should be pool-backed. Record `taskId`, `sessionId`, and any `selectionTraceId`; inspect allocation decisions with `bro_allocator_trace`. For any follow-up on that same work, use `bro_resume`; another `bro_exec` starts fresh and has no continuity.",
         example: Some(
-            r#"bro_exec(bro="executor", prompt="refactor the tail module", project_dir="/repo/x")"#,
+            r#"bro_exec(prompt="review this patch", project_dir="/repo/x", tier="standard", pool_name="coding", durable=true)"#,
         ),
     },
     ToolDoc {
@@ -686,6 +686,20 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(
             r#"bro_resume(bro="executor", prompt="add tests for the edge case we discussed")"#,
         ),
+    },
+    ToolDoc {
+        name: "bro_allocator_status",
+        category: ToolCategory::Orchestration,
+        summary: "Read pool-backed runtime allocation config, active leases, and in-flight lane counts.",
+        when_to_use: "Use when debugging or auditing late-bound bro dispatch: inspect effective tier mappings, pools, selection policies, active runtime leases, and current in-flight lane counts. This is read-only; allocation config is hot-loaded from allocator.json on each dispatch.",
+        example: Some(r#"bro_allocator_status(project_dir="/repo/x")"#),
+    },
+    ToolDoc {
+        name: "bro_allocator_trace",
+        category: ToolCategory::Orchestration,
+        summary: "Read a previous runtime allocation selection trace by id.",
+        when_to_use: "Use when bro_exec returned selectionTraceId and you need to explain why the allocator selected or rejected provider/account/model lanes.",
+        example: Some(r#"bro_allocator_trace(selection_trace_id="alloc-0123abcd")"#),
     },
     ToolDoc {
         name: "badgey_exec",
