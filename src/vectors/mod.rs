@@ -126,34 +126,24 @@ fn spawn_periodic_compactor(store: Arc<VectorStore>) {
         .spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(COMPACT_INTERVAL_SECS));
-                let partitions: Vec<_> = store.partitions.read().values().cloned().collect();
-                for partition in partitions {
-                    let needs = partition.read().needs_compaction();
-                    if !needs {
-                        continue;
+                match store.compact_partitions(None) {
+                    Ok(stats) => {
+                        for stat in stats {
+                            tracing::info!(
+                                route = %stat.route,
+                                before_wal_records = stat.before_wal_records,
+                                after_wal_records = stat.after_wal_records,
+                                before_slab_entries = stat.before_slab_entries,
+                                after_slab_entries = stat.after_slab_entries,
+                                elapsed_ms = stat.elapsed_ms,
+                                "vector partition compacted"
+                            );
+                        }
                     }
-                    let mut p = partition.write();
-                    if !p.needs_compaction() {
-                        continue;
-                    }
-                    let started = std::time::Instant::now();
-                    let route = p.route.clone();
-                    match p.compact() {
-                        Ok(stats) => tracing::info!(
-                            route = %route,
-                            before_wal_records = stats.before_wal_records,
-                            after_wal_records = stats.after_wal_records,
-                            before_slab_entries = stats.before_slab_entries,
-                            after_slab_entries = stats.after_slab_entries,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "vector partition compacted"
-                        ),
-                        Err(err) => tracing::warn!(
-                            route = %route,
-                            error = %err,
-                            "vector partition compaction failed; will retry"
-                        ),
-                    }
+                    Err(err) => tracing::warn!(
+                        error = %err,
+                        "vector partition compaction failed; will retry"
+                    ),
                 }
             }
         })
@@ -408,6 +398,98 @@ impl VectorStore {
         result
     }
 
+    pub fn compact_partitions(
+        &self,
+        max_partitions: Option<usize>,
+    ) -> Result<Vec<RouteCompactionStats>> {
+        self.compact_partitions_with_policy(
+            COMPACT_DELETED_RATIO,
+            COMPACT_MIN_DELETED_ENTRIES,
+            COMPACT_MIN_WAL_SURPLUS_RECORDS,
+            max_partitions,
+        )
+    }
+
+    fn compact_partitions_with_policy(
+        &self,
+        deleted_ratio_threshold: f32,
+        min_deleted_entries: usize,
+        min_wal_surplus_records: usize,
+        max_partitions: Option<usize>,
+    ) -> Result<Vec<RouteCompactionStats>> {
+        let mut candidates = self
+            .partitions
+            .read()
+            .iter()
+            .filter_map(|(route, partition)| {
+                let partition_read = partition.read();
+                if !partition_read.needs_compaction_with_policy(
+                    deleted_ratio_threshold,
+                    min_deleted_entries,
+                    min_wal_surplus_records,
+                ) {
+                    return None;
+                }
+                Some((
+                    route.clone(),
+                    partition_read.metrics().deleted_ratio,
+                    partition.clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        let limit = max_partitions.unwrap_or(usize::MAX);
+        let mut compacted = Vec::new();
+        for (route, _, partition) in candidates.into_iter().take(limit) {
+            let started = std::time::Instant::now();
+            let Some(stats) = Self::compact_partition_from_snapshot(
+                &partition,
+                deleted_ratio_threshold,
+                min_deleted_entries,
+                min_wal_surplus_records,
+            )?
+            else {
+                continue;
+            };
+            compacted.push(RouteCompactionStats {
+                route,
+                before_wal_records: stats.before_wal_records,
+                after_wal_records: stats.after_wal_records,
+                before_slab_entries: stats.before_slab_entries,
+                after_slab_entries: stats.after_slab_entries,
+                elapsed_ms: started.elapsed().as_millis(),
+            });
+        }
+        Ok(compacted)
+    }
+
+    fn compact_partition_from_snapshot(
+        partition: &Arc<RwLock<Partition>>,
+        deleted_ratio_threshold: f32,
+        min_deleted_entries: usize,
+        min_wal_surplus_records: usize,
+    ) -> Result<Option<CompactionStats>> {
+        let prepared = {
+            let partition = partition.read();
+            if !partition.needs_compaction_with_policy(
+                deleted_ratio_threshold,
+                min_deleted_entries,
+                min_wal_surplus_records,
+            ) {
+                return Ok(None);
+            }
+            partition.prepare_compaction()?
+        };
+        let mut partition = partition.write();
+        if partition.wal_records != prepared.before_wal_records
+            || partition.slab.len() != prepared.before_slab_entries
+        {
+            return Ok(None);
+        }
+        partition.apply_prepared_compaction(prepared).map(Some)
+    }
+
     pub fn partition_count(&self) -> usize {
         self.partitions.read().len()
     }
@@ -464,6 +546,16 @@ pub struct PartitionMetrics {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RouteCompactionStats {
+    pub route: String,
+    pub before_wal_records: usize,
+    pub after_wal_records: usize,
+    pub before_slab_entries: usize,
+    pub after_slab_entries: usize,
+    pub elapsed_ms: u128,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum PartitionState {
     Empty,
@@ -500,6 +592,9 @@ pub struct HnswMetricsSerde {
     pub max_level: isize,
     pub entry_point: Option<usize>,
     pub neighbor_refs: usize,
+    pub avg_neighbor_degree: f64,
+    pub layer_distribution: Vec<usize>,
+    pub disconnected_nodes: usize,
 }
 
 impl From<HnswMetrics> for HnswMetricsSerde {
@@ -512,6 +607,9 @@ impl From<HnswMetrics> for HnswMetricsSerde {
             max_level: value.max_level,
             entry_point: value.entry_point,
             neighbor_refs: value.neighbor_refs,
+            avg_neighbor_degree: value.avg_neighbor_degree,
+            layer_distribution: value.layer_distribution,
+            disconnected_nodes: value.disconnected_nodes,
         }
     }
 }
@@ -562,6 +660,14 @@ struct CompactionStats {
     after_wal_records: usize,
     before_slab_entries: usize,
     after_slab_entries: usize,
+}
+
+struct PreparedCompaction {
+    before_wal_records: usize,
+    before_slab_entries: usize,
+    compacted_slab: VectorSlab,
+    rebuilt_hnsw: Option<HnswIndex>,
+    compacted_count: usize,
 }
 
 impl Partition {
@@ -707,6 +813,11 @@ impl Partition {
     }
 
     fn compact(&mut self) -> Result<CompactionStats> {
+        let prepared = self.prepare_compaction()?;
+        self.apply_prepared_compaction(prepared)
+    }
+
+    fn prepare_compaction(&self) -> Result<PreparedCompaction> {
         let before_wal_records = self.wal_records;
         let before_slab_entries = self.slab.len();
         // Build the new slab from the old one's active entries.
@@ -726,31 +837,57 @@ impl Partition {
             )?;
             compacted_count += 1;
         }
+        let items = compacted_slab
+            .active_entries()
+            .map(|entry| (entry.entity_id.clone(), entry.vector.clone()))
+            .collect::<Vec<_>>();
+        let rebuilt_hnsw = if items.is_empty() {
+            None
+        } else {
+            Some(HnswIndex::build(items, HnswOptions::default()).map_err(anyhow::Error::msg)?)
+        };
+        Ok(PreparedCompaction {
+            before_wal_records,
+            before_slab_entries,
+            compacted_slab,
+            rebuilt_hnsw,
+            compacted_count,
+        })
+    }
+
+    fn apply_prepared_compaction(
+        &mut self,
+        prepared: PreparedCompaction,
+    ) -> Result<CompactionStats> {
         // Stream the compacted slab directly to the WAL file — no
         // intermediate Vec<WalRecord>. This avoids doubling memory
         // during compaction for routes with millions of vectors.
         wal::rewrite(
             &self.wal_path(),
-            compacted_slab.active_entries().map(|entry| WalRecord {
-                entity_id: entry.entity_id.clone(),
-                content_hash: entry.content_hash.clone(),
-                model: self.route.clone(),
-                dims: entry.vector.len(),
-                vector: entry.vector.clone(),
-                upserted_at: entry.upserted_at.clone(),
-                deleted_at: None,
-                route: self.route.clone(),
-            }),
+            prepared
+                .compacted_slab
+                .active_entries()
+                .map(|entry| WalRecord {
+                    entity_id: entry.entity_id.clone(),
+                    content_hash: entry.content_hash.clone(),
+                    model: self.route.clone(),
+                    dims: entry.vector.len(),
+                    vector: entry.vector.clone(),
+                    upserted_at: entry.upserted_at.clone(),
+                    deleted_at: None,
+                    route: self.route.clone(),
+                }),
         )?;
-        self.slab = compacted_slab;
-        self.wal_records = compacted_count;
-        self.rebuild_hnsw()?;
+        self.slab = prepared.compacted_slab;
+        self.wal_records = prepared.compacted_count;
+        self.hnsw = prepared.rebuilt_hnsw;
+        self.hnsw_rebuilds += 1;
         self.flush_derived_full()?;
 
         Ok(CompactionStats {
-            before_wal_records,
+            before_wal_records: prepared.before_wal_records,
             after_wal_records: self.wal_records,
-            before_slab_entries,
+            before_slab_entries: prepared.before_slab_entries,
             after_slab_entries: self.slab.len(),
         })
     }
@@ -879,6 +1016,19 @@ impl Partition {
     }
 
     fn needs_compaction(&self) -> bool {
+        self.needs_compaction_with_policy(
+            COMPACT_DELETED_RATIO,
+            COMPACT_MIN_DELETED_ENTRIES,
+            COMPACT_MIN_WAL_SURPLUS_RECORDS,
+        )
+    }
+
+    fn needs_compaction_with_policy(
+        &self,
+        deleted_ratio_threshold: f32,
+        min_deleted_entries: usize,
+        min_wal_surplus_records: usize,
+    ) -> bool {
         let active_count = self.slab.active_count();
         let deleted_count = self.slab.deleted_count();
         if deleted_count == 0 {
@@ -887,9 +1037,8 @@ impl Partition {
         let total = active_count + deleted_count;
         let deleted_ratio = deleted_count as f32 / total as f32;
         let wal_surplus = self.wal_records.saturating_sub(active_count);
-        deleted_ratio >= COMPACT_DELETED_RATIO
-            && (deleted_count >= COMPACT_MIN_DELETED_ENTRIES
-                || wal_surplus >= COMPACT_MIN_WAL_SURPLUS_RECORDS)
+        deleted_ratio >= deleted_ratio_threshold
+            && (deleted_count >= min_deleted_entries || wal_surplus >= min_wal_surplus_records)
     }
 
     fn wal_path(&self) -> PathBuf {
@@ -1087,6 +1236,45 @@ mod tests {
     }
 
     #[test]
+    fn compact_partitions_processes_multiple_over_threshold_routes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        for route in ["route-a", "route-b"] {
+            for idx in 0..10 {
+                let theta = idx as f32 * 0.01;
+                store
+                    .upsert(
+                        route,
+                        &format!("{route}-id-{idx}"),
+                        &format!("{route}-hash-{idx}"),
+                        vec![theta.cos(), theta.sin()],
+                    )
+                    .unwrap();
+            }
+            for idx in 0..4 {
+                store.delete(route, &format!("{route}-id-{idx}")).unwrap();
+            }
+        }
+
+        let stats = store
+            .compact_partitions_with_policy(0.30, 1, usize::MAX, None)
+            .unwrap();
+
+        assert_eq!(stats.len(), 2);
+        for route in ["route-a", "route-b"] {
+            let metrics = store.metrics().remove(route).unwrap();
+            assert_eq!(metrics.active_count, 6);
+            assert_eq!(metrics.deleted_count, 0);
+            assert_eq!(metrics.deleted_ratio, 0.0);
+            assert_eq!(
+                store.search(route, &[1.0, 0.0], 3).unwrap().len(),
+                3,
+                "search should be served from the rebuilt snapshot for {route}"
+            );
+        }
+    }
+
+    #[test]
     fn upsert_uses_incremental_hnsw_insertion() {
         let tmp = tempfile::tempdir().unwrap();
         let store = VectorStore::open(tmp.path()).unwrap();
@@ -1112,6 +1300,17 @@ mod tests {
         let partition = &metrics["voyage-1024"];
         assert_eq!(partition.active_count, 100);
         assert_eq!(partition.hnsw.as_ref().unwrap().total_nodes, 100);
+        assert_eq!(
+            partition
+                .hnsw
+                .as_ref()
+                .unwrap()
+                .layer_distribution
+                .iter()
+                .sum::<usize>(),
+            partition.active_count
+        );
+        assert_eq!(partition.hnsw.as_ref().unwrap().disconnected_nodes, 0,);
         assert!(partition.hnsw_rebuilds <= start_rebuilds + 2);
     }
 

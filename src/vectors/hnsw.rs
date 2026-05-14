@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, VecDeque};
 
 use ordered_float::NotNan;
 use sha2::{Digest, Sha256};
@@ -45,6 +45,9 @@ pub struct HnswMetrics {
     pub max_level: isize,
     pub entry_point: Option<usize>,
     pub neighbor_refs: usize,
+    pub avg_neighbor_degree: f64,
+    pub layer_distribution: Vec<usize>,
+    pub disconnected_nodes: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -145,19 +148,35 @@ impl HnswIndex {
     }
 
     pub fn metrics(&self) -> HnswMetrics {
+        let active_nodes = self.active.iter().filter(|active| **active).count();
+        let neighbor_refs = self
+            .graph
+            .iter()
+            .enumerate()
+            .filter(|(ordinal, _)| self.active[*ordinal])
+            .flat_map(|(_, layers)| layers.iter())
+            .map(|neighbors| {
+                neighbors
+                    .iter()
+                    .filter(|neighbor| self.active[**neighbor])
+                    .count()
+            })
+            .sum::<usize>();
         HnswMetrics {
             total_nodes: self.ids.len(),
-            active_nodes: self.active.iter().filter(|active| **active).count(),
+            active_nodes,
             deleted_nodes: self.active.iter().filter(|active| !**active).count(),
             dimensions: self.vectors.dimensions,
             max_level: self.max_level,
             entry_point: self.entry_point,
-            neighbor_refs: self
-                .graph
-                .iter()
-                .flat_map(|layers| layers.iter())
-                .map(Vec::len)
-                .sum(),
+            neighbor_refs,
+            avg_neighbor_degree: if active_nodes == 0 {
+                0.0
+            } else {
+                neighbor_refs as f64 / active_nodes as f64
+            },
+            layer_distribution: self.layer_distribution(),
+            disconnected_nodes: self.disconnected_nodes(),
         }
     }
 
@@ -207,6 +226,44 @@ impl HnswIndex {
         };
         self.entry_point = Some(ordinal);
         self.max_level = level as isize;
+    }
+
+    fn layer_distribution(&self) -> Vec<usize> {
+        let mut by_layer = vec![0usize; self.options.max_layers];
+        for (ordinal, level) in self.levels.iter().copied().enumerate() {
+            if !self.active[ordinal] {
+                continue;
+            }
+            by_layer[level.min(self.options.max_layers - 1)] += 1;
+        }
+        by_layer
+    }
+
+    fn disconnected_nodes(&self) -> usize {
+        let Some(entry_point) = self.entry_point else {
+            return 0;
+        };
+        let mut frontier = VecDeque::new();
+        let mut visited = vec![false; self.ids.len()];
+        visited[entry_point] = true;
+        frontier.push_back(entry_point);
+
+        while let Some(current) = frontier.pop_front() {
+            for neighbors in &self.graph[current] {
+                for &neighbor in neighbors {
+                    if !self.active[neighbor] || visited[neighbor] {
+                        continue;
+                    }
+                    visited[neighbor] = true;
+                    frontier.push_back(neighbor);
+                }
+            }
+        }
+        self.active
+            .iter()
+            .zip(visited.iter())
+            .filter(|(active, visited)| **active && !**visited)
+            .count()
     }
 
     fn insert_internal(&mut self, ordinal: usize) {
@@ -510,6 +567,58 @@ mod tests {
         let hits = index.search(&[1.0, 0.0, 0.0, 0.0], 2);
         assert_eq!(hits[0].id, "x");
         assert!(hits[0].distance <= 0.001);
+    }
+
+    #[test]
+    fn health_metrics_report_layer_and_neighbor_summary() {
+        let index = HnswIndex::build(
+            vec![
+                ("x".to_string(), vec![1.0, 0.0, 0.0, 0.0]),
+                ("y".to_string(), vec![0.0, 1.0, 0.0, 0.0]),
+                ("z".to_string(), vec![0.0, 0.0, 1.0, 0.0]),
+            ],
+            HnswOptions {
+                m: 4,
+                ef_construction: 20,
+                ef_search: 20,
+                max_layers: 4,
+            },
+        )
+        .unwrap();
+
+        let metrics = index.metrics();
+        assert_eq!(metrics.total_nodes, 3);
+        assert_eq!(metrics.active_nodes, 3);
+        assert_eq!(metrics.deleted_nodes, 0);
+        assert_eq!(metrics.layer_distribution.iter().sum::<usize>(), 3);
+        assert!(metrics.avg_neighbor_degree >= 0.0);
+        assert_eq!(metrics.disconnected_nodes, 0);
+    }
+
+    #[test]
+    fn disconnected_nodes_detects_orphaned_active_vectors() {
+        let mut index = HnswIndex::build(
+            vec![
+                ("x".to_string(), vec![1.0, 0.0, 0.0, 0.0]),
+                ("y".to_string(), vec![0.0, 1.0, 0.0, 0.0]),
+            ],
+            HnswOptions {
+                m: 4,
+                ef_construction: 20,
+                ef_search: 20,
+                max_layers: 4,
+            },
+        )
+        .unwrap();
+
+        for level in &mut index.graph {
+            for edges in level {
+                edges.clear();
+            }
+        }
+        index.entry_point = Some(0);
+        index.max_level = 0;
+        assert_eq!(index.metrics().disconnected_nodes, 1);
     }
 
     #[test]

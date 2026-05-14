@@ -78,6 +78,7 @@ struct EmbedQueueInner {
     senders: RwLock<BTreeMap<String, mpsc::UnboundedSender<WorkerCommand>>>,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
     router: Option<EmbeddingRouter>,
+    vector_store: Option<Arc<crate::vectors::VectorStore>>,
     debounce: Duration,
     retry_backoff: Duration,
 }
@@ -100,13 +101,23 @@ struct WorkerSpec {
     debounce: Duration,
     retry_backoff: Duration,
     statuses: Arc<RwLock<BTreeMap<String, RouteStatus>>>,
+    vector_store: Option<Arc<crate::vectors::VectorStore>>,
     persist_vectors: bool,
 }
 
 impl EmbedQueueHandle {
     pub fn start_default() -> Self {
+        Self::start_default_with_store(crate::vectors::global())
+    }
+
+    pub fn start_default_with_store(vector_store: Arc<crate::vectors::VectorStore>) -> Self {
         match EmbeddingRouter::load_default() {
-            Ok(router) => Self::from_router(router, DEFAULT_DEBOUNCE, DEFAULT_RETRY_BACKOFF),
+            Ok(router) => Self::from_router(
+                router,
+                DEFAULT_DEBOUNCE,
+                DEFAULT_RETRY_BACKOFF,
+                vector_store,
+            ),
             Err(err) => {
                 tracing::warn!(error = %err, "embedding router config failed; embedding queue disabled");
                 Self::disabled_with_error(err)
@@ -114,7 +125,12 @@ impl EmbedQueueHandle {
         }
     }
 
-    fn from_router(router: EmbeddingRouter, debounce: Duration, retry_backoff: Duration) -> Self {
+    fn from_router(
+        router: EmbeddingRouter,
+        debounce: Duration,
+        retry_backoff: Duration,
+        vector_store: Arc<crate::vectors::VectorStore>,
+    ) -> Self {
         let mut providers: Vec<ProviderSpec> = Vec::new();
         for bucket in Bucket::ALL {
             let route = bucket.as_str().to_string();
@@ -157,7 +173,13 @@ impl EmbedQueueHandle {
                 }
             }
         }
-        Self::from_providers(providers, debounce, retry_backoff, Some(router))
+        Self::from_providers(
+            providers,
+            debounce,
+            retry_backoff,
+            Some(router),
+            Some(vector_store),
+        )
     }
 
     pub fn enqueue(&self, request: EmbedRequest) -> bool {
@@ -226,12 +248,14 @@ impl EmbedQueueHandle {
     }
 
     pub fn tombstone(&self, entity_id: &str) {
-        if let Err(err) = crate::vectors::delete_entity_all_routes(entity_id) {
-            tracing::warn!(
-                entity_id,
-                error = %err,
-                "embedding tombstone failed; vector WAL can be reconstructed by reindex"
-            );
+        if let Some(vector_store) = &self.inner.vector_store {
+            if let Err(err) = vector_store.delete_entity_all_routes(entity_id) {
+                tracing::warn!(
+                    entity_id,
+                    error = %err,
+                    "embedding tombstone failed; vector WAL can be reconstructed by reindex"
+                );
+            }
         }
         tracing::debug!(entity_id, "embedding tombstone accepted");
     }
@@ -265,23 +289,14 @@ impl EmbedQueueHandle {
     }
 
     fn should_embed(&self, request: &EmbedRequest, vector_route: &str) -> bool {
+        let Some(vector_store) = &self.inner.vector_store else {
+            return true;
+        };
         if self.inner.router.is_none() {
             return true;
         }
-        match crate::vectors::try_contains_active_if_initialized(
-            vector_route,
-            &request.entity_id,
-            &request.chunk_hash,
-        ) {
-            Ok(Some(already_indexed)) => !already_indexed,
-            Ok(None) => {
-                tracing::debug!(
-                    vector_route,
-                    entity_id = %request.entity_id,
-                    "embedding dedup check skipped because vector store is still initializing"
-                );
-                true
-            }
+        match vector_store.contains_active(vector_route, &request.entity_id, &request.chunk_hash) {
+            Ok(already_indexed) => !already_indexed,
             Err(err) => {
                 tracing::warn!(
                     vector_route,
@@ -333,6 +348,7 @@ impl EmbedQueueHandle {
             debounce: self.inner.debounce,
             retry_backoff: self.inner.retry_backoff,
             statuses: self.inner.statuses.clone(),
+            vector_store: self.inner.vector_store.clone(),
             persist_vectors: true,
         };
         tokio::spawn(worker_loop(spec, rx));
@@ -361,6 +377,7 @@ impl EmbedQueueHandle {
                 senders: RwLock::new(BTreeMap::new()),
                 statuses: Arc::new(RwLock::new(statuses)),
                 router: None,
+                vector_store: None,
                 debounce: DEFAULT_DEBOUNCE,
                 retry_backoff: DEFAULT_RETRY_BACKOFF,
             }),
@@ -381,7 +398,17 @@ impl EmbedQueueHandle {
             debounce,
             retry_backoff,
             None,
+            None,
         )
+    }
+
+    #[cfg(test)]
+    fn from_router_for_test(
+        router: EmbeddingRouter,
+        debounce: Duration,
+        retry_backoff: Duration,
+    ) -> Self {
+        Self::from_providers(Vec::new(), debounce, retry_backoff, Some(router), None)
     }
 
     fn from_providers(
@@ -389,6 +416,7 @@ impl EmbedQueueHandle {
         debounce: Duration,
         retry_backoff: Duration,
         router: Option<EmbeddingRouter>,
+        vector_store: Option<Arc<crate::vectors::VectorStore>>,
     ) -> Self {
         let statuses = Arc::new(RwLock::new(BTreeMap::new()));
         let mut senders = BTreeMap::new();
@@ -409,7 +437,8 @@ impl EmbedQueueHandle {
                 debounce,
                 retry_backoff,
                 statuses: statuses.clone(),
-                persist_vectors: router.is_some(),
+                vector_store: vector_store.clone(),
+                persist_vectors: vector_store.is_some(),
             };
             tokio::spawn(worker_loop(spec, rx));
             senders.insert(route, tx);
@@ -419,6 +448,7 @@ impl EmbedQueueHandle {
                 senders: RwLock::new(senders),
                 statuses,
                 router,
+                vector_store,
                 debounce,
                 retry_backoff,
             }),
@@ -724,7 +754,10 @@ fn persist_vectors(
             }
         })
         .collect();
-    crate::vectors::upsert_batch(&spec.vector_route, records)?;
+    let Some(store) = &spec.vector_store else {
+        return Ok(());
+    };
+    store.upsert_batch(&spec.vector_route, records)?;
     for (request, vector) in contradiction_checks {
         crate::embed_queue::maybe_detect_knowledge_contradiction(
             &request,
@@ -1032,7 +1065,7 @@ mod tests {
             "#,
         )
         .unwrap();
-        let queue = EmbedQueueHandle::from_router(
+        let queue = EmbedQueueHandle::from_router_for_test(
             router,
             Duration::from_millis(10),
             Duration::from_millis(20),
