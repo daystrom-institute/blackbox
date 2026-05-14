@@ -348,14 +348,15 @@ mod tests {
     use crate::notes::NoteKind;
     use tempfile::tempdir;
 
-    fn gap_body(title: &str, dedupe_key: &str) -> String {
+    fn gap_body(title: &str, dedupe_slug: &str) -> String {
         serde_json::json!({
             "type": GAP_NOTE_TYPE,
             "title": title,
             "gap_kind": "workflow",
+            "domain": "gap-spool-test",
             "wanted_capability": title,
             "impact": "high",
-            "dedupe_key": dedupe_key
+            "dedupe_key": format!("workflow/gap-spool-test/{dedupe_slug}")
         })
         .to_string()
     }
@@ -368,7 +369,7 @@ mod tests {
         fs::create_dir_all(&inbox).unwrap();
         fs::write(
             inbox.join("gap.json"),
-            gap_body("Need workflow latch", "workflow/latch"),
+            gap_body("Need workflow latch", "latch"),
         )
         .unwrap();
 
@@ -397,7 +398,7 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         fs::write(
             host.join("gap.json"),
-            gap_body("Need host hook", "host/hook"),
+            gap_body("Need host hook", "host-hook"),
         )
         .unwrap();
         let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
@@ -444,11 +445,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let host = dir.path().join("host/inbox");
         fs::create_dir_all(&host).unwrap();
-        fs::write(
-            host.join("first.json"),
-            gap_body("Need hook", "workflow/hook"),
-        )
-        .unwrap();
+        fs::write(host.join("first.json"), gap_body("Need hook", "hook")).unwrap();
         let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
 
@@ -463,7 +460,7 @@ mod tests {
 
         fs::write(
             host.join("second.json"),
-            gap_body("Need hook again", "workflow/hook"),
+            gap_body("Need hook again", "hook"),
         )
         .unwrap();
         let second = import_gap_spool_from_dirs(

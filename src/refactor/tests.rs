@@ -4883,6 +4883,71 @@ mod rx_f2b_obligation_tests {
         );
     }
 
+    #[test]
+    fn continue_for_repair_after_plan_writes_rolls_back_prior_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_dir = tempfile::tempdir().unwrap();
+        let _guard = with_state_dir_and_lock(state_dir.path());
+        let script = make_failing_capture_script(dir.path(), "cargo_check", 1, 0);
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "fn keep() {}\n").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "final check rolls back plan writes before soft fail".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "add_rust_mod_decl".into(),
+                            source: "lib.rs".into(),
+                            module_name: Some("generated".into()),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    RefactorRunStep::Command {
+                        command: path_string(&script),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(false),
+                        capture: Some(CaptureSpec::RustcJson),
+                        on_failure: Some(OnFailure::ContinueForRepair),
+                    },
+                    RefactorRunStep::Plan {
+                        params: RefactorPlanParams {
+                            kind: "test_consume_obligation".into(),
+                            source: "last".into(),
+                            ..Default::default()
+                        },
+                        optional: false,
+                    },
+                    RefactorRunStep::Command {
+                        command: "false".into(),
+                        args: Vec::new(),
+                        cwd: None,
+                        touches: Vec::new(),
+                        required: Some(true),
+                        capture: None,
+                        on_failure: None,
+                    },
+                ],
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+
+        let resp: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(resp.status, "step_failed", "{response}");
+        assert!(resp.rolled_back, "should have rolled back");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "fn keep() {}\n");
+    }
+
     // ── Gate C: multi-soft-fail cursor stays at FIRST soft-fail ──
 
     #[test]
@@ -5856,6 +5921,49 @@ impl Cache {
                 || steps["items"].get("$ref").is_some(),
             "bbox_refactor_run.steps should expose structured RefactorRunStep variants: {steps}"
         );
+    }
+
+    #[test]
+    fn refactor_run_tool_schema_exposes_structured_step_variants() {
+        let router = crate::tools::refactor::router();
+        let tool = router
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name.as_ref() == "bbox_refactor_run")
+            .expect("bbox_refactor_run should be registered");
+        let schema = serde_json::Value::Object((*tool.input_schema).clone());
+        let steps = &schema["properties"]["steps"];
+        assert_ne!(
+            steps["items"]["type"], "string",
+            "bbox_refactor_run tool schema must not advertise steps as string[]: {steps}"
+        );
+        assert!(
+            steps["items"].get("oneOf").is_some()
+                || steps["items"].get("anyOf").is_some()
+                || steps["items"].get("$ref").is_some(),
+            "bbox_refactor_run tool schema should expose structured RefactorRunStep variants: {steps}"
+        );
+    }
+
+    #[test]
+    fn refactor_run_params_accept_legacy_json_string_steps() {
+        let raw = serde_json::json!({
+            "title": "legacy encoded steps",
+            "project_dir": "/tmp/project",
+            "steps": [
+                r#"{"op":"command","command":"cargo","args":["check"]}"#
+            ]
+        });
+
+        let params: RefactorRunParams = serde_json::from_value(raw).unwrap();
+        assert_eq!(params.steps.len(), 1);
+        match &params.steps[0] {
+            RefactorRunStep::Command { command, args, .. } => {
+                assert_eq!(command, "cargo");
+                assert_eq!(args, &vec!["check".to_string()]);
+            }
+            other => panic!("expected command step, got {other:?}"),
+        }
     }
 
     // G15: bbox_refactor_apply refuses to apply when the caller's cwd

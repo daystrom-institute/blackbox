@@ -44,22 +44,24 @@ pub struct ImplPartitionGraph {
 /// Analyze the named impl block(s) in `source_path`, returning a partition
 /// graph with per-method field reads/writes/calls and inferred edges.
 ///
-/// `impl_name` is the simple type name (e.g. `"BlackboxServer"`) matched
-/// against the `impl_item`'s `type` field in the tree-sitter AST. All impl
-/// blocks for that type are merged; methods are ordered by source byte position.
+/// `impl_name` accepts either the simple type name (e.g. `"BlackboxServer"`)
+/// or the impl header text emitted by `bbox_refactor_status` (e.g.
+/// `"impl BlackboxServer"`). All impl blocks for that type are merged; methods
+/// are ordered by source byte position.
 ///
 /// `semantic_status: IndexedHints` — tree-sitter only; calls that don't resolve
 /// to a method in the same set of impl blocks are placed in `unresolved_callbacks`.
 pub fn analyze_impl(source_path: &Path, impl_name: &str) -> Result<ImplPartitionGraph> {
     let parsed = parse_rust_file(source_path)?;
     let root = parsed.tree.root_node();
+    let requested_impl = normalize_impl_query(impl_name);
 
     // Collect all impl blocks whose `type` field matches the given name
     let mut cursor = root.walk();
     let impl_nodes: Vec<Node> = root
         .named_children(&mut cursor)
         .filter(|node| node.kind() == "impl_item")
-        .filter(|node| impl_type_name(*node, &parsed.source).as_deref() == Some(impl_name))
+        .filter(|node| impl_matches(*node, &parsed.source, impl_name, &requested_impl))
         .collect();
 
     if impl_nodes.is_empty() {
@@ -70,7 +72,11 @@ pub fn analyze_impl(source_path: &Path, impl_name: &str) -> Result<ImplPartition
     }
 
     // Collect struct field declarations for the type (best-effort; struct may be elsewhere)
-    let struct_field_types = collect_struct_field_types(&parsed, impl_name);
+    let struct_type_name = impl_nodes
+        .first()
+        .and_then(|node| impl_type_name(*node, &parsed.source))
+        .unwrap_or(requested_impl);
+    let struct_field_types = collect_struct_field_types(&parsed, &struct_type_name);
 
     // First pass: build the complete method-name set across all matching impl blocks.
     // Used to distinguish intra-impl calls from unresolved external callbacks.
@@ -109,6 +115,33 @@ fn impl_type_name(impl_node: Node, source: &str) -> Option<String> {
         .child_by_field_name("type")
         .and_then(|t| t.utf8_text(source.as_bytes()).ok())
         .map(str::to_string)
+}
+
+fn impl_header_name(impl_node: Node, source: &str) -> Option<String> {
+    impl_node
+        .utf8_text(source.as_bytes())
+        .ok()
+        .and_then(|text| text.split('{').next())
+        .map(|text| text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|text| !text.is_empty())
+}
+
+fn normalize_impl_query(impl_name: &str) -> String {
+    let compact = impl_name.split_whitespace().collect::<Vec<_>>().join(" ");
+    compact
+        .strip_prefix("impl ")
+        .map(str::to_string)
+        .unwrap_or(compact)
+}
+
+fn impl_matches(
+    impl_node: Node,
+    source: &str,
+    requested_header: &str,
+    requested_type: &str,
+) -> bool {
+    impl_type_name(impl_node, source).as_deref() == Some(requested_type)
+        || impl_header_name(impl_node, source).as_deref() == Some(requested_header)
 }
 
 fn extract_impl_router(parsed: &ParsedSource, impl_node: Node) -> Option<String> {
@@ -606,6 +639,13 @@ impl Widget {
         .unwrap();
 
         let graph = analyze_impl(&source_path, "Widget").expect("analyze_impl should succeed");
+        let header_graph =
+            analyze_impl(&source_path, "impl Widget").expect("status-style impl name should work");
+        assert_eq!(
+            header_graph.methods.len(),
+            graph.methods.len(),
+            "status-style impl names should select the same impl blocks"
+        );
         let method_names: BTreeSet<_> = graph.methods.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(
             method_names,

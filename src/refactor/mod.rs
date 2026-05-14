@@ -565,6 +565,7 @@ pub struct RefactorRunParams {
     /// Project root used for relative paths.
     pub project_dir: String,
     /// Ordered primitive-plan steps.
+    #[serde(deserialize_with = "deserialize_refactor_run_steps")]
     pub steps: Vec<RefactorRunStep>,
     /// Must be true to write files. Otherwise returns a plan-only report.
     #[serde(default)]
@@ -664,6 +665,28 @@ pub enum RefactorRunStep {
         #[serde(default)]
         on_failure: Option<OnFailure>,
     },
+}
+
+fn deserialize_refactor_run_steps<'de, D>(deserializer: D) -> Result<Vec<RefactorRunStep>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum StepInput {
+        Structured(RefactorRunStep),
+        JsonString(String),
+    }
+
+    Vec::<StepInput>::deserialize(deserializer)?
+        .into_iter()
+        .map(|step| match step {
+            StepInput::Structured(step) => Ok(step),
+            StepInput::JsonString(raw) => {
+                serde_json::from_str::<RefactorRunStep>(&raw).map_err(serde::de::Error::custom)
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
@@ -2126,9 +2149,6 @@ pub fn run_with_ctx(
                     continue;
                 }
 
-                // Capture snapshot count before touches so the soft-fail cursor
-                // points to the START of this step (includes the step's own touches).
-                let step_snapshot_start = snapshots.len();
                 let touched_paths = touches
                     .iter()
                     .map(|path| resolve_path(Some(&path_string(&project_dir)), path))
@@ -2269,13 +2289,11 @@ pub fn run_with_ctx(
                         }
                         OnFailure::ContinueForRepair => {
                             // Open a repair obligation and continue (RX-F2b).
-                            // The cursor points to the START of this step so that
-                            // the step's own touches are included in rollback.
-                            capture_ctx.open_obligation(
-                                "last".to_string(),
-                                idx,
-                                step_snapshot_start,
-                            );
+                            // The repair gate validates the whole transaction
+                            // segment so far. Later terminal failure must
+                            // restore prior plan writes as well as this
+                            // command's declared touches.
+                            capture_ctx.open_obligation("last".to_string(), idx, 0);
                         }
                     }
                 }
