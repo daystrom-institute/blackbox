@@ -27,7 +27,8 @@ with rollback across primitive-plan file writes if a later required step fails.
 
 Plan kinds, grouped by intent:
 
-- Syntactic moves / deletes: `extract_rust_items`, `extract_rust_impl_methods`,
+- Syntactic moves / deletes: `extract_rust_items`, `extract_rust_section`,
+  `move_rust_items_with_local_deps`, `extract_rust_impl_methods`,
   `extract_rust_function_region`, `lift_rust_inherent_to_free`,
   `extract_rust_trait`, `move_rust_struct_fields`,
   `delete_rust_items`, `move_file`,
@@ -75,6 +76,16 @@ Writable plan kinds:
   Optional `target_prelude` is inserted before generated target content when it
   is not already present; use it for child-module imports needed by derives and
   external crates.
+- `extract_rust_section`: move every complete named top-level Rust item inside a
+  marker or line-delimited source range. Bounds come from
+  `toml_entries.start_marker` + `end_marker` or `start_line` + `end_line`.
+  The planner refuses ranges that split a top-level item, then delegates to the
+  same extraction/validation machinery as `extract_rust_items`.
+- `move_rust_items_with_local_deps`: move named top-level Rust items plus private
+  top-level dependencies that are exclusively referenced by the moving closure.
+  Shared or externally referenced dependencies stay in the source and are
+  reported in leftovers. This is syntax/index-hint closure, not full Rust name
+  resolution; run `cargo check` after applying.
 - `extract_rust_impl_methods`: move named methods out of one `impl` block into
   another file, preserving method attributes/modifiers such as `async` and
   optionally generating a `#[tool_router(router = name)]` wrapper around the

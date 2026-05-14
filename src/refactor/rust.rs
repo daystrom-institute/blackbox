@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RustImplMethod {
@@ -175,6 +176,183 @@ pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> 
         fixme_count: None,
     };
 
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+pub(crate) fn plan_extract_rust_section(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let parsed = parse_rust_file(&source_path)?;
+    let (start, end) = rust_section_bounds(p, &parsed.source)?;
+    if start >= end {
+        bail!("extract_rust_section bounds are empty");
+    }
+    let items = rust_items(&parsed);
+    let mut selected = Vec::new();
+    let mut partial = Vec::new();
+    for item in &items {
+        let item_start = item.byte_start;
+        let item_end = item.byte_end;
+        if item_start >= start && item_end <= end {
+            if let Some(name) = item.name.clone() {
+                selected.push(name);
+            }
+        } else if item_start < end && item_end > start {
+            partial.push(format!(
+                "{} {} bytes {}..{}",
+                item.kind,
+                item.name.as_deref().unwrap_or("(unnamed)"),
+                item_start,
+                item_end
+            ));
+        }
+    }
+    if !partial.is_empty() {
+        bail!(
+            "extract_rust_section bounds split top-level item(s): {}",
+            partial.join(", ")
+        );
+    }
+    if selected.is_empty() {
+        bail!("extract_rust_section selected no named top-level items");
+    }
+
+    let mut delegated = p.clone();
+    delegated.kind = "extract_rust_items".to_string();
+    delegated.item_names = Some(selected.clone());
+    let plan_text = plan_extract_rust_items(&delegated)?;
+    let mut plan: RefactorPlan = serde_json::from_str(&plan_text)?;
+    plan.kind = "extract_rust_section".to_string();
+    plan.title = format!(
+        "extract Rust section ({} item(s)) from {} to {}",
+        selected.len(),
+        path_string(&source_path),
+        p.target.as_deref().unwrap_or("<missing target>")
+    );
+    plan.leftovers.insert(
+        0,
+        format!(
+            "section bounds bytes {start}..{end}; selected items: {}",
+            selected.join(", ")
+        ),
+    );
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+pub(crate) fn plan_move_rust_items_with_local_deps(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let seeds = p
+        .item_names
+        .as_deref()
+        .filter(|names| !names.is_empty())
+        .ok_or_else(|| anyhow!("item_names is required for move_rust_items_with_local_deps"))?;
+    if p.item_kinds
+        .as_deref()
+        .is_some_and(|kinds| kinds.iter().any(|kind| kind == "impl_method"))
+    {
+        bail!("move_rust_items_with_local_deps does not support impl_method");
+    }
+
+    let graph = super::rust_top_level_deps::analyze_top_level(
+        &source_path,
+        p.project_dir.as_deref(),
+        None,
+        None,
+    )?;
+    let item_order = graph
+        .items
+        .iter()
+        .map(|item| item.name.clone())
+        .collect::<Vec<_>>();
+    let item_names = item_order.iter().cloned().collect::<HashSet<_>>();
+    for seed in seeds {
+        if !item_names.contains(seed) {
+            bail!("requested Rust item `{seed}` was not found");
+        }
+    }
+
+    let external_refs = graph.external_references.iter().fold(
+        HashMap::<String, usize>::new(),
+        |mut acc, reference| {
+            *acc.entry(reference.item.clone()).or_default() += 1;
+            acc
+        },
+    );
+    let mut outgoing = HashMap::<String, Vec<String>>::new();
+    let mut incoming = HashMap::<String, Vec<String>>::new();
+    for edge in &graph.edges {
+        outgoing
+            .entry(edge.from.clone())
+            .or_default()
+            .push(edge.to.clone());
+        incoming
+            .entry(edge.to.clone())
+            .or_default()
+            .push(edge.from.clone());
+    }
+
+    let mut closure = seeds.iter().cloned().collect::<HashSet<_>>();
+    let mut shared = BTreeSet::<String>::new();
+    loop {
+        let mut changed = false;
+        for source in closure.clone() {
+            for target in outgoing.get(source.as_str()).into_iter().flatten() {
+                if closure.contains(target) {
+                    continue;
+                }
+                let has_external_refs = external_refs.get(target).copied().unwrap_or(0) > 0;
+                let only_referenced_by_closure = incoming
+                    .get(target)
+                    .is_none_or(|sources| sources.iter().all(|source| closure.contains(source)));
+                if !has_external_refs && only_referenced_by_closure {
+                    closure.insert(target.clone());
+                    changed = true;
+                } else {
+                    shared.insert(target.clone());
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    let expanded = item_order
+        .into_iter()
+        .filter(|name| closure.contains(name))
+        .collect::<Vec<_>>();
+    let mut delegated = p.clone();
+    delegated.kind = "extract_rust_items".to_string();
+    delegated.item_names = Some(expanded.clone());
+    let plan_text = plan_extract_rust_items(&delegated)?;
+    let mut plan: RefactorPlan = serde_json::from_str(&plan_text)?;
+    plan.kind = "move_rust_items_with_local_deps".to_string();
+    plan.title = format!(
+        "move {} Rust item(s) with local dependencies from {} to {}",
+        expanded.len(),
+        path_string(&source_path),
+        p.target.as_deref().unwrap_or("<missing target>")
+    );
+    let added = expanded
+        .iter()
+        .filter(|name| !seeds.iter().any(|seed| seed == *name))
+        .cloned()
+        .collect::<Vec<_>>();
+    plan.leftovers.insert(
+        0,
+        format!(
+            "local dependency closure seeds=[{}] added=[{}]",
+            seeds.join(", "),
+            added.join(", ")
+        ),
+    );
+    if !shared.is_empty() {
+        plan.leftovers.push(format!(
+            "shared or externally referenced dependencies left in source: {}",
+            shared.into_iter().collect::<Vec<_>>().join(", ")
+        ));
+    }
     validate_plan_shape(&plan)?;
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -991,6 +1169,56 @@ fn rust_module_wiring_remove_use_edit(
         offset += line.len();
     }
     bail!("use declaration for `{use_path}` not found")
+}
+
+fn rust_section_bounds(p: &RefactorPlanParams, source: &str) -> Result<(usize, usize)> {
+    let entries = p
+        .toml_entries
+        .as_ref()
+        .ok_or_else(|| anyhow!("toml_entries is required for extract_rust_section"))?;
+    let start = if let Some(marker) = entries.get("start_marker").and_then(|value| value.as_str()) {
+        source
+            .find(marker)
+            .map(|byte| byte + marker.len())
+            .ok_or_else(|| anyhow!("start_marker `{marker}` not found"))?
+    } else if let Some(line) = entries.get("start_line").and_then(|value| value.as_u64()) {
+        rust_line_start_byte(source, line as usize)?
+    } else {
+        bail!("extract_rust_section requires start_marker or start_line");
+    };
+    let end = if let Some(marker) = entries.get("end_marker").and_then(|value| value.as_str()) {
+        source[start..]
+            .find(marker)
+            .map(|offset| start + offset)
+            .ok_or_else(|| anyhow!("end_marker `{marker}` not found after start"))?
+    } else if let Some(line) = entries.get("end_line").and_then(|value| value.as_u64()) {
+        rust_line_start_byte(source, line as usize + 1).unwrap_or(source.len())
+    } else {
+        bail!("extract_rust_section requires end_marker or end_line");
+    };
+    Ok((start, end))
+}
+
+fn rust_line_start_byte(source: &str, one_based_line: usize) -> Result<usize> {
+    if one_based_line == 0 {
+        bail!("line numbers are 1-based");
+    }
+    if one_based_line == 1 {
+        return Ok(0);
+    }
+    let mut current_line = 1usize;
+    for (idx, ch) in source.char_indices() {
+        if ch == '\n' {
+            current_line += 1;
+            if current_line == one_based_line {
+                return Ok(idx + 1);
+            }
+        }
+    }
+    if current_line + 1 == one_based_line {
+        return Ok(source.len());
+    }
+    bail!("line {one_based_line} is outside source")
 }
 
 pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String> {

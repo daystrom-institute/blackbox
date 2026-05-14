@@ -245,6 +245,135 @@ mod tests {
     }
 
     #[test]
+    fn extract_rust_section_moves_marker_delimited_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("section.rs");
+        fs::write(
+            &source,
+            "fn keep_before() {}\n\n// section:start\nfn alpha() {}\n\nstruct Beta;\n// section:end\n\nfn keep_after() {}\n",
+        )
+        .unwrap();
+        let entries = BTreeMap::from([
+            (
+                "start_marker".to_string(),
+                serde_json::Value::String("// section:start".to_string()),
+            ),
+            (
+                "end_marker".to_string(),
+                serde_json::Value::String("// section:end".to_string()),
+            ),
+        ]);
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_section".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(plan_value["kind"], "extract_rust_section");
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("fn alpha()"));
+        assert!(target_text.contains("struct Beta;"));
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(source_text.contains("fn keep_before()"));
+        assert!(source_text.contains("fn keep_after()"));
+        assert!(!source_text.contains("fn alpha()"));
+    }
+
+    #[test]
+    fn extract_rust_section_refuses_partial_item_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("section.rs");
+        fs::write(&source, "fn alpha() {\n    // marker\n}\n").unwrap();
+        let entries = BTreeMap::from([
+            (
+                "start_marker".to_string(),
+                serde_json::Value::String("// marker".to_string()),
+            ),
+            (
+                "end_line".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(3)),
+            ),
+        ]);
+
+        let err = plan(&RefactorPlanParams {
+            kind: "extract_rust_section".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("split top-level item"));
+    }
+
+    #[test]
+    fn move_rust_items_with_local_deps_includes_private_helper_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        let target = dir.path().join("moved.rs");
+        fs::write(
+            &source,
+            "fn entry() { helper(); shared(); }\nfn helper() {}\nfn shared() {}\nfn other() { shared(); }\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "move_rust_items_with_local_deps".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["entry".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(plan_value["kind"], "move_rust_items_with_local_deps");
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("fn entry()"));
+        assert!(target_text.contains("fn helper()"));
+        assert!(!target_text.contains("fn shared()"));
+        let source_text = fs::read_to_string(&source).unwrap();
+        assert!(source_text.contains("fn shared()"));
+        assert!(source_text.contains("fn other()"));
+        assert!(!source_text.contains("fn helper()"));
+    }
+
+    #[test]
     fn extract_impl_methods_wraps_target_router_and_applies() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
