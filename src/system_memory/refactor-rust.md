@@ -8,8 +8,9 @@ blackbox refactor tools.
 For recurring Rust refactor patterns, check `atom_search(query="<intent>")`
 before re-deriving the whole tool sequence. Use atoms as contextual shortcuts
 for patterns such as impl partition inventory, public-API preflight, test
-island extraction, state extraction, trait extraction, error migration, or
-large impl splitting. The atom manifest is the source of truth for version,
+island extraction, state extraction, trait extraction, error migration, large
+impl splitting, single-domain impl-method extraction with wiring, or bin-to-lib
+module migration. The atom manifest is the source of truth for version,
 inputs, cost, and prompt text; this memory keeps the primitive plan-kind map
 and safety invariants.
 

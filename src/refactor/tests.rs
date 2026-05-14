@@ -5606,6 +5606,241 @@ impl Cache {
         }
     }
 
+    #[test]
+    fn split_rust_impl_methods_expansion_includes_all_wiring_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("server.rs");
+        fs::write(
+            &source,
+            "struct Server;\n\nimpl Server {\n    fn handle_search(&self) {}\n    fn handle_browse(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "extract search methods".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "split_rust_impl_methods_to_submodule".into(),
+                        source: "server.rs".into(),
+                        target: Some("server/search.rs".into()),
+                        item_names: Some(vec!["handle_search".into()]),
+                        impl_name: Some("impl Server".into()),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[g15_project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "planned");
+        let kinds: Vec<&str> = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect();
+        assert!(kinds.contains(&"add_rust_mod_decl"));
+        assert!(kinds.contains(&"extract_rust_impl_methods"));
+        assert!(kinds.contains(&"rust_organize_imports"));
+        assert!(kinds.contains(&"rust_compile_fix_round"));
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| step.title.as_deref() == Some("cargo check --message-format=json"))
+        );
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| step.title.as_deref() == Some("cargo check"))
+        );
+    }
+
+    #[test]
+    fn split_rust_impl_methods_respects_skip_organize_imports() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("server.rs");
+        fs::write(
+            &source,
+            "struct Server;\n\nimpl Server {\n    fn do_work(&self) {}\n}\n",
+        )
+        .unwrap();
+        let entries = BTreeMap::from([(
+            "skip_organize_imports".to_string(),
+            serde_json::Value::Bool(true),
+        )]);
+
+        let response = run(
+            &RefactorRunParams {
+                title: "extract without organize".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "split_rust_impl_methods_to_submodule".into(),
+                        source: "server.rs".into(),
+                        target: Some("server/work.rs".into()),
+                        item_names: Some(vec!["do_work".into()]),
+                        impl_name: Some("impl Server".into()),
+                        toml_entries: Some(entries),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[g15_project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "planned");
+        assert!(
+            !run_response
+                .steps
+                .iter()
+                .any(|step| step.kind.as_deref() == Some("rust_organize_imports"))
+        );
+    }
+
+    #[test]
+    fn migrate_rust_mods_to_lib_expansion_includes_all_wiring_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"my-crate\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("main.rs"),
+            "mod alpha;\nmod beta;\nfn main() { crate::alpha::go(); crate::beta::go(); }\n",
+        )
+        .unwrap();
+        fs::write(src_dir.join("lib.rs"), "").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "migrate alpha and beta".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "migrate_rust_mods_to_lib".into(),
+                        source: "src/main.rs".into(),
+                        item_names: Some(vec!["alpha".into(), "beta".into()]),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[g15_project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "planned");
+        let kinds: Vec<&str> = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect();
+        assert!(kinds.contains(&"copy_rust_mod_decls"));
+        assert!(kinds.contains(&"delete_rust_items"));
+        assert!(kinds.contains(&"rewrite_rust_bin_crate_paths"));
+        assert!(kinds.contains(&"rust_compile_fix_round"));
+        assert!(run_response.steps.iter().any(|step| {
+            step.title.as_deref() == Some("cargo check --bins --message-format=json")
+        }));
+        assert!(
+            run_response
+                .steps
+                .iter()
+                .any(|step| step.title.as_deref() == Some("cargo check --bins"))
+        );
+    }
+
+    #[test]
+    fn migrate_rust_mods_to_lib_rejects_empty_item_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(src_dir.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let result = run(
+            &RefactorRunParams {
+                title: "migrate nothing".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "migrate_rust_mods_to_lib".into(),
+                        source: "src/main.rs".into(),
+                        item_names: Some(vec![]),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[g15_project_record(dir.path())],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn split_rust_impl_methods_rejects_missing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("server.rs");
+        fs::write(
+            &source,
+            "struct Server;\n\nimpl Server {\n    fn do_work(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let result = run(
+            &RefactorRunParams {
+                title: "extract without target".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "split_rust_impl_methods_to_submodule".into(),
+                        source: "server.rs".into(),
+                        target: None,
+                        item_names: Some(vec!["do_work".into()]),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[g15_project_record(dir.path())],
+        );
+        assert!(result.is_err());
+    }
+
     // G15: bbox_refactor_apply refuses to apply when the caller's cwd
     // is in a different git toplevel than the plan's recorded paths,
     // unless `force_path=true`. Without the guard, plans built against
