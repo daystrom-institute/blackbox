@@ -284,10 +284,12 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         .iter()
         .filter_map(|method| method.item.name.as_deref())
         .any(|name| rust_text_contains_identifier(&parent_after_move, name));
-    let effective_visibility = p
-        .visibility
-        .as_deref()
-        .or_else(|| parent_still_calls_moved_method.then_some("pub(super)"));
+    let explicit_visibility = p.visibility.as_deref();
+    let fallback_visibility = if explicit_visibility.is_none() && parent_still_calls_moved_method {
+        Some("pub(super)")
+    } else {
+        None
+    };
     let rebase_super_paths = rust_target_is_child_module_of_source(&source_path, &target_path);
 
     let target_source = fs::read_to_string(&target_path).unwrap_or_default();
@@ -300,7 +302,8 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         &selected[0].impl_name,
         &parsed.source,
         &selected,
-        effective_visibility,
+        explicit_visibility,
+        fallback_visibility,
         rebase_super_paths,
     )?;
 
@@ -765,6 +768,229 @@ pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
 
     validate_plan_shape(&plan)?;
     Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+pub(crate) fn plan_rust_module_wiring(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let action = p
+        .toml_entries
+        .as_ref()
+        .and_then(|entries| entries.get("action"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .or_else(|| p.use_path.as_ref().map(|_| "add_use".to_string()))
+        .or_else(|| {
+            p.module_name
+                .as_ref()
+                .or_else(|| p.item_names.as_ref().and_then(|names| names.first()))
+                .map(|_| "add_mod".to_string())
+        })
+        .ok_or_else(|| {
+            anyhow!("rust_module_wiring requires toml_entries.action or module_name/use_path")
+        })?;
+
+    let parsed = parse_rust_file(&source_path)?;
+    let (title, edit, leftover) = match action.as_str() {
+        "add_mod" => rust_module_wiring_add_mod_edit(p, &parsed)?,
+        "remove_mod" => rust_module_wiring_remove_mod_edit(p, &parsed)?,
+        "add_use" => rust_module_wiring_add_use_edit(p, &parsed)?,
+        "remove_use" => rust_module_wiring_remove_use_edit(p, &parsed)?,
+        other => bail!(
+            "unsupported rust_module_wiring action `{other}`; supported: add_mod, remove_mod, add_use, remove_use"
+        ),
+    };
+
+    let plan = RefactorPlan {
+        title: format!("{title} in {}", path_string(&source_path)),
+        kind: "rust_module_wiring".to_string(),
+        semantic_status: SemanticStatus::SyntaxOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        edits: vec![FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: vec![edit],
+            new_text: None,
+        }],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: path_string(&source_path),
+            byte_range: None,
+        }],
+        items: Vec::new(),
+        leftovers: leftover.into_iter().collect(),
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
+    };
+
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn rust_module_wiring_module_name(p: &RefactorPlanParams) -> Result<&str> {
+    let module_name = p
+        .module_name
+        .as_deref()
+        .or_else(|| {
+            p.item_names
+                .as_deref()
+                .and_then(|names| names.first().map(String::as_str))
+        })
+        .ok_or_else(|| anyhow!("module_name is required for rust_module_wiring mod actions"))?;
+    validate_rust_identifier(module_name, "module_name")?;
+    Ok(module_name)
+}
+
+fn rust_module_wiring_add_mod_edit(
+    p: &RefactorPlanParams,
+    parsed: &ParsedSource,
+) -> Result<(String, TextEdit, Option<String>)> {
+    let module_name = rust_module_wiring_module_name(p)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let declaration = format!("{visibility}mod {module_name};");
+    let items = rust_items(parsed);
+    if items
+        .iter()
+        .any(|item| item.kind == "mod_item" && item.name.as_deref() == Some(module_name))
+    {
+        bail!("module declaration `{module_name}` already exists");
+    }
+    let last_mod = items
+        .iter()
+        .filter(|item| item.kind == "mod_item")
+        .filter(|item| ensure_rust_mod_declaration(&parsed.source, item).is_ok())
+        .max_by_key(|item| item.byte_end);
+    let (insert_at, replacement) = if let Some(item) = last_mod {
+        (item.byte_end, format!("\n{declaration}"))
+    } else {
+        (
+            rust_module_decl_fallback_insert_byte(&parsed.source),
+            format!("{declaration}\n"),
+        )
+    };
+    Ok((
+        format!("add Rust module declaration {declaration}"),
+        TextEdit {
+            byte_start: insert_at,
+            byte_end: insert_at,
+            replacement,
+        },
+        None,
+    ))
+}
+
+fn rust_module_wiring_remove_mod_edit(
+    p: &RefactorPlanParams,
+    parsed: &ParsedSource,
+) -> Result<(String, TextEdit, Option<String>)> {
+    let module_name = rust_module_wiring_module_name(p)?;
+    let items = rust_items(parsed);
+    let item = items
+        .iter()
+        .find(|item| item.kind == "mod_item" && item.name.as_deref() == Some(module_name))
+        .ok_or_else(|| anyhow!("module declaration `{module_name}` not found"))?;
+    ensure_rust_mod_declaration(&parsed.source, item)?;
+    Ok((
+        format!("remove Rust module declaration {module_name}"),
+        TextEdit {
+            byte_start: item.leading_trivia_start,
+            byte_end: item.trailing_trivia_end,
+            replacement: String::new(),
+        },
+        None,
+    ))
+}
+
+fn rust_module_wiring_add_use_edit(
+    p: &RefactorPlanParams,
+    parsed: &ParsedSource,
+) -> Result<(String, TextEdit, Option<String>)> {
+    let use_path = p
+        .use_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("use_path is required for rust_module_wiring use actions"))?;
+    validate_rust_use_path(use_path)?;
+    let visibility = rust_decl_visibility_prefix(p.visibility.as_deref())?;
+    let declaration = format!("{visibility}use {use_path};");
+    if parsed.source.lines().any(|line| line.trim() == declaration) {
+        bail!("use declaration `{declaration}` already exists");
+    }
+    let items = rust_items(parsed);
+    let insert_at = items
+        .iter()
+        .filter(|item| item.kind == "use_declaration")
+        .max_by_key(|item| item.byte_end)
+        .map(|item| item.byte_end)
+        .or_else(|| {
+            items
+                .iter()
+                .filter(|item| item.kind == "mod_item")
+                .max_by_key(|item| item.byte_end)
+                .map(|item| item.trailing_trivia_end)
+        })
+        .unwrap_or_else(|| rust_module_decl_fallback_insert_byte(&parsed.source));
+    let replacement = if parsed.source[insert_at..].starts_with('\n') {
+        format!("\n{declaration}")
+    } else if insert_at == parsed.source.len() || parsed.source[..insert_at].ends_with('\n') {
+        format!("{declaration}\n")
+    } else {
+        format!("\n{declaration}\n")
+    };
+    Ok((
+        format!("add Rust use declaration {declaration}"),
+        TextEdit {
+            byte_start: insert_at,
+            byte_end: insert_at,
+            replacement,
+        },
+        None,
+    ))
+}
+
+fn rust_module_wiring_remove_use_edit(
+    p: &RefactorPlanParams,
+    parsed: &ParsedSource,
+) -> Result<(String, TextEdit, Option<String>)> {
+    let use_path = p
+        .use_path
+        .as_deref()
+        .ok_or_else(|| anyhow!("use_path is required for rust_module_wiring use actions"))?;
+    validate_rust_use_path(use_path)?;
+    let wanted_visibility = p
+        .visibility
+        .as_deref()
+        .map(|visibility| rust_decl_visibility_prefix(Some(visibility)))
+        .transpose()?;
+    let mut offset = 0usize;
+    for line in parsed.source.split_inclusive('\n') {
+        let line_no_newline = line.strip_suffix('\n').unwrap_or(line);
+        let trimmed = line_no_newline.trim();
+        let matches = if let Some(visibility) = wanted_visibility {
+            trimmed == format!("{visibility}use {use_path};")
+        } else {
+            ["", "pub ", "pub(crate) ", "pub(super) "]
+                .iter()
+                .any(|visibility| trimmed == format!("{visibility}use {use_path};"))
+        };
+        if matches {
+            return Ok((
+                format!("remove Rust use declaration {trimmed}"),
+                TextEdit {
+                    byte_start: offset,
+                    byte_end: offset + line.len(),
+                    replacement: String::new(),
+                },
+                None,
+            ));
+        }
+        offset += line.len();
+    }
+    bail!("use declaration for `{use_path}` not found")
 }
 
 pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String> {
@@ -1270,7 +1496,8 @@ pub(crate) fn rust_impl_methods_target_edits(
     impl_name: &str,
     source: &str,
     selected: &[RustImplMethod],
-    visibility: Option<&str>,
+    explicit_visibility: Option<&str>,
+    fallback_visibility: Option<&str>,
     rebase_super_paths: bool,
 ) -> Result<Vec<TextEdit>> {
     if let Some(insertion) =
@@ -1283,7 +1510,8 @@ pub(crate) fn rust_impl_methods_target_edits(
         replacement.push_str(&rust_impl_methods_block(
             source,
             selected,
-            visibility,
+            explicit_visibility,
+            fallback_visibility,
             rebase_super_paths,
         )?);
         return Ok(vec![TextEdit {
@@ -1300,7 +1528,8 @@ pub(crate) fn rust_impl_methods_target_edits(
         impl_name,
         source,
         selected,
-        visibility,
+        explicit_visibility,
+        fallback_visibility,
         rebase_super_paths,
     )?;
     let Some(prelude) = target_prelude
@@ -1440,14 +1669,16 @@ pub(crate) fn rust_impl_methods_target_wrapper(
     impl_name: &str,
     source: &str,
     selected: &[RustImplMethod],
-    visibility: Option<&str>,
+    explicit_visibility: Option<&str>,
+    fallback_visibility: Option<&str>,
     rebase_super_paths: bool,
 ) -> Result<String> {
     let mut wrapper = String::new();
     if let Some(export_name) = router_export_name {
         let router_name =
             router_name.ok_or_else(|| anyhow!("router_export_name requires router_name"))?;
-        let vis_str = visibility
+        let vis_str = explicit_visibility
+            .or(fallback_visibility)
             .map(|v| format!("{v} "))
             .unwrap_or_else(|| "pub(super) ".to_string());
         wrapper.push_str(&vis_str);
@@ -1467,7 +1698,8 @@ pub(crate) fn rust_impl_methods_target_wrapper(
     wrapper.push_str(&rust_impl_methods_block(
         source,
         selected,
-        visibility,
+        explicit_visibility,
+        fallback_visibility,
         rebase_super_paths,
     )?);
     wrapper.push_str("}\n");
@@ -1490,11 +1722,17 @@ pub(crate) fn rust_impl_methods_target_wrapper(
 pub(crate) fn rust_impl_methods_block(
     source: &str,
     selected: &[RustImplMethod],
-    visibility: Option<&str>,
+    explicit_visibility: Option<&str>,
+    fallback_visibility: Option<&str>,
     rebase_super_paths: bool,
 ) -> Result<String> {
     let mut block = String::new();
-    let vis_prefix = if let Some(v) = visibility {
+    let explicit_vis_prefix = if let Some(v) = explicit_visibility {
+        Some(rust_decl_visibility_prefix(Some(v))?)
+    } else {
+        None
+    };
+    let fallback_vis_prefix = if let Some(v) = fallback_visibility {
         Some(rust_decl_visibility_prefix(Some(v))?)
     } else {
         None
@@ -1510,7 +1748,18 @@ pub(crate) fn rust_impl_methods_block(
                 )
             })?;
 
-        let mut text = if let Some(ref new_vis) = vis_prefix {
+        let keyword = rust_visibility_keyword_byte(source, &method.item)?;
+        let vis_start = rust_item_visibility_start_byte(source, &method.item, keyword);
+        let current_prefix = source.get(vis_start..keyword).unwrap_or_default();
+        let chosen_visibility = explicit_vis_prefix.or_else(|| {
+            current_prefix
+                .trim()
+                .is_empty()
+                .then_some(fallback_vis_prefix)
+                .flatten()
+        });
+
+        let mut text = if let Some(new_vis) = chosen_visibility {
             let keyword = rust_visibility_keyword_byte(source, &method.item)?;
             let vis_start = rust_item_visibility_start_byte(source, &method.item, keyword);
 

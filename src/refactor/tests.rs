@@ -408,6 +408,97 @@ mod tests {
     }
 
     #[test]
+    fn extract_impl_methods_preserves_existing_visibility_when_auto_widening() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("engine.rs");
+        let target = dir.path().join("engine/helpers.rs");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(
+            &source,
+            "struct Engine;\n\nimpl Engine {\n    fn keep(&self) {\n        self.move_me();\n        self.public_move();\n    }\n\n    pub(crate) fn public_move(&self) {}\n\n    fn move_me(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["public_move".into(), "move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl Engine".into()),
+            target_prelude: Some("use super::*;".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("pub(crate) fn public_move(&self) {}"));
+        assert!(target_text.contains("pub(super) fn move_me(&self) {}"));
+        assert!(!target_text.contains("pub(super) pub(crate)"));
+    }
+
+    #[test]
+    fn extract_impl_methods_explicit_visibility_overrides_existing_visibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("main.rs");
+        let target = dir.path().join("tools.rs");
+        fs::write(
+            &source,
+            "struct Server;\n\nimpl Server {\n    pub(super) fn move_me(&self) {}\n}\n",
+        )
+        .unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "extract_rust_impl_methods".into(),
+            source: path_string(&source),
+            target: Some(path_string(&target)),
+            item_names: Some(vec!["move_me".into()]),
+            item_kinds: Some(vec!["impl_method".into()]),
+            impl_name: Some("impl Server".into()),
+            visibility: Some("pub(crate)".into()),
+            target_prelude: Some("use super::*;".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+
+        let target_text = fs::read_to_string(&target).unwrap();
+        assert!(target_text.contains("pub(crate) fn move_me(&self) {}"));
+        assert!(!target_text.contains("pub(super) fn move_me"));
+    }
+
+    #[test]
     fn extract_impl_methods_can_generate_router_export_helper() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("main.rs");
@@ -2533,6 +2624,103 @@ mod tests {
             fs::read_to_string(&source).unwrap(),
             "pub mod alpha;\npub(crate) mod beta;\n"
         );
+    }
+
+    #[test]
+    fn rust_module_wiring_adds_mod_decl() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "mod alpha;\n\nfn keep() {}\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_module_wiring".into(),
+            source: path_string(&source),
+            module_name: Some("beta".into()),
+            visibility: Some("pub(crate)".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        assert_eq!(plan_value["kind"], "rust_module_wiring");
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "mod alpha;\npub(crate) mod beta;\n\nfn keep() {}\n"
+        );
+    }
+
+    #[test]
+    fn rust_module_wiring_removes_pub_use_reexport() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("mod.rs");
+        fs::write(
+            &source,
+            "pub mod response;\npub(crate) use response::*;\n\npub mod handler;\n",
+        )
+        .unwrap();
+        let entries = BTreeMap::from([(
+            "action".to_string(),
+            serde_json::Value::String("remove_use".to_string()),
+        )]);
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_module_wiring".into(),
+            source: path_string(&source),
+            use_path: Some("response::*".into()),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+        let plan_value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: None,
+                force_path: None,
+            },
+            &[project_record(dir.path())],
+        )
+        .unwrap();
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(
+            fs::read_to_string(&source).unwrap(),
+            "pub mod response;\n\npub mod handler;\n"
+        );
+    }
+
+    #[test]
+    fn rust_module_wiring_rejects_duplicate_mod_decl() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("lib.rs");
+        fs::write(&source, "mod alpha;\n").unwrap();
+
+        let err = plan(&RefactorPlanParams {
+            kind: "rust_module_wiring".into(),
+            source: path_string(&source),
+            module_name: Some("alpha".into()),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
     }
 
     #[test]

@@ -40,8 +40,9 @@ Plan kinds, grouped by intent:
 - Caller / accessor rewrites: `update_rust_callers`, `migrate_rust_type_usages`,
   `migrate_rust_string_field_to_enum`, `add_rust_delegate_field`,
   `add_rust_router_to_sum`.
-- Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `copy_rust_mod_decls`,
-  `rust_minimize_imports` (conservative wildcard-import replacement).
+- Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `rust_module_wiring`,
+  `copy_rust_mod_decls`, `rust_minimize_imports` (conservative wildcard-import
+  replacement).
 - Visibility: `rewrite_rust_mod_visibility`, `rewrite_rust_item_visibility`,
   `rewrite_rust_field_visibility`.
 - LSP-backed (rust-analyzer): `rust_lsp_rename` (semantic rename),
@@ -78,9 +79,11 @@ Writable plan kinds:
   another file, preserving method attributes/modifiers such as `async` and
   optionally generating a `#[tool_router(router = name)]` wrapper around the
   moved methods. When moving from `foo.rs` to `foo/bar.rs`, the planner rebases
-  `super::...` references one module deeper (`super::super::...`). If the
-  parent file still references a moved method after deletion and `visibility`
-  was not supplied, the moved method is widened to `pub(super)`.
+  `super::...` references one module deeper (`super::super::...`). If explicit
+  `visibility` is supplied, it overrides every moved method. If it is not
+  supplied and the parent file still references a moved method after deletion,
+  only originally private moved methods are widened to `pub(super)`; existing
+  `pub`, `pub(crate)`, or `pub(super)` visibility is preserved.
 - `extract_rust_function_region`: conservative intra-function extraction.
   Requires exact `old_text`, helper name via `item_names[0]` or `module_name`,
   and explicit `toml_entries.parameters=["x: Type"]` /
@@ -113,7 +116,14 @@ Writable plan kinds:
   `migrate_rust_mods_to_lib`; rewrites simple `crate::<module>` references and
   grouped `use crate::{module_a, module_b};` imports when every grouped entry
   is in `item_names`. Mixed grouped imports are reported in `leftovers` for
-  manual split.
+  manual cleanup after.
+- `rust_module_wiring`: one conservative module-graph edit in a Rust module
+  file. `toml_entries.action` supports `add_mod`, `remove_mod`, `add_use`, and
+  `remove_use`; `module_name` drives mod actions and `use_path` drives use or
+  reexport actions. Add actions reject duplicates, remove actions reject missing
+  declarations, and every plan includes tree-sitter validation. Use it for
+  repeated `mod.rs` cleanup such as adding `pub mod tools;` or removing stale
+  `pub(crate) use response::*;` reexports.
 - `delete_rust_items`: delete named top-level Rust items or named impl methods
   in place. `item_names` is required; use `item_kinds` only to narrow matches.
   Use `item_kinds=["impl_method"]` plus `impl_name` when method names are
