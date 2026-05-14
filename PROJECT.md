@@ -1,138 +1,216 @@
-## Project
+## Project Shape
 
-**Blackbox** — MCP server that indexes Claude Code, Codex CLI, Copilot, Vibe, and Gemini transcripts into a tantivy full-text search index, manages a unified knowledge store across providers, tracks long-running work threads, and orchestrates multi-provider agent execution.
+**Blackbox** is a long-lived HTTP MCP daemon plus operator CLIs for AI-dev-tool
+coordination. It indexes provider transcripts and registered project source into
+tantivy, projects that corpus into a typed graph, manages shared knowledge and
+work threads, and dispatches/resumes agents across multiple providers.
 
-The crate is `blackbox` (`Cargo.toml`); it produces two binaries:
-- `blackboxd` — the MCP server daemon (`src/main.rs`)
-- `bro` — terminal client for tailing live orchestration events (`src/cli.rs`)
+The crate is `blackbox` (`Cargo.toml`). Binary entry points:
 
-MCP tools are prefixed `bbox_*` (transcript/knowledge/threads) and `bro_*` (orchestration).
+- `blackboxd` (`src/main.rs`) - daemon entry point; real startup lives in
+  `blackbox::server::run()`.
+- `bro` (`src/cli.rs`) - terminal client for tailing orchestration, workflows,
+  and councils.
+- `bro-irc` (`src/irc_bridge.rs`) - IRC bridge sidecar.
+- `bro-slack` (`src/slack_bridge.rs`) - Slack Socket Mode bridge sidecar.
 
-## Build & Run
+Core MCP namespaces:
 
-```bash
-cargo build --release    # release binaries at target/release/{blackboxd,bro}
-cargo build              # debug build
-cargo test               # unit tests (159 tests, ~0.1s)
-cargo clippy             # lint
-```
+- `bbox_*` - transcript, knowledge, graph, project, and refactor primitives.
+- `bro_*` - orchestration and dispatch primitives.
+- `work_*` - workspace-tool namespace; do not add new workspace tools under
+  `bbox_*`.
 
-`blackbox` has a `[lib]` target plus binary entry points. The daemon modules are
-owned by `src/lib.rs`; `src/main.rs` is only the `blackboxd` entry point calling
-`blackbox::server::run()`. Use `cargo test --lib` for library tests and
-`cargo test --bin blackboxd` for the daemon binary entry point.
+## Fast Orientation
 
-`blackboxd` serves MCP over HTTP (`axum`) on `127.0.0.1:${BBOX_PORT:-7264}/mcp`. Stderr carries tracing logs; stdout is unused. The same built daemon artifact is installed under two names for service isolation: `~/.local/bin/blackboxd` for prod and `~/.local/bin/blackboxd-dev` for the dev unit.
+`src/lib.rs` owns the daemon module graph and shared exports. `src/main.rs` is a
+thin wrapper only.
 
-## Architecture
+Major code ownership boundaries:
 
-Source layout (`src/`):
+- `server/` - daemon bootstrap, shared state, HTTP routes, MCP transport,
+  shutdown/reload, workflow runtime plumbing, and storage maintenance.
+- `tools/` - MCP tool adapters. Tool behavior usually delegates into domain
+  modules rather than living entirely in the adapter.
+- `tool_docs.rs` - source of truth for rendered tool docs. Adding a `#[tool]`
+  without a matching stanza should fail tests.
+- `index/`, `providers/`, `chunker/`, `vectors/`, `embed/` - corpus indexing,
+  entity providers, chunking, vector storage, and embedding routes.
+- `mcp_tools/` - graph retrieval helpers (`hybrid_search`, `inspect`,
+  `find_paths`, evidence bundling, provenance).
+- `knowledge.rs`, `render.rs`, `system_memory/` - durable knowledge, rendered
+  provider memory, and runtime-loaded system memories.
+- `threads.rs`, `notes.rs`, `inbox.rs`, `pins.rs`, `roadmap.rs`,
+  `whiteboards.rs` - coordination stores.
+- `orchestration/` - providers, brofiles, teams, agent dispatch/resume, MCP
+  injection, recursion guard, atoms, Badgey, and supervision.
+- `workflow/`, `pollers.rs`, `crons.rs`, `webhooks.rs`, `system_events/` -
+  deterministic orchestration, ingress, scheduling, and external event routing.
+- `refactor/`, `code_nav/`, `lsp/` - syntax navigation, guarded refactor plans,
+  compound refactor runs, and warm LSP sessions.
+- `config.rs` - config loader and env override allowlist.
 
-- **main.rs** — tiny `blackboxd` binary entry point that calls `blackbox::server::run()`.
-- **server/** — daemon bootstrap, shared state, HTTP routes, MCP transport wiring, tool-router construction, progress plumbing, `/tail` SSE, `/roster`, and workflow/runtime helpers.
-- **cli.rs** — `bro` binary. Connects to `blackboxd`'s `/tail` endpoint and renders colorized live task events.
-- **index/** — Tantivy index lifecycle, schema (account, project, role, session_id, content, timestamps, git_branch, agent_slug, is_subagent, cwd), search/browse handlers, incremental reindex thread.
-- **parser.rs** — Multi-format transcript parsing: Claude Code (`message.content` array), Codex CLI (`payload.content`), history.jsonl (`display`). Extracts roles, tool use/results, thinking blocks. Caps content at 12KB per document.
-- **knowledge.rs** — Knowledge entry CRUD (`~/.claude-shared/blackbox-knowledge.json`). Three write verbs: `bbox_learn` (rendered rules/conventions), `bbox_remember` (indexed-only notes), `bbox_decide` (durable commitments with required rationale + supersession chain). Render pipeline emits provider-specific markdown (CLAUDE.md, AGENTS.md, GEMINI.md) with three layers: steerage → shared memory → PROJECT.md. Git-based absorption imports external edits to rendered files as unverified entries.
-- **threads.rs** — Work thread tracker for non-dispatchable, multi-session efforts. Friendly names with rename support; typed graph edges between threads/sessions. Thread `kind` distinguishes `work_item` (propose→execute→review→refine loops) from `investigation`.
-- **notes.rs** — Side-channel note store (`bbox_note`). Structured records executors emit during work — kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Scan-friendly trail so the orchestrator can query instead of re-parsing prose. Filterable by kind/project/session/thread/resolution.
-- **inbox.rs** — Attention layer (`bbox_inbox`). Cross-store aggregator that surfaces unresolved notes (disputes/blocked/surprises), deferred followups, stale threads, unverified knowledge, and failed bro tasks in one ranked view.
-- **tool_docs.rs** — Single source of truth for the agent-facing tool reference. Per-tool stanzas (`name`, `summary`, `when_to_use`, `example`) grouped by category plus cross-tool `WORKFLOW_NOTES`. Rendered into a fixed-ID global knowledge entry (`bb-tool-reference`) by `sync_into_knowledge`, which runs automatically on every daemon startup. A compile-time unit test asserts every `#[tool]`-registered name has a matching stanza — adding a tool without docs fails the build.
-- **orchestration/** — Multi-provider agent dispatch (Claude, GLM, DeepSeek, Inception, Codex, Copilot, Vibe, Gemini). Provider catalogs (models, effort tiers), exec/resume arg builders, brofile/team management, task lifecycle, tail event stream. Two orthogonal prompt layers: **ambient** (`apply_ambient`, per-turn) prepends a scope block with pre-bound `session`/`project`/`bro`/`thread`/`work_item` IDs + optional `completion_contract`; **brofile lens** (`apply_brofile_lens`, persona/system-prompt layer) composes on top. Only the ambient layer is gated by `allow_recursion`.
-  - `orchestration/mcp.rs` — MCP registry + filter layer. `McpServerConfig` (Http/Sse/Stdio), `McpFilters` (allow/disallow glob patterns), `McpStore` (JSON-backed). Global at `~/.bro/mcp.json`, project overlay at `<project>/.bro/mcp.json`. `self_register_blackbox(url)` runs on daemon startup and upserts a `blackbox` HTTP entry in every installed provider's MCP config (Claude / Copilot / Codex / Gemini via their native `mcp add/list/remove` CLIs). `bro_mcp` tool exposes list/get/add/remove/allow/disallow/clear_filters/sync — global-scope writes fan out to every provider CLI, project-scope writes stay local until `sync`.
-  - **Mechanical recursion guard, universal.** Every dispatch-capable provider applies a default disallow list for recursive `bro_*` orchestration/control tools mechanically at argv construction. `bro_report` is intentionally excluded because it is telemetry, not recursive dispatch. Translation per provider: Claude `--disallowedTools`, Copilot `--deny-tool=`, Codex `-c mcp_servers.blackbox.disabled_tools=[...]` (with expansion via `tool_docs::recursion_guard_tool_names_prefixed`), Gemini `--policy <tempfile>` (per-dispatch TOML written to `~/.bro/gemini-policies/dispatch-<id>.toml`, cleaned up when the task terminates, orphan sweep on daemon startup). Vibe has no MCP and no bro_* surface to recurse through. The text recursion guard is retired — `allow_recursion=true` on exec/resume is the only bypass.
-- **render.rs** — Markdown emitter shared by knowledge render and other tooling.
+Generated or rendered surfaces are not the authority. Prefer editing their source
+owners, then regenerating through the intended path.
 
-## Provider Catalog
+## Validation
 
-Maintained in `src/orchestration/providers.rs`:
+Use the narrowest command that proves the change, then broaden when touching
+shared behavior.
 
-- **Claude**: Opus 4.7 (default, 1M context built-in), Opus 4.6 [1m]/200K, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (xhigh default, Opus-4.7-only; max unsupported on Haiku).
-- **GLM**: Z.AI Coding Plan API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `glm-5.1`, helper model `glm-4.5-air`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-zai` by default). The old OpenCode `zai-coding-plan/...` model prefix is accepted only as a legacy brofile normalization input.
-- **DeepSeek**: DeepSeek API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `deepseek-v4-pro`, helper model `deepseek-v4-flash`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-ds` by default). The old OpenCode `deepseek/...` model prefix is accepted only as a legacy brofile normalization input.
-- **Inception**: Inception Mercury via OpenCode transport. Exposes only `inception/mercury-2` as the default/tool-capable model, and variant tiers `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
-- **Codex**: gpt-5.4 family. Effort tiers `minimal`/`low`/`medium`/`high`/`xhigh`.
-- **Copilot**: tracks Anthropic + OpenAI models. Effort tiers `low`/`medium`/`high`/`xhigh`.
-- **Vibe**, **Gemini**: model lists only, no effort tier.
-
-## Key Design Decisions
-
-- **One tantivy doc per content block** — enables role-based filtering and precise excerpt generation rather than one doc per session.
-- **Field-based filtering** — account, project, role, subagent, branch, cwd filters all happen at the tantivy query level, no post-filtering.
-- **Response cap** — 80KB max MCP response. 12KB max per indexed document.
-- **Multi-account auto-detection** — scans `~/` for `.claude-*` dirs with `projects/` subdirs; always includes `~/.claude` as `claude` account; includes `~/.codex` if sessions dir exists.
-- **Tokio runtime** — async only where needed (MCP transport, HTTP `/tail`, orchestration child processes); synchronous I/O for tantivy and JSON storage.
-
-## Environment Variables
-
-- `TRANSCRIPT_SEARCH_ROOTS` — override account roots (`name=/path,name2=/path2`)
-- `TRANSCRIPT_SEARCH_CODEX_ROOT` — override Codex data dir
-- `TRANSCRIPT_SEARCH_INDEX_PATH` — override tantivy index location
-- `BLACKBOX_REINDEX_INTERVAL_SECS` — background reindex interval (default: 120)
-- `BBOX_PORT` / `BRO_PORT` — HTTP listener port for `/mcp`, `/tail`, `/roster` (default: 7264; 7263 is retired and avoided)
-- `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` — override provider binary paths
-- `RUST_LOG` — tracing filter (default: `transcript_search=info`)
-
-## Deployment
-
-`blackboxd` is designed to run as a single long-lived user service, not a
-per-session stdio child. It exposes HTTP MCP on `127.0.0.1:${BBOX_PORT:-7264}/mcp`
-so every Claude/Codex/Gemini CLI on the host connects to one daemon with one
-shared knowledge store + tantivy index. The bundled `deploy/blackbox.service`
-unit and the daemon default both pin port 7264 — 7263 is retired (old
-`bro.service`) and intentionally avoided. Client config examples below use
-7264 accordingly.
-
-Install templates at `deploy/blackbox.service` and `deploy/blackbox-dev.service`:
+Baseline commands:
 
 ```bash
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -d ~/.local/share/blackbox/memories
-cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
-cp deploy/blackbox.service ~/.config/systemd/user/
-cp deploy/blackbox-dev.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now blackbox.service
-systemctl --user enable --now blackbox-dev.service
+cargo check
+cargo test --lib
+cargo clippy
 ```
 
-Prod and dev intentionally run different installed daemon paths even when both
-come from the same release build: `blackbox.service` uses
-`~/.local/bin/blackboxd`, while `blackbox-dev.service` uses
-`~/.local/bin/blackboxd-dev`. That keeps dev binary swaps and restarts from
-mutating the prod service executable in place.
+Targeted recipes:
 
-Upgrades: build, install both daemon names plus `bro`, then restart whichever
-service you actually changed. The `install` is atomic (unlink + write) so the
-running process keeps the old inode until systemd restarts it.
+- Tool docs or MCP adapters: run the relevant tool/module tests and ensure
+  `tool_docs.rs` coverage still passes.
+- Config, startup, service, or DI-like behavior: `cargo check` is not enough;
+  start `blackboxd` or the relevant sidecar and confirm it initializes.
+- Render or knowledge changes: run render/knowledge tests and inspect generated
+  markdown diffs. Do not hand-edit generated provider memory regions.
+- Refactor machinery: start with `cargo test --lib refactor`; for LSP-backed
+  paths also validate the language server availability/failure mode.
+- Workflow, webhook, poller, cron, or system-event routing: run the targeted
+  unit tests and exercise the relevant HTTP/tool path when behavior is runtime
+  shaped.
+- Provider dispatch changes: verify arg construction for the affected provider
+  and confirm recursion guard/MCP injection semantics.
+- Frontend/site/docs-only changes: run the docs/site build only when that surface
+  is touched.
 
-Client config (all point to the same daemon): keep one canonical `blackbox`
-entry for normal human/operator use and point it at
-`http://127.0.0.1:7264/mcp?surface=ops`. Do not register both `blackbox` and
-`blackbox-ops` by default; add extra aliases only for intentionally restricted
-surfaces such as `readonly`.
+Do not record exact test counts in this file. Counts stale quickly and do not
+help an agent choose the right validation.
 
-## Render Pipeline
+## Runtime & State
 
-`bbox_render` has two scopes:
+`blackboxd` is a single long-lived user service, not a per-session stdio child.
+It listens on `127.0.0.1:${BBOX_PORT:-7264}/mcp` by default and also serves
+operator HTTP routes such as `/tail`, `/roster`, `/orchestrate`, `/webhook`,
+`/irc/*`, `/admin/*`, and `/council/*`.
 
-- **`scope=global`** — surgical patch of each provider's global-memory file
-  (`~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`)
-  between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers.
-  Snapshots the original to `~/.local/state/blackbox/backups/<ISO-ts>/`
-  before writing. RTK `@imports` and user-authored content outside the
-  markers are preserved. Copilot (greedy reader of project files) and Vibe
-  (unsupported) are intentionally skipped — `global_target_path` returns
-  `None` for them.
-- **`scope=project`** — writes `<project>/{CLAUDE,AGENTS,GEMINI}.md` with
-  **only** project-scope entries + verbatim `PROJECT.md` content. No global
-  entries duplicated per project (use `scope=both` if you need first-time
-  install or a re-sync).
+Prod and dev services intentionally use different installed daemon paths:
 
-## Design Docs
+- prod: `~/.local/bin/blackboxd`, `deploy/blackbox.service`
+- dev: `~/.local/bin/blackboxd-dev`, `deploy/blackbox-dev.service`
 
-- `design/archive/knowledge-store.md` — knowledge store v2: layer architecture, absorption, entry schema, rendering pipeline, migration path.
-- `design/agentic-corpus-data-export-policy.md` — per-bucket embedding-route data-export policy (Voyage vs Ollama).
-- `design/archive/` — shipped designs (agentic-corpus, refactor-rust-expansion, agent-system, bro-slack, mcp-surfaces, etc.).
-- `design/proposed/` — open designs awaiting implementation.
+That isolation lets dev binary swaps/restarts avoid mutating the prod service
+executable. Ask before restarting or mutating shared services unless the user has
+explicitly asked for that operation.
+
+Config precedence is defaults, config file, explicit env overrides, then flags.
+Default config path is `$XDG_CONFIG_HOME/blackbox/config.toml`; `BLACKBOX_CONFIG`
+selects a different file.
+
+Important state/config env vars:
+
+- Daemon: `BBOX_PORT`, `BBOX_BIND`, `BLACKBOX_MCP_NAME`,
+  `BBOX_MCP_SESSION_KEEPALIVE_SECS`, `BLACKBOX_SHUTDOWN_GRACE_SECS`
+- Stores/paths: `BLACKBOX_STATE_DIR`, `BLACKBOX_KNOWLEDGE_PATH`,
+  `BLACKBOX_THREADS_PATH`, `BLACKBOX_NOTES_PATH`, `BLACKBOX_ROADMAP_PATH`,
+  `BLACKBOX_PINS_PATH`, `BLACKBOX_PROJECTS_PATH`, `BLACKBOX_PACKETS_DIR`,
+  `BLACKBOX_ARTIFACTS_DIR`, `BRO_HOME`
+- Render targets: `BLACKBOX_GLOBAL_COMMON_MD`, `BLACKBOX_GLOBAL_CLAUDE_MD`,
+  `BLACKBOX_GLOBAL_CODEX_MD`, `BLACKBOX_GLOBAL_GEMINI_MD`,
+  `BLACKBOX_BACKUP_DIR`
+- Index/transcripts: `TRANSCRIPT_SEARCH_ROOTS`,
+  `TRANSCRIPT_SEARCH_CODEX_ROOT`, `TRANSCRIPT_SEARCH_INDEX_PATH`,
+  `BLACKBOX_REINDEX_INTERVAL_SECS`, `BLACKBOX_EDGE_INDEX_BOOT_REBUILD`
+- Providers: `CLAUDE_BIN`, `OPENCODE_BIN`, `CODEX_BIN`, `COPILOT_BIN`,
+  `VIBE_BIN`, `GEMINI_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
+- LSP/refactor: `BLACKBOX_LSP_IDLE_SECS`, `BLACKBOX_JDTLS_TIMEOUT_SECS`,
+  `BLACKBOX_JDTLS_INIT_TIMEOUT_SECS`, `BLACKBOX_JDTLS_BIN`,
+  `BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS`, `BLACKBOX_RUST_ANALYZER_BIN`
+- Ingress/provenance: `BBOX_POLLER_MIN_INTERVAL_SECS`,
+  `BBOX_GIT_NOTES_NAMESPACE`
+
+Legacy aliases should not be revived unless the code explicitly still accepts
+them.
+
+## Provider & Agent Surfaces
+
+The provider catalog is code-owned in `src/orchestration/providers.rs`. Do not
+copy full model inventories into `PROJECT.md`; they go stale. Keep this file to
+routing facts:
+
+- Claude, GLM, and DeepSeek dispatch through Claude Code transport.
+- Inception dispatches through OpenCode transport.
+- Codex, Copilot, Vibe, and Gemini each have provider-specific arg builders.
+- Provider binary overrides belong in config/env, not hard-coded call sites.
+
+Dispatch-capable providers apply a mechanical recursion guard for recursive
+`bro_*` orchestration/control tools. `bro_report` remains allowed because it is
+telemetry. `allow_recursion=true` is the explicit bypass.
+
+Provider MCP registration is no longer implicitly rewritten on daemon startup.
+`configure_dispatch_mcp_env` exports `BLACKBOX_MCP_URL` and
+`BLACKBOX_MCP_NAME` for dispatch-time injection; persistent MCP config changes
+are user-owned or explicit through `bro_mcp`.
+
+Installed agents, atoms, packets, workflows, and brofiles are catalog data, not
+PROJECT.md content. Discover them through their tools (`bbox_describe_schema`,
+artifact/atom/agent list/describe surfaces) rather than mirroring inventories
+here.
+
+## Knowledge & Render Invariants
+
+System memories are invariants and runbooks, not release ledgers or artifact
+inventories. Deep or role-specific docs belong in system memories, scoped docs,
+or code-owned catalogs rather than always-rendered provider memory.
+
+`bbox_render` surfaces:
+
+- `scope=global` patches global provider memory files and the common Blackbox
+  memory file inside managed markers, with backups.
+- `scope=project` writes project provider files from project-scope entries plus
+  `PROJECT.md`.
+
+Do not hand-edit managed regions. If rendered output is wrong, fix the producing
+system or source memory.
+
+Durable memories are operator-gated. If a new lesson seems worth remembering,
+first check existing Blackbox memory, then present the proposed verbatim text and
+wait for approval before calling `bbox_learn`, `bbox_remember`, or
+`bbox_decide`. Task-local workflow notes are still allowed when the active
+workflow requires them.
+
+## Versioning & Releases
+
+`Cargo.toml` `[package].version` is the source of truth for the Blackbox version.
+Code should read it through Cargo compile-time metadata such as
+`env!("CARGO_PKG_VERSION")`, not a hand-maintained constant. `Cargo.lock` should
+reflect the same root package version.
+
+This repo uses manual changelog-first releases because normal development does
+not currently flow through GitHub PRs. Keep notable user-visible changes in
+`CHANGELOG.md` under `Unreleased`; at release time, move them into a dated
+`X.Y.Z - YYYY-MM-DD` section, commit the release metadata, create an annotated
+SemVer tag (`vX.Y.Z`), and publish a GitHub Release using that changelog section
+as the release body. `RELEASE.md` holds the checklist.
+
+## Docs Map
+
+Use `PROJECT.md` as the map and guardrail layer. Put detailed procedures in docs
+or system memories and link/pointer from here.
+
+- `README.md` - user-facing overview and setup.
+- `docs/getting-started.md`, `docs/operating-blackbox.md`,
+  `docs/operations.md` - operational setup and day-2 runbooks.
+- `docs/internals.md`, `docs/index-embedding-internals.md`,
+  `docs/graph-retrieval-internals.md` - architecture internals.
+- `docs/transcript-retrieval.md`, `docs/knowledge-store.md`,
+  `docs/projects-code-indexing.md` - core corpus surfaces.
+- `docs/refactor.md`, `system-defaults/memories/refactor*.md` - refactor
+  capability and language-specific protocols.
+- `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,
+  `docs/rule-packets.md` - orchestration and event routing.
+- `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
+  `docs/councils-whiteboards.md` - agentic coordination surfaces.
+- `design/archive/` - shipped designs.
+- `design/proposed/` and `design/partial/` - not-yet-shipped or in-flight
+  designs; verify against code before treating them as current behavior.
