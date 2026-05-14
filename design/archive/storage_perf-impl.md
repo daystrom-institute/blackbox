@@ -1,13 +1,26 @@
-# Storage and Performance Hygiene — Implementation Plan
+# Storage and Performance Hygiene — Implementation Record
 
 Date: 2026-05-13
-Companion to: `design/proposed/storage_perf.md` (architecture).
-Status: implementation proposal
+Companion to: `design/archive/storage_perf.md` (architecture).
+Status: shipped; archived as the implementation record
 
-This plan turns the storage design into incremental, testable cuts. The order
-is intentional: first make storage visible and pruneable, then stop new
-append-only damage, then introduce manifests and snapshots. The early phases
-reduce user pain while snapshot work lands.
+This record maps the shipped storage-performance work back to the incremental
+cuts that landed it. The order was intentional: first make storage visible and
+pruneable, then stop new append-only damage, then introduce manifests,
+snapshots, legacy extraction, and v2 refs.
+
+## Completion Status
+
+All phase gates in this record are implemented:
+
+| Phase | Landed surface |
+|---|---|
+| 1 — storage health and GC | `bbox_storage_health`, `bbox_storage_gc`, backup/temp/orphan/inactive snapshot inventory, exact dry-run/apply candidates. |
+| 2 — lane split | lifecycle-specific edge write APIs, materialized replacement writers, observed and explicit append APIs, writer audit in `src/edge_index.rs`. |
+| 3 — manifests and active loader | workspace manifests, `manifest-index.json`, active-path loading with fallback classification, observed retention policy. |
+| 4 — snapshots and dirty overlay | clean snapshot ids, snapshot directories, dirty-current overlay, branch/worktree behavior, snapshot GC protection. |
+| 5 — legacy extraction | `bbox_storage_migrate_legacy_edges`, extraction planning, explicit/observed lane install, quarantine, idempotent migration behavior. |
+| 6 — v2 refs | `project_file_v2` and `symbol_v2` parser/provider support, exact snapshot refs, feature-gated producer emission. |
 
 ```
 Phase 1 ──▶ Phase 2 ──▶ Phase 3 ──▶ Phase 4 ──▶ Phase 5 ──▶ Phase 6
@@ -483,7 +496,7 @@ On reindex for a registered git project:
    exclusively derived materialized edges; otherwise quarantine it and report a
    health warning;
 5. update manifest;
-6. defer GC for old snapshots by configured grace.
+6. schedule GC for old snapshots after the configured grace.
 
 ### 4.5 Worktree Flow
 
@@ -664,7 +677,7 @@ Tests:
 
 ## Cross-Phase Acceptance Suite
 
-Add integration-style tests or fixtures that simulate:
+The shipped focused and cross-phase tests cover this scenario:
 
 1. register repo on branch A;
 2. index project;
@@ -681,9 +694,10 @@ Add integration-style tests or fixtures that simulate:
 The fixture can be a temp git repo created inside a unit test. Keep it small:
 two branches, one file, one symbol rename.
 
-## Deployment Order
+## Deployment Notes
 
-Recommended shipping cuts:
+These were the intended shipping cuts; no item in this list remains as a
+pending task in this record.
 
 1. Phase 1 only: health + GC visibility.
 2. Phase 2 only: no new derived append growth.

@@ -1,6 +1,6 @@
-# Agentic Corpus — Shipped-Phase Follow-ups
+# Agentic Corpus — Shipped-Phase Follow-up Record
 
-Status: implemented.
+Status: shipped; archived as the follow-up closure record.
 Related: `design/archive/agentic-corpus-release-notes.md` (original source of
 the shipped-phase caveats).
 

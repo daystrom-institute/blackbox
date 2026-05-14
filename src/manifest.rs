@@ -11,7 +11,7 @@
 // P1 observed backfill consideration:
 //   `bbox_project_register` post-step will retroactively walk transcripts
 //   and emit EDITED_FILE/READ_FILE/RAN_BASH edges for the newly registered
-//   project (see design/proposed/agentic-corpus-followups.md §P1). This
+//   project (see design/archive/agentic-corpus-followups.md §P1). This
 //   will grow observed history for every project that gets registered after
 //   initial transcript indexing. Storage health surfaces observed bytes per
 //   project so operators can see that growth.

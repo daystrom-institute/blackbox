@@ -1,7 +1,7 @@
 # Storage and Performance Hygiene for Project-Derived State
 
 Date: 2026-05-13
-Status: design proposal
+Status: shipped; archived as the storage-performance design record
 
 ## Problem
 
@@ -59,7 +59,9 @@ Recent fixes added:
 - legacy sidecar compaction after full project refresh;
 - daily background full refresh by default.
 
-Those are necessary hygiene, not the final architecture.
+Those were the first hygiene cuts. The implementation now follows through with
+lifecycle-owned storage, bounded GC, manifest-index active loading, snapshot
+materialization, dirty overlays, legacy extraction, and v2 entity refs.
 
 ## Failure Modes
 
@@ -209,10 +211,10 @@ There are two subtypes:
 - **repo materializations** are repo-scoped and describe immutable commit facts
   keyed by `repo_id`.
 
-Commit docs and commit-to-parent edges should eventually move toward the
-repo-scoped subtype. Edges from current chunks to commits remain workspace
-snapshot-scoped, because they depend on which files/chunks exist in that
-checkout.
+Commit docs and commit-to-parent edges use the repo-scoped subtype when repo
+materialization is available. Edges from current chunks to commits remain
+workspace snapshot-scoped, because they depend on which files/chunks exist in
+that checkout.
 
 ## Identity Model
 
@@ -230,7 +232,7 @@ behavior. In this design, `project_id` remains the public compatibility id and
 is documented as "workspace id" semantically. Snapshot-specific precision is
 provided by the v2 ref types.
 
-Proposed fields:
+Implemented manifest fields:
 
 ```json
 {
@@ -395,9 +397,9 @@ GC should run as part of the daemon's background maintenance loop and expose a
 dry-run/apply tool. The dry-run output must be exact: paths, bytes, reason, and
 retention rule.
 
-GC should not synchronously delete old snapshots during a branch switch. Branch
+GC does not synchronously delete old snapshots during a branch switch. Branch
 hopping is common during development, and immediate deletion defeats cache
-reuse. A branch switch should only mark the previous snapshot inactive and
+reuse. A branch switch only marks the previous snapshot inactive and
 eligible after `branch_switch_grace_minutes`.
 
 Manual pruning remains possible, but it becomes an operator override rather
@@ -603,15 +605,17 @@ The final system should maintain these invariants:
 - Observed event history is retained as provenance substrate. Storage health
   reports observed bytes so operators can see growth.
 
-## Recommendation
+## Implemented Sequence
 
-Do not start with a database migration. Start by making lifecycle visible:
+The implementation followed the intended order: make lifecycle visible before
+changing identity, then move derived state to replaceable materializations, then
+add manifests/snapshots and compatibility-preserving v2 refs.
 
 1. add storage health and GC dry-run/apply;
 2. finish moving derived edges to managed replaceable sidecars;
 3. add workspace manifests;
 4. only then introduce snapshot directories.
 
-This sequence attacks the user pain first: no opaque disk growth, no manual
-backup pruning, and no stale branch/worktree facts quietly leaking into active
-graph answers.
+The result is no opaque disk growth, no manual backup pruning for normal
+operation, and no stale branch/worktree facts leaking into active graph
+answers.
