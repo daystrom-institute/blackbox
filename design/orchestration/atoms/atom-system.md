@@ -22,7 +22,7 @@ public capability work moves to atoms.
 Related:
 - [Agent System](../agents/agent-system.md) - predecessor design for
   manifest-wrapped brofiles and `bro_agent_*`.
-- [WORKFLOWS](../../../WORKFLOWS.md) - current actor / node / subworkflow
+- [Workflow Engine](../../../docs/workflows.md) - current actor / node / subworkflow
   orchestration model.
 - [Turing Completeness](../workflows/turing-completeness.md) - workflow specs as a bounded
   deterministic programming surface.

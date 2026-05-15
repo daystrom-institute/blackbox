@@ -8,7 +8,7 @@ into a deterministic state machine driven by mermaid graphs.
 > **Why a separate doc.** README is for the project. This is for the
 > engine. If you're authoring a workflow, this is your map. If you
 > just want to *run* an example, head to
-> [`examples/keystone/`](https://github.com/invidious9000/transcript-search/tree/main/examples/keystone).
+> [Keystone Example](../examples/keystone/keystone-example.md).
 
 ## Why it exists
 
@@ -1087,20 +1087,20 @@ spawn arc
 
 ## Examples
 
-- [`examples/whiteboard/`](https://github.com/invidious9000/transcript-search/tree/main/examples/whiteboard) - end-to-end:
+- [Whiteboard Example](../examples/whiteboard/whiteboard-example.md) - end-to-end:
   ADR-tagged issue webhook → 3-specialist ensemble posts blind to
   whiteboard → debate (annotate + vote) → facilitator synthesizes ADR
   markdown → PR opens → auto-merge. The reference arc for the
   whiteboard primitive + multi-round durable ensemble.
-- [`examples/sastquatch/`](https://github.com/invidious9000/transcript-search/tree/main/examples/sastquatch) - end-to-end:
+- [Sastquatch Example](../examples/sastquatch/sastquatch-example.md) - end-to-end:
   cron tick → analyzer (mcp_call → biofilter sast_*; executor picks
   a finding cluster) → fixer subworkflow → wait → ensemble reviewer →
   loop on feedback → auto-merge. The reference arc for cron + mcp_call.
-- [`examples/keystone/`](https://github.com/invidious9000/transcript-search/tree/main/examples/keystone) - end-to-end:
+- [Keystone Example](../examples/keystone/keystone-example.md) - end-to-end:
   Forgejo webhook → arc → implementer subworkflow → wait → reviewer
   ensemble → wait-loop until merged → cleanup hooks. Real LLM
   dispatch. Full layout + adaptation guide in the example's README.
-- [`examples/workflows/`](https://github.com/invidious9000/transcript-search/tree/main/examples/workflows) - smaller
+- [Workflow Examples](../examples/workflows/workflow-examples.md) - smaller
   shape catalog: linear, gated, ensemble, fork-join, blind-convergence,
   optimistic-review, self-audit.
 

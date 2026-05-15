@@ -193,6 +193,6 @@ landed in its own commit before the workflows could be authored.
 ## See also
 
 - [Keystone](../keystone/keystone-example.md) — issue-driven sibling
-- [`../../WORKFLOWS.md`](../../WORKFLOWS.md) — engine semantics
+- [Workflow Engine](../../docs/workflows.md) — engine semantics
 - [Workflow Examples](../workflows/workflow-examples.md) — pattern catalog
   (linear, fork-join, ensemble-vote, blind-converge, ...)

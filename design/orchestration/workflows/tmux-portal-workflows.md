@@ -13,7 +13,7 @@ brief: "Designs workflow-native tmux portal handoff for live bro sessions, focus
 
 # Tmux portal for workflow-native live bro handoff
 
-Related: `WORKFLOWS.md`, `examples/keystone/`, `../supervision/supervision.md`, `design/surfaces/provider-transcripts/provider-transcript-read-plane.md`, `tmux-portal-workflows-impl.md`
+Related: [Workflow Engine](../../../docs/workflows.md), [Keystone Example](../../../examples/keystone/keystone-example.md), [Supervision](../supervision/supervision.md), [Provider Transcript Read Plane](../../surfaces/provider-transcripts/provider-transcript-read-plane.md), [Tmux Portal Workflows Impl](tmux-portal-workflows-impl.md)
 
 ## 1. Thesis
 

@@ -9,7 +9,7 @@ operator-blessed cleanup hooks at terminal state.
 
 This README is a *reference* + *adaptation guide*: read it to
 understand what's wired here, then customize for your stack. For the
-underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
+underlying engine semantics see [Workflow Engine](../../docs/workflows.md).
 
 ## What it exercises
 
@@ -47,7 +47,7 @@ underlying engine semantics see [`../../WORKFLOWS.md`](../../WORKFLOWS.md).
 - `jq`, `curl`, `git`, `python3` (for HMAC signature when you replay manually)
 - Forgejo 15 available on `FORGEJO_BASE_URL` (the bundled compose file starts `codeberg.org/forgejo/forgejo:15` on `http://127.0.0.1:3000`)
 - `blackboxd` running (default port `7264`; override with `BBOX_PORT`)
-- For webhook delivery from Docker, the daemon listener must be reachable from the Forgejo container. On Linux that usually means binding the daemon to `0.0.0.0` or using the poller/direct-dispatch path instead of webhooks. See [`../../WORKFLOWS.md` § Operator-blessed registries](../../WORKFLOWS.md#operator-blessed-registries).
+- For webhook delivery from Docker, the daemon listener must be reachable from the Forgejo container. On Linux that usually means binding the daemon to `0.0.0.0` or using the poller/direct-dispatch path instead of webhooks. See [Workflow Engine § Operator-blessed registries](../../docs/workflows.md#operator-blessed-registries).
 - Daemon environment must include:
   - `FORGEJO_BASE_URL`, `FORGEJO_TOKEN` — for the implementer/reviewer to call the Forgejo API
   - `FORGEJO_WEBHOOK_SECRET` — for the daemon to verify inbound webhook signatures
@@ -267,14 +267,14 @@ Edit `workflows/*.json` `actors[*].brofile` (or pass `IMPL_BROFILE=` / `REVIEWER
 }
 ```
 
-Capability validation will refuse to install/dispatch the arc if any team member's brofile resolves to a provider lacking that capability — see [`WORKFLOWS.md` § Capability tags](../../WORKFLOWS.md#capability-tags).
+Capability validation will refuse to install/dispatch the arc if any team member's brofile resolves to a provider lacking that capability — see [Workflow Engine § Capability tags](../../docs/workflows.md#capability-tags).
 
 ### Adapting the loop semantics
 
 Concrete tweaks you'll likely want:
 
 - **Concurrent arcs on different PRs.** Wired by default: both `Wait` nodes correlate on `{ "pr": "${vars.pr_number}" }` and the routing packet's `signal_arc` verdicts emit `correlate: {"pr": "${entity.pr_number}"}`. The dispatch path runs `routing::resolve_entity_template` over the consequent before parse, so a `pr-merged` for PR #117 only resumes the arc waiting on PR #117 — concurrent arcs on different PRs don't cross-resume. To revert to broadcast match (single-arc demos that don't care about pinning), drop the `correlate` keys from both `Wait` nodes AND the routing rules.
-- **Push-storm debouncing.** Three commits to the PR fire three `pull_request.synchronize` webhooks → three `pr-ready` signals → three reviewer dispatches. Add a `vars.review_in_progress` flag in `Review`'s `on_enter`/`on_exit`, then add a routing rule that ignores `synchronize` events while it's set. Pattern documented in [`WORKFLOWS.md` § Webhook ingress](../../WORKFLOWS.md#webhook-ingress); not wired here for clarity.
+- **Push-storm debouncing.** Three commits to the PR fire three `pull_request.synchronize` webhooks → three `pr-ready` signals → three reviewer dispatches. Add a `vars.review_in_progress` flag in `Review`'s `on_enter`/`on_exit`, then add a routing rule that ignores `synchronize` events while it's set. Pattern documented in [Workflow Engine § Webhook](../../docs/workflows.md#webhook); not wired here for clarity.
 - **Different cleanup policy.** Edit `packets/cleanup-policy.json`. Three options ship as templates:
   - `keep-on-fail` (default here) — keep worktree for failed/cancelled/timeout, delete on success
   - `always-delete` — change the rule to fire-default on any outcome
@@ -292,7 +292,7 @@ Concrete tweaks you'll likely want:
 
 ### Adding a new hook op
 
-The op catalog is in `src/workflow/ops.rs`. Add a variant to `OpKind` + a handler function + a test. Update [`WORKFLOWS.md` § Op catalog](../../WORKFLOWS.md#op-catalog-current) when you do.
+The op catalog is in `src/workflow/ops.rs`. Add a variant to `OpKind` + a handler function + a test. Update [Workflow Engine § Op catalog](../../docs/workflows.md#op-catalog-current) when you do.
 
 For most external API calls, `http_json` is the primitive: workflow author writes the URL/headers/body as templates over `${env.X}` (credentials, base URLs) and `${vars.X}` (workflow state); the response lands in `vars[into_var]` for downstream templates. The engine carries no platform-specific knowledge — adapting to GitHub, GitLab, Gitea, Bitbucket, or anything else is a workflow JSON change, not a code change.
 
@@ -392,9 +392,9 @@ systemctl --user restart blackbox.service   # picks up the deletion
 | Gap                                    | Impact                                                                 | Fix sketch                                            |
 |----------------------------------------|------------------------------------------------------------------------|-------------------------------------------------------|
 | Push-storm not debounced via `vars.review_in_progress` | First reviewer dispatch is not yet pinned per-PR via the engine's idempotency layer | Add a hook + packet that flips an in-progress flag on review entry/exit. Independent of the per-PR correlation already wired (waits + routing carry `{pr: ${entity.pr_number}}`); this would dedup duplicate _dispatches_ for the same PR. |
-| Push-storm not debounced               | N commits → N `pull_request.synchronize` events → N reviewer dispatches  | `vars.review_in_progress` flag + routing-rule guard (see `WORKFLOWS.md` § Webhook ingress) |
+| Push-storm not debounced               | N commits → N `pull_request.synchronize` events → N reviewer dispatches  | `vars.review_in_progress` flag + routing-rule guard; see [Workflow Engine § Webhook](../../docs/workflows.md#webhook). |
 | PR reuse only handles open PRs         | A closed-but-unmerged PR for the same head will conflict on POST → halt. The `state=open&limit=50` GET also doesn't paginate. | Either paginate + scan all PRs (need `find_first` over multiple pages, or a follow-up `find_all` op) OR widen to `state=all` and add a PATCH-reopen branch — the workflow is already wired to handle either via packet gating. |
-| `Shell` op has no allowlist enforcement| Trusted-actor assumption                                                | Wire shell-policy packet (design in `WORKFLOWS.md`)   |
+| `Shell` op has no allowlist enforcement| Trusted-actor assumption                                                | Wire shell-policy packet; see [Workflow Engine](../../docs/workflows.md). |
 | `cancel_arc` routing verdict           | Webhook can't terminate a running arc                                   | Engine cancellation primitive (phase-next)            |
 | `bro_workflow_uninstall` / `bro_webhook_uninstall` don't exist | Tear-down requires `rm` + restart                       | Add inverse MCP tools + matching `/admin/` endpoints  |
 | `WaitStore` is in-memory only          | Daemon restart loses every suspended arc                                | Disk-back: serialize on register, drop on resolve     |

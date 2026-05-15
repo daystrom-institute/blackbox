@@ -15,7 +15,7 @@ Status: shipped
 Companion to: [System Events](system-events.md)
 
 Related:
-- [WORKFLOWS](../../../WORKFLOWS.md) - workflow hooks, inlets, Wait signals,
+- [Workflow Engine](../../../docs/workflows.md) - workflow hooks, inlets, Wait signals,
   routing verdicts, and operational surfaces.
 - [Atom System Impl](../../orchestration/atoms/atom-system-impl.md) - artifact/ref/runtime patterns for
   reusable invocation surfaces.

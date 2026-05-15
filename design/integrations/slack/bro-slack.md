@@ -152,7 +152,7 @@ claim is narrower than "Slack tokens live in the sidecar":
   `examples/keystone/packets/routing-forgejo.json` — the canonical
   webhook → extractor → routing-packet → workflow flow. The daemon
   side of bro-slack matches this contract.
-- `WORKFLOWS.md` — engine semantics: Wait correlation tuples, gate
+- [Workflow Engine](../../../docs/workflows.md) — engine semantics: Wait correlation tuples, gate
   packets, hook ops, the in-memory `WaitStore` (§14), poller inlets.
 - `src/packets.rs` — actual predicate vocabulary used in routing packets
   (§6.1). The doc cites these literally.
@@ -866,7 +866,7 @@ on `(workflow, correlate)`** — a new primitive, not Slack-specific,
 useful for any webhook-driven workflow where duplicate triggers can
 race. The Slack adapter's correlate key would be
 `{channel, thread_ts}`. Persistent `WaitStore` (a separate v1.5 daemon
-deliverable per `WORKFLOWS.md`) is the right time to land both.
+deliverable per [Workflow Engine](../../../docs/workflows.md)) is the right time to land both.
 
 ### 11.2 Reaction correlation: item_ts ≠ thread_ts in general
 
@@ -959,7 +959,7 @@ arrives with `view_state_values` populated. The sidecar projects
 sees the projection as `${last_signal.payload.view_state_values}` at
 resume time (signal payloads land via `last_signal`, not `entity` —
 `entity` is the routing-time substitution, not a workflow-runtime
-variable; see `WORKFLOWS.md` signal substitution). v1.5.
+variable; see [Workflow Engine](../../../docs/workflows.md) signal substitution). v1.5.
 
 ### 12.6 App Home as personal dashboard [v1.5]
 
@@ -1153,7 +1153,7 @@ received webhooks. Cross-process correlation key: `envelope_id`.
 | Daemon down | Sidecar holds ack until daemon recovers (3-retry budget per envelope), then drops with logged warning | Disk-backed sidecar buffer (v1.5) |
 | Token rotated mid-flight | 401; sidecar exits and systemd restarts | — |
 | Outbound 429 | Workflow node fails; engine has no fixed-interval retry — `on_failure: warn` lets the arc continue past the failed post; `on_failure: halt` terminates the arc | Expose response headers in `HttpFetchResult` (v1.5); Slack-aware retry hook |
-| `WaitStore` is in-memory (`WORKFLOWS.md` known limitation) | Daemon restart loses every suspended arc; Slack events arriving while the arc is gone correlate to nothing | Disk-backed WaitStore (v1.5 — daemon-wide phase-next, not Slack-specific) |
+| `WaitStore` is in-memory ([Workflow Engine](../../../docs/workflows.md) known limitation) | Daemon restart loses every suspended arc; Slack events arriving while the arc is gone correlate to nothing | Disk-backed WaitStore (v1.5 — daemon-wide phase-next, not Slack-specific) |
 | Two app_mentions on same thread before Wait registers | Both fire start_arc; two arcs race. `bbox_pin` is not atomic so cannot guard | Daemon-side `start_arc` idempotency keyed on `(workflow, correlate)` at v1.5 |
 | Reaction on mid-thread message | `item_ts != thread_ts`; correlation misses | Sidecar enriches `parent_thread_ts` via `conversations.replies` lookup (v1.5) |
 | Slack Workflow Builder posting to webhook | Not supported at v1 (loopback-only daemon cannot receive cloud Slack POSTs) | Public-ingress deployment shape (out of v1 scope) |

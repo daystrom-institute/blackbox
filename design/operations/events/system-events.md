@@ -14,7 +14,7 @@ Date: 2026-05-13
 Status: shipped
 
 Related:
-- [WORKFLOWS](../../../WORKFLOWS.md) - current workflow hooks, inbound
+- [Workflow Engine](../../../docs/workflows.md) - current workflow hooks, inbound
   webhook/poller/cron inlets, Wait signals, and routing packets.
 - [Atom System](../../orchestration/atoms/atom-system.md) - reusable capability boundary; reactions may
   invoke atoms as bounded actions.

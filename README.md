@@ -341,7 +341,7 @@ MCP surface: `bro_orchestrate_run`, `bro_orchestrate_author`,
 HMAC-SHA256 signature verification (Forgejo / GitHub / None for
 closed networks).
 
-> **See [`WORKFLOWS.md`](WORKFLOWS.md) for the canonical reference** -
+> **See [Workflow Engine](docs/workflows.md) for the canonical reference** -
 > ArcContext templating, hook ops, Wait/signal correlation,
 > subworkflow imports/exports, capability tags, webhook routing,
 > operator-blessed registries, audit surfaces, and authoring loops.
@@ -457,7 +457,7 @@ Full reference in [`docs/atoms.md`](docs/atoms.md).
 | `bro_arc_signal`          | Manually deliver a signal to a pending Wait (debug / rescue path). |
 | `bro_arc_status`          | Read-only snapshot of running arc + pending waits. |
 
-Full reference and authoring guide in [`WORKFLOWS.md`](WORKFLOWS.md).
+Full reference and authoring guide in [Workflow Engine](docs/workflows.md).
 
 ### HTTP endpoints (non-MCP)
 
@@ -466,7 +466,7 @@ Full reference and authoring guide in [`WORKFLOWS.md`](WORKFLOWS.md).
 | `GET /mcp` | MCP streamable-HTTP transport. All client CLIs connect here. |
 | `GET /tail` | SSE stream of orchestration lifecycle events. Filter via `?team=`/`?bro=`/`?provider=`. |
 | `GET /roster` | Resolves `?bros=a,b&team=X&provider=Y` selectors → `[{bro, team, provider, session_id, jsonl_path, model}]`. Used by `bro tail` to locate transcript files. |
-| `POST /webhook/<name>`        | External-event ingestion → routing packet → `start_arc`/`signal_arc`/`cancel_arc`/`ignore`/`dead_letter`. See [`WORKFLOWS.md`](WORKFLOWS.md#webhook-ingress). |
+| `POST /webhook/<name>`        | External-event ingestion → routing packet → `start_arc`/`signal_arc`/`cancel_arc`/`ignore`/`dead_letter`. See [Workflow Engine](docs/workflows.md#webhook). |
 | `POST /webhook/<name>/replay` | Run a payload through the extractor + routing packet without dispatching. Debug aid. |
 | `POST /orchestrate`           | Dispatch a full workflow spec (JSON body). |
 | `POST /orchestrate/by-id`     | Dispatch a registry-installed workflow by id with optional `initial_vars`. |

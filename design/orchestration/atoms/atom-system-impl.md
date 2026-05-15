@@ -23,7 +23,7 @@ deprecation cleanup for legacy `bro_agent_*` defaults, not the atom runtime.
 
 Related:
 - [Agent System](../agents/agent-system.md) - predecessor implementation shape.
-- [WORKFLOWS](../../../WORKFLOWS.md) - current workflow actor/subworkflow model.
+- [Workflow Engine](../../../docs/workflows.md) - current workflow actor/subworkflow model.
 - [Supervision Impl](../supervision/supervision-impl.md) - advisor/oracle policy substrate.
 - [Tmux Portal Impl](../workflows/tmux-portal-workflows-impl.md) - run focus and portal
   state.

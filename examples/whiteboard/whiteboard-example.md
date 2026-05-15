@@ -136,4 +136,4 @@ The arc walk is repeatable — re-running against the same issue creates a new a
 
 - [Keystone](../keystone/keystone-example.md) — issue → fix → review → merge
 - [Sastquatch](../sastquatch/sastquatch-example.md) — cron → SAST → fix → review → merge
-- [`../../WORKFLOWS.md`](../../WORKFLOWS.md) — engine semantics, including the new Whiteboards section
+- [Workflow Engine](../../docs/workflows.md) — engine semantics, including the new Whiteboards section
