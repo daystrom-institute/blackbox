@@ -1,3 +1,8 @@
+---
+tags:
+  - refactor-tools
+  - java
+---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
 tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]

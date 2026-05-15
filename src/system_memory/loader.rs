@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const TOML_DELIMITER: &str = "+++";
+const YAML_DELIMITER: &str = "---";
 const NON_MEMORY_MARKDOWN_FILES: &[&str] = &["system-memory-catalog.md"];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -42,7 +43,28 @@ fn strip_leading_newline(raw: &str) -> &str {
     }
 }
 
+fn strip_optional_obsidian_front_matter(raw: &str) -> &str {
+    let Some(rest) = raw.strip_prefix(YAML_DELIMITER) else {
+        return raw;
+    };
+    let Some(rest) = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")) else {
+        return raw;
+    };
+
+    let mut offset = raw.len() - rest.len();
+    for line in rest.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        offset += line.len();
+        if trimmed == YAML_DELIMITER {
+            return &raw[offset..];
+        }
+    }
+
+    raw
+}
+
 pub fn parse_memory_file(slug: &str, raw_content: &str) -> Result<RawMemory> {
+    let raw_content = strip_optional_obsidian_front_matter(raw_content);
     let mut parts = raw_content.splitn(3, TOML_DELIMITER);
     let lead = parts
         .next()
@@ -140,6 +162,16 @@ mod tests {
         assert_eq!(memory.front_matter.tags, vec!["a", "b"]);
         assert_eq!(memory.front_matter.order, 1);
         assert!(!memory.front_matter.template);
+        assert_eq!(memory.body, "alpha body\n");
+    }
+
+    #[test]
+    fn parse_memory_file_ignores_leading_obsidian_front_matter() {
+        let content = "---\ntags:\n  - refactor-tools\n  - java\n---\n+++\ntitle = \"Alpha\"\ntags = [\"a\", \"b\"]\norder = 1\n+++\n\nalpha body\n";
+        let memory =
+            parse_memory_file("alpha", content).expect("obsidian + toml front matter should parse");
+        assert_eq!(memory.front_matter.title, "Alpha");
+        assert_eq!(memory.front_matter.tags, vec!["a", "b"]);
         assert_eq!(memory.body, "alpha body\n");
     }
 

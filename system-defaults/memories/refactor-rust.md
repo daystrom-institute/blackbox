@@ -1,3 +1,8 @@
+---
+tags:
+  - refactor-tools
+  - rust
+---
 +++
 title = "Rust refactor mechanization — tree-sitter inventory and writable item extraction"
 tags = ["refactor", "refactoring", "mechanization", "restructure", "rust", "rs", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "extract_rust_items", "cargo", "rust-analyzer", "symbol", "rename", "move", "extract"]
