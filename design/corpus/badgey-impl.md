@@ -1,10 +1,12 @@
 ---
-title: "Badgey \u2014 implementation skeleton"
+title: Badgey — implementation skeleton
 kind: design
 lifecycle: archived
 corpus: blackbox-design
 topic:
   - corpus
+tags:
+  - integrations
 ---
 
 # Badgey — implementation skeleton

@@ -1,11 +1,13 @@
 ---
-title: "bro-slack next - Slack-native agent iteration"
+title: bro-slack next - Slack-native agent iteration
 kind: design
 lifecycle: proposed
 corpus: blackbox-design
 topic:
   - integrations
   - slack
+tags:
+  - integrations
 ---
 
 # bro-slack next - Slack-native agent iteration

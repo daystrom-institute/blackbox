@@ -1,11 +1,13 @@
 ---
-title: "Obsidian"
+title: Obsidian
 kind: design-hub
 corpus: blackbox-design
 topic:
   - integrations
   - obsidian
-brief: "Hub for Obsidian-facing Blackbox context, graph, and vault integration designs."
+brief: Hub for Obsidian-facing Blackbox context, graph, and vault integration designs.
+tags:
+  - integrations
 ---
 
 # Obsidian

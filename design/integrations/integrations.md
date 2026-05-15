@@ -1,10 +1,12 @@
 ---
-title: "Integrations"
+title: Integrations
 kind: design-hub
 corpus: blackbox-design
 topic:
   - integrations
-brief: "Hub for editor, chat, and external UI integrations over Blackbox surfaces."
+brief: Hub for editor, chat, and external UI integrations over Blackbox surfaces.
+tags:
+  - integrations
 ---
 
 # Integrations

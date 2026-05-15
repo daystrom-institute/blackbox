@@ -1,11 +1,13 @@
 ---
-title: "bro-slack \u2014 Slack sidecar bridge for blackbox"
+title: bro-slack — Slack sidecar bridge for blackbox
 kind: design
 lifecycle: archived
 corpus: blackbox-design
 topic:
   - integrations
   - slack
+tags:
+  - integrations
 ---
 
 # bro-slack — Slack sidecar bridge for blackbox
