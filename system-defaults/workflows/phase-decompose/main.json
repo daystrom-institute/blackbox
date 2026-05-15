@@ -34,6 +34,13 @@
             "key": "epoch",
             "by": 0
           }
+        },
+        {
+          "op": "default_var",
+          "args": {
+            "key": "max_epochs",
+            "value": 3
+          }
         }
       ],
       "next": { "type": "goto", "to": "Discovery" }
@@ -157,13 +164,13 @@
         "type": "branch",
         "cases": {
           "satisfied": "Done",
-          "work_remains": "EpochGate",
+          "work_remains": "EpochCheck",
           "untenable": "Halt"
         },
-        "default": "EpochGate"
+        "default": "EpochCheck"
       }
     },
-    "EpochGate": {
+    "EpochCheck": {
       "actor": "",
       "on_enter": [
         {
@@ -179,7 +186,13 @@
           },
           "into_var": "epoch_check",
           "on_failure": "halt"
-        },
+        }
+      ],
+      "next": { "type": "goto", "to": "EpochGate" }
+    },
+    "EpochGate": {
+      "actor": "",
+      "on_enter": [
         {
           "op": "set_var",
           "args": {

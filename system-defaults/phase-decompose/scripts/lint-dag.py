@@ -72,6 +72,11 @@ def main() -> int:
             errors.append(f"sub_units[{idx}].depends_on is required")
         elif not isinstance(depends_on, list):
             errors.append(f"sub_units[{idx}].depends_on must be an array")
+        if "assigned_brofile" in unit:
+            errors.append(
+                f"sub_units[{idx}].assigned_brofile is not allowed; "
+                "sub-unit execution uses the fixed supervised-impl workflow"
+            )
         predicted_writes = unit.get("predicted_writes")
         if predicted_writes is None:
             errors.append(f"sub_units[{idx}].predicted_writes is required")
