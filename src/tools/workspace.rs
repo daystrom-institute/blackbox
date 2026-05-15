@@ -586,6 +586,7 @@ fn impl_work_smart_read(state: &SharedState, p: &WorkSmartReadParams) -> anyhow:
 
     // Unresolved notes mentioning this path
     let notes_result = state.notes.read().list(&NoteListParams {
+        id: None,
         query: Some(p.file_path.clone()),
         resolution: Some("unresolved".to_string()),
         limit: Some(5),

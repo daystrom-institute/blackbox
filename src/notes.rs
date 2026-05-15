@@ -47,6 +47,11 @@ pub struct NoteParams {
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NoteListParams {
+    /// Exact note ID. Canonical form is `note-<8 hex>` (e.g.
+    /// `note-a1b2c3d4`). The bare 8-hex suffix is accepted as a fallback.
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^(note-)?[0-9a-f]{8}$"))]
+    pub id: Option<String>,
     /// Filter by kind
     #[serde(default)]
     pub kind: Option<String>,
@@ -77,7 +82,8 @@ pub struct NoteListParams {
     /// Max rows (default: 50)
     #[serde(default)]
     pub limit: Option<u64>,
-    /// Include notes whose resolution is "addressed" (default: false)
+    /// Include notes whose resolution is "addressed" (default: false for list
+    /// views, true for exact `id` lookups)
     #[serde(default)]
     pub include_addressed: Option<bool>,
     /// Render full note bodies. Default false → bodies are previewed at 200
@@ -639,10 +645,11 @@ impl Notes {
             .transpose()
             .map_err(|_| anyhow::anyhow!("Unknown resolution filter: {:?}", p.resolution))?;
 
-        let include_addressed = p.include_addressed.unwrap_or(false);
+        let include_addressed = p.include_addressed.unwrap_or(p.id.is_some());
         let full = p.full.unwrap_or(false);
         let limit = p.limit.unwrap_or(50).max(1) as usize;
 
+        let id_filter = p.id.as_deref().map(str::to_ascii_lowercase);
         let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
         let project_lower = p.project.as_deref().map(|s| s.to_lowercase());
 
@@ -651,6 +658,12 @@ impl Notes {
             .notes
             .iter()
             .filter(|n| {
+                if let Some(id) = id_filter.as_deref() {
+                    let needle = id.strip_prefix("note-").unwrap_or(id);
+                    if n.id != id && n.id.strip_prefix("note-") != Some(needle) {
+                        return false;
+                    }
+                }
                 if let Some(k) = kind_filter {
                     if n.kind != k {
                         return false;
@@ -813,6 +826,7 @@ mod tests {
 
         let out = notes
             .list(&NoteListParams {
+                id: None,
                 kind: Some("dispute".into()),
                 project: None,
                 session_id: None,
@@ -829,6 +843,104 @@ mod tests {
             .unwrap();
         assert!(out.contains("brief conflates schemas"));
         assert!(out.contains("bro=executor"));
+    }
+
+    #[test]
+    fn list_filters_by_exact_id_with_bare_suffix_fallback() {
+        let (_tmp, mut notes) = mk_store();
+        notes
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: "target body".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        let target_id = notes.store.notes[0].id.clone();
+        notes
+            .create(&NoteParams {
+                kind: "done".into(),
+                body: "other body".into(),
+                session_id: None,
+                project: None,
+                task_id: None,
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        let other_id = notes.store.notes[1].id.clone();
+
+        notes
+            .resolve(&NoteResolveParams {
+                id: target_id.clone(),
+                resolution: "addressed".into(),
+                note: None,
+            })
+            .unwrap();
+
+        let by_canonical_id = notes
+            .list(&NoteListParams {
+                id: Some(target_id.clone()),
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: None,
+                since: None,
+                limit: None,
+                include_addressed: None,
+                full: None,
+            })
+            .unwrap();
+        assert!(by_canonical_id.contains("target body"));
+        assert!(!by_canonical_id.contains("other body"));
+
+        let bare_id = target_id.strip_prefix("note-").unwrap().to_string();
+        let by_bare_id = notes
+            .list(&NoteListParams {
+                id: Some(bare_id),
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: None,
+                since: None,
+                limit: None,
+                include_addressed: None,
+                full: None,
+            })
+            .unwrap();
+        assert!(by_bare_id.contains("target body"));
+
+        let id_as_query = notes
+            .list(&NoteListParams {
+                id: None,
+                kind: None,
+                project: None,
+                session_id: None,
+                task_id: None,
+                thread_id: None,
+                bro: None,
+                resolution: None,
+                query: Some(other_id),
+                since: None,
+                limit: None,
+                include_addressed: None,
+                full: None,
+            })
+            .unwrap();
+        assert_eq!(id_as_query, "No notes found.");
     }
 
     #[test]
@@ -1091,6 +1203,7 @@ mod tests {
         // Default list excludes addressed but includes acknowledged
         let out = notes
             .list(&NoteListParams {
+                id: None,
                 kind: None,
                 project: None,
                 session_id: None,
@@ -1117,6 +1230,7 @@ mod tests {
 
         let out = notes
             .list(&NoteListParams {
+                id: None,
                 kind: None,
                 project: None,
                 session_id: None,
@@ -1138,6 +1252,7 @@ mod tests {
 
         let out_all = notes
             .list(&NoteListParams {
+                id: None,
                 kind: None,
                 project: None,
                 session_id: None,
@@ -1224,6 +1339,7 @@ mod tests {
 
         let out = notes
             .list(&NoteListParams {
+                id: None,
                 kind: None,
                 project: None,
                 session_id: None,
@@ -1260,6 +1376,7 @@ mod tests {
 
         let preview = notes
             .list(&NoteListParams {
+                id: None,
                 kind: None,
                 project: None,
                 session_id: None,
@@ -1279,6 +1396,7 @@ mod tests {
 
         let full = notes
             .list(&NoteListParams {
+                id: None,
                 kind: None,
                 project: None,
                 session_id: None,

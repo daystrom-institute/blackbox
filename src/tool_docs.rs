@@ -563,9 +563,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_notes",
         category: ToolCategory::Notes,
-        summary: "List / filter notes by kind, project, session, thread, resolution.",
-        when_to_use: "Orchestrators reading what executors emitted this round, or auditing past dispatch for a work-item thread. Bodies are previewed at 200 chars by default; pass `full=true` to render complete bodies (useful for `done` summaries and structured `dispute` rationales).",
-        example: Some(r#"bbox_notes(kind="assumption", thread_id="thread-abc", full=true)"#),
+        summary: "List / filter notes by exact id, kind, project, session, thread, resolution.",
+        when_to_use: "Orchestrators reading what executors emitted this round, auditing past dispatch for a work-item thread, or retrieving a known note by `id=\"note-<8hex>\"`. The `query` filter searches note bodies, not IDs. Bodies are previewed at 200 chars by default; pass `full=true` to render complete bodies (useful for `done` summaries and structured `dispute` rationales). Addressed notes are hidden by default for list views but included by default for exact `id` lookups.",
+        example: Some(r#"bbox_notes(id="note-a1b2c3d4", full=true)"#),
     },
     ToolDoc {
         name: "bbox_note_resolve",

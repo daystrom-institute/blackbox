@@ -17,7 +17,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_notes",
-        description = "List / filter notes by kind, project, session, thread, resolution."
+        description = "List / filter notes by exact id, kind, project, session, thread, resolution."
     )]
     pub(crate) fn bbox_notes(&self, Parameters(p): Parameters<NoteListParams>) -> CallToolResult {
         Self::run("bbox_notes", || self.state.notes.read().list(&p))
