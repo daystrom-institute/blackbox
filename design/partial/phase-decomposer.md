@@ -1,8 +1,8 @@
 # Phase Decomposer — context-budget-aware execution of large phased plans
 
 Date: 2026-05-10
-Status: partially implemented — Phase 1 `bbox_ref_size` has shipped; workflow
-and agent-artifact phases remain open.
+Status: partially implemented — Phase 1 `bbox_ref_size` and Phase 2
+`corpus-pathfinder` scout manifest have shipped; workflow phases remain open.
 Predecessor archived at `design/archive/phase-decomposer.md`.
 
 ## 1. Problem

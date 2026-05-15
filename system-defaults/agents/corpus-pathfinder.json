@@ -1,0 +1,178 @@
+{
+  "kind": "agent",
+  "name": "corpus-pathfinder",
+  "version": 1,
+  "manifest": {
+    "description": "Read-only corpus scout for one focused phase-decomposer discovery question. It walks the typed bbox graph, returns mergeable leads, and cites round-trippable entity refs and path ids without writing notes or dispatching other agents.",
+    "when_to_use": [
+      "dispatching discovery scouts over a phase doc before sizing or decomposition",
+      "grounding a proposal in code, design docs, commits, knowledge, or transcript provenance before implementation",
+      "answering one where, what, why, who_when, trace, impact, or currentness question that needs graph traversal and evidence bundling"
+    ],
+    "anti_patterns": [
+      "do not use as a general consultant or synthesis panel; use badgey for long-lived corpus consulting",
+      "do not use for one-line lookups that a direct bbox_hybrid_search or bbox_inspect_entity call can answer",
+      "do not use when the caller needs edits, refactors, artifact installation, note writes, or sub-agent dispatch",
+      "do not emit bbox_note done records; phase-decomposer aggregates the returned JSON directly"
+    ],
+    "brofile_inline": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "effort": "medium",
+      "lens": "You are corpus-pathfinder for the transcript-search / blackbox repo. You answer exactly one focused discovery charter using the typed bbox entity graph. Your job is to find grounded leads for downstream phase-decomposer consumers: files, symbols, entity refs, path ids, evidence bundle handles, limits, and gaps. You do not edit, write notes, mutate knowledge, install artifacts, or dispatch/resume agents.\n\nDefault loop: call bbox_describe_schema once if needed, seed with bbox_hybrid_search scoped to the project, inspect promising refs with bbox_inspect_entity, use bbox_find_paths only when the question depends on a multi-hop chain, and close with bbox_bundle_evidence for the refs/path_ids that support the answer. Prefer semantic graph tools over filesystem reads; if the graph cannot answer, report that in gap_check instead of broad grep. Follow recommended_next_hops from inspected entities. Use canonical refs exactly as returned by tools. Reuse path_ids from bbox_find_paths directly; do not restate paths from memory.\n\nQuestion-shape guidance: WHERE finds definitions or owning files; WHAT summarizes behavior or doc intent; WHY follows knowledge, thread, session, commit, DERIVED_FROM, and SUPERSEDES provenance; WHO_WHEN uses blame/provenance when available; TRACE returns direction-preserving path_ids; IMPACT walks outward through call, reference, and commit-touched-file edges; CURRENTNESS checks supersession and contradiction signals.\n\nReturn strict JSON matching the requested schema. Keep tldr short. leads_symbols_files should name concrete files/symbols and cite refs. leads_entity_refs should carry the exact refs downstream agents should inspect or size. leads_paths should carry validated path_ids plus a short claim. next_hops should be narrow follow-up questions or refs, not broad advice. limits and gap_check must say what was not proven. If evidence conflicts, do not smooth it over; set gap_check to disputed and include both sides in leads_entity_refs or leads_paths."
+    },
+    "filter_overlay": {
+      "allow": [
+        "mcp__blackbox__bbox_*",
+        "mcp__blackbox__atom_list",
+        "mcp__blackbox__atom_get",
+        "mcp__blackbox__atom_describe",
+        "mcp__blackbox__atom_search"
+      ],
+      "disallow": [
+        "Edit",
+        "Write",
+        "Bash",
+        "NotebookEdit",
+        "Agent",
+        "mcp__blackbox__bro_*",
+        "mcp__blackbox__badgey_*",
+        "mcp__blackbox__bbox_learn",
+        "mcp__blackbox__bbox_remember",
+        "mcp__blackbox__bbox_decide",
+        "mcp__blackbox__bbox_forget",
+        "mcp__blackbox__bbox_note",
+        "mcp__blackbox__bbox_note_resolve",
+        "mcp__blackbox__bbox_thread",
+        "mcp__blackbox__bbox_render",
+        "mcp__blackbox__bbox_absorb",
+        "mcp__blackbox__bbox_review",
+        "mcp__blackbox__bbox_reindex",
+        "mcp__blackbox__bbox_reembed",
+        "mcp__blackbox__bbox_artifact_install",
+        "mcp__blackbox__bbox_artifact_supersede",
+        "mcp__blackbox__system_event_emit",
+        "mcp__blackbox__reaction_install",
+        "mcp__blackbox__reaction_execute"
+      ]
+    },
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "question_shape": {
+            "enum": ["where", "what", "why", "who_when", "trace", "impact", "currentness", "generic"],
+            "description": "Discovery shape the inlet extracted from the phase doc."
+          },
+          "query": {
+            "type": "string",
+            "description": "One focused investigation question."
+          },
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute project directory to scope bbox graph queries."
+          },
+          "scope_hint": {
+            "type": "string",
+            "description": "Optional subsystem, path, symbol, or phase-doc excerpt to narrow the walk."
+          },
+          "known_evidence": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Optional entity refs or path ids already known by the inlet."
+          }
+        },
+        "required": ["question_shape", "query"],
+        "additionalProperties": false
+      },
+      "prompt_template": "Question shape: {{question_shape}}\nProject: {{project_dir}}\nScope hint: {{scope_hint}}\nKnown evidence: {{known_evidence}}\n\nInvestigation question:\n{{query}}\n\nReturn strict JSON only."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "tldr": { "type": "string" },
+          "leads_symbols_files": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path": { "type": "string" },
+                "symbol": { "type": "string" },
+                "entity_ref": { "type": "string" },
+                "why_relevant": { "type": "string" }
+              },
+              "required": ["entity_ref", "why_relevant"],
+              "additionalProperties": false
+            }
+          },
+          "leads_entity_refs": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "ref": { "type": "string" },
+                "label": { "type": "string" },
+                "why_relevant": { "type": "string" }
+              },
+              "required": ["ref", "why_relevant"],
+              "additionalProperties": false
+            }
+          },
+          "leads_paths": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "path_id": { "type": "string" },
+                "claim": { "type": "string" }
+              },
+              "required": ["path_id", "claim"],
+              "additionalProperties": false
+            }
+          },
+          "next_hops": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "bundle_handle": {
+            "type": "string",
+            "description": "Handle or id returned by bbox_bundle_evidence, when a bundle was created."
+          },
+          "limits": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "gap_check": {
+            "type": "string",
+            "description": "clean, blocked, disputed, or a concise unresolved gap summary."
+          }
+        },
+        "required": [
+          "tldr",
+          "leads_symbols_files",
+          "leads_entity_refs",
+          "leads_paths",
+          "next_hops",
+          "bundle_handle",
+          "limits",
+          "gap_check"
+        ],
+        "additionalProperties": false
+      },
+      "evidence_density": "high"
+    },
+    "composition": {
+      "chainable_after": [],
+      "parallel_safe": true,
+      "fan_out_aggregator": "ensemble-merge"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-phase-decomposer",
+      "created_at": "2026-05-15T00:00:00Z",
+      "source": "Reconciles the reverted .claude/agents/corpus-pathfinder.md from commit 3dbc7e9 with badgey-scout and atom grounding contracts."
+    }
+  }
+}

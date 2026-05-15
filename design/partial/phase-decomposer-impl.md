@@ -1,7 +1,7 @@
 # Phase Decomposer — Implementation Plan
 
 Date: 2026-05-10
-Status: partially implemented — Phase 1 shipped; Phases 2-7 remain open.
+Status: partially implemented — Phases 1-2 shipped; Phases 3-7 remain open.
 Companion to: `design/partial/phase-decomposer.md` (pure design - this is the build plan).
 Depends on: `design/archive/supervision-phased-implementation.md` (supervised atom
 orchestration primitives must exist before Phase 6 foreach implementer
@@ -12,7 +12,7 @@ dispatch).
 | Phase | Status | Notes |
 |---|---|---|
 | 1. `bbox_ref_size` MCP tool | **Done** | Tool handler in `src/tools/graph.rs`; implementation in `src/mcp_tools/ref_size.rs`; project-file full-content lookup in `src/index/mod.rs`; docs in `src/tool_docs.rs`. |
-| 2. Scout agent manifest | **Not built** | Next independent artifact phase. |
+| 2. Scout agent manifest | **Done** | `system-defaults/agents/corpus-pathfinder.json`; reconciles the reverted Claude subagent prompt with Badgey's scout contract and atom-style grounding discipline. |
 | 3. Inlet agent | **Not built** | Depends on Phases 1-2. |
 | 4. Single-implementer path | **Not built** | Depends on Phase 3. |
 | 5. Ensemble decomposition | **Not built** | Depends on Phase 3. |
@@ -81,26 +81,49 @@ bytes: 2140}, {ref: ..., bytes: 895}]}`.
 
 ## Phase 2: Scout agent manifest
 
+> **Status: shipped.** `corpus-pathfinder` is installed as a generic agent
+> manifest in `system-defaults/agents/corpus-pathfinder.json`. It pulls the
+> useful intent from the reverted Claude Code subagent
+> (`3dbc7e9:.claude/agents/corpus-pathfinder.md`) but does not resurrect that
+> prompt-only enforcement model.
+
 **Prerequisites:** none. Can proceed in parallel with Phase 1.
 
-**What gets built:**
+**What shipped:**
 
-2.1 **Corpus-pathfinder as JSON agent.** Lift the existing
-   `.claude/agents/corpus-pathfinder.md` (Claude-frontmatter agent) to
-   an installed JSON manifest in `system-defaults/agents/corpus-pathfinder.json`.
-   Follows the `code-reviewer.json` schema (`system-defaults/agents/`).
+2.1 **Corpus-pathfinder as JSON agent.** The old
+   `.claude/agents/corpus-pathfinder.md` was intentionally removed in
+   `ad36da6` because Claude did not reliably honor prompt-enforced search/read
+   caps. The shipped artifact preserves its durable intent instead:
+   one focused graph-grounding scout that returns round-trippable entity refs,
+   validated path ids, evidence-bundle handles, limits, and gaps.
 
-   Fields (matching `code-reviewer.json` schema,
-   `system-defaults/agents/code-reviewer.json`):
+   The manifest follows the `code-reviewer.json` / `diff-narrator.json`
+   schema under `system-defaults/agents/`, with these reconciliations:
+
+   - Default provider is Codex (`codex`, `gpt-5.5`, medium), because the
+     removal commit records Codex as the provider that actually followed the
+     grounding contract in the original trials.
+   - The lens keeps the old pathfinder loop:
+     `bbox_describe_schema` when needed, `bbox_hybrid_search`,
+     `bbox_inspect_entity`, `bbox_find_paths` for multi-hop claims, and
+     `bbox_bundle_evidence` before returning.
+   - The behavior matches `system-defaults/badgey/agents/badgey-scout.json`
+     at the conceptual level: one focused investigation, no sub-agent spawn,
+     no synthesis beyond evidence. It deliberately differs by returning
+     structured JSON directly instead of emitting `bbox_note(kind="done")`,
+     because Phase 3 aggregates `vars.scout_results` mechanically.
+   - It can read grounding atoms (`atom_list`, `atom_get`, `atom_describe`,
+     `atom_search`) so scout output can point downstream consumers at existing
+     atomized analysis tools rather than inventing manual tool sequences.
+
+   Fields:
    - `description`: "Scout for codebase exploration..."
    - `when_to_use`: ["when dispatching discovery scouts over a phase doc",
      "when grounding a proposal in code before implementing"]
    - `anti_patterns`: ["do not use for one-line lookups",
      "do not use when the answer is already known"]
-   - `brofile_inline`: provider/model/effort + lens (the existing
-     `.md` body as the system prompt). Note: `brofile_inline` is a
-     full brofile object, not just a string. See `diff-narrator.json`
-     for the inline shape.
+   - `brofile_inline`: provider/model/effort + reconciled pathfinder lens.
    - `filter_overlay.disallow`: ["Edit", "Write", "Bash",
      "NotebookEdit", "mcp__blackbox__bro_*",
      "mcp__blackbox__bbox_learn", "mcp__blackbox__bbox_remember",
@@ -114,17 +137,18 @@ bytes: 2140}, {ref: ..., bytes: 895}]}`.
    - `composition.fan_out_aggregator: "ensemble-merge"`
    - `cost_class: "cheap"`
 
-2.2 **Provider routing.** Primary provider: Claude (Sonnet 4.6, medium
-   effort). Cross-provider via render pipeline. The agent manifest
-   declares the brofile inline; `bro_agent_dispatch` resolves the
-   provider.
+2.2 **Provider routing.** Primary provider is Codex (`gpt-5.5`, medium).
+   Claude can be added later as an alternate only if the runner can enforce
+   the same read-only graph surface mechanically; prompt-only discipline was
+   already tested and removed. The agent manifest declares the brofile inline;
+   `bro_agent_dispatch` resolves the provider.
 
 **Deliverable:** `bro_agent_dispatch(agent="corpus-pathfinder",
 args={query: "find auth middleware", question_shape: "WHERE"})` returns
 structured leads JSON. Installable via `bbox_artifact_install
 kind=agent`.
 
-**Estimated size:** 1 JSON artifact (~80-120 lines). No Rust code.
+**Actual size:** 1 JSON artifact. No Rust code.
 
 ---
 
