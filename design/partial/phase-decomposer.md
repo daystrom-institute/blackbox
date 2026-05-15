@@ -41,8 +41,7 @@ measuring it mechanically, and routing accordingly.
   │ 6. Measure manifest via         │
   │    bbox_ref_size MCP tool       │
   │ 7. Emit triage verdict +        │
-  │    evidence bundle + (optional) │
-  │    DAG sketch                   │
+  │    evidence bundle              │
   └───────────────┬─────────────────┘
                   │
         ┌─────────┴─────────┐
@@ -156,10 +155,10 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
 
 5. **Produce the triage verdict.** If the measured manifest fits in the
    target model's context window → `fit_direct`. If it exceeds →
-   `needs_decompose`. The inlet also exports the evidence bundle
-   (structured JSON of refs + measurements) and, if decomposition is
-   indicated, may sketch an initial DAG for the ensemble to start from —
-   but the ensemble owns the final DAG.
+   `needs_decompose`. The inlet exports only the evidence bundle
+   (structured JSON of refs + measurements) and the verdict. It does
+   **not** sketch, seed, or export a DAG; the decomposer/ensemble owns
+   the first DAG construction after reading scout results.
 
 ### 3.2 Why scouts before triage
 
@@ -189,8 +188,7 @@ The inlet's output to downstream:
     ],
     "knowledge_ids": ["kn-..."],
     "path_ids": ["path-..."]
-  },
-  "dag_sketch": null
+  }
 }
 ```
 
@@ -202,8 +200,9 @@ compares to the model's context window.
 
 The inlet runs inside a discovery subworkflow (`schema.rs:144-151`). The
 subworkflow imports `phase_doc_path` from the parent and exports
-`evidence_bundle`, `triage_verdict`, and `dag_sketch` back to the parent
-(`engine.rs:2464-2570`).
+`evidence_bundle` and `triage_verdict` back to the parent
+(`engine.rs:2464-2570`). DAG artifacts are produced later by the
+decomposer/ensemble path, not by discovery.
 
 The discovery subworkflow node carries a `gate` packet
 (`schema.rs:120-127`). The gate's entity includes the subworkflow's exported

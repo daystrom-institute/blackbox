@@ -175,8 +175,8 @@ kind=agent`.
      `bro_agent_dispatch`. Results collect into `vars.scout_results`.
    - **Inlet** (durable Executor): reads `vars.scout_results`.
      Aggregates, deduplicates, calls `bbox_ref_size`, produces
-     `vars.evidence_bundle`, `vars.triage_verdict`,
-     `vars.dag_sketch`.
+     `vars.evidence_bundle` and `vars.triage_verdict`. DAG construction
+     belongs to the decomposer/ensemble path after discovery.
 
 3.3 **Parent gate packet.** After the discovery subworkflow exports
    `triage_verdict` to the parent, the PARENT node carries a `gate`
@@ -188,8 +188,8 @@ kind=agent`.
 
 3.4 **Parent workflow integration.** The parent workflow imports
    `phase_doc_path` into the discovery subworkflow. On completion,
-   exports `evidence_bundle`, `triage_verdict`, `dag_sketch` are
-   promoted back to parent vars (`engine.rs:2543`). The parent's next
+   exports `evidence_bundle` and `triage_verdict` are promoted back to
+   parent vars (`engine.rs:2543`). The parent's next
    node carries a gate packet that reads `vars.triage_verdict` and
    emits the classification. `Branch` routes on `last_verdict`.
    **Subworkflow gate verdicts are not promoted** — the parent needs
