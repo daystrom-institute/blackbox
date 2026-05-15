@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - rust
+tags:
+  - refactor-tools
+  - rust
 date: 2026-05-15
 status: "design proposal, gap inventory (no implementation phasing)"
 brief: "Current Rust refactor gap inventory for remaining plan kinds and toolbelt additions."

@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - rust
+tags:
+  - refactor-tools
+  - rust
 status: "proposed v2 follow-ups"
 brief: "Captures Rust refactor v2 invariants and deferred plan kinds after the initial expansion work."
 ---

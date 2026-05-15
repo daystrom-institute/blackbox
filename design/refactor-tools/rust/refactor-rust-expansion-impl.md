@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - rust
+tags:
+  - refactor-tools
+  - rust
 brief: "Dependency-ordered implementation skeleton for Rust refactor expansion plan kinds and cross-surface invariants."
 ---
 

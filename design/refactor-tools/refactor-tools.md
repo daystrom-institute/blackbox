@@ -4,6 +4,8 @@ kind: design-hub
 corpus: blackbox-design
 topic:
   - refactor-tools
+tags:
+  - refactor-tools
 brief: "Hub for Blackbox structural refactor tooling, refactor atoms, Rust expansion, and Java refactor closure."
 ---
 

@@ -5,6 +5,8 @@ lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
+tags:
+  - refactor-tools
 date: 2026-05-07
 status: "archived checkpoint plan; moved from design/proposed on 2026-05-12 and archived on 2026-05-14"
 brief: "AST-grounded execution plan for the crate restructure, retained as a refactor planning checkpoint."

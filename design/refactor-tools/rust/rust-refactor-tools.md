@@ -5,6 +5,9 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - rust
+tags:
+  - refactor-tools
+  - rust
 brief: "Hub for Rust refactor expansion, Rust refactor atoms, v2 invariants, and current gap inventory."
 ---
 

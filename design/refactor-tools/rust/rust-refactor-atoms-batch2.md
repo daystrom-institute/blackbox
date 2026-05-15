@@ -7,6 +7,9 @@ topic:
   - refactor-tools
   - rust
   - atoms
+tags:
+  - refactor-tools
+  - rust
 date: 2026-05-13
 status: "design proposal"
 brief: "Second-batch Rust refactor atom proposal building on refactor-agent and Rust v2 invariant work."

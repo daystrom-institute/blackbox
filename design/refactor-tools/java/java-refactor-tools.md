@@ -5,6 +5,9 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - java
+tags:
+  - refactor-tools
+  - java
 brief: "Hub for Java refactor gap closure and shipped Java refactor atom coverage."
 ---
 

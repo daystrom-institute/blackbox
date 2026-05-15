@@ -5,6 +5,8 @@ lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
+tags:
+  - refactor-tools
 date: 2026-05-07
 status: "working benchmark"
 brief: "Benchmark record for exercising the refactor MCP surface against the crate restructure design."

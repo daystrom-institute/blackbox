@@ -1,12 +1,6 @@
 ---
 title: System Memory Catalog
 brief: Plain Markdown map for navigating system memory runbooks from Obsidian.
-tags:
-  - system-memory
-  - catalog
-  - routing
-  - runbook
-  - obsidian
 ---
 # System Memory Catalog
 

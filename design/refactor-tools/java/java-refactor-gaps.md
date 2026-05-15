@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - java
+tags:
+  - refactor-tools
+  - java
 status: "closed; archived 2026-05-15"
 brief: "Closed Java refactor gap inventory showing shipped atom coverage and validation for Java plan kinds."
 ---

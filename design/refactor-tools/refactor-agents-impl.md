@@ -6,6 +6,8 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - atoms
+tags:
+  - refactor-tools
 brief: "Implementation skeleton for refactor atom manifests layered over Rust expansion and agent-system substrate."
 ---
 

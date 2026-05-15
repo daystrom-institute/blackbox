@@ -5,6 +5,8 @@ lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
+tags:
+  - refactor-tools
 date: 2026-05-07
 status: "proposal, revised after Claude review"
 brief: "Foundational design for AST-assisted refactor planning, validation, and language-specific recipes."

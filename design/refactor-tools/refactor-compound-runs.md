@@ -5,6 +5,8 @@ lifecycle: partial
 corpus: blackbox-design
 topic:
   - refactor-tools
+tags:
+  - refactor-tools
 date: 2026-05-07
 status: "partially implemented; updated 2026-05-13"
 brief: "Design and implementation status for transactional multi-step refactor runs with command validation and rollback."

@@ -6,6 +6,8 @@ corpus: blackbox-design
 topic:
   - refactor-tools
   - atoms
+tags:
+  - refactor-tools
 date: 2026-05-10
 revision: "rev 2 - applies codex-gpt55 review convergence"
 status: "design proposal, pure design (no implementation phasing)"
