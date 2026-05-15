@@ -308,17 +308,24 @@ acceptance subsets, and measured byte sizes.
 ## Phase 6: Foreach implementer dispatch
 
 **Prerequisites:** Phase 4 (supervised subworkflow template), Phase 5
-(DAG artifact). Supervision phases 1-6 must be complete.
+(DAG artifact). Supervision P1, P2, P3a, P4, P5, and the needed P6 action
+subset must be complete.
 
 **What gets built:**
 
 6.1 **Foreach over DAG.** After the decomposer produces `vars.dag`,
    a `foreach` node iterates over `vars.dag.sub_units`. Each
-   iteration runs `subworkflow_ref: "supervised-impl"` with:
-   - `brofile`: the sub-unit's assigned implementer brofile
-   - `prompt`: the sub-unit's acceptance criteria + evidence subset
-   - `evidence_manifest`: the refs from the DAG for this sub-unit
-   - `acceptance_criteria`: the sub-unit's `acceptance_subset`
+   iteration runs `subworkflow_ref:
+   "phase-decompose-supervised-impl"` with the fixed bounded
+   implementer/advisor pair:
+   - `sub_unit`: the current DAG sub-unit, including its acceptance subset
+     and refs.
+   - `evidence_bundle`: the parent evidence bundle.
+   - `acceptance_criteria`: the parent acceptance criteria; the sub-unit's
+     scope is carried by `sub_unit.acceptance_subset`.
+
+   DAG entries must not carry `assigned_brofile`; bounded execution is
+   controlled by the supervised-impl workflow and brofiles.
 
 6.2 **Collect outcomes.** `foreach.collect.into_var: sub_results`.
    Each outcome is a `FanoutChildOutcome` with `{status, exports,

@@ -7,5 +7,5 @@
   "filters": {
     "disallow": ["Edit", "Write", "Bash", "NotebookEdit"]
   },
-  "lens": "You are the phase-decomposer acceptance advisor. Read the implementer output, evidence bundle, and acceptance criteria. Return strict JSON only: {\"advisor_verdict\":\"accept|remediate|halt\",\"acceptance_status\":\"passed|failed|blocked\",\"summary\":\"...\",\"failed_acceptance_ids\":[],\"steer_prompt\":\"...\"}. Do not edit files and do not dispatch agents."
+  "lens": "You are the phase-decomposer acceptance advisor. Read the implementer output, evidence bundle, sub-unit, parent workflow evidence, and acceptance criteria. For live-test/no-edit fixtures, accept static wiring plus parent live-arc evidence when the bounded sub-unit is asked to validate artifacts the parent already produced; do not require the sub-unit to launch a fresh top-level dispatch. Return strict JSON only: {\"advisor_verdict\":\"accept|remediate|halt\",\"acceptance_status\":\"passed|failed|blocked\",\"summary\":\"...\",\"failed_acceptance_ids\":[],\"steer_prompt\":\"...\"}. Do not edit files and do not dispatch agents."
 }
