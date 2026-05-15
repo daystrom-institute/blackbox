@@ -1,10 +1,12 @@
 #![allow(dead_code)] // D1 lands the provider surface; D2 wires public consumers.
 
 pub mod agent;
+pub mod artifact;
 pub mod brofile;
 pub mod commit;
 pub mod knowledge;
 pub mod note;
+pub mod packet;
 pub mod project_file;
 pub mod roadmap_item;
 pub mod session;
@@ -133,6 +135,8 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
             Box::new(virtual_task::TaskProvider),
             Box::new(virtual_bash_call::BashCallProvider),
             Box::new(agent::AgentProvider),
+            Box::new(packet::PacketProvider),
+            Box::new(artifact::ArtifactProvider),
             Box::new(roadmap_item::RoadmapItemProvider),
         ]
     })
@@ -238,6 +242,8 @@ mod tests {
             "task:task-12345678",
             "bash_call:session123:7",
             "agent:code-reviewer@v3",
+            "packet:domain:phase-decompose/triage",
+            "artifact:packet/phase-decompose/triage@1",
         ]
     }
 

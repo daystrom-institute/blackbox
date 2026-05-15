@@ -295,6 +295,8 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec![
                 "knowledge:a".into(),
+                "packet:domain:phase-decompose/triage".into(),
+                "artifact:packet/phase-decompose/triage@1".into(),
                 "knowledge:b".into(),
                 "knowledge:c".into(),
                 "not-a-ref".into(),
@@ -311,7 +313,21 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["status"], "ok");
-        assert_eq!(value["entities"].as_array().unwrap().len(), 3);
+        assert_eq!(value["entities"].as_array().unwrap().len(), 5);
+        assert!(
+            value["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entity| entity["entity_ref"] == "packet:domain:phase-decompose/triage")
+        );
+        assert!(
+            value["entities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|entity| entity["entity_ref"] == "artifact:packet/phase-decompose/triage@1")
+        );
         assert_eq!(
             value["degraded"]["unresolved_entity_refs"]
                 .as_array()

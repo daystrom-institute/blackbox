@@ -28,11 +28,13 @@ pub enum EntityType {
     Task,
     BashCall,
     Agent,
+    Packet,
+    Artifact,
     RoadmapItem,
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 16] = [
+    pub const ALL: [EntityType; 18] = [
         EntityType::Knowledge,
         EntityType::Transcript,
         EntityType::ProjectFile,
@@ -48,6 +50,8 @@ impl EntityType {
         EntityType::Task,
         EntityType::BashCall,
         EntityType::Agent,
+        EntityType::Packet,
+        EntityType::Artifact,
         EntityType::RoadmapItem,
     ];
 
@@ -68,6 +72,8 @@ impl EntityType {
             EntityType::Task => "task",
             EntityType::BashCall => "bash_call",
             EntityType::Agent => "agent",
+            EntityType::Packet => "packet",
+            EntityType::Artifact => "artifact",
             EntityType::RoadmapItem => "roadmap_item",
         }
     }
@@ -97,6 +103,8 @@ impl EntityType {
             EntityType::Task => "task:<task_id>",
             EntityType::BashCall => "bash_call:<session>:<turn>",
             EntityType::Agent => "agent:<name>@v<version>",
+            EntityType::Packet => "packet:domain:<domain>",
+            EntityType::Artifact => "artifact:<kind>/<name>@<version>",
             EntityType::RoadmapItem => "roadmap_item:<id>",
         }
     }
@@ -190,6 +198,14 @@ pub enum EntityRef {
         name: String,
         version: u32,
     },
+    Packet {
+        selector: String,
+    },
+    Artifact {
+        kind: String,
+        name: String,
+        version: Option<String>,
+    },
     RoadmapItem {
         id: String,
     },
@@ -246,6 +262,8 @@ impl EntityRef {
             }),
             EntityType::BashCall => parse_bash_call(input, rest),
             EntityType::Agent => parse_agent(input, rest),
+            EntityType::Packet => parse_packet(input, rest),
+            EntityType::Artifact => parse_artifact(input, rest),
             EntityType::RoadmapItem => parse_single(input, rest, EntityType::RoadmapItem, |id| {
                 EntityRef::RoadmapItem { id }
             }),
@@ -327,6 +345,15 @@ impl EntityRef {
                 }
                 Ok(format!("agent:{name}@v{version}"))
             }
+            EntityRef::Packet { selector } => Ok(format!("packet:{selector}")),
+            EntityRef::Artifact {
+                kind,
+                name,
+                version,
+            } => match version {
+                Some(version) => Ok(format!("artifact:{kind}/{name}@{version}")),
+                None => Ok(format!("artifact:{kind}/{name}")),
+            },
             EntityRef::RoadmapItem { id } => Ok(format!("roadmap_item:{id}")),
         }
     }
@@ -348,6 +375,8 @@ impl EntityRef {
             EntityRef::Task { .. } => EntityType::Task,
             EntityRef::BashCall { .. } => EntityType::BashCall,
             EntityRef::Agent { .. } => EntityType::Agent,
+            EntityRef::Packet { .. } => EntityType::Packet,
+            EntityRef::Artifact { .. } => EntityType::Artifact,
             EntityRef::RoadmapItem { .. } => EntityType::RoadmapItem,
         }
     }
@@ -620,6 +649,50 @@ fn parse_agent(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError
     Ok(EntityRef::Agent {
         name: name.to_string(),
         version: parse_u32(input, version_str, EntityType::Agent, "version")?,
+    })
+}
+
+fn parse_packet(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    let selector = non_empty(input, rest, EntityType::Packet, "selector")?;
+    if selector.starts_with("domain:") || selector.starts_with("packet-") {
+        Ok(EntityRef::Packet {
+            selector: selector.to_string(),
+        })
+    } else {
+        Err(shape_error(input, EntityType::Packet))
+    }
+}
+
+fn parse_artifact(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    let (kind, tail) = rest.split_once('/').ok_or_else(|| {
+        EntityRefParseError::bad_input(
+            input,
+            "missing `name` in artifact",
+            Some(format!("Expected `{}`", EntityType::Artifact.example())),
+        )
+    })?;
+    let kind = non_empty(input, kind, EntityType::Artifact, "kind")?;
+    let valid_kind = matches!(
+        kind,
+        "workflow" | "packet" | "brofile" | "agent" | "atom" | "team" | "cron"
+    );
+    if !valid_kind {
+        return Err(shape_error(input, EntityType::Artifact));
+    }
+    let (name, version) = match tail.rsplit_once('@') {
+        Some((name, version)) => {
+            let version = version.strip_prefix('v').unwrap_or(version);
+            (
+                non_empty(input, name, EntityType::Artifact, "name")?,
+                Some(non_empty(input, version, EntityType::Artifact, "version")?.to_string()),
+            )
+        }
+        None => (non_empty(input, tail, EntityType::Artifact, "name")?, None),
+    };
+    Ok(EntityRef::Artifact {
+        kind: kind.to_string(),
+        name: name.to_string(),
+        version,
     })
 }
 
@@ -1142,7 +1215,15 @@ mod tests {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            15 => EntityRef::RoadmapItem {
+            15 => EntityRef::Packet {
+                selector: format!("domain:{}", rng.token("packet-domain-")),
+            },
+            16 => EntityRef::Artifact {
+                kind: "workflow".into(),
+                name: rng.token("workflow-"),
+                version: Some("1".into()),
+            },
+            17 => EntityRef::RoadmapItem {
                 id: rng.token("roadmap-"),
             },
             _ => unreachable!(),
