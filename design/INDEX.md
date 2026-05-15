@@ -7,11 +7,11 @@ describes behavior that matters for implementation, verify it against the code,
 
 ## Directory Semantics
 
-- [`proposed/`](proposed/) - candidate designs and not-yet-accepted directions.
+- `proposed/` - candidate designs and not-yet-accepted directions.
   These are useful for intent and options, but they are not current behavior.
-- [`partial/`](partial/) - in-flight designs or implementation plans where some
+- `partial/` - in-flight designs or implementation plans where some
   work has landed and some remains. Verify both the doc and code before acting.
-- [`archive/`](archive/) - shipped, closed, or historical designs. These are
+- `archive/` - shipped, closed, or historical designs. These are
   useful for provenance and rationale, but newer code or system memories may
   supersede details.
 
