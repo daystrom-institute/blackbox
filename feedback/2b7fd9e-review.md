@@ -1,7 +1,0 @@
-Blocker: `bro_agent_dispatch` args validation is not schema conformance. `src/main.rs:4801` checks only `required` and top-level `type == "object"`, so schemas with `properties` type constraints, enums, nested objects, arrays, `additionalProperties`, etc. pass invalid args. Design requires `args` conform to `manifest.inputs.schema` with field-level details. Use the existing `jsonschema` dependency or an equivalent shared validator, and add a negative test that fails today, e.g. `{schema:{type:"object",properties:{diff:{type:"string"}},required:["diff"]}, args:{diff:123}}`.
-
-Blocker: agent attribution is still lost when `bro_agent_dispatch(..., bro=...)` is used. `src/main.rs:4912` stamps `agent:<name>@v<version>`, then `record_task_to_bro` overwrites `TaskInner.bro_label` at `src/main.rs:6212` / `6241` with the named bro or `team::member`. Design says `bro_label = "agent:<name>@v<version>"` and named-bro resume should also work. Need a way to preserve agent attribution in `bro_status`/`bro_dashboard` while still recording named-bro routing. Add a test for dispatch with `bro=...`.
-
-Issue: `bro_dashboard` still builds entries manually and does not emit `broLabel` / agent attribution (`src/main.rs:2766`). Design §5.3 says `bro_status` and `bro_dashboard` parse/surface the agent prefix.
-
-Nit: worker still used raw shell commands (`cargo`, `git`, `grep`, `cat`) instead of `rtk` despite the repo instruction.

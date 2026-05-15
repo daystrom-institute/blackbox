@@ -6,6 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const TOML_DELIMITER: &str = "+++";
+const NON_MEMORY_MARKDOWN_FILES: &[&str] = &["system-memory-catalog.md"];
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MemoryFrontMatter {
@@ -82,6 +83,11 @@ fn list_markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| !NON_MEMORY_MARKDOWN_FILES.contains(&name))
+        })
         .collect();
 
     entries.sort();
@@ -210,5 +216,25 @@ mod tests {
         let base = dir.path();
         fs::write(base.join("bad.md"), "no delimiter\nbody\n").expect("write bad");
         assert!(load_dir(base).is_err());
+    }
+
+    #[test]
+    fn load_dir_skips_markdown_navigation_catalog() {
+        let dir = tempdir().expect("temp dir");
+        let base = dir.path();
+        fs::write(
+            base.join("valid.md"),
+            "+++\ntitle = \"valid\"\ntags = [\"x\"]\norder = 1\n+++\nValid\n",
+        )
+        .expect("write valid");
+        fs::write(
+            base.join("system-memory-catalog.md"),
+            "---\ntitle: Catalog\n---\n# Catalog\n",
+        )
+        .expect("write catalog");
+
+        let loaded = load_dir(base).expect("load should skip catalog");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].slug, "valid");
     }
 }

@@ -1,4 +1,0 @@
-- `a73a552` committed `feedback/AS-*.md` review files. These are side-channel reviewer notes, not product artifacts; remove them from tracked history in the next commit if possible.
-- `src/providers/agent.rs` reads only `description` and `when_to_use` from wrapped manifests. Schema still advertises `brofile_ref`; preserve parity with `main.rs::inspect_extra_properties` by reading `brofile_ref` from `manifest`.
-- `src/providers/agent.rs` ignores the requested pinned `version` when loading artifact value by bare `name`. This matches current catalog limits but should be explicitly documented/tested as "active-only until catalog supports versioned values" if pinned historical lookup is not real yet.
-- Provider tests were described as "pre-existing failures"; verify after rebase that the same three failures also fail on `origin/agentic-corpus-impl`, or phrase as observed non-agent failures rather than known baseline.

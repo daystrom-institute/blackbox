@@ -205,6 +205,8 @@ or system memories and link/pointer from here.
   `docs/graph-retrieval-internals.md` - architecture internals.
 - `docs/transcript-retrieval.md`, `docs/knowledge-store.md`,
   `docs/projects-code-indexing.md` - core corpus surfaces.
+- `system-defaults/memories/system-memory-catalog.md` - Obsidian navigation
+  map for system memory runbooks; not loaded as a runtime memory.
 - `docs/refactor.md`, `system-defaults/memories/refactor*.md` - refactor
   capability and language-specific protocols.
 - `docs/workflows.md`, `docs/ingress-paths.md`, `docs/system-events.md`,

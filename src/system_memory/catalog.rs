@@ -490,6 +490,13 @@ mod tests {
             if path.extension().is_none_or(|ext| ext != "md") {
                 continue;
             }
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == "system-memory-catalog.md")
+            {
+                continue;
+            }
             let body = fs::read_to_string(&path).unwrap();
             let slug = path.file_stem().unwrap().to_str().unwrap();
             crate::system_memory::loader::parse_memory_file(slug, &body).unwrap();

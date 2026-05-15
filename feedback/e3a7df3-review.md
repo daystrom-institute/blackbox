@@ -1,4 +1,0 @@
-- Touched files are not rustfmt-clean. `rustfmt --edition 2024 --check src/main.rs src/orchestration/agents/registry.rs src/orchestration/agents/validate.rs src/providers/agent.rs` reports required formatting in the changed sections. Do not run whole-repo fmt; format only the touched files/sections or otherwise avoid unrelated churn.
-- T1a-3 was deferred, but `src/main.rs` already has `#[cfg(test)] mod tests`, `test_server`, and direct private method access. Add direct handler tests there for `bro_agent_list` / `bro_agent_get`: list output shape, invalid cost_class is `is_error == Some(true)`, missing agent behavior, pinned ref. Seed agents through `server.state.artifacts.write().install_value(...)`.
-- Keep `feedback/AS-*.md` and `feedback/rebase-review.md` untracked/local. Do not commit reviewer notes.
-- `bro_agent_list` currently returns optional fields only when present; test should lock whichever output shape is intended so future changes are deliberate.

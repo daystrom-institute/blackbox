@@ -1,7 +1,0 @@
-Blocker: `bro_agent_dispatch` validates schemas as Draft7 (`src/main.rs:4809-4811`) while the manifest contract says `inputs.schema` is JSON Schema 2020-12 (`design/agent-system.md:518-519`). `Cargo.toml:126` also disables `jsonschema` default features and does not enable `draft202012`, so `Draft202012` is unavailable. Enable the needed feature and validate dispatch args with Draft202012, or intentionally use the schema's `$schema` with 2020-12 support. Add a regression using a 2020-12-only keyword such as `prefixItems` or `unevaluatedProperties`.
-
-Blocker: `agent_label` adds the new TaskInner metadata field that the design explicitly says is unnecessary (`src/orchestration/mod.rs:70-74` vs `design/agent-system.md:648-652`). Either revise the implementation back to the design seam (`bro_label = agent:<name>@v<version>` and parse/surface attribution there) while preserving `bro_resume(bro=...)`, or update the design/impl docs and tool contract in the same commit so the new `agentLabel` field is intentional, documented, and not an accidental parallel metadata path.
-
-Issue: `agent_label` is set after `spawn_task` returns (`src/main.rs:4917-4919`), but `spawn_task` emits `TaskStarted` and may persist failed-spawn tasks before the attribution exists (`src/orchestration/mod.rs:638-663`). If the new field stays, thread it into task construction instead of mutating after spawn.
-
-Nit: raw `cargo`, `grep`, and `sed -i` appeared again in the checkpoint transcript. Use `rtk` and edit tools.
