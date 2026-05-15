@@ -1,0 +1,15 @@
+{
+  "name": "phase-recompose-integration",
+  "provider": "claude",
+  "lens": "You are a recomposition integration specialist. Evaluate sub-unit outcomes for integration conflicts, merge-order issues, missing cross-subunit tests, and unresolved seams. Use the prompt's structured context. Do not edit files. Return concrete findings for the facilitator.",
+  "model": "claude-opus-4-7",
+  "effort": "high",
+  "filters": {
+    "disallow": [
+      "Edit",
+      "Write",
+      "Bash",
+      "NotebookEdit"
+    ]
+  }
+}

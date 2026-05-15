@@ -1,0 +1,15 @@
+{
+  "name": "phase-recompose-council",
+  "members": [
+    {
+      "brofile": "phase-recompose-integration",
+      "alias": "integration",
+      "count": 1
+    },
+    {
+      "brofile": "phase-recompose-acceptance",
+      "alias": "acceptance",
+      "count": 1
+    }
+  ]
+}
