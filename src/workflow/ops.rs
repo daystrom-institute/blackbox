@@ -54,6 +54,9 @@ pub struct HookOp {
 #[serde(rename_all = "snake_case")]
 pub enum OpKind {
     SetVar,
+    /// Set a variable only when it is currently missing or null.
+    /// Useful for optional workflow inputs that still appear in prompts.
+    DefaultVar,
     IncVar,
     AppendVar,
     MergeVar,
@@ -224,6 +227,7 @@ pub async fn execute_op_with_hub(
         .map_err(|e| anyhow!("op {:?}: arg render failed: {e}", hook.op))?;
     match hook.op {
         OpKind::SetVar => exec_set_var(&rendered_args),
+        OpKind::DefaultVar => exec_default_var(&rendered_args, ctx),
         OpKind::IncVar => exec_inc_var(&rendered_args, ctx),
         OpKind::AppendVar => exec_append_var(&rendered_args, ctx),
         OpKind::MergeVar => exec_merge_var(&rendered_args, ctx),
@@ -1104,6 +1108,23 @@ fn exec_set_var(args: &Value) -> Result<OpEffect> {
     bail!("SetVar args must be {{key,value}} or a single-entry object, got: {args}")
 }
 
+fn exec_default_var(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
+    let key = args
+        .get("key")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("DefaultVar requires args.key (string)"))?;
+    let value = args
+        .get("value")
+        .ok_or_else(|| anyhow!("DefaultVar requires args.value"))?;
+    if ctx.vars.get(key).is_some_and(|v| !v.is_null()) {
+        return Ok(OpEffect::None);
+    }
+    Ok(OpEffect::SetVar {
+        key: key.to_string(),
+        value: value.clone(),
+    })
+}
+
 fn exec_inc_var(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
     let key = args
         .get("key")
@@ -1786,6 +1807,31 @@ mod tests {
             }
             _ => panic!("expected SetVar effect"),
         }
+    }
+
+    #[tokio::test]
+    async fn default_var_only_writes_missing_value() {
+        let mut ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::DefaultVar,
+            args: json!({"key": "sub_unit", "value": {}}),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: None,
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "sub_unit");
+                assert_eq!(value, json!({}));
+            }
+            _ => panic!("expected SetVar effect"),
+        }
+
+        ctx.vars
+            .insert("sub_unit".to_string(), json!({"sub_unit_id": "su-1"}));
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        assert!(matches!(effect, OpEffect::None));
     }
 
     #[tokio::test]

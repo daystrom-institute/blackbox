@@ -46,7 +46,7 @@
     },
     "FacilitateVerdict": {
       "actor": "facilitator",
-      "prompt": "Council findings:\n${vars.council_output}\n\nProject: ${vars.project_dir}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nReturn strict JSON only: {\"recompose_verdict\":\"satisfied|work_remains|untenable\",\"summary\":\"...\",\"remediation_packet\":{\"phase_doc_text\":\"...\",\"remaining_acceptance_ids\":[],\"conflicts\":[],\"prior_epoch_notes\":\"...\"},\"integration_tests\":[],\"halt_reason\":\"\"}.",
+      "prompt": "Council findings:\n${vars.council_output}\n\nProject: ${vars.project_dir}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nReturn strict JSON only: {\"recompose_verdict\":\"satisfied|work_remains|untenable\",\"summary\":\"...\",\"remediation_packet\":{\"phase_doc_text\":\"...\",\"remaining_acceptance_ids\":[],\"conflicts\":[],\"prior_epoch_notes\":\"...\"},\"integration_tests\":[],\"halt_reason\":\"\"}. The only terminal verdict labels for AC-DECOMP-3 are satisfied, work_remains, and untenable. Epoch-ceiling halt is a control-flow stop, not an AC-DECOMP-3 terminal verdict. If a no-edit fixture has empty file writes, base satisfaction on explicit foreach completion, advisor verdicts, and recompose_contract.cross_subunit_tests assertions rather than treating zero writes as sufficient by itself.",
       "gate": "domain:phase-decompose/recompose-verdict",
       "on_exit": [
         {

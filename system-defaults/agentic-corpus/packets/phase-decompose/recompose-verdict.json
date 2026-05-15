@@ -26,19 +26,19 @@
     {
       "id": "untenable_from_output",
       "classification": "untenable",
-      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"untenable\"" },
+      "antecedent": { "op": "StringMatches", "field": "node_output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"untenable\"" },
       "consequent": "untenable"
     },
     {
       "id": "work_remains_from_output",
       "classification": "work_remains",
-      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"work_remains\"" },
+      "antecedent": { "op": "StringMatches", "field": "node_output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"work_remains\"" },
       "consequent": "work_remains"
     },
     {
       "id": "satisfied_from_output",
       "classification": "satisfied",
-      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"satisfied\"" },
+      "antecedent": { "op": "StringMatches", "field": "node_output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"satisfied\"" },
       "consequent": "satisfied"
     },
     {

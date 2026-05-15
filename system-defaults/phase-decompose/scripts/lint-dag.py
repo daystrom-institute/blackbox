@@ -42,6 +42,8 @@ def main() -> int:
     if not isinstance(sub_units, list) or not sub_units:
         errors.append("dag.sub_units must be a non-empty array")
         sub_units = []
+    elif len(sub_units) < 2:
+        errors.append("dag.sub_units must contain at least two sub-units for a decomposed path")
 
     ids = []
     covered = set()
@@ -70,9 +72,6 @@ def main() -> int:
             errors.append(f"sub_units[{idx}].depends_on is required")
         elif not isinstance(depends_on, list):
             errors.append(f"sub_units[{idx}].depends_on must be an array")
-        assigned = unit.get("assigned_brofile")
-        if not isinstance(assigned, str) or not assigned:
-            errors.append(f"sub_units[{idx}].assigned_brofile is required")
         predicted_writes = unit.get("predicted_writes")
         if predicted_writes is None:
             errors.append(f"sub_units[{idx}].predicted_writes is required")
@@ -110,6 +109,32 @@ def main() -> int:
         errors.append("recompose_contract.merge_order must be an array")
     elif set(map(str, merge_order)) != set(ids):
         errors.append("merge_order must contain exactly the sub_unit_id set")
+
+    cross_tests = contract.get("cross_subunit_tests") if isinstance(contract, dict) else None
+    if not isinstance(cross_tests, list) or not cross_tests:
+        errors.append("recompose_contract.cross_subunit_tests must be a non-empty array")
+    else:
+        allowed_terminal = {"satisfied", "work_remains", "untenable"}
+        for idx, test in enumerate(cross_tests):
+            if not isinstance(test, dict):
+                errors.append(f"cross_subunit_tests[{idx}] must be an object")
+                continue
+            test_id = test.get("test_id")
+            if not isinstance(test_id, str) or not test_id:
+                errors.append(f"cross_subunit_tests[{idx}].test_id is required")
+            assertions = test.get("assertions")
+            if not isinstance(assertions, list) or not assertions:
+                errors.append(f"cross_subunit_tests[{idx}].assertions must be a non-empty array")
+            terminal_verdicts = test.get("terminal_verdicts")
+            if not isinstance(terminal_verdicts, list) or not terminal_verdicts:
+                errors.append(f"cross_subunit_tests[{idx}].terminal_verdicts must be a non-empty array")
+                continue
+            unknown = sorted({str(v) for v in terminal_verdicts} - allowed_terminal)
+            if unknown:
+                errors.append(
+                    f"cross_subunit_tests[{idx}].terminal_verdicts contains non-recompose verdicts: "
+                    + ", ".join(unknown)
+                )
 
     required = criterion_ids(acceptance)
     missing = sorted(required - covered)

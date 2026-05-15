@@ -343,6 +343,7 @@ the operator-blessed allow set: `allow`, `pass`, `proceed`, `fire`,
 | Op                    | Purpose                                                |
 |-----------------------|--------------------------------------------------------|
 | `set_var`             | Write `vars[key] = value` (schema-validated).          |
+| `default_var`         | Write `vars[key] = value` only when the var is missing or null. |
 | `inc_var`             | Increment integer var (default delta 1).               |
 | `append_var`          | Append to array var.                                   |
 | `merge_var`           | Merge object into object var.                          |

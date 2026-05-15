@@ -25,8 +25,21 @@
       "durable": false
     }
   },
-  "start": "Implement",
+  "start": "InitDefaults",
   "nodes": {
+    "InitDefaults": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "default_var",
+          "args": {
+            "key": "sub_unit",
+            "value": {}
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "Implement" }
+    },
     "Implement": {
       "actor": "implementer",
       "prompt": "Project: ${vars.project_dir}\nPhase doc path: ${vars.phase_doc_path}\nPhase doc text, when present:\n${vars.phase_doc_text}\n\nEvidence bundle JSON:\n${vars.evidence_bundle}\n\nParent acceptance criteria JSON:\n${vars.acceptance_criteria}\n\nSub-unit JSON, when present:\n${vars.sub_unit}\n\nExecute only this bounded assignment. If this is a live-test/no-edit phase, do not edit files. Otherwise implement and validate normally. Return strict JSON only: {\"status\":\"completed|blocked|failed\",\"summary\":\"...\",\"files_touched\":[],\"validation\":[],\"acceptance_ids\":[\"...\"],\"residual_risk\":\"...\"}.",

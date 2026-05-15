@@ -84,7 +84,7 @@ Every node's `next` is a tagged enum:
 
 - `start` — entry node id (required).
 - `policy_packet` — optional packet id applied to the arc's own state at each node boundary. Entity is `{ step, just_ran, next, completed, completed_count, in_flight, in_flight_count, last_verdict, visit_counts }`. Classifications are arc-level verdicts: `halt` stops the arc, `escalate` writes a `blocked` note, `warn` writes a `surprise` note, anything else is no-op. This is "advisor as packet" — deterministic arc-health without an LLM in the decision loop.
-- `vars_schema` — optional kind/required schema for arc vars; `set_var` / `inc_var` hooks validate against this.
+- `vars_schema` — optional kind/required schema for arc vars; `set_var`, `default_var`, and `inc_var` hooks validate against this.
 - `on_arc_exit` / `on_arc_cancel` — hook arrays fired at terminal (any outcome) / cancellation respectively.
 
 ## Standard shapes
