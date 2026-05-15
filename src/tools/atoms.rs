@@ -740,6 +740,151 @@ impl BlackboxServer {
         }
     }
 
+    fn supervision_plan_defaults() -> orchestration::atoms::types::SupervisionPlanDefaults {
+        use orchestration::atoms::types::{AtomRef, SupervisionClassifierMode};
+
+        orchestration::atoms::types::SupervisionPlanDefaults {
+            default_classifier_atom: Some(AtomRef::pinned("supervision-classifier", 1)),
+            default_classifier_mode: Some(SupervisionClassifierMode::CadenceOrAlert),
+            default_advisor_atom: Some(AtomRef::pinned("supervision-advisor", 1)),
+        }
+    }
+
+    fn normalized_supervision_plan_for_invoke(
+        &self,
+        manifest: &orchestration::atoms::types::AtomManifest,
+        invoke_override: Option<&orchestration::atoms::types::SupervisionPlanOverride>,
+    ) -> Result<orchestration::atoms::types::SupervisionPlan, String> {
+        orchestration::atoms::types::SupervisionPlan::normalize(
+            manifest.supervision.as_ref(),
+            None,
+            invoke_override,
+            &Self::supervision_plan_defaults(),
+        )
+    }
+
+    async fn start_supervision_for_primary_invocation(
+        &self,
+        primary_invocation_id: &str,
+        primary_task_id: &str,
+        owner: &str,
+        project_dir: Option<String>,
+        plan: &orchestration::atoms::types::SupervisionPlan,
+    ) -> Result<serde_json::Value, String> {
+        use orchestration::atoms::invocation::SupervisionAttachment;
+        use orchestration::atoms::types::{SupervisionAdvisorMode, SupervisionClassifierMode};
+
+        if plan.classifier.mode == SupervisionClassifierMode::None
+            && plan.advisor.mode == SupervisionAdvisorMode::None
+        {
+            return Ok(serde_json::json!({"enabled": false}));
+        }
+
+        let supervision_run_id = format!("sup-{}", uuid::Uuid::new_v4().simple());
+        let mut attachment = SupervisionAttachment {
+            supervision_run_id: supervision_run_id.clone(),
+            primary_invocation_id: primary_invocation_id.to_string(),
+            primary_task_id: primary_task_id.to_string(),
+            classifier_invocation_id: None,
+            advisor_invocation_id: None,
+            attempt: 1,
+        };
+        self.state
+            .atom_invocation_store
+            .write()
+            .insert_attachment(attachment.clone());
+
+        let mut classifier_error: Option<String> = None;
+        if plan.classifier.mode != SupervisionClassifierMode::None {
+            let classifier_ref = plan
+                .classifier
+                .atom_ref
+                .as_ref()
+                .ok_or_else(|| "enabled classifier supervision requires classifier.atom_ref")?
+                .render();
+            let classifier_result = Box::pin(self.atom_invoke_value(
+                crate::AtomInvokeParams {
+                    atom: classifier_ref,
+                    args: serde_json::json!({
+                        "primary_invocation_id": primary_invocation_id,
+                        "attempt": 1,
+                        "tail_policy": plan.tail_policy,
+                        "alerting_classifications": plan.classifier.alerting_classifications,
+                    }),
+                    project_dir: project_dir.clone(),
+                    owner: Some(owner.to_string()),
+                    parent_invocation_id: None,
+                    supervision_override: None,
+                },
+                None,
+            ))
+            .await;
+            match classifier_result {
+                Ok(classifier_result) => {
+                    attachment.classifier_invocation_id = classifier_result
+                        .get("invocation_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string);
+                    self.state
+                        .atom_invocation_store
+                        .write()
+                        .insert_attachment(attachment.clone());
+                }
+                Err(err) if !plan.classifier.required => {
+                    classifier_error = Some(err);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        if plan.advisor.mode == SupervisionAdvisorMode::Always {
+            let advisor_ref = plan
+                .advisor
+                .atom_ref
+                .as_ref()
+                .ok_or_else(|| "enabled advisor supervision requires advisor.atom_ref")?
+                .render();
+            let advisor_result = Box::pin(self.atom_invoke_value(
+                crate::AtomInvokeParams {
+                    atom: advisor_ref,
+                    args: serde_json::json!({
+                        "primary_invocation_id": primary_invocation_id,
+                        "attempt": 1,
+                        "tail_policy": plan.tail_policy,
+                        "classifier_findings": [],
+                        "acceptance_criteria": "Assess whether the supervised atom completed the requested work correctly and safely.",
+                        "attempt_history": [],
+                        "allowed_actions": ["accept", "continue_observing", "steer_primary", "cancel_and_retry", "escalate_human", "bail"],
+                        "recovery_policy": plan.recovery,
+                    }),
+                    project_dir,
+                    owner: Some(owner.to_string()),
+                    parent_invocation_id: None,
+                    supervision_override: None,
+                },
+                None,
+            ))
+            .await?;
+            attachment.advisor_invocation_id = advisor_result
+                .get("invocation_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            self.state
+                .atom_invocation_store
+                .write()
+                .insert_attachment(attachment.clone());
+        }
+
+        Ok(serde_json::json!({
+            "enabled": true,
+            "supervision_run_id": supervision_run_id,
+            "attempt": 1,
+            "classifier_invocation_id": attachment.classifier_invocation_id,
+            "advisor_invocation_id": attachment.advisor_invocation_id,
+            "classifier_error": classifier_error,
+        }))
+    }
+
     async fn atom_invoke_profile(
         &self,
         invocation_id: &str,
@@ -802,6 +947,8 @@ impl BlackboxServer {
                 }
             }
         };
+        let supervision_plan =
+            self.normalized_supervision_plan_for_invoke(manifest, p.supervision_override.as_ref())?;
 
         let cwd = p.project_dir.clone();
         let brofile_filters = orchestration::mcp::McpFilters {
@@ -872,6 +1019,15 @@ impl BlackboxServer {
             invocation_id,
             dispatch_cost,
         );
+        let supervision = self
+            .start_supervision_for_primary_invocation(
+                invocation_id,
+                &task_id,
+                owner,
+                p.project_dir.clone(),
+                &supervision_plan,
+            )
+            .await?;
 
         Ok(serde_json::json!({
             "invocation_id": invocation_id,
@@ -879,6 +1035,7 @@ impl BlackboxServer {
             "task_id": task_id,
             "session_id": session_id,
             "status": "running",
+            "supervision": supervision,
         }))
     }
 
@@ -1450,6 +1607,11 @@ impl BlackboxServer {
                 })
             }
             "cancel_and_retry" => {
+                if let Some(max_attempts) = action.get("max_attempts").and_then(|v| v.as_u64())
+                    && attachment.attempt >= max_attempts
+                {
+                    return Err("error.retry_budget_exhausted: max_attempts reached".into());
+                }
                 let task_id = task_id.ok_or_else(|| {
                     "error.incompatible_action: cancel_and_retry requires a task-backed primary"
                         .to_string()
@@ -1461,18 +1623,70 @@ impl BlackboxServer {
                     })?
                 };
                 orchestration::cancel_task(&task, &self.state.task_store, &self.state.store_dir)?;
+                let replacement = if let Some(args) = action.get("args").cloned() {
+                    let retry = Box::pin(self.atom_invoke_value(
+                        crate::AtomInvokeParams {
+                            atom: primary_invocation.atom_ref.clone(),
+                            args,
+                            project_dir: None,
+                            owner: Some(primary_owner),
+                            parent_invocation_id: None,
+                            supervision_override: None,
+                        },
+                        None,
+                    ))
+                    .await?;
+                    self.link_replacement_attempt(&attachment, attachment.attempt + 1, &retry);
+                    Some(retry)
+                } else {
+                    None
+                };
                 serde_json::json!({
                     "status": "cancelled",
                     "action": action_kind,
                     "mutated_primary": true,
                     "task_id": task_id,
+                    "replacement": replacement,
                 })
             }
             "replace_primary" => {
-                return Err(
-                    "error.unsupported_action: replace_primary requires replacement dispatch wiring"
-                        .into(),
-                );
+                if let Some(max_attempts) = action.get("max_attempts").and_then(|v| v.as_u64())
+                    && attachment.attempt >= max_attempts
+                {
+                    return Err("error.retry_budget_exhausted: max_attempts reached".into());
+                }
+                let replacement_atom = action
+                    .get("atom_ref")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or(primary_invocation.atom_ref.as_str())
+                    .to_string();
+                let replacement_args = action.get("args").cloned().unwrap_or_else(|| {
+                    serde_json::json!({
+                        "prompt": action
+                            .get("prompt")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("")
+                    })
+                });
+                let replacement = Box::pin(self.atom_invoke_value(
+                    crate::AtomInvokeParams {
+                        atom: replacement_atom,
+                        args: replacement_args,
+                        project_dir: None,
+                        owner: Some(primary_owner),
+                        parent_invocation_id: None,
+                        supervision_override: None,
+                    },
+                    None,
+                ))
+                .await?;
+                self.link_replacement_attempt(&attachment, attachment.attempt + 1, &replacement);
+                serde_json::json!({
+                    "status": "replaced",
+                    "action": action_kind,
+                    "mutated_primary": true,
+                    "replacement": replacement,
+                })
             }
             other => {
                 return Err(format!(
@@ -1488,6 +1702,36 @@ impl BlackboxServer {
             "decision": action,
             "result": result,
         }))
+    }
+
+    fn link_replacement_attempt(
+        &self,
+        prior: &orchestration::atoms::invocation::SupervisionAttachment,
+        attempt: u64,
+        replacement: &serde_json::Value,
+    ) {
+        let Some(primary_invocation_id) = replacement
+            .get("invocation_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Some(primary_task_id) = replacement
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        self.state.atom_invocation_store.write().insert_attachment(
+            orchestration::atoms::invocation::SupervisionAttachment {
+                supervision_run_id: prior.supervision_run_id.clone(),
+                primary_invocation_id: primary_invocation_id.to_string(),
+                primary_task_id: primary_task_id.to_string(),
+                classifier_invocation_id: None,
+                advisor_invocation_id: prior.advisor_invocation_id.clone(),
+                attempt,
+            },
+        );
     }
 
     #[tool(

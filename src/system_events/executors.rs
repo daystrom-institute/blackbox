@@ -258,6 +258,7 @@ async fn exec_atom_invoke(
         owner: Some(format!("reaction:{}", event.id)),
         parent_invocation_id: None,
         runtime: None,
+        supervision_override: None,
     };
 
     let server = crate::server::BlackboxServer::new(state.clone());

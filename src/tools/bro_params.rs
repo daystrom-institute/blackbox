@@ -869,6 +869,9 @@ pub(crate) struct AtomInvokeParams {
     /// Optional RuntimeRequest overlay for profile-backed atom dispatch.
     #[serde(default)]
     pub(crate) runtime: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(crate) supervision_override: Option<orchestration::atoms::types::SupervisionPlanOverride>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

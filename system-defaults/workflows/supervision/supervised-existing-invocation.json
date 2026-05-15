@@ -1,0 +1,72 @@
+{
+  "name": "supervised-existing-invocation",
+  "version": 1,
+  "vars_schema": {
+    "primary_invocation_id": { "kind": "string", "required": true },
+    "attempt": { "kind": "int" },
+    "tail_policy": { "kind": "object" },
+    "classifier_findings": { "kind": "array" },
+    "acceptance_criteria": { "kind": "string", "required": true },
+    "attempt_history": { "kind": "array" },
+    "allowed_actions": { "kind": "array" },
+    "recovery_policy": { "kind": "object" },
+    "advisor_status": { "kind": "object" }
+  },
+  "actors": {},
+  "atom_bindings": {
+    "advisor": {
+      "atom_ref": "atom:supervision-advisor@v1",
+      "limits": {
+        "writes_files": false,
+        "dispatches_runs": 1,
+        "max_depth": 1,
+        "uses_network": false
+      }
+    }
+  },
+  "start": "Advisor",
+  "nodes": {
+    "Advisor": {
+      "atom": "advisor",
+      "atom_args": {
+        "primary_invocation_id": "${vars.primary_invocation_id}",
+        "attempt": "${vars.attempt}",
+        "tail_policy": "${vars.tail_policy}",
+        "classifier_findings": "${vars.classifier_findings}",
+        "acceptance_criteria": "${vars.acceptance_criteria}",
+        "attempt_history": "${vars.attempt_history}",
+        "allowed_actions": "${vars.allowed_actions}",
+        "recovery_policy": "${vars.recovery_policy}"
+      },
+      "on_exit": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "advisor_status",
+            "value": "${actor_results.Advisor}"
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "ExportOutcome" }
+    },
+    "ExportOutcome": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "_structured_exit",
+            "value": {
+              "primary_invocation_id": "${vars.primary_invocation_id}",
+              "attempt": "${vars.attempt}",
+              "advisor_action": "${vars.advisor_status.structured_output}",
+              "final_status": "${vars.advisor_status.state}",
+              "evidence_summary": "${vars.advisor_status.summary}"
+            }
+          }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

@@ -369,7 +369,7 @@ fn default_alert_dedup_window_ms() -> u64 {
     60_000
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SupervisionRuntimeIntent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tier: Option<String>,
@@ -611,7 +611,9 @@ impl SupervisionPlan {
                 self.classifier.alerting_classifications = alerting.clone();
             }
             if let Some(runtime) = &classifier.runtime {
-                self.classifier.runtime = Some(runtime.clone());
+                let mut runtime = runtime.clone();
+                ensure_runtime_capability(&mut runtime, "structured_output");
+                self.classifier.runtime = Some(runtime);
             }
         }
 
@@ -630,7 +632,9 @@ impl SupervisionPlan {
                 self.advisor.durable = durable;
             }
             if let Some(runtime) = &advisor.runtime {
-                self.advisor.runtime = Some(runtime.clone());
+                let mut runtime = runtime.clone();
+                ensure_runtime_capability(&mut runtime, "structured_output");
+                self.advisor.runtime = Some(runtime);
             }
         }
 
@@ -725,8 +729,61 @@ impl SupervisionPlan {
         {
             return Err("recovery tier_mode at_least/bounded requires tier_ladder".into());
         }
+        validate_runtime_intent("classifier.runtime", self.classifier.runtime.as_ref())?;
+        validate_runtime_intent("advisor.runtime", self.advisor.runtime.as_ref())?;
+        validate_runtime_intent("recovery.runtime", self.recovery.runtime.as_ref())?;
         Ok(())
     }
+}
+
+fn ensure_runtime_capability(runtime: &mut SupervisionRuntimeIntent, capability: &str) {
+    if !runtime
+        .capabilities
+        .iter()
+        .any(|existing| existing == capability)
+    {
+        runtime.capabilities.push(capability.to_string());
+    }
+}
+
+fn validate_runtime_intent(
+    field: &str,
+    runtime: Option<&SupervisionRuntimeIntent>,
+) -> Result<(), String> {
+    let Some(runtime) = runtime else {
+        return Ok(());
+    };
+    if runtime
+        .tier
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(format!("{field}.tier must not be empty"));
+    }
+    if runtime
+        .tier_ladder
+        .as_deref()
+        .is_some_and(|value| value.trim().is_empty())
+    {
+        return Err(format!("{field}.tier_ladder must not be empty"));
+    }
+    if matches!(
+        runtime.tier_mode,
+        Some(SupervisionTierMode::AtLeast | SupervisionTierMode::Bounded)
+    ) && runtime.tier_ladder.is_none()
+    {
+        return Err(format!(
+            "{field}.tier_mode at_least/bounded requires tier_ladder"
+        ));
+    }
+    for capability in &runtime.capabilities {
+        if capability.trim().is_empty() {
+            return Err(format!(
+                "{field}.capabilities must not contain empty values"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn parse_supervision_atom_ref(raw: &str, field: &str) -> Result<AtomRef, String> {
@@ -1207,6 +1264,78 @@ mod tests {
             plan.classifier.alerting_classifications,
             vec!["maybe_scope_drift", "needs_advisor"]
         );
+    }
+
+    #[test]
+    fn supervision_runtime_intent_derives_structured_output_for_judges() {
+        let override_policy = SupervisionPlanOverride {
+            classifier: Some(SupervisionClassifierOverride {
+                mode: Some(SupervisionClassifierMode::Cadence),
+                atom_ref: Some("atom:supervision-classifier@v1".into()),
+                runtime: Some(SupervisionRuntimeIntent {
+                    tier: Some("economy".into()),
+                    ..SupervisionRuntimeIntent::default()
+                }),
+                ..Default::default()
+            }),
+            advisor: Some(SupervisionAdvisorOverride {
+                mode: Some(SupervisionAdvisorMode::Always),
+                atom_ref: Some("atom:supervision-advisor@v1".into()),
+                runtime: Some(SupervisionRuntimeIntent {
+                    tier: Some("standard".into()),
+                    ..SupervisionRuntimeIntent::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let plan = SupervisionPlan::normalize(
+            None,
+            Some(&override_policy),
+            None,
+            &SupervisionPlanDefaults::default(),
+        )
+        .unwrap();
+        assert!(
+            plan.classifier
+                .runtime
+                .unwrap()
+                .capabilities
+                .contains(&"structured_output".to_string())
+        );
+        assert!(
+            plan.advisor
+                .runtime
+                .unwrap()
+                .capabilities
+                .contains(&"structured_output".to_string())
+        );
+    }
+
+    #[test]
+    fn supervision_runtime_intent_fails_closed_without_ladder_for_bounded() {
+        let override_policy = SupervisionPlanOverride {
+            classifier: Some(SupervisionClassifierOverride {
+                mode: Some(SupervisionClassifierMode::Cadence),
+                atom_ref: Some("atom:supervision-classifier@v1".into()),
+                runtime: Some(SupervisionRuntimeIntent {
+                    tier_mode: Some(SupervisionTierMode::Bounded),
+                    ..SupervisionRuntimeIntent::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let err = SupervisionPlan::normalize(
+            None,
+            Some(&override_policy),
+            None,
+            &SupervisionPlanDefaults::default(),
+        )
+        .unwrap_err();
+        assert!(err.contains("requires tier_ladder"), "{err}");
     }
 
     #[test]

@@ -1925,6 +1925,7 @@ impl<'a> WorkflowRunner<'a> {
                                 owner: Some(owner.clone()),
                                 parent_invocation_id,
                                 runtime: None,
+                                supervision_override: binding.supervision_override.clone(),
                             },
                             binding.limits.as_ref(),
                         )
@@ -1943,6 +1944,7 @@ impl<'a> WorkflowRunner<'a> {
                         owner: Some(owner.clone()),
                         parent_invocation_id,
                         runtime: None,
+                        supervision_override: binding.supervision_override.clone(),
                     },
                     binding.limits.as_ref(),
                 )
