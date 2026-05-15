@@ -17,43 +17,85 @@
     {
       "id": "accept",
       "classification": "accept",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "accept" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "accept" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"accept\"" }
+        ]
+      },
       "consequent": "accept"
     },
     {
       "id": "continue_observing",
       "classification": "continue_observing",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "continue_observing" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "continue_observing" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"continue_observing\"" }
+        ]
+      },
       "consequent": "continue_observing"
     },
     {
       "id": "steer_primary",
       "classification": "steer_primary",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "steer_primary" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "steer_primary" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"steer_primary\"" }
+        ]
+      },
       "consequent": "steer_primary"
     },
     {
       "id": "cancel_and_retry",
       "classification": "cancel_and_retry",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "cancel_and_retry" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "cancel_and_retry" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"cancel_and_retry\"" }
+        ]
+      },
       "consequent": "cancel_and_retry"
     },
     {
       "id": "replace_primary",
       "classification": "replace_primary",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "replace_primary" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "replace_primary" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"replace_primary\"" }
+        ]
+      },
       "consequent": "replace_primary"
     },
     {
       "id": "escalate_human",
       "classification": "escalate_human",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "escalate_human" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "escalate_human" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"escalate_human\"" }
+        ]
+      },
       "consequent": "escalate_human"
     },
     {
       "id": "bail",
       "classification": "bail",
-      "antecedent": { "op": "Eq", "field": "vars.advisor_action.action", "value": "bail" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.advisor_action.action", "value": "bail" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"action\"\\s*:\\s*\"bail\"" }
+        ]
+      },
       "consequent": "bail"
     },
     {

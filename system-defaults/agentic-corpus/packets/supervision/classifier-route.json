@@ -8,7 +8,13 @@
     {
       "id": "classifier_schema_failure",
       "classification": "classifier_failed",
-      "antecedent": { "op": "Eq", "field": "vars.classifier_result.classification", "value": "classifier_failed" },
+      "antecedent": {
+        "op": "Any",
+        "args": [
+          { "op": "Eq", "field": "vars.classifier_result.classification", "value": "classifier_failed" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"classification\"\\s*:\\s*\"classifier_failed\"" }
+        ]
+      },
       "consequent": "classifier_failed"
     },
     {
@@ -19,7 +25,10 @@
         "args": [
           { "op": "Eq", "field": "vars.classifier_result.classification", "value": "stalled" },
           { "op": "Eq", "field": "vars.classifier_result.classification", "value": "off_task" },
-          { "op": "Eq", "field": "vars.classifier_result.classification", "value": "needs_steer" }
+          { "op": "Eq", "field": "vars.classifier_result.classification", "value": "needs_steer" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"classification\"\\s*:\\s*\"stalled\"" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"classification\"\\s*:\\s*\"off_task\"" },
+          { "op": "StringMatches", "field": "output", "pattern": "\"classification\"\\s*:\\s*\"needs_steer\"" }
         ]
       },
       "consequent": "alert"

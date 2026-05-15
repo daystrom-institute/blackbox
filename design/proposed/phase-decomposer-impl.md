@@ -416,6 +416,7 @@ Phases 4, 6, and 7 require the supervision infrastructure from
 - Phase 7 additionally needs P7 runtime allocation/recovery and mediation
   patterns (M1-M4, which use existing shell/Executor/whiteboard primitives).
 
-The decomposer implementation plan can begin Phases 1-3 in parallel
-with supervision primitive work. Phase 4 onward must wait for supervision
-to be complete.
+The decomposer implementation plan can begin from the assumption that the
+supervision primitives through P7 have landed. Phase 4 onward should still
+exercise the live advisor/classifier paths in its own workflow fixtures, because
+the decomposer composes those primitives rather than owning them.

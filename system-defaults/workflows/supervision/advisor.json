@@ -27,6 +27,13 @@
       "actor": "",
       "on_enter": [
         {
+          "op": "set_var",
+          "args": {
+            "key": "action_result",
+            "value": {}
+          }
+        },
+        {
           "op": "poll_attached_invocation",
           "args": {
             "primary_invocation_id": "${vars.primary_invocation_id}",
@@ -104,7 +111,6 @@
               "action": "${vars.advisor_action.action}",
               "reason": "${vars.advisor_action.reason}",
               "confidence": "${vars.advisor_action.confidence}",
-              "prompt": "${vars.advisor_action.prompt}",
               "evidence_keys": "${vars.advisor_action.evidence_keys}",
               "checkpoint": {
                 "primary": "${vars.snapshot.attempt_metadata}",

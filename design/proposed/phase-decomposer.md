@@ -441,10 +441,10 @@ debates. The council decides.
 | Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
 | Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
 | Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
-| Classifier workflow-backed atom pattern | `design/archive/supervision-classifier-cosession.md` | **aspirational** |
-| Advisor workflow-backed atom pattern | `design/archive/supervision-turn-end-advisor.md` | **aspirational** |
+| Classifier workflow-backed atom pattern | `system-defaults/atoms/supervision/classifier.json`, `system-defaults/workflows/supervision/classifier.json`, `src/tools/atoms.rs` | implemented |
+| Advisor workflow-backed atom pattern | `system-defaults/atoms/supervision/advisor.json`, `system-defaults/workflows/supervision/advisor.json`, `src/tools/atoms.rs` | implemented |
 | `bbox_ref_size` MCP tool (ref→bytes measurement) | — | **aspirational** |
-| Typed advisor action executor | — | **aspirational** |
+| Typed advisor action executor | `src/tools/atoms.rs` | implemented |
 | Mediation agent manifests | — | **aspirational** |
 
 ## 8. What this design does NOT do

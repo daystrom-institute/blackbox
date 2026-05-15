@@ -64,7 +64,7 @@
     },
     "effects": {
       "writes_files": false,
-      "dispatches_runs": 1,
+      "dispatches_runs": 2,
       "max_depth": 1,
       "uses_network": false
     },
