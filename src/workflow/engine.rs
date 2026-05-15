@@ -845,10 +845,16 @@ impl<'a> WorkflowRunner<'a> {
             })
             .unwrap_or_else(|| format!("workflow:{}", self.ctx.meta.arc_id));
         let attempt = rendered_args.get("attempt").and_then(Value::as_u64);
-        let action = rendered_args
+        let mut action = rendered_args
             .get("action")
             .cloned()
             .ok_or_else(|| anyhow!("execute_supervision_action requires args.action"))?;
+        if action.get("max_attempts").is_none()
+            && let Some(max_attempts) = rendered_args.get("max_attempts").cloned()
+            && let Some(obj) = action.as_object_mut()
+        {
+            obj.insert("max_attempts".to_string(), max_attempts);
+        }
         let value = self
             .server
             .execute_supervision_action_value(primary_invocation_id, &owner, attempt, action)
@@ -1926,6 +1932,7 @@ impl<'a> WorkflowRunner<'a> {
                                 parent_invocation_id,
                                 runtime: None,
                                 supervision_override: binding.supervision_override.clone(),
+                                suppress_auto_supervision: false,
                             },
                             binding.limits.as_ref(),
                         )
@@ -1945,6 +1952,7 @@ impl<'a> WorkflowRunner<'a> {
                         parent_invocation_id,
                         runtime: None,
                         supervision_override: binding.supervision_override.clone(),
+                        suppress_auto_supervision: false,
                     },
                     binding.limits.as_ref(),
                 )

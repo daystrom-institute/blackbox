@@ -872,6 +872,9 @@ pub(crate) struct AtomInvokeParams {
     #[serde(default)]
     #[schemars(skip)]
     pub(crate) supervision_override: Option<orchestration::atoms::types::SupervisionPlanOverride>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub(crate) suppress_auto_supervision: bool,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]

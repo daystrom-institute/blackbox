@@ -1723,6 +1723,7 @@ async fn atom_invoke_deterministic_runner_returns_terminal_trace() {
             parent_invocation_id: None,
             runtime: None,
             supervision_override: None,
+            suppress_auto_supervision: false,
         }))
         .await;
     assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
@@ -1770,6 +1771,7 @@ async fn atom_invoke_adapter_runner_returns_terminal_trace() {
             parent_invocation_id: None,
             runtime: None,
             supervision_override: None,
+            suppress_auto_supervision: false,
         }))
         .await;
     assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
@@ -1938,6 +1940,7 @@ async fn atom_invoke_workflow_wrapper_returns_workflow_handle() {
             parent_invocation_id: None,
             runtime: None,
             supervision_override: None,
+            suppress_auto_supervision: false,
         }))
         .await;
     assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
@@ -2002,6 +2005,7 @@ async fn workflow_atom_rejects_underdeclared_raw_actor_dispatch_budget() {
             parent_invocation_id: None,
             runtime: None,
             supervision_override: None,
+            suppress_auto_supervision: false,
         }))
         .await;
     assert_eq!(invoke.is_error, Some(true));

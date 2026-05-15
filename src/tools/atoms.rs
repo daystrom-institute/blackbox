@@ -617,6 +617,23 @@ impl BlackboxServer {
             Ok(args) => args,
             Err(e) => return Err(e),
         };
+        if matches!(
+            &manifest.implementation,
+            AtomImplementation::Workflow { .. }
+        ) {
+            let plan = self.normalized_supervision_plan_for_invoke(
+                &manifest,
+                p.supervision_override.as_ref(),
+            )?;
+            if plan.classifier.mode != orchestration::atoms::types::SupervisionClassifierMode::None
+                || plan.advisor.mode != orchestration::atoms::types::SupervisionAdvisorMode::None
+            {
+                return Err(
+                    "error.unsupported_supervision: workflow-backed primary atoms cannot be supervised yet"
+                        .into(),
+                );
+            }
+        }
 
         let invocation_id = uuid::Uuid::new_v4().to_string();
         let owner = p.owner.clone().unwrap_or_else(default_atom_owner);
@@ -755,12 +772,29 @@ impl BlackboxServer {
         manifest: &orchestration::atoms::types::AtomManifest,
         invoke_override: Option<&orchestration::atoms::types::SupervisionPlanOverride>,
     ) -> Result<orchestration::atoms::types::SupervisionPlan, String> {
-        orchestration::atoms::types::SupervisionPlan::normalize(
+        let plan = orchestration::atoms::types::SupervisionPlan::normalize(
             manifest.supervision.as_ref(),
             None,
             invoke_override,
             &Self::supervision_plan_defaults(),
-        )
+        )?;
+        Self::reject_unimplemented_runtime_intents(&plan)?;
+        Ok(plan)
+    }
+
+    fn reject_unimplemented_runtime_intents(
+        plan: &orchestration::atoms::types::SupervisionPlan,
+    ) -> Result<(), String> {
+        if plan.classifier.runtime.is_some()
+            || plan.advisor.runtime.is_some()
+            || plan.recovery.runtime.is_some()
+        {
+            return Err(
+                "error.unsupported_runtime_allocation: supervision runtime intent is validated but allocator dispatch is not wired yet"
+                    .into(),
+            );
+        }
+        Ok(())
     }
 
     async fn start_supervision_for_primary_invocation(
@@ -815,6 +849,7 @@ impl BlackboxServer {
                     owner: Some(owner.to_string()),
                     parent_invocation_id: None,
                     supervision_override: None,
+                    suppress_auto_supervision: true,
                 },
                 None,
             ))
@@ -829,6 +864,15 @@ impl BlackboxServer {
                         .atom_invocation_store
                         .write()
                         .insert_attachment(attachment.clone());
+                    if plan.advisor.mode == SupervisionAdvisorMode::OnAlert {
+                        self.spawn_on_alert_advisor_watch(
+                            attachment.clone(),
+                            classifier_result,
+                            owner.to_string(),
+                            project_dir.clone(),
+                            plan.clone(),
+                        );
+                    }
                 }
                 Err(err) if !plan.classifier.required => {
                     classifier_error = Some(err);
@@ -861,6 +905,7 @@ impl BlackboxServer {
                     owner: Some(owner.to_string()),
                     parent_invocation_id: None,
                     supervision_override: None,
+                    suppress_auto_supervision: true,
                 },
                 None,
             ))
@@ -883,6 +928,96 @@ impl BlackboxServer {
             "advisor_invocation_id": attachment.advisor_invocation_id,
             "classifier_error": classifier_error,
         }))
+    }
+
+    fn spawn_on_alert_advisor_watch(
+        &self,
+        attachment: orchestration::atoms::invocation::SupervisionAttachment,
+        classifier_result: serde_json::Value,
+        owner: String,
+        project_dir: Option<String>,
+        plan: orchestration::atoms::types::SupervisionPlan,
+    ) {
+        let Some(classifier_invocation_id) = attachment.classifier_invocation_id.clone() else {
+            return;
+        };
+        let Some(classifier_task_id) = classifier_result
+            .get("task_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            let server = BlackboxServer::new(state.clone());
+            let task = {
+                let task_store = state.task_store.read();
+                task_store.get(&classifier_task_id)
+            };
+            if let Some(task) = task {
+                let should_wait = {
+                    let inner = task.inner.lock();
+                    matches!(inner.status, orchestration::TaskStatus::Running)
+                };
+                if should_wait {
+                    task.notify.notified().await;
+                }
+            }
+            let Ok(status) = server.atom_status_value(crate::AtomStatusParams {
+                invocation_id: classifier_invocation_id,
+                owner: Some(owner.clone()),
+            }) else {
+                return;
+            };
+            let structured = status
+                .get("structured_output")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            let should_advise = structured
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|status| status == "alert" || status == "classifier_failed");
+            if !should_advise {
+                return;
+            }
+            let Some(advisor_ref) = plan.advisor.atom_ref.as_ref().map(|atom| atom.render()) else {
+                return;
+            };
+            let advisor_result = Box::pin(server.atom_invoke_value(
+                crate::AtomInvokeParams {
+                    atom: advisor_ref,
+                    args: serde_json::json!({
+                        "primary_invocation_id": attachment.primary_invocation_id,
+                        "attempt": attachment.attempt,
+                        "tail_policy": plan.tail_policy,
+                        "classifier_findings": [structured],
+                        "acceptance_criteria": "Assess the classifier alert and choose a safe supervision action.",
+                        "attempt_history": [],
+                        "allowed_actions": ["accept", "continue_observing", "steer_primary", "cancel_and_retry", "escalate_human", "bail"],
+                        "recovery_policy": plan.recovery,
+                    }),
+                    project_dir,
+                    owner: Some(owner),
+                    parent_invocation_id: None,
+                    supervision_override: None,
+                    suppress_auto_supervision: true,
+                },
+                None,
+            ))
+            .await;
+            if let Ok(advisor_result) = advisor_result {
+                let mut updated = attachment;
+                updated.advisor_invocation_id = advisor_result
+                    .get("invocation_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string);
+                state
+                    .atom_invocation_store
+                    .write()
+                    .insert_attachment(updated);
+            }
+        });
     }
 
     async fn atom_invoke_profile(
@@ -1019,15 +1154,18 @@ impl BlackboxServer {
             invocation_id,
             dispatch_cost,
         );
-        let supervision = self
-            .start_supervision_for_primary_invocation(
+        let supervision = if p.suppress_auto_supervision {
+            serde_json::json!({"enabled": false, "suppressed": true})
+        } else {
+            self.start_supervision_for_primary_invocation(
                 invocation_id,
                 &task_id,
                 owner,
                 p.project_dir.clone(),
                 &supervision_plan,
             )
-            .await?;
+            .await?
+        };
 
         Ok(serde_json::json!({
             "invocation_id": invocation_id,
@@ -1632,6 +1770,7 @@ impl BlackboxServer {
                             owner: Some(primary_owner),
                             parent_invocation_id: None,
                             supervision_override: None,
+                            suppress_auto_supervision: true,
                         },
                         None,
                     ))
@@ -1668,6 +1807,25 @@ impl BlackboxServer {
                             .unwrap_or("")
                     })
                 });
+                if let Some(task_id) = task_id.as_deref() {
+                    let task = {
+                        let task_store = self.state.task_store.read();
+                        task_store.get(task_id)
+                    };
+                    if let Some(task) = task {
+                        let is_running = {
+                            let inner = task.inner.lock();
+                            matches!(inner.status, orchestration::TaskStatus::Running)
+                        };
+                        if is_running {
+                            orchestration::cancel_task(
+                                &task,
+                                &self.state.task_store,
+                                &self.state.store_dir,
+                            )?;
+                        }
+                    }
+                }
                 let replacement = Box::pin(self.atom_invoke_value(
                     crate::AtomInvokeParams {
                         atom: replacement_atom,
@@ -1676,6 +1834,7 @@ impl BlackboxServer {
                         owner: Some(primary_owner),
                         parent_invocation_id: None,
                         supervision_override: None,
+                        suppress_auto_supervision: true,
                     },
                     None,
                 ))

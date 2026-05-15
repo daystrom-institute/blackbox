@@ -259,6 +259,7 @@ async fn exec_atom_invoke(
         parent_invocation_id: None,
         runtime: None,
         supervision_override: None,
+        suppress_auto_supervision: false,
     };
 
     let server = crate::server::BlackboxServer::new(state.clone());

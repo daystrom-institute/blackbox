@@ -85,7 +85,8 @@
           "args": {
             "primary_invocation_id": "${vars.primary_invocation_id}",
             "attempt": "${vars.attempt}",
-            "action": "${vars.advisor_action}"
+            "action": "${vars.advisor_action}",
+            "max_attempts": "${vars.recovery_policy.max_attempts}"
           },
           "into_var": "action_result"
         }
