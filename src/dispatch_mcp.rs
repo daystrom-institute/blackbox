@@ -1,6 +1,6 @@
 pub(crate) fn dispatch_mcp_url(bind_host: &str, port: u16) -> String {
     let host = dispatch_mcp_host(bind_host);
-    format!("http://{host}:{port}/mcp")
+    format!("http://{host}:{port}/mcp?surface=agent-internal")
 }
 
 pub(crate) fn dispatch_mcp_host(bind_host: &str) -> &str {

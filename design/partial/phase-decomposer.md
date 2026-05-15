@@ -1,8 +1,9 @@
 # Phase Decomposer — context-budget-aware execution of large phased plans
 
 Date: 2026-05-10
-Status: partially implemented — Phase 1 `bbox_ref_size` and Phase 2
-`corpus-pathfinder` scout manifest have shipped; workflow phases remain open.
+Status: implemented as `system-defaults/phase-decompose` workflows, packets,
+brofiles, teamplates, fixtures, and the `corpus-pathfinder` agent manifest.
+Live no-edit smoke coverage currently includes the direct and decomposed paths.
 Predecessor archived at `design/archive/phase-decomposer.md`.
 
 ## 1. Problem
@@ -443,9 +444,9 @@ debates. The council decides.
 | Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
 | Classifier workflow-backed atom pattern | `system-defaults/atoms/supervision/classifier.json`, `system-defaults/workflows/supervision/classifier.json`, `src/tools/atoms.rs` | implemented |
 | Advisor workflow-backed atom pattern | `system-defaults/atoms/supervision/advisor.json`, `system-defaults/workflows/supervision/advisor.json`, `src/tools/atoms.rs` | implemented |
-| `bbox_ref_size` MCP tool (ref→bytes measurement) | — | **aspirational** |
+| `bbox_ref_size` MCP tool (ref→bytes measurement) | `src/tools/graph.rs`, `src/mcp_tools/ref_size.rs`, `src/index/mod.rs` | implemented |
 | Typed advisor action executor | `src/tools/atoms.rs` | implemented |
-| Mediation agent manifests | — | **aspirational** |
+| Mediation agent manifests | `system-defaults/brofiles/phase-decompose/conflict-resolver.json`, `system-defaults/brofiles/phase-decompose/regression-fixer.json` | implemented (runtime artifacts; full merge mediation remains a follow-on exercise) |
 
 ## 8. What this design does NOT do
 
@@ -471,7 +472,8 @@ debates. The council decides.
 1. **`bbox_ref_size` MCP tool.** Resolves entity_refs/project_file_refs to
    byte payloads. The shared measurement primitive both stages depend on.
 2. **Scout agent manifest.** Corpus-pathfinder as installed JSON agent
-   (`examples/agents/`). Strict-typed structured output. Parallel-safe.
+   (`system-defaults/agents/corpus-pathfinder.json`). Strict-typed structured
+   output. Parallel-safe.
 3. **Inlet agent.** The discovery subworkflow that orchestrates scouts,
    aggregates results, calls `bbox_ref_size`, and produces the triage
    verdict + evidence bundle.
@@ -483,5 +485,8 @@ debates. The council decides.
 7. **Recompose council** — durable ensemble evaluating collected results, producing remediation packets, iterating until satisfied or untenable.
 8. **Mediation** — M1-M4 within the council's evaluation loop (mechanical merge, conflict resolver, mediation panel, regression fixer).
 
-Each step independently testable. Steps 1-3 deliver value before any
-decomposition machinery exists.
+Each step is independently testable. Current live fixtures:
+`system-defaults/phase-decompose/fixtures/direct-live-no-edit.md` exercises
+`fit_direct`; `system-defaults/phase-decompose/fixtures/decompose-live-no-edit.md`
+exercises `needs_decompose` through DAG synthesis, foreach supervised
+sub-units, and recomposition.

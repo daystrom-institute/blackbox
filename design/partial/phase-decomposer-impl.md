@@ -1,7 +1,9 @@
 # Phase Decomposer — Implementation Plan
 
 Date: 2026-05-10
-Status: partially implemented — Phases 1-2 shipped; Phases 3-7 remain open.
+Status: implemented. Live no-edit smoke coverage has passed for both
+`fit_direct` and `needs_decompose`; final review/commit state is tracked in
+the working branch rather than this plan.
 Companion to: `design/partial/phase-decomposer.md` (pure design - this is the build plan).
 Depends on: `design/archive/supervision-phased-implementation.md` (supervised atom
 orchestration primitives must exist before Phase 6 foreach implementer
@@ -13,11 +15,11 @@ dispatch).
 |---|---|---|
 | 1. `bbox_ref_size` MCP tool | **Done** | Tool handler in `src/tools/graph.rs`; implementation in `src/mcp_tools/ref_size.rs`; project-file full-content lookup in `src/index/mod.rs`; docs in `src/tool_docs.rs`. |
 | 2. Scout agent manifest | **Done** | `system-defaults/agents/corpus-pathfinder.json`; reconciles the reverted Claude subagent prompt with Badgey's scout contract and atom-style grounding discipline. |
-| 3. Inlet agent | **Not built** | Depends on Phases 1-2. |
-| 4. Single-implementer path | **Not built** | Depends on Phase 3. |
-| 5. Ensemble decomposition | **Not built** | Depends on Phase 3. |
-| 6. Foreach implementer dispatch | **Not built** | Depends on Phases 4-5 and supervision primitives. |
-| 7. Recomposition council + mediation | **Not built** | Depends on Phase 6. |
+| 3. Inlet agent | **Done** | `phase-decompose-discovery` v8 plus `phase-decomposer-inlet`; scouts feed `bbox_ref_size`, inlet emits `evidence_bundle` + `triage_verdict`, and does not construct a DAG. |
+| 4. Single-implementer path | **Done** | `phase-decompose-supervised-impl` v2 plus `phase-decompose-main` direct branch. Live direct smoke passed after `InitEpoch` hardening (`arc-6381ec7ba9c34201b427897cd40884a5`). |
+| 5. Ensemble decomposition | **Done** | `phase-decompose-ensemble-decompose` v8, `phase-decomposer-panel`, whiteboard packets, facilitator strict-DAG synthesis, and mechanical `lint-dag.py` byte/coverage validation. |
+| 6. Foreach implementer dispatch | **Done** | `phase-decompose-main` foreaches over `vars.dag.sub_units` into `phase-decompose-supervised-impl` and collects sub-results. |
+| 7. Recomposition council + mediation | **Done** | `phase-decompose-recompose` v2, `phase-recompose-council`, verdict packet, conflict/regression brofiles, and epoch-ceiling routing. Live decomposed smoke passed (`arc-67949c254c264a0687941f182509ea50`). Full edit/merge mediation remains the follow-on exercise beyond the no-edit smoke fixture. |
 
 The decomposer is mostly **configuration** on top of existing workflow
 engine primitives. The engine already has `foreach`, `subworkflow`,
@@ -35,8 +37,8 @@ Phase 2 ──┘              │              ├──▶ Phase 6 ──▶ P
                          └──▶ Phase 5 ──┘
 
 The reusable supervision primitives in
-`design/archive/supervision-phased-implementation.md` must exist before
-decomposer Phase 6 (foreach implementers run inside supervised subworkflows).
+`design/archive/supervision-phased-implementation.md` exist and are composed by
+Phase 6 (foreach implementers run inside supervised subworkflows).
 ```
 
 ---
@@ -165,7 +167,7 @@ kind=agent`.
    `bbox_ref_size`. Produce a triage verdict."
 
 3.2 **Discovery subworkflow.** A workflow JSON artifact
-   (`examples/phase-decompose/workflows/discovery.json`), installed via
+   (`system-defaults/workflows/phase-decompose/discovery.json`), installed via
    `bro_workflow_install`. Three nodes:
 
    - **Parse** (hook-only): `shell` hook-op extracts question-shapes
@@ -214,7 +216,7 @@ execution must exist.
 **What gets built:**
 
 4.1 **Supervised implementer subworkflow.** A reusable subworkflow
-   artifact (`examples/phase-decompose/workflows/supervised-impl.json`).
+   artifact (`system-defaults/workflows/phase-decompose/supervised-impl.json`).
    Imports: `vars.brofile`, `vars.prompt`, `vars.evidence_manifest`,
    `vars.acceptance_criteria`. Inside:
    - Implementer dispatch (fire-and-forget)
@@ -248,7 +250,7 @@ parallel with Phase 4.
 **What gets built:**
 
 5.1 **Decomposer teamplate.** A teamplate
-   (`examples/phase-decompose/teamplates/decomposer-panel.json`).
+   (`system-defaults/phase-decompose/teamplates/decomposer-panel.json`).
    Members: 2-3 specialist brofiles (e.g., `decomposer-security`,
    `decomposer-architecture`, `decomposer-performance`). The actor
    kind for the node is `Ensemble` (`schema.rs:99`), which broadcasts
@@ -385,11 +387,13 @@ for the supervision/adversarial patterns.
    → remediation packet.
 
 7.5 **Epoch ceiling.** `max_epochs` is not a `NodeSpec` field
-   (`schema.rs:107-220`). Use an epoch counter in `vars.epoch` (set
-   and incremented by the council node's `on_exit` hook) plus a gate
-   packet that reads `Ge{vars.epoch, value: N}` → `halt`. Or reuse
-   `retry.max_generations` (`schema.rs:348-353`) on the council node
-   as a ceiling on council evaluations.
+   (`schema.rs:107-220`). The shipped workflow initializes
+   `vars.epoch`, runs `system-defaults/phase-decompose/scripts/epoch-check.py`
+   to compute `vars.epoch_status`, and routes through the
+   `domain:phase-decompose/epoch-ceiling` packet. The packet reads
+   `epoch_status=continue|halt` instead of hardcoding a numeric ceiling,
+   so `max_epochs` remains runtime-configurable. The remediation back-edge
+   increments `vars.epoch` before re-entering discovery.
 
 7.6 **End-to-end test.** A phase doc requiring decomposition → inlet
    → decompose → DAG → foreach implementers → council evaluates →
@@ -418,8 +422,37 @@ lines), 1 gate packet for epoch ceiling (~20 lines). No new Rust code.
 | 6. Foreach implementers | 4, 5, supervision P4-P6 | — | parent workflow nodes | DAG sub-units -> foreach -> collect outcomes |
 | 7. Recompose council | 6, supervision P7 | — | 1 teamplate, 2 brofiles, 1 packet | Conflict → mediate → converge or halt |
 
-Total new Rust code: ~100-150 lines (Phase 1 only). Everything else is
+Additional Rust code after Phase 1: `src/dispatch_mcp.rs` now injects the
+`agent-internal` MCP surface for dispatched bros so whiteboard tools are
+visible, and `src/workflow/ops.rs` now makes `parse_json` robust to
+live-agent preambles before inline JSON. The remaining implementation is
 configuration artifacts on top of the existing workflow engine.
+
+## Live validation
+
+Current smoke runs:
+
+- Direct path: `arc-2720d7cf32f84bddb3b2bf9d716fd20e`, completed before
+  `InitEpoch` hardening.
+- Direct path after `InitEpoch` hardening:
+  `arc-6381ec7ba9c34201b427897cd40884a5`, completed,
+  `path=fit_direct`, `triage_verdict=fit_direct`, `acceptance_status=passed`,
+  `evidence_total_bytes=14931`, `target_context_window=1000000`, unresolved
+  refs `[]`.
+- Earlier decomposed path: `arc-4c09aa3a93c549aa9a722fd4cb307257`, completed
+  before the fail-closed DAG lint hardening.
+- Decomposed path after fail-closed DAG lint and epoch-ceiling hardening:
+  `arc-67949c254c264a0687941f182509ea50`, completed, `path=decomposed`,
+  `triage_verdict=needs_decompose`, `recompose_verdict=satisfied`, sub-unit
+  bytes `[8000, 8500, 9500]` against a `10000` target, all sub-results
+  completed.
+
+Required external review also passed after the hardening pass:
+
+- Claude Opus 4.7 xhigh follow-up task
+  `d373b281-a2af-4597-a1bf-5dec2085eaf4`: `approve`, blockers `[]`.
+- DeepSeek V4 Pro follow-up task
+  `6ea7b64f-5b8e-4639-84ef-b8c4efc0033c`: `approve`, blockers `[]`.
 
 ## What already exists (no new code needed)
 

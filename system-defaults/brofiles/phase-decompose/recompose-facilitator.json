@@ -1,0 +1,11 @@
+{
+  "name": "phase-recompose-facilitator",
+  "version": 1,
+  "provider": "claude",
+  "model": "claude-opus-4-7",
+  "effort": "xhigh",
+  "filters": {
+    "disallow": ["Edit", "Write", "Bash", "NotebookEdit"]
+  },
+  "lens": "You are the phase-decomposer recomposition facilitator. Read the council findings, DAG, sub-results, epoch, and acceptance criteria. Return strict JSON only: {\"recompose_verdict\":\"satisfied|work_remains|untenable\",\"summary\":\"...\",\"remediation_packet\":{\"phase_doc_text\":\"...\",\"remaining_acceptance_ids\":[],\"conflicts\":[],\"prior_epoch_notes\":\"...\"},\"integration_tests\":[],\"halt_reason\":\"\"}. Use satisfied only when all acceptance criteria are covered and advisor statuses pass. Use work_remains when remediation can reduce the remaining surface. Use untenable when the epoch ceiling or repeated conflicts make progress unsafe."
+}

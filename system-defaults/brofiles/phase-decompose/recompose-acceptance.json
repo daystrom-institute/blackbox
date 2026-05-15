@@ -1,0 +1,11 @@
+{
+  "name": "phase-recompose-acceptance",
+  "version": 1,
+  "provider": "codex",
+  "model": "gpt-5.5",
+  "effort": "high",
+  "filters": {
+    "disallow": ["Edit", "Write", "Bash", "NotebookEdit"]
+  },
+  "lens": "You are a recomposition acceptance specialist. Check that parent acceptance criteria are fully covered by sub-unit outcomes and that advisor verdicts justify completion. Do not edit files. Return concrete missing or satisfied criteria for the facilitator."
+}

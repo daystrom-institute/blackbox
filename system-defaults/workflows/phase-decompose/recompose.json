@@ -1,0 +1,76 @@
+{
+  "name": "phase-decompose-recompose",
+  "version": 2,
+  "vars_schema": {
+    "phase_doc_path": { "kind": "string", "required": true },
+    "phase_doc_text": { "kind": "string", "required": true },
+    "project_dir": { "kind": "string", "required": true },
+    "acceptance_criteria": { "kind": "array" },
+    "dag": { "kind": "object" },
+    "sub_results": { "kind": "array" },
+    "epoch": { "kind": "int" },
+    "max_epochs": { "kind": "int" },
+    "council_output": { "kind": "string" },
+    "recompose_result": { "kind": "object" },
+    "recompose_verdict": { "kind": "string" },
+    "remediation_packet": { "kind": "object" }
+  },
+  "actors": {
+    "council": {
+      "kind": "ensemble",
+      "team": "phase-recompose-council",
+      "durable": true
+    },
+    "facilitator": {
+      "kind": "executor",
+      "brofile": "phase-recompose-facilitator",
+      "durable": true,
+      "compaction_anchor": true
+    }
+  },
+  "start": "CouncilEvaluate",
+  "nodes": {
+    "CouncilEvaluate": {
+      "actor": "council",
+      "prompt": "Project: ${vars.project_dir}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nPhase doc path: ${vars.phase_doc_path}\nPhase doc text:\n${vars.phase_doc_text}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nEvaluate integration and acceptance coverage. Do not edit files. Return concise findings for the facilitator.",
+      "on_exit": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "council_output",
+            "value": "${CouncilEvaluate.output}"
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "FacilitateVerdict" }
+    },
+    "FacilitateVerdict": {
+      "actor": "facilitator",
+      "prompt": "Council findings:\n${vars.council_output}\n\nProject: ${vars.project_dir}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nReturn strict JSON only: {\"recompose_verdict\":\"satisfied|work_remains|untenable\",\"summary\":\"...\",\"remediation_packet\":{\"phase_doc_text\":\"...\",\"remaining_acceptance_ids\":[],\"conflicts\":[],\"prior_epoch_notes\":\"...\"},\"integration_tests\":[],\"halt_reason\":\"\"}.",
+      "gate": "domain:phase-decompose/recompose-verdict",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${FacilitateVerdict.output}" },
+          "into_var": "recompose_result",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "recompose_verdict",
+            "value": "${vars.recompose_result.recompose_verdict}"
+          }
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "remediation_packet",
+            "value": "${vars.recompose_result.remediation_packet}"
+          }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

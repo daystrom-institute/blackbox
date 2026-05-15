@@ -1,0 +1,51 @@
+{
+  "domain": "phase-decompose/recompose-verdict",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["untenable", "work_remains", "satisfied"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "untenable_from_var",
+      "classification": "untenable",
+      "antecedent": { "op": "Eq", "field": "vars.recompose_verdict", "value": "untenable" },
+      "consequent": "untenable"
+    },
+    {
+      "id": "work_remains_from_var",
+      "classification": "work_remains",
+      "antecedent": { "op": "Eq", "field": "vars.recompose_verdict", "value": "work_remains" },
+      "consequent": "work_remains"
+    },
+    {
+      "id": "satisfied_from_var",
+      "classification": "satisfied",
+      "antecedent": { "op": "Eq", "field": "vars.recompose_verdict", "value": "satisfied" },
+      "consequent": "satisfied"
+    },
+    {
+      "id": "untenable_from_output",
+      "classification": "untenable",
+      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"untenable\"" },
+      "consequent": "untenable"
+    },
+    {
+      "id": "work_remains_from_output",
+      "classification": "work_remains",
+      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"work_remains\"" },
+      "consequent": "work_remains"
+    },
+    {
+      "id": "satisfied_from_output",
+      "classification": "satisfied",
+      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"recompose_verdict\"\\s*:\\s*\"satisfied\"" },
+      "consequent": "satisfied"
+    },
+    {
+      "id": "default_work_remains",
+      "classification": "work_remains",
+      "antecedent": { "op": "True" },
+      "consequent": "work_remains"
+    }
+  ]
+}

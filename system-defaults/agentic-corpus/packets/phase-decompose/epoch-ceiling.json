@@ -1,0 +1,27 @@
+{
+  "domain": "phase-decompose/epoch-ceiling",
+  "version": 2,
+  "scope": "global",
+  "classification_lattice": ["halt", "continue"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "halt_at_computed_ceiling",
+      "classification": "halt",
+      "antecedent": { "op": "Eq", "field": "vars.epoch_status", "value": "halt" },
+      "consequent": "halt"
+    },
+    {
+      "id": "continue_before_ceiling",
+      "classification": "continue",
+      "antecedent": { "op": "Eq", "field": "vars.epoch_status", "value": "continue" },
+      "consequent": "continue"
+    },
+    {
+      "id": "halt_default",
+      "classification": "halt",
+      "antecedent": { "op": "True" },
+      "consequent": "halt"
+    }
+  ]
+}

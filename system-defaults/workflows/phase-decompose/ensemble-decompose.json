@@ -1,0 +1,330 @@
+{
+  "name": "phase-decompose-ensemble-decompose",
+  "version": 8,
+  "vars_schema": {
+    "phase_doc_path": { "kind": "string", "required": true },
+    "phase_doc_text": { "kind": "string", "required": true },
+    "project_dir": { "kind": "string", "required": true },
+    "evidence_bundle": { "kind": "object", "required": true },
+    "acceptance_criteria": { "kind": "array" },
+    "target_context_window": { "kind": "int" },
+    "board_id": { "kind": "string" },
+    "board_check": { "kind": "object" },
+    "board_summary": { "kind": "object" },
+    "dag": { "kind": "object" }
+  },
+  "actors": {
+    "panel": {
+      "kind": "ensemble",
+      "team": "phase-decomposer-panel",
+      "durable": true
+    },
+    "facilitator": {
+      "kind": "executor",
+      "brofile": "phase-decomposer-facilitator",
+      "durable": true,
+      "compaction_anchor": true
+    }
+  },
+  "start": "OpenBoard",
+  "nodes": {
+    "OpenBoard": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "board_id",
+            "value": "phase-decompose:${meta.arc_id}"
+          }
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_open",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "opened_by": "facilitator",
+              "domain": "phase-decompose",
+              "project": "${vars.project_dir}",
+              "topic": "Phase decomposition for ${vars.phase_doc_path}"
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "architecture",
+              "role": "specialist",
+              "domain": "phase-decompose"
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "implementation",
+              "role": "specialist",
+              "domain": "phase-decompose"
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "risk",
+              "role": "specialist",
+              "domain": "phase-decompose"
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "BlindPost" }
+    },
+    "BlindPost": {
+      "actor": "panel",
+      "prompt": "Whiteboard board_id=${vars.board_id}. Phase doc path: ${vars.phase_doc_path}\nPhase doc text:\n${vars.phase_doc_text}\nEvidence bundle JSON:\n${vars.evidence_bundle}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nTarget context window: ${vars.target_context_window}\n\nPost one blind `proposal` to the whiteboard. Use your registered alias as agent_name exactly: architecture, implementation, or risk. Do not use your brofile name. Do not call whiteboard_register. Your post must include proposed sub-units, refs, acceptance_subset ids, dependencies, predicted writes, and risks. Do not edit files.",
+      "next": { "type": "goto", "to": "ValidateBlind" }
+    },
+    "ValidateBlind": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_summarize",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator"
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "board_check",
+          "on_failure": "halt"
+        }
+      ],
+      "gate": "domain:phase-decompose/whiteboard-participation",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "ready": "TransitionToDebate",
+          "invalid": "BoardInvalid"
+        },
+        "default": "BoardInvalid"
+      }
+    },
+    "TransitionToDebate": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
+              "target_phase": "read",
+              "summary": "Blind decomposition proposals posted; making proposals visible."
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
+              "target_phase": "debate",
+              "summary": "Read phase opened; moving to debate for annotations and votes."
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Debate" }
+    },
+    "Debate": {
+      "actor": "panel",
+      "prompt": "Whiteboard board_id=${vars.board_id}. Read the board with whiteboard_state using your registered alias as agent_name exactly: architecture, implementation, or risk. Do not use your brofile name. Do not call whiteboard_register. Challenge, corroborate, or resolve proposals, then vote. Focus on acceptance coverage, measured context fit, missing dependencies, and integration risk. Do not edit files.",
+      "next": { "type": "goto", "to": "ValidateDebate" }
+    },
+    "ValidateDebate": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_summarize",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator"
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "board_check",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "board_summary",
+            "value": "${vars.board_check}"
+          }
+        }
+      ],
+      "gate": "domain:phase-decompose/whiteboard-participation",
+      "next": {
+        "type": "branch",
+        "cases": {
+          "ready": "TransitionToResolve",
+          "invalid": "BoardInvalid"
+        },
+        "default": "BoardInvalid"
+      }
+    },
+    "TransitionToResolve": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator",
+              "target_phase": "resolve",
+              "summary": "Debate complete; facilitator will synthesize the DAG."
+            },
+            "timeout_secs": 60
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_summarize",
+            "arguments": {
+              "board_id": "${vars.board_id}",
+              "agent_name": "facilitator"
+            },
+            "timeout_secs": 60
+          },
+          "into_var": "board_summary",
+          "on_failure": "warn"
+        }
+      ],
+      "next": { "type": "goto", "to": "SynthesizeDag" }
+    },
+    "BoardInvalid": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "_structured_exit",
+            "value": {
+              "error": "whiteboard_participation_invalid",
+              "board_check": "${vars.board_check}"
+            }
+          }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "SynthesizeDag": {
+      "actor": "facilitator",
+      "prompt": "Whiteboard board_id=${vars.board_id}. Board summary JSON:\n${vars.board_summary}\n\nRead full board state if needed. Evidence bundle JSON:\n${vars.evidence_bundle}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nTarget context window: ${vars.target_context_window}\n\nSynthesize the final decomposition DAG. Use bbox_ref_size for any cluster refs whose bytes are not already measured. Return one strict JSON object only with keys sub_units and recompose_contract. The first byte must be { and the final byte must be }. Every sub-unit needs sub_unit_id, title, refs, bytes, acceptance_subset, depends_on, assigned_brofile, predicted_writes. Every sub_unit.bytes must be <= target_context_window; split or narrow refs until this is true. Do not call bbox_note or any note/status tool. Do not include prose, markdown fences, progress messages, or duplicate JSON.",
+      "gate": "domain:phase-decompose/dag-structure",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${SynthesizeDag.output}" },
+          "into_var": "dag",
+          "on_failure": "halt"
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": [
+              "python3",
+              "system-defaults/phase-decompose/scripts/lint-dag.py",
+              "--dag=${vars.dag}",
+              "--acceptance=${vars.acceptance_criteria}",
+              "--target-context-window=${vars.target_context_window}"
+            ],
+            "cwd": "${vars.project_dir}"
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "branch",
+        "cases": {
+          "valid": "ExportDag",
+          "invalid": "DagInvalid"
+        },
+        "default": "DagInvalid"
+      }
+    },
+    "ExportDag": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "_structured_exit",
+            "value": "${vars.dag}"
+          }
+        }
+      ],
+      "next": { "type": "terminal" }
+    },
+    "DagInvalid": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "_structured_exit",
+            "value": {
+              "error": "invalid_dag",
+              "dag": "${vars.dag}"
+            }
+          }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

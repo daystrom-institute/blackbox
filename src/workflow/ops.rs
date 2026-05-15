@@ -1175,8 +1175,26 @@ fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
             } else {
                 // Try fenced ```json blocks first — common LLM output shape.
                 let stripped = strip_code_fence(trimmed).unwrap_or(trimmed.to_string());
-                serde_json::from_str(&stripped)
-                    .map_err(|e| anyhow!("ParseJson: input did not parse as JSON: {e}"))?
+                match serde_json::from_str(&stripped) {
+                    Ok(value) => value,
+                    Err(first_err) => {
+                        let mut last_err = first_err.to_string();
+                        let candidates = crate::tools::bro_helpers::extract_json_candidates(trimmed);
+                        let mut parsed = None;
+                        for candidate in candidates {
+                            match serde_json::from_str(&candidate) {
+                                Ok(value) => {
+                                    parsed = Some(value);
+                                    break;
+                                }
+                                Err(err) => last_err = err.to_string(),
+                            }
+                        }
+                        parsed.ok_or_else(|| {
+                            anyhow!("ParseJson: input did not parse as JSON: {last_err}")
+                        })?
+                    }
+                }
             }
         }
         // Already structured — pass through.
@@ -1832,6 +1850,27 @@ mod tests {
             OpEffect::SetVar { key, value } => {
                 assert_eq!(key, "parsed");
                 assert_eq!(value, json!({"scout_charters": [{"scout_id": "s1"}]}));
+            }
+            _ => panic!("expected SetVar effect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_json_extracts_inline_object_after_prose_preamble() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let body = "Acknowledged - single discovery, no task tracker needed.\n\n{\"tldr\":\"ok\",\"leads_entity_refs\":[]}";
+        let hook = HookOp {
+            op: OpKind::ParseJson,
+            args: json!({ "from": body }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("parsed".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "parsed");
+                assert_eq!(value, json!({"tldr": "ok", "leads_entity_refs": []}));
             }
             _ => panic!("expected SetVar effect"),
         }

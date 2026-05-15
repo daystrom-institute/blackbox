@@ -1,0 +1,47 @@
+{
+  "domain": "phase-decompose/dag-structure",
+  "version": 2,
+  "scope": "global",
+  "classification_lattice": ["invalid", "valid"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "invalid_missing_sub_units",
+      "classification": "invalid",
+      "antecedent": {
+        "op": "Not",
+        "arg": { "op": "StringMatches", "field": "node_output", "pattern": "\"sub_units\"\\s*:" }
+      },
+      "consequent": "invalid"
+    },
+    {
+      "id": "invalid_missing_recompose_contract",
+      "classification": "invalid",
+      "antecedent": {
+        "op": "Not",
+        "arg": { "op": "StringMatches", "field": "node_output", "pattern": "\"recompose_contract\"\\s*:" }
+      },
+      "consequent": "invalid"
+    },
+    {
+      "id": "valid_shape_present",
+      "classification": "valid",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "StringMatches", "field": "node_output", "pattern": "\"sub_units\"\\s*:" },
+          { "op": "StringMatches", "field": "node_output", "pattern": "\"sub_unit_id\"\\s*:" },
+          { "op": "StringMatches", "field": "node_output", "pattern": "\"acceptance_subset\"\\s*:" },
+          { "op": "StringMatches", "field": "node_output", "pattern": "\"merge_order\"\\s*:" }
+        ]
+      },
+      "consequent": "valid"
+    },
+    {
+      "id": "invalid_default",
+      "classification": "invalid",
+      "antecedent": { "op": "True" },
+      "consequent": "invalid"
+    }
+  ]
+}

@@ -1,0 +1,39 @@
+{
+  "domain": "phase-decompose/triage",
+  "version": 1,
+  "scope": "global",
+  "classification_lattice": ["needs_decompose", "fit_direct"],
+  "prefix_inference": {},
+  "rules": [
+    {
+      "id": "needs_decompose_from_var",
+      "classification": "needs_decompose",
+      "antecedent": { "op": "Eq", "field": "vars.triage_verdict", "value": "needs_decompose" },
+      "consequent": "needs_decompose"
+    },
+    {
+      "id": "needs_decompose_from_output",
+      "classification": "needs_decompose",
+      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"triage_verdict\"\\s*:\\s*\"needs_decompose\"" },
+      "consequent": "needs_decompose"
+    },
+    {
+      "id": "fit_direct_from_var",
+      "classification": "fit_direct",
+      "antecedent": { "op": "Eq", "field": "vars.triage_verdict", "value": "fit_direct" },
+      "consequent": "fit_direct"
+    },
+    {
+      "id": "fit_direct_from_output",
+      "classification": "fit_direct",
+      "antecedent": { "op": "StringMatches", "field": "output", "pattern": "\"triage_verdict\"\\s*:\\s*\"fit_direct\"" },
+      "consequent": "fit_direct"
+    },
+    {
+      "id": "default_needs_decompose",
+      "classification": "needs_decompose",
+      "antecedent": { "op": "True" },
+      "consequent": "needs_decompose"
+    }
+  ]
+}
