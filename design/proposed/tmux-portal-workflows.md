@@ -2,7 +2,7 @@
 
 Status: design proposal v3
 Date: 2026-05-12
-Related: `WORKFLOWS.md`, `examples/keystone/`, `design/partial/supervision.md`, `design/archive/provider-transcript-read-plane.md`, `design/proposed/tmux-portal-workflows-impl.md`
+Related: `WORKFLOWS.md`, `examples/keystone/`, `design/archive/supervision.md`, `design/archive/provider-transcript-read-plane.md`, `design/proposed/tmux-portal-workflows-impl.md`
 
 ## 1. Thesis
 

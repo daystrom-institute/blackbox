@@ -5,7 +5,7 @@ Status: archived as implemented substrate.
 
 This document records the mechanical supervision layer that exists today. It is
 archived because it is not the open design problem anymore; it is substrate for
-the atom-era classifier/advisor design in `design/partial/supervision.md`.
+the atom-era classifier/advisor design in `design/archive/supervision.md`.
 
 ## 1. Scope
 

@@ -2,7 +2,7 @@
 
 Date: 2026-05-10
 Companion to: `design/proposed/phase-decomposer.md` (pure design - this is the build plan).
-Depends on: `design/partial/supervision-phased-implementation.md` (supervised atom
+Depends on: `design/archive/supervision-phased-implementation.md` (supervised atom
 orchestration primitives must exist before Phase 6 foreach implementer
 dispatch).
 
@@ -22,7 +22,7 @@ Phase 2 ──┘              │              ├──▶ Phase 6 ──▶ P
                          └──▶ Phase 5 ──┘
 
 The reusable supervision primitives in
-`design/partial/supervision-phased-implementation.md` must exist before
+`design/archive/supervision-phased-implementation.md` must exist before
 decomposer Phase 6 (foreach implementers run inside supervised subworkflows).
 ```
 
@@ -406,7 +406,7 @@ configuration artifacts on top of the existing workflow engine.
 ## Dependency on supervision-phased-implementation.md
 
 Phases 4, 6, and 7 require the supervision infrastructure from
-`design/partial/supervision-phased-implementation.md`:
+`design/archive/supervision-phased-implementation.md`:
 
 - Phase 4 needs advisor-only supervision: P1 plan normalization, P2
   attachment/polling, P3a structured exits, P5 advisor atom, and the P6 action

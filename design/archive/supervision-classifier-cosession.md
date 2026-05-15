@@ -51,8 +51,8 @@ it emits an alert, hits a polling/time budget, or the primary reaches a terminal
 state.
 
 `Sleep` is a needed primitive, not current workflow engine behavior. See
-S4-sleep-primitive in `design/partial/supervision-impl.md`, implemented in
-phase P3b of `design/partial/supervision-phased-implementation.md`.
+S4-sleep-primitive in `design/archive/supervision-impl.md`, implemented in
+phase P3b of `design/archive/supervision-phased-implementation.md`.
 
 ## 3. Responsibilities
 

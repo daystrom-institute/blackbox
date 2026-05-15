@@ -18,12 +18,12 @@ Related docs:
 
 - `design/archive/supervision-mechanical.md` - implemented mechanical
   supervision substrate.
-- `design/partial/supervision-classifier-cosession.md` - workflow-backed
+- `design/archive/supervision-classifier-cosession.md` - workflow-backed
   classifier co-session.
-- `design/partial/supervision-turn-end-advisor.md` - turn-end and alert-driven
+- `design/archive/supervision-turn-end-advisor.md` - turn-end and alert-driven
   advisor loop.
 - `design/partial/supervision-test-plan.md` - test skeleton.
-- `design/partial/supervision-phased-implementation.md` - phased build plan.
+- `design/archive/supervision-phased-implementation.md` - phased build plan.
 - `design/proposed/runtime-allocation-tier-mapping.md` - tier keys, ladders,
   runtime allocation, and recovery lane selection.
 - `design/proposed/acquire-drone.md` - superseded pool/probe donor material.

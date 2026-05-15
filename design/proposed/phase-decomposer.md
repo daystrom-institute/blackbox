@@ -95,7 +95,7 @@ measuring it mechanically, and routing accordingly.
 ```
 
 Each implementer runs inside a **supervised subworkflow**
-(`design/partial/supervision.md`): implemented mechanical telemetry observes
+(`design/archive/supervision.md`): implemented mechanical telemetry observes
 the implementer; an optional workflow-backed classifier atom can poll that
 telemetry and task state; an optional advisor atom evaluates turn-end or alert
 checkpoints and routes to acceptance, steering, recovery, replacement, human
@@ -270,7 +270,7 @@ coverage. No typed coverage-lint op exists in the engine today
 ### 4.4 Implementer dispatch
 
 `foreach` over DAG sub-units (`schema.rs:193`). Each sub-unit is a
-**supervised subworkflow** (`design/partial/supervision.md`): the implementer
+**supervised subworkflow** (`design/archive/supervision.md`): the implementer
 runs inside a subworkflow with mechanical telemetry plus optional classifier
 and advisor-gated completion. The implementer is seeded with its evidence
 subset (the refs from the DAG for that sub-unit). No exploration, no
@@ -325,14 +325,14 @@ If the council can't converge after a configurable epoch ceiling
 
 The phase-decomposer pipeline composes supervision - it does not own it.
 Each implementer dispatch (single or fan-out) runs inside a supervised
-subworkflow defined in `design/partial/supervision.md`: mechanical telemetry
+subworkflow defined in `design/archive/supervision.md`: mechanical telemetry
 is available for every task; a workflow-backed classifier atom may poll the
 primary; an advisor atom may evaluate turn-end or alert checkpoints; verdicts
 route to acceptance, steering, recovery, replacement, human escalation, or
 bail. N implementers = N advisors when advisor supervision is enabled.
 
 The supervision layers are separate infrastructure. See
-`design/partial/supervision.md` for the full specification.
+`design/archive/supervision.md` for the full specification.
 
 ## 6. Fault handling: two distinct paths
 
@@ -441,8 +441,8 @@ debates. The council decides.
 | Agent manifests (typed install artifacts) | `system-defaults/agents/code-reviewer.json` | implemented |
 | Advisor checkpoint/packet/resume pipeline | `src/tools/roster.rs` | implemented (team-scoped) |
 | Mechanical supervision telemetry | `src/orchestration/supervision.rs` | implemented |
-| Classifier workflow-backed atom pattern | `design/partial/supervision-classifier-cosession.md` | **aspirational** |
-| Advisor workflow-backed atom pattern | `design/partial/supervision-turn-end-advisor.md` | **aspirational** |
+| Classifier workflow-backed atom pattern | `design/archive/supervision-classifier-cosession.md` | **aspirational** |
+| Advisor workflow-backed atom pattern | `design/archive/supervision-turn-end-advisor.md` | **aspirational** |
 | `bbox_ref_size` MCP tool (ref→bytes measurement) | — | **aspirational** |
 | Typed advisor action executor | — | **aspirational** |
 | Mediation agent manifests | — | **aspirational** |

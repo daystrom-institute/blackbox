@@ -11,7 +11,7 @@ This skeleton covers the atom-era supervision model:
 - typed recovery actions
 - runtime allocation tier integration
 
-`design/partial/supervision-phased-implementation.md` is the active execution
+`design/archive/supervision-phased-implementation.md` is the active execution
 plan and lists tests at each phase boundary. This file is the broader coverage
 checklist to keep those phase tests complete.
 

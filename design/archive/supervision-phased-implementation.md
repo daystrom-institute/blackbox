@@ -5,17 +5,17 @@ Status: partial implementation plan.
 
 Companion docs:
 
-- `design/partial/supervision.md`
+- `design/archive/supervision.md`
 - `design/archive/supervision-mechanical.md`
-- `design/partial/supervision-classifier-cosession.md`
-- `design/partial/supervision-turn-end-advisor.md`
+- `design/archive/supervision-classifier-cosession.md`
+- `design/archive/supervision-turn-end-advisor.md`
 - `design/partial/supervision-test-plan.md`
 - `design/proposed/runtime-allocation-tier-mapping.md`
 
 This plan implements supervised atom orchestration by adding reusable workflow
 and atom-runtime primitives. It does not add a daemon-special LLM sidecar.
 
-This is the active implementation sequence. `design/partial/supervision-impl.md`
+This is the active implementation sequence. `design/archive/supervision-impl.md`
 is a compact S-id index for stable cross-document references; the table below
 maps those S-ids to the phase plan. Test coverage is enumerated per phase here;
 `design/partial/supervision-test-plan.md` remains the broader coverage
@@ -474,11 +474,11 @@ phase-decomposer integration.
 
 Before landing each phase, check:
 
-- `design/partial/supervision.md` still describes the same optional
+- `design/archive/supervision.md` still describes the same optional
   orchestration shape.
-- `design/partial/supervision-classifier-cosession.md` still matches P2, P3b,
+- `design/archive/supervision-classifier-cosession.md` still matches P2, P3b,
   and P4.
-- `design/partial/supervision-turn-end-advisor.md` still matches P3a, P5, P6,
+- `design/archive/supervision-turn-end-advisor.md` still matches P3a, P5, P6,
   and P7.
 - `design/partial/supervision-test-plan.md` still covers the phase tests here.
 - `design/proposed/phase-decomposer-impl.md` still points at P-phase

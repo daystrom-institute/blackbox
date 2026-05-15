@@ -8,11 +8,11 @@ co-session as daemon-side machinery and under-described the implemented
 mechanical telemetry. The current design is split across:
 
 - `design/archive/supervision-mechanical.md`
-- `design/partial/supervision.md`
-- `design/partial/supervision-classifier-cosession.md`
-- `design/partial/supervision-turn-end-advisor.md`
+- `design/archive/supervision.md`
+- `design/archive/supervision-classifier-cosession.md`
+- `design/archive/supervision-turn-end-advisor.md`
 - `design/partial/supervision-test-plan.md`
-- `design/partial/supervision-phased-implementation.md` - active build
+- `design/archive/supervision-phased-implementation.md` - active build
   sequence.
 
 The phased implementation plan is the authoritative build order. The S-ids

@@ -848,6 +848,7 @@ impl BlackboxServer {
                     project_dir: project_dir.clone(),
                     owner: Some(owner.to_string()),
                     parent_invocation_id: None,
+                    runtime: None,
                     supervision_override: None,
                     suppress_auto_supervision: true,
                 },
@@ -904,6 +905,7 @@ impl BlackboxServer {
                     project_dir,
                     owner: Some(owner.to_string()),
                     parent_invocation_id: None,
+                    runtime: None,
                     supervision_override: None,
                     suppress_auto_supervision: true,
                 },
@@ -1000,6 +1002,7 @@ impl BlackboxServer {
                     project_dir,
                     owner: Some(owner),
                     parent_invocation_id: None,
+                    runtime: None,
                     supervision_override: None,
                     suppress_auto_supervision: true,
                 },
@@ -1128,11 +1131,10 @@ impl BlackboxServer {
                 spawn_agent_label: Some(atom_label.clone()),
                 record_to_bro: None,
             })?;
-        let inner = dispatched.task.inner.lock();
-        let task_id = inner.id.clone();
-        let session_id = inner.session_id.clone();
-        let selected_provider = inner.provider;
-        drop(inner);
+        let (task_id, session_id, selected_provider) = {
+            let inner = dispatched.task.inner.lock();
+            (inner.id.clone(), inner.session_id.clone(), inner.provider)
+        };
 
         let mut inv = AtomInvocation::new_profile(
             invocation_id.to_string(),
@@ -1769,6 +1771,7 @@ impl BlackboxServer {
                             project_dir: None,
                             owner: Some(primary_owner),
                             parent_invocation_id: None,
+                            runtime: None,
                             supervision_override: None,
                             suppress_auto_supervision: true,
                         },
@@ -1833,6 +1836,7 @@ impl BlackboxServer {
                         project_dir: None,
                         owner: Some(primary_owner),
                         parent_invocation_id: None,
+                        runtime: None,
                         supervision_override: None,
                         suppress_auto_supervision: true,
                     },
