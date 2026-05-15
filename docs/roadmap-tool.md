@@ -1,9 +1,16 @@
 # Roadmap Tool
 
-`bbox_roadmap` is a prospective work tracker: designed-but-not-implemented
-features, refactors, explorations, tech debt, and risks. It sits in a
-distinct time band from the other stores - inbox is reactive, threads
-are active, knowledge is atemporal. The roadmap tracks the *future*.
+`bbox_roadmap` is an operator-directed prospective work tracker:
+designed-but-not-implemented features, refactors, explorations, tech debt,
+and risks. It sits in a distinct time band from the other stores - inbox is
+reactive, threads are active, knowledge is atemporal. The roadmap tracks the
+*future*.
+
+Roadmap interactions are performed only at the express direction of the
+operator. Agents must not create, update, rank, promote, or render roadmap
+items as an agent-selected deferral path. If the operator requested
+implementation, do the implementation unless the operator explicitly redirects
+the work to roadmap tracking.
 
 The [blackbox project roadmap](roadmap.md) is the generated output of
 this tool applied to this repo. This page explains the tool itself.
@@ -76,8 +83,9 @@ bbox_roadmap(action="update", id="rm-a1b2c3d4", status="accepted", priority="hig
 
 ### `next`
 
-Rank accepted items by priority, staleness, and design-link health.
-The primary planning surface: tells you what to work on next.
+Rank accepted items by priority, staleness, and design-link health. Use this
+only when the operator asks for roadmap-based planning or asks what accepted
+roadmap item should be worked next.
 
 ```
 bbox_roadmap(action="next", n=5, project="/repo/x")
@@ -91,7 +99,8 @@ filtered out unless `include_blocked=true`.
 ### `promote`
 
 Spin an accepted roadmap item into an active work thread. Injects the
-item's body and design links as the thread's context.
+item's body and design links as the thread's context. Use this only when the
+operator explicitly asks to promote a roadmap item or start work from one.
 
 ```
 bbox_roadmap(action="promote", id="rm-a1b2c3d4", project_dir="/repo/x")
@@ -148,6 +157,9 @@ bbox_roadmap(action="delete", id="rm-a1b2c3d4")
 ```
 
 ## Typical flow
+
+The flow below is operator-directed. It is not a license for an agent to avoid
+requested implementation by filing or promoting roadmap work on its own.
 
 ```
 # Propose an item
