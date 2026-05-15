@@ -212,11 +212,19 @@ or system memories and link/pointer from here.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
   `docs/councils-whiteboards.md` - agentic coordination surfaces.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
+- `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,
+  storage, code navigation, provenance, roadmap, and Badgey designs.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
   supervision, phase decomposition, runtime allocation, and live handoff
   designs.
 - `design/refactor-tools/` - topic home for structural refactor tools,
   refactor atoms, Rust expansion, and Java refactor closure designs.
+- `design/integrations/` - topic home for editor/chat/external UI
+  integrations such as Obsidian and Slack.
+- `design/surfaces/` - topic home for MCP surfaces, workspace tools, and
+  provider transcript read planes.
+- `design/operations/` - topic home for config/artifact lifecycle, bundles,
+  doctor, and system-event coordination.
 - `design/archive/`, `design/proposed/`, and `design/partial/` - legacy
   lifecycle folders for designs not yet migrated into a topic home. Prefer
   frontmatter `lifecycle` over path when determining currentness, and verify

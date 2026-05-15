@@ -1,0 +1,24 @@
+---
+title: "Code Navigation"
+kind: design-hub
+corpus: blackbox-design
+topic:
+  - corpus
+  - code-navigation
+brief: "Hub for code-navigation and symbolic-exploration designs over indexed project source."
+---
+
+# Code Navigation
+
+Code navigation is the corpus layer that turns indexed project source into
+symbolic lookup and syntax-grounded exploration surfaces.
+
+## Docs
+
+- [Code Navigation And Symbolic Exploration](code-nav-symbolic-exploration.md)
+- [Code Navigation And Symbolic Exploration - Implementation Skeleton](code-nav-symbolic-exploration-impl.md)
+
+## Crosscuts
+
+- [Agentic Corpus Platform](../agentic-corpus/agentic-corpus-platform.md)
+- [Refactor Tools](../../refactor-tools/refactor-tools.md)

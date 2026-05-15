@@ -789,8 +789,8 @@ path (acknowledged, out of scope)".
     `bbox_artifact_install` with `provenance: distilled` and
     agentic-corpus edges back to source sessions.
   - Distiller implementation tracked separately
-    (badgey-flavor; references `design/badgey.md` /
-    `design/badgey-impl.md` once those phases reach a relevant
+    (badgey-flavor; references `design/corpus/badgey.md` /
+    `design/corpus/badgey-impl.md` once those phases reach a relevant
     stage).
 - `AgentProvenance::Distilled` variant
   (`src/orchestration/agents/types.rs:170`) is already in the

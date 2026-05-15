@@ -13,7 +13,7 @@ brief: "Designs workflow-native tmux portal handoff for live bro sessions, focus
 
 # Tmux portal for workflow-native live bro handoff
 
-Related: `WORKFLOWS.md`, `examples/keystone/`, `../supervision/supervision.md`, `design/archive/provider-transcript-read-plane.md`, `tmux-portal-workflows-impl.md`
+Related: `WORKFLOWS.md`, `examples/keystone/`, `../supervision/supervision.md`, `design/surfaces/provider-transcripts/provider-transcript-read-plane.md`, `tmux-portal-workflows-impl.md`
 
 ## 1. Thesis
 
@@ -116,7 +116,7 @@ struct PortalHandle {
 The handle is task metadata, not output. It should appear in
 `bro_arc_status`, `bro tail`, and notes only by reference.
 `TranscriptLocation` and `TranscriptCursor` come from
-`design/archive/provider-transcript-read-plane.md`; tmux mode must not define a parallel
+`design/surfaces/provider-transcripts/provider-transcript-read-plane.md`; tmux mode must not define a parallel
 read-source model.
 
 ## 4. Portal hook ops
@@ -333,11 +333,11 @@ There are two processor classes.
 
 Read processors normalize provider transcript/session stores into a common
 event stream. These are the source of truth for workflow automation and are
-specified in `design/archive/provider-transcript-read-plane.md`.
+specified in `design/surfaces/provider-transcripts/provider-transcript-read-plane.md`.
 
 Normalized events should be provider-neutral enough for workflow gates. The
 canonical implementation shape lives in `src/transcripts/types.rs`; the
-archived design is `design/archive/provider-transcript-read-plane.md`. Tmux
+archived design is `design/surfaces/provider-transcripts/provider-transcript-read-plane.md`. Tmux
 mode uses it but does not own it. A typical event has this form:
 
 ```json
@@ -415,7 +415,7 @@ over transcript-quality data.
 
 If the read-plane adapter fails while a workflow gate is waiting, the
 workflow follows the degradation rule in
-`design/archive/provider-transcript-read-plane.md`: retry briefly, then block
+`design/surfaces/provider-transcripts/provider-transcript-read-plane.md`: retry briefly, then block
 with the adapter error and include any TUI snapshot only as diagnostic
 evidence.
 

@@ -15,3 +15,4 @@ agent CLI while preserving Blackbox-owned semantics and provenance.
 ## Areas
 
 - [Obsidian](obsidian/obsidian.md)
+- [Slack](slack/slack.md)

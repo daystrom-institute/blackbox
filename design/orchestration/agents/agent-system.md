@@ -708,7 +708,7 @@ callers resume the session. Storing only `session_id` is a hazard
 ### 6.1 Embedding pipeline
 
 Manifest embeddings ride the agentic-corpus vector store
-(`design/archive/agentic-corpus.md` §5.3-5.4). Bucket: `agent_manifest`
+(`design/corpus/agentic-corpus/agentic-corpus.md` §5.3-5.4). Bucket: `agent_manifest`
 (new bucket; required substrate extension per §16.1). Field
 embedded:
 

@@ -16,10 +16,18 @@ describes behavior that matters for implementation, verify it against the code,
 
 ## Topic Hubs
 
+- [Corpus](corpus/corpus.md) - search, provenance, knowledge, notes, storage,
+  code navigation, and corpus-facing assistants.
 - [Orchestration](orchestration/orchestration.md) - atoms, agents, workflows,
   supervision, phase decomposition, and runtime handoff.
 - [Refactor Tools](refactor-tools/refactor-tools.md) - structural refactor
   machinery, refactor atoms, Rust expansion, and Java gap closure.
+- [Integrations](integrations/integrations.md) - Obsidian, Slack, and other
+  external user-facing adapters.
+- [Surfaces](surfaces/surfaces.md) - MCP, workspace tools, and provider
+  transcript read planes.
+- [Operations](operations/operations.md) - config, artifacts, bundles, doctor,
+  and evented coordination.
 
 ## Lifecycle
 

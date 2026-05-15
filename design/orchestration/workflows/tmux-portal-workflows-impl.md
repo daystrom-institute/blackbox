@@ -14,7 +14,7 @@ brief: "Implementation plan for workflow-native tmux portal handoff, focus, and 
 # Tmux Portal Workflows: Implementation Plan
 
 Companion to: `tmux-portal-workflows.md`
-Depends on: `design/archive/provider-transcript-read-plane.md`
+Depends on: `design/surfaces/provider-transcripts/provider-transcript-read-plane.md`
 
 This plan turns the tmux portal design into blackbox workflow machinery. The
 implementation should keep one invariant strict:

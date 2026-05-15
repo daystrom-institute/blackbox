@@ -15,7 +15,9 @@
 # Obsidian local/session state. Keep stable shared vault config tracked.
 /.obsidian/workspace.json
 /.obsidian/workspace-mobile.json
+/.obsidian/graph.json
 /.obsidian/cache/
+/.obsidian/plugins/
 /.obsidian/plugins/*/data.json
 
 # keystone-arc demo writes admin token + webhook secret here on bootstrap.

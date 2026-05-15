@@ -466,7 +466,7 @@ debates. The council decides.
 - **No triage before scouts.** The inlet runs scouts first, then produces
   the verdict. Decisions are informed by data, not guesses.
 - **No interception of provider built-ins.** The coercion surface is
-  described in `design/workspace-tools.md`. Hard interception requires a
+  described in `design/surfaces/workspace-tools/workspace-tools-v3.md`. Hard interception requires a
   parallel mechanism per provider — not wired today
   (`src/orchestration/providers.rs:790-850`).
 - **No overminds or scope_expansion_request.** These are daystrom design

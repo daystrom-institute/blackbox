@@ -31,7 +31,7 @@ Archived for provenance. The replacement is
 
 Date: 2026-05-10
 Status: design proposal — incorporates codex review findings (2026-05-10);
-depends on `design/workspace-tools.md` for instrumentation and coercion.
+depends on `design/surfaces/workspace-tools/workspace-tools-v3.md` for instrumentation and coercion.
 
 ## 1. Problem
 
@@ -70,7 +70,7 @@ not pre-built parts:
 - **Implemented in daystrom, ports needed:**
   Workspace tools — file/git/shell wrappers with augmentation
   (`../daystrom-mk2/src/Daystrom.Worker/Tools/`). These are the
-  instrumentation substrate and ship in `design/workspace-tools.md`.
+  instrumentation substrate and ship in `design/surfaces/workspace-tools/workspace-tools-v3.md`.
 - **Donor patterns, design-stage even in daystrom:**
   Dispatch-v2's overminds, write-target DAG, scope-expansion-request,
   signal processors. `../daystrom-mk2/design/dispatch-v2.md:5` says
@@ -104,7 +104,7 @@ Cheap. Computes:
 - `nominal_context(provider, model)` — from the provider catalog.
 - `effective_budget = nominal_context * compaction_factor[provider]` —
   per-provider quality factor calibrated from `tool_call` events
-  (`design/workspace-tools.md` §5) cross-referenced with task outcomes.
+  (`design/surfaces/workspace-tools/workspace-tools-v3.md` §5) cross-referenced with task outcomes.
   Codex factor ≈ 0.9; Opus 4.7 factor ≈ 0.6 (eyeball). **Actual numbers
   require the workspace-tools instrumentation pipeline to land first**;
   until then, eyeball factors gate the rung.
@@ -345,7 +345,7 @@ Each sub-unit dispatches as a standard `bro_exec` with:
 - The `ContextBundle` referenced via `bbox_pin`.
 - The sub-unit work-item thread (child of the parent phase thread).
 - `coerce_workspace=true` — emits the workspace-tools appendix
-  (`design/workspace-tools.md` §6), which lists `bbox_smart_read`,
+  (`design/surfaces/workspace-tools/workspace-tools-v3.md` §6), which lists `bbox_smart_read`,
   `bbox_bash`, `bbox_git_*` as preferred tools.
 
 ### Scheduling
@@ -365,7 +365,7 @@ interception:
 
 1. The implementer writes — via `bbox_apply` (instrumented), via
    `bbox_refactor_apply` (already instrumented), or via raw `Edit` /
-   `Write` (logged as `tool_call_event` per `design/workspace-tools.md` §5).
+   `Write` (logged as `tool_call_event` per `design/surfaces/workspace-tools/workspace-tools-v3.md` §5).
 2. A scope-check signal processor runs on each `tool_call_event` write:
    if the `tool_target` (file path, or symbol when resolvable) is outside
    `predicted_writes`, it emits
@@ -532,7 +532,7 @@ The vibe-at-80% case. Substrate is already there:
   granularity is **per logical sub-step tied to acceptance IDs and
   observable validation** — not per symbol (too noisy), not per full
   criterion (too coarse). When the implementer uses
-  `bbox_git_commit` (`design/workspace-tools.md` §4.2), each commit
+  `bbox_git_commit` (`design/surfaces/workspace-tools/workspace-tools-v3.md` §4.2), each commit
   auto-emits `bbox_note(kind=done, body="commit <sha>: <criterion_ids>
   verified")` as a side effect; manual done-notes are the fallback when
   the implementer doesn't use the wrapper.
@@ -551,7 +551,7 @@ Audit per codex review (2026-05-10):
 | Conflict among proposed splits | `whiteboard_conflicts` (`src/whiteboards.rs:351-365`) | implemented; **caveat: file/location keyed, not symbol-DAG. Council must encode symbol IDs by convention.** |
 | Per sub-unit AssignmentPacket | Daystrom dispatch-v2 packet shape (`../daystrom-mk2/design/dispatch-v2.md:896`) | **donor pattern, not implemented in daystrom either.** Field set differs from daystrom (acceptance_subset + preload_pin_id are bbox additions) |
 | Sub-unit dispatch | `bro_exec` + `bbox_pin` | implemented |
-| Scope expansion | `tool_call_event` instrumentation (`design/workspace-tools.md` §5) → dispute note | **bbox-specific; not interception. Daystrom's design proposes an MCP tool; we use post-hoc telemetry.** |
+| Scope expansion | `tool_call_event` instrumentation (`design/surfaces/workspace-tools/workspace-tools-v3.md` §5) → dispute note | **bbox-specific; not interception. Daystrom's design proposes an MCP tool; we use post-hoc telemetry.** |
 | Mediator on live contention | Daystrom overmind LIVE mode (`dispatch-v2.md` §6.3) | **donor pattern; daystrom itself recommends scheduler-mediated coordination first** (`dispatch-v2.md:2182`) |
 | Completion verification | Acceptance re-injection at gate (daystrom `steering.md:602`) | **donor pattern; bbox workflow gates are packet-based, not build-gate-equivalent.** Workspace-tools layer required for full parity |
 | Resume from 80% | Work-item thread notes + `bbox_notes` | implemented; granularity convention (§11) is new |
@@ -575,7 +575,7 @@ Audit per codex review (2026-05-10):
 6. **Done-note granularity** — per logical sub-step tied to acceptance
    IDs. `bbox_git_commit` auto-emits done notes; manual fallback. (§11)
 7. **Compaction-factor calibration** — mine `tool_call_event`
-   (`design/workspace-tools.md` §5) cross-referenced with task outcomes,
+   (`design/surfaces/workspace-tools/workspace-tools-v3.md` §5) cross-referenced with task outcomes,
    per provider+model+effort tier. Eyeball factors gate the rung until
    instrumentation lands. (§3.1)
 8. **Mediator-memory bootstrap** — deferred from v1. Promote to project
@@ -612,7 +612,7 @@ the load-bearing first step is the typed contract layer. Reordered:
    `AssignmentPacket`, `recompose_contract`, with stable JSON schemas.
    No engine work yet.
 2. **Workspace-tools instrumentation.** Schema bump for `tool_call`
-   doc-type; parser changes (`design/workspace-tools.md` §5 steps 1–2).
+   doc-type; parser changes (`design/surfaces/workspace-tools/workspace-tools-v3.md` §5 steps 1–2).
    Now `tool_call_event` is queryable; predicted-writes contention
    checks have a substrate.
 3. **Tree-sitter symbol-set as `predicted_writes`** — wire

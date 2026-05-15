@@ -20,7 +20,7 @@ Sandboxed Shell op currently runs with cwd from meta.worktree but no allowlist e
 ### Commit-work provenance (WorkGraphLink)
 *Feature · high priority*
 
-Commit-to-work provenance - link commits to the threads, tasks, sessions, and notes that produced them. Requires a generic WorkGraphLink store (not overloading ThreadEdge), bbox_link MCP tool, automatic commit hook capture, and git notes import/export for cross-clone portability. Design: design/commit-work-provenance.md. Phases 0-5 in the design doc.
+Commit-to-work provenance - link commits to the threads, tasks, sessions, and notes that produced them. Requires a generic WorkGraphLink store (not overloading ThreadEdge), bbox_link MCP tool, automatic commit hook capture, and git notes import/export for cross-clone portability. Design: design/corpus/commit-work-provenance.md. Phases 0-5 in the design doc.
 
 **Threads:**▸ `thread-12980121`
 

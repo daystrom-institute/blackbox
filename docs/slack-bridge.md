@@ -157,5 +157,5 @@ layer.
 
 For the full design rationale - why a sidecar rather than an embedded
 Slack crate, the process-supervision pattern shared with `bro-irc`, and
-known gaps - see [`design/bro-slack.md`](https://github.com/invidious9000/transcript-search/blob/main/design/bro-slack.md) and
-[`design/bro-slack-next.md`](https://github.com/invidious9000/transcript-search/blob/main/design/bro-slack-next.md).
+known gaps - see [`design/integrations/slack/bro-slack.md`](https://github.com/invidious9000/transcript-search/blob/main/design/integrations/slack/bro-slack.md) and
+[`design/integrations/slack/bro-slack-next.md`](https://github.com/invidious9000/transcript-search/blob/main/design/integrations/slack/bro-slack-next.md).

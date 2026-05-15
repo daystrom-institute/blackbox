@@ -118,7 +118,7 @@ bbox_roadmap(
   id="rm-a1b2c3d4",
   link_type="designed_in",
   link_target="knowledge:ab12cd34",
-  link_note="Phase 1 of design/commit-work-provenance.md"
+  link_note="Phase 1 of design/corpus/commit-work-provenance.md"
 )
 bbox_roadmap(action="unlink", id="rm-a1b2c3d4", link_type="depends_on", link_target="rm-efgh5678")
 ```
