@@ -5,6 +5,9 @@ corpus: blackbox-design
 topic:
   - corpus
   - code-navigation
+tags:
+  - code-navigation
+  - refactor-tools
 brief: "Hub for code-navigation and symbolic-exploration designs over indexed project source."
 ---
 

@@ -1,3 +1,15 @@
+---
+title: "Restructure Proposal - Crate Topology"
+kind: design
+lifecycle: partial
+corpus: blackbox-design
+topic:
+  - restructure
+tags:
+  - refactor-tools
+  - restructure
+brief: "Live topology cleanup record for the crate restructure that drove the refactor tooling benchmark."
+---
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05

@@ -5,6 +5,9 @@ corpus: blackbox-design
 topic:
   - orchestration
   - atoms
+tags:
+  - atoms
+  - refactor-tools
 brief: "Crosscut hub for atoms as public, contracted capabilities over brofiles, workflows, deterministic runners, and adapters."
 ---
 

@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - corpus
   - code-navigation
+tags:
+  - code-navigation
+  - refactor-tools
 ---
 
 # Code Navigation and Symbolic Exploration

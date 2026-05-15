@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - orchestration
   - atoms
+tags:
+  - atoms
+  - refactor-tools
 date: 2026-05-13
 status: "implemented core runtime; implementation plan retained for audit trail"
 brief: "Phased build plan for the atom runtime, registry, invocation handles, resolver kinds, and workflow bindings."

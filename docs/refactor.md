@@ -1,3 +1,10 @@
+---
+title: "Refactor Tools And Atoms"
+brief: "Public guide for structural refactor primitives, compound runs, language support, and shipped refactor atoms."
+tags:
+  - refactor-tools
+  - atoms
+---
 # Refactor Tools And Atoms
 
 Blackbox has two refactor layers.

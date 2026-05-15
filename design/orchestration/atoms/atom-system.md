@@ -6,6 +6,9 @@ corpus: blackbox-design
 topic:
   - orchestration
   - atoms
+tags:
+  - atoms
+  - refactor-tools
 date: 2026-05-13
 status: "implemented core runtime; design remains the conceptual reference"
 brief: "Defines atoms as contracted, discoverable capabilities over bros, workflows, deterministic runners, and adapters."
