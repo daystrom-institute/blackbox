@@ -1,4 +1,4 @@
-# Examples
+# Runnable Examples
 
 Tutorial configs and integration demos that demonstrate how to wire blackbox
 (`bbox_*`, `bro_*`, and `atom_*` MCP tools) into the CLIs it orchestrates.

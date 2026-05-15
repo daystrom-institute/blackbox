@@ -200,7 +200,7 @@ or system memories and link/pointer from here.
 
 - `README.md` - user-facing overview and setup.
 - `docs/index.md` - human documentation map.
-- `examples/examples.md`, `system-defaults/system-defaults.md` - maps for
+- `examples/runnable-examples.md`, `system-defaults/system-defaults.md` - maps for
   tutorial examples and installable default artifacts.
 - `docs/getting-started.md`, `docs/operating-blackbox.md`,
   `docs/operations.md` - operational setup and day-2 runbooks.

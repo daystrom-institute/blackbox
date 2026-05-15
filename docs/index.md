@@ -27,7 +27,7 @@ The crate is `blackbox`. It produces four binaries:
 | [Graph And Retrieval Internals](graph-retrieval-internals.md) | Graph grounding, opening sequence, entity refs, edges, hybrid search ranking |
 | [Index And Embedding Internals](index-embedding-internals.md) | Tantivy indexing, embedding queues, schema migration, vector and edge compaction |
 | [Workflow Engine](workflows.md) | Canonical reference for authoring and running workflows |
-| [Example Catalog](examples.md) | Example agents, skills, workflows, and end-to-end demos |
+| [Reference Implementations](reference-implementations.md) | Narrative reference walks for Keystone, Sastquatch, and related demo arcs |
 | [Atoms](atoms.md) | Install, discover, invoke, resume, and bind reusable capabilities |
 | [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |
 | [Refactor Tools And Atoms](refactor.md) | Structural refactor primitives plus shipped Java/Rust refactor atoms |
