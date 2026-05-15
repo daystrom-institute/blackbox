@@ -6,11 +6,11 @@ Status: shipped
 Related:
 - [WORKFLOWS](../../WORKFLOWS.md) - current workflow hooks, inbound
   webhook/poller/cron inlets, Wait signals, and routing packets.
-- [Atom System](atom-system.md) - reusable capability boundary; reactions may
+- [Atom System](../orchestration/atoms/atom-system.md) - reusable capability boundary; reactions may
   invoke atoms as bounded actions.
-- [bro-slack next](bro-slack-next.md) - Slack egress and native agent
+- [bro-slack next](../proposed/bro-slack-next.md) - Slack egress and native agent
   projection; system events should become its daemon-side signal source.
-- [Supervision](supervision.md) - mid-dispatch observations and policy-driven
+- [Supervision](../orchestration/supervision/supervision.md) - mid-dispatch observations and policy-driven
   action over running work.
 - [Keystone example](../../examples/keystone/README.md) - existing
   Forgejo-backed issue to PR to review loop.

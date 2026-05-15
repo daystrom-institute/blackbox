@@ -2,7 +2,7 @@
 
 Date: 2026-05-05
 Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; refreshed 2026-05-14
-Related: `design/archive/restructure-ast.md`
+Related: `design/refactor-tools/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
 target, `src/packets/`, `src/server/`, `src/tools/`, and first-pass child
@@ -52,7 +52,7 @@ Archive criteria: this doc can move to `design/archive/` once these follow-ups
 are either complete or represented as accepted roadmap/thread items with enough
 detail that agents do not need this historical proposal to proceed. The
 companion AST execution plan was a checkpoint artifact for the old mechanized
-sequence and now lives at `design/archive/restructure-ast.md`.
+sequence and now lives at `design/refactor-tools/restructure-ast.md`.
 
 ## Original Problem
 

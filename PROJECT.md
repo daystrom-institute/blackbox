@@ -211,6 +211,13 @@ or system memories and link/pointer from here.
   `docs/rule-packets.md` - orchestration and event routing.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
   `docs/councils-whiteboards.md` - agentic coordination surfaces.
-- `design/archive/` - shipped designs.
-- `design/proposed/` and `design/partial/` - not-yet-shipped or in-flight
-  designs; verify against code before treating them as current behavior.
+- `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
+- `design/orchestration/` - topic home for atoms, agents, workflows,
+  supervision, phase decomposition, runtime allocation, and live handoff
+  designs.
+- `design/refactor-tools/` - topic home for structural refactor tools,
+  refactor atoms, Rust expansion, and Java refactor closure designs.
+- `design/archive/`, `design/proposed/`, and `design/partial/` - legacy
+  lifecycle folders for designs not yet migrated into a topic home. Prefer
+  frontmatter `lifecycle` over path when determining currentness, and verify
+  against code before treating any design as current behavior.

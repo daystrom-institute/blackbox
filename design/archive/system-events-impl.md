@@ -7,9 +7,9 @@ Companion to: [System Events](system-events.md)
 Related:
 - [WORKFLOWS](../../WORKFLOWS.md) - workflow hooks, inlets, Wait signals,
   routing verdicts, and operational surfaces.
-- [Atom System Impl](atom-system-impl.md) - artifact/ref/runtime patterns for
+- [Atom System Impl](../orchestration/atoms/atom-system-impl.md) - artifact/ref/runtime patterns for
   reusable invocation surfaces.
-- [Supervision Impl](supervision-impl.md) - per-event daemon observations,
+- [Supervision Impl](../orchestration/supervision/supervision-impl.md) - per-event daemon observations,
   policy evaluation, and action routing.
 - [Keystone](../../examples/keystone/README.md) - Forgejo-backed coordination
   example this work extends.

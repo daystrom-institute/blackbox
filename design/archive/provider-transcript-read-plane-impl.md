@@ -3,7 +3,7 @@
 Date: 2026-05-12
 Status: implemented and archived after `c3022b5`
 Companion to: `design/archive/provider-transcript-read-plane.md` (design);
-supports `design/proposed/tmux-portal-workflows.md`.
+supports `design/orchestration/workflows/tmux-portal-workflows.md`.
 
 The implementation should land the read-plane abstraction without breaking
 the current Claude/Codex corpus behavior. The build order is deliberately

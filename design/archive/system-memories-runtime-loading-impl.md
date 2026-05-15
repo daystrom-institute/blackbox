@@ -6,7 +6,7 @@ Companion to: [System Memories Runtime Loading](system-memories-runtime-loading.
 
 Related:
 - [System Events Impl](system-events-impl.md) — phase DAG pattern this doc follows.
-- [Atom System](atom-system.md) — `system-defaults/atoms/` precedent for shipped file artifacts.
+- [Atom System](../orchestration/atoms/atom-system.md) — `system-defaults/atoms/` precedent for shipped file artifacts.
 - `src/template.rs` — Tera infrastructure.
 - `src/config.rs` — path resolution and config instance isolation.
 

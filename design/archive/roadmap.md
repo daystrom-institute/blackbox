@@ -347,7 +347,7 @@ and `GEMINI.md`. Adding `ROADMAP.md` follows the same pattern:
 
 ### Feature: Add roadmap tracker
 - **Priority:** high
-- **Designed in:** [`design/roadmap.md#entity-type-roadmap_item`](design/roadmap.md)
+- **Designed in:** [`roadmap.md#entity-type-roadmap_item`](roadmap.md)
 - **Thread:** `thread-a1b2c3d4`
 - Design notes, motivation, and acceptance criteria...
 

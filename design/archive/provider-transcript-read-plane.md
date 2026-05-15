@@ -2,7 +2,7 @@
 
 Status: implemented and archived after `c3022b5`
 Date: 2026-05-12
-Related: `design/archive/provider-transcript-read-plane-impl.md`, `design/proposed/tmux-portal-workflows.md`, `WORKFLOWS.md`
+Related: `design/archive/provider-transcript-read-plane-impl.md`, `design/orchestration/workflows/tmux-portal-workflows.md`, `WORKFLOWS.md`
 
 Implementation note: this archived design records the pre-implementation
 intent. The landed code in `src/transcripts/types.rs` uses a flat

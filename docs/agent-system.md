@@ -161,4 +161,4 @@ See also:
 - [Rule Packets](rule-packets.md): agents use packets for deterministic classification
 - [Workflow Engine](workflows.md): agents are dispatched as actor nodes; atoms are bound through `atom_bindings`
 - [Atoms](atoms.md): use these for new reusable surfaces
-- Design docs: `design/archive/agent-system.md`, `design/archive/agent-system-impl.md`
+- Design docs: `design/orchestration/agents/agent-system.md`, `design/orchestration/agents/agent-system-impl.md`
