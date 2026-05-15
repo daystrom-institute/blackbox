@@ -153,6 +153,7 @@ use mcp_tools::find_paths::FindPathsParams;
 use mcp_tools::hybrid_search::HybridSearchParams;
 use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
+use mcp_tools::ref_size::RefSizeParams;
 use notes::{NoteListParams, NoteParams, NoteResolveParams};
 use packets::{
     ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,

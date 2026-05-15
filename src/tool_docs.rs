@@ -286,6 +286,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "bbox_ref_size",
+        category: ToolCategory::Graph,
+        summary: "Measure the byte payload size of entity refs. Project-file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
+        when_to_use: "Use when planning context-budget-sensitive dispatches. Pass the exact entity refs a downstream actor would need to read; the response returns per-ref byte counts, total_bytes, canonicalized successful refs, and unresolved/omitted refs without estimating from prose.",
+        example: Some(
+            r#"bbox_ref_size(refs=["project_file:d723917f:4967479d:c0d564f7ae71833785768017bb3ba3741e21d928c25d1262bde677b540e088b8:0"])"#,
+        ),
+    },
+    ToolDoc {
         name: "bbox_edge_compact",
         category: ToolCategory::Graph,
         summary: "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete.",

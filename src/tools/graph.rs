@@ -100,6 +100,17 @@ impl BlackboxServer {
     }
 
     #[tool(
+        name = "bbox_ref_size",
+        description = "Measure the byte payload size of entity refs. Project-file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded."
+    )]
+    pub(crate) fn bbox_ref_size(&self, Parameters(p): Parameters<RefSizeParams>) -> CallToolResult {
+        Self::run("bbox_ref_size", || {
+            let provider_ctx = ProviderContext::new(&self.state);
+            mcp_tools::ref_size::ref_size(&p, &provider_ctx)
+        })
+    }
+
+    #[tool(
         name = "bbox_edge_compact",
         description = "Dry-run or apply legacy edge sidecar compaction for one project. Removes append-only derived edges from edges/<project_id>.jsonl while retaining explicit/provenance/malformed lines; apply defaults false and writes a backup before replacement. With apply=true, rebuild=true forces a sidecar-only in-memory EdgeIndex rebuild even when compaction is already complete."
     )]

@@ -444,22 +444,46 @@ impl TranscriptIndex {
             }
             f(EmbeddingSourceDoc {
                 doc_type,
-                account: first_text(&doc, self.fields.account),
-                session_id: first_text(&doc, self.fields.session_id),
-                project: first_text(&doc, self.fields.project),
-                file_path: first_text(&doc, self.fields.file_path),
-                byte_offset: first_u64(&doc, self.fields.byte_offset),
-                chunk_kind: first_text(&doc, self.fields.chunk_kind),
-                language: optional_text(&doc, self.fields.language),
-                symbol: optional_text(&doc, self.fields.symbol),
-                symbol_exact: optional_text(&doc, self.fields.symbol_exact),
-                chunk_hash: optional_text(&doc, self.fields.chunk_hash),
-                entity_id: optional_text(&doc, self.fields.entity_id),
-                content: first_text(&doc, self.fields.content),
+                ..self.embedding_source_doc_from_doc(&doc)
             })?;
             emitted += 1;
         }
         Ok(emitted)
+    }
+
+    pub(crate) fn embedding_source_doc_for_entity_id(
+        &self,
+        entity_id: &str,
+    ) -> Result<Option<EmbeddingSourceDoc>> {
+        let searcher = self.reader.searcher();
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.entity_id, entity_id),
+            IndexRecordOption::Basic,
+        );
+        let top_docs = searcher.search(&query, &tantivy::collector::TopDocs::with_limit(1))?;
+        let Some((_score, addr)) = top_docs.into_iter().next() else {
+            return Ok(None);
+        };
+        let doc: TantivyDocument = searcher.doc(addr)?;
+        Ok(Some(self.embedding_source_doc_from_doc(&doc)))
+    }
+
+    fn embedding_source_doc_from_doc(&self, doc: &TantivyDocument) -> EmbeddingSourceDoc {
+        EmbeddingSourceDoc {
+            doc_type: first_text(doc, self.fields.doc_type),
+            account: first_text(doc, self.fields.account),
+            session_id: first_text(doc, self.fields.session_id),
+            project: first_text(doc, self.fields.project),
+            file_path: first_text(doc, self.fields.file_path),
+            byte_offset: first_u64(doc, self.fields.byte_offset),
+            chunk_kind: first_text(doc, self.fields.chunk_kind),
+            language: optional_text(doc, self.fields.language),
+            symbol: optional_text(doc, self.fields.symbol),
+            symbol_exact: optional_text(doc, self.fields.symbol_exact),
+            chunk_hash: optional_text(doc, self.fields.chunk_hash),
+            entity_id: optional_text(doc, self.fields.entity_id),
+            content: first_text(doc, self.fields.content),
+        }
     }
 
     pub(crate) fn entity_properties(
@@ -898,6 +922,73 @@ mod tests {
         assert_eq!(
             optional_text(&stored, fields.project_id).as_deref(),
             Some("proj-cn-d3")
+        );
+    }
+
+    #[test]
+    fn embedding_source_doc_for_entity_id_returns_full_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("index");
+        let index = TranscriptIndex::open_or_create(
+            &index_path,
+            Vec::new(),
+            None,
+            dir.path().join("projects.json"),
+            dir.path().join("knowledge.json"),
+            dir.path().join("threads.json"),
+            dir.path().join("roadmap.json"),
+        )
+        .unwrap();
+        let project = crate::projects::ProjectRecord {
+            project_id: "proj-size".into(),
+            repo_id: Some("repo-size".into()),
+            canonical_path: "/tmp/repo".into(),
+            registered_at: "2026-05-05T17:30:00Z".into(),
+            is_git_repo: true,
+            languages: Default::default(),
+        };
+        let content = "pub fn measured() { println!(\"full content\"); }";
+        let chunk = crate::chunker::Chunk {
+            project_id: "proj-size".into(),
+            file_path: PathBuf::from("src/lib.rs"),
+            rel_path_hash: "abcd1234".into(),
+            chunk_kind: "code_block".into(),
+            chunk_hash: "e".repeat(64),
+            occurrence_idx: 0,
+            language: Some("rust".into()),
+            symbol: Some("measured".into()),
+            symbol_exact: Some("measured".into()),
+            symbol_kind: Some("function_item".into()),
+            parent_kind: None,
+            line_start: Some(1),
+            line_end: Some(1),
+            content: content.into(),
+            byte_start: 0,
+            byte_end: content.len() as u64,
+        };
+        let doc = project_files::build_project_file_doc(
+            &chunk,
+            &project,
+            Path::new("/tmp/repo/src/lib.rs"),
+            None,
+            None,
+            index.field_handles(),
+        );
+        let entity_id = crate::embed_queue::project_file_entity_id_for_snapshot(&chunk, None);
+        let mut writer = index.index_handle().writer(50_000_000).unwrap();
+        writer.add_document(doc).unwrap();
+        writer.commit().unwrap();
+        index.reader.reload().unwrap();
+
+        let resolved = index
+            .embedding_source_doc_for_entity_id(&entity_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.content, content);
+        assert_eq!(resolved.entity_id.as_deref(), Some(entity_id.as_str()));
+        assert_eq!(
+            resolved.chunk_hash.as_deref(),
+            Some(chunk.chunk_hash.as_str())
         );
     }
 
