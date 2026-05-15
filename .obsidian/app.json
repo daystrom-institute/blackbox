@@ -1,1 +1,6 @@
-{}
+{
+  "userIgnoreFilters": [
+    "target/",
+    "node_modules/"
+  ]
+}
