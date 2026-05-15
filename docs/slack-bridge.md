@@ -153,6 +153,8 @@ This is the same pipeline that handles code-host webhooks (Forgejo,
 GitHub). The only Slack-specific code lives in the sidecar's translation
 layer.
 
+Operator-ready artifacts live in [Slack Example](../examples/slack/slack-example.md).
+
 ## Design notes
 
 For the full design rationale - why a sidecar rather than an embedded

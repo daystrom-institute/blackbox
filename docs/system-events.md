@@ -264,9 +264,10 @@ via `blackbox::secrets::resolve`. Failure modes:
 
 ## Examples
 
-Operator-ready examples live in `examples/system-events/`. They are wired
-to compile against the installed reaction and packet contracts but are
-intentionally generic — adapt to the host's Forgejo instance, secret
+Operator-ready examples live in
+[System Events Example](../examples/system-events/system-events-example.md).
+They are wired to compile against the installed reaction and packet contracts
+but are intentionally generic — adapt to the host's Forgejo instance, secret
 names, and atom identifiers.
 
 | File | Purpose |

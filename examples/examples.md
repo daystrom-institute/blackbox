@@ -40,6 +40,8 @@ bootstrap, install, and run script.
 | [Keystone](keystone/keystone-example.md) | Forgejo `issues.opened` webhook (or poller alternative) | Implementer fixes the bug, opens a PR, reviewer ensemble votes, auto-merge on approval. The reference arc - most engine features touch it. |
 | [Sastquatch](sastquatch/sastquatch-example.md) | Cron tick (calendar-driven; sibling primitive of webhook + poller) | Analyzer arc grounds itself by calling biofilter `sast_*` via `mcp_call`, executor picks a finding cluster, fixer arc applies the fix and opens a PR, ensemble reviewer votes, auto-merge. Exercises three primitives keystone does not: cron inlet, `mcp_call` op, persona-via-brofile dispatch. |
 | [Whiteboard](whiteboard/whiteboard-example.md) | ADR-tagged issue webhook | Three specialist agents (security / performance / design) post stances blind to a phaser-style whiteboard, transition through phases, debate + vote. Facilitator synthesizes an ADR markdown file, opens a PR, auto-merges on consensus. Exercises the engine's whiteboard primitive, multi-round durable ensemble dispatch, and human-in-the-loop via the same `whiteboard_*` MCP surface specialists use. |
+| [Slack](slack/slack-example.md) | Slack Socket Mode events | Sidecar normalizes Slack events into daemon webhooks, routing packets classify mentions/slash commands/reactions, and workflows dispatch Badgey or command arcs. |
+| [System Events](system-events/system-events-example.md) | EventHub reaction examples | Reaction and packet artifacts for `task.completed` and Forgejo identity provisioning flows. |
 
 ## Agents
 
