@@ -360,7 +360,7 @@ cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 
 No changes needed — `<exe_dir>/../share/blackbox/memories` resolves correctly for `~/.local/bin/blackboxd` → `~/.local/share/blackbox/memories`.
 
-### Update `system-defaults/README.md`
+### Update `system-defaults/system-defaults.md`
 
 Add `memories/` row to the directory layout table documenting the new directory and its file format.
 

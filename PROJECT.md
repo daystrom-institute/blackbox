@@ -199,6 +199,9 @@ Use `PROJECT.md` as the map and guardrail layer. Put detailed procedures in docs
 or system memories and link/pointer from here.
 
 - `README.md` - user-facing overview and setup.
+- `docs/index.md` - human documentation map.
+- `examples/examples.md`, `system-defaults/system-defaults.md` - maps for
+  tutorial examples and installable default artifacts.
 - `docs/getting-started.md`, `docs/operating-blackbox.md`,
   `docs/operations.md` - operational setup and day-2 runbooks.
 - `docs/internals.md`, `docs/index-embedding-internals.md`,

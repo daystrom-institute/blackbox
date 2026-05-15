@@ -148,7 +148,7 @@ claim is narrower than "Slack tokens live in the sidecar":
   events (which routing packets enable) rather than fire one-shot
   RPCs (which the IRC bridge was designed for). The sidecars are
   cousins, not siblings.
-- `examples/keystone/README.md`, `examples/keystone/webhooks/forgejo.json`,
+- `examples/keystone/keystone-example.md`, `examples/keystone/webhooks/forgejo.json`,
   `examples/keystone/packets/routing-forgejo.json` — the canonical
   webhook → extractor → routing-packet → workflow flow. The daemon
   side of bro-slack matches this contract.

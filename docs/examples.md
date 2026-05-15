@@ -207,8 +207,9 @@ candidates, proposing entity edges, detecting contradictions, and
 compacting the embedding index.
 
 These are the artifacts the daemon ships as sane defaults. They are
-functional but several depend on engine primitives still in progress
-(see the `system-defaults/agentic-corpus/README.md` status section).
+functional but several depend on engine primitives still in progress; see the
+[Agentic Corpus Defaults](../system-defaults/agentic-corpus/agentic-corpus-defaults.md)
+status section.
 
 ### Workflows
 

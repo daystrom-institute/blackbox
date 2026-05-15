@@ -22,7 +22,7 @@ Related:
   projection; system events should become its daemon-side signal source.
 - [Supervision](../../orchestration/supervision/supervision.md) - mid-dispatch observations and policy-driven
   action over running work.
-- [Keystone example](../../../examples/keystone/README.md) - existing
+- [Keystone example](../../../examples/keystone/keystone-example.md) - existing
   Forgejo-backed issue to PR to review loop.
 
 ## Problem

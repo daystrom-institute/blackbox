@@ -27,6 +27,7 @@ The crate is `blackbox`. It produces four binaries:
 | [Graph And Retrieval Internals](graph-retrieval-internals.md) | Graph grounding, opening sequence, entity refs, edges, hybrid search ranking |
 | [Index And Embedding Internals](index-embedding-internals.md) | Tantivy indexing, embedding queues, schema migration, vector and edge compaction |
 | [Workflow Engine](workflows.md) | Canonical reference for authoring and running workflows |
+| [Example Catalog](examples.md) | Example agents, skills, workflows, and end-to-end demos |
 | [Atoms](atoms.md) | Install, discover, invoke, resume, and bind reusable capabilities |
 | [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |
 | [Refactor Tools And Atoms](refactor.md) | Structural refactor primitives plus shipped Java/Rust refactor atoms |
@@ -36,7 +37,11 @@ The crate is `blackbox`. It produces four binaries:
 | [Projects And Code Indexing](projects-code-indexing.md) | Project registration, `.bbox`, code navigation, reindex, and reembed |
 | [Artifact Catalog](artifact-catalog.md) | Install, list, supersede, and reason about `system-defaults/` |
 | [Agent System](agent-system.md) | Legacy registered-agent compatibility surface |
+| [Badgey](badgey.md) | Evidence-carrying corpus consultant, persistent instances, and proposals |
+| [Project Roadmap](roadmap.md) | Generated roadmap for this repository |
+| [Roadmap Tool](roadmap-tool.md) | Operator-directed prospective work tracker |
 | [Ingress Paths](ingress-paths.md) | Webhooks, pollers, and crons. One routing pipeline. |
+| [System Events](system-events.md) | Durable event model used by workflows and external inlets |
 | [Slack Bridge](slack-bridge.md) | Sidecar architecture, channel binding, triage workflow, proposal lifecycle |
 | [IRC Bridge](irc-bridge.md) | LAN couch steering, ngircd setup, commands, council integration |
 | [Councils & Whiteboards](councils-whiteboards.md) | Structured multi-agent deliberation (phased boards, councils) |

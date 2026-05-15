@@ -1,6 +1,6 @@
 # Whiteboard — multi-agent ADR deliberation arc
 
-Companion to [keystone](../keystone/README.md) and [sastquatch](../sastquatch/README.md). Same backbone — webhook ingress, idempotent PR mechanics, auto-merge — but the work in the middle is **structured deliberation** instead of bug-fixing or SAST-squashing. A panel of specialist agents posts blind, debates, votes, and a facilitator synthesizes the result into a markdown ADR that ships as a PR.
+Companion to [keystone](../keystone/keystone-example.md) and [sastquatch](../sastquatch/sastquatch-example.md). Same backbone — webhook ingress, idempotent PR mechanics, auto-merge — but the work in the middle is **structured deliberation** instead of bug-fixing or SAST-squashing. A panel of specialist agents posts blind, debates, votes, and a facilitator synthesizes the result into a markdown ADR that ships as a PR.
 
 This is also the example that absorbs phaser into the engine. The whiteboard primitive is now first-class machinery (`whiteboard_*` MCP tools, `whiteboards` module), not an external MCP dependency.
 
@@ -134,6 +134,6 @@ The arc walk is repeatable — re-running against the same issue creates a new a
 
 ## See also
 
-- [`../keystone/README.md`](../keystone/README.md) — issue → fix → review → merge
-- [`../sastquatch/README.md`](../sastquatch/README.md) — cron → SAST → fix → review → merge
+- [Keystone](../keystone/keystone-example.md) — issue → fix → review → merge
+- [Sastquatch](../sastquatch/sastquatch-example.md) — cron → SAST → fix → review → merge
 - [`../../WORKFLOWS.md`](../../WORKFLOWS.md) — engine semantics, including the new Whiteboards section

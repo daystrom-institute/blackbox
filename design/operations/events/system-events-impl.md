@@ -21,7 +21,7 @@ Related:
   reusable invocation surfaces.
 - [Supervision Impl](../../orchestration/supervision/supervision-impl.md) - per-event daemon observations,
   policy evaluation, and action routing.
-- [Keystone](../../../examples/keystone/README.md) - Forgejo-backed coordination
+- [Keystone](../../../examples/keystone/keystone-example.md) - Forgejo-backed coordination
   example this work extends.
 
 ## Implementation Thesis
@@ -1131,7 +1131,7 @@ examples/system-events/
   reactions/noop-task-completed.json
   reactions/forgejo-ensure-bro-user.json
   packets/forgejo-identity-required.json
-  README.md
+  system-events-example.md
 ```
 
 If the Forgejo work continues under `deploy/forgejo15/`, link the example

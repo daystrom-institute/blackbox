@@ -5,9 +5,9 @@ Tutorial configs and integration demos that demonstrate how to wire blackbox
 Copy or adapt these into your own project or agent directories.
 
 Blackbox-owned installable defaults now live in
-[`../system-defaults/`](../system-defaults/README.md). That tree contains atoms,
-Badgey artifacts, refactor personas, agentic-corpus machinery, legacy registered
-agents, and MCP surface packets.
+[System Defaults](../system-defaults/system-defaults.md). That tree contains
+atoms, Badgey artifacts, refactor personas, agentic-corpus machinery, legacy
+registered agents, and MCP surface packets.
 
 ## Workflows
 
@@ -26,7 +26,8 @@ JSON specs consumed by `bro orchestrate run`. Each one declares actors and nodes
 | [`workflows/optimistic.json`](workflows/optimistic.json) | Ensemble version of the async-review pattern — needs an ensemble team on the daemon. |
 | [`workflows/blind.json`](workflows/blind.json) | Blind converge-then-execute pattern — needs an ensemble team on the daemon. |
 
-See [`workflows/README.md`](workflows/README.md) for the authoring guide, the transition catalog, and the common traps.
+See [Workflow Examples](workflows/workflow-examples.md) for the authoring
+guide, the transition catalog, and the common traps.
 
 ## End-to-end demos
 
@@ -36,9 +37,9 @@ bootstrap, install, and run script.
 
 | Path | Trigger | What it does |
 |------|---------|--------------|
-| [`keystone/`](keystone/) | Forgejo `issues.opened` webhook (or poller alternative) | Implementer fixes the bug, opens a PR, reviewer ensemble votes, auto-merge on approval. The reference arc — most engine features touch it. |
-| [`sastquatch/`](sastquatch/) | Cron tick (calendar-driven; sibling primitive of webhook + poller) | Analyzer arc grounds itself by calling biofilter `sast_*` via `mcp_call`, executor picks a finding cluster, fixer arc applies the fix and opens a PR, ensemble reviewer votes, auto-merge. Exercises three primitives keystone doesn't: cron inlet, `mcp_call` op, persona-via-brofile dispatch. |
-| [`whiteboard/`](whiteboard/) | ADR-tagged issue webhook | Three specialist agents (security / performance / design) post stances blind to a phaser-style whiteboard, transition through phases, debate + vote. Facilitator synthesizes an ADR markdown file, opens a PR, auto-merges on consensus. Exercises the engine's whiteboard primitive (absorbed phaser into `src/whiteboards.rs`), multi-round durable ensemble dispatch, and human-in-the-loop via the same `whiteboard_*` MCP surface specialists use. |
+| [Keystone](keystone/keystone-example.md) | Forgejo `issues.opened` webhook (or poller alternative) | Implementer fixes the bug, opens a PR, reviewer ensemble votes, auto-merge on approval. The reference arc - most engine features touch it. |
+| [Sastquatch](sastquatch/sastquatch-example.md) | Cron tick (calendar-driven; sibling primitive of webhook + poller) | Analyzer arc grounds itself by calling biofilter `sast_*` via `mcp_call`, executor picks a finding cluster, fixer arc applies the fix and opens a PR, ensemble reviewer votes, auto-merge. Exercises three primitives keystone does not: cron inlet, `mcp_call` op, persona-via-brofile dispatch. |
+| [Whiteboard](whiteboard/whiteboard-example.md) | ADR-tagged issue webhook | Three specialist agents (security / performance / design) post stances blind to a phaser-style whiteboard, transition through phases, debate + vote. Facilitator synthesizes an ADR markdown file, opens a PR, auto-merges on consensus. Exercises the engine's whiteboard primitive, multi-round durable ensemble dispatch, and human-in-the-loop via the same `whiteboard_*` MCP surface specialists use. |
 
 ## Agents
 

@@ -119,7 +119,7 @@ Inlet runtime:
 
 System defaults:
 
-- `system-defaults/README.md` says the daemon does not auto-install the tree.
+- `system-defaults/system-defaults.md` says the daemon does not auto-install the tree.
 - `docs/artifact-catalog.md` calls `system-defaults/` the shipped catalog
   source, but explicitly treats crons/webhooks as install-order dependencies
   rather than catalog kinds.

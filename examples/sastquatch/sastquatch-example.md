@@ -1,6 +1,6 @@
 # SASTquatch — cron → SAST → fix → PR → review → merge arc
 
-Companion to [keystone-arc](../keystone/README.md). Same backbone — sub-
+Companion to [keystone-arc](../keystone/keystone-example.md). Same backbone — sub-
 workflow composition, gated branches, ensemble review, idempotent PR
 mechanics, auto-merge on approval — but inverted in three ways at once
 to exercise primitives keystone doesn't:
@@ -192,6 +192,7 @@ landed in its own commit before the workflows could be authored.
 
 ## See also
 
-- [`../keystone/README.md`](../keystone/README.md) — issue-driven sibling
+- [Keystone](../keystone/keystone-example.md) — issue-driven sibling
 - [`../../WORKFLOWS.md`](../../WORKFLOWS.md) — engine semantics
-- [`../workflows/`](../workflows/) — pattern catalog (linear, fork-join, ensemble-vote, blind-converge, …)
+- [Workflow Examples](../workflows/workflow-examples.md) — pattern catalog
+  (linear, fork-join, ensemble-vote, blind-converge, ...)

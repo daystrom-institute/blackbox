@@ -548,7 +548,7 @@ Update:
 - `docs/artifact-catalog.md`
 - `docs/operating-blackbox.md`
 - `docs/operations.md`
-- `system-defaults/README.md`
+- `system-defaults/system-defaults.md`
 - any examples that mention direct `bro_cron_install` or `bbox_compile` for
   shipped MCP surfaces.
 

@@ -346,7 +346,7 @@ closed networks).
 > subworkflow imports/exports, capability tags, webhook routing,
 > operator-blessed registries, audit surfaces, and authoring loops.
 >
-> **End-to-end example**: [`examples/keystone/`](examples/keystone/README.md)
+> **End-to-end example**: [Keystone example](examples/keystone/keystone-example.md)
 > wires Forgejo issues → implementer subworkflow → reviewer ensemble
 > → wait-loop until merged → cleanup hooks. Real LLM dispatch.
 
@@ -608,22 +608,27 @@ Source layout (`src/`):
 
 ## System defaults
 
-Installable blackbox-owned artifacts live in [`system-defaults/`](system-defaults/README.md).
+Installable blackbox-owned artifacts live in
+[System Defaults](system-defaults/system-defaults.md).
 This includes atoms, Badgey artifacts, refactor personas, agentic-corpus
 producer machinery, and the default MCP surface packet. The daemon does not
 auto-install them; seed only the catalog entries you want with
 `bbox_artifact_install` or the per-kind installer.
 
+For the runtime runbook set, start at the Obsidian navigation map:
+[System Memory Catalog](system-defaults/memories/system-memory-catalog.md).
+
 ---
 
 ## Examples
 
-Drop-in configs for wiring blackbox into agent CLIs live in [`examples/`](examples/README.md):
+Drop-in configs for wiring blackbox into agent CLIs live in
+[Examples](examples/examples.md):
 
 - **Agents** - [`session-searcher`](examples/agents/session-searcher.md): read-only subagent that keeps transcript digging off your main context window.
 - **Skills / slash commands** - [`crucible`](examples/skills/crucible.md) (orchestrator + durable implementer + continuous red-team ensemble, coordinated through a `bbox_thread(kind="work_item")` and structured `bbox_note` signals), [`takeover`](examples/skills/takeover.md) (pick up a stalled or handed-off agent session without losing scope), and [`overmind`](examples/skills/overmind.md) (meta-orchestration - strategic Advisor above crucible, with a durable spine doc that survives orchestrator compaction; demonstrates the legitimate `allow_recursion=true` pattern).
-- **Workflow shape catalog** - [`examples/workflows/`](examples/workflows/) - runnable single-file specs covering linear, gated, ensemble, fork-join, atom-binding, blind-convergence, optimistic-review, self-audit patterns.
-- **Keystone end-to-end** - [`examples/keystone/`](examples/keystone/README.md) - Forgejo issue → arc → implementer subworkflow → wait → reviewer ensemble → wait-loop until merged → cleanup hooks. Real LLM dispatch. Adaptation guide in the example's README.
+- **Workflow shape catalog** - [Workflow examples](examples/workflows/workflow-examples.md) - runnable single-file specs covering linear, gated, ensemble, fork-join, atom-binding, blind-convergence, optimistic-review, self-audit patterns.
+- **Keystone end-to-end** - [Keystone example](examples/keystone/keystone-example.md) - Forgejo issue → arc → implementer subworkflow → wait → reviewer ensemble → wait-loop until merged → cleanup hooks. Real LLM dispatch.
 
 ---
 

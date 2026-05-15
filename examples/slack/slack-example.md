@@ -19,7 +19,7 @@ examples/slack/
 ├── scripts/
 │   └── install.sh              # compile + install artifacts via /admin/* endpoints
 ├── manifest.yaml               # Slack app manifest template (v1 scopes)
-├── README.md                   # this file
+├── slack-example.md            # this file
 
 deploy/
 └── bro-slack.service           # systemd unit template

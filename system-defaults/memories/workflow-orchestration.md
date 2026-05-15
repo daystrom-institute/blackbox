@@ -220,5 +220,5 @@ Control:
 - `sm-rule-packets` — how to compile the gate + policy packets workflows depend on
 - `sm-bro-dispatch-patterns` — the primitives workflows are built on
 - `sm-scoped-pins` — complementary short-horizon guidance tool
-- `examples/workflows/README.md` — runnable catalog + authoring guide
+- [Workflow Examples](../../examples/workflows/workflow-examples.md) — runnable catalog + authoring guide
 - `schema/workflow.schema.json` — JSON Schema for editor tooling
