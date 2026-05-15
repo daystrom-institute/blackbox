@@ -481,7 +481,7 @@ Before landing each phase, check:
 - `design/archive/supervision-turn-end-advisor.md` still matches P3a, P5, P6,
   and P7.
 - `design/partial/supervision-test-plan.md` still covers the phase tests here.
-- `design/proposed/phase-decomposer-impl.md` still points at P-phase
+- `design/partial/phase-decomposer-impl.md` still points at P-phase
   dependencies rather than stale S-only ranges.
 
 ## 14. Non-goals

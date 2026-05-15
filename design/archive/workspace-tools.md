@@ -144,7 +144,7 @@ back via the same MCP response cap (80KB) — extend with a
 on commit (`GitWorkspaceTools.cs:124-128` for the pattern), automatic
 `bbox_note(kind=done, body="commit <sha> <files>")` emission tied to
 the dispatched bro's task_id. Solves the "natural milestone" granularity
-question for phase-decomposer (`design/phase-decomposer.md` §11 Q6) by
+question for phase-decomposer (`design/partial/phase-decomposer.md` §11 Q6) by
 making per-commit done-notes a side effect of using the tool, not an
 agent's responsibility.
 
@@ -290,7 +290,7 @@ thread_id=<sub_unit>)`. The mediator overmind reads disputes at the
 round boundary.
 
 This collapses two of phase-decomposer's open questions
-(`design/phase-decomposer.md` §13):
+(`design/partial/phase-decomposer.md` §13):
 
 - Q3 (assumption-note enforcement): soft. Instrumentation is hard;
   notes are advisory.

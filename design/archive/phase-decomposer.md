@@ -10,7 +10,8 @@ architectures without grounding in code. The user lost trust and abandoned the
 session. Several claims in this doc are incorrect or aspirational — see the
 handoff doc at `HANDOFF.md` for a full audit of what was confabulated.
 
-Archived for provenance. The replacement is `design/phase-decomposer.md`.
+Archived for provenance. The replacement is
+`design/partial/phase-decomposer.md`.
 
 --- BEGIN ORIGINAL ---
 

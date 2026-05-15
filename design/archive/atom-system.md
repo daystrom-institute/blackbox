@@ -22,8 +22,8 @@ Related:
 - [Tmux Portal Workflows](tmux-portal-workflows.md) and
   [Tmux Portal Impl](tmux-portal-workflows-impl.md) - human projection and
   focus for live runs.
-- [Phase Decomposer](phase-decomposer.md) and
-  [Phase Decomposer Impl](phase-decomposer-impl.md) - workflow-level
+- [Phase Decomposer](../partial/phase-decomposer.md) and
+  [Phase Decomposer Impl](../partial/phase-decomposer-impl.md) - workflow-level
   decomposition, foreach dispatch, recomposition, and mediation.
 - [Refactor Compound Runs](refactor-compound-runs.md) - deterministic compound
   tool-runner shape.

@@ -1,10 +1,23 @@
 # Phase Decomposer — Implementation Plan
 
 Date: 2026-05-10
-Companion to: `design/proposed/phase-decomposer.md` (pure design - this is the build plan).
+Status: partially implemented — Phase 1 shipped; Phases 2-7 remain open.
+Companion to: `design/partial/phase-decomposer.md` (pure design - this is the build plan).
 Depends on: `design/archive/supervision-phased-implementation.md` (supervised atom
 orchestration primitives must exist before Phase 6 foreach implementer
 dispatch).
+
+## Implementation Status
+
+| Phase | Status | Notes |
+|---|---|---|
+| 1. `bbox_ref_size` MCP tool | **Done** | Tool handler in `src/tools/graph.rs`; implementation in `src/mcp_tools/ref_size.rs`; project-file full-content lookup in `src/index/mod.rs`; docs in `src/tool_docs.rs`. |
+| 2. Scout agent manifest | **Not built** | Next independent artifact phase. |
+| 3. Inlet agent | **Not built** | Depends on Phases 1-2. |
+| 4. Single-implementer path | **Not built** | Depends on Phase 3. |
+| 5. Ensemble decomposition | **Not built** | Depends on Phase 3. |
+| 6. Foreach implementer dispatch | **Not built** | Depends on Phases 4-5 and supervision primitives. |
+| 7. Recomposition council + mediation | **Not built** | Depends on Phase 6. |
 
 The decomposer is mostly **configuration** on top of existing workflow
 engine primitives. The engine already has `foreach`, `subworkflow`,
@@ -30,32 +43,33 @@ decomposer Phase 6 (foreach implementers run inside supervised subworkflows).
 
 ## Phase 1: `bbox_ref_size` MCP tool
 
+> **Status: shipped.** The live tool accepts up to 500 refs, canonicalizes
+> successful refs, reports unresolved/omitted refs under `degraded`, measures
+> full indexed chunk content for `project_file` / `project_file_v2`, and
+> measures provider-properties JSON for other entity refs.
+
 **Prerequisites:** none.
 
-**What gets built:**
+**What shipped:**
 
 1.1 **MCP tool handler.** `bbox_ref_size(refs: [String]) -> {total_bytes:
-   u64, per_ref: [{ref: String, bytes: u64}]}`. Resolves each entity_ref
-   or project_file_ref to its byte payload. For `project_file` refs,
-   resolves the chunk via the index (`mod.rs:476`) and measures the
-   `content` field size (available via `EmbeddingSourceDoc.content`,
-   `mod.rs:122, 307`). For `entity_ref` types
-   (knowledge, note, transcript), resolves via `entity_loader.rs` and
-   returns the serialized size.
+   u64, per_ref: [{ref: String, bytes: u64}], degraded: {...}}`. Resolves
+   each entity_ref or project_file_ref to the payload that downstream phase
+   routing will actually receive. For `project_file` and `project_file_v2`
+   refs, it resolves the indexed chunk and measures the full `content` bytes.
+   For non-file entity refs, it resolves through registered entity providers
+   and measures the serialized provider-properties JSON.
 
 1.2 **Resolution.** Reuses `entity_ref::EntityRef::parse`
-   (`entity_ref.rs:174`). For project_file refs, resolves the chunk
-   via `state.idx.read().entity_properties` (`mod.rs:476`) which
-   returns `byte_offset` and `content_preview`. For byte
-    measurement, use `EmbeddingSourceDoc.content` (`mod.rs:122, 307`).
-    For non-file refs, resolves
-   via `entity_loader::load` (`entity_loader.rs:10`) and returns
-   the serialized JSON size. **`entity_loader::load` returns
-   `EntityView`, not byte payloads** — the tool must resolve file
-   chunks from the index directly.
+   (`entity_ref.rs`). For project-file refs, it uses the index lookup path
+   added for this phase to fetch `EmbeddingSourceDoc.content`; this avoids
+   measuring only `content_preview`. For non-file refs, it uses the entity
+   provider registry directly rather than measuring an expanded neighborhood
+   view.
 
 1.3 **Batching.** Accepts up to 500 refs per call. Returns total +
-   per-ref breakdown.
+   per-ref breakdown, with unresolved refs and over-cap omissions reported
+   under `degraded`.
 
 **Deliverable:** `bbox_ref_size(["project_file:<pid>:<h>:<c>:0",
 "knowledge:<id>"])` returns `{total_bytes: 3035, per_ref: [{ref: ...,

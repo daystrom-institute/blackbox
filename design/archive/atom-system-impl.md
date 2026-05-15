@@ -16,8 +16,8 @@ Related:
 - [Supervision Impl](supervision-impl.md) - advisor/oracle policy substrate.
 - [Tmux Portal Impl](tmux-portal-workflows-impl.md) - run focus and portal
   state.
-- [Phase Decomposer](phase-decomposer.md) and
-  [Phase Decomposer Impl](phase-decomposer-impl.md) - workflow-level
+- [Phase Decomposer](../partial/phase-decomposer.md) and
+  [Phase Decomposer Impl](../partial/phase-decomposer-impl.md) - workflow-level
   parallelism, decomposition, recomposition, and mediation.
 - [Refactor Compound Runs](refactor-compound-runs.md) - transactional refactor
   runner.

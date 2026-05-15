@@ -1,8 +1,9 @@
 # Phase Decomposer — context-budget-aware execution of large phased plans
 
 Date: 2026-05-10
-Status: design proposal — v2, corrected from predecessor-authored v0.
-Predecessor archived at `archive/phase-decomposer.md`.
+Status: partially implemented — Phase 1 `bbox_ref_size` has shipped; workflow
+and agent-artifact phases remain open.
+Predecessor archived at `design/archive/phase-decomposer.md`.
 
 ## 1. Problem
 
