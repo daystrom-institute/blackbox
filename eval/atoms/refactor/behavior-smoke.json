@@ -292,6 +292,137 @@
       "done_note_required": true
     },
     {
+      "atom": "java-rewrite-visibility",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_public_api_guard",
+        "bbox_refactor_plan:rewrite_java_visibility",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "public-visibility-narrow-without-acknowledge",
+        "expected_block_reason_substring": "breaking"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-migrate-type-usages",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_code_symbols",
+        "bbox_refactor_plan:java_public_api_guard",
+        "bbox_refactor_plan:migrate_java_type_usages",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "public-signature-type-migration-without-acknowledge",
+        "expected_block_reason_substring": "breaking"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-add-fields",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:add_java_fields",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "duplicate-field",
+        "expected_block_reason_substring": "already"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-add-constructor",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:add_java_constructor",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-add-delegate-field",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:add_java_delegate_field",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "constructor-args-not-in-scope",
+        "expected_block_reason_substring": "constructor"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-add-implements",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_code_symbols",
+        "bbox_refactor_plan:add_java_implements",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "missing-interface-methods",
+        "expected_block_reason_substring": "required method"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-move-field",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:move_java_field",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "remaining-accessors-without-acknowledge",
+        "expected_block_reason_substring": "remaining"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-move-constant",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:move_java_constant",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "non-static-final-field",
+        "expected_block_reason_substring": "static final"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "java-update-callers",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_code_symbols",
+        "bbox_refactor_plan:update_java_callers",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "delegate-field-missing",
+        "expected_block_reason_substring": "delegate"
+      },
+      "done_note_required": true
+    },
+    {
       "atom": "java-extract-static-nested-class",
       "expected_plan_sequence": [
         "bbox_code_symbols",

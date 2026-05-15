@@ -249,6 +249,10 @@ agent follows.
 
 | Atom | Job |
 |---|---|
+| `atom:java-add-constructor@v1` | Add a constructor with optional parameter-to-field assignments. |
+| `atom:java-add-delegate-field@v1` | Add a delegate field and constructor initialization. |
+| `atom:java-add-fields@v1` | Add field declarations to a Java class. |
+| `atom:java-add-implements@v1` | Add an implements clause to a Java class. |
 | `atom:java-class-dependency-graph@v2` | Inventory a Java class before deciding what can be extracted. |
 | `atom:java-extract-cohesive-class@v3` | Extract methods plus field moves, delegate wiring, caller rewrites, and visibility fixes. |
 | `atom:java-extract-interface@v2` | Extract an interface and optionally migrate callers to the interface type. |
@@ -256,10 +260,15 @@ agent follows.
 | `atom:java-extract-static-nested-class@v1` | Move static or implicitly-static nested types to top-level Java files. |
 | `atom:java-find-usages@v1` | Walk references for one or more Java names. |
 | `atom:java-lombokify@v1` | Convert hand-written POJO boilerplate to Lombok where semantics are safe. |
+| `atom:java-migrate-type-usages@v1` | Migrate structural Java type-use positions and organize imports. |
+| `atom:java-move-constant@v1` | Move static final constants to another Java class. |
+| `atom:java-move-field@v1` | Move instance fields to another Java class with remaining-accessor review. |
 | `atom:java-organize-imports@v1` | Organize Java imports through JDTLS with the structural fallback. |
 | `atom:java-promote-inner-class@v1` | Promote a non-static inner class with outer captures to a top-level class. |
 | `atom:java-public-api-guard@v1` | Report public API impact before a Java refactor. |
 | `atom:java-rename-symbol@v1` | Project-wide Java symbol rename with usage inventory, public-API preflight, optional file rename handling, and validation. |
+| `atom:java-rewrite-visibility@v1` | Rewrite Java method or field visibility with public-API preflight. |
+| `atom:java-update-callers@v1` | Rewrite source-local calls through a delegate field. |
 
 ### Rust Refactor Atoms
 

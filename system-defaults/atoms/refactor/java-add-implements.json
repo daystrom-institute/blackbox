@@ -1,0 +1,61 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-add-implements",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Add an implements clause to a Java class through add_java_implements.",
+    "when_to_use": [
+      "after creating an interface and intentionally binding an implementation class to it",
+      "adding a missing interface contract after extracting methods",
+      "composing interface-adoption steps without rerunning extract_java_interface"
+    ],
+    "anti_patterns": [
+      "do not use when the class does not satisfy the interface methods",
+      "do not use when extract_java_interface should create the interface and implements clause together",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "module_name"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "module_name": { "type": "string", "description": "Simple or fully-qualified interface name to add." },
+          "impl_name": { "type": "string", "description": "Optional class name when the file has multiple classes." },
+          "apply": { "type": "boolean" },
+          "validation_cmd": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "prompt_template": "You are java-add-implements. Charter: Add an implements clause using add_java_implements.\n\nProtocol:\n\n1. Ground the implementation class and interface name:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\",\n                     languages=[\"java\"], item_kinds=[\"interface_declaration\"])\n   Confirm the file is Java, parses, and impl_name (when supplied) resolves.\n\n2. Plan implements insertion:\n   bbox_refactor_plan(kind=\"add_java_implements\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      module_name=\"{{module_name}}\", impl_name=\"{{impl_name}}\")\n\n3. Decide:\n   - If the interface declaration is found in-project, compare its required method names with the class inventory. Block if obvious required methods are absent.\n   - If the interface is external and not in the project index, proceed only as plan-only unless apply=true was explicitly requested by the operator.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <add_java_implements step>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: source, impl_name, interface, validation result>).\n\nStrict refusal rules:\n- Never call any tool outside the refactor persona tool surface.\n- Never claim the class satisfies an external interface unless compile validation ran.\n- Never apply when planning failed.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}} {{impl_name}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": { "type": "object", "properties": { "plan_only": { "type": "integer", "minimum": 0 }, "warning": { "type": "integer", "minimum": 0 } } },
+          "deep_analysis_summary": { "type": "object", "additionalProperties": true },
+          "cargo_result": { "type": "object", "properties": { "command": { "type": "string" }, "exit_code": { "type": "integer" }, "summary": { "type": "string" }, "rolled_back": { "type": "boolean" } } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "interface_name": { "type": "string" },
+          "impl_name": { "type": "string" }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-15T00:00:00Z" }
+  }
+}

@@ -1307,6 +1307,65 @@ mod tests {
     }
 
     #[test]
+    fn java_refactor_plan_kinds_have_atom_coverage() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let dir = crate_root.join("system-defaults/atoms/refactor");
+        let mut atom_text = String::new();
+        for entry in std::fs::read_dir(&dir).expect("refactor atoms dir exists") {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let filename = path.file_name().unwrap().to_string_lossy();
+            if filename.starts_with('_') || !filename.starts_with("java-") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let v: serde_json::Value = serde_json::from_str(&src).expect("manifest parses");
+            if let Some(template) = v
+                .pointer("/manifest/inputs/prompt_template")
+                .and_then(|value| value.as_str())
+            {
+                atom_text.push_str(template);
+                atom_text.push('\n');
+            }
+        }
+
+        let java_plan_kinds = [
+            "extract_java_class",
+            "extract_java_methods",
+            "extract_java_nested_classes",
+            "extract_java_interface",
+            "promote_java_inner_class",
+            "add_java_fields",
+            "add_java_constructor",
+            "add_java_delegate_field",
+            "add_java_implements",
+            "move_java_field",
+            "move_java_constant",
+            "update_java_callers",
+            "rewrite_java_visibility",
+            "rename_java_symbol",
+            "migrate_java_type_usages",
+            "lombokify_java_class",
+            "find_java_usages",
+            "java_class_dependency_analysis",
+            "java_public_api_guard",
+            "java_lsp_organize_imports",
+        ];
+
+        for kind in java_plan_kinds {
+            assert!(
+                atom_text.contains(&format!("kind=\"{kind}\""))
+                    || atom_text.contains(&format!("kind=\\\"{kind}\\\""))
+                    || atom_text.contains(&format!("bbox_refactor_plan:{kind}")),
+                "missing Java refactor atom coverage for plan kind `{kind}`"
+            );
+        }
+    }
+
+    #[test]
     fn sm_refactor_uses_signposts_not_atom_ledger() {
         let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let raw = std::fs::read_to_string(crate_root.join("system-defaults/memories/refactor.md"))

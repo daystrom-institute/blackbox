@@ -1,0 +1,190 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-rewrite-visibility",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Rewrite visibility for named Java methods or fields through the guarded rewrite_java_visibility plan kind, with public API preflight.",
+    "when_to_use": [
+      "widening helper methods after extraction so delegate calls compile",
+      "narrowing Java method or field visibility after usage inventory proves callers do not depend on it",
+      "making package-private Java members public or protected for an intentional cross-package refactor boundary"
+    ],
+    "anti_patterns": [
+      "do not use to change class-level visibility — this atom targets named methods or fields",
+      "do not narrow public or protected members without acknowledge_public_api_change when the guard reports breaking",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source",
+          "item_names",
+          "visibility"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Java project root."
+          },
+          "source": {
+            "type": "string",
+            "description": "Java source file, relative to project_dir."
+          },
+          "item_names": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "string"
+            },
+            "description": "Method or field names whose visibility should change."
+          },
+          "visibility": {
+            "enum": [
+              "public",
+              "protected",
+              "private",
+              "package"
+            ],
+            "description": "Target Java visibility. `package` removes any explicit visibility keyword."
+          },
+          "acknowledge_public_api_change": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out when java_public_api_guard reports breaking. Must be explicit; no default."
+          },
+          "apply": {
+            "type": "boolean"
+          },
+          "validation_cmd": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Validation command + args. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-rewrite-visibility. Charter: Rewrite visibility for named Java methods or fields using the guarded rewrite_java_visibility plan kind.\n\nProtocol:\n\n1. Ground the selected members structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{item_names}}\",\n                     languages=[\"java\"], item_kinds=[\"method_declaration\", \"field_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm every requested item exists in {{source}} and visibility is one of public, protected, private, package.\n\n2. Preflight public API impact:\n   Build proposed_changes for each selected item with change_kind=\"modify\" and run:\n   bbox_refactor_plan(kind=\"java_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      toml_entries={\"proposed_changes\": proposed_changes})\n\n3. Plan the visibility rewrite:\n   bbox_refactor_plan(kind=\"rewrite_java_visibility\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      item_names={{item_names}},\n                      visibility=\"{{visibility}}\")\n\n4. Decide:\n   - If java_public_api_guard returns advisory_severity=\"breaking\" and\n     acknowledge_public_api_change is not true, emit bbox_note(kind=\"blocked\",\n     body=<guard summary + selected items + plan_path>) and return status=\"blocked\".\n   - If the rewrite plan reports all selected members already have the requested\n     visibility, emit bbox_note(kind=\"done\", body=<no-op summary>) and return\n     status=\"planned\" with zero files_touched.\n   - Otherwise proceed.\n\n5. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <rewrite_java_visibility step>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n6. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: source, item_names,\n     target visibility, guard severity, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never default acknowledge_public_api_change.\n- Never apply when status=blocked.\n- Never rewrite class visibility with this atom; use a dedicated plan or manual review.\n\nInputs:\n{{project_dir}} {{source}} {{item_names}} {{visibility}} {{acknowledge_public_api_change}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "items_rewritten": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "target_visibility": {
+            "enum": [
+              "public",
+              "protected",
+              "private",
+              "package"
+            ]
+          },
+          "guard_severity": {
+            "enum": [
+              "info",
+              "caution",
+              "breaking"
+            ]
+          }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-15T00:00:00Z"
+    }
+  }
+}

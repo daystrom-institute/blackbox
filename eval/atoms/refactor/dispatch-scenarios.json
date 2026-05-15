@@ -396,6 +396,179 @@
       ]
     },
     {
+      "id": "dispatch-java-rewrite-visibility-planonly",
+      "atom": "java-rewrite-visibility",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ServiceImpl.java",
+        "item_names": [
+          "process"
+        ],
+        "visibility": "public",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "items_rewritten",
+        "target_visibility",
+        "guard_severity"
+      ]
+    },
+    {
+      "id": "dispatch-java-migrate-type-usages-planonly",
+      "atom": "java-migrate-type-usages",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/Client.java",
+        "module_name": "ServiceImpl",
+        "new_text": "Service",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "old_type",
+        "new_type",
+        "type_use_edits",
+        "import_edits"
+      ]
+    },
+    {
+      "id": "dispatch-java-add-fields-planonly",
+      "atom": "java-add-fields",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilityTarget.java",
+        "fields": [
+          {
+            "visibility": "private",
+            "type_name": "Service",
+            "name": "service",
+            "final_field": true
+          }
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "fields_added"
+      ]
+    },
+    {
+      "id": "dispatch-java-add-constructor-planonly",
+      "atom": "java-add-constructor",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilityTarget.java",
+        "visibility": "public",
+        "parameters": [
+          {
+            "type_name": "Service",
+            "name": "service"
+          }
+        ],
+        "assign_to_fields": true,
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "constructor_parameters"
+      ]
+    },
+    {
+      "id": "dispatch-java-add-delegate-field-planonly",
+      "atom": "java-add-delegate-field",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "delegate_field": "meterGrid",
+        "delegate_type": "DashboardMeterGrid",
+        "parameters": [
+          {
+            "type_name": "Service",
+            "name": "service"
+          }
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "delegate_field",
+        "delegate_type"
+      ]
+    },
+    {
+      "id": "dispatch-java-add-implements-planonly",
+      "atom": "java-add-implements",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ServiceImpl.java",
+        "module_name": "Service",
+        "impl_name": "ServiceImpl",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "interface_name",
+        "impl_name"
+      ]
+    },
+    {
+      "id": "dispatch-java-move-field-planonly",
+      "atom": "java-move-field",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/DashboardMeterGrid.java",
+        "item_names": [
+          "meterGrid"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "fields_moved",
+        "remaining_accessor_count"
+      ]
+    },
+    {
+      "id": "dispatch-java-move-constant-planonly",
+      "atom": "java-move-constant",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/DashboardConstants.java",
+        "item_names": [
+          "DEFAULT_PAGE_SIZE"
+        ],
+        "visibility": "public",
+        "keep_copy": false,
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "constants_moved",
+        "keep_copy"
+      ]
+    },
+    {
+      "id": "dispatch-java-update-callers-planonly",
+      "atom": "java-update-callers",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "delegate_field": "meterGrid",
+        "item_names": [
+          "refreshMeterData"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "delegate_field",
+        "methods_rewritten"
+      ]
+    },
+    {
       "id": "dispatch-java-extract-static-nested-class-planonly",
       "atom": "java-extract-static-nested-class",
       "args": {

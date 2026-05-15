@@ -1,0 +1,65 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-move-constant",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Move named Java static final constants to another class through move_java_constant.",
+    "when_to_use": [
+      "moving constants alongside a newly extracted helper class",
+      "copying or relocating static final values while preserving source compatibility with keep_copy",
+      "separating constant ownership from a source class during Java decomposition"
+    ],
+    "anti_patterns": [
+      "do not use for mutable or instance fields — use java-move-field",
+      "do not keep a source copy unless callers still depend on the old owner",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "item_names"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "item_names": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+          "visibility": { "enum": ["public", "protected", "private", "package"] },
+          "keep_copy": { "type": "boolean" },
+          "target_prelude": { "type": "string" },
+          "module_name": { "type": "string", "description": "Target class name when creating a missing target file." },
+          "apply": { "type": "boolean" },
+          "validation_cmd": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "prompt_template": "You are java-move-constant. Charter: Move Java static final constants using move_java_constant.\n\nProtocol:\n\n1. Ground source and target:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   If {{target}} exists, bbox_refactor_status(file=\"{{target}}\", project_dir=\"{{project_dir}}\")\n   Confirm every item in {{item_names}} is a static final field on the source.\n\n2. Plan constant move:\n   bbox_refactor_plan(kind=\"move_java_constant\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      target=\"{{target}}\", item_names={{item_names}},\n                      visibility=\"{{visibility}}\", keep_copy={{keep_copy}},\n                      target_prelude=\"{{target_prelude}}\", module_name=\"{{module_name}}\")\n\n3. Decide:\n   - If keep_copy=true, surface that the old owner remains as a compatibility copy and may need a later cleanup pass.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <move_java_constant step>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: source, target, constants moved/copied, validation result>).\n\nStrict refusal rules:\n- Never call any tool outside the refactor persona tool surface.\n- Never use this atom for non-static-final fields.\n- Never apply when planning failed.\n\nInputs:\n{{project_dir}} {{source}} {{target}} {{item_names}} {{visibility}} {{keep_copy}} {{target_prelude}} {{module_name}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": { "type": "object", "properties": { "plan_only": { "type": "integer", "minimum": 0 }, "warning": { "type": "integer", "minimum": 0 } } },
+          "deep_analysis_summary": { "type": "object", "additionalProperties": true },
+          "cargo_result": { "type": "object", "properties": { "command": { "type": "string" }, "exit_code": { "type": "integer" }, "summary": { "type": "string" }, "rolled_back": { "type": "boolean" } } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "constants_moved": { "type": "array", "items": { "type": "string" } },
+          "keep_copy": { "type": "boolean" }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-15T00:00:00Z" }
+  }
+}

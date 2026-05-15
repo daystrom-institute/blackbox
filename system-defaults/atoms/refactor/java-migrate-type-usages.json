@@ -1,0 +1,181 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-migrate-type-usages",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Migrate Java type-use positions in one source file from one simple type name to another, then organize imports and validate.",
+    "when_to_use": [
+      "after extracting an interface and migrating callers from the concrete class to the interface type",
+      "rewriting field, parameter, local variable, and return type positions while leaving constructor and instanceof sites alone",
+      "reducing manual type-use edits after a Java extraction or rename preflight"
+    ],
+    "anti_patterns": [
+      "do not use for constructor calls, casts, instanceof checks, .class literals, XML, config, or generated source",
+      "do not use as a full semantic type migration across modules without per-file validation",
+      "do not apply public signature migrations without acknowledge_public_api_change when the guard reports breaking"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source",
+          "module_name",
+          "new_text"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the Java project root."
+          },
+          "source": {
+            "type": "string",
+            "description": "Java source file whose type-use positions should be migrated, relative to project_dir."
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Old simple type name to replace."
+          },
+          "new_text": {
+            "type": "string",
+            "description": "Replacement simple type name."
+          },
+          "acknowledge_public_api_change": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out when java_public_api_guard reports breaking. Must be explicit; no default."
+          },
+          "apply": {
+            "type": "boolean"
+          },
+          "validation_cmd": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Validation command + args. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-migrate-type-usages. Charter: Migrate Java type-use positions in one file from one simple type name to another.\n\nProtocol:\n\n1. Ground the source structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}} {{new_text}}\",\n                     languages=[\"java\"])\n   Confirm {{source}} is Java, parses, and contains type-use references to {{module_name}}.\n\n2. Preflight public API impact:\n   Build proposed_changes for {{source}} with change_kind=\"modify\" and run:\n   bbox_refactor_plan(kind=\"java_public_api_guard\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      toml_entries={\"proposed_changes\": proposed_changes})\n\n3. Plan type migration and import cleanup:\n   bbox_refactor_plan(kind=\"migrate_java_type_usages\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\",\n                      new_text=\"{{new_text}}\")\n   Then plan:\n   bbox_refactor_plan(kind=\"java_lsp_organize_imports\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\")\n   The migrate plan rewrites type-use positions such as field, parameter,\n   return, and local variable types. It intentionally skips `new`, method calls,\n   `.class`, `instanceof`, and cast positions.\n\n4. Decide:\n   - If java_public_api_guard returns advisory_severity=\"breaking\" and\n     acknowledge_public_api_change is not true, emit bbox_note(kind=\"blocked\",\n     body=<guard summary + source + plan_path>) and return status=\"blocked\".\n   - If no type-use edits are produced, emit bbox_note(kind=\"done\", body=<no-op summary>)\n     and return status=\"planned\" with zero files_touched.\n   - Otherwise proceed.\n\n5. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <migrate_java_type_usages step>,\n     <java_lsp_organize_imports step>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n6. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: source, module_name,\n     new_text, type-use edits, import edits, guard severity, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never default acknowledge_public_api_change.\n- Never claim constructor/cast/instanceof rewrites; the primitive intentionally skips them.\n- Never apply when status=blocked.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}} {{new_text}} {{acknowledge_public_api_change}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "old_type": {
+            "type": "string"
+          },
+          "new_type": {
+            "type": "string"
+          },
+          "type_use_edits": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "import_edits": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "guard_severity": {
+            "enum": [
+              "info",
+              "caution",
+              "breaking"
+            ]
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-15T00:00:00Z"
+    }
+  }
+}

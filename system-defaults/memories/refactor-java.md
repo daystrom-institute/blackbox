@@ -14,9 +14,12 @@ For recurring Java refactor patterns, check `atom_search(query="<intent>")`
 before re-deriving the whole tool sequence. Use atoms as contextual shortcuts
 for patterns such as class dependency inventory, public-API preflight,
 project-wide usage enumeration, cohesive-class extraction, inner-class
-promotion, interface extraction, or Lombok conversion. The atom manifest is the
-source of truth for version, inputs, cost, and prompt text; this memory keeps
-the primitive plan-kind map and safety invariants.
+promotion, interface extraction, lightweight method moves, source-local caller
+rewrites, low-level field/constructor/delegate wiring, visibility rewrites,
+type-use migration, import organization, Java symbol rename, or Lombok
+conversion. The atom manifest is the source of truth for version, inputs, cost,
+and prompt text; this memory keeps the primitive plan-kind map and safety
+invariants.
 
 When no atom fits the exact shape, the manual plan-kind sequence below is the
 canonical path.
@@ -27,6 +30,13 @@ Java has full inspect-and-extract support, plus composite class extraction,
 field/constructor wiring, caller delegation, interface extraction, visibility
 rewriting, type migration, import organization, and Lombok-ification of
 hand-rolled boilerplate (POJO DOJO).
+
+Every Java refactor plan kind has at least one shipped refactor atom wrapper
+under `system-defaults/atoms/refactor/`. The coverage guard
+`java_refactor_plan_kinds_have_atom_coverage` fails if a new Java plan kind is
+added without corresponding atom coverage. Use `atom_search(query="<intent>",
+subcontract="refactor/v1")` for the current catalog instead of relying on this
+memory as an atom ledger.
 
 - Inspect: supported with `bbox_refactor_status`; syntax grounding also uses
   `bbox_code_symbols`, `bbox_code_node_describe`, `bbox_code_query`, and
@@ -95,9 +105,10 @@ Tree-sitter language: `java`.
 
 This parent also keeps concise sections for `promote_java_inner_class`,
 `extract_java_nested_classes`, `find_java_usages`, `rename_java_symbol`,
-`extract_java_interface`, `migrate_java_type_usages`, and
-`java_lsp_organize_imports`. Split those into dedicated child memories when the
-detail grows beyond quick routing/signpost prose.
+`extract_java_interface`, `migrate_java_type_usages`, low-level field /
+constructor / delegate / caller primitives, and `java_lsp_organize_imports`.
+Split those into dedicated child memories when the detail grows beyond quick
+routing/signpost prose.
 
 All child memories are reachable via `bbox_knowledge(query=...)` with their own
 tag set. Pull the relevant child for parameter detail; this parent stays a
@@ -347,12 +358,19 @@ dropped. Resolve each finding before applying:
 4–9. Composite extract — see `sm-refactor-java-extract-class` for
      `extract_java_class` (one-shot composite extraction with delegate
      wiring + caller rewrite) and for the finer-grained primitives
-     (`add_java_fields`, `add_java_constructor`, `move_java_fields`,
-     `move_java_constant`, `add_java_delegate_field`,
-     `rewrite_java_calls_to_delegate`), plus the full parameter
+     (`add_java_fields`, `add_java_constructor`, `move_java_field`,
+     `move_java_constant`, `add_java_delegate_field`, `update_java_callers`),
+     plus the full parameter
      reference, capture-analysis semantics, accessor-rewrite rules,
      and the generated-FIXME marker catalog operators consult after
      apply.
+
+Low-level atom wrappers exist for each primitive in this block:
+`java-add-fields`, `java-add-constructor`, `java-move-field`,
+`java-move-constant`, `java-add-delegate-field`, and `java-update-callers`.
+Prefer `java-extract-cohesive-class` when the desired shape is a normal
+extract-class flow; use these atoms when the operator is deliberately composing
+leaf primitives.
 
 10. Extract an interface from a class:
 
@@ -405,6 +423,8 @@ bbox_refactor_plan(
 ```
 
 `visibility` must be one of: `public`, `protected`, `private`, `package` (removes keyword).
+The matching atom is `java-rewrite-visibility`; it preflights public API impact
+with `java_public_api_guard` before applying.
 
 13. Migrate type usages (concretion -> interface):
 
@@ -420,6 +440,10 @@ bbox_refactor_plan(
 )
 ```
 
+The matching atom is `java-migrate-type-usages`; it pairs
+`migrate_java_type_usages` with `java_lsp_organize_imports` and a public API
+preflight.
+
 14. Organize imports:
 
 ```text
@@ -429,6 +453,8 @@ bbox_refactor_plan(
   project_dir="/absolute/project/root"
 )
 ```
+
+The matching atom is `java-organize-imports`.
 
 The planner asks JDTLS for workspace-aware organize-import edits through a
 shared per-project session pool. The first call for a `(project_dir, java)`

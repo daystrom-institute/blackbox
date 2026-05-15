@@ -173,6 +173,78 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-java-rewrite-visibility",
+      "query": "rewrite visibility of java methods or fields with public api preflight",
+      "expected_atoms": [
+        "java-rewrite-visibility"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-migrate-type-usages",
+      "query": "migrate java type usages from concrete class to interface",
+      "expected_atoms": [
+        "java-migrate-type-usages"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-add-fields",
+      "query": "add java field declarations to a target class",
+      "expected_atoms": [
+        "java-add-fields"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-add-constructor",
+      "query": "add a java constructor with parameter field assignments",
+      "expected_atoms": [
+        "java-add-constructor"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-add-delegate-field",
+      "query": "add java delegate field and constructor initialization",
+      "expected_atoms": [
+        "java-add-delegate-field"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-add-implements",
+      "query": "add implements clause to a java class",
+      "expected_atoms": [
+        "java-add-implements"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-move-field",
+      "query": "move java instance fields from source class to target class",
+      "expected_atoms": [
+        "java-move-field"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-move-constant",
+      "query": "move java static final constants to another class",
+      "expected_atoms": [
+        "java-move-constant"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-update-callers",
+      "query": "rewrite java call sites through a delegate field",
+      "expected_atoms": [
+        "java-update-callers"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-extract-static-nested-class",
       "query": "move a static java nested class to a top level file",
       "expected_atoms": [
@@ -251,6 +323,60 @@
       "id": "anti-rename-overloaded-broad",
       "query": "rename overloaded java methods without narrowing the source or item kinds",
       "atom": "java-rename-symbol",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-visibility-class-level",
+      "query": "change java class visibility through the method visibility atom",
+      "atom": "java-rewrite-visibility",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-type-migration-constructors",
+      "query": "migrate java constructor calls and instanceof checks to the interface type",
+      "atom": "java-migrate-type-usages",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-add-fields-composite",
+      "query": "extract java class and move fields in one composite plan",
+      "atom": "java-add-fields",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-add-constructor-complex-body",
+      "query": "add java constructor with validation and side effects",
+      "atom": "java-add-constructor",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-add-delegate-field-composite",
+      "query": "extract java class and create delegate wiring automatically",
+      "atom": "java-add-delegate-field",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-add-implements-unsatisfied",
+      "query": "add implements clause when class does not satisfy interface methods",
+      "atom": "java-add-implements",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-move-field-static-final",
+      "query": "move a java static final constant as an instance field",
+      "atom": "java-move-field",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-move-constant-instance-field",
+      "query": "move a mutable java instance field as a constant",
+      "atom": "java-move-constant",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-update-callers-cross-file",
+      "query": "rewrite project wide cross file java callers through delegate",
+      "atom": "java-update-callers",
       "expect_matched_anti_pattern": true
     },
     {

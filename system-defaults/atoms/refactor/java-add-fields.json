@@ -1,0 +1,73 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-add-fields",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Add one or more Java field declarations to a class through add_java_fields.",
+    "when_to_use": [
+      "preparing a target class before moving methods that require constructor-injected state",
+      "adding delegate-owned dependency fields as a deliberate low-level refactor step",
+      "composing a hand-planned Java extraction from leaf primitives"
+    ],
+    "anti_patterns": [
+      "do not use when extract_java_class can move and wire fields in one composite plan",
+      "do not add duplicate fields; the plan skips existing names and refuses all-duplicates",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "fields"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file to edit, relative to project_dir." },
+          "impl_name": { "type": "string", "description": "Optional class name when the file has multiple classes." },
+          "fields": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["type_name", "name"],
+              "properties": {
+                "visibility": { "enum": ["public", "protected", "private", "package"] },
+                "type_name": { "type": "string" },
+                "name": { "type": "string" },
+                "final_field": { "type": "boolean" }
+              }
+            }
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "prompt_template": "You are java-add-fields. Charter: Add explicit Java field declarations using the guarded add_java_fields plan kind.\n\nProtocol:\n\n1. Ground the target class:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file is Java, parses, and impl_name (when supplied) resolves.\n\n2. Plan field insertion:\n   bbox_refactor_plan(kind=\"add_java_fields\", deep_analysis=true,\n                      project_dir=\"{{project_dir}}\", source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\", fields={{fields}})\n\n3. Decide:\n   - If the plan refuses because all requested fields already exist, emit bbox_note(kind=\"done\", body=<no-op summary>) and return status=\"planned\" with zero files_touched.\n   - Otherwise proceed.\n\n4. Apply (if inputs.apply == true) or return plan-only:\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <add_java_fields step>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: source, fields added, validation result>).\n\nStrict refusal rules:\n- Never call any tool outside the refactor persona tool surface.\n- Never invent field names or types; use exactly the supplied fields.\n- Never apply when planning failed.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{fields}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": { "type": "object", "properties": { "plan_only": { "type": "integer", "minimum": 0 }, "warning": { "type": "integer", "minimum": 0 } } },
+          "deep_analysis_summary": { "type": "object", "additionalProperties": true },
+          "cargo_result": { "type": "object", "properties": { "command": { "type": "string" }, "exit_code": { "type": "integer" }, "summary": { "type": "string" }, "rolled_back": { "type": "boolean" } } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "fields_added": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-15T00:00:00Z" }
+  }
+}
