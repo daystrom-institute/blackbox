@@ -1,0 +1,6 @@
+{
+  "name": "glm-turbo-drone",
+  "provider": "glm",
+  "model": "glm-5-turbo",
+  "effort": "medium"
+}

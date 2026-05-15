@@ -303,11 +303,15 @@ pub struct AllocationContext {
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-pub fn allocation_lock() -> std::sync::MutexGuard<'static, ()> {
-    ALLOCATION_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+pub fn try_allocation_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    match ALLOCATION_LOCK.get_or_init(|| Mutex::new(())).try_lock() {
+        Ok(guard) => Ok(guard),
+        Err(std::sync::TryLockError::WouldBlock) => Err(
+            "error.allocation_busy: another runtime allocation is in progress; retry shortly"
+                .into(),
+        ),
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+    }
 }
 
 pub fn config_file(store_dir: &Path) -> PathBuf {

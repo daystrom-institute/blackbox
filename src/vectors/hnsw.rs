@@ -3,6 +3,7 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, VecDeque};
 
 use ordered_float::NotNan;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::distance::cosine_distance;
@@ -11,7 +12,7 @@ thread_local! {
     static VISITED_ARENA: RefCell<VisitedArena> = RefCell::new(VisitedArena::default());
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HnswOptions {
     pub m: usize,
     pub ef_construction: usize,
@@ -50,7 +51,7 @@ pub struct HnswMetrics {
     pub disconnected_nodes: usize,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HnswIndex {
     options: HnswOptions,
     m0: usize,
@@ -440,7 +441,7 @@ impl HnswIndex {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct VectorSlab {
     dimensions: usize,
     data: Vec<f32>,

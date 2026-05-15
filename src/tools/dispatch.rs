@@ -219,10 +219,11 @@ impl BlackboxServer {
         mut request: FreshDispatchRequest,
     ) -> Result<FreshDispatchResult, String> {
         let store_dir = self.state.store_dir.clone();
-        let _allocation_guard = request
-            .allocation_request
-            .as_ref()
-            .map(|_| orchestration::allocator::allocation_lock());
+        let allocation_guard = if request.allocation_request.is_some() {
+            Some(orchestration::allocator::try_allocation_lock()?)
+        } else {
+            None
+        };
         let mut allocation: Option<orchestration::allocator::Allocation> = None;
         if let Some(runtime_request) = request.allocation_request.take() {
             let allocator_config =
@@ -328,17 +329,26 @@ impl BlackboxServer {
             Some(self.state.system_events.clone()),
         );
         if let Some(allocation) = &allocation {
+            let (task_id, session_id, cwd) = {
+                let inner = task.inner.lock();
+                (
+                    inner.id.clone(),
+                    inner.session_id.clone(),
+                    inner.cwd.clone(),
+                )
+            };
             orchestration::allocator::record_lease(
                 &store_dir,
                 orchestration::allocator::lease_from_allocation(
-                    task.inner.lock().id.clone(),
-                    task.inner.lock().session_id.clone(),
+                    task_id,
+                    session_id,
                     allocation,
                     request.project_dir_for_lease,
-                    task.inner.lock().cwd.clone(),
+                    cwd,
                 ),
             );
         }
+        drop(allocation_guard);
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         if let Some(bro_name) = &request.record_to_bro {
             self.record_task_to_bro(bro_name, &task);

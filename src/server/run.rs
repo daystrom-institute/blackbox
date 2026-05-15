@@ -972,8 +972,9 @@ pub async fn run() -> anyhow::Result<()> {
     // which is worse than just leaving the WAL to replay on next start.
     // Spawn it on a thread + join with a short cap; if it doesn't
     // finish in time, drop on the floor and exit cleanly. The next
-    // daemon start runs `rebuild_from_wal` which is correct (the WAL
-    // was sync'd per batch) just slow.
+    // daemon start restores from any matching vector snapshot and replays
+    // the WAL tail, or falls back to a full WAL rebuild if no usable
+    // snapshot exists.
     let flush_handle = std::thread::spawn(|| vectors::global().flush_all());
     let flush_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while std::time::Instant::now() < flush_deadline {

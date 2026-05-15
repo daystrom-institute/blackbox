@@ -8,7 +8,7 @@ pub struct SlabEntry {
     pub entity_id: String,
     pub content_hash: String,
     pub vector: Vec<f32>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub upserted_at: Option<String>,
     pub active: bool,
 }
@@ -102,6 +102,10 @@ impl VectorSlab {
             }
         }
         self.index_built = true;
+    }
+
+    pub fn rebuild_active_index(&mut self) {
+        self.ensure_index_built();
     }
 
     pub fn upsert(

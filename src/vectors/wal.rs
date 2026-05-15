@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
@@ -161,11 +161,23 @@ pub fn read_all(path: &Path) -> Result<Vec<WalRecord>> {
 }
 
 pub fn for_each(path: &Path, mut f: impl FnMut(WalRecord) -> Result<()>) -> Result<()> {
+    for_each_from(path, 0, &mut f)
+}
+
+pub fn for_each_from(
+    path: &Path,
+    offset: u64,
+    mut f: impl FnMut(WalRecord) -> Result<()>,
+) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let file =
+    let mut file =
         fs::File::open(path).with_context(|| format!("opening vector WAL {}", path.display()))?;
+    if offset > 0 {
+        file.seek(SeekFrom::Start(offset))
+            .with_context(|| format!("seeking vector WAL {} to byte {offset}", path.display()))?;
+    }
     let reader = BufReader::new(file);
     for (idx, line) in reader.lines().enumerate() {
         let line = line.with_context(|| format!("reading vector WAL line {}", idx + 1))?;
@@ -218,6 +230,12 @@ pub fn rewrite(path: &Path, records: impl IntoIterator<Item = WalRecord>) -> Res
             }) {
                 let _ = fs::remove_file(&tmp_path);
                 return Err(e);
+            }
+            if let Some(parent) = path.parent() {
+                fs::File::open(parent)
+                    .with_context(|| format!("opening vector WAL parent {}", parent.display()))?
+                    .sync_data()
+                    .with_context(|| format!("fsync vector WAL parent {}", parent.display()))?;
             }
         }
         Err(e) => {

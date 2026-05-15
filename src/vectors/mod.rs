@@ -7,7 +7,8 @@ pub mod wal;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result};
@@ -21,6 +22,11 @@ use self::slab::VectorSlab;
 use self::wal::WalRecord;
 
 const VECTOR_SCHEMA_VERSION: &str = "agentic-corpus-e3";
+const VECTOR_SNAPSHOT_VERSION: &str = "agentic-corpus-e3-snapshot-v1";
+const VECTOR_SNAPSHOT_MAGIC: &[u8; 16] = b"BBOXVSNAPv1\0\0\0\0\0";
+const SNAPSHOT_FILE: &str = "snapshot.bin";
+const SNAPSHOT_TMP_FILE: &str = "snapshot.bin.tmp";
+const SNAPSHOT_MIN_RECORDS: usize = 100_000;
 
 static GLOBAL_STORE: OnceLock<Arc<VectorStore>> = OnceLock::new();
 
@@ -105,6 +111,9 @@ fn spawn_periodic_flusher(store: Arc<VectorStore>) {
                                 elapsed_ms,
                                 "vector partition derived files flushed"
                             );
+                            if p.needs_snapshot_refresh() {
+                                p.write_snapshot_best_effort("periodic_refresh");
+                            }
                         }
                         Err(err) => {
                             tracing::warn!(
@@ -333,7 +342,8 @@ impl VectorStore {
     }
 
     /// Force-checkpoint every partition's derived metadata and fsync every
-    /// dirty WAL. Cold-start still rebuilds from the WAL.
+    /// dirty WAL. Startup uses snapshots opportunistically and falls back to
+    /// WAL replay when a snapshot is absent or stale.
     pub fn flush_all(&self) -> Result<()> {
         let partitions: Vec<_> = self.partitions.read().values().cloned().collect();
         for partition in partitions {
@@ -543,10 +553,12 @@ impl VectorStore {
             return Ok(partition);
         }
         let path = self.root.join(route);
+        let mut partitions = self.partitions.write();
+        if let Some(partition) = partitions.get(route).cloned() {
+            return Ok(partition);
+        }
         let partition = Arc::new(RwLock::new(Partition::open(route.to_string(), path)?));
-        self.partitions
-            .write()
-            .insert(route.to_string(), partition.clone());
+        partitions.insert(route.to_string(), partition.clone());
         Ok(partition)
     }
 }
@@ -647,6 +659,8 @@ struct Partition {
     /// records have landed since last time. Force-flushes on shutdown +
     /// periodic timer ignore this gate.
     last_flushed_wal_records: usize,
+    /// `wal_records` value captured by the current `snapshot.bin`.
+    last_snapshot_wal_records: usize,
 }
 
 /// Minimum new WAL records required between non-forced flushes. Each flush
@@ -689,6 +703,20 @@ struct PreparedCompaction {
     compacted_count: usize,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PartitionSnapshot {
+    // Bincode 1.x is positional: changing field order/types in this struct,
+    // VectorSlab, SlabEntry, or HnswIndex requires a VECTOR_SNAPSHOT_VERSION
+    // bump so old caches fall back to WAL replay.
+    schema_version: String,
+    route: String,
+    wal_records: usize,
+    wal_len_bytes: u64,
+    hnsw_rebuilds: usize,
+    slab: VectorSlab,
+    hnsw: Option<HnswIndex>,
+}
+
 impl Partition {
     fn open(route: String, path: PathBuf) -> Result<Self> {
         fs::create_dir_all(&path)
@@ -701,8 +729,23 @@ impl Partition {
             wal_records: 0,
             hnsw_rebuilds: 0,
             last_flushed_wal_records: 0,
+            last_snapshot_wal_records: 0,
         };
-        partition.rebuild_from_wal()?;
+        let restored_snapshot = match partition.restore_from_snapshot() {
+            Ok(restored) => restored,
+            Err(err) => {
+                tracing::warn!(
+                    route = %partition.route,
+                    error = %err,
+                    "vector snapshot restore failed; rebuilding partition from WAL"
+                );
+                false
+            }
+        };
+        if !restored_snapshot {
+            partition.rebuild_from_wal()?;
+            partition.write_snapshot_best_effort("wal_rebuild");
+        }
         Ok(partition)
     }
 
@@ -810,6 +853,7 @@ impl Partition {
     fn rebuild_from_wal(&mut self) -> Result<()> {
         let wal_path = self.wal_path();
         self.slab = VectorSlab::default();
+        self.hnsw = None;
         let mut wal_records = 0usize;
         wal::for_each(&wal_path, |record| {
             wal_records += 1;
@@ -829,6 +873,193 @@ impl Partition {
         self.rebuild_hnsw()?;
         // After a full replay, checkpoint metadata and sync the WAL.
         self.flush_derived_full()
+    }
+
+    fn restore_from_snapshot(&mut self) -> Result<bool> {
+        let snapshot_path = self.snapshot_path();
+        if !snapshot_path.exists() {
+            return Ok(false);
+        }
+        let snapshot = read_snapshot(&snapshot_path)?;
+        if snapshot.schema_version != VECTOR_SNAPSHOT_VERSION {
+            tracing::warn!(
+                route = %self.route,
+                snapshot_version = %snapshot.schema_version,
+                expected_version = VECTOR_SNAPSHOT_VERSION,
+                "vector snapshot version mismatch; rebuilding from WAL"
+            );
+            return Ok(false);
+        }
+        if snapshot.route != self.route {
+            tracing::warn!(
+                route = %self.route,
+                snapshot_route = %snapshot.route,
+                "vector snapshot route mismatch; rebuilding from WAL"
+            );
+            return Ok(false);
+        }
+        let wal_path = self.wal_path();
+        let wal_len_bytes = wal_path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        if wal_len_bytes < snapshot.wal_len_bytes {
+            tracing::warn!(
+                route = %self.route,
+                wal_len_bytes,
+                snapshot_wal_len_bytes = snapshot.wal_len_bytes,
+                "vector snapshot is ahead of WAL; rebuilding from WAL"
+            );
+            return Ok(false);
+        }
+
+        self.slab = snapshot.slab;
+        self.slab.rebuild_active_index();
+        self.hnsw = snapshot.hnsw;
+        if let Some(hnsw) = &self.hnsw {
+            let metrics = hnsw.metrics();
+            if metrics.active_nodes != self.slab.active_count()
+                || metrics.dimensions != self.slab.dims()
+            {
+                tracing::warn!(
+                    route = %self.route,
+                    snapshot_active_count = self.slab.active_count(),
+                    hnsw_active_nodes = metrics.active_nodes,
+                    snapshot_dims = self.slab.dims(),
+                    hnsw_dims = metrics.dimensions,
+                    "vector snapshot HNSW metrics mismatch; rebuilding from WAL"
+                );
+                return Ok(false);
+            }
+        } else if self.slab.active_count() > 0 {
+            tracing::warn!(
+                route = %self.route,
+                active_count = self.slab.active_count(),
+                "vector snapshot has active vectors but no HNSW index; rebuilding from WAL"
+            );
+            return Ok(false);
+        }
+        self.wal_records = snapshot.wal_records;
+        self.hnsw_rebuilds = snapshot.hnsw_rebuilds;
+        self.last_flushed_wal_records = snapshot.wal_records;
+        self.last_snapshot_wal_records = snapshot.wal_records;
+
+        let mut replayed_tail = 0usize;
+        wal::for_each_from(&wal_path, snapshot.wal_len_bytes, |record| {
+            self.apply_wal_record(record)?;
+            replayed_tail += 1;
+            Ok(())
+        })?;
+
+        if replayed_tail > 0 || wal_len_bytes > snapshot.wal_len_bytes {
+            self.flush_derived_full()?;
+            self.write_snapshot_best_effort("snapshot_tail_replay");
+        }
+        tracing::info!(
+            route = %self.route,
+            wal_records = self.wal_records,
+            replayed_tail,
+            "vector partition restored from snapshot"
+        );
+        Ok(true)
+    }
+
+    fn apply_wal_record(&mut self, record: WalRecord) -> Result<()> {
+        self.wal_records += 1;
+        if record.deleted_at.is_some() {
+            self.slab.delete(&record.entity_id);
+            if let Some(hnsw) = self.hnsw.as_mut() {
+                hnsw.delete(&record.entity_id);
+            }
+            return Ok(());
+        }
+        if !self.slab.upsert_at(
+            &record.entity_id,
+            &record.content_hash,
+            record.vector.clone(),
+            record.upserted_at,
+        )? {
+            return Ok(());
+        }
+        match self.hnsw.as_mut() {
+            Some(hnsw) => hnsw
+                .push(record.entity_id, record.vector)
+                .map_err(anyhow::Error::msg)?,
+            None => self.rebuild_hnsw()?,
+        }
+        Ok(())
+    }
+
+    fn write_snapshot_best_effort(&mut self, reason: &'static str) {
+        let started = std::time::Instant::now();
+        match self.write_snapshot() {
+            Ok(()) => tracing::info!(
+                route = %self.route,
+                reason,
+                wal_records = self.wal_records,
+                active_count = self.slab.active_count(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "vector partition snapshot written"
+            ),
+            Err(err) => tracing::warn!(
+                route = %self.route,
+                reason,
+                error = %err,
+                "vector partition snapshot write failed; WAL rebuild remains available"
+            ),
+        }
+    }
+
+    fn write_snapshot(&mut self) -> Result<()> {
+        fs::create_dir_all(&self.path)?;
+        let wal_path = self.wal_path();
+        crate::vectors::wal::sync_path(&wal_path)?;
+        let wal_len_bytes = wal_path.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let snapshot = PartitionSnapshot {
+            schema_version: VECTOR_SNAPSHOT_VERSION.to_string(),
+            route: self.route.clone(),
+            wal_records: self.wal_records,
+            wal_len_bytes,
+            hnsw_rebuilds: self.hnsw_rebuilds,
+            slab: self.slab.clone(),
+            hnsw: self.hnsw.clone(),
+        };
+        let tmp_path = self.path.join(SNAPSHOT_TMP_FILE);
+        let snapshot_path = self.snapshot_path();
+        let _ = fs::remove_file(&tmp_path);
+        let result = (|| -> Result<()> {
+            let file = fs::File::create(&tmp_path)
+                .with_context(|| format!("creating vector snapshot {}", tmp_path.display()))?;
+            let mut writer = BufWriter::new(file);
+            writer
+                .write_all(VECTOR_SNAPSHOT_MAGIC)
+                .with_context(|| format!("writing vector snapshot magic {}", tmp_path.display()))?;
+            bincode::serialize_into(&mut writer, &snapshot)
+                .with_context(|| format!("serializing vector snapshot {}", tmp_path.display()))?;
+            writer
+                .flush()
+                .with_context(|| format!("flushing vector snapshot {}", tmp_path.display()))?;
+            writer
+                .get_ref()
+                .sync_data()
+                .with_context(|| format!("fsync vector snapshot {}", tmp_path.display()))?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                fs::rename(&tmp_path, &snapshot_path).with_context(|| {
+                    format!(
+                        "renaming vector snapshot {} to {}",
+                        tmp_path.display(),
+                        snapshot_path.display()
+                    )
+                })?;
+                sync_parent_dir(&snapshot_path)?;
+                self.last_snapshot_wal_records = self.wal_records;
+                Ok(())
+            }
+            Err(err) => {
+                let _ = fs::remove_file(&tmp_path);
+                Err(err)
+            }
+        }
     }
 
     fn compact(&mut self) -> Result<CompactionStats> {
@@ -878,6 +1109,17 @@ impl Partition {
         &mut self,
         prepared: PreparedCompaction,
     ) -> Result<CompactionStats> {
+        // The WAL is about to be rewritten from scratch. Drop the old
+        // snapshot first so a failed post-compaction snapshot write cannot
+        // leave a cache keyed to the previous WAL byte offsets.
+        let snapshot_path = self.snapshot_path();
+        match fs::remove_file(&snapshot_path) {
+            Ok(()) => sync_parent_dir(&snapshot_path)?,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).context("removing stale vector snapshot before compaction");
+            }
+        }
         // Stream the compacted slab directly to the WAL file — no
         // intermediate Vec<WalRecord>. This avoids doubling memory
         // during compaction for routes with millions of vectors.
@@ -902,6 +1144,7 @@ impl Partition {
         self.hnsw = prepared.rebuilt_hnsw;
         self.hnsw_rebuilds += 1;
         self.flush_derived_full()?;
+        self.write_snapshot_best_effort("compaction");
 
         Ok(CompactionStats {
             before_wal_records: prepared.before_wal_records,
@@ -965,13 +1208,13 @@ impl Partition {
     /// Historical context: previous versions wrote `slab.bin` (full
     /// slab as f32), `ids.bin` (entity_id list), and `graph.bin` (HNSW
     /// metrics) on every flush — hundreds of MB per call when the
-    /// partition was hot. NONE of those files were ever read; the cold-
-    /// start path is always `rebuild_from_wal`. We dropped them in the
+    /// partition was hot. NONE of those files were ever read; at the time,
+    /// cold start always used `rebuild_from_wal`. We dropped them in the
     /// disk-hammer post-mortem (see thread-3e2a0cfa).
     ///
     /// `flush_derived_full` is the same operation today — kept as a
     /// distinct alias so future durability extensions can branch on
-    /// "checkpoint vs full snapshot" without churning callers.
+    /// checkpoint strength without churning callers.
     fn flush_derived_files(&mut self) -> Result<()> {
         let options = HnswOptions::default();
         let metrics = self.metrics();
@@ -995,15 +1238,14 @@ impl Partition {
         // Checkpoint the WAL — durability for everything written since
         // the last sync. The append path no longer fsyncs per batch
         // (see `wal::append_many`), so this is where durability lands.
-        crate::vectors::wal::sync_path(&self.wal_path()).ok();
+        crate::vectors::wal::sync_path(&self.wal_path())?;
         self.last_flushed_wal_records = self.wal_records;
         Ok(())
     }
 
     /// Identical to `flush_derived_files` today. Kept as a distinct
-    /// name so a future change that adds a snapshot file (mmap'able
-    /// slab cache to skip rebuild_from_wal on huge corpora) has a
-    /// natural place to land without churning every caller.
+    /// name so callers can keep expressing "full checkpoint" intent even
+    /// though vector snapshots are written from the startup/compaction paths.
     fn flush_derived_full(&mut self) -> Result<()> {
         self.flush_derived_files()
     }
@@ -1032,6 +1274,12 @@ impl Partition {
     /// the next tick.
     fn needs_flush(&self) -> bool {
         self.wal_records > self.last_flushed_wal_records
+    }
+
+    fn needs_snapshot_refresh(&self) -> bool {
+        self.wal_records
+            .saturating_sub(self.last_snapshot_wal_records)
+            >= SNAPSHOT_MIN_RECORDS
     }
 
     fn needs_compaction(&self) -> bool {
@@ -1063,12 +1311,16 @@ impl Partition {
     fn wal_path(&self) -> PathBuf {
         self.path.join("records.wal")
     }
+
+    fn snapshot_path(&self) -> PathBuf {
+        self.path.join(SNAPSHOT_FILE)
+    }
 }
 
 // `write_f32_file` was removed alongside the slab.bin / ids.bin / graph.bin
-// per-flush writes. Cold-start always rebuilds via WAL, so the derived
-// raw-f32 dump had no consumer. Kept the bulk-write helper notes in git
-// history (commit d8cd57d) in case a future snapshot path needs them.
+// per-flush writes. Those derived raw-f32 dumps had no consumer; the current
+// startup cache is an explicit `snapshot.bin` of the in-memory structures.
+// Kept the bulk-write helper notes in git history (commit d8cd57d).
 
 fn cluster_entries(entries: Vec<VectorEntry>, similarity_threshold: f32) -> Vec<VectorCluster> {
     if entries.len() < 2 {
@@ -1126,6 +1378,31 @@ fn union(parent: &mut [usize], left: usize, right: usize) {
     }
 }
 
+fn read_snapshot(path: &Path) -> Result<PartitionSnapshot> {
+    let file = fs::File::open(path)
+        .with_context(|| format!("opening vector snapshot {}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut magic = [0u8; VECTOR_SNAPSHOT_MAGIC.len()];
+    reader
+        .read_exact(&mut magic)
+        .with_context(|| format!("reading vector snapshot magic {}", path.display()))?;
+    if &magic != VECTOR_SNAPSHOT_MAGIC {
+        anyhow::bail!("unsupported vector snapshot file header");
+    }
+    bincode::deserialize_from(&mut reader)
+        .with_context(|| format!("decoding vector snapshot {}", path.display()))
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .with_context(|| format!("finding parent directory for {}", path.display()))?;
+    fs::File::open(parent)
+        .with_context(|| format!("opening vector snapshot parent {}", parent.display()))?
+        .sync_data()
+        .with_context(|| format!("fsync vector snapshot parent {}", parent.display()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,6 +1428,174 @@ mod tests {
             .search("voyage-1024", &[1.0, 0.0, 0.0, 0.0], 5)
             .unwrap();
         assert_eq!(hits[0].id, "a");
+    }
+
+    #[test]
+    fn snapshot_restore_preserves_active_vectors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert("voyage-1024", "b", "h2", vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        drop(store);
+
+        let restored_from_wal = VectorStore::open(tmp.path()).unwrap();
+        assert!(tmp.path().join("voyage-1024").join(SNAPSHOT_FILE).exists());
+        drop(restored_from_wal);
+
+        let restored_from_snapshot = VectorStore::open(tmp.path()).unwrap();
+        let metrics = restored_from_snapshot.metrics();
+        assert_eq!(metrics["voyage-1024"].wal_records, 2);
+        assert_eq!(metrics["voyage-1024"].active_count, 2);
+        let hits = restored_from_snapshot
+            .search("voyage-1024", &[1.0, 0.0, 0.0, 0.0], 5)
+            .unwrap();
+        assert_eq!(hits[0].id, "a");
+    }
+
+    #[test]
+    fn snapshot_restore_replays_wal_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        drop(store);
+
+        let restored = VectorStore::open(tmp.path()).unwrap();
+        assert!(tmp.path().join("voyage-1024").join(SNAPSHOT_FILE).exists());
+        restored
+            .upsert("voyage-1024", "b", "h2", vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        drop(restored);
+
+        let restored_with_tail = VectorStore::open(tmp.path()).unwrap();
+        let metrics = restored_with_tail.metrics();
+        assert_eq!(metrics["voyage-1024"].wal_records, 2);
+        assert_eq!(metrics["voyage-1024"].active_count, 2);
+        assert!(
+            restored_with_tail
+                .contains_active("voyage-1024", "a", "h1")
+                .unwrap()
+        );
+        assert!(
+            restored_with_tail
+                .contains_active("voyage-1024", "b", "h2")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn snapshot_restore_replays_delete_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        store
+            .upsert("voyage-1024", "b", "h2", vec![0.0, 1.0, 0.0, 0.0])
+            .unwrap();
+        drop(store);
+
+        let restored = VectorStore::open(tmp.path()).unwrap();
+        assert!(tmp.path().join("voyage-1024").join(SNAPSHOT_FILE).exists());
+        restored.delete("voyage-1024", "a").unwrap();
+        drop(restored);
+
+        let restored_with_tail_delete = VectorStore::open(tmp.path()).unwrap();
+        let metrics = restored_with_tail_delete.metrics();
+        assert_eq!(metrics["voyage-1024"].wal_records, 3);
+        assert_eq!(metrics["voyage-1024"].active_count, 1);
+        assert!(
+            !restored_with_tail_delete
+                .contains_active("voyage-1024", "a", "h1")
+                .unwrap()
+        );
+        assert!(
+            restored_with_tail_delete
+                .contains_active("voyage-1024", "b", "h2")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn invalid_snapshot_falls_back_to_wal_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        drop(store);
+
+        let restored = VectorStore::open(tmp.path()).unwrap();
+        drop(restored);
+
+        let snapshot_path = tmp.path().join("voyage-1024").join(SNAPSHOT_FILE);
+        let mut snapshot = read_snapshot(&snapshot_path).unwrap();
+        snapshot.route = "wrong-route".to_string();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(VECTOR_SNAPSHOT_MAGIC);
+        bincode::serialize_into(&mut encoded, &snapshot).unwrap();
+        fs::write(&snapshot_path, encoded).unwrap();
+
+        let rebuilt = VectorStore::open(tmp.path()).unwrap();
+        let metrics = rebuilt.metrics();
+        assert_eq!(metrics["voyage-1024"].wal_records, 1);
+        assert_eq!(metrics["voyage-1024"].active_count, 1);
+        assert!(rebuilt.contains_active("voyage-1024", "a", "h1").unwrap());
+    }
+
+    #[test]
+    fn old_snapshot_without_magic_falls_back_to_wal_rebuild() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = VectorStore::open(tmp.path()).unwrap();
+        store
+            .upsert("voyage-1024", "a", "h1", vec![1.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        drop(store);
+
+        let restored = VectorStore::open(tmp.path()).unwrap();
+        drop(restored);
+
+        let snapshot_path = tmp.path().join("voyage-1024").join(SNAPSHOT_FILE);
+        let snapshot = read_snapshot(&snapshot_path).unwrap();
+        fs::write(&snapshot_path, bincode::serialize(&snapshot).unwrap()).unwrap();
+
+        let rebuilt = VectorStore::open(tmp.path()).unwrap();
+        let metrics = rebuilt.metrics();
+        assert_eq!(metrics["voyage-1024"].wal_records, 1);
+        assert_eq!(metrics["voyage-1024"].active_count, 1);
+        assert!(rebuilt.contains_active("voyage-1024", "a", "h1").unwrap());
+    }
+
+    #[test]
+    fn snapshot_roundtrips_entries_without_upsert_timestamp() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut slab = VectorSlab::new(2);
+        slab.upsert_at("legacy", "h1", vec![1.0, 0.0], None)
+            .unwrap();
+        let snapshot = PartitionSnapshot {
+            schema_version: VECTOR_SNAPSHOT_VERSION.to_string(),
+            route: "voyage-1024".to_string(),
+            wal_records: 1,
+            wal_len_bytes: 123,
+            hnsw_rebuilds: 0,
+            slab,
+            hnsw: None,
+        };
+        let snapshot_path = tmp.path().join(SNAPSHOT_FILE);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(VECTOR_SNAPSHOT_MAGIC);
+        bincode::serialize_into(&mut encoded, &snapshot).unwrap();
+        fs::write(&snapshot_path, encoded).unwrap();
+
+        let restored = read_snapshot(&snapshot_path).unwrap();
+        let entry = restored.slab.active_entries().next().unwrap();
+        assert_eq!(entry.entity_id, "legacy");
+        assert_eq!(entry.upserted_at, None);
     }
 
     #[test]

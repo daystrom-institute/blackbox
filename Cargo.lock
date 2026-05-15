@@ -330,6 +330,7 @@ dependencies = [
  "async-stream",
  "async-trait",
  "axum",
+ "bincode",
  "chrono",
  "clap",
  "cron",
