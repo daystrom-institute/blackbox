@@ -13,7 +13,13 @@ brief: "Routes oversized phase docs through scouting, evidence sizing, optional 
 
 # Phase Decomposer — context-budget-aware execution of large phased plans
 
-Live no-edit smoke coverage currently includes the direct and decomposed paths.
+Date: 2026-05-10
+Status: implemented, pending final validation as `system-defaults/phase-decompose`
+workflows, packets, brofiles, teamplates, fixtures, and the `corpus-pathfinder`
+agent manifest. Live no-edit smoke coverage currently includes the direct and
+decomposed paths, but measured-byte DAG lint was hardened after those smokes and
+still needs a fresh live run. Edit/merge mediation is explicitly out of v1
+rather than a shipped claim.
 Predecessor archived at `design/orchestration/phase-decomposer/phase-decomposer-archived.md`.
 
 ## 1. Problem
@@ -159,13 +165,20 @@ the discovery subworkflow via `durable: true` (`schema.rs:64`).
    returns the aggregate size. No LLM estimation. No eyeball compaction
    factors. A number.
 
+   In v1, `target_context_window` means the **measured evidence payload**
+   budget. It is compared against bytes returned by `bbox_ref_size` for
+   the refs a downstream actor must load. It deliberately does not include
+   fixed workflow prompt text, brofile text, ambient scope blocks, or MCP
+   tool-injection overhead; those require a separate full-envelope
+   measurement field if we decide to enforce them later.
+
    Acceptance-coverage lint is not a pure packet gate today. The packet AST can
    quantify over one array path, but cannot correlate `acceptance_criteria[*]`
    against `sub_units[*].acceptance_subset[*]`; use a mechanical hook/tool for
    that coverage check.
 
-5. **Produce the triage verdict.** If the measured manifest fits in the
-   target model's context window → `fit_direct`. If it exceeds →
+5. **Produce the triage verdict.** If the measured evidence payload fits
+   under `target_context_window` → `fit_direct`. If it exceeds →
    `needs_decompose`. The inlet exports only the evidence bundle
    (structured JSON of refs + measurements) and the verdict. It does
    **not** sketch, seed, or export a DAG; the decomposer/ensemble owns
@@ -205,7 +218,7 @@ The inlet's output to downstream:
 
 The `bytes` per ref come from the `bbox_ref_size` tool — the tool resolves
 each ref and returns its resolved byte size. The inlet sums them and
-compares to the model's context window.
+compares to the v1 evidence-payload budget (`target_context_window`).
 
 ### 3.4 Subworkflow boundary
 
@@ -244,9 +257,13 @@ A whiteboard deliberation following the `whiteboard-arc.json` pattern
 
 The ensemble uses the **same** `bbox_ref_size` MCP tool — but deeply,
 cluster-by-cluster. Each proposed sub-unit's file/symbol refs are batched
-through the tool to measure the per-cluster payload. This informs the DAG
-construction: clusters that fit individually but collectively exceed budget
-get split, serialized, or re-clustered.
+through the tool to measure the per-cluster payload. After synthesis,
+`SynthesizeDag/on_exit` mechanically extracts all DAG refs, calls
+`bbox_ref_size`, and runs `lint-dag.py` with the measured output. The lint
+fails if any sub-unit's declared `bytes` differs from the measured ref sum,
+if measured bytes exceed `target_context_window`, or if ref measurement is
+degraded. This closes the under-reporting hole: the facilitator's declared
+bytes are checked, not trusted.
 
 ### 4.3 DAG output
 
@@ -273,10 +290,9 @@ get split, serialized, or re-clustered.
 
 Every parent acceptance criterion must appear in at least one sub-unit's
 `acceptance_subset` by stable `criterion_id`. This is mechanically
-lintable: after the ensemble produces the DAG, a `shell` hook-op (or a
-future typed `lint_acceptance` op) iterates acceptance IDs and verifies
-coverage. No typed coverage-lint op exists in the engine today
-(`src/workflow/ops.rs:53`); `shell` is sufficient for v1.
+linted by `system-defaults/phase-decompose/scripts/lint-dag.py` after the
+ensemble produces the DAG. No typed coverage-lint op exists in the engine
+today; `shell` plus the checked-in script is the v1 enforcement path.
 
 ### 4.4 Implementer dispatch
 
@@ -362,74 +378,16 @@ when recovery also fails or the advisor declares the sub-unit untenable.
 
 ### 6.2 Post-recompose: integration conflict
 
-All sub-units PASSED. Advisors signed off. Individual acceptance criteria
-met. The council attempts to merge. The merge fails. This is NOT a
-sub-unit failure — nobody failed their individual work. The integration
-seam doesn't close.
+The v1 workflow does **not** implement edit/merge mediation. The current
+fan-out subworkflow returns structured outcomes, not branch handles,
+and `phase-decompose-main` routes `work_remains` through remediation-packet
+re-entry instead of attempting in-place `git merge` conflict resolution.
 
-The council handles this in-place via M1-M4. It does NOT re-enter the
-inlet unless mediation exhausts all options.
-
-#### M1 — Mechanical merge
-
-A `shell` hook-op (`src/workflow/ops.rs:55`) runs `git merge` for each
-sub-unit branch in merge order. Fast-forward merges succeed silently. If
-merge conflicts → M2.
-
-#### M2 — Conflict-resolver agent
-
-An Executor with a resolver brofile. Its prompt includes:
-- Merge conflict markers (both sides' versions of the conflicted file)
-- Both sub-units' acceptance criteria and predicted writes
-- Both sub-units' advisor verdicts and outputs
-
-Its job: produce a **concrete file edit** that integrates both sides.
-Commits the resolution. It does NOT drop acceptance criteria — if
-satisfying both is impossible, it surfaces the conflict with an explicit
-note ("can't satisfy criterion A and criterion B simultaneously because
-they touch the same code path differently") and escalates to M3.
-
-The resolver is an implementer, not a judge. Only the council can modify
-or drop acceptance criteria.
-
-#### M3 — Mediation panel
-
-Whiteboard deliberation (`examples/whiteboard/workflows/whiteboard-arc.json`).
-One advocate per conflicting sub-unit. Each advocate posts:
-- Their sub-unit's charter and acceptance criteria
-- Why their version should win
-- What compromise they're willing to accept
-
-The panel debates. The facilitator reads `whiteboard_summarize` and
-emits a resolution — which side wins, a compromise edit, or deadlock.
-Commits the resolution.
-
-If the panel deadlocks (no majority, unresolvable conflict) → surfaced
-to the council as a failed mediation.
-
-#### M4 — Regression-fixer
-
-After merge resolution: run the project's test suite. If tests fail, an
-Executor (fixer brofile) reads the failure output and patches the
-failures. Re-runs up to `retry.max_generations` (`schema.rs:349-353`).
-If tests still fail after ceiling → surfaced to the council as a failure.
-
-#### Council verdict on mediation
-
-The council reads M1-M4 outcomes:
-
-- **Resolution worked, tests pass** → batch is satisfied. Council may
-  declare `EXIT_MET` or proceed to next batch.
-- **Mediation deadlocked, or tests won't pass** → council produces a
-  **remediation packet**. This packet describes the unresolvable conflict
-  and may include modified acceptance criteria (only the council can
-  modify criteria). The packet re-enters the inlet → decomposer →
-  dispatch → advisor gate → council re-evaluates.
-- **Untenable** (same conflict recurs across epochs, budget exhausted) →
-  council halts. Human escalation.
-
-The council is the only entity that judges. M2 resolves merges. M3
-debates. The council decides.
+That is intentional for v1 archive truthfulness: recomposition decides
+`satisfied | work_remains | untenable`; it does not claim M1-M4 merge
+mediation. Edit/merge mediation needs a separate design with explicit branch
+contracts, merge workspace ownership, conflict-resolution agents, regression
+repair, and live mutating validation.
 
 ## 7. Key primitives (grounded)
 
@@ -456,7 +414,7 @@ debates. The council decides.
 | Advisor workflow-backed atom pattern | `system-defaults/atoms/supervision/advisor.json`, `system-defaults/workflows/supervision/advisor.json`, `src/tools/atoms.rs` | implemented |
 | `bbox_ref_size` MCP tool (ref→bytes measurement) | `src/tools/graph.rs`, `src/mcp_tools/ref_size.rs`, `src/index/mod.rs` | implemented |
 | Typed advisor action executor | `src/tools/atoms.rs` | implemented |
-| Mediation agent manifests | `system-defaults/brofiles/phase-decompose/conflict-resolver.json`, `system-defaults/brofiles/phase-decompose/regression-fixer.json` | implemented (runtime artifacts; full merge mediation remains a follow-on exercise) |
+| Edit/merge mediation | — | not part of v1; deferred to a separate design |
 
 ## 8. What this design does NOT do
 
@@ -476,6 +434,9 @@ debates. The council decides.
 - **No new actor kinds.** The engine has two (`Executor`, `Ensemble`).
   Roles are workflow-author concerns expressed via brofile + prompt +
   `on_exit` parse_json + gate.
+- **No edit/merge mediation in v1.** The shipped workflow does not merge
+  sub-unit branches or run conflict/regression repair agents. Work-remains
+  cases produce remediation packets and re-enter the inlet.
 
 ## 9. Build sequence
 
@@ -493,7 +454,8 @@ debates. The council decides.
    producing DAG, using `bbox_ref_size` cluster-by-cluster.
 6. **Implementer foreach** over DAG sub-units, each in a supervised subworkflow.
 7. **Recompose council** — durable ensemble evaluating collected results, producing remediation packets, iterating until satisfied or untenable.
-8. **Mediation** — M1-M4 within the council's evaluation loop (mechanical merge, conflict resolver, mediation panel, regression fixer).
+8. **Edit/merge mediation** — explicitly out of v1; requires a separate
+   design and live mutating validation before it can be claimed.
 
 Each step is independently testable. Current live fixtures:
 `system-defaults/phase-decompose/fixtures/direct-live-no-edit.md` exercises

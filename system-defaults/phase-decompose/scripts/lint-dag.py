@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mechanical DAG shape and acceptance-coverage lint for phase-decompose."""
+"""Mechanical DAG shape, evidence-size, and acceptance-coverage lint."""
 
 import argparse
 import json
@@ -27,11 +27,68 @@ def criterion_ids(criteria):
     return ids
 
 
+def iter_unit_refs(sub_units):
+    for unit in sub_units:
+        if not isinstance(unit, dict):
+            continue
+        refs = unit.get("refs")
+        if not isinstance(refs, list):
+            continue
+        for ref in refs:
+            if isinstance(ref, str) and ref:
+                yield ref
+
+
+def unique_refs(sub_units):
+    out = []
+    seen = set()
+    for ref in iter_unit_refs(sub_units):
+        if ref not in seen:
+            seen.add(ref)
+            out.append(ref)
+    return out
+
+
+def ref_size_index(ref_size):
+    if not isinstance(ref_size, dict):
+        return {}, ["ref_size payload must be an object"]
+    errors = []
+    degraded = ref_size.get("degraded")
+    if isinstance(degraded, dict):
+        unresolved = degraded.get("unresolved_refs") or []
+        if unresolved:
+            refs = []
+            for item in unresolved:
+                if isinstance(item, dict):
+                    refs.append(str(item.get("ref") or item.get("entity_ref") or item))
+                else:
+                    refs.append(str(item))
+            errors.append("bbox_ref_size unresolved refs: " + ", ".join(refs))
+        omitted = degraded.get("omitted_refs") or 0
+        if omitted:
+            errors.append(f"bbox_ref_size omitted {omitted} refs; DAG byte lint requires full coverage")
+    sizes = {}
+    per_ref = ref_size.get("per_ref") or []
+    if not isinstance(per_ref, list):
+        errors.append("ref_size.per_ref must be an array")
+        return sizes, errors
+    for item in per_ref:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("ref")
+        bytes_value = item.get("bytes")
+        if isinstance(ref, str) and isinstance(bytes_value, int):
+            sizes[ref] = bytes_value
+    return sizes, errors
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dag", required=True)
     parser.add_argument("--acceptance", default="[]")
     parser.add_argument("--target-context-window", type=int)
+    parser.add_argument("--ref-size")
+    parser.add_argument("--emit-refs", action="store_true")
     args = parser.parse_args()
 
     dag = load_json_arg("dag", args.dag)
@@ -44,6 +101,16 @@ def main() -> int:
         sub_units = []
     elif len(sub_units) < 2:
         errors.append("dag.sub_units must contain at least two sub-units for a decomposed path")
+
+    if args.emit_refs:
+        json.dump(unique_refs(sub_units), sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return 0
+
+    measured_sizes = None
+    if args.ref_size is not None:
+        measured_sizes, ref_size_errors = ref_size_index(load_json_arg("ref-size", args.ref_size))
+        errors.extend(ref_size_errors)
 
     ids = []
     covered = set()
@@ -67,6 +134,26 @@ def main() -> int:
                 f"sub_units[{idx}].bytes exceeds target_context_window "
                 f"({bytes_value} > {args.target_context_window})"
             )
+        if measured_sizes is not None and isinstance(refs, list):
+            missing_refs = [ref for ref in refs if isinstance(ref, str) and ref not in measured_sizes]
+            if missing_refs:
+                errors.append(
+                    f"sub_units[{idx}].refs missing from measured ref-size output: "
+                    + ", ".join(missing_refs)
+                )
+            measured_bytes = sum(
+                measured_sizes.get(ref, 0) for ref in refs if isinstance(ref, str)
+            )
+            if args.target_context_window is not None and measured_bytes > args.target_context_window:
+                errors.append(
+                    f"sub_units[{idx}].measured_ref_bytes exceeds target_context_window "
+                    f"({measured_bytes} > {args.target_context_window})"
+                )
+            if isinstance(bytes_value, int) and bytes_value != measured_bytes:
+                errors.append(
+                    f"sub_units[{idx}].bytes must equal measured ref bytes "
+                    f"({bytes_value} != {measured_bytes})"
+                )
         depends_on = unit.get("depends_on")
         if depends_on is None:
             errors.append(f"sub_units[{idx}].depends_on is required")

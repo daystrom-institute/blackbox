@@ -13,7 +13,11 @@ brief: "Build plan and status ledger for the phase-decompose workflows, scout ag
 
 # Phase Decomposer — Implementation Plan
 
-Final review/commit state is tracked in the working branch rather than this plan.
+Date: 2026-05-10
+Status: implemented, pending final validation. Live no-edit smoke coverage has
+passed for both `fit_direct` and `needs_decompose`; measured-byte DAG lint was
+hardened after those smokes and still needs a fresh live run. Edit/merge
+mediation is explicitly out of v1 rather than a shipped Phase 7 claim.
 Companion to: `design/orchestration/phase-decomposer/phase-decomposer.md` (pure design - this is the build plan).
 Depends on: `design/orchestration/supervision/supervision-phased-implementation.md` (supervised atom
 orchestration primitives must exist before Phase 6 foreach implementer
@@ -29,7 +33,7 @@ dispatch).
 | 4. Single-implementer path | **Done** | `phase-decompose-supervised-impl` v2 plus `phase-decompose-main` direct branch. Live direct smoke passed after `InitEpoch` hardening (`arc-6381ec7ba9c34201b427897cd40884a5`). |
 | 5. Ensemble decomposition | **Done** | `phase-decompose-ensemble-decompose` v8, `phase-decomposer-panel`, whiteboard packets, facilitator strict-DAG synthesis, and mechanical `lint-dag.py` byte/coverage validation. |
 | 6. Foreach implementer dispatch | **Done** | `phase-decompose-main` foreaches over `vars.dag.sub_units` into `phase-decompose-supervised-impl` and collects sub-results. |
-| 7. Recomposition council + mediation | **Done** | `phase-decompose-recompose` v2, `phase-recompose-council`, verdict packet, conflict/regression brofiles, and epoch-ceiling routing. Live decomposed smoke passed (`arc-67949c254c264a0687941f182509ea50`). Full edit/merge mediation remains the follow-on exercise beyond the no-edit smoke fixture. |
+| 7. Recomposition council + remediation | **Done** | `phase-decompose-recompose` v2, `phase-recompose-council`, verdict packet, remediation packet back-edge, and epoch-ceiling routing. Live decomposed smoke passed (`arc-67949c254c264a0687941f182509ea50`). Edit/merge mediation is out of v1. |
 
 The decomposer is mostly **configuration** on top of existing workflow
 engine primitives. The engine already has `foreach`, `subworkflow`,
@@ -282,18 +286,24 @@ parallel with Phase 4.
    - **Synthesize**: Executor (facilitator brofile). Reads
      `whiteboard_summarize`. Emits the DAG artifact
      (`vars.dag`). Uses `bbox_ref_size` cluster-by-cluster to
-     validate sub-unit sizes.
+     validate sub-unit sizes. In v1, `target_context_window` means the
+     per-sub-unit measured evidence payload budget returned by
+     `bbox_ref_size`; it excludes fixed workflow prompt, brofile, ambient
+     scope, and MCP-injection overhead.
 
 5.4 **DAG validation.** A gate packet on the Synthesize node verifies
    the DAG shape (required fields present, sub_units non-empty,
-   merge_order matches sub_unit_ids). **Coverage lint cannot be fully
-   expressed as a packet rule today** — `ForAll` (`ast.rs:211`)
-   quantifies over one array path but cannot correlate an outer
-   `criterion_id` into an inner `Exists` over sibling `sub_units[*]`
-   acceptance subsets. The coverage lint is a `shell` hook-op
-   or a future typed `lint_acceptance` op. The gate packet handles
-   structural validation; coverage is mechanical but not purely
-   packet-driven in v1.
+   merge_order matches sub_unit_ids). **Coverage and measured-byte lint
+   cannot be fully expressed as packet rules today** — `ForAll`
+   (`ast.rs:211`) quantifies over one array path but cannot correlate an
+   outer `criterion_id` into an inner `Exists` over sibling `sub_units[*]`
+   acceptance subsets, and packet rules cannot call `bbox_ref_size`.
+   `SynthesizeDag/on_exit` therefore extracts DAG refs, calls
+   `bbox_ref_size`, and runs `lint-dag.py`. The lint fails on missing
+   acceptance coverage, degraded ref measurement, declared bytes that differ
+   from measured ref bytes, and measured bytes over `target_context_window`.
+   The packet gate handles structural validation; coverage and byte accuracy
+   are mechanical hook validation in v1.
 
 **Deliverable:** A `needs_decompose` verdict routes to the decomposer
 panel. The panel produces a validated DAG with per-sub-unit refs,
@@ -355,7 +365,7 @@ code (foreach exists in the engine).
 
 ---
 
-## Phase 7: Recomposition council + mediation
+## Phase 7: Recomposition council + remediation
 
 **Prerequisites:** Phase 6 (foreach implementer outcomes). Phases 4-5
 for the supervision/adversarial patterns.
@@ -372,7 +382,8 @@ for the supervision/adversarial patterns.
    (durable Ensemble) reads `vars.sub_results`. It evaluates:
    - Which sub-units passed their advisors + acceptance gates?
    - Which failed?
-   - Which passed individually but conflict on integration?
+   - Which passed individually but still leave integration or acceptance
+     seams for the next epoch?
 
    The council produces a verdict:
    - **Satisfied**: all passed, integration verified → `EXIT_MET`.
@@ -388,20 +399,11 @@ for the supervision/adversarial patterns.
    re-enters the inlet → decomposer → dispatch → advisor gate →
    council loop.
 
-7.4 **Mediation (M1-M4).** When sub-units passed individually but
-   merge conflicts exist:
-   - **M1**: `shell` hook-op runs `git merge` per branch.
-   - **M2**: Conflict-resolver Executor. Produces concrete file edit.
-     Surfaces unresolvable conflicts with explicit notes. Does NOT
-     drop acceptance criteria.
-   - **M3**: Mediation whiteboard panel. One advocate per conflicting
-     sub-unit. Debates, votes. Facilitator resolves or declares
-     deadlock.
-   - **M4**: Regression-fixer. Runs test suite. Patches failures.
-     Retries up to ceiling.
-
-   The council reads M1-M4 outcomes. Resolved → satisfied. Deadlocked
-   → remediation packet.
+7.4 **Edit/merge mediation is out of v1.** The shipped workflow does not
+   merge sub-unit branches or dispatch conflict/regression repair agents.
+   It has no branch-handle contract from foreach children, so claiming M1-M4
+   here would be hollow. Integration failures are represented as
+   `work_remains` plus a remediation packet that re-enters the inlet.
 
 7.5 **Epoch ceiling.** `max_epochs` is not a `NodeSpec` field
    (`schema.rs:107-220`). The shipped workflow initializes
@@ -417,13 +419,13 @@ for the supervision/adversarial patterns.
    remediation packet → re-enters inlet → re-dispatches → council
    evaluates again → satisfied → done.
 
-**Deliverable:** A multi-sub-unit phase with an integration conflict
-is detected by the council, mediated, and resolved iteratively. A
-phase that truly can't converge halts after the epoch ceiling.
+**Deliverable:** A multi-sub-unit phase with remaining work is detected by
+the council, converted into a remediation packet, and resolved iteratively.
+A phase that truly can't converge halts after the epoch ceiling.
 
 **Estimated size:** 1 teamplate (~30 lines), council brofiles (~60
-lines), parent workflow nodes for council + mediation (~150-200
-lines), 1 gate packet for epoch ceiling (~20 lines). No new Rust code.
+lines), parent workflow nodes for council/remediation (~150 lines), 1 gate
+packet for epoch ceiling (~20 lines). No new Rust code.
 
 ---
 
@@ -437,7 +439,7 @@ lines), 1 gate packet for epoch ceiling (~20 lines). No new Rust code.
 | 4. Single-implementer | 3, supervision P1, P2, P3a, P5, P6 subset | — | 1 workflow | fit_direct -> implementer -> advisor -> done |
 | 5. Ensemble decompose | 3 | — | 1 teamplate, 2-3 brofiles, 1 packet | needs_decompose → whiteboard → validated DAG |
 | 6. Foreach implementers | 4, 5, supervision P4-P6 | — | parent workflow nodes | DAG sub-units -> foreach -> collect outcomes |
-| 7. Recompose council | 6, supervision P7 | — | 1 teamplate, 2 brofiles, 1 packet | Conflict → mediate → converge or halt |
+| 7. Recompose council | 6, supervision P7 | — | 1 teamplate, 2 brofiles, 1 packet | Work remains → remediation packet → converge or halt |
 
 Additional Rust code after Phase 1: `src/dispatch_mcp.rs` now injects the
 `agent-internal` MCP surface for dispatched bros so whiteboard tools are
@@ -463,6 +465,12 @@ Current smoke runs:
   `triage_verdict=needs_decompose`, `recompose_verdict=satisfied`, sub-unit
   bytes `[8000, 8500, 9500]` against a `10000` target, all sub-results
   completed.
+- Measured-byte DAG lint hardening is implemented after that smoke: the
+  current `phase-decompose-ensemble-decompose` extracts DAG refs, calls
+  `bbox_ref_size`, and rejects under-reported or degraded sub-unit bytes.
+  Archive requires a fresh decomposed smoke after daemon rebuild/restart.
+- Edit/merge mediation is not part of v1 and no longer appears as a shipped
+  artifact claim in this plan.
 
 Required external review also passed after the hardening pass:
 
@@ -501,8 +509,8 @@ Phases 4, 6, and 7 require the supervision infrastructure from
   subset for `accept`, `steer_primary`, and `bail`.
 - Phase 6 additionally needs P4 classifier support and P6 action execution
   available inside foreach subworkflows.
-- Phase 7 additionally needs P7 runtime allocation/recovery and mediation
-  patterns (M1-M4, which use existing shell/Executor/whiteboard primitives).
+- Phase 7 additionally needs P7 runtime allocation/recovery patterns for
+  remediation re-entry. Edit/merge mediation is a separate future design.
 
 The decomposer implementation plan can begin from the assumption that the
 supervision primitives through P7 have landed. Phase 4 onward should still
