@@ -288,7 +288,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_ref_size",
         category: ToolCategory::Graph,
-        summary: "Measure the byte payload size of entity refs. Project-file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
+        summary: "Measure the byte payload size of entity refs. file refs resolve to registered project file content; project_file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
         when_to_use: "Use when planning context-budget-sensitive dispatches. Pass the exact entity refs a downstream actor would need to read; the response returns per-ref byte counts, total_bytes, canonicalized successful refs, and unresolved/omitted refs without estimating from prose.",
         example: Some(
             r#"bbox_ref_size(refs=["project_file:d723917f:4967479d:c0d564f7ae71833785768017bb3ba3741e21d928c25d1262bde677b540e088b8:0"])"#,

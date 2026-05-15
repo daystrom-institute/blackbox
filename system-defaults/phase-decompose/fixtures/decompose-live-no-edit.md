@@ -3,7 +3,7 @@ question_shapes:
   - question_shape: where
     query: Locate the phase decomposer ensemble, foreach implementer, recomposition, whiteboard, and gate packet artifacts for a no-edit decomposition smoke test.
     scope_hint: system-defaults/workflows/phase-decompose/ensemble-decompose.json system-defaults/workflows/phase-decompose/recompose.json system-defaults/workflows/phase-decompose/main.json system-defaults/agentic-corpus/packets/phase-decompose
-    known_evidence: system-defaults/workflows/phase-decompose/ensemble-decompose.json
+    known_evidence: file:system-defaults/workflows/phase-decompose/ensemble-decompose.json
 ---
 
 # Phase Decomposer Ensemble Path Live Smoke

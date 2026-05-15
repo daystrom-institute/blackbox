@@ -4,6 +4,7 @@ pub mod agent;
 pub mod artifact;
 pub mod brofile;
 pub mod commit;
+pub mod file;
 pub mod knowledge;
 pub mod note;
 pub mod packet;
@@ -20,7 +21,7 @@ pub mod whiteboard;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
@@ -121,6 +122,7 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
     REGISTRY.get_or_init(|| {
         vec![
             Box::new(knowledge::KnowledgeProvider),
+            Box::new(file::FileProvider),
             Box::new(project_file::ProjectFileProvider),
             Box::new(project_file::ProjectFileV2Provider),
             Box::new(transcript::TranscriptProvider),
@@ -230,6 +232,7 @@ mod tests {
     fn sample_refs() -> Vec<&'static str> {
         vec![
             "knowledge:abc12345",
+            "file:README.md",
             "project_file:proj1234:relhash:chunkhash:0",
             "transcript:claude:session123:42:0",
             "session:claude:session123",

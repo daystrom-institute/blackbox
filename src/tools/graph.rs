@@ -101,7 +101,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_ref_size",
-        description = "Measure the byte payload size of entity refs. Project-file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded."
+        description = "Measure the byte payload size of entity refs. file refs resolve to registered project file content; project_file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded."
     )]
     pub(crate) fn bbox_ref_size(&self, Parameters(p): Parameters<RefSizeParams>) -> CallToolResult {
         Self::run("bbox_ref_size", || {

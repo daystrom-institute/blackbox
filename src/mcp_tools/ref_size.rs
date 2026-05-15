@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -80,6 +80,13 @@ fn size_one_ref(raw: &str, ctx: &ProviderContext<'_>) -> Result<RefSizeEntry> {
                 .ok_or_else(|| anyhow!("project_file entity {entity_ref} not found"))?;
             (byte_len(&doc.content), "project_file_content")
         }
+        EntityType::File => {
+            let EntityRef::File { path } = &entity_ref else {
+                unreachable!();
+            };
+            let resolved = crate::providers::file::resolve_file(ctx, path)?;
+            (resolved.content.len() as u64, "file_content")
+        }
         _ => {
             let view = entity_loader::load(ctx, &entity_ref)?;
             let payload = json!({
@@ -109,6 +116,7 @@ fn byte_len(value: &str) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn byte_len_counts_utf8_bytes_not_chars() {
@@ -191,6 +199,36 @@ mod tests {
             "artifact:packet/phase-decompose/triage@1"
         );
         assert_eq!(value["per_ref"][1]["entity_type"], "artifact");
+    }
+
+    #[test]
+    fn file_ref_measures_registered_project_file_content() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        fs::create_dir_all(project.path().join("docs")).unwrap();
+        let file_path = project.path().join("docs/design.md");
+        fs::write(&file_path, "hello\nworld\n").unwrap();
+
+        let state = crate::server::state::SharedState::for_test(store.path());
+        state
+            .projects
+            .write()
+            .register_path(project.path())
+            .unwrap();
+        let ctx = ProviderContext::new(&state);
+        let out = ref_size(
+            &RefSizeParams {
+                refs: vec!["file:docs/design.md".into()],
+            },
+            &ctx,
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(value["status"], "ok");
+        assert_eq!(value["total_bytes"], 12);
+        assert_eq!(value["per_ref"][0]["ref"], "file:docs/design.md");
+        assert_eq!(value["per_ref"][0]["entity_type"], "file");
+        assert_eq!(value["per_ref"][0]["source"], "file_content");
     }
 
     #[test]

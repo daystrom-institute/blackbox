@@ -15,6 +15,7 @@ pub(crate) use crate::git::git_root_for_path;
 pub enum EntityType {
     Knowledge,
     Transcript,
+    File,
     ProjectFile,
     ProjectFileV2,
     Session,
@@ -34,9 +35,10 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 18] = [
+    pub const ALL: [EntityType; 19] = [
         EntityType::Knowledge,
         EntityType::Transcript,
+        EntityType::File,
         EntityType::ProjectFile,
         EntityType::ProjectFileV2,
         EntityType::Session,
@@ -59,6 +61,7 @@ impl EntityType {
         match self {
             EntityType::Knowledge => "knowledge",
             EntityType::Transcript => "transcript",
+            EntityType::File => "file",
             EntityType::ProjectFile => "project_file",
             EntityType::ProjectFileV2 => "project_file_v2",
             EntityType::Session => "session",
@@ -84,6 +87,7 @@ impl EntityType {
             EntityType::Transcript => {
                 "transcript:<provider>:<session_id>:<line_offset>:<event_idx>"
             }
+            EntityType::File => "file:<project-relative-path>",
             EntityType::ProjectFile => {
                 "project_file:<project_id>:<rel_path_hash>:<chunk_hash>:<occurrence_idx>"
             }
@@ -142,6 +146,9 @@ pub enum EntityRef {
         session_id: String,
         line_offset: u64,
         event_idx: u32,
+    },
+    File {
+        path: String,
     },
     ProjectFile {
         project_id: String,
@@ -237,6 +244,7 @@ impl EntityRef {
                 EntityRef::Knowledge { id }
             }),
             EntityType::Transcript => parse_transcript(input, rest),
+            EntityType::File => parse_file(input, rest),
             EntityType::ProjectFile => parse_project_file(input, rest),
             EntityType::ProjectFileV2 => parse_project_file_v2(input, rest),
             EntityType::Session => parse_session(input, rest),
@@ -289,6 +297,7 @@ impl EntityRef {
                     "transcript:{provider}:{session_id}:{line_offset}:{event_idx}"
                 ))
             }
+            EntityRef::File { path } => Ok(format!("file:{path}")),
             EntityRef::ProjectFile {
                 project_id,
                 rel_path_hash,
@@ -362,6 +371,7 @@ impl EntityRef {
         match self {
             EntityRef::Knowledge { .. } => EntityType::Knowledge,
             EntityRef::Transcript { .. } => EntityType::Transcript,
+            EntityRef::File { .. } => EntityType::File,
             EntityRef::ProjectFile { .. } => EntityType::ProjectFile,
             EntityRef::ProjectFileV2 { .. } => EntityType::ProjectFileV2,
             EntityRef::Session { .. } => EntityType::Session,
@@ -556,6 +566,12 @@ fn parse_transcript(input: &str, rest: &str) -> Result<EntityRef, EntityRefParse
         session_id: non_empty(input, session_id, EntityType::Transcript, "session_id")?.to_string(),
         line_offset: parse_u64(input, line_offset, EntityType::Transcript, "line_offset")?,
         event_idx: parse_u32(input, event_idx, EntityType::Transcript, "event_idx")?,
+    })
+}
+
+fn parse_file(input: &str, rest: &str) -> Result<EntityRef, EntityRefParseError> {
+    Ok(EntityRef::File {
+        path: non_empty(input, rest, EntityType::File, "path")?.to_string(),
     })
 }
 
@@ -959,53 +975,58 @@ mod tests {
     }
 
     #[test]
+    fn file_ref_round_trips_with_relative_paths() {
+        let entity = EntityRef::File {
+            path: "system-defaults/workflows/phase-decompose/main.json".to_string(),
+        };
+        let parsed = EntityRef::parse(&entity.render()).unwrap();
+        assert_eq!(parsed, entity);
+        assert_eq!(
+            parsed.render(),
+            "file:system-defaults/workflows/phase-decompose/main.json"
+        );
+    }
+
+    #[test]
     fn parse_bad_input_returns_error_shape_with_suggestion() {
         let err = EntityRef::parse("knowlege:abc").unwrap_err();
         assert_eq!(err.status, "error.bad_input");
         assert_eq!(err.code, "invalid_entity_ref");
         assert_eq!(err.field, "entity_ref");
-        assert!(
-            err.suggested_fix
-                .as_deref()
-                .unwrap_or_default()
-                .contains("knowledge:<entry_id>")
-        );
+        assert!(err
+            .suggested_fix
+            .as_deref()
+            .unwrap_or_default()
+            .contains("knowledge:<entry_id>"));
     }
 
     #[test]
     fn numeric_parse_error_suggests_expected_grammar() {
         let err = EntityRef::parse("transcript:codex:sess-1:not-a-line:2").unwrap_err();
         assert_eq!(err.status, "error.bad_input");
-        assert!(
-            err.suggested_fix
-                .as_deref()
-                .unwrap_or_default()
-                .contains("line_offset")
-        );
+        assert!(err
+            .suggested_fix
+            .as_deref()
+            .unwrap_or_default()
+            .contains("line_offset"));
     }
 
     #[test]
     fn virtual_classification_matches_design() {
-        assert!(
-            EntityRef::Task {
-                task_id: "task-1".to_string()
-            }
-            .is_virtual()
-        );
-        assert!(
-            EntityRef::BashCall {
-                session: "sess".to_string(),
-                turn: 4
-            }
-            .is_virtual()
-        );
-        assert!(
-            !EntityRef::Commit {
-                repo_id: "abcd1234".to_string(),
-                sha: "abc".to_string()
-            }
-            .is_virtual()
-        );
+        assert!(EntityRef::Task {
+            task_id: "task-1".to_string()
+        }
+        .is_virtual());
+        assert!(EntityRef::BashCall {
+            session: "sess".to_string(),
+            turn: 4
+        }
+        .is_virtual());
+        assert!(!EntityRef::Commit {
+            repo_id: "abcd1234".to_string(),
+            sha: "abc".to_string()
+        }
+        .is_virtual());
     }
 
     #[test]
@@ -1150,30 +1171,33 @@ mod tests {
                 line_offset: rng.next(),
                 event_idx: rng.next() as u32,
             },
-            2 => EntityRef::ProjectFile {
+            2 => EntityRef::File {
+                path: format!("{}/{}.rs", rng.token("src"), rng.token("mod")),
+            },
+            3 => EntityRef::ProjectFile {
                 project_id: rng.hex(8),
                 rel_path_hash: rng.hex(8),
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            3 => EntityRef::ProjectFileV2 {
+            4 => EntityRef::ProjectFileV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 rel_path_hash: rng.hex(8),
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            4 => EntityRef::Session {
+            5 => EntityRef::Session {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("sub-")),
             },
-            5 => EntityRef::Thread {
+            6 => EntityRef::Thread {
                 thread_id: rng.token("thread-"),
             },
-            6 => EntityRef::Note {
+            7 => EntityRef::Note {
                 note_id: rng.token("note-"),
             },
-            7 => EntityRef::Symbol {
+            8 => EntityRef::Symbol {
                 project_id: rng.hex(8),
                 qualified_name: format!(
                     "{}::{}::{}",
@@ -1183,7 +1207,7 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            8 => EntityRef::SymbolV2 {
+            9 => EntityRef::SymbolV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 qualified_name: format!(
@@ -1194,36 +1218,36 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            9 => EntityRef::Brofile {
+            10 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            10 => EntityRef::Whiteboard {
+            11 => EntityRef::Whiteboard {
                 board_id: rng.token("board-"),
             },
-            11 => EntityRef::Commit {
+            12 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            12 => EntityRef::Task {
+            13 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            13 => EntityRef::BashCall {
+            14 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            14 => EntityRef::Agent {
+            15 => EntityRef::Agent {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            15 => EntityRef::Packet {
+            16 => EntityRef::Packet {
                 selector: format!("domain:{}", rng.token("packet-domain-")),
             },
-            16 => EntityRef::Artifact {
+            17 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),
             },
-            17 => EntityRef::RoadmapItem {
+            18 => EntityRef::RoadmapItem {
                 id: rng.token("roadmap-"),
             },
             _ => unreachable!(),
