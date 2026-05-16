@@ -8117,7 +8117,7 @@ fn prune_java_orphans_keeps_serial_version_uid() {
 }
 
 #[test]
-fn prune_java_orphans_marks_multi_declarator_field_excluded() {
+fn prune_java_orphans_v2_deletes_entire_multi_declarator_when_all_orphaned() {
     let dir = tempfile::tempdir().unwrap();
     let path = write_java(
         dir.path(),
@@ -8130,11 +8130,41 @@ fn prune_java_orphans_marks_multi_declarator_field_excluded() {
     );
     let mut params = java_plan_params("prune_java_orphans", &path);
     params.project_dir = Some(path_string(dir.path()));
-    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
-    // Multi-declarator fields are excluded — never appear as orphans even
-    // when no callers reference them. v1 leaves the operator to split the
-    // declaration manually.
-    assert!(err.contains("no orphaned"), "got: {err}");
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // All three declarators orphaned → single full-field delete edit.
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "");
+    // 3 orphans logged in items.
+    assert_eq!(plan.items.len(), 3);
+}
+
+#[test]
+fn prune_java_orphans_v2_rewrites_multi_declarator_when_some_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Partial.java",
+        "package com.example;\n\
+         public class Partial {\n\
+         \x20   private int a, b, c;\n\
+         \x20   public int run() { return b; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // b is referenced; a and c are orphans. One rewrite edit for the
+    // whole field with b surviving.
+    assert_eq!(edits.len(), 1);
+    assert!(
+        edits[0].replacement.contains("private int b;"),
+        "expected rewrite keeping only b: {:?}",
+        edits[0].replacement
+    );
 }
 
 #[test]
@@ -8646,6 +8676,89 @@ fn java_split_provider_auto_injects_via_getter_types() {
     });
     assert!(has_call_rewrite, "call rewrite missing: {edits:?}");
     assert!(has_inject_field, "inject field missing: {edits:?}");
+}
+
+#[test]
+fn java_split_provider_v2_deletes_original_field_on_full_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("FullCov.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         import jakarta.inject.Provider;\n\
+         class FullCov {\n\
+         \x20   @Inject\n\
+         \x20   private Provider<SessionData> sessionDataProvider;\n\
+         \x20   AuthLogRecord rec() { return sessionDataProvider.get().getAuthLogRecord(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_types".to_string(),
+        serde_json::json!({ "getAuthLogRecord": "AuthLogRecord" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Full coverage → original field declaration deleted.
+    let has_field_delete = edits.iter().any(|e| {
+        e.replacement.is_empty() && e.byte_end > e.byte_start && {
+            let bytes = std::fs::read(&path).unwrap();
+            let slice = &bytes[e.byte_start..e.byte_end];
+            std::str::from_utf8(slice)
+                .map(|s| s.contains("Provider<SessionData>"))
+                .unwrap_or(false)
+        }
+    });
+    assert!(has_field_delete, "expected original field delete: {edits:?}");
+}
+
+#[test]
+fn java_split_provider_v2_keeps_original_field_on_partial_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Partial.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         import jakarta.inject.Provider;\n\
+         class Partial {\n\
+         \x20   @Inject\n\
+         \x20   private Provider<SessionData> sessionDataProvider;\n\
+         \x20   AuthLogRecord rec() { return sessionDataProvider.get().getAuthLogRecord(); }\n\
+         \x20   String other() { return sessionDataProvider.get().getUnmappedThing(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_types".to_string(),
+        serde_json::json!({ "getAuthLogRecord": "AuthLogRecord" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Partial coverage → original field NOT deleted (getUnmappedThing
+    // still goes through it).
+    let bytes_src = std::fs::read(&path).unwrap();
+    let has_field_delete = edits.iter().any(|e| {
+        e.replacement.is_empty() && e.byte_end > e.byte_start && {
+            std::str::from_utf8(&bytes_src[e.byte_start..e.byte_end])
+                .map(|s| s.contains("Provider<SessionData>"))
+                .unwrap_or(false)
+        }
+    });
+    assert!(!has_field_delete, "should NOT delete original field on partial coverage: {edits:?}");
 }
 
 #[test]
