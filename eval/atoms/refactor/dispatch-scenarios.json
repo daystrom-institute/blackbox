@@ -664,6 +664,20 @@
         "status",
         "class_name"
       ]
+    },
+    {
+      "id": "dispatch-java-inline-method-planonly",
+      "atom": "java-inline-method",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "module_name": "normalize",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "call_sites_inlined"
+      ]
     }
   ]
 }

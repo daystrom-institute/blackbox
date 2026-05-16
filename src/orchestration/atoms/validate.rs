@@ -1356,6 +1356,7 @@ mod tests {
             "prune_java_orphans",
             "extract_java_code_block_to_method",
             "convert_method_to_class",
+            "inline_java_method",
         ];
 
         for kind in java_plan_kinds {

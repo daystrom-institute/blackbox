@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -508,6 +508,31 @@ the workspace-import drain has completed.
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b4. Inline a private helper into its call sites:
+
+```text
+bbox_refactor_plan(
+  kind="inline_java_method",
+  source="src/main/java/com/example/Calc.java",
+  project_dir="/absolute/project/root",
+  module_name="add"
+)
+```
+
+The matching atom is `java-inline-method`. Finds every `method_invocation`
+of the named method (no receiver or `this` receiver) in the same file,
+substitutes each call's argument expressions (wrapped in parens for
+operator-precedence safety) into the method's body expression, replaces
+the call expression with the substituted form, and deletes the method
+declaration.
+
+**v1 scope**: private methods only, single-statement bodies only
+(return-expression for non-void, expression-statement for void). The
+body must reference only formal parameters — no `this`, `super`, field
+reads, or calls to other methods. Refuses cleanly on every violation;
+operator can lift state to parameters first or pick a different
+refactor. `inline_java_class` is a separate primitive not yet shipped.
 
 14b3. Method Object — convert a method into a standalone class:
 

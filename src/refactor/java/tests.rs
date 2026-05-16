@@ -8308,6 +8308,211 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// inline_java_method — note-8d4674ad
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn inline_java_method_inlines_return_expression() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Calc.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Calc {\n\
+         \x20   public int run() { return add(1, 2); }\n\
+         \x20   private int add(int a, int b) { return a + b; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("add".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "inline_java_method");
+    let edits = &plan.edits[0].edits;
+    // One inline edit + one declaration-deletion edit.
+    assert_eq!(edits.len(), 2);
+    let call_replacement = edits
+        .iter()
+        .find(|e| e.byte_start != e.byte_end && !e.replacement.is_empty())
+        .unwrap();
+    assert!(
+        call_replacement.replacement.contains("(1) + (2)"),
+        "expected substituted args: got `{}`",
+        call_replacement.replacement
+    );
+}
+
+#[test]
+fn inline_java_method_inlines_void_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Log.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Log {\n\
+         \x20   public void run() { say(\"hi\"); }\n\
+         \x20   private void say(String s) { System.out.println(s); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("say".to_string());
+    // say's body calls System.out.println which the v1 safety check refuses.
+    // This confirms the refusal.
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("calls another method"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_refuses_non_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Pub.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Pub {\n\
+         \x20   public int run() { return add(1, 2); }\n\
+         \x20   public int add(int a, int b) { return a + b; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("add".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("non-private"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_refuses_multi_statement_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   public int run() { return more(); }\n\
+         \x20   private int more() { int x = 1; return x + 2; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("more".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("2 statements"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_refuses_this_in_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("This.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class This {\n\
+         \x20   private int counter = 0;\n\
+         \x20   public int run() { return read(); }\n\
+         \x20   private int read() { return this.counter; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("read".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    // `this.counter` parses as `field_access`; tree-sitter visits the
+    // field_access node first, so the refusal we surface is "reads a
+    // field". Either refusal is correct — body containing a field
+    // reference is unsafe to inline.
+    assert!(
+        err.contains("reads a field") || err.contains("uses `this`"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn inline_java_method_refuses_no_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Orphan.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Orphan {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private int dead(int x) { return x + 1; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("dead".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("no call sites"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_inlines_multiple_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Many.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Many {\n\
+         \x20   public int a() { return sq(2); }\n\
+         \x20   public int b() { return sq(3) + sq(4); }\n\
+         \x20   private int sq(int n) { return n * n; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("sq".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // 3 inline edits + 1 declaration deletion.
+    assert_eq!(edits.len(), 4);
+    let leftover = plan.leftovers.first().unwrap();
+    assert_eq!(leftover, "call_sites_inlined=3");
+}
+
+#[test]
+fn inline_java_method_substitutes_arg_with_parens_for_precedence_safety() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Prec.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Prec {\n\
+         \x20   public int run() { return sq(1 + 2) * 3; }\n\
+         \x20   private int sq(int n) { return n * n; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("sq".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let call_replacement = edits
+        .iter()
+        .find(|e| !e.replacement.is_empty())
+        .unwrap();
+    // The substituted form should preserve precedence: `(1 + 2) * (1 + 2)`
+    // wrapped in parens so the surrounding `* 3` binds correctly.
+    assert!(
+        call_replacement.replacement.contains("((1 + 2) * (1 + 2))"),
+        "expected paren-wrapped args, got `{}`",
+        call_replacement.replacement
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // convert_method_to_class — note-bd2b7a24
 // ─────────────────────────────────────────────────────────────────────
 

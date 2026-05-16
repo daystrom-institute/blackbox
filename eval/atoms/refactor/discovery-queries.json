@@ -291,6 +291,14 @@
         "java-convert-method-to-class"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-inline-method",
+      "query": "inline a private java method into its call sites and delete the declaration",
+      "expected_atoms": [
+        "java-inline-method"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [
