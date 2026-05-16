@@ -17,10 +17,6 @@
 //! `error.unimplemented_csharp_kind` so the dispatcher recognizes them
 //! and surfaces the contract.
 
-use anyhow::{Result, bail};
-
-use crate::refactor::RefactorPlanParams;
-
 pub(crate) mod lex;
 pub mod async_dispose_convert;
 pub mod awaited_query_in_loop_audit;
@@ -30,7 +26,9 @@ pub mod find_usages;
 pub mod lsp_move_item;
 pub mod lsp_rename;
 pub mod migrate_type_usages;
+pub mod move_members_to_partial;
 pub mod move_type_to_file;
+pub mod nullable_annotation_repair;
 pub mod organize_usings;
 pub mod partial_class_audit;
 pub mod primary_ctor_migrate;
@@ -51,7 +49,9 @@ pub use find_usages::plan_find_csharp_usages;
 pub use lsp_move_item::plan_lsp_move_item;
 pub use lsp_rename::plan_lsp_rename;
 pub use migrate_type_usages::plan_migrate_type_usages;
+pub use move_members_to_partial::plan_move_members_to_partial;
 pub use move_type_to_file::plan_move_type_to_file;
+pub use nullable_annotation_repair::plan_nullable_annotation_repair;
 pub use organize_usings::plan_organize_usings;
 pub use partial_class_audit::plan_partial_class_audit;
 pub use primary_ctor_migrate::plan_primary_ctor_migrate;
@@ -67,28 +67,9 @@ pub(crate) mod lsp_rename_helpers {
     pub(crate) use super::lsp_rename::find_first_identifier_byte;
 }
 
-/// Generic v1 stub for plan kinds enumerated in the design doc but not
-/// yet implemented. Returns `error.unimplemented_csharp_kind` so the
-/// dispatcher acknowledges the kind and atom prompts get a clear
-/// contract violation rather than a generic "unsupported plan kind"
-/// surface.
-pub fn plan_unimplemented(p: &RefactorPlanParams, kind: &str) -> Result<String> {
-    bail!(
-        "error.unimplemented_csharp_kind: `{kind}` is enumerated in design/refactor-tools/csharp/refactor-csharp-expansion.md but not yet implemented (params source={:?})",
-        p.source
-    );
-}
-
-/// Phase 2 stub — the plan kind requires the Roslyn sidecar architecture
-/// from the design doc, which lands after Phase 1 LSP plumbing is
-/// proven. Refuses with `error.csharp_sidecar_required` so callers
-/// distinguish "not built yet" from "needs sidecar dispatch".
-pub fn plan_sidecar_required(p: &RefactorPlanParams, kind: &str) -> Result<String> {
-    bail!(
-        "error.csharp_sidecar_required: `{kind}` requires the Roslyn sidecar (Phase 2; design/refactor-tools/csharp/refactor-csharp-expansion.md). Source={:?}",
-        p.source
-    );
-}
+// Generic stubs (plan_unimplemented / plan_sidecar_required) were
+// removed when every plan kind landed a real implementation. Add
+// them back if a future kind ships an interim stub.
 
 #[allow(unused_imports)]
 pub(crate) use crate::refactor::{

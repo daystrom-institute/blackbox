@@ -1248,13 +1248,9 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "csharp_partial_class_audit" => csharp::plan_partial_class_audit(p),
         "csharp_awaited_query_in_loop_audit" => csharp::plan_awaited_query_audit(p),
         "csharp_compile_fix_round" => csharp::plan_compile_fix_round(p),
-        "csharp_nullable_annotation_repair" => {
-            csharp::plan_sidecar_required(p, "csharp_nullable_annotation_repair")
-        }
+        "csharp_nullable_annotation_repair" => csharp::plan_nullable_annotation_repair(p),
         "unseal_csharp_class" => csharp::plan_unseal(p),
-        "move_csharp_members_to_partial" => {
-            csharp::plan_sidecar_required(p, "move_csharp_members_to_partial")
-        }
+        "move_csharp_members_to_partial" => csharp::plan_move_members_to_partial(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
