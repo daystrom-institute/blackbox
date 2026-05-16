@@ -3909,6 +3909,7 @@ pub(crate) use test_slice::plan_extract_java_test_slice;
 
 mod atom_plans;
 mod collapse_chain;
+mod di_plumbing;
 mod extract_class;
 mod extract_code_block;
 mod extract_methods;

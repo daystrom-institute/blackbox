@@ -29,6 +29,7 @@
 //! - `error.no_matches`
 
 use super::*;
+use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
 use std::collections::HashMap;
 
 pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String> {
@@ -55,31 +56,60 @@ pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String>
                 .collect()
         })
         .unwrap_or_default();
-    if mapping.is_empty() {
+    // Optional parallel map: {getter → type-to-auto-inject}. When
+    // supplied for a getter and the type isn't already injected on the
+    // enclosing class, the planner generates an `@Inject Provider<T>`
+    // field (or `@Inject T` when prefer_provider=false).
+    let getter_types: HashMap<String, String> = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("getter_types"))
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if mapping.is_empty() && getter_types.is_empty() {
         bail!(
-            "toml_entries.getter_mapping is required and must be a non-empty object \
-             mapping `oldGetterName` → `newProviderField`"
+            "either `toml_entries.getter_mapping` (getter → existing Provider field name) or \
+             `toml_entries.getter_types` (getter → type to auto-inject as Provider<T>) must be \
+             supplied"
         );
     }
 
-    let class_filter: Option<Node<'_>> = if let Some(class_name) = p.impl_name.as_deref() {
-        Some(find_class_declaration_by_name(&parsed, class_name).ok_or_else(|| {
+    let class_node: Node<'_> = if let Some(class_name) = p.impl_name.as_deref() {
+        find_class_declaration_by_name(&parsed, class_name).ok_or_else(|| {
             anyhow!(
                 "class `{class_name}` not found in {}",
                 source_path.display()
             )
-        })?)
+        })?
     } else {
-        None
+        find_first_class_declaration(parsed.tree.root_node())
+            .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?
     };
 
+    // Build effective mapping. Values are BARE field names; the walker
+    // appends `.get()` itself (matching the Provider<T> shape this
+    // primitive is for). For getter_types entries, ensure_inject_field
+    // generates `@Inject Provider<T> tProvider;` and we use the bare
+    // field name.
+    let mut effective_mapping: HashMap<String, String> = mapping.clone();
+    let mut aux_edits: Vec<TextEdit> = Vec::new();
+    for (getter, type_name) in &getter_types {
+        let ensured = ensure_inject_field(class_node, &parsed.source, type_name, true)?;
+        effective_mapping.insert(getter.clone(), ensured.field.name.clone());
+        aux_edits.extend(ensured.edits);
+    }
+
     let mut edits = Vec::new();
-    let root_node = class_filter.unwrap_or_else(|| parsed.tree.root_node());
     walk_for_provider_chains(
-        root_node,
+        class_node,
         &parsed,
         &delegate_field,
-        &mapping,
+        &effective_mapping,
         &mut edits,
     );
 
@@ -90,6 +120,8 @@ pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String>
         );
     }
 
+    edits.extend(aux_edits);
+    edits = dedupe_insertion_edits(edits);
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
 

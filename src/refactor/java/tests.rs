@@ -8435,6 +8435,50 @@ fn replace_java_static_reference_skips_other_class_qualifiers() {
 }
 
 #[test]
+fn replace_java_static_reference_auto_injects_via_delegate_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Auto.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         import jakarta.inject.Provider;\n\
+         class Auto {\n\
+         \x20   void run() { UI.getCurrent().push(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UI".to_string());
+    params.delegate_type = Some("UI".to_string());
+    params.item_names = Some(vec!["getCurrent".to_string()]);
+    params.delegate_field = Some("UI.getCurrent".to_string()); // drop-accessor mode
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let has_call_rewrite = edits.iter().any(|e| e.replacement == "uIProvider.get()");
+    let has_inject_field = edits
+        .iter()
+        .any(|e| e.replacement.contains("private Provider<UI> uIProvider;"));
+    assert!(has_call_rewrite, "call rewrite missing: {edits:?}");
+    assert!(has_inject_field, "inject field missing: {edits:?}");
+}
+
+#[test]
+fn replace_java_static_reference_requires_new_text_or_delegate_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("X.java");
+    fs::write(&path, "class X {}\n").unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("Cls".to_string());
+    params.item_names = Some(vec!["x".to_string()]);
+    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    assert!(err.contains("new_text") && err.contains("delegate_type"), "got: {err}");
+}
+
+#[test]
 fn replace_java_static_reference_rejects_unknown_item_kind() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("X.java");
@@ -8562,6 +8606,46 @@ fn java_split_provider_refuses_empty_mapping() {
     params.delegate_field = Some("provider".to_string());
     let err = plan_java_split_provider(&params).unwrap_err().to_string();
     assert!(err.contains("getter_mapping"), "got: {err}");
+}
+
+#[test]
+fn java_split_provider_auto_injects_via_getter_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Auto.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         import jakarta.inject.Provider;\n\
+         class Auto {\n\
+         \x20   @Inject private Provider<SessionData> sessionDataProvider;\n\
+         \x20   AuthLogRecord rec() { return sessionDataProvider.get().getAuthLogRecord(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_types".to_string(),
+        serde_json::json!({ "getAuthLogRecord": "AuthLogRecord" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Should contain: rewrite to authLogRecordProvider.get() + new
+    // @Inject Provider<AuthLogRecord> field declaration.
+    let has_call_rewrite = edits
+        .iter()
+        .any(|e| e.replacement == "authLogRecordProvider.get()");
+    let has_inject_field = edits.iter().any(|e| {
+        e.replacement
+            .contains("private Provider<AuthLogRecord> authLogRecordProvider;")
+    });
+    assert!(has_call_rewrite, "call rewrite missing: {edits:?}");
+    assert!(has_inject_field, "inject field missing: {edits:?}");
 }
 
 #[test]
@@ -8701,6 +8785,113 @@ fn migrate_java_method_receiver_handles_provider_get_receiver() {
     let edits = &plan.edits[0].edits;
     assert_eq!(edits.len(), 1);
     assert_eq!(edits[0].replacement, "authzProvider.get()");
+}
+
+#[test]
+fn migrate_java_method_receiver_auto_injects_when_field_absent() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Auto.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         class Auto {\n\
+         \x20   @Inject private SessionData sessionData;\n\
+         \x20   boolean check() { return sessionData.isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.delegate_type = Some("AuthorizationService".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Expect: 1 receiver-rewrite edit + 1 @Inject field-injection edit.
+    let has_receiver_rewrite = edits
+        .iter()
+        .any(|e| e.replacement == "authorizationService");
+    let has_inject_field = edits.iter().any(|e| {
+        e.replacement.contains("@Inject")
+            && e.replacement.contains("private AuthorizationService authorizationService;")
+    });
+    assert!(has_receiver_rewrite, "receiver rewrite missing: {edits:?}");
+    assert!(has_inject_field, "inject field missing: {edits:?}");
+}
+
+#[test]
+fn migrate_java_method_receiver_reuses_existing_inject_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Reuse.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         class Reuse {\n\
+         \x20   @Inject private SessionData sessionData;\n\
+         \x20   @Inject private AuthorizationService alreadyInjected;\n\
+         \x20   boolean check() { return sessionData.isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.delegate_type = Some("AuthorizationService".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Only the receiver-rewrite edit; no new field declaration.
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "alreadyInjected");
+}
+
+#[test]
+fn migrate_java_method_receiver_provider_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Prov.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import jakarta.inject.Inject;\n\
+         import jakarta.inject.Provider;\n\
+         class Prov {\n\
+         \x20   @Inject private SessionData sessionData;\n\
+         \x20   boolean check() { return sessionData.isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.delegate_type = Some("AuthorizationService".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("prefer_provider".to_string(), serde_json::json!(true));
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert!(edits.iter().any(|e| e.replacement == "authorizationServiceProvider.get()"));
+    assert!(edits.iter().any(|e| e
+        .replacement
+        .contains("private Provider<AuthorizationService> authorizationServiceProvider;")));
+}
+
+#[test]
+fn migrate_java_method_receiver_refuses_when_no_new_text_or_delegate_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Bad.java");
+    fs::write(&path, "class Bad {}\n").unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("x".to_string());
+    params.item_names = Some(vec!["foo".to_string()]);
+    let err = plan_migrate_java_method_receiver(&params).unwrap_err().to_string();
+    assert!(err.contains("new_text") && err.contains("delegate_type"), "got: {err}");
 }
 
 #[test]

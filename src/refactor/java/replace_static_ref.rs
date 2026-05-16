@@ -39,6 +39,7 @@
 //! - `error.invalid_item_kind`
 
 use super::*;
+use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
 use std::collections::HashSet;
 
 const ALLOWED_KINDS: &[&str] = &["field", "method"];
@@ -55,13 +56,64 @@ pub(crate) fn plan_replace_java_static_reference(p: &RefactorPlanParams) -> Resu
         .as_deref()
         .ok_or_else(|| anyhow!("impl_name (qualifying class) is required"))?
         .to_string();
-    let new_receiver = p
+    let manual_new_text = p
         .new_text
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("new_text (replacement receiver) is required"))?
-        .to_string();
+        .map(str::to_string);
+    let delegate_type = p
+        .delegate_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if manual_new_text.is_none() && delegate_type.is_none() {
+        bail!(
+            "either `new_text` (replacement receiver) or `delegate_type` (type to auto-inject as \
+             the new receiver) is required"
+        );
+    }
+    let prefer_provider = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("prefer_provider"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    // For auto-inject mode we need an enclosing class to attach the
+    // field to. Use impl_name's same value? No — impl_name is the OLD
+    // qualifier (e.g. `UI`), not the enclosing class. Use the
+    // `enclosing_class` toml entry if supplied, else first class in
+    // file.
+    let enclosing_class_name = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("enclosing_class"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let enclosing_class_node: Node<'_> = if let Some(name) = enclosing_class_name.as_deref() {
+        find_class_declaration_by_name(&parsed, name).ok_or_else(|| {
+            anyhow!(
+                "toml_entries.enclosing_class = `{name}` not found in {}",
+                source_path.display()
+            )
+        })?
+    } else {
+        find_first_class_declaration(parsed.tree.root_node())
+            .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?
+    };
+
+    let (new_receiver, aux_edits): (String, Vec<TextEdit>) = match (manual_new_text, delegate_type)
+    {
+        (Some(text), _) => (text, Vec::new()),
+        (None, Some(ty)) => {
+            let ensured =
+                ensure_inject_field(enclosing_class_node, &parsed.source, &ty, prefer_provider)?;
+            (ensured.field.receiver_expr(), ensured.edits)
+        }
+        _ => unreachable!("guarded above"),
+    };
     let item_names: HashSet<String> = p
         .item_names
         .as_deref()
@@ -117,6 +169,8 @@ pub(crate) fn plan_replace_java_static_reference(p: &RefactorPlanParams) -> Resu
         );
     }
 
+    edits.extend(aux_edits);
+    edits = dedupe_insertion_edits(edits);
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
 

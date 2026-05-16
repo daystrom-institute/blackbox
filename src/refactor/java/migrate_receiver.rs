@@ -3,44 +3,41 @@
 //!
 //! After `extract_java_class` moves a method from `OldHolder` to
 //! `NewHolder`, every call site `oldHolder.foo(args)` needs to become
-//! `newHolder.foo(args)`. This primitive handles that rewrite for one
-//! source file: the operator supplies the OLD receiver text, the NEW
-//! receiver text, and the list of moved method names. The planner
-//! finds matching `method_invocation` nodes and rewrites their
-//! receiver tokens.
+//! `newHolder.foo(args)`. Two modes:
 //!
-//! v1 scope:
-//! - Single source file (project-wide caller walk is v2).
-//! - Operator-supplied old + new receiver text (the receiver field
-//!   must already exist; auto-injection of `@Inject Provider<T>` is
-//!   v2 follow-up).
-//! - Plain `<recv>.<method>(...)` invocations, where `<recv>` matches
-//!   `delegate_field` either exactly or as the `<delegate_field>.get()`
-//!   provider shape.
+//! ## Auto-injection mode
 //!
-//! ## Inputs
+//! Operator supplies `delegate_type` (the NEW holder's type). The
+//! planner uses the shared `di_plumbing` helper to find or generate an
+//! `@Inject` field of that type on the enclosing class, then uses its
+//! canonical receiver expression (`<field>` or `<field>.get()`) at the
+//! rewritten call sites.
 //!
-//! - `source` (required)
-//! - `project_dir` (required)
+//! Inputs:
+//! - `delegate_field` (required) — OLD receiver text
+//! - `delegate_type` (required) — NEW type for auto-injection
+//! - `toml_entries.prefer_provider` (optional) — when true, generate
+//!   `@Inject Provider<T>` instead of `@Inject T`
+//! - `item_names` (required) — moved method names
 //! - `impl_name` (optional) — enclosing class filter
-//! - `delegate_field` (required) — OLD receiver text (e.g.
-//!   `"sessionData"` or `"sessionDataProvider.get()"`)
-//! - `new_text` (required) — NEW receiver text (e.g.
-//!   `"authorizationService"` or `"authorizationServiceProvider.get()"`)
-//! - `item_names` (required) — list of method names whose receivers
-//!   should be rewritten
 //!
-//! ## v1 refusals
+//! ## Manual-text mode (operator override)
 //!
-//! - `error.no_matches` — zero matching call sites in the file
+//! Operator supplies `new_text` explicitly. No type-aware lookup, no
+//! auto-injection — pure text rewrite of the receiver token.
 //!
-//! ## v1 limitations (followups filed separately)
+//! Inputs:
+//! - `delegate_field` (required) — OLD receiver text
+//! - `new_text` (required) — NEW receiver text. The field must already
+//!   exist; the planner does not synthesize it.
+//! - `item_names` (required)
+//! - `impl_name` (optional)
 //!
-//! - Method-reference shapes (`oldHolder::foo`) are skipped in v1.
-//! - Auto `@Inject Provider<T>` insertion when the new receiver field
-//!   doesn't exist on the enclosing class — v2 enhancement.
+//! When both `new_text` and `delegate_type` are supplied, `new_text`
+//! wins.
 
 use super::*;
+use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
 
 pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
@@ -54,13 +51,30 @@ pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Resul
         .as_deref()
         .ok_or_else(|| anyhow!("delegate_field (old receiver text) is required"))?
         .to_string();
-    let new_receiver = p
+    let manual_new_text = p
         .new_text
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| anyhow!("new_text (new receiver text) is required"))?
-        .to_string();
+        .map(str::to_string);
+    let delegate_type = p
+        .delegate_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    if manual_new_text.is_none() && delegate_type.is_none() {
+        bail!(
+            "either `new_text` (explicit new receiver text) or `delegate_type` (NEW holder \
+             type for auto-injection) is required"
+        );
+    }
+    let prefer_provider = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("prefer_provider"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let item_names: std::collections::HashSet<String> = p
         .item_names
         .as_deref()
@@ -72,21 +86,34 @@ pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Resul
         .cloned()
         .collect();
 
-    let class_filter: Option<Node<'_>> = if let Some(class_name) = p.impl_name.as_deref() {
-        Some(find_class_declaration_by_name(&parsed, class_name).ok_or_else(|| {
+    let class_node_for_inject: Node<'_> = if let Some(class_name) = p.impl_name.as_deref() {
+        find_class_declaration_by_name(&parsed, class_name).ok_or_else(|| {
             anyhow!(
                 "class `{class_name}` not found in {}",
                 source_path.display()
             )
-        })?)
+        })?
     } else {
-        None
+        find_first_class_declaration(parsed.tree.root_node())
+            .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?
+    };
+
+    // Resolve effective new receiver and collect auxiliary edits (e.g.
+    // the inject-field declaration + import addition for auto-inject mode).
+    let (new_receiver, aux_edits): (String, Vec<TextEdit>) = match (manual_new_text, delegate_type)
+    {
+        (Some(text), _) => (text, Vec::new()),
+        (None, Some(ty)) => {
+            let ensured =
+                ensure_inject_field(class_node_for_inject, &parsed.source, &ty, prefer_provider)?;
+            (ensured.field.receiver_expr(), ensured.edits)
+        }
+        _ => unreachable!("guarded above"),
     };
 
     let mut edits = Vec::new();
-    let root_node = class_filter.unwrap_or_else(|| parsed.tree.root_node());
     walk_for_call_sites(
-        root_node,
+        class_node_for_inject,
         &parsed,
         &old_receiver,
         &new_receiver,
@@ -102,6 +129,8 @@ pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Resul
         );
     }
 
+    edits.extend(aux_edits);
+    edits = dedupe_insertion_edits(edits);
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
 
