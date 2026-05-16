@@ -29,6 +29,7 @@
 //! - `error.no_matches`
 
 use super::*;
+use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
 use std::collections::HashMap;
 
 pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String> {
@@ -55,31 +56,60 @@ pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String>
                 .collect()
         })
         .unwrap_or_default();
-    if mapping.is_empty() {
+    // Optional parallel map: {getter → type-to-auto-inject}. When
+    // supplied for a getter and the type isn't already injected on the
+    // enclosing class, the planner generates an `@Inject Provider<T>`
+    // field (or `@Inject T` when prefer_provider=false).
+    let getter_types: HashMap<String, String> = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("getter_types"))
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect()
+        })
+        .unwrap_or_default();
+    if mapping.is_empty() && getter_types.is_empty() {
         bail!(
-            "toml_entries.getter_mapping is required and must be a non-empty object \
-             mapping `oldGetterName` → `newProviderField`"
+            "either `toml_entries.getter_mapping` (getter → existing Provider field name) or \
+             `toml_entries.getter_types` (getter → type to auto-inject as Provider<T>) must be \
+             supplied"
         );
     }
 
-    let class_filter: Option<Node<'_>> = if let Some(class_name) = p.impl_name.as_deref() {
-        Some(find_class_declaration_by_name(&parsed, class_name).ok_or_else(|| {
+    let class_node: Node<'_> = if let Some(class_name) = p.impl_name.as_deref() {
+        find_class_declaration_by_name(&parsed, class_name).ok_or_else(|| {
             anyhow!(
                 "class `{class_name}` not found in {}",
                 source_path.display()
             )
-        })?)
+        })?
     } else {
-        None
+        find_first_class_declaration(parsed.tree.root_node())
+            .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?
     };
 
+    // Build effective mapping. Values are BARE field names; the walker
+    // appends `.get()` itself (matching the Provider<T> shape this
+    // primitive is for). For getter_types entries, ensure_inject_field
+    // generates `@Inject Provider<T> tProvider;` and we use the bare
+    // field name.
+    let mut effective_mapping: HashMap<String, String> = mapping.clone();
+    let mut aux_edits: Vec<TextEdit> = Vec::new();
+    for (getter, type_name) in &getter_types {
+        let ensured = ensure_inject_field(class_node, &parsed.source, type_name, true)?;
+        effective_mapping.insert(getter.clone(), ensured.field.name.clone());
+        aux_edits.extend(ensured.edits);
+    }
+
     let mut edits = Vec::new();
-    let root_node = class_filter.unwrap_or_else(|| parsed.tree.root_node());
     walk_for_provider_chains(
-        root_node,
+        class_node,
         &parsed,
         &delegate_field,
-        &mapping,
+        &effective_mapping,
         &mut edits,
     );
 
@@ -90,8 +120,39 @@ pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String>
         );
     }
 
+    // Part (a) of note-4ec8ff30: if every called getter on
+    // delegate_field is covered by the operator's mapping (so every
+    // chain gets rewritten), the original `@Inject Provider<Big>
+    // delegate_field;` declaration has no remaining consumers in this
+    // file — delete it.
+    let called_getters = collect_called_getters_on_delegate(class_node, &parsed, &delegate_field);
+    let mapped_getters: std::collections::HashSet<&str> = effective_mapping
+        .keys()
+        .map(String::as_str)
+        .collect();
+    let full_coverage =
+        !called_getters.is_empty() && called_getters.iter().all(|g| mapped_getters.contains(g.as_str()));
+    let mut field_deleted = false;
+    if full_coverage {
+        if let Some(field_decl) =
+            find_private_inject_provider_field(class_node, &parsed.source, &delegate_field)
+        {
+            let start = leading_trivia_start_of_node(&parsed.source, field_decl);
+            let end = trailing_newline_after(&parsed.source, field_decl.end_byte());
+            edits.push(TextEdit {
+                byte_start: start,
+                byte_end: end,
+                replacement: String::new(),
+            });
+            field_deleted = true;
+        }
+    }
+
+    edits.extend(aux_edits);
+    edits = dedupe_insertion_edits(edits);
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
+    let _ = field_deleted;
 
     let plan = RefactorPlan {
         title: format!(
@@ -202,4 +263,158 @@ fn invocation_is_zero_arg(node: Node<'_>) -> bool {
     };
     let mut cursor = args.walk();
     args.named_children(&mut cursor).count() == 0
+}
+
+/// Walk the class node for every `<delegate_field>.get().<X>()` chain
+/// and collect the names X (the getters being called).
+fn collect_called_getters_on_delegate(
+    node: Node<'_>,
+    parsed: &ParsedSource,
+    delegate_field: &str,
+) -> std::collections::HashSet<String> {
+    let bytes = parsed.source.as_bytes();
+    let mut out = std::collections::HashSet::new();
+    let mut stack = vec![node];
+    while let Some(n) = stack.pop() {
+        let mut c = n.walk();
+        for child in n.named_children(&mut c) {
+            stack.push(child);
+        }
+        if n.kind() != "method_invocation" {
+            continue;
+        }
+        let Some(outer_name) = n.child_by_field_name("name") else {
+            continue;
+        };
+        let Ok(outer_name_text) = outer_name.utf8_text(bytes) else {
+            continue;
+        };
+        let Some(object) = n.child_by_field_name("object") else {
+            continue;
+        };
+        if object.kind() != "method_invocation" {
+            continue;
+        }
+        let inner_name = object
+            .child_by_field_name("name")
+            .and_then(|nm| nm.utf8_text(bytes).ok())
+            .map(str::to_string)
+            .unwrap_or_default();
+        if inner_name != "get" {
+            continue;
+        }
+        let Some(inner_recv) = object.child_by_field_name("object") else {
+            continue;
+        };
+        let recv_text = match inner_recv.utf8_text(bytes) {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if recv_text == delegate_field {
+            out.insert(outer_name_text.to_string());
+        }
+    }
+    out
+}
+
+/// Find `@Inject private Provider<T> <delegate_field>;` on the
+/// enclosing class. Returns the field_declaration node.
+fn find_private_inject_provider_field<'a>(
+    class_node: Node<'a>,
+    source: &str,
+    delegate_field: &str,
+) -> Option<Node<'a>> {
+    let bytes = source.as_bytes();
+    let body = class_node.child_by_field_name("body")?;
+    let mut cursor = body.walk();
+    for member in body.named_children(&mut cursor) {
+        if member.kind() != "field_declaration" {
+            continue;
+        }
+        let mut has_inject = false;
+        let mut is_private = false;
+        let mut mc = member.walk();
+        for mc_child in member.children(&mut mc) {
+            if mc_child.kind() == "modifiers" {
+                let mut mod_cursor = mc_child.walk();
+                for mod_child in mc_child.children(&mut mod_cursor) {
+                    if mod_child.kind() == "private" {
+                        is_private = true;
+                    }
+                    if matches!(mod_child.kind(), "marker_annotation" | "annotation") {
+                        let aname = mod_child
+                            .child_by_field_name("name")
+                            .and_then(|n| n.utf8_text(bytes).ok())
+                            .unwrap_or("");
+                        if aname == "Inject" {
+                            has_inject = true;
+                        }
+                    }
+                }
+            }
+        }
+        if !is_private || !has_inject {
+            continue;
+        }
+        // Type must be Provider<*>.
+        let Some(type_node) = member.child_by_field_name("type") else {
+            continue;
+        };
+        let type_text = type_node.utf8_text(bytes).unwrap_or("").trim();
+        if !type_text.starts_with("Provider<") && !type_text.contains(".Provider<") {
+            continue;
+        }
+        // Find declarator named delegate_field.
+        let mut dc = member.walk();
+        for decl in member.named_children(&mut dc) {
+            if decl.kind() != "variable_declarator" {
+                continue;
+            }
+            if let Some(name_node) = decl.child_by_field_name("name") {
+                if let Ok(name) = name_node.utf8_text(bytes) {
+                    if name == delegate_field {
+                        return Some(member);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn leading_trivia_start_of_node(source: &str, node: Node<'_>) -> usize {
+    let bytes = source.as_bytes();
+    let mut cursor = node.start_byte();
+    while cursor > 0 {
+        let b = bytes[cursor - 1];
+        if b == b' ' || b == b'\t' {
+            cursor -= 1;
+            continue;
+        }
+        if b == b'\n' {
+            cursor -= 1;
+            break;
+        }
+        break;
+    }
+    cursor
+}
+
+fn trailing_newline_after(source: &str, end: usize) -> usize {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut cursor = end;
+    while cursor < len {
+        let b = bytes[cursor];
+        if b == b' ' || b == b'\t' {
+            cursor += 1;
+            continue;
+        }
+        if b == b'\n' {
+            cursor += 1;
+            break;
+        }
+        break;
+    }
+    cursor
 }

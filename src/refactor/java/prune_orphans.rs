@@ -98,13 +98,35 @@ const PINNING_ANNOTATIONS: &[&str] = &[
 struct OrphanCandidate {
     kind: OrphanKind,
     name: String,
-    /// Byte range to delete (`leading_trivia_start..trailing_trivia_end`).
+    /// Byte range to delete (`leading_trivia_start..trailing_trivia_end`)
+    /// when this candidate is a STANDALONE declaration. For
+    /// multi-declarator declarators, this is unused — the multi-
+    /// declarator group rewrite is computed separately.
     delete_start: usize,
     delete_end: usize,
     /// Byte range of the declaration's simple-name token. Used to
     /// exclude the declaration site from the reference count.
     name_byte_start: usize,
     name_byte_end: usize,
+    /// When set, this candidate is one declarator inside a
+    /// multi-declarator field. The (field_start, field_end) identifies
+    /// the parent field_declaration; the planner groups orphan
+    /// declarators by this key and emits a single field-rewrite edit
+    /// per group.
+    multi_declarator_field: Option<MultiDeclaratorInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct MultiDeclaratorInfo {
+    field_start: usize,
+    field_end: usize,
+    /// The `private int ` prefix (modifiers + type + trailing space)
+    /// shared by all declarators.
+    type_prefix: String,
+    /// All declarator texts in source order (e.g. ["a", "b = 2", "c"])
+    declarator_texts: Vec<String>,
+    /// All declarator names in source order.
+    declarator_names: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,8 +216,6 @@ pub(crate) fn plan_prune_java_orphans(p: &RefactorPlanParams) -> Result<String> 
             .get(cand.name.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        // A reference counts unless it falls inside the candidate's own
-        // declaration name token (the declaration site itself).
         let referenced = refs.iter().any(|(s, e)| {
             !(*s == cand.name_byte_start && *e == cand.name_byte_end)
         });
@@ -215,34 +235,87 @@ pub(crate) fn plan_prune_java_orphans(p: &RefactorPlanParams) -> Result<String> 
         );
     }
 
-    // Sort orphans by ascending byte_start so the edit list is monotonic.
-    orphans.sort_by_key(|o| o.delete_start);
+    // Group multi-declarator orphans by parent field. For each group,
+    // emit a single field-rewrite edit (full delete if all declarators
+    // are orphans; partial rewrite otherwise).
+    let mut standalone_orphans: Vec<&OrphanCandidate> = Vec::new();
+    let mut multi_groups: std::collections::HashMap<
+        (usize, usize),
+        (MultiDeclaratorInfo, Vec<String>),
+    > = std::collections::HashMap::new();
+    for o in &orphans {
+        match &o.multi_declarator_field {
+            None => standalone_orphans.push(o),
+            Some(info) => {
+                let key = (info.field_start, info.field_end);
+                multi_groups
+                    .entry(key)
+                    .or_insert_with(|| (info.clone(), Vec::new()))
+                    .1
+                    .push(o.name.clone());
+            }
+        }
+    }
 
-    let edits = orphans
+    let mut edits: Vec<TextEdit> = standalone_orphans
         .iter()
         .map(|o| TextEdit {
             byte_start: o.delete_start,
             byte_end: o.delete_end,
             replacement: String::new(),
         })
-        .collect::<Vec<_>>();
+        .collect();
+    for ((field_start, field_end), (info, orphan_names)) in &multi_groups {
+        let total = info.declarator_names.len();
+        let orphan_set: HashSet<&str> = orphan_names.iter().map(String::as_str).collect();
+        if orphan_names.len() == total {
+            // Every declarator in this field is orphaned — full delete.
+            edits.push(TextEdit {
+                byte_start: *field_start,
+                byte_end: *field_end,
+                replacement: String::new(),
+            });
+        } else {
+            // Partial: rewrite the field with only the surviving declarators.
+            let kept: Vec<String> = info
+                .declarator_names
+                .iter()
+                .zip(info.declarator_texts.iter())
+                .filter(|(n, _)| !orphan_set.contains(n.as_str()))
+                .map(|(_, t)| t.clone())
+                .collect();
+            let replacement = format!("{}{};\n", info.type_prefix, kept.join(", "));
+            edits.push(TextEdit {
+                byte_start: *field_start,
+                byte_end: *field_end,
+                replacement,
+            });
+        }
+    }
+    edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
 
-    let items = orphans
+    let items: Vec<SyntaxItem> = orphans
         .iter()
-        .map(|o| SyntaxItem {
-            kind: format!("java_{}", o.kind.as_str()),
-            name: Some(o.name.clone()),
-            byte_start: o.delete_start,
-            byte_end: o.delete_end,
-            line_start: byte_to_line(&parsed.source, o.delete_start),
-            line_end: byte_to_line(&parsed.source, o.delete_end),
-            leading_trivia_start: o.delete_start,
-            trailing_trivia_end: o.delete_end,
-            attributes: Vec::new(),
-            plan_local_id: format!("orphan-{}-{}", o.kind.as_str(), o.name),
+        .map(|o| {
+            let (start, end) = match &o.multi_declarator_field {
+                Some(info) => (info.field_start, info.field_end),
+                None => (o.delete_start, o.delete_end),
+            };
+            SyntaxItem {
+                kind: format!("java_{}", o.kind.as_str()),
+                name: Some(o.name.clone()),
+                byte_start: start,
+                byte_end: end,
+                line_start: byte_to_line(&parsed.source, start),
+                line_end: byte_to_line(&parsed.source, end),
+                leading_trivia_start: start,
+                trailing_trivia_end: end,
+                attributes: Vec::new(),
+                plan_local_id: format!("orphan-{}-{}", o.kind.as_str(), o.name),
+            }
         })
-        .collect::<Vec<_>>();
+        .collect();
 
     let plan = RefactorPlan {
         title: format!(
@@ -361,6 +434,7 @@ fn consider_method(
     let candidate = OrphanCandidate {
         kind: OrphanKind::Method,
         name: name.to_string(),
+        multi_declarator_field: None,
         delete_start: leading_trivia_start_of(&parsed.source, node),
         delete_end: trailing_trivia_end_of(&parsed.source, node.end_byte()),
         name_byte_start: name_node.start_byte(),
@@ -384,14 +458,52 @@ fn consider_field(
         return;
     }
     if declarators.len() > 1 {
-        // Multi-declarator field declarations are not pruned in v1 —
-        // emit one excluded candidate per declarator so the operator
-        // can see which names were skipped and why.
+        // Multi-declarator field. Build a MultiDeclaratorInfo shared
+        // across all declarators, then register each declarator as a
+        // candidate. The orphan-collection phase groups by
+        // field_start/field_end and emits a single field-rewrite edit
+        // per group.
+        let bytes = parsed.source.as_bytes();
+        let type_node = match node.child_by_field_name("type") {
+            Some(t) => t,
+            None => return,
+        };
+        let modifiers_prefix_end = type_node.end_byte();
+        // Type prefix runs from field_decl start through end of the
+        // type node, plus a trailing space (which exists between type
+        // and the first declarator in the source).
+        let prefix_end_with_space = {
+            let mut e = modifiers_prefix_end;
+            while e < bytes.len() && (bytes[e] == b' ' || bytes[e] == b'\t') {
+                e += 1;
+            }
+            e
+        };
+        let type_prefix = parsed.source[node.start_byte()..prefix_end_with_space].to_string();
+        let mut decl_texts = Vec::new();
+        let mut decl_names = Vec::new();
+        for d in &declarators {
+            let dt = parsed.source[d.start_byte()..d.end_byte()].to_string();
+            let dn = d
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(bytes).ok())
+                .unwrap_or("")
+                .to_string();
+            decl_texts.push(dt);
+            decl_names.push(dn);
+        }
+        let info = MultiDeclaratorInfo {
+            field_start: leading_trivia_start_of(&parsed.source, node),
+            field_end: trailing_trivia_end_of(&parsed.source, node.end_byte()),
+            type_prefix,
+            declarator_texts: decl_texts,
+            declarator_names: decl_names,
+        };
         for decl in &declarators {
             let Some(name_node) = decl.child_by_field_name("name") else {
                 continue;
             };
-            let Ok(name) = name_node.utf8_text(parsed.source.as_bytes()) else {
+            let Ok(name) = name_node.utf8_text(bytes) else {
                 continue;
             };
             if let Some(filter) = name_filter
@@ -406,11 +518,17 @@ fn consider_field(
                 delete_end: 0,
                 name_byte_start: name_node.start_byte(),
                 name_byte_end: name_node.end_byte(),
+                multi_declarator_field: Some(info.clone()),
             };
-            out.push((
-                candidate,
-                Some("excluded_multi_declarator".to_string()),
-            ));
+            // serialVersionUID guard also applies to multi-declarator
+            // declarators.
+            let reason =
+                if name == "serialVersionUID" && field_is_long_type(node, &parsed.source) {
+                    Some("excluded_serial_version_uid".to_string())
+                } else {
+                    method_or_field_exclusion_reason(node, parsed)
+                };
+            out.push((candidate, reason));
         }
         return;
     }
@@ -429,6 +547,7 @@ fn consider_field(
     let candidate = OrphanCandidate {
         kind: OrphanKind::Field,
         name: name.to_string(),
+        multi_declarator_field: None,
         delete_start: leading_trivia_start_of(&parsed.source, node),
         delete_end: trailing_trivia_end_of(&parsed.source, node.end_byte()),
         name_byte_start: name_node.start_byte(),
@@ -467,6 +586,7 @@ fn consider_inner_class(
     let candidate = OrphanCandidate {
         kind: OrphanKind::InnerClass,
         name: name.to_string(),
+        multi_declarator_field: None,
         delete_start: leading_trivia_start_of(&parsed.source, node),
         delete_end: trailing_trivia_end_of(&parsed.source, node.end_byte()),
         name_byte_start: name_node.start_byte(),

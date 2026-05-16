@@ -682,14 +682,33 @@ verbatim (including throws clause). The original method body becomes
 name defaults to PascalCase of the method name + `"Operation"`;
 override via `new_text`.
 
-**v1 limitations**: the generated class has no reference to the
-enclosing instance. Original-body uses of `this.<field>` or `super.<x>`
-get flagged with a `// FIXME(method-object):` header inside `execute()`
-and counted in `fixme_count.warning`. The operator either lifts those
-references to parameters first or hand-edits the generated class to
-take an `Outer` constructor argument. v2 auto-capture is a planned
-follow-up. Refuses static methods, abstract methods, constructors, and
-interface methods.
+The planner builds a class-field index of the enclosing class and a
+lexical scope of the method, then auto-captures READ-ONLY enclosing
+field references. Each `this.field` (or bare `field`) read becomes a
+constructor parameter on the Method Object class; the call site is
+synthesized as `new MOClass(originalArgs..., this.field1, this.field2)
+.execute()`. Body rewrite strips the `this.` prefix; bare field
+references stay (they bind to the new class's field of the same name).
+
+**Refusal classes** (operator-actionable, no FIXME-and-hope):
+- `error.mutated_enclosing_field(name)` — body reassigns `this.X` or
+  uses `++`/`--` on it. Method Object captures fields by VALUE so
+  mutations can't propagate back; refactor to return the new value.
+- `error.enclosing_method_call(name)` — receiverless call to an
+  enclosing-class method. Inline that helper first (`java-inline-method`),
+  move it to the new MO class, or pass an `Outer` instance manually.
+- `error.unresolvable_reference(name)` — bare identifier or `this.X`
+  references a field/method that doesn't exist on the enclosing class.
+  Likely a static import — qualify the call explicitly (`Math.max`) and
+  re-run.
+- `error.super_reference` — body uses `super.X`. No safe way to capture
+  super in a separate class; refactor.
+- `error.bare_this_reference` — body uses `this` as a value (identity
+  comparison, return value). The Method Object class doesn't share
+  identity; refactor.
+
+Refuses static methods, abstract methods, constructors, and interface
+methods.
 
 14b2. Intra-method extraction — lift a statement range into a private helper:
 
@@ -715,11 +734,26 @@ etc. The synthesized call site is `<helper>(<args>);` for void returns
 and `<return_type> <return_var> = <helper>(<args>);` for non-void. Use
 `new_text` for unusual call-site shapes (chained call, try/catch wrap).
 
-**v1 is manual mode**: the operator owns the parameter and argument
-lists. The planner does NOT yet infer captures from the AST — if the
-extracted range reads three locals and you supply zero parameters, the
-helper compiles but won't see those locals. v2 inference (capture /
-mutated-capture / multi-return analysis) is a planned follow-up.
+The planner builds a lexical scope tree for the enclosing method and
+analyzes the selected byte range. **Inferred automatically**:
+- parameters (variables read inside the range whose declarations are
+  outside) — typed via the scope's declared types
+- return type and return variable (a variable declared inside the
+  range and read after it)
+- refusals: `error.mutated_capture(name)` (captured local reassigned
+  in range; Java has no out-params), `error.multi_return_needs_record`
+  (multiple inner declarations used after; operator must write a
+  record type first), `error.non_local_control_flow(kind)` (return /
+  break / continue inside the range targeting outside).
+
+References to `this.field`, `super`, and bare identifiers that resolve
+to enclosing-class members do NOT need parameters — the generated
+helper is on the same class and resolves them via `this` directly.
+
+The operator can override inferred parameters by supplying
+`parameters` + `toml_entries.arguments`. Use this when you specifically
+want different parameter names (e.g. interface type instead of concrete
+implementation) — otherwise let inference run.
 
 14c. Janitor pass — delete unused private members:
 

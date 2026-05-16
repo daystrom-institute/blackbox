@@ -5,7 +5,7 @@
   "version": 1,
   "subcontract": "refactor/v1",
   "manifest": {
-    "description": "Extract a statement range out of a Java method body into a new private helper — manual mode (operator supplies parameters and arguments).",
+    "description": "Extract a statement range out of a Java method body into a new private helper. Captures, return type, and refusal conditions (mutated capture / multi-return / non-local control flow) are inferred from a lexical scope analysis; operator can override by supplying explicit `parameters` + `arguments`.",
     "when_to_use": [
       "shrink a god-method by lifting one logical chunk into a named helper",
       "split-then-rename: extract a chunk, name it, run java-rename-symbol on the helper later",
@@ -13,8 +13,9 @@
     ],
     "anti_patterns": [
       "do not use for cross-method extraction — old_text must fit inside one method body",
-      "do not use without specifying parameters when the range reads locals — supply parameters explicitly until capture inference ships (v2)",
-      "do not use to extract a return-yielding range without setting return_type — call site will compile but silently lose the value"
+      "do not pre-fight inference with manual `parameters` unless you specifically want different param names / types — the planner infers from scope automatically",
+      "do not try to extract a range that reassigns a captured variable; the planner refuses with `error.mutated_capture` — restructure first",
+      "do not try to extract a range that returns / breaks / continues to outside the range; refuses with `error.non_local_control_flow`"
     ],
     "inputs": {
       "schema": {
