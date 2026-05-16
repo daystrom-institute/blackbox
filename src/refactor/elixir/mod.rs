@@ -26,6 +26,7 @@ use tree_sitter::{Node, Tree};
 use super::ParsedSource;
 use crate::chunker::code::parser_for_language;
 
+pub(crate) mod codegen_audit;
 pub(crate) mod extract_behaviour;
 pub(crate) mod extract_module;
 pub(crate) mod facade;
@@ -36,9 +37,12 @@ pub(crate) mod module_deps;
 pub(crate) mod organize_aliases;
 pub(crate) mod pipe_chain;
 pub(crate) mod public_api_guard;
+pub(crate) mod rename;
 pub(crate) mod split_clauses;
+pub(crate) mod test_fixture;
 pub(crate) mod with_clause;
 
+pub(crate) use codegen_audit::plan_codegen_audit;
 pub(crate) use extract_behaviour::plan_extract_behaviour;
 pub(crate) use extract_module::plan_extract_module;
 pub(crate) use facade::plan_facade_delegations;
@@ -49,7 +53,9 @@ pub(crate) use module_deps::plan_module_dependency_analysis;
 pub(crate) use organize_aliases::plan_organize_aliases;
 pub(crate) use pipe_chain::plan_pipe_chain_extract;
 pub(crate) use public_api_guard::plan_public_api_guard;
+pub(crate) use rename::plan_rename_symbol;
 pub(crate) use split_clauses::plan_split_clauses_by_tag;
+pub(crate) use test_fixture::plan_test_fixture_extract;
 pub(crate) use with_clause::plan_with_clause_extract;
 
 // Shared helper used by sibling submodules + tests for line/col reporting.

@@ -1369,6 +1369,104 @@ end
 }
 
 // ---------------------------------------------------------------------------
+// rename_elixir_symbol tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rename_elixir_symbol_refuses_always_in_v1() {
+    let body = "defmodule Foo do\n  def hello, do: :world\nend\n";
+    let (_dir, src) = write_elixir_fixture("rename_target.ex", body);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("position_line".to_string(), serde_json::json!(2));
+    entries.insert("position_column".to_string(), serde_json::json!(7));
+    entries.insert("new_name".to_string(), serde_json::json!("greet"));
+    entries.insert(
+        "expected_symbol_kind".to_string(),
+        serde_json::json!("public_def_cross_file"),
+    );
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "rename_elixir_symbol".to_string(),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("symbol_not_renameable"), "got: {err}");
+    // Refusal carries the capability matrix (encoded in the error body).
+    assert!(err.to_string().contains("capability_matrix"));
+}
+
+// ---------------------------------------------------------------------------
+// elixir_codegen_audit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn codegen_audit_detects_quote_blocks() {
+    let body = r#"defmodule App.WorkflowProjector do
+  @moduledoc false
+
+  def build(workflow) do
+    quote do
+      defmodule unquote(workflow.module) do
+        def evaluate(entity), do: entity
+      end
+    end
+  end
+end
+"#;
+    let (_dir, src) = write_elixir_fixture("codegen.ex", body);
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_codegen_audit".to_string(),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let sites = value["codegen_sites"].as_array().unwrap();
+    assert!(!sites.is_empty(), "expected at least one codegen site");
+    assert!(
+        sites
+            .iter()
+            .any(|s| s["kind"].as_str() == Some("defmodule_codegen"))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// elixir_test_fixture_extract tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_fixture_extract_pulls_duplicated_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let setup_body = "setup do\n  ctx = %{user: :alice, db: :test}\n  {:ok, ctx}\nend";
+    for i in 0..3 {
+        let test_file = dir.path().join(format!("test_{i}_test.exs"));
+        let content = format!(
+            "defmodule Test{i} do\n  use ExUnit.Case\n  {setup_body}\nend\n"
+        );
+        std::fs::write(&test_file, content).unwrap();
+    }
+    let target = dir.path().join("test/support/fixtures.ex");
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("fixture_name".to_string(), serde_json::json!("graph"));
+    entries.insert("min_duplicates".to_string(), serde_json::json!(3));
+    let params = RefactorPlanParams {
+        source: dir.path().to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "elixir_test_fixture_extract".to_string(),
+        module_name: Some("Test.Fixtures".to_string()),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let groups = value["duplicate_groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    let occ = groups[0]["occurrences"].as_array().unwrap();
+    assert_eq!(occ.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 
