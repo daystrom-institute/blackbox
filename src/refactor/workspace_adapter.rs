@@ -134,13 +134,16 @@ pub trait WorkspaceTransactionAdapter: Send + Sync {
 /// 4. If the step list is command-only or has no plan steps, returns
 ///    `Ok(None)` (no adapter to mirror into).
 pub fn resolve_workspace_adapter(
-    _steps: &[RefactorRunStep],
-    _project: &Path,
+    steps: &[RefactorRunStep],
+    project: &Path,
 ) -> Result<Option<Arc<dyn WorkspaceTransactionAdapter>>> {
-    // Phase 1: no adapter implementations registered. Phase 2 adds a
-    // registry keyed by language prefix; the C# sidecar entry plugs
-    // in here.
-    Ok(None)
+    // Delegate to the C# sidecar resolver. When the steps are
+    // entirely non-csharp_*, it returns Ok(None) and the runner
+    // short-circuits. When mixed, it raises
+    // error.mixed_workspace_adapters. When the sidecar binary is
+    // unavailable, it returns Ok(None) and the runner uses
+    // disk-only semantics — Phase 1 plan kinds still work.
+    super::csharp_sidecar::resolve_csharp_adapter(steps, project)
 }
 
 #[cfg(test)]

@@ -36,9 +36,9 @@ pub struct RpcRequest<P> {
 pub struct RpcResponse<R> {
     pub jsonrpc: String,
     pub id: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<R>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<RpcError>,
 }
 
