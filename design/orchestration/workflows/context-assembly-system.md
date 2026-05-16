@@ -43,8 +43,8 @@ controls stay outside the template as provider launch policy.
 
 There is no new context workflow runtime, context graph, hook registry, or
 session context object in v1. When turn construction needs dynamic work, it
-uses existing atom/workflow/rule-packet machinery as an explicit context
-producer.
+uses existing atom and rule-packet machinery as an explicit context producer
+(workflow-backed producers ship later — see Context Producers).
 
 ## Goals
 
@@ -62,8 +62,8 @@ producer.
 
 - Do not build a general context assembly graph.
 - Do not introduce implicit or hidden dynamic discovery hooks in v1. Any lookup
-  used for turn construction must be produced by an explicit atom/workflow
-  context producer before rendering.
+  used for turn construction must be produced by an explicit atom context
+  producer before rendering.
 - Do not require workflow dispatch to use context producers. Workflow dispatch
   only gets heavier when an actor node or brofile explicitly names one.
 - Do not store provider transcript content in blackbox for continuity. Provider
@@ -369,8 +369,8 @@ Producer failure policy is **per-turn opt-in**, default render-without:
      transcript and bro state remain exactly as they were before the
      resume attempt; no provider was spawned; no event was emitted; no
      task-store row was inserted.
-  4. Cap-check, render, emit `dispatch.template_resolved`, insert task,
-     launch provider.
+  4. Cap-check, render, insert task, emit `dispatch.template_resolved`
+     (event references the inserted task row), launch provider.
 
   `bro_exec` follows the same ordering minus the lease step. A producer
   failure on `bro_exec` returns `error.context_producer_failed` and
