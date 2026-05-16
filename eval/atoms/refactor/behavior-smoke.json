@@ -489,6 +489,57 @@
         "expected_block_reason_substring": "lsp_unavailable"
       },
       "done_note_required": true
+    },
+    {
+      "atom": "csharp-unseal-strangler",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:unseal_csharp_class",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "missing-acknowledge-flag",
+        "expected_block_reason_substring": "acknowledge_subclass_surface_change"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "csharp-partial-sg-guard",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:csharp_partial_class_audit",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "roslyn-sidecar-unavailable",
+        "expected_block_reason_substring": "lsp_unavailable"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "csharp-nullable-coverage-fix",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:csharp_nullable_annotation_repair",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "roslyn-sidecar-unavailable",
+        "expected_block_reason_substring": "lsp_unavailable"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "csharp-awaited-query-audit",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:csharp_awaited_query_in_loop_audit",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "roslyn-sidecar-unavailable",
+        "expected_block_reason_substring": "lsp_unavailable"
+      },
+      "done_note_required": true
     }
   ]
 }

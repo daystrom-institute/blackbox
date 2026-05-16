@@ -283,6 +283,38 @@
         "csharp-using-organize"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-unseal-strangler",
+      "query": "remove sealed modifier from csharp service class so tests can subclass",
+      "expected_atoms": [
+        "csharp-unseal-strangler"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-partial-sg-guard",
+      "query": "audit csharp source generators that bind to partial classes before structural refactor",
+      "expected_atoms": [
+        "csharp-partial-sg-guard"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-nullable-coverage-fix",
+      "query": "annotate uninitialized non nullable csharp properties with required modifier",
+      "expected_atoms": [
+        "csharp-nullable-coverage-fix"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-awaited-query-audit",
+      "query": "report awaited calls inside for foreach loop bodies in csharp method",
+      "expected_atoms": [
+        "csharp-awaited-query-audit"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [
