@@ -86,8 +86,10 @@ pub struct LspOverrides {
     pub jdtls_init_timeout_secs: Option<u64>,
     pub jdtls_ready_timeout_secs: Option<u64>,
     pub rust_analyzer_init_timeout_secs: Option<u64>,
+    pub roslyn_init_timeout_secs: Option<u64>,
     pub jdtls_bin: Option<Option<String>>,
     pub rust_analyzer_bin: Option<Option<String>>,
+    pub roslyn_lsp_bin: Option<Option<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -210,8 +212,11 @@ struct RawLspConfig {
     pub jdtls_ready_timeout_secs: u64,
     #[serde(default = "default_lsp_rust_analyzer_init_timeout_secs")]
     pub rust_analyzer_init_timeout_secs: u64,
+    #[serde(default = "default_lsp_roslyn_init_timeout_secs")]
+    pub roslyn_init_timeout_secs: u64,
     pub jdtls_bin: Option<String>,
     pub rust_analyzer_bin: Option<String>,
+    pub roslyn_lsp_bin: Option<String>,
 }
 
 fn default_lsp_idle_timeout_secs() -> u64 {
@@ -232,6 +237,9 @@ fn default_lsp_jdtls_ready_timeout_secs() -> u64 {
     60
 }
 fn default_lsp_rust_analyzer_init_timeout_secs() -> u64 {
+    60
+}
+fn default_lsp_roslyn_init_timeout_secs() -> u64 {
     60
 }
 
@@ -346,8 +354,10 @@ pub struct LspConfig {
     pub jdtls_init_timeout_secs: u64,
     pub jdtls_ready_timeout_secs: u64,
     pub rust_analyzer_init_timeout_secs: u64,
+    pub roslyn_init_timeout_secs: u64,
     pub jdtls_bin: Option<String>,
     pub rust_analyzer_bin: Option<String>,
+    pub roslyn_lsp_bin: Option<String>,
 }
 
 /// Transcript configuration
@@ -418,8 +428,10 @@ impl Config {
                 jdtls_init_timeout_secs: default_lsp_jdtls_init_timeout_secs(),
                 jdtls_ready_timeout_secs: default_lsp_jdtls_ready_timeout_secs(),
                 rust_analyzer_init_timeout_secs: default_lsp_rust_analyzer_init_timeout_secs(),
+                roslyn_init_timeout_secs: default_lsp_roslyn_init_timeout_secs(),
                 jdtls_bin: None,
                 rust_analyzer_bin: None,
+                roslyn_lsp_bin: None,
             },
             transcripts: RawTranscriptConfig {
                 roots: None,
@@ -565,6 +577,17 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
     {
         raw.lsp.rust_analyzer_bin = Some(bin);
     }
+    if let Ok(timeout) = std::env::var("BLACKBOX_ROSLYN_INIT_TIMEOUT_SECS")
+        && !timeout.trim().is_empty()
+        && let Ok(t) = timeout.parse()
+    {
+        raw.lsp.roslyn_init_timeout_secs = t;
+    }
+    if let Ok(bin) = std::env::var("BLACKBOX_ROSLYN_LSP_BIN")
+        && !bin.trim().is_empty()
+    {
+        raw.lsp.roslyn_lsp_bin = Some(bin);
+    }
 
     // Provider bins
     macro_rules! set_provider_bin {
@@ -687,8 +710,10 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             jdtls_init_timeout_secs: raw.lsp.jdtls_init_timeout_secs,
             jdtls_ready_timeout_secs: raw.lsp.jdtls_ready_timeout_secs,
             rust_analyzer_init_timeout_secs: raw.lsp.rust_analyzer_init_timeout_secs,
+            roslyn_init_timeout_secs: raw.lsp.roslyn_init_timeout_secs,
             jdtls_bin: raw.lsp.jdtls_bin,
             rust_analyzer_bin: raw.lsp.rust_analyzer_bin,
+            roslyn_lsp_bin: raw.lsp.roslyn_lsp_bin,
         },
         transcripts: TranscriptConfig {
             roots: raw.transcripts.roots,

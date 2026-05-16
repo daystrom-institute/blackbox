@@ -1,0 +1,110 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "csharp-using-organize",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Run the Roslyn LSP source.organizeImports code action on a single C# file. Mirrors rust-organize-imports / java-organize-imports.",
+    "when_to_use": [
+      "post-rename / post-extract cleanup when using directives may be stale",
+      "operator wants a deterministic using-sort across a folder (the atom runs per file)",
+      "preparing a file for review where the using block ordering is noisy"
+    ],
+    "anti_patterns": [
+      "do not run on auto-generated files (*.g.cs, *.Designer.cs, Generated/)",
+      "do not use as a substitute for full `dotnet format style` — this only touches usings",
+      "do not retry on error.lsp_unavailable; surface the failure and let the operator install Microsoft.CodeAnalysis.LanguageServer"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source_file"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the C# project root."
+          },
+          "source_file": {
+            "type": "string",
+            "description": "Target .cs file, relative to project_dir."
+          }
+        }
+      },
+      "prompt_template": "You are csharp-using-organize. Charter: invoke the Roslyn LSP source.organizeImports code action on ONE .cs file. RX-V3 fail-closed on LSP unavailability.\n\nProtocol:\n\n1. Ground structurally:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n\n2. Plan:\n   bbox_refactor_plan(kind=\"csharp_organize_usings\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source_file}}\")\n   If response is `error.lsp_unavailable` → bbox_note(kind=\"blocked\",\n     body=\"Roslyn LSP unavailable; install Microsoft.CodeAnalysis.LanguageServer or set BLACKBOX_ROSLYN_LSP_BIN\"). Exit.\n   If no edits are produced (already organized) → bbox_note(kind=\"done\",\n     body=\"usings already organized in {{source_file}}\"). Exit.\n\n3. Apply via run:\n   bbox_refactor_run(steps=[\n     {op: \"plan\", kind: \"csharp_organize_usings\",\n      project_dir: \"{{project_dir}}\", source: \"{{source_file}}\"}\n   ])\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=\"organized usings in {{source_file}}; <n> edits applied\").\n\nStrict refusal rules:\n- Never call any tool outside the refactor persona tool surface.\n- Never edit a second file in the same invocation — one .cs per atom call.\n- Never set the operator-authority flags (none apply to this kind).\n\nInputs:\n{{project_dir}} {{source_file}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "edit_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          }
+        }
+      },
+      "evidence_density": "low"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      },
+      "parallel_safe": "per_file",
+      "chainable_after": [
+        "csharp-filescoped-batch"
+      ]
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:csharp-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

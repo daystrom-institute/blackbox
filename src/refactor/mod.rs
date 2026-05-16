@@ -15,7 +15,11 @@ mod rust;
 use rust::*;
 mod java;
 use java::*;
+pub(crate) mod csharp;
+pub(crate) mod csharp_sidecar;
+pub(crate) mod csharp_sidecar_protocol;
 pub(crate) mod elixir;
+pub(crate) mod workspace_adapter;
 pub(crate) mod plan_slot;
 pub(crate) mod rust_compile_fix;
 pub(crate) mod rust_deep;
@@ -599,6 +603,13 @@ pub enum CaptureSpec {
     /// Parse stdout as `cargo --message-format=json` output and extract
     /// `compiler-message` entries.  Malformed lines are silently dropped.
     RustcJson,
+    /// Parse a `dotnet build -bl:<path>` binary log file (path in
+    /// `args`, recovered from the resolved command line) for MSBuild
+    /// + Roslyn + analyzer + emit + restore diagnostics. Falls back to
+    /// stdout-scrape parsing when the binlog file is absent. v1 ships
+    /// the stdout-scrape path; structured-log parsing via
+    /// `Microsoft.Build.Logging.StructuredLogger` lands in a follow-up.
+    Binlog,
 }
 
 /// Failure-handling mode for a Command step (RX-F2b).
@@ -739,6 +750,18 @@ pub enum SemanticStatus {
     #[serde(alias = "unverified")]
     IndexedHints,
     LspVerified,
+    /// Same authority as `LspVerified`, but a semantic caveat applies
+    /// that the operator has explicitly acknowledged. Two triggers in v1
+    /// (per design/refactor-tools/csharp/refactor-csharp-expansion.md):
+    /// 1. RX-V5 — workspace failed expected-vs-loaded comparison and
+    ///    operator passed `acknowledge_partial_workspace=true`.
+    /// 2. RX-V4 — raw-classification or unknown-package source generator
+    ///    in scope; operator declared coverage via `generator_inputs`
+    ///    manifest. Audit cannot fully verify the declaration matches.
+    /// Downstream consumers MUST treat this tier as semantically weaker
+    /// than `LspVerified` for any consumer that aggregates across
+    /// projects (cross-project rename, public-API guard).
+    LspVerifiedPartial,
 }
 
 /// Lifecycle state of a `RefactorPlan` (RX-A2).
@@ -1240,6 +1263,29 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "inline_elixir_module" => elixir::plan_inline_module(p),
         "rename_elixir_symbol" => elixir::plan_rename_symbol(p),
         "split_elixir_clauses_by_tag" => elixir::plan_split_clauses_by_tag(p),
+        // C# track (design/refactor-tools/csharp/refactor-csharp-expansion.md).
+        // Phase 1 ships workspace_probe, filescoped_namespace, and lsp_rename;
+        // remaining kinds dispatch to typed stubs that surface the contract.
+        "csharp_workspace_probe" => csharp::plan_workspace_probe(p),
+        "migrate_csharp_to_filescoped_namespace" => csharp::plan_filescoped_namespace(p),
+        "csharp_lsp_rename" => csharp::plan_lsp_rename(p, ctx),
+        "csharp_organize_usings" => csharp::plan_organize_usings(p, ctx),
+        "csharp_lsp_move_item" => csharp::plan_lsp_move_item(p, ctx),
+        "find_csharp_usages" => csharp::plan_find_csharp_usages(p, ctx),
+        "csharp_public_api_guard" => csharp::plan_public_api_guard(p),
+        "move_csharp_type_to_file" => csharp::plan_move_type_to_file(p),
+        "migrate_csharp_type_usages" => csharp::plan_migrate_type_usages(p),
+        "csharp_to_record_migrate" => csharp::plan_to_record_migrate(p),
+        "csharp_primary_ctor_migrate" => csharp::plan_primary_ctor_migrate(p),
+        "csharp_async_dispose_convert" => csharp::plan_async_dispose_convert(p),
+        // Phase 2 (sidecar-required) — distinct error so callers
+        // distinguish "not built yet" from "needs sidecar".
+        "csharp_partial_class_audit" => csharp::plan_partial_class_audit(p),
+        "csharp_awaited_query_in_loop_audit" => csharp::plan_awaited_query_audit(p),
+        "csharp_compile_fix_round" => csharp::plan_compile_fix_round(p),
+        "csharp_nullable_annotation_repair" => csharp::plan_nullable_annotation_repair(p),
+        "unseal_csharp_class" => csharp::plan_unseal(p),
+        "move_csharp_members_to_partial" => csharp::plan_move_members_to_partial(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
@@ -1757,6 +1803,23 @@ pub fn run_with_ctx(
 
     let steps = expand_refactor_run_steps(&p.steps, &project_dir)?;
 
+    // Resolve the language-scoped workspace transaction adapter
+    // (Phase 2: C# Roslyn sidecar). Phase 1 always returns None — the
+    // adapter calls below are no-ops for Rust/Java/generic kinds and
+    // remain no-ops for C# until the sidecar lands. Mixed-language
+    // step lists refuse here via `error.mixed_workspace_adapters`.
+    let workspace_adapter =
+        workspace_adapter::resolve_workspace_adapter(&steps, &project_dir)?;
+    // Use a deterministic run-id derived from steps + project + now so
+    // sidecar logs are trace-able. We don't pull in the `uuid` crate
+    // just for this — a SHA hash of the structured input suffices.
+    let run_id = compute_run_id(p, &project_dir);
+    if let Some(adapter) = workspace_adapter.as_ref() {
+        // Per the design doc: failing here MUST be benign — the
+        // runner continues with disk-only semantics. Log + drop.
+        let _ = adapter.begin(&run_id, &project_dir);
+    }
+
     for (idx, step) in steps.iter().enumerate() {
         match step {
             RefactorRunStep::Plan { params, optional } => {
@@ -1806,7 +1869,7 @@ pub fn run_with_ctx(
                             }
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1917,7 +1980,7 @@ pub fn run_with_ctx(
                         }
                         Err(err) => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -1963,7 +2026,7 @@ pub fn run_with_ctx(
                         if p.allow_unregistered_paths != Some(true) {
                             if let Err(err) = ensure_path_in_registered_project(&path, projects) {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1982,7 +2045,7 @@ pub fn run_with_ctx(
                                 if let Err(err) = ensure_git_clean_for_path(&path) {
                                     let cursor = capture_ctx.first_soft_fail_snapshot_idx();
                                     let rollback_errors =
-                                        restore_snapshots_from(&snapshots, cursor);
+                                        rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                     return Ok(serde_json::to_string_pretty(
                                         &RefactorRunResponse {
                                             status: "step_failed".to_string(),
@@ -2004,7 +2067,7 @@ pub fn run_with_ctx(
                                 Err(err) => {
                                     let cursor = capture_ctx.first_soft_fail_snapshot_idx();
                                     let rollback_errors =
-                                        restore_snapshots_from(&snapshots, cursor);
+                                        rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                     return Ok(serde_json::to_string_pretty(
                                         &RefactorRunResponse {
                                             status: "step_failed".to_string(),
@@ -2049,7 +2112,7 @@ pub fn run_with_ctx(
                         Ok(apply_text) => apply_text,
                         Err(err) => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -2068,7 +2131,7 @@ pub fn run_with_ctx(
                             Ok(response) => response,
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -2086,6 +2149,31 @@ pub fn run_with_ctx(
                     let validations = apply_response.validations.clone();
                     let step_written = apply_response.files_written.clone();
                     files_written.extend(step_written.iter().cloned());
+                    // Mirror the applied edit into the language-scoped
+                    // workspace snapshot, when an adapter is in scope.
+                    // We assemble an AppliedPlanDelta from the plan's
+                    // FileEdits / FileMoves and call apply_plan_step.
+                    if status == "ok"
+                        && let Some(adapter) = workspace_adapter.as_ref()
+                    {
+                        let edits: Vec<FileEdit> = refactor_plan.edits.clone();
+                        let moves: Vec<FileMove> = refactor_plan.file_moves.clone();
+                        let created: Vec<PathBuf> = moves
+                            .iter()
+                            .map(|m| PathBuf::from(&m.target_path))
+                            .collect();
+                        let deleted: Vec<PathBuf> = moves
+                            .iter()
+                            .map(|m| PathBuf::from(&m.source_path))
+                            .collect();
+                        let delta = workspace_adapter::AppliedPlanDelta {
+                            edits: &edits,
+                            file_moves: &moves,
+                            created: &created,
+                            deleted: &deleted,
+                        };
+                        let _ = adapter.apply_plan_step(&run_id, &delta);
+                    }
                     reports.push(RefactorRunStepReport {
                         index: idx,
                         op: "plan".to_string(),
@@ -2099,7 +2187,7 @@ pub fn run_with_ctx(
                     });
                     if status != "ok" {
                         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -2144,7 +2232,7 @@ pub fn run_with_ctx(
                 if agent_origin {
                     if let Err(err) = enforce_agent_command_allowlist(command, args, touches) {
                         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                         reports.push(RefactorRunStepReport {
                             index: idx,
                             op: "command".to_string(),
@@ -2201,7 +2289,7 @@ pub fn run_with_ctx(
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -2239,7 +2327,7 @@ pub fn run_with_ctx(
                             captured_diagnostics_summary: None,
                         });
                         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -2264,19 +2352,44 @@ pub fn run_with_ctx(
                         }
                     }
                 };
-                let captured_diag_summary = if let Some(CaptureSpec::RustcJson) = capture {
-                    let parsed = parse_rustc_json_output(&command_result.stdout);
-                    let summary = CapturedDiagnosticsSummary {
-                        count: parsed.len(),
-                        severity_counts: parsed.iter().fold(HashMap::new(), |mut acc, d| {
-                            *acc.entry(d.level.clone()).or_insert(0) += 1;
-                            acc
-                        }),
-                    };
-                    capture_ctx.stash("last".to_string(), parsed);
-                    Some(summary)
-                } else {
-                    None
+                let captured_diag_summary = match capture.as_ref() {
+                    Some(CaptureSpec::RustcJson) => {
+                        let parsed = parse_rustc_json_output(&command_result.stdout);
+                        let summary = CapturedDiagnosticsSummary {
+                            count: parsed.len(),
+                            severity_counts: parsed.iter().fold(
+                                HashMap::new(),
+                                |mut acc, d| {
+                                    *acc.entry(d.level.clone()).or_insert(0) += 1;
+                                    acc
+                                },
+                            ),
+                        };
+                        capture_ctx.stash("last".to_string(), parsed);
+                        Some(summary)
+                    }
+                    Some(CaptureSpec::Binlog) => {
+                        // v1 binlog parsing is summary-only — no
+                        // consumer wires it into a fix-round yet.
+                        // `csharp_compile_fix_round` (Phase 2) will
+                        // grow its own stash store keyed by severity
+                        // + code; for now we report counts so atom
+                        // recipes can see whether the build was
+                        // clean.
+                        let parsed = parse_dotnet_build_output(&command_result.stdout);
+                        let summary = CapturedDiagnosticsSummary {
+                            count: parsed.len(),
+                            severity_counts: parsed.iter().fold(
+                                HashMap::new(),
+                                |mut acc, d| {
+                                    *acc.entry(d.severity.clone()).or_insert(0) += 1;
+                                    acc
+                                },
+                            ),
+                        };
+                        Some(summary)
+                    }
+                    None => None,
                 };
                 files_written.extend(touched_paths.iter().map(|path| path_string(path)));
                 let step_status = if command_result.success {
@@ -2299,11 +2412,27 @@ pub fn run_with_ctx(
                     error: command_result.error,
                     captured_diagnostics_summary: captured_diag_summary,
                 });
+                // Mirror touched files into the workspace snapshot —
+                // but only on non-rollback outcomes. Required-failure
+                // takes the rollback branch below and never reaches
+                // this site; Optional / ContinueForRepair both keep
+                // the run going and may have mutated disk before the
+                // command failed.
+                if !touched_paths.is_empty()
+                    && let Some(adapter) = workspace_adapter.as_ref()
+                {
+                    let touches_owned: Vec<PathBuf> = touched_paths.clone();
+                    let mirror = workspace_adapter::AppliedCommandTouches {
+                        touches: &touches_owned,
+                        succeeded: command_result.success,
+                    };
+                    let _ = adapter.apply_command_touches(&run_id, &mirror);
+                }
                 if !command_result.success {
                     match effective_on_failure {
                         OnFailure::Required => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -2342,7 +2471,7 @@ pub fn run_with_ctx(
     // rollback anchors until this terminal-success gate is passed.
     if confirmed && capture_ctx.has_any_obligation() && !capture_ctx.all_obligations_resolved() {
         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
             status: "obligations_unresolved".to_string(),
             title: p.title.clone(),
@@ -2354,6 +2483,12 @@ pub fn run_with_ctx(
             rollback_errors,
             obligations: capture_ctx.obligation_reports(),
         })?);
+    }
+
+    // Success exit: commit the workspace transaction. Failure is
+    // non-fatal — disk is canonical and already reflects the run.
+    if let Some(adapter) = workspace_adapter.as_ref() {
+        let _ = adapter.commit(&run_id);
     }
 
     Ok(serde_json::to_string_pretty(&RefactorRunResponse {
@@ -3049,6 +3184,101 @@ pub fn parse_rustc_json_output(stdout: &[u8]) -> Vec<RustcDiagnostic> {
             message,
             spans,
             children,
+        });
+    }
+    out
+}
+
+/// A single diagnostic parsed from `dotnet build` stdout (RX-V2 / Binlog
+/// capture). v1 ships a stdout-scrape parser; structured-log parsing
+/// via `Microsoft.Build.Logging.StructuredLogger` is a follow-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DotnetBuildDiagnostic {
+    /// "error", "warning", "info" — mapped from MSBuild + Roslyn
+    /// severity prefixes.
+    pub severity: String,
+    /// Diagnostic code (e.g. "CS8618", "MSB4096"), if recoverable from
+    /// the line.
+    pub code: Option<String>,
+    pub message: String,
+    /// Source file path the diagnostic refers to, if recoverable.
+    pub file: Option<String>,
+    /// 1-based line number, if recoverable.
+    pub line: Option<u32>,
+}
+
+/// Parse `dotnet build` stdout for compile diagnostics.
+///
+/// MSBuild's default formatter emits lines shaped like:
+///   `path/to/File.cs(42,7): error CS8618: ...message... [project.csproj]`
+///   `path/to/File.cs(42,7): warning CS8625: ...message... [project.csproj]`
+///   `MSB4096: ...`
+///
+/// This parser is deliberately minimal — it recognizes the common
+/// `<file>(<line>,<col>): <severity> <code>: <message>` shape and
+/// pure-code shapes like `<code>: <message>`. Lines that don't match
+/// are dropped. Phase 2 may swap in `Microsoft.Build.Logging.StructuredLogger`
+/// for structured binlog parsing.
+pub fn parse_dotnet_build_output(stdout: &[u8]) -> Vec<DotnetBuildDiagnostic> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Locate the first `: error ` / `: warning ` / `: info ` marker.
+        // Walk severity tokens in order to find the leftmost one — the
+        // file path may itself contain colons on Windows-style paths.
+        let mut found: Option<(usize, &str)> = None;
+        for sev in [": error ", ": warning ", ": info "] {
+            if let Some(pos) = line.find(sev)
+                && found.map_or(true, |(p, _)| pos < p)
+            {
+                found = Some((pos, sev.trim_start_matches(": ").trim()));
+            }
+        }
+        let Some((sev_pos, severity)) = found else {
+            continue;
+        };
+        let prefix = &line[..sev_pos];
+        let after_sev = &line[sev_pos + 2 + severity.len() + 1..]; // ": <sev> "
+        let (code, message) = match after_sev.find(": ") {
+            Some(p) => (
+                Some(after_sev[..p].trim().to_string()),
+                after_sev[p + 2..].trim().to_string(),
+            ),
+            None => (None, after_sev.trim().to_string()),
+        };
+        let (file, line_no) = match (prefix.rfind('('), prefix.rfind(')')) {
+            (Some(open), Some(close)) if close > open => {
+                let path = prefix[..open].trim().to_string();
+                let inside = &prefix[open + 1..close];
+                let line_no = inside
+                    .split(',')
+                    .next()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                (Some(path).filter(|s| !s.is_empty()), line_no)
+            }
+            _ => (Some(prefix.trim().to_string()).filter(|s| !s.is_empty()), None),
+        };
+        // Strip the trailing `[project.csproj]` label MSBuild appends.
+        let message = message
+            .rsplit_once(" [")
+            .and_then(|(head, tail)| {
+                if tail.ends_with(']') {
+                    Some(head.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(message);
+        out.push(DotnetBuildDiagnostic {
+            severity: severity.to_string(),
+            code,
+            message,
+            file,
+            line: line_no,
         });
     }
     out
@@ -3998,6 +4228,47 @@ fn restore_snapshots_from(
 ) -> Vec<String> {
     let start = cursor.unwrap_or(0);
     restore_snapshots(&snapshots[start..])
+}
+
+/// Run-rollback helper. Per the design doc's "Rollback ordering"
+/// rule: disk is canonical, restore it first, *then* tell the
+/// workspace adapter to roll back its in-memory snapshot. Returns
+/// the per-file restore errors from the disk pass (adapter rollback
+/// failure is non-fatal and logged via tracing instead of surfaced
+/// in the response).
+fn rollback_run(
+    snapshots: &[(PathBuf, Option<Vec<u8>>)],
+    cursor: Option<usize>,
+    adapter: Option<&std::sync::Arc<dyn workspace_adapter::WorkspaceTransactionAdapter>>,
+    run_id: &str,
+) -> Vec<String> {
+    let restore_errors = restore_snapshots_from(snapshots, cursor);
+    if let Some(adapter) = adapter
+        && let Err(_e) = adapter.rollback(run_id)
+    {
+        // Sidecar drift is recoverable; the next request relaods the
+        // Solution. We deliberately do not surface this to the
+        // operator response.
+    }
+    restore_errors
+}
+
+/// Deterministic-ish run id used by the workspace adapter for
+/// per-run logs. SHA over (project_dir, title, step count, current
+/// time). Truncated to 16 hex chars for log-line ergonomics.
+fn compute_run_id(p: &RefactorRunParams, project_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_dir.to_string_lossy().as_bytes());
+    hasher.update(p.title.as_bytes());
+    let count = p.steps.len() as u64;
+    hasher.update(&count.to_le_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hasher.update(&now.to_le_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    hex[..16].to_string()
 }
 
 fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {

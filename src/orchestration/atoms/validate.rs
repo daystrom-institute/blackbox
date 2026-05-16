@@ -24,8 +24,11 @@ const ATOM_KIND: &str = "atom";
 
 pub const REFACTOR_SUBCONTRACT: &str = "refactor/v1";
 
-pub const RECOGNIZED_REFACTOR_PERSONAS: &[&str] =
-    &["rust-refactor-persona", "java-refactor-persona"];
+pub const RECOGNIZED_REFACTOR_PERSONAS: &[&str] = &[
+    "rust-refactor-persona",
+    "java-refactor-persona",
+    "csharp-refactor-persona",
+];
 
 const REF_PREFIX_BROFILE: &str = "brofile:";
 const REF_PREFIX_WORKFLOW: &str = "workflow:";

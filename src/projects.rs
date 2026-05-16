@@ -30,6 +30,8 @@ use crate::util;
 pub enum Language {
     Java,
     Rust,
+    #[serde(alias = "cs", alias = "c-sharp")]
+    Csharp,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -277,10 +277,26 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-csharp-filescoped-batch",
+      "query": "convert csharp file from block scoped to file scoped namespace",
+      "expected_atoms": [
+        "csharp-filescoped-batch"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-extract-code-block",
       "query": "extract a block of java statements out of a method body into a new private helper",
       "expected_atoms": [
         "java-extract-code-block"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-using-organize",
+      "query": "organize csharp using directives via roslyn lsp source organize imports",
+      "expected_atoms": [
+        "csharp-using-organize"
       ],
       "forbidden_atoms": []
     },
@@ -293,6 +309,14 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-csharp-unseal-strangler",
+      "query": "remove sealed modifier from csharp service class so tests can subclass",
+      "expected_atoms": [
+        "csharp-unseal-strangler"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-inline-method",
       "query": "inline a private java method into its call sites and delete the declaration",
       "expected_atoms": [
@@ -301,10 +325,26 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-csharp-partial-sg-guard",
+      "query": "audit csharp source generators that bind to partial classes before structural refactor",
+      "expected_atoms": [
+        "csharp-partial-sg-guard"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-extract-test-slice",
       "query": "migrate junit test methods to a new test class after extracting a production class",
       "expected_atoms": [
         "java-extract-test-slice"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-nullable-coverage-fix",
+      "query": "annotate uninitialized non nullable csharp properties with required modifier",
+      "expected_atoms": [
+        "csharp-nullable-coverage-fix"
       ],
       "forbidden_atoms": []
     },
@@ -353,6 +393,14 @@
       "query": "replace vaadin ui getCurrent or vaadinSession getCurrent with injected provider",
       "expected_atoms": [
         "java-replace-vaadin-static-lookup"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-awaited-query-audit",
+      "query": "report awaited calls inside for foreach loop bodies in csharp method",
+      "expected_atoms": [
+        "csharp-awaited-query-audit"
       ],
       "forbidden_atoms": []
     }

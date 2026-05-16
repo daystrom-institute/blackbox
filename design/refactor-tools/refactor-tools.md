@@ -6,7 +6,7 @@ topic:
   - refactor-tools
 tags:
   - refactor-tools
-brief: "Hub for Blackbox structural refactor tooling, refactor atoms, Rust expansion, Java refactor closure, and Elixir expansion."
+brief: "Hub for Blackbox structural refactor tooling, refactor atoms, Rust expansion, Java refactor closure, Elixir expansion, and the C# track."
 ---
 
 # Refactor Tools
@@ -32,3 +32,4 @@ refactor runs, language-specific expansion, and refactor atoms.
 - [Rust Refactor Tools](rust/rust-refactor-tools.md)
 - [Java Refactor Tools](java/java-refactor-tools.md)
 - [Elixir Refactor Tools](elixir/elixir-refactor-tools.md)
+- [C# Refactor Tools](csharp/csharp-refactor-tools.md)

@@ -1,0 +1,71 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "csharp-partial-sg-guard",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Analysis-only RX-V4 source-generator audit. Walks the Roslyn sidecar's loaded workspace, enumerates IIncrementalGenerator implementations across in-repo + AnalyzerReference + package sources, fingerprints them, and surfaces undetected / unknown-external generators that would block structural partial-class refactors.",
+    "when_to_use": [
+      "before any rename/move/extract touching a partial class",
+      "checking generator coverage in a freshly loaded workspace",
+      "verifying .blackbox/csharp.json operator manifest is current after a package upgrade"
+    ],
+    "anti_patterns": [
+      "do not use to authorize structural moves — the audit reports; the operator decides",
+      "do not skip on a workspace with raw SyntaxProvider generators; RX-V4 fails closed without manifest coverage"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir"],
+        "properties": {
+          "project_dir": {"type": "string", "description": "Absolute path to the C# project root."},
+          "workspace_source": {"type": "string", "description": "Optional .sln/.slnx/.csproj path. Auto-discovered when absent."}
+        }
+      },
+      "prompt_template": "You are csharp-partial-sg-guard. Charter: produce the RX-V4 generator audit. Analysis-only.\n\nProtocol (no apply, no run):\n\n1. Plan:\n   bbox_refactor_plan(kind=\"csharp_partial_class_audit\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{workspace_source}}\")\n   If response is error.lsp_unavailable → bbox_note(kind=\"blocked\",\n     body=\"Roslyn sidecar unavailable; set BLACKBOX_ROSLYN_WORKER_BIN\"). Exit.\n\n2. Emit done:\n   bbox_note(kind=\"done\", body=\"audit complete: <generators_count> generators, <undetected_count> undetected, <partial_file_count> partial files\").\n\nThe operator consumes the report — do not modify any file.\n\nInputs:\n{{project_dir}} {{workspace_source}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "plan_path": {"type": "string"},
+          "generators": {"type": "array", "items": {"type": "object"}},
+          "undetected_generators": {"type": "array", "items": {"type": "object"}},
+          "unknown_external_generators": {"type": "array", "items": {"type": "object"}},
+          "partial_type_files": {"type": "array", "items": {"type": "string"}},
+          "semantic_status": {"enum": ["lsp_verified", "lsp_verified_partial"]},
+          "block_reason": {"type": "string"},
+          "done_note_id": {"type": "string"}
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 0,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {"kind": "none"},
+      "parallel_safe": "per_project",
+      "chainable_after": []
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:csharp-refactor-persona@v1"
+    },
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

@@ -1,0 +1,93 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "csharp-unseal-strangler",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Strangler-fig unseal of ONE C# class: removes `sealed`, optionally inserts `virtual` on operator-named methods. Required operator-authority flag acknowledge_subclass_surface_change=true.",
+    "when_to_use": [
+      "service class is sealed and tests need a subclass to override behaviour",
+      "operator wants to migrate one service per change-window without batch risk",
+      "CLAUDE.md project rule mandates preferring public over sealed for services"
+    ],
+    "anti_patterns": [
+      "do not run as a codebase-wide sweep — one class per atom call",
+      "do not set acknowledge_subclass_surface_change on the operator's behalf (RX-V1)",
+      "do not use on auto-generated files (*.g.cs, *.Designer.cs, Generated/)"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source_file",
+          "class_name"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string",
+            "description": "Absolute path to the C# project root."
+          },
+          "source_file": {
+            "type": "string",
+            "description": "Target .cs file, relative to project_dir."
+          },
+          "class_name": {
+            "type": "string",
+            "description": "Simple name of the sealed class to unseal."
+          },
+          "virtualize_methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional list of method simple-names to mark virtual."
+          },
+          "acknowledge_subclass_surface_change": {
+            "type": "boolean",
+            "description": "Required RX-V1 operator-authority flag — must be true to proceed."
+          }
+        }
+      },
+      "prompt_template": "You are csharp-unseal-strangler. Charter: unseal ONE C# class. Refuse without acknowledge_subclass_surface_change. Do not modify any other file.\n\nProtocol:\n\n1. Ground structurally:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file contains a single `sealed class {{class_name}}` declaration.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"unseal_csharp_class\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source_file}}\",\n                      item_names=[\"{{class_name}}\"],\n                      item_kinds={{virtualize_methods}},\n                      toml_entries={\"acknowledge_subclass_surface_change\": {{acknowledge_subclass_surface_change}}})\n   On operator_authority_required → bbox_note(kind=\"blocked\", body=\"missing acknowledge_subclass_surface_change for {{class_name}}\"). Exit.\n\n3. Apply via run + tests:\n   bbox_refactor_run(steps=[\n     {op: \"plan\", kind: \"unseal_csharp_class\", project_dir: \"{{project_dir}}\",\n      source: \"{{source_file}}\", item_names: [\"{{class_name}}\"],\n      item_kinds: {{virtualize_methods}},\n      toml_entries: {\"acknowledge_subclass_surface_change\": true}},\n     {op: \"command\", command: \"dotnet\", args: [\"build\", \"{{project_dir}}\", \"/clp:NoSummary\"],\n      capture: \"binlog\", on_failure: \"required\"}\n   ])\n\n4. Emit done:\n   bbox_note(kind=\"done\", body=\"unsealed {{class_name}} in {{source_file}}\").\n\nInputs:\n{{project_dir}} {{source_file}} {{class_name}} {{virtualize_methods}} {{acknowledge_subclass_surface_change}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "plan_path": {"type": "string"},
+          "files_touched": {"type": "array", "items": {"type": "string"}},
+          "block_reason": {"type": "string"},
+          "done_note_id": {"type": "string"}
+        }
+      },
+      "evidence_density": "low"
+    },
+    "effects": {
+      "writes_files": true,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {"kind": "none"},
+      "parallel_safe": "per_class",
+      "chainable_after": ["csharp-partial-sg-guard"]
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:csharp-refactor-persona@v1"
+    },
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

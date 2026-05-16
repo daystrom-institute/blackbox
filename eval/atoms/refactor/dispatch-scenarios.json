@@ -787,6 +787,81 @@
         "status",
         "lookups_rewritten"
       ]
+    },
+    {
+      "id": "dispatch-csharp-filescoped-batch",
+      "atom": "csharp-filescoped-batch",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}",
+        "source_file": "src/Foo/Foo.cs"
+      },
+      "expect_response_fields": [
+        "status",
+        "files_touched"
+      ]
+    },
+    {
+      "id": "dispatch-csharp-using-organize",
+      "atom": "csharp-using-organize",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}",
+        "source_file": "src/Foo/Foo.cs"
+      },
+      "expect_response_fields": [
+        "status",
+        "edit_count"
+      ]
+    },
+    {
+      "id": "dispatch-csharp-unseal-strangler",
+      "atom": "csharp-unseal-strangler",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}",
+        "source_file": "src/Foo/Service.cs",
+        "class_name": "Service",
+        "acknowledge_subclass_surface_change": true
+      },
+      "expect_response_fields": [
+        "status",
+        "files_touched"
+      ]
+    },
+    {
+      "id": "dispatch-csharp-partial-sg-guard",
+      "atom": "csharp-partial-sg-guard",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status",
+        "generators",
+        "semantic_status"
+      ]
+    },
+    {
+      "id": "dispatch-csharp-nullable-coverage-fix",
+      "atom": "csharp-nullable-coverage-fix",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status",
+        "edit_count"
+      ]
+    },
+    {
+      "id": "dispatch-csharp-awaited-query-audit",
+      "atom": "csharp-awaited-query-audit",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}",
+        "source_file": "src/Foo/Service.cs",
+        "method_name": "DoWork"
+      },
+      "expect_response_fields": [
+        "status",
+        "per_iteration_count",
+        "collection_await_count"
+      ]
     }
   ]
 }
