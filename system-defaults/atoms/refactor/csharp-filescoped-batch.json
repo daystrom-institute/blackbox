@@ -32,19 +32,13 @@
             "type": "string",
             "description": "Target .cs file, relative to project_dir."
           },
-          "validation_cmd": {
-            "type": "object",
-            "description": "Optional dotnet build validation step. When omitted, the atom skips the build gate — the conversion is syntax-only and tree-sitter parse-validated.",
-            "properties": {
-              "csproj": {
-                "type": "string",
-                "description": "Path to .csproj for `dotnet build` validation."
-              }
-            }
+          "validation_csproj": {
+            "type": "string",
+            "description": "Optional path to a .csproj for a `dotnet build` validation step (capture: binlog). When omitted, the atom skips the build gate — the conversion is syntax-only and tree-sitter parse-validated."
           }
         }
       },
-      "prompt_template": "You are csharp-filescoped-batch. Charter: convert ONE C# file from block-scoped to file-scoped namespace syntax. Refuse on multiple namespaces. Do not modify any other file.\n\nProtocol:\n\n1. Ground structurally:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file has exactly one top-level namespace declaration.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"migrate_csharp_to_filescoped_namespace\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source_file}}\")\n   If response is `error.multiple_namespaces` → bbox_note(kind=\"blocked\",\n     body=\"multiple_namespaces in {{source_file}}; operator must split the file first\"). Exit.\n\n3. Apply via run (no command step when validation_cmd absent):\n   bbox_refactor_run(steps=[\n     {op: \"plan\", kind: \"migrate_csharp_to_filescoped_namespace\",\n      project_dir: \"{{project_dir}}\", source: \"{{source_file}}\"}\n     // when validation_cmd.csproj is set, append:\n     // {op: \"command\", command: \"dotnet\",\n     //  args: [\"build\", \"{{validation_cmd.csproj}}\", \"/clp:NoSummary\", \"-bl:diag.binlog\"],\n     //  capture: \"binlog\", on_failure: \"required\"}\n   ])\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=\"converted {{source_file}} to file-scoped namespace; <files_written count> file(s) touched\").\n\nStrict refusal rules:\n- Never call any tool outside the refactor persona tool surface.\n- Never edit a second file in the same invocation — one .cs per atom call.\n- Never use validation_cmd values other than the operator-supplied csproj.\n\nInputs:\n{{project_dir}} {{source_file}} {{validation_cmd}}"
+      "prompt_template": "You are csharp-filescoped-batch. Charter: convert ONE C# file from block-scoped to file-scoped namespace syntax. Refuse on multiple namespaces. Do not modify any other file.\n\nProtocol:\n\n1. Ground structurally:\n   bbox_refactor_status(file=\"{{source_file}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file has exactly one top-level namespace declaration.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"migrate_csharp_to_filescoped_namespace\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source_file}}\")\n   If response is `error.multiple_namespaces` → bbox_note(kind=\"blocked\",\n     body=\"multiple_namespaces in {{source_file}}; operator must split the file first\"). Exit.\n\n3. Apply via run (no command step when validation_csproj absent):\n   bbox_refactor_run(steps=[\n     {op: \"plan\", kind: \"migrate_csharp_to_filescoped_namespace\",\n      project_dir: \"{{project_dir}}\", source: \"{{source_file}}\"}\n     // when validation_csproj is set, append:\n     // {op: \"command\", command: \"dotnet\",\n     //  args: [\"build\", \"{{validation_csproj}}\", \"/clp:NoSummary\", \"-bl:diag.binlog\"],\n     //  capture: \"binlog\", on_failure: \"required\"}\n   ])\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=\"converted {{source_file}} to file-scoped namespace; <files_written count> file(s) touched\").\n\nStrict refusal rules:\n- Never call any tool outside the refactor persona tool surface.\n- Never edit a second file in the same invocation — one .cs per atom call.\n- Never substitute a different csproj for validation_csproj.\n\nInputs:\n{{project_dir}} {{source_file}} {{validation_csproj}}"
     },
     "outputs": {
       "schema": {

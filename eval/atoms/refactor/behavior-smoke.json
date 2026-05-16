@@ -461,6 +461,34 @@
         "expected_block_reason_substring": "external"
       },
       "done_note_required": true
+    },
+    {
+      "atom": "csharp-filescoped-batch",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:migrate_csharp_to_filescoped_namespace",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "multiple-namespaces-in-one-file",
+        "expected_block_reason_substring": "multiple_namespaces"
+      },
+      "done_note_required": true
+    },
+    {
+      "atom": "csharp-using-organize",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:csharp_organize_usings",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "block_reachability": {
+        "fixture": "roslyn-lsp-unavailable",
+        "expected_block_reason_substring": "lsp_unavailable"
+      },
+      "done_note_required": true
     }
   ]
 }

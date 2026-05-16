@@ -267,6 +267,22 @@
         "java-extract-methods-light"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-filescoped-batch",
+      "query": "convert csharp file from block scoped to file scoped namespace",
+      "expected_atoms": [
+        "csharp-filescoped-batch"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-csharp-using-organize",
+      "query": "organize csharp using directives via roslyn lsp source organize imports",
+      "expected_atoms": [
+        "csharp-using-organize"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

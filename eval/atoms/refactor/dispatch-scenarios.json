@@ -619,6 +619,30 @@
         "target_file",
         "dependency_warnings"
       ]
+    },
+    {
+      "id": "dispatch-csharp-filescoped-batch",
+      "atom": "csharp-filescoped-batch",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}",
+        "source_file": "src/Foo/Foo.cs"
+      },
+      "expect_response_fields": [
+        "status",
+        "files_touched"
+      ]
+    },
+    {
+      "id": "dispatch-csharp-using-organize",
+      "atom": "csharp-using-organize",
+      "args": {
+        "project_dir": "${FIXTURE_CSHARP_PROJECT}",
+        "source_file": "src/Foo/Foo.cs"
+      },
+      "expect_response_fields": [
+        "status",
+        "edit_count"
+      ]
     }
   ]
 }
