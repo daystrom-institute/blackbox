@@ -57,12 +57,19 @@ before re-deriving the whole tool sequence. Use atoms as contextual shortcuts:
 | `rename_elixir_symbol` | lsp_verified (refuses in v1) | Probe-or-refuse only. |
 | `elixir_codegen_audit` | syntax_only | Analysis-only quote-block report. |
 | `elixir_test_fixture_extract` | syntax_only | Pull duplicated setup blocks. |
+| `elixir_move_module_across_apps` | indexed_hints | Umbrella module move + mix.exs advisory. |
+| `elixir_compile_fix_round` | syntax_only | Mix compile diagnostic → edit proposals. |
+| `elixir_credo_fix_round` | syntax_only | Credo JSON lint → edit proposals. |
+| `elixir_dialyzer_attribution` | indexed_hints | Dialyzer warning attribution; report-only. |
 
-Deferred (v2; need the AST helper escript):
-- `elixir_compile_fix_round` — ingest `mix compile` diagnostics.
-- `elixir_credo_fix_round` — machine-applicable Credo fixes.
-- `elixir_dialyzer_attribution` — map dialyzer warnings to defs.
-- `elixir_move_module_across_apps` — umbrella-aware module moves.
+All 19 v1 plan kinds ship. The fix-round kinds operate in two modes:
+1. **Subprocess fallback (v1 default):** parse mix compile / credo / dialyzer
+   stdout-stderr via the stable text formats (Credo + Dialyzer JSON/short
+   formats are version-stable; mix compile stderr is parsed by the
+   helper module's stable regex).
+2. **Escript-driven (v2 path):** when `priv/elixir_ast_helper/` is built,
+   `compile_diagnostics` uses `Code.with_diagnostics/2` for structured
+   capture without depending on stderr formatting.
 
 ## Operator-authority acknowledgments (EX-V1)
 
