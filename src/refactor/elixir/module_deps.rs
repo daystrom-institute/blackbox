@@ -263,6 +263,11 @@ fn is_elixir_file(path: &Path, include_exs: bool) -> bool {
 // Module-ref extraction
 // ---------------------------------------------------------------------------
 
+/// Public re-export so other elixir submodules can reuse the helper.
+pub(super) fn defmodule_full_name_pub(defmod_call: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+    defmodule_full_name(defmod_call, source)
+}
+
 /// Extract the dotted module name from a `defmodule X.Y.Z do ... end` call.
 fn defmodule_full_name(defmod_call: tree_sitter::Node<'_>, source: &str) -> Option<String> {
     let args = super::call_arguments(defmod_call)?;

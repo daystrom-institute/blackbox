@@ -629,6 +629,335 @@ fn module_deps_skips_build_and_deps() {
 }
 
 // ---------------------------------------------------------------------------
+// split_elixir_clauses_by_tag tests (keystone)
+// ---------------------------------------------------------------------------
+
+fn make_split_params(
+    src_path: &std::path::Path,
+    target_dir: &std::path::Path,
+    fn_name: &str,
+    arity: usize,
+    partition: serde_json::Value,
+    selection_mode: &str,
+) -> RefactorPlanParams {
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("arity".to_string(), serde_json::json!(arity));
+    entries.insert(
+        "head_matcher".to_string(),
+        serde_json::json!({
+            "discriminators": [
+                {"arg_index": 1, "binding": "%Op{kind: $TAG}", "primary": true}
+            ],
+            "preserve_guards": "verbatim"
+        }),
+    );
+    entries.insert("partition".to_string(), partition);
+    entries.insert(
+        "selection_mode".to_string(),
+        serde_json::json!(selection_mode),
+    );
+    entries.insert(
+        "target_dir".to_string(),
+        serde_json::json!(target_dir.to_string_lossy().into_owned()),
+    );
+    RefactorPlanParams {
+        source: src_path.to_string_lossy().into_owned(),
+        kind: "split_elixir_clauses_by_tag".to_string(),
+        module_name: Some("Demo".to_string()),
+        item_names: Some(vec![fn_name.to_string()]),
+        toml_entries: Some(entries),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn split_clauses_exhaustive_basic_carve() {
+    let body = r#"defmodule Demo do
+  def run(_data, %Op{kind: :foo}), do: :foo_result
+  def run(_data, %Op{kind: :bar}), do: :bar_result
+  def run(_data, %Op{kind: :baz}), do: :baz_result
+end
+"#;
+    let (dir, src) = write_elixir_fixture("split_basic.ex", body);
+    let target_dir = dir.path().join("ops");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let params = make_split_params(
+        &src,
+        &target_dir,
+        "run",
+        2,
+        serde_json::json!({
+            "Demo.Letters": [":foo", ":bar"],
+            "Demo.Other": [":baz"]
+        }),
+        "exhaustive",
+    );
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+    let partitions = value["partitions"].as_array().expect("partitions");
+    assert_eq!(partitions.len(), 2);
+
+    let names: Vec<&str> = partitions
+        .iter()
+        .map(|p| p["target_module"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"Demo.Letters"));
+    assert!(names.contains(&"Demo.Other"));
+
+    // Target files should exist as edits with new_text.
+    let edits = value["edits"].as_array().unwrap();
+    // 1 source + 2 targets = 3
+    assert_eq!(edits.len(), 3);
+
+    // Source should be rewritten to dispatch wrappers.
+    let source_edit = &edits[0];
+    let new_source = apply_file_edits_to(body, source_edit);
+    assert!(
+        new_source.contains("Demo.Letters.run(arg0, arg1)"),
+        "expected dispatch wrapper for Demo.Letters, got:\n{new_source}"
+    );
+    assert!(new_source.contains("Demo.Other.run(arg0, arg1)"));
+    // Originals removed.
+    assert!(!new_source.contains(":foo_result"));
+    assert!(!new_source.contains(":bar_result"));
+    assert!(!new_source.contains(":baz_result"));
+
+    // Target Demo.Letters should hold the foo and bar bodies verbatim.
+    let letters = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.ends_with("letters.ex"))
+                .unwrap_or(false)
+        })
+        .expect("letters file");
+    let letters_text = letters["new_text"].as_str().unwrap();
+    assert!(letters_text.contains("defmodule Demo.Letters do"));
+    assert!(letters_text.contains(":foo_result"));
+    assert!(letters_text.contains(":bar_result"));
+    assert!(!letters_text.contains(":baz_result"));
+}
+
+#[test]
+fn split_clauses_selected_only_leaves_rest() {
+    let body = r#"defmodule Demo do
+  def run(_, %Op{kind: :foo}), do: :foo_body
+  def run(_, %Op{kind: :keep}), do: :keep_body
+  def run(_, %Op{kind: :bar}), do: :bar_body
+end
+"#;
+    let (dir, src) = write_elixir_fixture("split_selected.ex", body);
+    let target_dir = dir.path().join("ops");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let params = make_split_params(
+        &src,
+        &target_dir,
+        "run",
+        2,
+        serde_json::json!({"Demo.Moved": [":foo", ":bar"]}),
+        "selected_only",
+    );
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let unenumerated: Vec<&str> = value["unenumerated_tags"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(unenumerated, vec!["keep"]);
+    let edits = value["edits"].as_array().unwrap();
+    let new_source = apply_file_edits_to(body, &edits[0]);
+    // :keep clause should remain on the router unchanged (body present).
+    assert!(new_source.contains(":keep_body"), "got: {new_source}");
+    // Moved clauses' bodies should be gone from source.
+    assert!(!new_source.contains(":foo_body"), "got: {new_source}");
+    assert!(!new_source.contains(":bar_body"), "got: {new_source}");
+    // Dispatch wrappers should be present.
+    assert!(new_source.contains("Demo.Moved.run(arg0, arg1)"));
+}
+
+#[test]
+fn split_clauses_refuses_on_unenumerated_tags_in_exhaustive_mode() {
+    let body = r#"defmodule Demo do
+  def run(_, %Op{kind: :foo}), do: :foo
+  def run(_, %Op{kind: :missing}), do: :missing
+end
+"#;
+    let (dir, src) = write_elixir_fixture("split_missing.ex", body);
+    let target_dir = dir.path().join("ops");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let params = make_split_params(
+        &src,
+        &target_dir,
+        "run",
+        2,
+        serde_json::json!({"Demo.M": [":foo"]}),
+        "exhaustive",
+    );
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("unenumerated_tags"), "got: {err}");
+}
+
+#[test]
+fn split_clauses_groups_duplicate_tags_into_one_bucket_verbatim() {
+    let body = r#"defmodule Demo do
+  def run(_, %Op{kind: :dup, args: %{stage: :first}}), do: :first
+  def run(_, %Op{kind: :dup, args: %{stage: stage}}), do: stage
+end
+"#;
+    let (dir, src) = write_elixir_fixture("split_dup.ex", body);
+    let target_dir = dir.path().join("ops");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let params = make_split_params(
+        &src,
+        &target_dir,
+        "run",
+        2,
+        serde_json::json!({"Demo.Dup": [":dup"]}),
+        "exhaustive",
+    );
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let edits = value["edits"].as_array().unwrap();
+    let target_edit = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.ends_with("/ops/dup.ex"))
+                .unwrap_or(false)
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "no edit for ops/dup.ex; got paths: {:?}",
+                edits.iter().map(|e| e["path"].as_str()).collect::<Vec<_>>()
+            )
+        });
+    let target_text = target_edit["new_text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("missing new_text: {target_edit:?}"));
+    // Both verbatim clauses should be in the target, in original order.
+    assert!(target_text.contains(":first"), "target_text: {target_text}");
+    assert!(target_text.contains("stage: stage"));
+    let first_pos = target_text.find(":first").unwrap();
+    let second_pos = target_text.find("stage: stage").unwrap();
+    assert!(first_pos < second_pos, "clauses out of order");
+
+    // Source should hold exactly ONE dispatch wrapper (the first of the dup
+    // group); the second is deleted entirely.
+    let new_source = apply_file_edits_to(body, &edits[0]);
+    assert_eq!(new_source.matches("Demo.Dup.run").count(), 1);
+    let dup_groups = &value["partitions"][0]["duplicate_tag_groups"];
+    assert_eq!(dup_groups["dup"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn split_clauses_refuses_on_unknown_tag_in_partition() {
+    let body = "defmodule Demo do\n  def run(_, %Op{kind: :foo}), do: :foo\nend\n";
+    let (dir, src) = write_elixir_fixture("split_unknown.ex", body);
+    let target_dir = dir.path().join("ops");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let params = make_split_params(
+        &src,
+        &target_dir,
+        "run",
+        2,
+        serde_json::json!({"Demo.M": [":foo", ":nonexistent"]}),
+        "exhaustive",
+    );
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("unknown_tag_in_partition"), "got: {err}");
+}
+
+#[test]
+fn split_clauses_carries_static_helper_to_target() {
+    let body = r#"defmodule Demo do
+  def run(_data, %Op{kind: :foo}, do_local), do: do_local |> normalize()
+  def run(_data, %Op{kind: :bar}, _do_local), do: :bar
+
+  defp normalize(x), do: x
+end
+"#;
+    let (dir, src) = write_elixir_fixture("split_helper.ex", body);
+    let target_dir = dir.path().join("ops");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("arity".to_string(), serde_json::json!(3));
+    entries.insert(
+        "head_matcher".to_string(),
+        serde_json::json!({
+            "discriminators": [
+                {"arg_index": 1, "binding": "%Op{kind: $TAG}", "primary": true}
+            ],
+            "preserve_guards": "verbatim"
+        }),
+    );
+    entries.insert(
+        "partition".to_string(),
+        serde_json::json!({"Demo.Foo": [":foo"], "Demo.Bar": [":bar"]}),
+    );
+    entries.insert(
+        "selection_mode".to_string(),
+        serde_json::json!("exhaustive"),
+    );
+    entries.insert(
+        "target_dir".to_string(),
+        serde_json::json!(target_dir.to_string_lossy().into_owned()),
+    );
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "split_elixir_clauses_by_tag".to_string(),
+        module_name: Some("Demo".to_string()),
+        item_names: Some(vec!["run".to_string()]),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let edits = value["edits"].as_array().unwrap();
+
+    let foo_edit = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.ends_with("foo.ex"))
+                .unwrap_or(false)
+        })
+        .expect("foo.ex");
+    let foo_text = foo_edit["new_text"].as_str().unwrap();
+    assert!(
+        foo_text.contains("defp normalize"),
+        "normalize/1 helper should move to foo bucket only, got:\n{foo_text}"
+    );
+
+    let bar_edit = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.ends_with("bar.ex"))
+                .unwrap_or(false)
+        })
+        .expect("bar.ex");
+    let bar_text = bar_edit["new_text"].as_str().unwrap();
+    assert!(
+        !bar_text.contains("defp normalize"),
+        "bar bucket should not get normalize/1, got:\n{bar_text}"
+    );
+
+    // Source should no longer have normalize/1 (single-bucket helper moved).
+    let new_source = apply_file_edits_to(body, &edits[0]);
+    assert!(
+        !new_source.contains("defp normalize"),
+        "normalize should be removed from source, got:\n{new_source}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 

@@ -30,11 +30,25 @@ pub(crate) mod extract_module;
 pub(crate) mod facade;
 pub(crate) mod module_deps;
 pub(crate) mod organize_aliases;
+pub(crate) mod split_clauses;
 
 pub(crate) use extract_module::plan_extract_module;
 pub(crate) use facade::plan_facade_delegations;
 pub(crate) use module_deps::plan_module_dependency_analysis;
 pub(crate) use organize_aliases::plan_organize_aliases;
+pub(crate) use split_clauses::plan_split_clauses_by_tag;
+
+// Shared helper used by sibling submodules + tests for line/col reporting.
+pub(crate) fn byte_to_line_col(source: &str, byte: usize) -> (usize, usize) {
+    let prefix = &source[..byte.min(source.len())];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let col = prefix
+        .rfind('\n')
+        .map(|n| byte.saturating_sub(n + 1))
+        .unwrap_or(byte)
+        + 1;
+    (line, col)
+}
 
 // ---------------------------------------------------------------------------
 // AST lane plumbing
