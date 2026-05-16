@@ -27,11 +27,13 @@ use super::ParsedSource;
 use crate::chunker::code::parser_for_language;
 
 pub(crate) mod codegen_audit;
+pub(crate) mod compile_fix;
 pub(crate) mod extract_behaviour;
 pub(crate) mod extract_module;
 pub(crate) mod facade;
 pub(crate) mod genserver_callback;
 pub(crate) mod genserver_state;
+pub(crate) mod helper;
 pub(crate) mod inline_module;
 pub(crate) mod module_deps;
 pub(crate) mod move_across_apps;
@@ -44,6 +46,7 @@ pub(crate) mod test_fixture;
 pub(crate) mod with_clause;
 
 pub(crate) use codegen_audit::plan_codegen_audit;
+pub(crate) use compile_fix::plan_compile_fix_round;
 pub(crate) use extract_behaviour::plan_extract_behaviour;
 pub(crate) use extract_module::plan_extract_module;
 pub(crate) use facade::plan_facade_delegations;

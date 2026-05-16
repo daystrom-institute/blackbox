@@ -1530,6 +1530,50 @@ fn move_across_apps_refuses_when_source_not_in_apps() {
 }
 
 // ---------------------------------------------------------------------------
+// elixir_compile_fix_round tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compile_fix_round_removes_unused_alias() {
+    let body = "defmodule Foo do\n  alias Bar.Baz\n  def hi, do: :world\nend\n";
+    let (_dir, src) = write_elixir_fixture("compile_fix.ex", body);
+    let stderr = format!("{}:2: warning: unused alias Baz\n", src.to_string_lossy());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("diagnostics_stderr".to_string(), serde_json::json!(stderr));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_compile_fix_round".to_string(),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let fixable = value["fixable_diagnostics"].as_array().unwrap();
+    assert_eq!(fixable.len(), 1);
+    let edits = value["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 1);
+    let new_text = apply_file_edits_to(body, &edits[0]);
+    assert!(!new_text.contains("alias Bar.Baz"), "got: {new_text}");
+}
+
+#[test]
+fn compile_fix_round_empty_when_clean() {
+    let (_dir, src) = write_elixir_fixture("clean.ex", "defmodule X do\nend\n");
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("diagnostics_stderr".to_string(), serde_json::json!(""));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_compile_fix_round".to_string(),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["fixable_diagnostics"].as_array().unwrap().len(), 0);
+    assert_eq!(value["edits"].as_array().unwrap().len(), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 
