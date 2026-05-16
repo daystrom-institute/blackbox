@@ -1115,6 +1115,145 @@ fn public_api_guard_inventories_publics() {
 }
 
 // ---------------------------------------------------------------------------
+// elixir_genserver_state_audit tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn genserver_state_audit_infers_state_and_callbacks() {
+    let body = r#"defmodule MyServer do
+  use GenServer
+
+  def init(_opts), do: {:ok, %{pending: %{}, refs: %{}, counter: 0}}
+
+  def handle_call({:lookup, id}, _from, state) do
+    {:reply, Map.get(state, :pending), state}
+  end
+
+  def handle_call({:store, key, val}, _from, state) do
+    new_state = %{state | pending: Map.put(state.pending, key, val)}
+    {:reply, :ok, new_state}
+  end
+
+  def handle_info({:DOWN, ref, _, _, _}, state) do
+    {:noreply, %{state | refs: Map.delete(state.refs, ref)}}
+  end
+end
+"#;
+    let (_dir, src) = write_elixir_fixture("genserver_audit.ex", body);
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_genserver_state_audit".to_string(),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+    let fields = value["state_fields"].as_object().unwrap();
+    assert!(fields.contains_key("pending"));
+    assert!(fields.contains_key("refs"));
+    assert!(fields.contains_key("counter"));
+
+    // per_callback should include at least three callbacks.
+    let per_cb = value["per_callback"].as_object().unwrap();
+    assert!(per_cb.len() >= 3, "got: {per_cb:?}");
+}
+
+// ---------------------------------------------------------------------------
+// extract_genserver_callback_group tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn genserver_callback_group_extract_single_dispatch_fn() {
+    let body = r#"defmodule App.Admin do
+  use GenServer
+
+  def status, do: GenServer.call(__MODULE__, :status, :infinity)
+  def verify_checkpoint(id), do: GenServer.call(__MODULE__, {:verify_checkpoint, id}, :infinity)
+  def list_decisions, do: GenServer.call(__MODULE__, :list_decisions, :infinity)
+
+  def init(_opts), do: {:ok, %{}}
+
+  def handle_call(req, _from, state), do: {:reply, dispatch(req), state}
+
+  defp dispatch(:status), do: :ok
+  defp dispatch({:verify_checkpoint, _id}), do: :verified
+  defp dispatch(:list_decisions), do: []
+end
+"#;
+    let (dir, src) = write_elixir_fixture("admin.ex", body);
+    let target = dir.path().join("admin/checkpoint.ex");
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("dispatch_pattern".to_string(), serde_json::json!("single_dispatch_fn"));
+    entries.insert("client_api_strategy".to_string(), serde_json::json!("rewrite_callers"));
+    entries.insert("acknowledge_use_at_scope".to_string(), serde_json::json!(true));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_genserver_callback_group".to_string(),
+        module_name: Some("App.Admin.Checkpoint".to_string()),
+        item_names: Some(vec!["verify_checkpoint".to_string()]),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+    let edits = value["edits"].as_array().unwrap();
+    let target_edit = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.ends_with("/admin/checkpoint.ex"))
+                .unwrap_or(false)
+        })
+        .expect("target file");
+    let target_text = target_edit["new_text"].as_str().unwrap();
+    assert!(target_text.contains("defmodule App.Admin.Checkpoint do"));
+    assert!(target_text.contains("def verify_checkpoint"));
+    assert!(target_text.contains("defp dispatch({:verify_checkpoint"));
+
+    // Triplet completeness: verify_checkpoint should have client_api +
+    // dispatch_clause both true.
+    let triplet = &value["triplet_completeness"]["verify_checkpoint"];
+    assert_eq!(triplet["client_api"], true);
+    assert_eq!(triplet["dispatch_clause"], true);
+}
+
+#[test]
+fn genserver_callback_group_refuses_per_message_plus_delegate() {
+    let body = r#"defmodule App.Server do
+  use GenServer
+  def hello, do: GenServer.call(__MODULE__, :hello)
+  def handle_call(:hello, _from, state), do: {:reply, :ok, state}
+end
+"#;
+    let (dir, src) = write_elixir_fixture("per_msg.ex", body);
+    let target = dir.path().join("split.ex");
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "dispatch_pattern".to_string(),
+        serde_json::json!("per_message_handle_call"),
+    );
+    entries.insert("client_api_strategy".to_string(), serde_json::json!("delegate"));
+    entries.insert("acknowledge_use_at_scope".to_string(), serde_json::json!(true));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_genserver_callback_group".to_string(),
+        module_name: Some("App.Server.Split".to_string()),
+        item_names: Some(vec!["hello".to_string()]),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(
+        err.to_string().contains("delegate_requires_dispatch_fn"),
+        "got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 
