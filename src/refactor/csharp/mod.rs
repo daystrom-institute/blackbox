@@ -22,12 +22,23 @@ use anyhow::{Result, bail};
 use crate::refactor::RefactorPlanParams;
 
 pub mod filescoped_namespace;
+pub mod find_usages;
 pub mod lsp_rename;
+pub mod organize_usings;
 pub mod workspace_probe;
 
 pub use filescoped_namespace::plan_filescoped_namespace;
+pub use find_usages::plan_find_csharp_usages;
 pub use lsp_rename::plan_lsp_rename;
+pub use organize_usings::plan_organize_usings;
 pub use workspace_probe::plan_workspace_probe;
+
+/// Re-exported helpers for sibling submodules. Lives here so the LSP
+/// helpers in `lsp_rename` can be called from `find_usages` without a
+/// circular dependency on the public API.
+pub(crate) mod lsp_rename_helpers {
+    pub(crate) use super::lsp_rename::find_first_identifier_byte;
+}
 
 /// Generic v1 stub for plan kinds enumerated in the design doc but not
 /// yet implemented. Returns `error.unimplemented_csharp_kind` so the

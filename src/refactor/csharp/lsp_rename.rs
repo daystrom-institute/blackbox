@@ -147,7 +147,7 @@ fn resolve_path(project_dir: Option<&str>, source: &str) -> Result<PathBuf> {
 /// `rust_rename_position_byte` heuristic — the LSP server resolves the
 /// actual symbol semantically; we just need a position inside the
 /// identifier token.
-fn find_first_identifier_byte(source: &str, name: &str) -> Option<usize> {
+pub(crate) fn find_first_identifier_byte(source: &str, name: &str) -> Option<usize> {
     let bytes = source.as_bytes();
     let needle = name.as_bytes();
     let mut i = 0usize;
