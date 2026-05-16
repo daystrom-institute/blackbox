@@ -73,8 +73,10 @@ struct Config {
     request_timeout: Duration,
     jdtls_init_timeout: Duration,
     rust_analyzer_init_timeout: Duration,
+    roslyn_init_timeout: Duration,
     jdtls_bin: Option<String>,
     rust_analyzer_bin: Option<String>,
+    roslyn_lsp_bin: Option<String>,
 }
 
 impl Default for Config {
@@ -90,10 +92,17 @@ impl Default for Config {
                 "BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS",
                 60,
             )),
+            roslyn_init_timeout: Duration::from_secs(env_u64(
+                "BLACKBOX_ROSLYN_INIT_TIMEOUT_SECS",
+                60,
+            )),
             jdtls_bin: std::env::var("BLACKBOX_JDTLS_BIN")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             rust_analyzer_bin: std::env::var("BLACKBOX_RUST_ANALYZER_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            roslyn_lsp_bin: std::env::var("BLACKBOX_ROSLYN_LSP_BIN")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
         }
@@ -107,8 +116,10 @@ impl Config {
             request_timeout: Duration::from_secs(cfg.request_timeout_secs),
             jdtls_init_timeout: Duration::from_secs(cfg.jdtls_init_timeout_secs),
             rust_analyzer_init_timeout: Duration::from_secs(cfg.rust_analyzer_init_timeout_secs),
+            roslyn_init_timeout: Duration::from_secs(cfg.roslyn_init_timeout_secs),
             jdtls_bin: cfg.jdtls_bin.clone(),
             rust_analyzer_bin: cfg.rust_analyzer_bin.clone(),
+            roslyn_lsp_bin: cfg.roslyn_lsp_bin.clone(),
         }
     }
 }
@@ -120,6 +131,7 @@ fn init_timeout_for(language: Language, config: &Config) -> Duration {
     match language {
         Language::Java => config.jdtls_init_timeout,
         Language::Rust => config.rust_analyzer_init_timeout,
+        Language::Csharp => config.roslyn_init_timeout,
     }
 }
 
@@ -571,6 +583,19 @@ fn launch_argv(language: Language, config: &Config) -> Vec<String> {
                 .rust_analyzer_bin
                 .clone()
                 .unwrap_or_else(|| "rust-analyzer".to_string());
+            vec![bin]
+        }
+        Language::Csharp => {
+            // Microsoft.CodeAnalysis.LanguageServer ships as a dotnet
+            // tool; operator points BLACKBOX_ROSLYN_LSP_BIN at the
+            // installed binary (the tool's invocation requires a
+            // `--logLevel Information` style argument, which can be
+            // appended via shell wrapper if needed). Defaulting to the
+            // bare binary keeps the same shape as jdtls / rust-analyzer.
+            let bin = config
+                .roslyn_lsp_bin
+                .clone()
+                .unwrap_or_else(|| "Microsoft.CodeAnalysis.LanguageServer".to_string());
             vec![bin]
         }
     }

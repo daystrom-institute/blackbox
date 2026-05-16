@@ -15,6 +15,7 @@ mod rust;
 use rust::*;
 mod java;
 use java::*;
+pub(crate) mod csharp;
 pub(crate) mod plan_slot;
 pub(crate) mod rust_compile_fix;
 pub(crate) mod rust_deep;
@@ -598,6 +599,13 @@ pub enum CaptureSpec {
     /// Parse stdout as `cargo --message-format=json` output and extract
     /// `compiler-message` entries.  Malformed lines are silently dropped.
     RustcJson,
+    /// Parse a `dotnet build -bl:<path>` binary log file (path in
+    /// `args`, recovered from the resolved command line) for MSBuild
+    /// + Roslyn + analyzer + emit + restore diagnostics. Falls back to
+    /// stdout-scrape parsing when the binlog file is absent. v1 ships
+    /// the stdout-scrape path; structured-log parsing via
+    /// `Microsoft.Build.Logging.StructuredLogger` lands in a follow-up.
+    Binlog,
 }
 
 /// Failure-handling mode for a Command step (RX-F2b).
@@ -738,6 +746,18 @@ pub enum SemanticStatus {
     #[serde(alias = "unverified")]
     IndexedHints,
     LspVerified,
+    /// Same authority as `LspVerified`, but a semantic caveat applies
+    /// that the operator has explicitly acknowledged. Two triggers in v1
+    /// (per design/refactor-tools/csharp/refactor-csharp-expansion.md):
+    /// 1. RX-V5 — workspace failed expected-vs-loaded comparison and
+    ///    operator passed `acknowledge_partial_workspace=true`.
+    /// 2. RX-V4 — raw-classification or unknown-package source generator
+    ///    in scope; operator declared coverage via `generator_inputs`
+    ///    manifest. Audit cannot fully verify the declaration matches.
+    /// Downstream consumers MUST treat this tier as semantically weaker
+    /// than `LspVerified` for any consumer that aggregates across
+    /// projects (cross-project rename, public-API guard).
+    LspVerifiedPartial,
 }
 
 /// Lifecycle state of a `RefactorPlan` (RX-A2).
@@ -1205,6 +1225,35 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rust_public_api_guard" => plan_rust_public_api_guard(p),
         "rust_minimize_imports" => rust_minimize_imports::plan_minimize_imports(p),
         "rewrite_rust_bin_crate_paths" => plan_rewrite_rust_bin_crate_paths(p),
+        // C# track (design/refactor-tools/csharp/refactor-csharp-expansion.md).
+        // Phase 1 ships workspace_probe, filescoped_namespace, and lsp_rename;
+        // remaining kinds dispatch to typed stubs that surface the contract.
+        "csharp_workspace_probe" => csharp::plan_workspace_probe(p),
+        "migrate_csharp_to_filescoped_namespace" => csharp::plan_filescoped_namespace(p),
+        "csharp_lsp_rename" => csharp::plan_lsp_rename(p, ctx),
+        "csharp_organize_usings" => csharp::plan_unimplemented(p, "csharp_organize_usings"),
+        "csharp_lsp_move_item" => csharp::plan_unimplemented(p, "csharp_lsp_move_item"),
+        "find_csharp_usages" => csharp::plan_unimplemented(p, "find_csharp_usages"),
+        "csharp_public_api_guard" => csharp::plan_unimplemented(p, "csharp_public_api_guard"),
+        "move_csharp_type_to_file" => csharp::plan_unimplemented(p, "move_csharp_type_to_file"),
+        "migrate_csharp_type_usages" => csharp::plan_unimplemented(p, "migrate_csharp_type_usages"),
+        "csharp_to_record_migrate" => csharp::plan_unimplemented(p, "csharp_to_record_migrate"),
+        "csharp_primary_ctor_migrate" => csharp::plan_unimplemented(p, "csharp_primary_ctor_migrate"),
+        "csharp_async_dispose_convert" => csharp::plan_unimplemented(p, "csharp_async_dispose_convert"),
+        // Phase 2 (sidecar-required) — distinct error so callers
+        // distinguish "not built yet" from "needs sidecar".
+        "csharp_partial_class_audit" => csharp::plan_sidecar_required(p, "csharp_partial_class_audit"),
+        "csharp_awaited_query_in_loop_audit" => {
+            csharp::plan_sidecar_required(p, "csharp_awaited_query_in_loop_audit")
+        }
+        "csharp_compile_fix_round" => csharp::plan_sidecar_required(p, "csharp_compile_fix_round"),
+        "csharp_nullable_annotation_repair" => {
+            csharp::plan_sidecar_required(p, "csharp_nullable_annotation_repair")
+        }
+        "unseal_csharp_class" => csharp::plan_sidecar_required(p, "unseal_csharp_class"),
+        "move_csharp_members_to_partial" => {
+            csharp::plan_sidecar_required(p, "move_csharp_members_to_partial")
+        }
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
@@ -2229,19 +2278,44 @@ pub fn run_with_ctx(
                         }
                     }
                 };
-                let captured_diag_summary = if let Some(CaptureSpec::RustcJson) = capture {
-                    let parsed = parse_rustc_json_output(&command_result.stdout);
-                    let summary = CapturedDiagnosticsSummary {
-                        count: parsed.len(),
-                        severity_counts: parsed.iter().fold(HashMap::new(), |mut acc, d| {
-                            *acc.entry(d.level.clone()).or_insert(0) += 1;
-                            acc
-                        }),
-                    };
-                    capture_ctx.stash("last".to_string(), parsed);
-                    Some(summary)
-                } else {
-                    None
+                let captured_diag_summary = match capture.as_ref() {
+                    Some(CaptureSpec::RustcJson) => {
+                        let parsed = parse_rustc_json_output(&command_result.stdout);
+                        let summary = CapturedDiagnosticsSummary {
+                            count: parsed.len(),
+                            severity_counts: parsed.iter().fold(
+                                HashMap::new(),
+                                |mut acc, d| {
+                                    *acc.entry(d.level.clone()).or_insert(0) += 1;
+                                    acc
+                                },
+                            ),
+                        };
+                        capture_ctx.stash("last".to_string(), parsed);
+                        Some(summary)
+                    }
+                    Some(CaptureSpec::Binlog) => {
+                        // v1 binlog parsing is summary-only — no
+                        // consumer wires it into a fix-round yet.
+                        // `csharp_compile_fix_round` (Phase 2) will
+                        // grow its own stash store keyed by severity
+                        // + code; for now we report counts so atom
+                        // recipes can see whether the build was
+                        // clean.
+                        let parsed = parse_dotnet_build_output(&command_result.stdout);
+                        let summary = CapturedDiagnosticsSummary {
+                            count: parsed.len(),
+                            severity_counts: parsed.iter().fold(
+                                HashMap::new(),
+                                |mut acc, d| {
+                                    *acc.entry(d.severity.clone()).or_insert(0) += 1;
+                                    acc
+                                },
+                            ),
+                        };
+                        Some(summary)
+                    }
+                    None => None,
                 };
                 files_written.extend(touched_paths.iter().map(|path| path_string(path)));
                 let step_status = if command_result.success {
@@ -3014,6 +3088,101 @@ pub fn parse_rustc_json_output(stdout: &[u8]) -> Vec<RustcDiagnostic> {
             message,
             spans,
             children,
+        });
+    }
+    out
+}
+
+/// A single diagnostic parsed from `dotnet build` stdout (RX-V2 / Binlog
+/// capture). v1 ships a stdout-scrape parser; structured-log parsing
+/// via `Microsoft.Build.Logging.StructuredLogger` is a follow-up.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DotnetBuildDiagnostic {
+    /// "error", "warning", "info" — mapped from MSBuild + Roslyn
+    /// severity prefixes.
+    pub severity: String,
+    /// Diagnostic code (e.g. "CS8618", "MSB4096"), if recoverable from
+    /// the line.
+    pub code: Option<String>,
+    pub message: String,
+    /// Source file path the diagnostic refers to, if recoverable.
+    pub file: Option<String>,
+    /// 1-based line number, if recoverable.
+    pub line: Option<u32>,
+}
+
+/// Parse `dotnet build` stdout for compile diagnostics.
+///
+/// MSBuild's default formatter emits lines shaped like:
+///   `path/to/File.cs(42,7): error CS8618: ...message... [project.csproj]`
+///   `path/to/File.cs(42,7): warning CS8625: ...message... [project.csproj]`
+///   `MSB4096: ...`
+///
+/// This parser is deliberately minimal — it recognizes the common
+/// `<file>(<line>,<col>): <severity> <code>: <message>` shape and
+/// pure-code shapes like `<code>: <message>`. Lines that don't match
+/// are dropped. Phase 2 may swap in `Microsoft.Build.Logging.StructuredLogger`
+/// for structured binlog parsing.
+pub fn parse_dotnet_build_output(stdout: &[u8]) -> Vec<DotnetBuildDiagnostic> {
+    let text = String::from_utf8_lossy(stdout);
+    let mut out = Vec::new();
+    for raw_line in text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Locate the first `: error ` / `: warning ` / `: info ` marker.
+        // Walk severity tokens in order to find the leftmost one — the
+        // file path may itself contain colons on Windows-style paths.
+        let mut found: Option<(usize, &str)> = None;
+        for sev in [": error ", ": warning ", ": info "] {
+            if let Some(pos) = line.find(sev)
+                && found.map_or(true, |(p, _)| pos < p)
+            {
+                found = Some((pos, sev.trim_start_matches(": ").trim()));
+            }
+        }
+        let Some((sev_pos, severity)) = found else {
+            continue;
+        };
+        let prefix = &line[..sev_pos];
+        let after_sev = &line[sev_pos + 2 + severity.len() + 1..]; // ": <sev> "
+        let (code, message) = match after_sev.find(": ") {
+            Some(p) => (
+                Some(after_sev[..p].trim().to_string()),
+                after_sev[p + 2..].trim().to_string(),
+            ),
+            None => (None, after_sev.trim().to_string()),
+        };
+        let (file, line_no) = match (prefix.rfind('('), prefix.rfind(')')) {
+            (Some(open), Some(close)) if close > open => {
+                let path = prefix[..open].trim().to_string();
+                let inside = &prefix[open + 1..close];
+                let line_no = inside
+                    .split(',')
+                    .next()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                (Some(path).filter(|s| !s.is_empty()), line_no)
+            }
+            _ => (Some(prefix.trim().to_string()).filter(|s| !s.is_empty()), None),
+        };
+        // Strip the trailing `[project.csproj]` label MSBuild appends.
+        let message = message
+            .rsplit_once(" [")
+            .and_then(|(head, tail)| {
+                if tail.ends_with(']') {
+                    Some(head.trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(message);
+        out.push(DotnetBuildDiagnostic {
+            severity: severity.to_string(),
+            code,
+            message,
+            file,
+            line: line_no,
         });
     }
     out
