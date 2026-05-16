@@ -1246,10 +1246,8 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         // Phase 2 (sidecar-required) — distinct error so callers
         // distinguish "not built yet" from "needs sidecar".
         "csharp_partial_class_audit" => csharp::plan_partial_class_audit(p),
-        "csharp_awaited_query_in_loop_audit" => {
-            csharp::plan_sidecar_required(p, "csharp_awaited_query_in_loop_audit")
-        }
-        "csharp_compile_fix_round" => csharp::plan_sidecar_required(p, "csharp_compile_fix_round"),
+        "csharp_awaited_query_in_loop_audit" => csharp::plan_awaited_query_audit(p),
+        "csharp_compile_fix_round" => csharp::plan_compile_fix_round(p),
         "csharp_nullable_annotation_repair" => {
             csharp::plan_sidecar_required(p, "csharp_nullable_annotation_repair")
         }

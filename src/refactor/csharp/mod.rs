@@ -23,6 +23,8 @@ use crate::refactor::RefactorPlanParams;
 
 pub(crate) mod lex;
 pub mod async_dispose_convert;
+pub mod awaited_query_in_loop_audit;
+pub mod compile_fix_round;
 pub mod filescoped_namespace;
 pub mod find_usages;
 pub mod lsp_move_item;
@@ -42,6 +44,8 @@ pub mod workspace_probe;
 pub(crate) use lex as unseal_lex;
 
 pub use async_dispose_convert::plan_async_dispose_convert;
+pub use awaited_query_in_loop_audit::plan_awaited_query_audit;
+pub use compile_fix_round::plan_compile_fix_round;
 pub use filescoped_namespace::plan_filescoped_namespace;
 pub use find_usages::plan_find_csharp_usages;
 pub use lsp_move_item::plan_lsp_move_item;
