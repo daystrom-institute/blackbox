@@ -1206,31 +1206,35 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "rust_public_api_guard" => plan_rust_public_api_guard(p),
         "rust_minimize_imports" => rust_minimize_imports::plan_minimize_imports(p),
         "rewrite_rust_bin_crate_paths" => plan_rewrite_rust_bin_crate_paths(p),
-        "elixir_organize_aliases" => elixir::plan_organize_aliases(p),
-        "extract_elixir_module" => elixir::plan_extract_module(p),
+        // ── Elixir refactor surface (EX-G1..EX-G19) ───────────────────────────
+        // Alphabetized by plan-kind name within the elixir block for
+        // grep-ability; design IDs documented in
+        // design/refactor-tools/elixir/refactor-elixir-expansion.md.
         "add_elixir_facade_delegations" => elixir::plan_facade_delegations(p),
-        "elixir_module_dependency_analysis" => elixir::plan_module_dependency_analysis(p),
-        "split_elixir_clauses_by_tag" => elixir::plan_split_clauses_by_tag(p),
-        "extract_elixir_behaviour" => elixir::plan_extract_behaviour(p),
-        "inline_elixir_module" => elixir::plan_inline_module(p),
-        "elixir_public_api_guard" => elixir::plan_public_api_guard(p),
-        "elixir_genserver_state_audit" => elixir::plan_genserver_state_audit(p),
-        "extract_genserver_callback_group" => elixir::plan_extract_genserver_callback_group(p),
-        "elixir_pipe_chain_extract" => elixir::plan_pipe_chain_extract(p),
-        "elixir_with_clause_extract" => elixir::plan_with_clause_extract(p),
-        "rename_elixir_symbol" => elixir::plan_rename_symbol(p),
         "elixir_codegen_audit" => elixir::plan_codegen_audit(p),
-        "elixir_test_fixture_extract" => elixir::plan_test_fixture_extract(p),
-        "elixir_move_module_across_apps" => elixir::plan_move_across_apps(p),
         "elixir_compile_fix_round" => elixir::plan_compile_fix_round(p),
         "elixir_credo_fix_round" => elixir::plan_credo_fix_round(p),
         "elixir_dialyzer_attribution" => elixir::plan_dialyzer_attribution(p),
+        "elixir_genserver_state_audit" => elixir::plan_genserver_state_audit(p),
+        "elixir_module_dependency_analysis" => elixir::plan_module_dependency_analysis(p),
+        "elixir_move_module_across_apps" => elixir::plan_move_across_apps(p),
+        "elixir_organize_aliases" => elixir::plan_organize_aliases(p),
+        "elixir_pipe_chain_extract" => elixir::plan_pipe_chain_extract(p),
+        "elixir_public_api_guard" => elixir::plan_public_api_guard(p),
+        "elixir_test_fixture_extract" => elixir::plan_test_fixture_extract(p),
+        "elixir_with_clause_extract" => elixir::plan_with_clause_extract(p),
+        "extract_elixir_behaviour" => elixir::plan_extract_behaviour(p),
+        "extract_elixir_module" => elixir::plan_extract_module(p),
+        "extract_genserver_callback_group" => elixir::plan_extract_genserver_callback_group(p),
+        "inline_elixir_module" => elixir::plan_inline_module(p),
+        "rename_elixir_symbol" => elixir::plan_rename_symbol(p),
+        "split_elixir_clauses_by_tag" => elixir::plan_split_clauses_by_tag(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, java_public_api_guard, lombokify_java_class, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, elixir_organize_aliases, extract_elixir_module, add_elixir_facade_delegations, elixir_module_dependency_analysis, split_elixir_clauses_by_tag, extract_elixir_behaviour, inline_elixir_module, elixir_public_api_guard, elixir_genserver_state_audit, extract_genserver_callback_group, elixir_pipe_chain_extract, elixir_with_clause_extract, rename_elixir_symbol, elixir_codegen_audit, elixir_test_fixture_extract, elixir_move_module_across_apps, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, java_public_api_guard, lombokify_java_class, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
