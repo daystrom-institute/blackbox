@@ -3897,15 +3897,19 @@ pub(crate) use leaf_plans::{
 pub(crate) use lombokify::plan_lombokify_java_class;
 pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
 pub(crate) use promote_inner::plan_promote_java_inner_class;
+pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
+pub(crate) use prune_orphans::plan_prune_java_orphans;
 
 mod atom_plans;
 mod extract_class;
+mod extract_code_block;
 mod extract_methods;
 mod find_usages;
 mod leaf_plans;
 mod lombokify;
 mod move_and_callers;
 mod promote_inner;
+mod prune_orphans;
 #[cfg(test)]
 mod tests;
 pub(crate) use find_usages::plan_find_java_usages;

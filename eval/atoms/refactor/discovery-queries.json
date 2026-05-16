@@ -267,6 +267,22 @@
         "java-extract-methods-light"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-prune-orphans",
+      "query": "delete unused private java methods fields and inner classes",
+      "expected_atoms": [
+        "java-prune-orphans"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-code-block",
+      "query": "extract a block of java statements out of a method body into a new private helper",
+      "expected_atoms": [
+        "java-extract-code-block"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

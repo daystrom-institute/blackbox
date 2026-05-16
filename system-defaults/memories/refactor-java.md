@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -464,20 +464,43 @@ The matching atom is `java-organize-imports`.
 The planner asks JDTLS for workspace-aware organize-import edits through a
 shared per-project session pool. The first call for a `(project_dir, java)`
 pair lazily spawns JDTLS, awaits a real `initialize` response (no fixed
-sleep), and sends `initialized`; subsequent calls reuse the same long-lived
-child. Idle sessions are evicted on a 60s tick after `BLACKBOX_LSP_IDLE_SECS`
-(default 600) of inactivity, and the daemon shuts every session down on stop.
-Tunables: `BLACKBOX_JDTLS_INIT_TIMEOUT_SECS` (default 60) for the cold-start
-window, `BLACKBOX_JDTLS_TIMEOUT_SECS` (default 30) per request,
-`BLACKBOX_JDTLS_BIN` to point at a non-default binary. If JDTLS is absent, the
-session is broken, or the request returns no edits, the tool falls back to a
-structural project scan: removes plain imports whose simple names are no
-longer referenced, keeps static and wildcard imports, and adds imports for
-uniquely named Java source files in the same `project_dir` when their simple
-type name is referenced. The fallback also detects inner-class-only simple
-names and skips synthesizing imports for them — references like
-`Outer.Inner` keep their qualified form rather than producing a non-resolving
-`import x.Inner;`. It is not a full classpath resolver.
+sleep), sends `initialized`, then **waits for the workspace to actually
+import** — JDTLS streams `language/status` notifications during gradle /
+maven / Buildship project import and signals `{ type: "Started" }` (Eclipse
+JDT.LS) or emits a Buildship `language/eventNotification { eventType: 100 }`
+when classpath resolution finishes. Until that drain completes, the session
+is "ready" by LSP-protocol semantics but JDTLS hasn't loaded a single
+project class — organize-imports can't tell whether statics are used,
+references return empty, and edits arrive with degenerate whitespace
+boundaries. The pool blocks on that signal up to
+`BLACKBOX_JDTLS_READY_TIMEOUT_SECS` (default 60s); on timeout the session
+proceeds and the caller sees degraded results rather than a hang.
+
+Per-file, the organize-imports call also opens the source via `didOpen` and
+waits for the first `publishDiagnostics` for that URI before issuing the
+code-action request — mirrors the rust-analyzer post-`didOpen` drain so the
+classpath-resolved request is what JDTLS actually sees, not a request that
+races ahead of JDTLS's lazy per-file type-check.
+
+Subsequent calls reuse the same long-lived child. Idle sessions are evicted
+on a 60s tick after `BLACKBOX_LSP_IDLE_SECS` (default 600) of inactivity,
+and the daemon shuts every session down on stop. Tunables:
+`BLACKBOX_JDTLS_INIT_TIMEOUT_SECS` (default 60) for the cold-start window,
+`BLACKBOX_JDTLS_READY_TIMEOUT_SECS` (default 60) for the post-`initialized`
+workspace-import drain, `BLACKBOX_JDTLS_TIMEOUT_SECS` (default 30) per
+request, `BLACKBOX_JDTLS_BIN` to point at a non-default binary.
+
+If JDTLS is absent, the session is broken, or the request returns no edits,
+the tool falls back to a structural project scan: removes plain imports
+whose simple names are no longer referenced, keeps static and wildcard
+imports, and adds imports for uniquely named Java source files in the same
+`project_dir` when their simple type name is referenced. The fallback also
+detects inner-class-only simple names and skips synthesizing imports for
+them — references like `Outer.Inner` keep their qualified form rather than
+producing a non-resolving `import x.Inner;`. The fallback is a structural
+heuristic, not a classpath resolver — it cannot identify unused static
+imports from third-party jars; only the LSP-backed path can, and only after
+the workspace-import drain has completed.
 
 14b. Lombokify hand-rolled POJO boilerplate — see
     `sm-refactor-java-lombokify` for `lombokify_java_class` (single-file
@@ -485,6 +508,70 @@ names and skips synthesizing imports for them — references like
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b2. Intra-method extraction — lift a statement range into a private helper:
+
+```text
+bbox_refactor_plan(
+  kind="extract_java_code_block_to_method",
+  source="src/main/java/com/example/Big.java",
+  project_dir="/absolute/project/root",
+  old_text="<exact statement-range text>",
+  module_name="<new helper name>",
+  parameters=[{"type":"int","name":"x"},{"type":"String","name":"s"}],
+  toml_entries={"arguments":["x","s"], "return_type":"int", "return_var":"total"}
+)
+```
+
+The matching atom is `java-extract-code-block`. Finds the enclosing
+`method_declaration` (or `constructor_declaration`) by walking up from
+the `old_text` match position, generates a `private` helper appended
+after that method, and replaces the original range with a call to the
+helper. Static-ness is inherited from the enclosing method; visibility
+defaults to `private` and can be overridden with `visibility="protected"`
+etc. The synthesized call site is `<helper>(<args>);` for void returns
+and `<return_type> <return_var> = <helper>(<args>);` for non-void. Use
+`new_text` for unusual call-site shapes (chained call, try/catch wrap).
+
+**v1 is manual mode**: the operator owns the parameter and argument
+lists. The planner does NOT yet infer captures from the AST — if the
+extracted range reads three locals and you supply zero parameters, the
+helper compiles but won't see those locals. v2 inference (capture /
+mutated-capture / multi-return analysis) is a planned follow-up.
+
+14c. Janitor pass — delete unused private members:
+
+```text
+bbox_refactor_plan(
+  kind="prune_java_orphans",
+  source="src/main/java/com/example/Big.java",
+  project_dir="/absolute/project/root"
+)
+```
+
+The matching atom is `java-prune-orphans`. Walks every `private`
+method, field, and inner class in the source file, counts in-file
+references (identifier / type_identifier / method_invocation.name /
+field_access.field / method_reference on either side), and proposes
+delete edits for the zero-reference set. Conservative — over-counts
+references rather than under-counts so live members are never deleted.
+
+Pinning exclusions (kept even with zero textual references): constructors,
+`serialVersionUID`, and members annotated with `@Override`, `@Inject`,
+`@Resource`, `@Autowired`, `@PostConstruct`, `@PreDestroy`, `@Test`,
+`@ParameterizedTest`, `@RepeatedTest`, `@BeforeEach`, `@AfterEach`,
+`@BeforeAll`, `@AfterAll`, `@BeforeClass`, `@AfterClass`, or
+`@SuppressWarnings("unused")`. Multi-declarator field declarations
+(`private int a, b, c;`) are excluded in v1 — split manually and re-run.
+Inputs:
+- `source` — Java file to prune.
+- `item_kinds` — optional subset of `["method", "field", "inner_class"]`.
+- `item_names` — optional whitelist; when set, only candidates whose
+  simple name is in this list are considered.
+
+Recursive-only private methods stay alive (the self-call counts as a
+reference). Reflection-accessed members are invisible to the AST walk
+— annotate them with `@SuppressWarnings("unused")` before running.
 
 
 15. Compound run — full extract-interface flow with rollback:

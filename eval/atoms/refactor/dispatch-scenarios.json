@@ -619,6 +619,36 @@
         "target_file",
         "dependency_warnings"
       ]
+    },
+    {
+      "id": "dispatch-java-prune-orphans-planonly",
+      "atom": "java-prune-orphans",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "pruned_count",
+        "leftover_count"
+      ]
+    },
+    {
+      "id": "dispatch-java-extract-code-block-planonly",
+      "atom": "java-extract-code-block",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "old_text": "System.out.println(\"hi\");",
+        "module_name": "greet",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "helper_name",
+        "enclosing_method"
+      ]
     }
   ]
 }

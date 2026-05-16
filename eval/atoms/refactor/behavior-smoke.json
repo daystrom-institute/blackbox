@@ -461,6 +461,26 @@
         "expected_block_reason_substring": "external"
       },
       "done_note_required": true
+    },
+    {
+      "atom": "java-prune-orphans",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:prune_java_orphans",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-extract-code-block",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_code_block_to_method",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

@@ -84,6 +84,7 @@ pub struct LspOverrides {
     pub idle_timeout_secs: Option<u64>,
     pub request_timeout_secs: Option<u64>,
     pub jdtls_init_timeout_secs: Option<u64>,
+    pub jdtls_ready_timeout_secs: Option<u64>,
     pub rust_analyzer_init_timeout_secs: Option<u64>,
     pub jdtls_bin: Option<Option<String>>,
     pub rust_analyzer_bin: Option<Option<String>>,
@@ -205,6 +206,8 @@ struct RawLspConfig {
     pub request_timeout_secs: u64,
     #[serde(default = "default_lsp_jdtls_init_timeout_secs")]
     pub jdtls_init_timeout_secs: u64,
+    #[serde(default = "default_lsp_jdtls_ready_timeout_secs")]
+    pub jdtls_ready_timeout_secs: u64,
     #[serde(default = "default_lsp_rust_analyzer_init_timeout_secs")]
     pub rust_analyzer_init_timeout_secs: u64,
     pub jdtls_bin: Option<String>,
@@ -218,6 +221,14 @@ fn default_lsp_request_timeout_secs() -> u64 {
     30
 }
 fn default_lsp_jdtls_init_timeout_secs() -> u64 {
+    60
+}
+// Post-`initialized` window for JDTLS to import the workspace (gradle /
+// maven build, classpath resolution, Buildship project load). Until this
+// drain completes, LSP queries see a "ready" session by protocol semantics
+// but JDTLS hasn't actually loaded a single project class — organize-imports
+// can't tell whether statics are used, references return empty, etc.
+fn default_lsp_jdtls_ready_timeout_secs() -> u64 {
     60
 }
 fn default_lsp_rust_analyzer_init_timeout_secs() -> u64 {
@@ -333,6 +344,7 @@ pub struct LspConfig {
     pub idle_timeout_secs: u64,
     pub request_timeout_secs: u64,
     pub jdtls_init_timeout_secs: u64,
+    pub jdtls_ready_timeout_secs: u64,
     pub rust_analyzer_init_timeout_secs: u64,
     pub jdtls_bin: Option<String>,
     pub rust_analyzer_bin: Option<String>,
@@ -404,6 +416,7 @@ impl Config {
                 idle_timeout_secs: default_lsp_idle_timeout_secs(),
                 request_timeout_secs: default_lsp_request_timeout_secs(),
                 jdtls_init_timeout_secs: default_lsp_jdtls_init_timeout_secs(),
+                jdtls_ready_timeout_secs: default_lsp_jdtls_ready_timeout_secs(),
                 rust_analyzer_init_timeout_secs: default_lsp_rust_analyzer_init_timeout_secs(),
                 jdtls_bin: None,
                 rust_analyzer_bin: None,
@@ -529,6 +542,12 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
         && let Ok(t) = timeout.parse()
     {
         raw.lsp.jdtls_init_timeout_secs = t;
+    }
+    if let Ok(timeout) = std::env::var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS")
+        && !timeout.trim().is_empty()
+        && let Ok(t) = timeout.parse()
+    {
+        raw.lsp.jdtls_ready_timeout_secs = t;
     }
     if let Ok(timeout) = std::env::var("BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS")
         && !timeout.trim().is_empty()
@@ -666,6 +685,7 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             idle_timeout_secs: raw.lsp.idle_timeout_secs,
             request_timeout_secs: raw.lsp.request_timeout_secs,
             jdtls_init_timeout_secs: raw.lsp.jdtls_init_timeout_secs,
+            jdtls_ready_timeout_secs: raw.lsp.jdtls_ready_timeout_secs,
             rust_analyzer_init_timeout_secs: raw.lsp.rust_analyzer_init_timeout_secs,
             jdtls_bin: raw.lsp.jdtls_bin,
             rust_analyzer_bin: raw.lsp.rust_analyzer_bin,
@@ -774,6 +794,9 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(jdtls_init_timeout_secs) = overrides.lsp.jdtls_init_timeout_secs {
         raw.lsp.jdtls_init_timeout_secs = jdtls_init_timeout_secs;
+    }
+    if let Some(jdtls_ready_timeout_secs) = overrides.lsp.jdtls_ready_timeout_secs {
+        raw.lsp.jdtls_ready_timeout_secs = jdtls_ready_timeout_secs;
     }
     if let Some(rust_analyzer_init_timeout_secs) = overrides.lsp.rust_analyzer_init_timeout_secs {
         raw.lsp.rust_analyzer_init_timeout_secs = rust_analyzer_init_timeout_secs;
