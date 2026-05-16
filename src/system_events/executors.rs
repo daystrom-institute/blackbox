@@ -54,7 +54,7 @@ async fn exec_emit_event(
     };
     let draft = SystemEventDraft {
         kind: SystemEventKind::from_wire(kind_str),
-        producer: format!("reaction:emit_event"),
+        producer: "reaction:emit_event".to_string(),
         project: event.project.clone(),
         principal: None,
         subject: None,
@@ -593,13 +593,6 @@ mod tests {
     async fn http_json_redacts_authorization_in_error_summary() {
         let event = make_event();
         let roots = make_roots(&event);
-        let args = json!({
-            "url": "http://127.0.0.1:9/redact-test",
-            "headers": {
-                "Authorization": "Bearer secret:my-api-key-123"
-            }
-        });
-
         let (url, _handle) =
             spawn_json_handler(400, json!({"error": "secret:my-api-key-123"})).await;
         let args = json!({
@@ -884,7 +877,7 @@ mod tests {
             state,
             ArtifactInstallParams {
                 kind: ArtifactKind::Atom,
-                source: format!("{name}.json").into(),
+                source: format!("{name}.json"),
                 name: None,
                 version: None,
                 supersedes: None,

@@ -229,6 +229,7 @@ impl EdgeIndex {
         refs
     }
 
+    #[cfg(test)]
     pub fn entity_type_counts(&self) -> BTreeMap<String, usize> {
         let mut seen = HashSet::new();
         let mut counts = BTreeMap::new();
@@ -942,6 +943,7 @@ fn sidecar_project_is_registered(
     registered_project_ids.contains(stem)
 }
 
+#[cfg(test)]
 pub(crate) fn append_project_edges(
     edges_dir: &Path,
     project_id: &str,
@@ -1290,12 +1292,6 @@ fn line_provenance_is_derived(line: &str) -> bool {
 //   routes.rs         → append_explicit_edges (global agents.jsonl)
 //   workflow/ops.rs   → append_explicit_edges
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EdgeLane {
-    Explicit,
-    Observed,
-}
 
 pub(crate) fn append_explicit_edges(
     edges_dir: &Path,
@@ -2594,7 +2590,7 @@ mod tests {
     fn append_explicit_dedups_and_writes() {
         let dir = tempfile::tempdir().unwrap();
         let e = explicit_edge("DESCRIBES");
-        let n = append_explicit_edges(dir.path(), "p1", &[e.clone()]).unwrap();
+        let n = append_explicit_edges(dir.path(), "p1", std::slice::from_ref(&e)).unwrap();
         assert_eq!(n, 1);
         let n2 = append_explicit_edges(dir.path(), "p1", &[e]).unwrap();
         assert_eq!(n2, 0, "dedup must skip reimport");
@@ -2644,7 +2640,7 @@ mod tests {
     fn plan_legacy_extraction_detects_managed_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let derived = derived_chunker_edge("NEXT_SECTION");
-        append_project_edges(dir.path(), "p1", &[derived.clone()]).unwrap();
+        append_project_edges(dir.path(), "p1", std::slice::from_ref(&derived)).unwrap();
 
         let plan_before = plan_legacy_edge_extraction(dir.path(), "p1").unwrap();
         assert!(!plan_before.managed_replacement_exists);
@@ -2662,7 +2658,8 @@ mod tests {
         let edge = derived_chunker_edge("CALLS");
 
         for _ in 0..5 {
-            replace_materialized_edges(dir.path(), "project", "p1", &[edge.clone()]).unwrap();
+            replace_materialized_edges(dir.path(), "project", "p1", std::slice::from_ref(&edge))
+                .unwrap();
         }
 
         let sidecar_path = dir.path().join("derived").join("project").join("p1.jsonl");
@@ -2818,8 +2815,13 @@ mod tests {
             confidence: EdgeConfidence::Exact,
         };
 
-        replace_materialized_edges_incremental(dir.path(), "project", "p1", &[edge.clone()])
-            .unwrap();
+        replace_materialized_edges_incremental(
+            dir.path(),
+            "project",
+            "p1",
+            std::slice::from_ref(&edge),
+        )
+        .unwrap();
         replace_materialized_edges_incremental(dir.path(), "project", "p1", &[edge]).unwrap();
 
         let after = read_managed_derived_edges(dir.path(), "project", "p1").unwrap();
@@ -2865,11 +2867,23 @@ mod tests {
             confidence: EdgeConfidence::Exact,
         };
 
-        replace_materialized_edges(dir.path(), "git", "p1", &[old_commit_edge.clone()]).unwrap();
+        replace_materialized_edges(
+            dir.path(),
+            "git",
+            "p1",
+            std::slice::from_ref(&old_commit_edge),
+        )
+        .unwrap();
         let after_full = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
         assert_eq!(after_full.len(), 1);
 
-        merge_materialized_edges(dir.path(), "git", "p1", &[new_commit_edge.clone()]).unwrap();
+        merge_materialized_edges(
+            dir.path(),
+            "git",
+            "p1",
+            std::slice::from_ref(&new_commit_edge),
+        )
+        .unwrap();
         let after_merge = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
         assert_eq!(after_merge.len(), 2, "old + new commit edges");
 
@@ -2904,7 +2918,7 @@ mod tests {
             confidence: EdgeConfidence::Exact,
         };
 
-        merge_materialized_edges(dir.path(), "git", "p1", &[edge.clone()]).unwrap();
+        merge_materialized_edges(dir.path(), "git", "p1", std::slice::from_ref(&edge)).unwrap();
         merge_materialized_edges(dir.path(), "git", "p1", &[edge]).unwrap();
 
         let after = read_managed_derived_edges(dir.path(), "git", "p1").unwrap();
@@ -3115,8 +3129,7 @@ mod tests {
             clean_snapshot_id, snapshot_dir, switch_to_clean_snapshot, switch_to_dirty_overlay,
         };
         use crate::storage_health::{
-            GcParams, GcPolicy, SnapshotRetentionPolicy, plan_gc, plan_gc_with_policy,
-            scan_storage_health,
+            GcParams, GcPolicy, SnapshotRetentionPolicy, plan_gc_with_policy, scan_storage_health,
         };
 
         fn derived_edge(source: &str, kind: &str, target: &str) -> Edge {
@@ -3366,13 +3379,15 @@ mod tests {
             .unwrap();
 
             let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
-            let mut policy = GcPolicy::default();
-            policy.materialized_snapshots = SnapshotRetentionPolicy {
-                keep_active: true,
-                keep_recent_per_workspace: 0,
-                keep_recent_per_repo: 0,
-                branch_switch_grace_minutes: 0,
-                max_age_days: None,
+            let policy = GcPolicy {
+                materialized_snapshots: SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: 0,
+                    keep_recent_per_repo: 0,
+                    branch_switch_grace_minutes: 0,
+                    max_age_days: None,
+                },
+                ..Default::default()
             };
 
             let candidates = plan_gc_with_policy(
@@ -3456,13 +3471,15 @@ mod tests {
             );
 
             let registered: HashSet<String> = [project_id.to_string()].into_iter().collect();
-            let mut policy = GcPolicy::default();
-            policy.materialized_snapshots = SnapshotRetentionPolicy {
-                keep_active: true,
-                keep_recent_per_workspace: 0,
-                keep_recent_per_repo: 0,
-                branch_switch_grace_minutes: 0,
-                max_age_days: None,
+            let policy = GcPolicy {
+                materialized_snapshots: SnapshotRetentionPolicy {
+                    keep_active: true,
+                    keep_recent_per_workspace: 0,
+                    keep_recent_per_repo: 0,
+                    branch_switch_grace_minutes: 0,
+                    max_age_days: None,
+                },
+                ..Default::default()
             };
             let candidates = plan_gc_with_policy(
                 edges_dir,
@@ -3639,7 +3656,7 @@ mod tests {
 
             for i in 0..20 {
                 let fake_source = EntityRef::Knowledge {
-                    id: format!("fake_padding_{i}").into(),
+                    id: format!("fake_padding_{i}"),
                 };
                 assert_eq!(
                     index.forward_edges(&fake_source).len(),

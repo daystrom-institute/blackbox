@@ -126,14 +126,14 @@ fn handle_tick_result(
         ProcessResult::PreCheckErr(WorkerError::Permanent(reason)) => {
             let redacted = redact_string(&reason);
             let project = event_project(hub, &record.event_id);
-            write_blocked_note(&state, &record, &redacted, project.as_deref());
+            write_blocked_note(state, record, &redacted, project.as_deref());
             hub.outbox_store()
                 .mark_dead_lettered(&record.id, &redacted, Some(&redacted))?;
         }
         ProcessResult::PreCheckErr(WorkerError::NonRetryable(reason)) => {
             let redacted = redact_string(&reason);
             let project = event_project(hub, &record.event_id);
-            write_blocked_note(&state, &record, &redacted, project.as_deref());
+            write_blocked_note(state, record, &redacted, project.as_deref());
             hub.outbox_store()
                 .mark_dead_lettered(&record.id, &redacted, Some(&redacted))?;
         }
@@ -150,7 +150,7 @@ fn handle_tick_result(
                 let reason = serde_json::to_string(&outcome.response_summary)?;
                 let redacted = redact_string(&reason);
                 let project = event_project(hub, &record.event_id);
-                write_blocked_note(&state, &record, &redacted, project.as_deref());
+                write_blocked_note(state, record, &redacted, project.as_deref());
                 hub.outbox_store()
                     .mark_dead_lettered(&record.id, &redacted, Some(&redacted))?;
             }
@@ -163,11 +163,11 @@ fn handle_tick_result(
                         record.attempt_count
                     );
                     let project = event_project(hub, &record.event_id);
-                    write_blocked_note(&state, &record, &reason, project.as_deref());
+                    write_blocked_note(state, record, &reason, project.as_deref());
                     hub.outbox_store()
                         .mark_dead_lettered(&record.id, &reason, Some(&reason))?;
                 } else {
-                    let next = compute_next_attempt(&record);
+                    let next = compute_next_attempt(record);
                     hub.outbox_store()
                         .mark_retry_at(&record.id, &next, &redacted)?;
                 }
@@ -273,7 +273,7 @@ async fn process_record_with_options(
         }
     }
 
-    if let Err(e) = check_repeated_pair(hub, &record, &event) {
+    if let Err(e) = check_repeated_pair(hub, record, &event) {
         return ProcessResult::PreCheckErr(e);
     }
 
@@ -335,11 +335,11 @@ fn compute_next_attempt(record: &OutboxRecord) -> String {
     let attempt = record.attempt_count;
     let base_secs = INITIAL_BACKOFF_SECS * 2u64.saturating_pow(attempt.saturating_sub(1));
     let capped = base_secs.min(MAX_BACKOFF_SECS);
-    let jitter = (record
+    let jitter = record
         .id
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-        % 3) as u64;
+        % 3 ;
     let delay_secs = capped + jitter;
     let now = chrono::Utc::now();
     let next = now + chrono::Duration::seconds(delay_secs as i64);
@@ -452,7 +452,7 @@ mod tests {
         (rec, event.id)
     }
 
-    async fn claim_record(hub: &EventHub, record: &OutboxRecord) {
+    async fn claim_record(hub: &EventHub, _record: &OutboxRecord) {
         let now = crate::util::now_iso();
         hub.outbox_store()
             .claim_next(&now, hub.process_instance_id())

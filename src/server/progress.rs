@@ -52,25 +52,6 @@ pub(crate) fn format_bro_line(task: &orch::Task, store_dir: &Path) -> (String, b
     )
 }
 
-#[cfg(test)]
-mod progress_tests {
-    use super::*;
-
-    #[test]
-    fn ellipsize_chars_handles_utf8_boundaries() {
-        let input = format!("{}’{}", "x".repeat(79), "tail");
-        let output = ellipsize_chars(&input, 80);
-
-        assert_eq!(output.chars().count(), 81);
-        assert!(output.ends_with('…'));
-    }
-
-    #[test]
-    fn ellipsize_chars_leaves_short_text_unchanged() {
-        assert_eq!(ellipsize_chars("working…", 80), "working…");
-    }
-}
-
 pub(crate) fn format_progress_snapshot(
     tasks: &[Arc<orch::Task>],
     store_dir: &Path,
@@ -352,4 +333,23 @@ pub(crate) fn spawn_progress_notifier(
             }
         }
     })
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+
+    #[test]
+    fn ellipsize_chars_handles_utf8_boundaries() {
+        let input = format!("{}’{}", "x".repeat(79), "tail");
+        let output = ellipsize_chars(&input, 80);
+
+        assert_eq!(output.chars().count(), 81);
+        assert!(output.ends_with('…'));
+    }
+
+    #[test]
+    fn ellipsize_chars_leaves_short_text_unchanged() {
+        assert_eq!(ellipsize_chars("working…", 80), "working…");
+    }
 }

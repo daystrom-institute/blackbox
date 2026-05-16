@@ -205,6 +205,7 @@ pub enum OpEffect {
 /// Execute one HookOp against the given context. Stateless variant —
 /// ops that require daemon state (e.g. `require_identity`) will error.
 /// Use `execute_op_with_hub` from the engine where state is available.
+#[cfg(test)]
 pub async fn execute_op(
     hook: &HookOp,
     ctx: &ArcContext,
@@ -1284,11 +1285,10 @@ fn append_missing_json_closers(s: &str) -> Option<String> {
             '"' => in_string = true,
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']' => {
-                if stack.pop() != Some(ch) {
+            '}' | ']'
+                if stack.pop() != Some(ch) => {
                     return None;
                 }
-            }
             _ => {}
         }
     }
@@ -1763,7 +1763,7 @@ fn exec_score_eval_output(
                 .ok()
                 .and_then(|v| v.get("drift_pp").and_then(Value::as_f64))
         })
-        .unwrap_or_else(|| {
+        .unwrap_or({
             // Exit-code heuristic: non-zero → minor drift signal
             if exit_code != 0 { 5.0 } else { 0.0 }
         });
@@ -2148,8 +2148,10 @@ mod tests {
         // Create a stray branch as if a prior arc left it behind.
         git(&["branch", "fix/issue-42"]);
 
-        let mut meta = ArcMeta::default();
-        meta.project_dir = Some(repo.to_string_lossy().into_owned());
+        let meta = ArcMeta {
+            project_dir: Some(repo.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
         let ctx = ArcContext::new(meta);
 
         let wt_path = tmp.path().join("wt-arc-1");
@@ -2215,8 +2217,10 @@ mod tests {
             occupied.to_str().unwrap(),
         ]);
 
-        let mut meta = ArcMeta::default();
-        meta.project_dir = Some(repo.to_string_lossy().into_owned());
+        let meta = ArcMeta {
+            project_dir: Some(repo.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
         let ctx = ArcContext::new(meta);
 
         let wt_path = tmp.path().join("wt-conflicting");

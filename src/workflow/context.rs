@@ -452,7 +452,7 @@ mod tests {
         c.last_signal = Some(SignalRef {
             name: "pr-merged".into(),
             payload: json!({"pr": 117, "merged_by": "alice"}),
-            correlation: serde_json::Map::from_iter([("pr".to_string(), json!(117))].into_iter()),
+            correlation: serde_json::Map::from_iter([("pr".to_string(), json!(117))]),
             received_at: "2026-04-26T00:01:00Z".into(),
         });
         c

@@ -451,7 +451,7 @@ mod tests {
         // Apply text edits in reverse to preserve byte ranges.
         for fe in file_edits {
             let mut sorted = fe.edits;
-            sorted.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+            sorted.sort_by_key(|b| std::cmp::Reverse(b.byte_start));
             for te in sorted {
                 text.replace_range(te.byte_start..te.byte_end, &te.replacement);
             }

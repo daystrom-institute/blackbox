@@ -299,15 +299,12 @@ fn parent_module_file(source_path: &Path) -> Option<PathBuf> {
     let parent_dir = source_path.parent()?;
     let module_name = parent_dir.file_name()?.to_str()?;
     let grandparent = parent_dir.parent()?;
-    for candidate in [
+    [
         grandparent.join(format!("{module_name}.rs")),
         parent_dir.join("mod.rs"),
-    ] {
-        if candidate.exists() && candidate != source_path {
-            return Some(candidate);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .find(|candidate| candidate.exists() && candidate != source_path)
 }
 
 fn module_child_dir(source_path: &Path) -> PathBuf {

@@ -19,9 +19,7 @@ impl MigrateReplacementKind {
     fn parse(raw: &str) -> Result<Self> {
         let normalized = raw
             .trim()
-            .replace('-', "")
-            .replace('_', "")
-            .replace(' ', "")
+            .replace(['-', '_', ' '], "")
             .to_ascii_lowercase();
 
         match normalized.as_str() {
@@ -243,7 +241,7 @@ pub fn plan_migrate_type_usages(p: &crate::refactor::RefactorPlanParams) -> Resu
         );
     }
 
-    let mut canonical_edits = canonicalize_and_merge(edits)?;
+    let canonical_edits = canonicalize_and_merge(edits)?;
     ensure_non_overlapping(&canonical_edits)
         .context("overlapping edits in migrate_rust_type_usages")?;
 
@@ -730,15 +728,11 @@ fn build_where_clause_edit(item: &Node<'_>, source: &str, bound_text: &str) -> O
             byte_end: insert_at,
             replacement: format!(", T: {bound_text}"),
         })
-    } else if let Some(header_end) = end_of_item_header(item, source) {
-        Some(TextEdit {
+    } else { end_of_item_header(item, source).map(|header_end| TextEdit {
             byte_start: header_end,
             byte_end: header_end,
             replacement: format!(" where T: {bound_text}"),
-        })
-    } else {
-        None
-    }
+        }) }
 }
 
 fn end_of_item_header(item: &Node<'_>, source: &str) -> Option<usize> {

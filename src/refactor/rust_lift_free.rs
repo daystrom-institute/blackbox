@@ -1,7 +1,4 @@
-use std::collections::HashMap;
-
 use anyhow::{Result, anyhow, bail};
-use tree_sitter::Query;
 
 use super::*;
 
@@ -122,13 +119,6 @@ pub fn plan_lift_to_free(p: &RefactorPlanParams) -> Result<String> {
     // Create target file edits
     let target_source = fs::read_to_string(&target_path).unwrap_or_default();
     let mut target_edits = Vec::new();
-
-    // Module name derived from target file basename
-    let module_name = target_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or("module")
-        .to_string();
 
     // Add free functions to target
     let free_functions = results
@@ -295,9 +285,8 @@ fn generate_free_function(method_text: &str, _method_name: &str) -> Result<Strin
     Ok(out_lines.join("\n"))
 }
 
-fn generate_call_site_edits(method_name: &str) -> Vec<TextEdit> {
-    // This is a simplified implementation
-    // Real implementation would need to scan the codebase for all call sites
+fn generate_call_site_edits(_method_name: &str) -> Vec<TextEdit> {
+    // TODO: scan the codebase for all call sites
     vec![]
 }
 

@@ -912,7 +912,8 @@ mod tests {
 
     #[test]
     fn whiteboard_workflows_compile() {
-        for path in &["../../examples/whiteboard/workflows/whiteboard-arc.json"] {
+        {
+            let path = &"../../examples/whiteboard/workflows/whiteboard-arc.json";
             let full = format!(
                 "{}/{}",
                 env!("CARGO_MANIFEST_DIR"),

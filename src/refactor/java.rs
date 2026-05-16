@@ -632,20 +632,6 @@ fn boxed_for_supplier(java_type: &str) -> String {
     }
 }
 
-/// Look up a Java type by simple name in the project, returning the simple
-/// names of methods declared on its body (top-level interface or class).
-/// Returns `None` if the type is not uniquely resolvable in the project.
-fn collect_interface_declared_methods(
-    project_dir: &Path,
-    interface_name: &str,
-) -> Option<HashSet<String>> {
-    let type_paths = project_java_type_paths(project_dir);
-    let path = type_paths.get(interface_name)?.as_ref()?;
-    let parsed = parse_source_file(path).ok()?;
-    let type_node = find_java_type_declaration_by_name(&parsed, interface_name)?;
-    Some(collect_java_type_method_names(&parsed, type_node))
-}
-
 /// Collect only the ABSTRACT methods declared on an interface — methods
 /// the implementer MUST provide. Excludes `default`, `static`, and
 /// `private` methods (all of which have bodies on the interface itself
@@ -1618,7 +1604,7 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
                 } else {
                     inside
                         .split(',')
-                        .map(|p| normalize_param_type_text(p))
+                        .map(normalize_param_type_text)
                         .collect()
                 };
                 (name, Some(params))
@@ -3677,11 +3663,10 @@ fn extracted_methods_write_to(
             }
             if let Some(parent) = target.parent() {
                 match parent.kind() {
-                    "assignment_expression" => {
-                        if parent.child_by_field_name("left").map(|c| c.id()) == Some(target.id()) {
+                    "assignment_expression"
+                        if parent.child_by_field_name("left").map(|c| c.id()) == Some(target.id()) => {
                             return true;
                         }
-                    }
                     "update_expression" => return true,
                     _ => {}
                 }
@@ -3894,8 +3879,8 @@ pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use extract_methods::plan_extract_java_methods;
 pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use leaf_plans::{
-    jdtls_organize_imports, plan_add_java_implements, plan_extract_java_interface,
-    plan_java_lsp_organize_imports, plan_migrate_java_type_usages,
+    plan_add_java_implements, plan_extract_java_interface, plan_java_lsp_organize_imports,
+    plan_migrate_java_type_usages,
 };
 pub(crate) use lombokify::plan_lombokify_java_class;
 pub(crate) use method_object::plan_convert_method_to_class;
@@ -3937,5 +3922,5 @@ mod class_dependency;
 pub(crate) use class_dependency::plan_java_class_dependency_analysis;
 mod imports;
 mod public_api_guard;
-pub(super) use imports::*;
+use imports::*;
 pub(crate) use public_api_guard::plan_java_public_api_guard;

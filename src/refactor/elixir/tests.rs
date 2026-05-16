@@ -1330,7 +1330,7 @@ end
     let value: serde_json::Value = serde_json::from_str(&json).expect("json");
     assert_eq!(value["kind"], "elixir_pipe_chain_extract");
     let extracted = value["extracted_subsequence"].as_array().unwrap();
-    assert!(extracted.len() >= 1, "got: {extracted:?}");
+    assert!(!extracted.is_empty(), "got: {extracted:?}");
 }
 
 #[test]

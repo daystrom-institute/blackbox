@@ -129,6 +129,8 @@ pub(crate) struct SharedState {
     pub(crate) lsp_sessions: lsp::LspSessionManager,
     pub(crate) config: std::sync::Arc<parking_lot::RwLock<crate::config::Config>>,
     pub(crate) atom_invocation_store: orchestration::atoms::invocation::SharedInvocationStore,
+    // kept: SharedState vector store handle; consumed by embed/queue path through alternate state plumbing, retained here for direct access
+    #[allow(dead_code)]
     pub(crate) vector_store: std::sync::Arc<crate::vectors::VectorStore>,
     pub(crate) system_events: system_events::SharedEventHub,
 }
@@ -268,7 +270,7 @@ impl SharedState {
             threads: RwLock::new(Threads::open(&store_dir.join("threads.json")).unwrap()),
             notes: RwLock::new(Notes::open(&store_dir.join("notes.json")).unwrap()),
             pins: RwLock::new(Pins::open(&store_dir.join("pins.json")).unwrap()),
-            projects: RwLock::new(ProjectRegistry::open(&store_dir.join("projects.json")).unwrap()),
+            projects: RwLock::new(ProjectRegistry::open(store_dir.join("projects.json")).unwrap()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),

@@ -708,9 +708,7 @@ fn has_compaction_marker(event: &Value) -> bool {
 }
 
 fn token_burn_ratio(total_tokens: u64, baseline: Option<u64>) -> Option<f64> {
-    let Some(baseline) = baseline else {
-        return None;
-    };
+    let baseline = baseline?;
     if baseline == 0 {
         return None;
     }
@@ -1100,7 +1098,7 @@ mod tests {
             "alerts should force full snapshot"
         );
         assert!(snap.get("alerts").is_some());
-        assert!(snap["alerts"].as_array().unwrap().len() > 0);
+        assert!(!snap["alerts"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -1136,8 +1134,10 @@ mod tests {
 
     #[test]
     fn stall_near_threshold_returns_full_snapshot() {
-        let mut state = SupervisionState::default();
-        state.last_event_at_ms = Some(0);
+        let state = SupervisionState {
+            last_event_at_ms: Some(0),
+            ..Default::default()
+        };
         // stall_amber_ms is 180_000, so elapsed=170_000 is below threshold
         // but stall_elapsed_ms (170_000) is checked against stall_amber_ms (180_000)
         // which passes, so this should still be green

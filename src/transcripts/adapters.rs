@@ -237,9 +237,8 @@ impl TranscriptReadAdapter for ClaudeTranscriptAdapter {
                 .filter_map(|entry| entry.ok())
             {
                 let path = entry.path();
-                if !path
-                    .file_name()
-                    .is_some_and(|name| name == filename.as_str())
+                if path
+                    .file_name().is_none_or(|name| name != filename.as_str())
                 {
                     continue;
                 }

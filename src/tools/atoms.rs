@@ -834,7 +834,7 @@ impl BlackboxServer {
                 .classifier
                 .atom_ref
                 .as_ref()
-                .ok_or_else(|| "enabled classifier supervision requires classifier.atom_ref")?
+                .ok_or("enabled classifier supervision requires classifier.atom_ref")?
                 .render();
             let classifier_result = Box::pin(self.atom_invoke_value(
                 crate::AtomInvokeParams {
@@ -887,7 +887,7 @@ impl BlackboxServer {
                 .advisor
                 .atom_ref
                 .as_ref()
-                .ok_or_else(|| "enabled advisor supervision requires advisor.atom_ref")?
+                .ok_or("enabled advisor supervision requires advisor.atom_ref")?
                 .render();
             let advisor_result = Box::pin(self.atom_invoke_value(
                 crate::AtomInvokeParams {
@@ -1505,6 +1505,7 @@ impl BlackboxServer {
         Err("error.forbidden: caller is not authorized for this attachment lineage".into())
     }
 
+    #[cfg(test)]
     pub(crate) fn attached_supervision_poll_value(
         &self,
         primary_invocation_id: &str,
@@ -1543,7 +1544,7 @@ impl BlackboxServer {
         drop(store);
 
         self.refresh_atom_invocation_from_task(&mut primary_invocation);
-        let _ = self
+        self
             .state
             .atom_invocation_store
             .write()

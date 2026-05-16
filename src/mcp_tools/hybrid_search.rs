@@ -828,7 +828,7 @@ mod tests {
 
     #[test]
     fn reranked_results_collapse_same_entity() {
-        let fused = vec![FusedHit {
+        let fused = [FusedHit {
             entity_id: "knowledge:a".into(),
             score: 0.2,
             sources: BTreeMap::from([("bm25".into(), 0.1), ("vector:x".into(), 0.1)]),

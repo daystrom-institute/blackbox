@@ -223,10 +223,6 @@ impl EventHub {
         self.tx.subscribe()
     }
 
-    pub fn event_store(&self) -> &EventStore {
-        &self.event_store
-    }
-
     pub fn outbox_store(&self) -> &OutboxStore {
         &self.outbox_store
     }
@@ -241,6 +237,7 @@ impl EventHub {
         })
     }
 
+    #[cfg(test)]
     pub fn reactions_dir(&self) -> &Path {
         &self.reactions_dir
     }
@@ -470,18 +467,6 @@ fn load_all_reactions_raw(dir: &Path) -> Vec<RawReaction> {
     out
 }
 
-pub fn load_all_reactions(dir: &Path) -> Vec<ReactionSpec> {
-    load_all_reactions_raw(dir)
-        .into_iter()
-        .filter_map(|entry| match entry {
-            RawReaction::Valid(spec) => Some(spec),
-            RawReaction::Invalid { path, error } => {
-                tracing::warn!("load_all_reactions: bad spec at {path}: {error}");
-                None
-            }
-        })
-        .collect()
-}
 
 fn scan_reaction_warnings(dir: &Path) -> Vec<ReactionLoadWarning> {
     load_all_reactions_raw(dir)

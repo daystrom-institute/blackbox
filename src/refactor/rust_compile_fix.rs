@@ -245,7 +245,7 @@ pub fn plan_compile_fix(p: &RefactorPlanParams, diagnostics: &[RustcDiagnostic])
 
     // Sort edits within each file in reverse byte order so offsets stay valid when applying.
     for fe in file_edits.values_mut() {
-        fe.edits.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+        fe.edits.sort_by_key(|b| std::cmp::Reverse(b.byte_start));
     }
 
     let mut edits: Vec<FileEdit> = file_edits.into_values().collect();

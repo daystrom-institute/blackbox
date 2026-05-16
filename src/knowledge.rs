@@ -3293,8 +3293,8 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             )
             .unwrap();
         assert_eq!(out.action, "created");
-        assert_eq!(out.rendered, false);
-        assert_eq!(out.render_pending, true);
+        assert!(!out.rendered);
+        assert!(out.render_pending);
         assert_eq!(out.summary, None);
         assert_eq!(out.id.len(), 8);
         assert!(out.message.starts_with("Created entry "));

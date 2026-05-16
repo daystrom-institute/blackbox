@@ -585,6 +585,8 @@ impl Provider {
     /// `exclude_tools` is honored only by Gemini (persistent, set at
     /// registration time). Other providers ignore it — they apply tool
     /// filtering per-dispatch via `build_filter_args`.
+    // kept: public MCP add-HTTP arg builder; persistent MCP-config CRUD is user-driven via `bro_mcp`
+    #[allow(dead_code)]
     pub fn build_mcp_add_http_args(
         &self,
         name: &str,
@@ -784,6 +786,8 @@ impl Provider {
     }
 
     /// Argv for `{provider} mcp list` (stdout will differ per provider).
+    // kept: public MCP list-args builder; persistent MCP-config CRUD is user-driven via `bro_mcp`
+    #[allow(dead_code)]
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
         match self {
             Provider::Claude | Provider::Glm | Provider::Deepseek => {
@@ -807,6 +811,8 @@ impl Provider {
     ///
     /// Output formats differ: coarse substring match is sufficient for
     /// our "skip if present with matching URL, else upsert" flow.
+    // kept: public MCP list-scanner helper; persistent MCP-config CRUD is user-driven via `bro_mcp`
+    #[allow(dead_code)]
     pub fn mcp_list_has(&self, stdout: &str, name: &str, expected_url: Option<&str>) -> MatchState {
         let has_name = stdout.lines().any(|l| l.contains(name));
         if !has_name {
@@ -1101,6 +1107,8 @@ pub fn claude_mcp_config_json(name: &str, url: &str) -> String {
 }
 
 /// Result of scanning a `mcp list` output for a specific entry.
+// kept: returned by public `mcp_list_has` helper; persistent MCP-config CRUD path retained as public API
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchState {
     /// Name not found in output.

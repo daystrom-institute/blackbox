@@ -292,7 +292,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["verdict_classification"], "tool_surface");
-        assert!(parsed["visible_tools"].as_array().unwrap().len() > 0);
+        assert!(!parsed["visible_tools"].as_array().unwrap().is_empty());
         let visible: Vec<&str> = parsed["visible_tools"]
             .as_array()
             .unwrap()

@@ -367,6 +367,9 @@ fn synth_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
         return None;
     }
     let imports = extract_imports(source);
+    // clippy suggests collapsing the inner Option into unwrap_or, but the three-way
+    // chain (imports → package decl → 0) reads more clearly as if/else if/else.
+    #[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
     let insert_byte = if let Some((_, end)) = imports.last() {
         *end
     } else if let Some(pkg_end) = find_package_decl_end(source) {
@@ -705,9 +708,9 @@ fn is_pure_method(
                     }
                 }
             }
-            "method_invocation" => {
+            "method_invocation"
                 // Receiverless call to a known same-class static method?
-                if n.child_by_field_name("object").is_none() {
+                if n.child_by_field_name("object").is_none() => {
                     if let Some(name_node) = n.child_by_field_name("name") {
                         if let Ok(text) = name_node.utf8_text(bytes) {
                             if static_methods.contains(text) {
@@ -716,7 +719,6 @@ fn is_pure_method(
                         }
                     }
                 }
-            }
             _ => {}
         }
     }

@@ -227,9 +227,7 @@ fn err_file_too_large(file: &Path, bytes: u64) -> Result<String> {
             bytes,
             MAX_CODE_NAV_FILE_BYTES
         ),
-        suggestion: format!(
-            "Narrow the request: target a smaller file, or use bbox_refactor_status with item_kinds to locate a specific symbol without reparsing the whole file."
-        ),
+        suggestion: "Narrow the request: target a smaller file, or use bbox_refactor_status with item_kinds to locate a specific symbol without reparsing the whole file.".to_string(),
         file: Some(file.to_string_lossy().into_owned()),
         file_bytes: Some(bytes),
         max_bytes: Some(MAX_CODE_NAV_FILE_BYTES),
@@ -1072,7 +1070,7 @@ pub fn code_symbols(
     let mode = match p.mode.as_deref() {
         Some(raw) => match CodeSymbolMode::from_param(Some(raw)) {
             Ok(m) => m,
-            Err(_) => return Ok(err_invalid_code_symbols_mode(raw)?),
+            Err(_) => return err_invalid_code_symbols_mode(raw),
         },
         None if idx.is_some() => CodeSymbolMode::Indexed,
         None => CodeSymbolMode::Live,
@@ -1740,12 +1738,10 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
                      `identifiers` is the only kind that falls back to the generic walker.",
                     kind = p.kind
                 ),
-                suggestion: format!(
-                    "Either pass kind=\"identifiers\" (shape-only fallback — emits records \
+                suggestion: "Either pass kind=\"identifiers\" (shape-only fallback — emits records \
                      for nodes literally named `identifier`; may return zero on grammars \
                      that use different identifier-like kinds, e.g. Erlang's `atom`/`variable`), \
-                     or use bbox_code_query with a grammar-native S-expression."
-                ),
+                     or use bbox_code_query with a grammar-native S-expression.".to_string(),
                 file: Some(path.to_string_lossy().into_owned()),
                 file_bytes: None,
                 max_bytes: None,

@@ -105,7 +105,7 @@ pub fn plan_ra_classify(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<Str
 
             if let Some(loc) = location {
                 let (decl_item, decl_kind) =
-                    classify_definition(project_dir, &loc).map_err(|e| LspError::Other(e))?;
+                    classify_definition(project_dir, &loc).map_err(LspError::Other)?;
                 by_method
                     .entry((callee, decl_item, decl_kind))
                     .or_default()
@@ -374,7 +374,7 @@ mod tests {
         fs::write(&path, source).unwrap();
         let parsed = parse_rust_file(&path).unwrap();
 
-        let sites = find_call_sites(&parsed, &vec!["a".to_string(), "b".to_string()]).unwrap();
+        let sites = find_call_sites(&parsed, &["a".to_string(), "b".to_string()]).unwrap();
         assert_eq!(sites.len(), 2);
 
         assert_eq!(sites[0].0, "self.b");

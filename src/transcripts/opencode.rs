@@ -174,7 +174,7 @@ impl OpencodeTranscriptAdapter {
                     cwd,
                     msg_role,
                     TranscriptEventKind::Message,
-                    &msg_data["summary"].as_str().unwrap_or_default().to_string(),
+                    msg_data["summary"].as_str().unwrap_or_default(),
                     RawTranscriptRef::provider_event(
                         self.provider,
                         TranscriptStorage::Sqlite,
@@ -320,7 +320,7 @@ impl OpencodeTranscriptAdapter {
                             self.provider,
                             TranscriptStorage::Sqlite,
                             db_path,
-                            &format!("{}-result", part.id),
+                            format!("{}-result", part.id),
                             &result_entity,
                         );
                         let mut result_event = make_event(
@@ -537,10 +537,8 @@ fn probe_tables(
             message: e.to_string(),
         })?;
     let mut tables = std::collections::HashSet::new();
-    for row in rows {
-        if let Ok(name) = row {
-            tables.insert(name);
-        }
+    for name in rows.flatten() {
+        tables.insert(name);
     }
     Ok(tables)
 }

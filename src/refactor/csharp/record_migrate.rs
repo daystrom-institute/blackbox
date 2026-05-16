@@ -130,6 +130,8 @@ fn refuse_generated_file(path: &Path) -> Result<()> {
 #[derive(Debug)]
 struct ClassLocation {
     head_start: usize,
+    // kept: captured by locator; reserved for finer-grained edit spans
+    #[allow(dead_code)]
     name_end: usize,
     body_start: usize,
     body_end: usize,
@@ -372,13 +374,12 @@ fn enforce_no_method_bodies(source: &str, class: &ClassLocation) -> Result<()> {
                 body_check_start
             };
             match bytes.get(body_check_start).copied() {
-                Some(b'{') | Some(b'=') => {
-                    if !canonical {
+                Some(b'{') | Some(b'=')
+                    if !canonical => {
                         bail!(
                             "error.non_canonical_method: type contains method `{name}` with a body; refuse to convert to record"
                         );
                     }
-                }
                 _ => {}
             }
             i = body_check_start + 1;
@@ -534,7 +535,7 @@ fn render_record(class: &ClassLocation, class_name: &str, props: &[RecordPropert
         .access_modifier
         .as_deref()
         .map(|m| format!("{m} "))
-        .unwrap_or_else(String::new);
+        .unwrap_or_default();
     let params: Vec<String> = props
         .iter()
         .map(|p| format!("{} {}", p.type_text, p.name))

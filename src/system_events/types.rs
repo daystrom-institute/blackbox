@@ -155,6 +155,7 @@ impl JournalEnvelope {
     }
 }
 
+#[cfg(test)]
 pub fn make_event(
     kind: SystemEventKind,
     producer: &str,
@@ -181,7 +182,9 @@ pub fn make_event(
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum OutboxStatus {
+    #[default]
     Pending,
     Claimed,
     Succeeded,
@@ -189,11 +192,6 @@ pub enum OutboxStatus {
     DeadLettered,
 }
 
-impl Default for OutboxStatus {
-    fn default() -> Self {
-        Self::Pending
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutboxRecord {
@@ -301,21 +299,20 @@ impl Default for RetryPolicy {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum FailurePolicy {
+    #[default]
     DeadLetter,
 }
 
-impl Default for FailurePolicy {
-    fn default() -> Self {
-        Self::DeadLetter
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionStatus {
     Succeeded,
     PermanentFailure,
     RetryableFailure,
+    // kept: gate-skip variant matched by worker; emission path wired in follow-up
+    #[allow(dead_code)]
     SkippedByGate,
 }
 

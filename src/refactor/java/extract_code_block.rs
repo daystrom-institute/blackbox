@@ -310,17 +310,18 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
     let enclosing_end = enclosing_method.end_byte();
     let helper_insert_text = format_helper_insert(&parsed.source, enclosing_end, &helper_decl);
 
-    let mut edits = Vec::with_capacity(2);
-    edits.push(TextEdit {
-        byte_start: region_start,
-        byte_end: region_end,
-        replacement,
-    });
-    edits.push(TextEdit {
-        byte_start: enclosing_end,
-        byte_end: enclosing_end,
-        replacement: helper_insert_text,
-    });
+    let mut edits = vec![
+        TextEdit {
+            byte_start: region_start,
+            byte_end: region_end,
+            replacement,
+        },
+        TextEdit {
+            byte_start: enclosing_end,
+            byte_end: enclosing_end,
+            replacement: helper_insert_text,
+        },
+    ];
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
 

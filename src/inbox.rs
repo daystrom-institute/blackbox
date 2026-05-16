@@ -693,6 +693,53 @@ fn project_leaf(project: Option<&str>) -> Option<&str> {
     project.and_then(|p| p.rsplit('/').find(|part| !part.is_empty()))
 }
 
+fn thread_age_days(thread: &Thread, now_secs: u64) -> u64 {
+    iso_age_days(&thread.last_activity, now_secs)
+}
+
+fn iso_age_days(ts: &str, now_secs: u64) -> u64 {
+    if ts.len() < 10 {
+        return 0;
+    }
+    let y: i64 = ts[0..4].parse().unwrap_or(2026);
+    let m: u32 = ts[5..7].parse().unwrap_or(1);
+    let d: u32 = ts[8..10].parse().unwrap_or(1);
+
+    let mut epoch_days: i64 = 0;
+    for yr in 1970..y {
+        epoch_days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) {
+            366
+        } else {
+            365
+        };
+    }
+    let months = [
+        31,
+        if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            29
+        } else {
+            28
+        },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    for days in months.iter().take((m as usize - 1).min(11)) {
+        epoch_days += *days as i64;
+    }
+    epoch_days += d as i64 - 1;
+
+    let activity_secs = epoch_days as u64 * 86400;
+    now_secs.saturating_sub(activity_secs) / 86400
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,51 +1308,4 @@ mod tests {
         assert!(out.contains("packet/review/rate — unresolved=1 acknowledged=1 addressed=0"));
         assert!(out.contains("workflow — unresolved=0 acknowledged=0 addressed=1"));
     }
-}
-
-fn thread_age_days(thread: &Thread, now_secs: u64) -> u64 {
-    iso_age_days(&thread.last_activity, now_secs)
-}
-
-fn iso_age_days(ts: &str, now_secs: u64) -> u64 {
-    if ts.len() < 10 {
-        return 0;
-    }
-    let y: i64 = ts[0..4].parse().unwrap_or(2026);
-    let m: u32 = ts[5..7].parse().unwrap_or(1);
-    let d: u32 = ts[8..10].parse().unwrap_or(1);
-
-    let mut epoch_days: i64 = 0;
-    for yr in 1970..y {
-        epoch_days += if yr % 4 == 0 && (yr % 100 != 0 || yr % 400 == 0) {
-            366
-        } else {
-            365
-        };
-    }
-    let months = [
-        31,
-        if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
-            29
-        } else {
-            28
-        },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    for days in months.iter().take((m as usize - 1).min(11)) {
-        epoch_days += *days as i64;
-    }
-    epoch_days += d as i64 - 1;
-
-    let activity_secs = epoch_days as u64 * 86400;
-    now_secs.saturating_sub(activity_secs) / 86400
 }

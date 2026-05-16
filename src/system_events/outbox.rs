@@ -333,6 +333,8 @@ impl OutboxStore {
             .collect())
     }
 
+    // kept: public OutboxStore filter helper alongside `load_all`/`list_for_event`; admin path wired in follow-up
+    #[allow(dead_code)]
     pub fn list_by_status(&self, status: OutboxStatus) -> Result<Vec<OutboxRecord>> {
         let records = self.load_all()?;
         Ok(records.into_iter().filter(|r| r.status == status).collect())

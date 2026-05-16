@@ -2238,7 +2238,7 @@ mod tests {
         let t0 = Instant::now();
         set.claim("x", t0);
         assert_eq!(set.len(), 1);
-        assert!(set.is_empty() == false);
+        assert!(!set.is_empty());
         // Entries expire after TTL, not before
         let t1 = t0 + Duration::from_secs(31);
         // claim with expired now → prunes old entry, claims new

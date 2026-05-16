@@ -127,12 +127,14 @@ pub fn plan_compile_fix_round(p: &RefactorPlanParams) -> Result<String> {
     );
     plan.edits = file_edits;
     plan.validations = validations;
-    plan.leftovers = leftovers.iter().map(|l| serialize_leftover(l)).collect();
+    plan.leftovers = leftovers.iter().map(serialize_leftover).collect();
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
 enum Classification {
     Leftover { hint: Option<String> },
+    // kept: variant matched but not yet constructed; sidecar-resolution path lands in follow-up
+    #[allow(dead_code)]
     AddUsingDirective { file: String, directive: String },
 }
 

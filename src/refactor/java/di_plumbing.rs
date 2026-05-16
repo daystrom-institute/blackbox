@@ -317,6 +317,9 @@ fn ensure_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
     // Find insertion point: after the last existing import, or after the
     // package declaration if no imports yet, or at byte 0.
     let imports = extract_existing_imports(source);
+    // clippy suggests collapsing the inner Option into unwrap_or, but the three-way
+    // chain (imports → package decl → 0) reads more clearly as if/else if/else.
+    #[allow(clippy::manual_unwrap_or, clippy::manual_unwrap_or_default)]
     let insert_byte = if let Some((_, end)) = imports.last() {
         *end
     } else if let Some(pkg_end) = find_package_decl_end(source) {

@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
@@ -54,10 +54,7 @@ pub fn plan_match_to_strategy(p: &crate::refactor::RefactorPlanParams) -> anyhow
     let behavior_names: Vec<String> = p
         .item_names
         .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .cloned()
-        .collect();
+        .unwrap_or(&[]).to_vec();
 
     let toml = p.toml_entries.as_ref();
 

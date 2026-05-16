@@ -248,17 +248,15 @@ fn collect_rename_edits(
                 }
             }
             // Reference sites: type_identifier in any position.
-            "type_identifier" => {
-                if node.utf8_text(src_bytes).ok() == Some(old_name) {
-                    if !is_declaration_name(node) && kind_passes(kind_filter, "type_reference") {
+            "type_identifier"
+                if node.utf8_text(src_bytes).ok() == Some(old_name)
+                    && !is_declaration_name(node) && kind_passes(kind_filter, "type_reference") => {
                         out.push(TextEdit {
                             byte_start: node.start_byte(),
                             byte_end: node.end_byte(),
                             replacement: new_name.to_string(),
                         });
                     }
-                }
-            }
             // method_invocation.name.
             "method_invocation" => {
                 if let Some(name_node) = node.child_by_field_name("name") {
@@ -423,7 +421,7 @@ mod tests {
 
     fn apply_edits(path: &Path, edits: &[TextEdit]) -> String {
         let mut text = fs::read_to_string(path).unwrap();
-        let mut sorted: Vec<_> = edits.iter().cloned().collect();
+        let mut sorted: Vec<_> = edits.to_vec();
         sorted.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
         for edit in &sorted {
             text.replace_range(edit.byte_start..edit.byte_end, &edit.replacement);

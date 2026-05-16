@@ -1821,9 +1821,9 @@ fn build_java_type_index_records_inner_classes() {
     let idx = build_java_type_index(dir.path()).unwrap();
     assert!(idx.inner_class_names.contains("Inner"));
     assert!(idx.inner_class_names.contains("IFoo"));
-    assert!(idx.top_level.get("Outer").is_some());
+    assert!(idx.top_level.contains_key("Outer"));
     // Top-level set must NOT include the inner names.
-    assert!(idx.top_level.get("Inner").is_none());
+    assert!(!idx.top_level.contains_key("Inner"));
 }
 
 // -----------------------------------------------------------------
@@ -4461,7 +4461,7 @@ fn extract_java_class_rewrites_cross_file_static_field_callers() {
         "constant qualifier must be rewritten: {rewritten}"
     );
     assert!(
-        !rewritten.matches("Dialog.PROTREND").next().is_some(),
+        rewritten.matches("Dialog.PROTREND").next().is_none(),
         "old qualifier must not survive: {rewritten}"
     );
 }

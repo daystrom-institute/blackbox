@@ -303,9 +303,9 @@ pub(crate) fn resolve_csharp_adapter(
     for step in steps {
         if let super::RefactorRunStep::Plan { params, .. } = step {
             let kind = params.kind.as_str();
-            if kind.starts_with("csharp_") || kind == "migrate_csharp_to_filescoped_namespace" {
-                has_csharp = true;
-            } else if kind == "move_csharp_type_to_file"
+            if kind.starts_with("csharp_")
+                || kind == "migrate_csharp_to_filescoped_namespace"
+                || kind == "move_csharp_type_to_file"
                 || kind == "unseal_csharp_class"
                 || kind == "find_csharp_usages"
             {

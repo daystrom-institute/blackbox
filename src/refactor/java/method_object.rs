@@ -626,8 +626,8 @@ fn rewrite_body(body_text: &str, body_start: usize, prefix_ranges: &[(usize, usi
     if prefix_ranges.is_empty() {
         return body_text.to_string();
     }
-    let mut sorted: Vec<_> = prefix_ranges.iter().copied().collect();
-    sorted.sort_by(|a, b| b.0.cmp(&a.0));
+    let mut sorted: Vec<_> = prefix_ranges.to_vec();
+    sorted.sort_by_key(|b| std::cmp::Reverse(b.0));
     let mut out = body_text.to_string();
     for (start, end) in sorted {
         let local_start = start - body_start;

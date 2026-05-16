@@ -2017,7 +2017,7 @@ mod tests {
     /// Returns the value with `\"` and `\\` unescaped so it matches how
     /// Rust's compile-time string literals round-trip into runtime str.
     fn extract_string_arg(body: &str, key: &str) -> Option<String> {
-        let needle = format!("{key}");
+        let needle = key.to_string();
         let mut start = 0;
         while let Some(pos) = body[start..].find(&needle) {
             let abs = start + pos;

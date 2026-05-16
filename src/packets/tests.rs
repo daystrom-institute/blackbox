@@ -1834,10 +1834,10 @@ fn fallback_ignored_in_first_mode() {
 #[test]
 fn apply_mode_enum_serde_lowercase() {
     assert_eq!(
-        serde_json::to_value(&ApplyMode::First).unwrap(),
+        serde_json::to_value(ApplyMode::First).unwrap(),
         json!("first")
     );
-    assert_eq!(serde_json::to_value(&ApplyMode::All).unwrap(), json!("all"));
+    assert_eq!(serde_json::to_value(ApplyMode::All).unwrap(), json!("all"));
     let m: ApplyMode = serde_json::from_value(json!("all")).unwrap();
     assert_eq!(m, ApplyMode::All);
 }

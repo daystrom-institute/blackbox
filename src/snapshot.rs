@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -197,7 +198,7 @@ fn validate_overlay_provenance(overlay_dir: &Path) -> std::result::Result<(), Ve
             if let Ok(file) = fs::File::open(&path) {
                 let reader = std::io::BufReader::new(file);
                 use std::io::BufRead;
-                for line in reader.lines().flatten() {
+                for line in reader.lines().map_while(Result::ok) {
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -234,14 +235,6 @@ fn quarantine_dirty_overlay(
         }
     }
     Ok(())
-}
-
-pub struct SnapshotSwitch {
-    pub snapshot_id: String,
-    pub dirty: bool,
-    pub branch: Option<String>,
-    pub head_sha: Option<String>,
-    pub edges: Vec<Edge>,
 }
 
 pub fn switch_to_clean_snapshot(
@@ -390,13 +383,15 @@ fn update_manifest_for_snapshot(
     Ok(())
 }
 
-pub fn worktree_identity(project_path: &Path) -> (String, Option<String>) {
+#[cfg(test)]
+fn worktree_identity(project_path: &Path) -> (String, Option<String>) {
     let project_id = crate::entity_ref::project_id_for_path(project_path)
         .unwrap_or_else(|_| hash_path_fallback(project_path));
     let repo_id = discover_repo_id(project_path);
     (project_id, repo_id)
 }
 
+#[cfg(test)]
 fn hash_path_fallback(path: &Path) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -404,6 +399,7 @@ fn hash_path_fallback(path: &Path) -> String {
     hex::encode(&hasher.finalize()[..8])
 }
 
+#[cfg(test)]
 fn discover_repo_id(project_path: &Path) -> Option<String> {
     let git_dir = project_path.join(".git");
     if !git_dir.exists() {

@@ -1,4 +1,6 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashSet;
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -31,12 +33,6 @@ pub fn quarantine_dir(edges_dir: &Path, project_id: &str) -> PathBuf {
 
 pub fn migrations_dir(edges_dir: &Path) -> PathBuf {
     edges_dir.join("migrations")
-}
-
-pub fn migration_manifest_path(edges_dir: &Path, migration_id: &str) -> PathBuf {
-    migrations_dir(edges_dir)
-        .join(migration_id)
-        .join("manifest.json")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -170,6 +166,7 @@ pub fn find_committed_migration(
     Ok(None)
 }
 
+#[cfg(test)]
 pub fn is_project_migrated(edges_dir: &Path, project_id: &str) -> bool {
     find_committed_migration(edges_dir, project_id)
         .ok()
@@ -378,7 +375,7 @@ fn merge_staging_into_lane(staging_path: PathBuf, lane_path: PathBuf) -> Result<
     if lane_path.exists() {
         let file = fs::File::open(&lane_path)?;
         let reader = std::io::BufReader::new(file);
-        for line in reader.lines().flatten() {
+        for line in reader.lines().map_while(Result::ok) {
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -393,7 +390,7 @@ fn merge_staging_into_lane(staging_path: PathBuf, lane_path: PathBuf) -> Result<
 
     let staging_file = fs::File::open(&staging_path)?;
     let staging_reader = std::io::BufReader::new(staging_file);
-    for line in staging_reader.lines().flatten() {
+    for line in staging_reader.lines().map_while(Result::ok) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -492,7 +489,7 @@ pub fn recover_pending_migrations(edges_dir: &Path) -> Result<Vec<String>> {
             .exists();
 
         if legacy_exists {
-            let _ = fs::remove_dir_all(&entry.path());
+            let _ = fs::remove_dir_all(entry.path());
             recovered.push(format!(
                 "removed pending migration {} (source still present, retry on next apply)",
                 manifest.migration_id

@@ -85,6 +85,8 @@ pub struct ProposedChangeRef {
 
 #[derive(Debug)]
 struct ParsedFile {
+    // kept: file path tracked alongside parsed source for future diagnostic provenance
+    #[allow(dead_code)]
     path: PathBuf,
     source: String,
     tree: Tree,
@@ -410,7 +412,7 @@ fn matching_items(
             candidates.push(item.clone());
             continue;
         }
-        if paths.iter().any(|path| item.path == *path) {
+        if paths.contains(&item.path) {
             candidates.push(item.clone());
             continue;
         }
@@ -470,7 +472,7 @@ fn collect_affected_root_re_exports(
             let names = parse_use_declaration_names(&node_text(node, &parsed.source));
             let touched_names: HashSet<&str> =
                 touched.iter().map(|item| item.name.as_str()).collect();
-            let touched_by_path = matches_proposed_path(&proposed_changes, &path);
+            let touched_by_path = matches_proposed_path(proposed_changes, &path);
 
             for name in names {
                 if touched_names.contains(name.as_str())

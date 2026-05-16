@@ -863,7 +863,7 @@ mod tests {
         let response = plan_find_java_usages(&make_params(dir.path(), &["Nonexistent"])).unwrap();
         let v = parse_response(&response);
         assert_eq!(v["kind"].as_str().unwrap(), "find_java_usages");
-        assert_eq!(v["dry_run"].as_bool().unwrap(), true);
+        assert!(v["dry_run"].as_bool().unwrap());
         assert_eq!(v["plan_status"].as_str().unwrap(), "planned");
         assert!(v["edits"].as_array().unwrap().is_empty());
         assert_eq!(v["usage_count"].as_u64().unwrap(), 0);

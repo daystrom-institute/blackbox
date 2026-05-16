@@ -1528,7 +1528,7 @@ mod tests {
             if name.starts_with('_') {
                 continue;
             }
-            let src = std::fs::read_to_string(&path).expect("read manifest");
+            let src = std::fs::read_to_string(path).expect("read manifest");
             let v: serde_json::Value =
                 serde_json::from_str(&src).unwrap_or_else(|e| panic!("{name} did not parse: {e}"));
             assert!(

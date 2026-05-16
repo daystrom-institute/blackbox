@@ -76,8 +76,8 @@ pub fn plan_async_dispose_convert(p: &RefactorPlanParams) -> Result<String> {
         .trim_start_matches(':')
         .trim();
     let parts: Vec<&str> = inheritance.split(',').map(|s| s.trim()).collect();
-    let has_disposable = parts.iter().any(|p| *p == "IDisposable");
-    let has_async = parts.iter().any(|p| *p == "IAsyncDisposable");
+    let has_disposable = parts.contains(&"IDisposable");
+    let has_async = parts.contains(&"IAsyncDisposable");
     if !has_disposable {
         bail!(
             "error.no_idisposable: class `{class_name}` does not implement IDisposable; async-dispose conversion has no anchor"
@@ -292,7 +292,7 @@ mod tests {
     fn apply(src: &str, edits: &[TextEdit]) -> String {
         let mut s = src.to_string();
         let mut sorted: Vec<&TextEdit> = edits.iter().collect();
-        sorted.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.byte_start));
         for te in sorted {
             s.replace_range(te.byte_start..te.byte_end, &te.replacement);
         }

@@ -115,7 +115,6 @@ pub(crate) fn plan_inline_java_method(p: &RefactorPlanParams) -> Result<String> 
     let mut file_edits: Vec<FileEdit> = Vec::new();
     let mut validations = Vec::new();
     let mut total_call_sites = 0usize;
-    let mut source_file_call_count = 0usize;
 
     // Process the source file first.
     let source_call_sites = collect_call_sites(class_node, method_name, &parsed.source);
@@ -132,7 +131,7 @@ pub(crate) fn plan_inline_java_method(p: &RefactorPlanParams) -> Result<String> 
         )?;
         source_edits.push(edit);
     }
-    source_file_call_count = source_call_sites.len();
+    let source_file_call_count = source_call_sites.len();
     if !source_edits.is_empty() {
         total_call_sites += source_edits.len();
     }

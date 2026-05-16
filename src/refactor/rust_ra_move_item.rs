@@ -1,12 +1,11 @@
 //! RX-R1 — rust-analyzer-backed top-level item move into module.
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::Path;
 
 use anyhow::{Result, anyhow, bail};
 use lsp_types::{
     CodeActionContext, CodeActionKind, CodeActionOrCommand, CodeActionParams,
-    DidOpenTextDocumentParams, Position, Range, TextDocumentIdentifier, TextDocumentItem, Url,
+    DidOpenTextDocumentParams, Range, TextDocumentIdentifier, TextDocumentItem, Url,
     notification::DidOpenTextDocument, request::CodeActionRequest,
 };
 

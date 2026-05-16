@@ -12,6 +12,7 @@ use crate::transcripts::types::TranscriptStorage;
 
 /// Extract a human-readable project name from the file path.
 /// Claude Code encodes project paths as directory names: `/home/user/repos/foo` → `-home-user-repos-foo`
+#[cfg(test)]
 pub(super) fn extract_project_from_path(file_path: &Path, projects_root: &Path) -> String {
     let relative = file_path.strip_prefix(projects_root).unwrap_or(file_path);
 

@@ -162,17 +162,14 @@ pub enum QueryClass {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum PassStrictness {
+    #[default]
     Any,
     All,
     First,
 }
 
-impl Default for PassStrictness {
-    fn default() -> Self {
-        Self::Any
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetLocator {

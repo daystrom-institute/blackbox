@@ -19,7 +19,6 @@
 
 use std::collections::HashSet;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
@@ -134,6 +133,8 @@ pub struct WorkspaceManifest {
 }
 
 impl WorkspaceManifest {
+    // kept: public manifest path helper; used by snapshot/manifest tests
+    #[allow(dead_code)]
     pub fn manifest_path(edges_dir: &Path, project_id: &str) -> PathBuf {
         workspace_manifest_dir(edges_dir, project_id).join("manifest.json")
     }
@@ -227,11 +228,6 @@ impl ManifestIndex {
     pub fn upsert_workspace(&mut self, project_id: &str, entry: WorkspaceIndexEntry) {
         self.updated_at = Some(chrono_now_rfc3339());
         self.workspaces.insert(project_id.to_string(), entry);
-    }
-
-    pub fn remove_workspace(&mut self, project_id: &str) {
-        self.workspaces.remove(project_id);
-        self.updated_at = Some(chrono_now_rfc3339());
     }
 
     pub fn active_materialized_paths(&self, edges_dir: &Path) -> Vec<PathBuf> {

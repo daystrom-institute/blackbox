@@ -34,6 +34,7 @@ pub struct StorageFileInfo {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct StorageHealthTotals {
     pub active_legacy_bytes: u64,
     pub active_legacy_files: u64,
@@ -53,28 +54,6 @@ pub struct StorageHealthTotals {
     pub total_files: u64,
 }
 
-impl Default for StorageHealthTotals {
-    fn default() -> Self {
-        Self {
-            active_legacy_bytes: 0,
-            active_legacy_files: 0,
-            managed_derived_bytes: 0,
-            managed_derived_files: 0,
-            backup_bytes: 0,
-            backup_files: 0,
-            temp_bytes: 0,
-            temp_files: 0,
-            orphan_bytes: 0,
-            orphan_files: 0,
-            observed_bytes: 0,
-            observed_files: 0,
-            inactive_snapshot_bytes: 0,
-            inactive_snapshot_files: 0,
-            total_bytes: 0,
-            total_files: 0,
-        }
-    }
-}
 
 impl StorageHealthTotals {
     fn accumulate(&mut self, kind: FileKind, bytes: u64) {
@@ -188,7 +167,7 @@ pub fn scan_storage_health(
     scan_inactive_snapshots(edges_dir, project_filter, &mut totals, &mut files);
     let observed = scan_observed_dir(edges_dir, project_filter, &mut totals, &mut files);
 
-    files.sort_by(|a, b| b.bytes.cmp(&a.bytes));
+    files.sort_by_key(|b| std::cmp::Reverse(b.bytes));
 
     let top_offenders: Vec<StorageFileInfo> = files.iter().take(10).cloned().collect();
 
@@ -280,17 +259,6 @@ fn scan_manifest_status(edges_dir: &Path) -> Option<ManifestStatus> {
                 inactive_materialized_files: inactive_files,
             }),
         },
-    }
-}
-
-fn collect_active_jsonl_prefixes(edges_dir: &Path) -> Vec<String> {
-    match crate::manifest::try_load_manifest_index(edges_dir) {
-        Ok(idx) => idx
-            .active_materialized_paths(edges_dir)
-            .into_iter()
-            .filter_map(|p| p.to_str().map(String::from))
-            .collect(),
-        Err(_) => Vec::new(),
     }
 }
 
@@ -848,6 +816,8 @@ pub struct GcResult {
 }
 
 pub struct GcParams {
+    // kept: public GC param surface for orchestrators; `dry_run` consumed by callers (currently only outer tools)
+    #[allow(dead_code)]
     pub dry_run: bool,
     pub project_filter: Option<String>,
     pub prune_backups: bool,
@@ -859,6 +829,7 @@ pub struct GcParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct GcPolicy {
     pub materialized_snapshots: SnapshotRetentionPolicy,
     pub backups: BackupRetentionPolicy,
@@ -866,16 +837,6 @@ pub struct GcPolicy {
     pub observed: ObservedRetentionPolicy,
 }
 
-impl Default for GcPolicy {
-    fn default() -> Self {
-        Self {
-            materialized_snapshots: SnapshotRetentionPolicy::default(),
-            backups: BackupRetentionPolicy::default(),
-            orphans: OrphanRetentionPolicy::default(),
-            observed: ObservedRetentionPolicy::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotRetentionPolicy {
@@ -927,20 +888,15 @@ impl Default for OrphanRetentionPolicy {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct ObservedRetentionPolicy {
     pub max_bytes_per_project: Option<u64>,
 }
 
-impl Default for ObservedRetentionPolicy {
-    fn default() -> Self {
-        Self {
-            max_bytes_per_project: None,
-        }
-    }
-}
 
 const TEMP_GRACE_SECS: u64 = 24 * 3600;
 
+#[cfg(test)]
 pub fn plan_gc(
     edges_dir: &Path,
     registered_project_ids: &HashSet<String>,
@@ -1057,7 +1013,7 @@ fn plan_backup_gc(
     let mut retained_backup_bytes = 0u64;
     let mut prunable_backup_refs: Vec<&StorageFileInfo> = Vec::new();
     for (source, mut backups) in backups_by_source {
-        backups.sort_by(|a, b| backup_recency_key(a).cmp(&backup_recency_key(b)));
+        backups.sort_by_key(|a| backup_recency_key(a));
         let keep = params.keep_newest_backup_per_source as usize;
         for (i, f) in backups.iter().enumerate() {
             let age_secs = file_age_secs(Path::new(&f.path)).unwrap_or(0);
@@ -1218,7 +1174,8 @@ fn plan_snapshot_gc(
     let grace_secs = policy.branch_switch_grace_minutes * 60;
 
     for snapshot in snapshots {
-        let retained_reason = if policy.keep_active { None } else { None }
+        // TODO: policy.keep_active is currently a no-op pending active-snapshot detection
+        let retained_reason = None
             .or_else(|| {
                 retain_by_workspace
                     .contains(&snapshot.snapshot_dir)

@@ -281,7 +281,7 @@ mod tests {
         unsafe {
             env::set_var(
                 "CREDENTIALS_DIRECTORY",
-                &creds_dir.to_string_lossy().into_owned(),
+                creds_dir.to_string_lossy().into_owned(),
             );
         }
 

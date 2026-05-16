@@ -1464,87 +1464,6 @@ fn main() -> anyhow::Result<()> {
     result
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn lane(team: &str, bro: &str, bro_selector: &str, session_id: Option<&str>) -> Lane {
-        Lane {
-            bro: bro.into(),
-            bro_selector: bro_selector.into(),
-            team: team.into(),
-            provider: "gemini".into(),
-            model: None,
-            session_id: session_id.map(str::to_string),
-            jsonl_path: None,
-            events: Vec::new(),
-            file_offset: 0,
-            file_mtime: None,
-            seen_ids: HashSet::new(),
-            scroll_from_bottom: 0,
-            cached_total_lines: 0,
-            status: LaneStatus::Waiting,
-            active_tasks: HashSet::new(),
-            last_progress_at: None,
-            last_progress_snippet: None,
-            last_failure: None,
-        }
-    }
-
-    #[test]
-    fn lane_matches_scoped_signal_before_bare_name() {
-        let lane = lane("red", "reviewer", "red::reviewer", Some("sid-red"));
-        assert!(lane.matches_signal(Some("reviewer"), Some("red::reviewer"), Some("sid-red")));
-        assert!(!lane.matches_signal(Some("reviewer"), Some("blue::reviewer"), Some("sid-blue")));
-    }
-
-    #[test]
-    fn adhoc_lane_can_match_by_session_without_team_scoping() {
-        let lane = lane("adhoc", "sid-red", "sid-red", Some("sid-red"));
-        assert!(lane.matches_signal(Some("sid-red"), None, Some("sid-red")));
-        assert!(!lane.matches_signal(Some("sid-blue"), None, Some("sid-blue")));
-    }
-
-    #[test]
-    fn clap_parses_tail_repeatable_and_positional_selectors() {
-        let cli = BroCli::parse_from([
-            "bro",
-            "tail",
-            "alpha",
-            "beta",
-            "--team",
-            "red",
-            "--team",
-            "blue",
-            "--bro",
-            "solo",
-            "--session",
-            "sid-123",
-            "--provider",
-            "gemini",
-        ]);
-
-        let BroCommand::Tail(args) = cli.command else {
-            panic!("expected Tail command");
-        };
-        let sel = TailSelectors::from(args);
-        assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
-        assert_eq!(sel.teams, vec!["red", "blue"]);
-        assert_eq!(sel.sessions, vec!["sid-123"]);
-        assert_eq!(sel.providers, vec!["gemini"]);
-    }
-
-    #[test]
-    fn clap_preserves_scoped_bro_selectors() {
-        let cli = BroCli::parse_from(["bro", "tail", "--bro", "red::reviewer"]);
-        let BroCommand::Tail(args) = cli.command else {
-            panic!("expected Tail command");
-        };
-        let sel = TailSelectors::from(args);
-        assert_eq!(sel.bros, vec!["red::reviewer"]);
-    }
-}
-
 // ── TUI main loop ───────────────────────────────────────────────────
 
 fn run_tui(mut app: App, signals: mpsc::Receiver<LaneSignal>) -> anyhow::Result<()> {
@@ -2369,3 +2288,84 @@ fn convert_core_color(c: ratatui_core::style::Color) -> Color {
 // Suppress dead-code warning on Path import when only used via PathBuf methods.
 #[allow(dead_code)]
 const _PATH: Option<&Path> = None;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lane(team: &str, bro: &str, bro_selector: &str, session_id: Option<&str>) -> Lane {
+        Lane {
+            bro: bro.into(),
+            bro_selector: bro_selector.into(),
+            team: team.into(),
+            provider: "gemini".into(),
+            model: None,
+            session_id: session_id.map(str::to_string),
+            jsonl_path: None,
+            events: Vec::new(),
+            file_offset: 0,
+            file_mtime: None,
+            seen_ids: HashSet::new(),
+            scroll_from_bottom: 0,
+            cached_total_lines: 0,
+            status: LaneStatus::Waiting,
+            active_tasks: HashSet::new(),
+            last_progress_at: None,
+            last_progress_snippet: None,
+            last_failure: None,
+        }
+    }
+
+    #[test]
+    fn lane_matches_scoped_signal_before_bare_name() {
+        let lane = lane("red", "reviewer", "red::reviewer", Some("sid-red"));
+        assert!(lane.matches_signal(Some("reviewer"), Some("red::reviewer"), Some("sid-red")));
+        assert!(!lane.matches_signal(Some("reviewer"), Some("blue::reviewer"), Some("sid-blue")));
+    }
+
+    #[test]
+    fn adhoc_lane_can_match_by_session_without_team_scoping() {
+        let lane = lane("adhoc", "sid-red", "sid-red", Some("sid-red"));
+        assert!(lane.matches_signal(Some("sid-red"), None, Some("sid-red")));
+        assert!(!lane.matches_signal(Some("sid-blue"), None, Some("sid-blue")));
+    }
+
+    #[test]
+    fn clap_parses_tail_repeatable_and_positional_selectors() {
+        let cli = BroCli::parse_from([
+            "bro",
+            "tail",
+            "alpha",
+            "beta",
+            "--team",
+            "red",
+            "--team",
+            "blue",
+            "--bro",
+            "solo",
+            "--session",
+            "sid-123",
+            "--provider",
+            "gemini",
+        ]);
+
+        let BroCommand::Tail(args) = cli.command else {
+            panic!("expected Tail command");
+        };
+        let sel = TailSelectors::from(args);
+        assert_eq!(sel.bros, vec!["solo", "alpha", "beta"]);
+        assert_eq!(sel.teams, vec!["red", "blue"]);
+        assert_eq!(sel.sessions, vec!["sid-123"]);
+        assert_eq!(sel.providers, vec!["gemini"]);
+    }
+
+    #[test]
+    fn clap_preserves_scoped_bro_selectors() {
+        let cli = BroCli::parse_from(["bro", "tail", "--bro", "red::reviewer"]);
+        let BroCommand::Tail(args) = cli.command else {
+            panic!("expected Tail command");
+        };
+        let sel = TailSelectors::from(args);
+        assert_eq!(sel.bros, vec!["red::reviewer"]);
+    }
+}

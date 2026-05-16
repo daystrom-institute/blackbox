@@ -282,6 +282,8 @@ impl BlackboxServer {
     /// as the verdict, or `None` when no rule fires. Entity shape is
     /// `{output: <output>, node: <node_id>}` — packet predicates can
     /// reference either field.
+    // kept: gate-packet helper for legacy output-only entity shape; engine uses entity-variant now
+    #[allow(dead_code)]
     pub(crate) fn apply_workflow_gate(
         &self,
         packet_id: &str,
@@ -305,6 +307,8 @@ impl BlackboxServer {
     /// highest-priority classification in the packet's lattice among
     /// the findings. Returns the verdict + the findings list so the
     /// engine can surface the multi-finding shape in arc notes.
+    // kept: gate-packet helper for legacy output-only entity shape; engine uses entity-variant now
+    #[allow(dead_code)]
     pub(crate) fn apply_workflow_gate_all(
         &self,
         packet_id: &str,

@@ -1,6 +1,10 @@
 use super::*;
 
+// The file is itself named `tests.rs`; the inner `mod tests` block keeps test
+// helpers isolated from any top-level `use super::*` imports above. Renaming
+// would ripple through every #[test] in the project, so suppress here.
 #[cfg(test)]
+#[allow(clippy::module_inception)]
 mod tests {
     use super::*;
 
@@ -1512,7 +1516,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = dir.path().join("src");
         fs::create_dir_all(src_dir.join("parent")).unwrap();
-        fs::write(&src_dir.join("parent.rs"), "pub(crate) struct Thing;\n").unwrap();
+        fs::write(src_dir.join("parent.rs"), "pub(crate) struct Thing;\n").unwrap();
         fs::write(
             src_dir.join("parent").join("child.rs"),
             "use super::*;\n\nfn run(_thing: Thing) {}\n",
@@ -2983,7 +2987,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = dir.path().join("src");
         fs::create_dir_all(src_dir.join("parent")).unwrap();
-        fs::write(&src_dir.join("parent.rs"), "mod helpers;\nmod child;\n").unwrap();
+        fs::write(src_dir.join("parent.rs"), "mod helpers;\nmod child;\n").unwrap();
         fs::write(
             src_dir.join("parent").join("helpers.rs"),
             "pub(super) enum Mode { Fast }\npub(super) fn unused() {}\n",
@@ -3017,7 +3021,7 @@ mod tests {
         let src_dir = dir.path().join("src");
         fs::create_dir_all(src_dir.join("parent")).unwrap();
         fs::write(
-            &src_dir.join("parent.rs"),
+            src_dir.join("parent.rs"),
             "pub(crate) trait Extension {}\n",
         )
         .unwrap();

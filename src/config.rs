@@ -1159,7 +1159,7 @@ bind = "0.0.0.0"
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &config_path.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
             );
         }
 
@@ -1442,7 +1442,7 @@ port = 8000
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &custom_config.to_string_lossy().into_owned(),
+                custom_config.to_string_lossy().into_owned(),
             );
         }
 
@@ -1768,7 +1768,7 @@ port = 8000
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &config_path.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
             )
         };
 
@@ -1800,7 +1800,7 @@ port = 8000
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &config_path.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
             )
         };
 
@@ -1831,7 +1831,7 @@ port = 8000
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &config_path.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
             )
         };
 
@@ -1865,7 +1865,7 @@ port = 8000
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &config_path.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
             )
         };
 
@@ -1961,7 +1961,7 @@ state_dir = "~"
         unsafe {
             env::set_var(
                 "BLACKBOX_CONFIG",
-                &config_path.to_string_lossy().into_owned(),
+                config_path.to_string_lossy().into_owned(),
             );
         }
 

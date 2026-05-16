@@ -229,6 +229,9 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+// Module-level Arc to hand to the daemon SharedState.
+pub type SharedRegistry = Arc<WebhookRegistry>;
+
 // `RoutingVerdict` lives in `crate::routing` — both webhook ingress
 // and (future) pollers feed extracted entities into the same dispatch
 // pipeline, so the verdict types are inlet-agnostic.
@@ -316,6 +319,3 @@ mod tests {
         verify_signature(&scheme, &headers, body, true).unwrap();
     }
 }
-
-// Module-level Arc to hand to the daemon SharedState.
-pub type SharedRegistry = Arc<WebhookRegistry>;

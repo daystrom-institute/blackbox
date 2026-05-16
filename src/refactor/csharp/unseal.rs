@@ -501,8 +501,8 @@ fn find_virtual_insert_point(region: &[u8], stmt_start: usize, name_start: usize
 
 // Lex helpers live in `super::lex`. Imported at top of file.
 use super::lex::{
-    find_matching_close_brace, is_ident_char, is_word_boundary, match_keyword, read_ident,
-    skip_balanced, skip_lex_atom, skip_whitespace,
+    find_matching_close_brace, is_word_boundary, match_keyword, read_ident, skip_balanced,
+    skip_lex_atom, skip_whitespace,
 };
 
 #[cfg(test)]
@@ -535,7 +535,7 @@ mod tests {
     fn apply(source: &str, edits: &[TextEdit]) -> String {
         let mut text = source.to_string();
         let mut sorted: Vec<&TextEdit> = edits.iter().collect();
-        sorted.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.byte_start));
         for te in sorted {
             text.replace_range(te.byte_start..te.byte_end, &te.replacement);
         }

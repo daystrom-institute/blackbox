@@ -361,6 +361,8 @@ pub struct WorkBashParams {
     /// Explicit working directory (required; do not infer from ambient context).
     pub cwd: String,
     /// Optional dispatch task ID for correlation.
+    // kept: public tool param accepted via JSON schema; correlation hook wired in follow-up
+    #[allow(dead_code)]
     #[serde(default)]
     pub task_id: Option<String>,
     /// Command timeout in seconds (default 60, max 300).
@@ -436,7 +438,7 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
         )),
     )];
 
-    if let Some(ref s) = p.server.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(s) = p.server.as_deref().filter(|s| !s.is_empty()) {
         clauses.push((
             Occur::Must,
             Box::new(TermQuery::new(
@@ -446,7 +448,7 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
         ));
     }
 
-    if let Some(ref n) = p.tool_name.as_deref().filter(|n| !n.is_empty()) {
+    if let Some(n) = p.tool_name.as_deref().filter(|n| !n.is_empty()) {
         clauses.push((
             Occur::Must,
             Box::new(TermQuery::new(
@@ -456,7 +458,7 @@ fn impl_work_tool_calls(idx: &TranscriptIndex, p: &WorkToolCallsParams) -> anyho
         ));
     }
 
-    if let Some(ref k) = p.tool_kind.as_deref().filter(|k| !k.is_empty()) {
+    if let Some(k) = p.tool_kind.as_deref().filter(|k| !k.is_empty()) {
         clauses.push((
             Occur::Must,
             Box::new(TermQuery::new(

@@ -582,6 +582,8 @@ fn has_final_modifier(node: Node<'_>) -> bool {
 pub struct CapturedRef {
     pub name: String,
     pub type_text: String,
+    // kept: parsed final-modifier flag for captured ref; consumed by future plan kinds
+    #[allow(dead_code)]
     pub is_final: bool,
     /// Whether the captured variable is reassigned inside the range
     /// (via `=`, `+=`, ..., `++`, `--`). Reassigned captures cannot
@@ -594,7 +596,10 @@ pub struct CapturedRef {
 pub struct NonLocalControlFlow {
     /// `return`, `break`, or `continue`.
     pub kind: String,
+    // kept: byte spans for non-local control-flow nodes; surfaced by future diagnostics
+    #[allow(dead_code)]
     pub byte_start: usize,
+    #[allow(dead_code)]
     pub byte_end: usize,
 }
 
@@ -636,8 +641,8 @@ pub fn analyze_range(
                 "this" | "super" => {
                     analysis.this_super_refs += 1;
                 }
-                "identifier" | "type_identifier" => {
-                    if !is_declaration_site(n) {
+                "identifier" | "type_identifier"
+                    if !is_declaration_site(n) => {
                         if let Ok(text) = n.utf8_text(bytes) {
                             let resolved = scope.resolve(text, n.start_byte());
                             match resolved {
@@ -675,7 +680,6 @@ pub fn analyze_range(
                             }
                         }
                     }
-                }
                 "return_statement" => {
                     analysis.non_local_control_flow.push(NonLocalControlFlow {
                         kind: "return".to_string(),
@@ -683,15 +687,14 @@ pub fn analyze_range(
                         byte_end: n.end_byte(),
                     });
                 }
-                "break_statement" | "continue_statement" => {
-                    if non_local_break_continue(n, range_start, range_end) {
+                "break_statement" | "continue_statement"
+                    if non_local_break_continue(n, range_start, range_end) => {
                         analysis.non_local_control_flow.push(NonLocalControlFlow {
                             kind: n.kind().to_string(),
                             byte_start: n.start_byte(),
                             byte_end: n.end_byte(),
                         });
                     }
-                }
                 _ => {}
             }
         }
@@ -940,7 +943,7 @@ mod tests {
         let tree = parse_java(src);
         let method = find_method(tree.root_node(), src, "run");
         let scope = ScopeTree::build_from_method(method, src);
-        let inside = byte_after_first(src, "sum(") + 0; // points right after "sum("
+        let inside = byte_after_first(src, "sum("); // points right after "sum("
         assert!(scope.resolve("v", inside).is_some());
         let after = src.find("} v;").unwrap() + 2; // points at "v"
         assert!(scope.resolve("v", after).is_none());
@@ -964,7 +967,7 @@ mod tests {
         let tree = parse_java(src);
         let method = find_method(tree.root_node(), src, "run");
         let scope = ScopeTree::build_from_method(method, src);
-        let inside = byte_after_first(src, "log(") + 0;
+        let inside = byte_after_first(src, "log(");
         assert!(scope.resolve("e", inside).is_some());
         let after = src.find("} e;").unwrap() + 2;
         assert!(scope.resolve("e", after).is_none());

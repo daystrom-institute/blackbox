@@ -5,7 +5,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 // ── MCP parameter structs ─────────────────────────────────────────
 
@@ -294,8 +294,9 @@ impl<'a> GapNoteView<'a> {
         })
     }
 
+    #[cfg(test)]
     pub fn to_json_value(&self) -> Value {
-        let mut object = Map::new();
+        let mut object = serde_json::Map::new();
         object.insert(
             GAP_NOTE_FIELD_TYPE.to_owned(),
             Value::String(GAP_NOTE_TYPE.to_owned()),

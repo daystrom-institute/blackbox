@@ -1839,7 +1839,7 @@ pub fn run_with_ctx(
                         .as_ref()
                         .and_then(|e| e.get("diagnostics_ref"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or_else(|| {
+                        .unwrap_or({
                             if step_params.source.is_empty() {
                                 "last"
                             } else {
@@ -3272,7 +3272,7 @@ pub fn parse_dotnet_build_output(stdout: &[u8]) -> Vec<DotnetBuildDiagnostic> {
         let mut found: Option<(usize, &str)> = None;
         for sev in [": error ", ": warning ", ": info "] {
             if let Some(pos) = line.find(sev)
-                && found.map_or(true, |(p, _)| pos < p)
+                && found.is_none_or(|(p, _)| pos < p)
             {
                 found = Some((pos, sev.trim_start_matches(": ").trim()));
             }
@@ -4303,12 +4303,12 @@ fn compute_run_id(p: &RefactorRunParams, project_dir: &Path) -> String {
     hasher.update(project_dir.to_string_lossy().as_bytes());
     hasher.update(p.title.as_bytes());
     let count = p.steps.len() as u64;
-    hasher.update(&count.to_le_bytes());
+    hasher.update(count.to_le_bytes());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    hasher.update(&now.to_le_bytes());
+    hasher.update(now.to_le_bytes());
     let hex = format!("{:x}", hasher.finalize());
     hex[..16].to_string()
 }

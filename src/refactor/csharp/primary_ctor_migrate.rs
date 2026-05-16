@@ -171,6 +171,8 @@ struct ClassLoc {
 
 #[derive(Debug)]
 struct InhPos {
+    // kept: inheritance clause start offset reserved for future edit anchoring
+    #[allow(dead_code)]
     start: usize,
 }
 
@@ -232,7 +234,7 @@ fn locate_class(source: &str, class_name: &str) -> Result<ClassLoc> {
                 // we want immediately after the identifier or generic
                 // list, before any whitespace. Walk back over trailing
                 // whitespace until we hit the `>` or the identifier.
-                let mut cursor = name_end_after_generics;
+                let cursor = name_end_after_generics;
                 // We over-walked to `:` or `{` — back up to the last
                 // non-whitespace byte that's still part of the name
                 // (or generic args).
@@ -503,8 +505,7 @@ fn find_simple_assign_op(s: &str) -> Option<usize> {
 
 fn is_simple_assign_target(lhs: &str) -> bool {
     let trimmed = lhs.trim();
-    if trimmed.starts_with("this.") {
-        let rest = &trimmed[5..];
+    if let Some(rest) = trimmed.strip_prefix("this.") {
         return rest.chars().all(|c| is_ident_char(c as u8));
     }
     trimmed.chars().all(|c| is_ident_char(c as u8))
@@ -558,7 +559,7 @@ mod tests {
         // Apply in reverse.
         let mut s = src.to_string();
         let mut sorted: Vec<&TextEdit> = text_edits.iter().collect();
-        sorted.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.byte_start));
         for te in sorted {
             s.replace_range(te.byte_start..te.byte_end, &te.replacement);
         }

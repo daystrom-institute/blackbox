@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 // AtomArtifact — top-level envelope for installed atom files
 // ---------------------------------------------------------------------------
 
+// kept: public atom artifact envelope type; deserialized via serde from installed atom files
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AtomArtifact {
     pub _contract: String,
@@ -162,6 +164,7 @@ fn default_supervision_advisor() -> String {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Default)]
 pub struct SupervisionPlan {
     pub classifier: SupervisionClassifierPlan,
     pub advisor: SupervisionAdvisorPlan,
@@ -171,18 +174,6 @@ pub struct SupervisionPlan {
     pub alert_dedup: SupervisionAlertDedupPolicy,
 }
 
-impl Default for SupervisionPlan {
-    fn default() -> Self {
-        Self {
-            classifier: SupervisionClassifierPlan::default(),
-            advisor: SupervisionAdvisorPlan::default(),
-            recovery: SupervisionRecoveryPlan::default(),
-            trigger: SupervisionTriggerPlan::default(),
-            tail_policy: SupervisionTailPolicy::default(),
-            alert_dedup: SupervisionAlertDedupPolicy::default(),
-        }
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupervisionClassifierPlan {
@@ -927,6 +918,8 @@ impl AtomRef {
         }
     }
 
+    // kept: public AtomRef constructor mirroring `pinned`; used by tests and external callers
+    #[allow(dead_code)]
     pub fn latest(name: &str) -> Self {
         Self {
             name: name.to_string(),

@@ -351,6 +351,7 @@ impl InvocationStore {
             .unwrap_or_default()
     }
 
+    #[cfg(test)]
     pub fn attachment_for_primary_attempt(
         &self,
         primary_invocation_id: &str,
@@ -363,6 +364,7 @@ impl InvocationStore {
             .cloned()
     }
 
+    #[cfg(test)]
     pub fn latest_attachment_for_primary(
         &self,
         primary_invocation_id: &str,

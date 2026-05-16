@@ -119,7 +119,7 @@ fn dispatch_mcp_url_preserves_specific_bind_host() {
 }
 
 fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {
-    orchestration::brofile::save_brofile(
+    let _ = orchestration::brofile::save_brofile(
         &orchestration::brofile::Brofile {
             name: name.to_string(),
             provider: Provider::Gemini,
@@ -138,7 +138,7 @@ fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {
 }
 
 fn save_badgey_test_brofile(tmp: &tempfile::TempDir) {
-    orchestration::brofile::save_brofile(
+    let _ = orchestration::brofile::save_brofile(
         &orchestration::brofile::Brofile {
             name: "badgey-persona".to_string(),
             provider: Provider::Codex,
@@ -4799,7 +4799,7 @@ fn bro_agent_describe_brofile_ref_resolved() {
         coerce_workspace: None,
         runtime: None,
     };
-    orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
+    let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
     let manifest = serde_json::json!({
         "description": "Agent referencing a saved brofile.",
         "when_to_use": ["when auditing"],
@@ -5541,25 +5541,28 @@ fn bro_agent_dispatch_adapter_unavailable_hard_fails() {
 async fn bro_agent_dispatch_noop_adapter_succeeds() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
-    let cat = &server.state.artifacts.read();
-    cat.install_value(
-        artifacts::ArtifactKind::Agent,
-        "noop-dispatch.json".into(),
-        &serde_json::json!({
-            "kind": "agent",
-            "name": "noop-agent",
-            "version": 1,
-            "manifest": {
-                "description": "Noop test agent.",
-                "dispatch_adapter": "noop",
-                "brofile_inline": {"provider": "claude"},
-            },
-        }),
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    server
+        .state
+        .artifacts
+        .read()
+        .install_value(
+            artifacts::ArtifactKind::Agent,
+            "noop-dispatch.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "noop-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Noop test agent.",
+                    "dispatch_adapter": "noop",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
     struct NoopAdapter;
     impl orchestration::agents::adapter::AgentDispatchAdapter for NoopAdapter {
@@ -5634,16 +5637,19 @@ async fn bro_agent_dispatch_handle_shape_reference_agent_noop_adapter() {
     let mut diff_narrator: serde_json::Value =
         serde_json::from_str(include_str!("../system-defaults/agents/diff-narrator.json")).unwrap();
     diff_narrator["manifest"]["dispatch_adapter"] = serde_json::json!("noop-ref");
-    let cat = &server.state.artifacts.read();
-    cat.install_value(
-        artifacts::ArtifactKind::Agent,
-        "diff-narrator-ref.json".into(),
-        &diff_narrator,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    server
+        .state
+        .artifacts
+        .read()
+        .install_value(
+            artifacts::ArtifactKind::Agent,
+            "diff-narrator-ref.json".into(),
+            &diff_narrator,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
 
     struct RefNoopAdapter;
     impl orchestration::agents::adapter::AgentDispatchAdapter for RefNoopAdapter {

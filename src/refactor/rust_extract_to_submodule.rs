@@ -537,7 +537,7 @@ fn survivors_referenced_in_source(
                 found = true;
                 break;
             }
-            i = i + nlen;
+            i += nlen;
         }
         if found {
             out.push(name.to_string());

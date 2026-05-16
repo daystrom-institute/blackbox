@@ -105,9 +105,10 @@ pub struct PoolConfig {
     pub max_concurrent_per_account: Option<usize>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SelectionPolicy {
+    #[default]
     Availability,
     Economy,
     Quality,
@@ -126,11 +127,6 @@ pub enum SelectionPolicy {
     },
 }
 
-impl Default for SelectionPolicy {
-    fn default() -> Self {
-        Self::Availability
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AllocatorConfig {
@@ -288,6 +284,8 @@ pub struct Allocation {
     pub trace: SelectionTrace,
 }
 
+// kept: lane-key shape for in-progress lane-grouping work
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct LaneId {
     provider: Provider,
@@ -529,6 +527,8 @@ pub fn merge_runtime_request(
     }
 }
 
+// kept: public overlay helper alongside `runtime_request_from_optional_overlay`; consumed by allocator extensions
+#[allow(dead_code)]
 pub fn runtime_request_with_overlay(
     base: Option<RuntimeRequest>,
     overlay: RuntimeRequest,
@@ -592,6 +592,8 @@ pub fn parse_capabilities(values: &[String]) -> Result<Vec<Capability>, String> 
         .collect()
 }
 
+// kept: public no-probes shortcut for `allocation_context_with_probes`
+#[allow(dead_code)]
 pub fn allocation_context(task_store: &TaskStore, leases: &RuntimeLeaseStore) -> AllocationContext {
     allocation_context_with_probes(task_store, leases, ProbeStore::default())
 }

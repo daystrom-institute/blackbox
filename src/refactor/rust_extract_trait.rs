@@ -42,7 +42,10 @@ struct LiftMethod {
     impl_start: usize,
     body_start: usize,
     body_end: usize,
+    // kept: parsed method name and full body retained for richer trait-extraction edits
+    #[allow(dead_code)]
     method_name: String,
+    #[allow(dead_code)]
     signature_with_body: String,
     signature_without_visibility: String,
     method_has_generics: bool,
@@ -497,8 +500,8 @@ fn append_trait_where_self_sized(mut signature: String, needs_sized: bool) -> St
 
 fn matching_paren(text: &str, open_pos: usize) -> Option<usize> {
     let mut depth = 0isize;
-    let mut bytes = text.as_bytes().iter().enumerate().skip(open_pos);
-    while let Some((idx, byte)) = bytes.next() {
+    let bytes = text.as_bytes().iter().enumerate().skip(open_pos);
+    for (idx, byte) in bytes {
         if *byte == b'(' {
             depth += 1;
         } else if *byte == b')' {
@@ -583,12 +586,7 @@ fn method_decl_node_by_start(
 ) -> Option<tree_sitter::Node<'_>> {
     let root = parsed.tree.root_node();
     let mut cursor = root.walk();
-    for node in root.named_children(&mut cursor) {
-        if node.kind() == "impl_item" && node.start_byte() == byte_start {
-            return Some(node);
-        }
-    }
-    None
+    root.named_children(&mut cursor).find(|&node| node.kind() == "impl_item" && node.start_byte() == byte_start)
 }
 
 fn discover_impl_associated_constants(
@@ -629,7 +627,7 @@ fn compose_trait_edit(
     let mut trait_lines = String::new();
     trait_lines.push_str(&format!("pub trait {trait_name} {{\n"));
     for method in methods {
-        trait_lines.push_str("\n");
+        trait_lines.push('\n');
         let maybe_attrs = method
             .item
             .leading_trivia_start
@@ -649,7 +647,7 @@ fn compose_trait_edit(
 
     trait_lines.push_str(&format!("impl {trait_name} for {impl_target} {{\n"));
     for method in methods {
-        trait_lines.push_str("\n");
+        trait_lines.push('\n');
         let body_text = parsed
             .source
             .get(method.item.leading_trivia_start..method.item.byte_end)
@@ -661,9 +659,7 @@ fn compose_trait_edit(
     }
     trait_lines.push_str("}\n");
 
-    let separator = if target_source.is_empty() {
-        ""
-    } else if target_source.ends_with("\n\n") {
+    let separator = if target_source.is_empty() || target_source.ends_with("\n\n") {
         ""
     } else if target_source.ends_with('\n') {
         "\n"
@@ -775,12 +771,9 @@ fn module_path_for_file(path: &Path, project_dir: Option<&Path>) -> Option<Strin
     let mut parts: Vec<String> = Vec::new();
 
     let mut components = rel.components();
-    let mut has_src = false;
     if let Some(component) = components.next() {
         let seg = component.as_os_str().to_string_lossy();
-        if seg == "src" {
-            has_src = true;
-        } else {
+        if seg != "src" {
             parts.push(seg.to_string());
         }
     }
@@ -801,11 +794,7 @@ fn module_path_for_file(path: &Path, project_dir: Option<&Path>) -> Option<Strin
         return Some("crate".to_string());
     }
 
-    if has_src {
-        Some(format!("crate::{}", parts.join("::")))
-    } else {
-        Some(format!("crate::{}", parts.join("::")))
-    }
+    Some(format!("crate::{}", parts.join("::")))
 }
 
 #[cfg(test)]

@@ -281,7 +281,7 @@ impl IdentityRegistry {
             }
             let scope = scope_entry.file_name().to_string_lossy().to_string();
             for instance_entry in fs::read_dir(scope_entry.path())
-                .with_context(|| format!("reading identity scope dir"))?
+                .with_context(|| "reading identity scope dir".to_string())?
             {
                 let instance_entry = instance_entry?;
                 if instance_entry.file_type()?.is_dir() {

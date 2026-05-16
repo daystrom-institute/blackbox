@@ -34,6 +34,7 @@ impl EventStore {
         Self::build(root)
     }
 
+    #[cfg(test)]
     pub fn new_at(root: PathBuf) -> Self {
         Self::build(root)
     }

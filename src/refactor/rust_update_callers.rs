@@ -38,6 +38,8 @@ struct Candidate {
     byte_start: usize,
     byte_end: usize,
     replacement: String,
+    // kept: candidate symbol name for diagnostics
+    #[allow(dead_code)]
     name: String,
     /// "method_call" | "field_read" | "method_ref"
     kind: &'static str,
@@ -602,12 +604,11 @@ fn is_in_self_receiver_fn(source_bytes: &[u8], node: Node<'_>) -> bool {
         if parent.kind() == "function_item" {
             if let Some(params) = parent.child_by_field_name("parameters") {
                 let mut cursor = params.walk();
-                for param in params.named_children(&mut cursor) {
+                if let Some(param) = params.named_children(&mut cursor).next() {
                     if param.kind() == "self_parameter" {
                         let text = param.utf8_text(source_bytes).unwrap_or("");
                         return text.starts_with('&') && !text.contains("mut");
                     }
-                    break;
                 }
             }
             return false;

@@ -353,7 +353,6 @@ fn has_from_impl_for(source: &str, new_text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     fn parse_response(plan_json: &str) -> (Vec<TextEdit>, Vec<QuestionMarkSite>, Vec<String>) {
         let value: serde_json::Value = serde_json::from_str(plan_json).unwrap();

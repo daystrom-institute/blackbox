@@ -1,6 +1,14 @@
+use std::sync::OnceLock;
+
 use anyhow::{Result, bail};
+use regex::Regex;
 
 use super::types::ReactionAction;
+
+fn secret_ref_name_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"^[A-Za-z0-9_.-]+$").unwrap())
+}
 
 fn validate_reaction_name(name: &str) -> Result<()> {
     if name.is_empty() {
@@ -36,8 +44,7 @@ fn validate_secret_ref_in_value(val: &serde_json::Value) -> Result<()> {
                 if name.contains('/') || name.contains('\\') {
                     bail!("secret ref name cannot contain path separators: secret:{name}");
                 }
-                let re = regex::Regex::new(r"^[A-Za-z0-9_.-]+$").unwrap();
-                if !re.is_match(name) {
+                if !secret_ref_name_re().is_match(name) {
                     bail!("secret ref name must match [A-Za-z0-9_.-]+: secret:{name}");
                 }
                 start = name_start + name_end;

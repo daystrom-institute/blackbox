@@ -507,11 +507,11 @@ pub(crate) fn analyze_inner_class_outer_refs(
             }
         }
     }
-    let mut analysis = InnerClassRefAnalysis::default();
-    analysis.captures = captures.into_values().collect();
-    analysis.outer_field_writes = writes.into_iter().collect();
-    analysis.outer_method_calls = methods.into_iter().collect();
-    analysis
+    InnerClassRefAnalysis {
+        captures: captures.into_values().collect(),
+        outer_field_writes: writes.into_iter().collect(),
+        outer_method_calls: methods.into_iter().collect(),
+    }
 }
 
 /// If `node` is an outer-field access — bare `identifier` matching an outer
@@ -552,22 +552,20 @@ pub(crate) fn classify_outer_field_access(
                 | "annotation"
                 | "enum_constant"
                 | "labeled_statement" => return None,
-                "method_invocation" => {
-                    if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) {
+                "method_invocation"
+                    if parent.child_by_field_name("name").map(|c| c.id()) == Some(node.id()) => {
                         return None;
                     }
-                }
                 "scoped_identifier"
                 | "scoped_type_identifier"
                 | "type_identifier"
                 | "generic_type" => return None,
-                "field_access" => {
+                "field_access"
                     // `something.field` — `field` part is consumed by the
                     // field_access classifier below; skip.
-                    if parent.child_by_field_name("field").map(|c| c.id()) == Some(node.id()) {
+                    if parent.child_by_field_name("field").map(|c| c.id()) == Some(node.id()) => {
                         return None;
                     }
-                }
                 _ => {}
             }
         }

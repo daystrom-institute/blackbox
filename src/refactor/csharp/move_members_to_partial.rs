@@ -528,7 +528,7 @@ mod tests {
             serde_json::from_value(edits[0]["edits"].clone()).unwrap();
         let mut s_after = src.to_string();
         let mut sorted: Vec<&TextEdit> = source_edit_text.iter().collect();
-        sorted.sort_by(|a, b| b.byte_start.cmp(&a.byte_start));
+        sorted.sort_by_key(|b| std::cmp::Reverse(b.byte_start));
         for e in sorted {
             s_after.replace_range(e.byte_start..e.byte_end, &e.replacement);
         }
