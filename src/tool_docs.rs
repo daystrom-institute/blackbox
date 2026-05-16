@@ -288,11 +288,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_ref_size",
         category: ToolCategory::Graph,
-        summary: "Measure the byte payload size of entity refs. file refs resolve to registered project file content; project_file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
+        summary: "Measure the byte payload size of entity refs. file refs resolve against optional project_dir first, then registered project file content; project_file and project_file_v2 refs resolve to full indexed chunk content; other refs resolve through entity providers and measure serialized provider-properties JSON. Accepts up to 500 refs; successful refs are canonicalized and unresolved/omitted refs are reported under degraded.",
         when_to_use: "Use when planning context-budget-sensitive dispatches. Pass the exact entity refs a downstream actor would need to read; the response returns per-ref byte counts, total_bytes, canonicalized successful refs, and unresolved/omitted refs without estimating from prose.",
-        example: Some(
-            r#"bbox_ref_size(refs=["project_file:d723917f:4967479d:c0d564f7ae71833785768017bb3ba3741e21d928c25d1262bde677b540e088b8:0"])"#,
-        ),
+        example: Some(r#"bbox_ref_size(project_dir="/repo/worktree", refs=["file:src/lib.rs"])"#),
     },
     ToolDoc {
         name: "bbox_edge_compact",
@@ -1240,8 +1238,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_annotate",
         category: ToolCategory::Whiteboards,
-        summary: "Annotate a post during the validate or debate phase. Validate phase accepts only `validation` (with required `result`: confirmed / refuted / inconclusive). Debate phase accepts `challenge`, `corroborate`, or `resolve` (resolve must reference a challenge id via `resolves`).",
-        when_to_use: "Use to react to other specialists' posts. You can't annotate your own post. `challenge` says you disagree (typically with reasoning), `corroborate` adds supporting evidence, `resolve` closes a challenge with a position. The challenge → resolve graph is what `ready_for_transition` checks in debate phase.",
+        summary: "Annotate a post during the validate or debate phase. Validate phase accepts only `validation` (with required `result`: confirmed / refuted / inconclusive). Debate phase accepts `challenge`, `corroborate`, or `resolve` (resolve must reference a challenge id via `resolves`; a post owner may resolve another agent's challenge on their own post).",
+        when_to_use: "Use to react to other specialists' posts. You can't challenge or corroborate your own post; `resolve` is the exception for answering another agent's challenge on your own post. `challenge` says you disagree (typically with reasoning), `corroborate` adds supporting evidence, `resolve` closes a challenge with a position. The challenge → resolve graph is what `ready_for_transition` checks in debate phase.",
         example: Some(
             r#"whiteboard_annotate(board_id="adr-2026-04-27", agent_name="perf", post_id="post-001", type="challenge", body="missing runtime cost analysis under load")"#,
         ),
@@ -1885,9 +1883,10 @@ mod tests {
         assert!(md.contains("never use the roadmap to defer"));
         assert!(doc.summary.contains("express direction of the operator"));
         assert!(doc.summary.contains("never use the roadmap to defer"));
-        assert!(doc
-            .when_to_use
-            .contains("Use only when the operator explicitly asks"));
+        assert!(
+            doc.when_to_use
+                .contains("Use only when the operator explicitly asks")
+        );
         assert!(doc.when_to_use.contains("Do not initiate roadmap actions"));
     }
 

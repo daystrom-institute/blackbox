@@ -2,12 +2,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use super::{
-    empty_neighborhood_view, ensure_type, schema, truncate_label, EdgeFamilyExpectation,
-    EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood, NextHop,
-    ProviderContext,
+    EdgeFamilyExpectation, EntitySchemaView, EntityView, InspectableEntityProvider, Neighborhood,
+    NextHop, ProviderContext, empty_neighborhood_view, ensure_type, schema, truncate_label,
 };
 use crate::entity_ref::{EntityRef, EntityType};
 use crate::projects::ProjectRecord;

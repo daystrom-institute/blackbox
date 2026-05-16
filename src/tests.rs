@@ -323,6 +323,162 @@ async fn artifact_install_wires_f3_workflow_and_packet() {
 }
 
 #[tokio::test]
+async fn active_workflow_artifact_restores_runtime_registry_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let workflow_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/agentic-corpus/workflows/schema-migration-arc.json"
+    ))
+    .unwrap();
+
+    server
+        .state
+        .artifacts
+        .write()
+        .install_value(
+            artifacts::ArtifactKind::Workflow,
+            "system-defaults/agentic-corpus/workflows/schema-migration-arc.json".into(),
+            &workflow_value,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert!(
+        !server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("schema-migration-arc"),
+        "catalog-only install should not pre-populate the runtime registry"
+    );
+    assert!(
+        !server
+            .state
+            .store_dir
+            .join("workflows/schema-migration-arc.json")
+            .exists(),
+        "catalog-only install should not pre-populate the runtime workflow store"
+    );
+
+    let restored = restore_runtime_artifacts_from_catalog(&server.state).unwrap();
+    assert_eq!(restored, 1);
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("schema-migration-arc"),
+        "active workflow artifact must be available to orchestration after restart"
+    );
+    assert!(
+        server
+            .state
+            .store_dir
+            .join("workflows/schema-migration-arc.json")
+            .exists(),
+        "active workflow artifact must be persisted into the runtime workflow store"
+    );
+}
+
+#[tokio::test]
+async fn active_brofile_artifact_restores_runtime_registry_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let brofile_value = serde_json::json!({
+        "name": "catalog-only-reviewer",
+        "version": 1,
+        "provider": "claude",
+        "model": "claude-opus-4-7",
+        "effort": "xhigh",
+        "lens": "Review without editing."
+    });
+
+    server
+        .state
+        .artifacts
+        .write()
+        .install_value(
+            artifacts::ArtifactKind::Brofile,
+            "inline".into(),
+            &brofile_value,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert!(
+        orchestration::brofile::resolve_brofile(
+            "catalog-only-reviewer",
+            &server.state.store_dir,
+            None,
+        )
+        .is_none(),
+        "catalog-only install should not pre-populate the runtime brofile store"
+    );
+
+    let restored = restore_runtime_artifacts_from_catalog(&server.state).unwrap();
+    assert_eq!(restored, 1);
+    assert!(
+        orchestration::brofile::resolve_brofile(
+            "catalog-only-reviewer",
+            &server.state.store_dir,
+            None,
+        )
+        .is_some(),
+        "active brofile artifact must resolve after restart reconciliation"
+    );
+}
+
+#[tokio::test]
+async fn active_packet_artifact_restores_runtime_registry_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let packet_value: Value = serde_json::from_str(include_str!(
+        "../system-defaults/agentic-corpus/packets/phase-decompose/dag-structure.json"
+    ))
+    .unwrap();
+
+    server
+        .state
+        .artifacts
+        .write()
+        .install_value(
+            artifacts::ArtifactKind::Packet,
+            "system-defaults/agentic-corpus/packets/phase-decompose/dag-structure.json".into(),
+            &packet_value,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:phase-decompose/dag-structure")
+            .is_err(),
+        "catalog-only install should not pre-populate the runtime packet registry"
+    );
+
+    let restored = restore_runtime_artifacts_from_catalog(&server.state).unwrap();
+    assert_eq!(restored, 1);
+    assert!(
+        server
+            .state
+            .packets
+            .read()
+            .load("domain:phase-decompose/dag-structure")
+            .is_ok(),
+        "active packet artifact must compile into the runtime packet registry"
+    );
+}
+
+#[tokio::test]
 async fn proposal_approved_hook_bumps_link_version() {
     // Verifies the dispatch_verdict signal hook resolves a Slack
     // message back to its SlackProposalLink and bumps the version
@@ -1490,6 +1646,70 @@ async fn artifact_supersession_deactivates_workflow_registry_entry() {
 }
 
 #[tokio::test]
+async fn artifact_same_name_workflow_upgrade_keeps_runtime_registry_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let workflow_v1 = serde_json::json!({
+        "name": "workflow-a",
+        "version": 1,
+        "actors": {},
+        "start": "Done",
+        "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+    });
+    let workflow_v2 = serde_json::json!({
+        "name": "workflow-a",
+        "version": 2,
+        "actors": {},
+        "start": "Done",
+        "nodes": {"Done": {"actor": "", "next": {"type": "terminal"}}}
+    });
+
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Workflow,
+            source: "workflow-a.json".into(),
+            name: Some("workflow-a".into()),
+            version: Some("1".into()),
+            supersedes: None,
+        },
+        workflow_v1,
+    )
+    .await
+    .unwrap();
+
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Workflow,
+            source: "workflow-a.json".into(),
+            name: Some("workflow-a".into()),
+            version: Some("2".into()),
+            supersedes: Some("workflow-a".into()),
+        },
+        workflow_v2,
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        server
+            .state
+            .workflow_registry
+            .read()
+            .contains_key("workflow-a")
+    );
+    assert!(
+        server
+            .state
+            .store_dir
+            .join("workflows")
+            .join("workflow-a.json")
+            .exists()
+    );
+}
+
+#[tokio::test]
 async fn agent_artifact_install_list_supersede_round_trip() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);
@@ -2618,6 +2838,103 @@ async fn workflow_foreach_runtime_collects_child_exports() {
     assert_eq!(rows[0]["key"], "a-0");
     assert_eq!(rows[0]["exports"]["summary"]["item"], "a");
     assert_eq!(rows[1]["exports"]["summary"]["idx"], 1);
+}
+
+#[tokio::test]
+async fn subworkflow_snapshot_completed_nodes_exclude_seeded_parent_outputs() {
+    use crate::workflow::{compile, engine, load_workflow};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let json = r#"{
+        "name": "parent-with-seed",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "ParentOnly": {
+                "actor": "",
+                "prompt": "parent-output",
+                "next": {"type": "goto", "to": "Sub"}
+            },
+            "Sub": {
+                "actor": "",
+                "subworkflow": {
+                    "name": "child-only",
+                    "version": 1,
+                    "actors": {},
+                    "nodes": {
+                        "ChildOnly": {
+                            "actor": "",
+                            "prompt": "child saw ${outputs.ParentOnly}",
+                            "next": {"type": "terminal"}
+                        }
+                    },
+                    "start": "ChildOnly"
+                },
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "ParentOnly"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+    let result = engine::run_workflow_with_initial_vars(
+        &server,
+        &compiled,
+        None,
+        Some(20),
+        serde_json::Map::new(),
+    )
+    .await;
+
+    assert_eq!(result.status, "completed", "events: {:?}", result.events);
+    let child_snapshot = server
+        .state
+        .running_arcs
+        .read()
+        .values()
+        .find(|snapshot| snapshot.workflow_name == "child-only")
+        .cloned()
+        .expect("child snapshot");
+    assert_eq!(child_snapshot.status, "completed");
+    assert_eq!(child_snapshot.completed_nodes, vec!["ChildOnly"]);
+    assert!(
+        !child_snapshot
+            .completed_nodes
+            .iter()
+            .any(|node| node == "ParentOnly"),
+        "seeded parent output must remain template context, not child completion state"
+    );
+}
+
+#[test]
+fn orchestrate_status_resolves_arc_id_to_arc_thread_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    server.state.running_arcs.write().insert(
+        "thread-test1234".into(),
+        ArcSnapshot {
+            arc_id: "arc-test1234".into(),
+            arc_thread_id: "thread-test1234".into(),
+            workflow_name: "test-workflow".into(),
+            workflow_version: 1,
+            status: "completed".into(),
+            current_node: None,
+            completed_nodes: vec!["Done".into()],
+            in_flight_nodes: vec![],
+            last_verdict: Some("satisfied".into()),
+            visit_counts: std::collections::HashMap::new(),
+            started_at: "2026-05-16T00:00:00Z".into(),
+            updated_at: "2026-05-16T00:00:01Z".into(),
+        },
+    );
+
+    assert_eq!(
+        crate::server::routes::resolve_orchestrate_thread_id(&server.state, "arc-test1234"),
+        "thread-test1234"
+    );
+    assert_eq!(
+        crate::server::routes::resolve_orchestrate_thread_id(&server.state, "thread-test1234"),
+        "thread-test1234"
+    );
 }
 
 #[tokio::test]

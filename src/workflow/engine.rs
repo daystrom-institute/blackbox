@@ -1118,13 +1118,23 @@ impl<'a> WorkflowRunner<'a> {
     /// Called at every node boundary + at start/finish with the
     /// appropriate status. Silent on missing arc_thread_id (the
     /// snapshot key).
+    fn completed_node_names(&self) -> Vec<String> {
+        let mut completed: Vec<String> = self
+            .node_outputs
+            .keys()
+            .filter(|node_id| self.compiled.spec.nodes.contains_key(*node_id))
+            .cloned()
+            .collect();
+        completed.sort();
+        completed
+    }
+
     fn update_arc_snapshot(&self, status: &str, just_ran: &str, next: Option<&str>) {
         let Some(thread_id) = self.arc_thread_id.as_deref() else {
             return;
         };
         let now = crate::util::now_iso();
-        let mut completed: Vec<String> = self.node_outputs.keys().cloned().collect();
-        completed.sort();
+        let completed = self.completed_node_names();
         let mut in_flight: Vec<String> = self.in_flight.keys().cloned().collect();
         in_flight.sort();
         let visit_counts: std::collections::HashMap<String, u32> = self
@@ -1136,6 +1146,7 @@ impl<'a> WorkflowRunner<'a> {
         let mut map = self.server.state.running_arcs.write();
         let existing_started = map.get(thread_id).map(|s| s.started_at.clone());
         let snapshot = crate::ArcSnapshot {
+            arc_id: self.ctx.meta.arc_id.clone(),
             arc_thread_id: thread_id.to_string(),
             workflow_name: self.compiled.spec.name.clone(),
             workflow_version: self.compiled.spec.version,
@@ -1171,6 +1182,20 @@ impl<'a> WorkflowRunner<'a> {
         };
         let mut notes = self.server.state.notes.write();
         let _ = notes.create(&params);
+    }
+
+    fn ensure_not_cancelled(&mut self, node_id: &str, phase: &str) -> Result<()> {
+        if self.cancel_token.is_cancelled() {
+            self.log_event(
+                "cancelled",
+                json!({
+                    "node": node_id,
+                    "phase": phase,
+                }),
+            );
+            bail!("arc cancelled");
+        }
+        Ok(())
     }
 
     async fn run(&mut self) -> Result<()> {
@@ -1235,8 +1260,7 @@ impl<'a> WorkflowRunner<'a> {
         let Some(packet_id) = self.compiled.spec.policy_packet.clone() else {
             return Ok(());
         };
-        let mut completed: Vec<&String> = self.node_outputs.keys().collect();
-        completed.sort();
+        let completed = self.completed_node_names();
         let mut in_flight: Vec<&String> = self.in_flight.keys().collect();
         in_flight.sort();
         let entity = json!({
@@ -1307,8 +1331,7 @@ impl<'a> WorkflowRunner<'a> {
     /// `compaction_anchor` on its overmind vertex. Ours is lighter:
     /// plain notes, no dedicated field, consumers scan-and-take-latest.
     fn write_compaction_anchor(&self, step: usize, just_ran: &str, next: &str) {
-        let mut completed: Vec<&String> = self.node_outputs.keys().collect();
-        completed.sort();
+        let completed = self.completed_node_names();
         let mut in_flight: Vec<&String> = self.in_flight.keys().collect();
         in_flight.sort();
         let mut visits: Vec<String> = self
@@ -1369,6 +1392,7 @@ impl<'a> WorkflowRunner<'a> {
     }
 
     async fn run_node(&mut self, node_id: &str) -> Result<()> {
+        self.ensure_not_cancelled(node_id, "before_node")?;
         // wait_for: explicit fan-in. Join any listed in-flight sources
         // before running the node body so their outputs are available
         // for prompt rendering / gate evaluation.
@@ -1399,6 +1423,7 @@ impl<'a> WorkflowRunner<'a> {
                 }),
             );
         }
+        self.ensure_not_cancelled(node_id, "after_wait_for")?;
         self.run_activity_node(node_id).await
     }
 
@@ -1430,6 +1455,7 @@ impl<'a> WorkflowRunner<'a> {
     }
 
     async fn run_activity_node(&mut self, node_id: &str) -> Result<()> {
+        self.ensure_not_cancelled(node_id, "before_activity")?;
         let spec = self
             .compiled
             .spec
@@ -1446,6 +1472,7 @@ impl<'a> WorkflowRunner<'a> {
             self.run_hooks(&spec.on_enter, &format!("{node_id}/on_enter"))
                 .await?;
         }
+        self.ensure_not_cancelled(node_id, "after_on_enter")?;
 
         // Dynamic fanout: foreach/matrix nodes own child
         // sub-workflow dispatch and collection; they otherwise pass
@@ -1453,7 +1480,7 @@ impl<'a> WorkflowRunner<'a> {
         if spec.foreach.is_some() || spec.matrix.is_some() {
             self.run_dynamic_fanout_node(node_id, &spec).await?;
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
-            self.apply_node_gate(node_id, &spec).await;
+            self.apply_node_gate(node_id, &spec).await?;
             return Ok(());
         }
 
@@ -1462,14 +1489,14 @@ impl<'a> WorkflowRunner<'a> {
         if let Some(wait_spec) = spec.wait.clone() {
             self.run_wait_node(node_id, &wait_spec).await?;
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
-            self.apply_node_gate(node_id, &spec).await;
+            self.apply_node_gate(node_id, &spec).await?;
             return Ok(());
         }
 
         if let Some(sleep_spec) = spec.sleep.clone() {
             self.run_sleep_node(node_id, sleep_spec.duration_ms).await?;
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
-            self.apply_node_gate(node_id, &spec).await;
+            self.apply_node_gate(node_id, &spec).await?;
             return Ok(());
         }
 
@@ -1478,9 +1505,10 @@ impl<'a> WorkflowRunner<'a> {
         // dispatching an actor. The parent node's output becomes the
         // concatenated sub-node outputs.
         if spec.subworkflow.is_some() || spec.subworkflow_ref.is_some() {
+            self.ensure_not_cancelled(node_id, "before_subworkflow")?;
             self.run_subworkflow_node(node_id).await?;
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
-            self.apply_node_gate(node_id, &spec).await;
+            self.apply_node_gate(node_id, &spec).await?;
             return Ok(());
         }
 
@@ -1525,7 +1553,7 @@ impl<'a> WorkflowRunner<'a> {
                 self.run_fork_dispatch(node_id).await?;
             }
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
-            self.apply_node_gate(node_id, &spec).await;
+            self.apply_node_gate(node_id, &spec).await?;
             return Ok(());
         }
 
@@ -1548,7 +1576,7 @@ impl<'a> WorkflowRunner<'a> {
                 self.run_fork_dispatch(node_id).await?;
             }
             self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
-            self.apply_node_gate(node_id, &spec).await;
+            self.apply_node_gate(node_id, &spec).await?;
             return Ok(());
         }
 
@@ -1622,7 +1650,7 @@ impl<'a> WorkflowRunner<'a> {
         // hook stuffs structured data into vars).
         self.run_node_exit_hooks(&spec.on_exit, node_id).await?;
 
-        self.apply_node_gate(node_id, &spec).await;
+        self.apply_node_gate(node_id, &spec).await?;
         Ok(())
     }
 
@@ -2337,6 +2365,7 @@ impl<'a> WorkflowRunner<'a> {
     /// project_dir — so it opens its own arc thread, applies its own
     /// gates, etc. Depth-limited to prevent runaway recursion.
     async fn run_subworkflow_node(&mut self, node_id: &str) -> Result<()> {
+        self.ensure_not_cancelled(node_id, "subworkflow_entry")?;
         let spec = self
             .compiled
             .spec
@@ -2552,9 +2581,13 @@ impl<'a> WorkflowRunner<'a> {
     /// receive the output string for backward compatibility; the
     /// flattened entity is added under `node_output_json` and via
     /// the gate-entity helpers in `apply_workflow_gate_*`.
-    async fn apply_node_gate(&mut self, node_id: &str, spec: &super::schema::NodeSpec) {
+    async fn apply_node_gate(
+        &mut self,
+        node_id: &str,
+        spec: &super::schema::NodeSpec,
+    ) -> Result<()> {
         let Some(packet_id) = spec.gate.as_deref() else {
-            return;
+            return Ok(());
         };
         // Build the canonical gate entity once, then both first- and
         // all-mode dispatchers use it.
@@ -2593,6 +2626,7 @@ impl<'a> WorkflowRunner<'a> {
                                 "error": e,
                             }),
                         );
+                        bail!("gate '{packet_id}' on node '{node_id}' errored: {e}");
                     }
                 }
             }
@@ -2643,10 +2677,12 @@ impl<'a> WorkflowRunner<'a> {
                                 "error": e,
                             }),
                         );
+                        bail!("gate '{packet_id}' on node '{node_id}' errored: {e}");
                     }
                 }
             }
         }
+        Ok(())
     }
 
     async fn run_sleep_node(&mut self, node_id: &str, duration_ms: u64) -> Result<()> {

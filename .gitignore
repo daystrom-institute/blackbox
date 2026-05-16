@@ -8,6 +8,8 @@
 /node_modules/
 /package.json
 /package-lock.json
+__pycache__/
+*.pyc
 /daystrom/
 /.env
 /.env.bro-slack-dev

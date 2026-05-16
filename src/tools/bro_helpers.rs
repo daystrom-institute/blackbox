@@ -116,7 +116,13 @@ pub(crate) fn extract_json_candidates(text: &str) -> Vec<String> {
             break;
         }
     }
-    // Strategy 3: first `{` to last `}` of the whole text.
+    // Strategy 3: first balanced JSON object. This handles trailing
+    // prose and accidental extra closing delimiters without accepting
+    // partial objects.
+    if let Some(candidate) = first_balanced_json_object(text) {
+        out.push(candidate);
+    }
+    // Strategy 4: first `{` to last `}` of the whole text.
     if let Some(first) = text.find('{') {
         if let Some(last) = text.rfind('}') {
             if last > first {
@@ -128,6 +134,44 @@ pub(crate) fn extract_json_candidates(text: &str) -> Vec<String> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     out.retain(|c| seen.insert(c.clone()));
     out
+}
+
+fn first_balanced_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+                if stack.is_empty() {
+                    let end = start + offset + ch.len_utf8();
+                    return Some(text[start..end].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
 }
 
 pub(crate) fn split_csv(s: &Option<String>) -> Vec<String> {

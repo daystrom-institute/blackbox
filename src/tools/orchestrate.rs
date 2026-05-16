@@ -304,35 +304,32 @@ Constraints:\n\
         &self,
         Parameters(p): Parameters<ArcStatusParams>,
     ) -> CallToolResult {
-        let snapshots: Vec<&ArcSnapshot> = if let Some(arc_id) = &p.arc_id {
-            self.state
-                .running_arcs
-                .read()
-                .values()
-                .filter(|s| s.arc_thread_id == *arc_id)
-                .cloned()
-                .collect::<Vec<_>>()
-                .iter()
-                .map(|_| unreachable!()) // we cloned above; collect adapter
-                .collect()
-        } else {
+        if p.arc_id.is_none() {
             // Default: all running.
             let map = self.state.running_arcs.read();
             return Self::ok_json(&serde_json::json!({
                 "snapshots": map.values().collect::<Vec<_>>(),
                 "pending_waits": self.state.wait_store.snapshot(),
             }));
-        };
-        let _ = snapshots;
+        }
         let map = self.state.running_arcs.read();
         let wanted = p.arc_id.unwrap_or_default();
-        let snap = map.values().find(|s| s.arc_thread_id == wanted).cloned();
+        let snap = map
+            .values()
+            .find(|s| s.arc_id == wanted || s.arc_thread_id == wanted)
+            .cloned();
         let waits = self
             .state
             .wait_store
             .snapshot()
             .into_iter()
-            .filter(|w| w.arc_id == wanted)
+            .filter(|w| {
+                w.arc_id == wanted
+                    || snap
+                        .as_ref()
+                        .map(|snapshot| w.arc_id == snapshot.arc_id)
+                        .unwrap_or(false)
+            })
             .collect::<Vec<_>>();
         Self::ok_json(&serde_json::json!({
             "snapshot": snap,

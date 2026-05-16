@@ -1,6 +1,6 @@
 {
   "domain": "phase-decompose/whiteboard-participation",
-  "version": 1,
+  "version": 2,
   "scope": "global",
   "classification_lattice": ["invalid", "ready"],
   "prefix_inference": {},
@@ -28,6 +28,7 @@
         "args": [
           { "op": "Eq", "field": "vars.board_check.phase", "value": "debate" },
           { "op": "Ge", "field": "vars.board_check.post_count", "value": 3 },
+          { "op": "Eq", "field": "vars.board_check.unresolved_challenges", "value": 0 },
           { "op": "Ge", "field": "vars.board_check.vote_count", "value": 1 }
         ]
       },

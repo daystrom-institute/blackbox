@@ -804,7 +804,7 @@ impl WhiteboardRegistry {
             Some(p) => p,
             None => bail!("post '{post_id}' does not exist on board '{id}'"),
         };
-        if post.agent == agent_name {
+        if post.agent == agent_name && annotation_type != AnnotationType::Resolve {
             bail!("agent '{agent_name}' cannot annotate own post '{post_id}'");
         }
         if annotation_type == AnnotationType::Resolve {
@@ -818,6 +818,9 @@ impl WhiteboardRegistry {
                 .ok_or_else(|| anyhow!("referenced annotation '{r}' does not exist"))?;
             if challenge.annotation_type != AnnotationType::Challenge {
                 bail!("referenced annotation '{r}' is not a challenge");
+            }
+            if challenge.agent == agent_name {
+                bail!("agent '{agent_name}' cannot resolve own challenge '{r}'");
             }
         }
         if annotation_type == AnnotationType::Validation && result.is_none() {
@@ -1320,6 +1323,100 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.to_string().contains("cannot annotate own post"));
+    }
+
+    #[test]
+    fn post_owner_can_resolve_external_challenge_on_own_post() {
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.register("b1", "f", Role::Facilitator, "ops").unwrap();
+        r.register("b1", "owner", Role::Specialist, "x").unwrap();
+        r.register("b1", "reviewer", Role::Specialist, "y").unwrap();
+        r.post(
+            "b1",
+            "owner",
+            PostType::Proposal,
+            "t",
+            "b",
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        r.transition("b1", "f", Phase::Read, None).unwrap();
+        r.transition("b1", "f", Phase::Debate, None).unwrap();
+        let challenge = r
+            .annotate(
+                "b1",
+                "reviewer",
+                "post-001",
+                AnnotationType::Challenge,
+                "missing proof",
+                None,
+                None,
+            )
+            .unwrap();
+        r.annotate(
+            "b1",
+            "owner",
+            "post-001",
+            AnnotationType::Resolve,
+            "proof added",
+            None,
+            Some(&challenge),
+        )
+        .unwrap();
+        let arc = r.get("b1").unwrap();
+        assert!(arc.read().ready_for_transition(0));
+    }
+
+    #[test]
+    fn agent_cannot_resolve_own_challenge() {
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, "f").unwrap();
+        r.register("b1", "f", Role::Facilitator, "ops").unwrap();
+        r.register("b1", "owner", Role::Specialist, "x").unwrap();
+        r.register("b1", "reviewer", Role::Specialist, "y").unwrap();
+        r.post(
+            "b1",
+            "owner",
+            PostType::Proposal,
+            "t",
+            "b",
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        r.transition("b1", "f", Phase::Read, None).unwrap();
+        r.transition("b1", "f", Phase::Debate, None).unwrap();
+        let challenge = r
+            .annotate(
+                "b1",
+                "reviewer",
+                "post-001",
+                AnnotationType::Challenge,
+                "missing proof",
+                None,
+                None,
+            )
+            .unwrap();
+        let err = r
+            .annotate(
+                "b1",
+                "reviewer",
+                "post-001",
+                AnnotationType::Resolve,
+                "withdrawn",
+                None,
+                Some(&challenge),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("cannot resolve own challenge"));
     }
 
     #[test]

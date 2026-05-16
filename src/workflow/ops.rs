@@ -21,6 +21,7 @@ use std::process::Stdio;
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use tokio::io::AsyncWriteExt;
 
 use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::EntityRef;
@@ -1188,6 +1189,10 @@ fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
     let from = args
         .get("from")
         .ok_or_else(|| anyhow!("ParseJson requires args.from (string or value)"))?;
+    let repair_missing_closing_delimiters = args
+        .get("repair_missing_closing_delimiters")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let parsed = match from {
         Value::String(s) => {
             let trimmed = s.trim();
@@ -1200,7 +1205,21 @@ fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
                     Ok(value) => value,
                     Err(first_err) => {
                         let mut last_err = first_err.to_string();
-                        let candidates = crate::tools::bro_helpers::extract_json_candidates(trimmed);
+                        if repair_missing_closing_delimiters {
+                            if let Some(repaired) = append_missing_json_closers(&stripped) {
+                                match serde_json::from_str(&repaired) {
+                                    Ok(value) => {
+                                        return Ok(OpEffect::SetVar {
+                                            key: into.to_string(),
+                                            value,
+                                        });
+                                    }
+                                    Err(err) => last_err = err.to_string(),
+                                }
+                            }
+                        }
+                        let candidates =
+                            crate::tools::bro_helpers::extract_json_candidates(trimmed);
                         let mut parsed = None;
                         for candidate in candidates {
                             match serde_json::from_str(&candidate) {
@@ -1208,7 +1227,24 @@ fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
                                     parsed = Some(value);
                                     break;
                                 }
-                                Err(err) => last_err = err.to_string(),
+                                Err(err) => {
+                                    last_err = err.to_string();
+                                    if repair_missing_closing_delimiters {
+                                        if let Some(repaired) =
+                                            append_missing_json_closers(&candidate)
+                                        {
+                                            match serde_json::from_str(&repaired) {
+                                                Ok(value) => {
+                                                    parsed = Some(value);
+                                                    break;
+                                                }
+                                                Err(repair_err) => {
+                                                    last_err = repair_err.to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                         parsed.ok_or_else(|| {
@@ -1225,6 +1261,47 @@ fn exec_parse_json(args: &Value, into_var: Option<&str>) -> Result<OpEffect> {
         key: into.to_string(),
         value: parsed,
     })
+}
+
+fn append_missing_json_closers(s: &str) -> Option<String> {
+    let mut stack = Vec::new();
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in s.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' => stack.push('}'),
+            '[' => stack.push(']'),
+            '}' | ']' => {
+                if stack.pop() != Some(ch) {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if in_string || stack.is_empty() {
+        return None;
+    }
+
+    let mut repaired = s.trim_end().to_string();
+    for ch in stack.into_iter().rev() {
+        repaired.push(ch);
+    }
+    Some(repaired)
 }
 
 fn strip_code_fence(s: &str) -> Option<String> {
@@ -1288,9 +1365,18 @@ async fn exec_shell(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> R
         .map(|s| s.to_string())
         .or_else(|| ctx.meta.worktree.clone())
         .or_else(|| ctx.meta.project_dir.clone());
+    let stdin_payload = args
+        .get("stdin")
+        .map(shell_stdin_payload)
+        .transpose()
+        .map_err(|e| anyhow!("Shell stdin: {e}"))?;
     let mut cmd = tokio::process::Command::new(&strs[0]);
     cmd.args(&strs[1..])
-        .stdin(Stdio::null())
+        .stdin(if stdin_payload.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     if let Some(d) = &cwd {
@@ -1314,10 +1400,25 @@ async fn exec_shell(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> R
             cmd.env(key, resolved);
         }
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| anyhow!("Shell spawn failed: {e}"))?;
+    let output = if let Some(payload) = stdin_payload {
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow!("Shell spawn failed: {e}"))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin
+                .write_all(payload.as_bytes())
+                .await
+                .map_err(|e| anyhow!("Shell stdin write failed: {e}"))?;
+        }
+        child
+            .wait_with_output()
+            .await
+            .map_err(|e| anyhow!("Shell wait failed: {e}"))?
+    } else {
+        cmd.output()
+            .await
+            .map_err(|e| anyhow!("Shell spawn failed: {e}"))?
+    };
 
     let exit_code = output.status.code().unwrap_or(-1);
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -1342,6 +1443,13 @@ async fn exec_shell(args: &Value, into_var: Option<&str>, ctx: &ArcContext) -> R
         bail!("Shell {strs:?} exited with {exit_code}: {stderr_str}",);
     }
     Ok(OpEffect::None)
+}
+
+fn shell_stdin_payload(value: &Value) -> Result<String> {
+    match value {
+        Value::String(s) => Ok(s.clone()),
+        other => Ok(serde_json::to_string(other)?),
+    }
 }
 
 async fn exec_worktree_create(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
@@ -1923,6 +2031,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn parse_json_extracts_first_balanced_object_before_trailing_text() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let body = "{\"triage_verdict\":\"needs_decompose\",\"evidence_bundle\":{\"degraded\":{\"unresolved_refs\":[]}}}} trailing";
+        let hook = HookOp {
+            op: OpKind::ParseJson,
+            args: json!({ "from": body }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("parsed".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "parsed");
+                assert_eq!(
+                    value,
+                    json!({
+                        "triage_verdict": "needs_decompose",
+                        "evidence_bundle": {"degraded": {"unresolved_refs": []}}
+                    })
+                );
+            }
+            _ => panic!("expected SetVar effect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_json_repairs_missing_trailing_delimiters_when_enabled() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let body = "{\"sub_units\":[{\"sub_unit_id\":\"su-1\"}],\"recompose_contract\":{\"leftover_acceptance_ids\":[]}";
+        let hook = HookOp {
+            op: OpKind::ParseJson,
+            args: json!({
+                "from": body,
+                "repair_missing_closing_delimiters": true
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("parsed".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "parsed");
+                assert_eq!(
+                    value,
+                    json!({
+                        "sub_units": [{"sub_unit_id": "su-1"}],
+                        "recompose_contract": {"leftover_acceptance_ids": []}
+                    })
+                );
+            }
+            _ => panic!("expected SetVar effect"),
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_json_does_not_repair_missing_trailing_delimiters_by_default() {
+        let ctx = ArcContext::new(ArcMeta::default());
+        let hook = HookOp {
+            op: OpKind::ParseJson,
+            args: json!({
+                "from": "{\"sub_units\":[{\"sub_unit_id\":\"su-1\"}]"
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("parsed".into()),
+        };
+        let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+        assert!(
+            err.to_string().contains("input did not parse as JSON"),
+            "unexpected error: {err:#}"
+        );
+    }
+
+    #[tokio::test]
     async fn shell_runs_command() {
         let ctx = ArcContext::new(ArcMeta::default());
         let hook = HookOp {
@@ -2146,6 +2330,37 @@ mod tests {
         // Malformed JSON → parsed should be null, but the op still succeeds
         let effect = execute_op(&hook, &ctx, None).await.unwrap();
         assert!(matches!(effect, OpEffect::SetVar { .. }));
+    }
+
+    #[tokio::test]
+    async fn shell_writes_typed_stdin_payload() {
+        let mut ctx = ArcContext::new(ArcMeta::default());
+        ctx.vars.insert("issue".into(), json!(42));
+        let hook = HookOp {
+            op: OpKind::Shell,
+            args: json!({
+                "argv": ["cat"],
+                "stdin": {
+                    "issue": "${vars.issue}",
+                    "label": "phase-decompose"
+                }
+            }),
+            when: None,
+            on_failure: OnFailure::Halt,
+            into_var: Some("out".into()),
+        };
+        let effect = execute_op(&hook, &ctx, None).await.unwrap();
+        match effect {
+            OpEffect::SetVar { key, value } => {
+                assert_eq!(key, "out");
+                assert_eq!(value["exit_code"], json!(0));
+                assert_eq!(
+                    value["parsed"],
+                    json!({"issue": 42, "label": "phase-decompose"})
+                );
+            }
+            _ => panic!("expected SetVar"),
+        }
     }
 
     // ── ScoreEvalOutput ────────────────────────────────────────────────────────

@@ -1,8 +1,8 @@
 ---
 question_shapes:
   - question_shape: where
-    query: Locate the phase decomposer ensemble, foreach implementer, recomposition, whiteboard, and gate packet artifacts for a no-edit decomposition smoke test.
-    scope_hint: system-defaults/workflows/phase-decompose/ensemble-decompose.json system-defaults/workflows/phase-decompose/recompose.json system-defaults/workflows/phase-decompose/main.json system-defaults/agentic-corpus/packets/phase-decompose
+    query: Locate the phase decomposer ensemble, foreach implementer, recomposition, whiteboard, gate packet, and no-edit guard artifacts for a no-edit decomposition smoke test.
+    scope_hint: system-defaults/workflows/phase-decompose/ensemble-decompose.json system-defaults/workflows/phase-decompose/supervised-impl.json system-defaults/workflows/phase-decompose/recompose.json system-defaults/workflows/phase-decompose/main.json system-defaults/agentic-corpus/packets/phase-decompose system-defaults/phase-decompose/scripts/no-edit-diff-guard.py system-defaults/phase-decompose/scripts/recompose-assertions.py
     known_evidence: file:system-defaults/workflows/phase-decompose/ensemble-decompose.json
 ---
 

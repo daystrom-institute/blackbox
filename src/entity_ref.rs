@@ -993,40 +993,48 @@ mod tests {
         assert_eq!(err.status, "error.bad_input");
         assert_eq!(err.code, "invalid_entity_ref");
         assert_eq!(err.field, "entity_ref");
-        assert!(err
-            .suggested_fix
-            .as_deref()
-            .unwrap_or_default()
-            .contains("knowledge:<entry_id>"));
+        assert!(
+            err.suggested_fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("knowledge:<entry_id>")
+        );
     }
 
     #[test]
     fn numeric_parse_error_suggests_expected_grammar() {
         let err = EntityRef::parse("transcript:codex:sess-1:not-a-line:2").unwrap_err();
         assert_eq!(err.status, "error.bad_input");
-        assert!(err
-            .suggested_fix
-            .as_deref()
-            .unwrap_or_default()
-            .contains("line_offset"));
+        assert!(
+            err.suggested_fix
+                .as_deref()
+                .unwrap_or_default()
+                .contains("line_offset")
+        );
     }
 
     #[test]
     fn virtual_classification_matches_design() {
-        assert!(EntityRef::Task {
-            task_id: "task-1".to_string()
-        }
-        .is_virtual());
-        assert!(EntityRef::BashCall {
-            session: "sess".to_string(),
-            turn: 4
-        }
-        .is_virtual());
-        assert!(!EntityRef::Commit {
-            repo_id: "abcd1234".to_string(),
-            sha: "abc".to_string()
-        }
-        .is_virtual());
+        assert!(
+            EntityRef::Task {
+                task_id: "task-1".to_string()
+            }
+            .is_virtual()
+        );
+        assert!(
+            EntityRef::BashCall {
+                session: "sess".to_string(),
+                turn: 4
+            }
+            .is_virtual()
+        );
+        assert!(
+            !EntityRef::Commit {
+                repo_id: "abcd1234".to_string(),
+                sha: "abc".to_string()
+            }
+            .is_virtual()
+        );
     }
 
     #[test]

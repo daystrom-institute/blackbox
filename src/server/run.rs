@@ -648,6 +648,19 @@ pub async fn run() -> anyhow::Result<()> {
             }
         }
     }
+    match routes::restore_runtime_artifacts_from_catalog(&shared) {
+        Ok(restored) if restored > 0 => {
+            tracing::info!(
+                "restored {restored} workflow/packet/brofile runtime artifact(s) from active catalog"
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            tracing::warn!(
+                "failed to restore workflow/packet/brofile runtime artifacts from active catalog: {err:#}"
+            );
+        }
+    }
 
     // Reactions — restore installed reaction specs from disk so they
     // survive daemon restart. Bad specs are logged and skipped; warnings

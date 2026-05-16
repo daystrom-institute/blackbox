@@ -335,6 +335,7 @@ impl SharedState {
 
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct ArcSnapshot {
+    pub(crate) arc_id: String,
     pub(crate) arc_thread_id: String,
     pub(crate) workflow_name: String,
     pub(crate) workflow_version: u32,

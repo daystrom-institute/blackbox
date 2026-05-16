@@ -1,5 +1,6 @@
 use super::*;
 use crate::*;
+use anyhow::Context;
 
 pub(crate) async fn orchestrate_list_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
@@ -105,13 +106,15 @@ pub(crate) async fn orchestrate_status_handler(
     Query(q): Query<OrchestrateStatusQuery>,
 ) -> impl axum::response::IntoResponse {
     use axum::response::IntoResponse;
+    let requested_id = q.thread_id;
+    let resolved_thread_id = resolve_orchestrate_thread_id(&state, &requested_id);
     // Snapshot notes linked to this thread via the raw store.
     let entries: Vec<Value> = {
         let store = state.notes.read();
         store
             .all()
             .iter()
-            .filter(|n| n.thread_id.as_deref() == Some(q.thread_id.as_str()))
+            .filter(|n| n.thread_id.as_deref() == Some(resolved_thread_id.as_str()))
             .map(|n| serde_json::to_value(n).unwrap_or_default())
             .collect()
     };
@@ -131,11 +134,25 @@ pub(crate) async fn orchestrate_status_handler(
         })
         .and_then(|e| e.get("body").and_then(Value::as_str).map(String::from));
     axum::Json(OrchestrateStatusResponse {
-        thread_id: q.thread_id,
+        thread_id: resolved_thread_id,
         notes: entries,
         latest_anchor,
     })
     .into_response()
+}
+
+pub(crate) fn resolve_orchestrate_thread_id(state: &SharedState, requested_id: &str) -> String {
+    if requested_id.starts_with("thread-") {
+        return requested_id.to_string();
+    }
+
+    state
+        .running_arcs
+        .read()
+        .values()
+        .find(|snapshot| snapshot.arc_id == requested_id || snapshot.arc_thread_id == requested_id)
+        .map(|snapshot| snapshot.arc_thread_id.clone())
+        .unwrap_or_else(|| requested_id.to_string())
 }
 
 pub(crate) async fn orchestrate_stream_handler(
@@ -723,6 +740,10 @@ pub(crate) struct OrchestrateByIdRequest {
     project_dir: Option<String>,
     #[serde(default)]
     max_steps: Option<usize>,
+    #[serde(default)]
+    await_completion: Option<bool>,
+    #[serde(default)]
+    timeout_seconds: Option<f64>,
 }
 
 pub(crate) async fn orchestrate_by_id_handler(
@@ -763,15 +784,31 @@ pub(crate) async fn orchestrate_by_id_handler(
         )
             .into_response();
     }
-    let result = workflow::run_workflow_with_initial_vars(
-        &server,
-        &compiled,
-        req.project_dir,
-        req.max_steps,
-        req.initial_vars,
-    )
-    .await;
-    axum::Json(result).into_response()
+    let (task, arc_id) =
+        server.spawn_workflow_task(compiled, req.project_dir, req.max_steps, req.initial_vars);
+    if req.await_completion.unwrap_or(false) {
+        let completed = orchestration::wait_for_task_with_timeout(&task, req.timeout_seconds).await;
+        let mut out = if completed {
+            orchestration::task_result_json(&task)
+        } else {
+            orchestration::timeout_snapshot_json(&task)
+        };
+        out["arcId"] = Value::String(arc_id);
+        return axum::Json(out).into_response();
+    }
+    let inner = task.inner.lock();
+    axum::Json(serde_json::json!({
+        "taskId": inner.id,
+        "sessionId": inner.session_id,
+        "arcId": arc_id,
+        "status": "running",
+        "poll": {
+            "status_tool": "bro_status",
+            "wait_tool": "bro_wait",
+            "arc_status_tool": "bro_arc_status"
+        }
+    }))
+    .into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1084,7 +1121,9 @@ pub(crate) async fn install_artifact_value(
         .install_value(p.kind, p.source, &value, p.name, p.version, p.supersedes)
         .and_then(|meta| {
             if let Some(prev) = meta.supersedes.as_deref() {
-                deactivate_artifact(state, meta.kind, prev)?;
+                if prev != meta.name {
+                    deactivate_artifact(state, meta.kind, prev)?;
+                }
             }
             Ok(meta)
         })?;
@@ -1100,6 +1139,101 @@ pub(crate) async fn install_artifact_value(
         persist_agent_provenance_edges(state, &agent_ref, &manifest)?;
     }
     Ok(meta)
+}
+
+pub(crate) fn restore_runtime_artifacts_from_catalog(
+    state: &Arc<SharedState>,
+) -> anyhow::Result<usize> {
+    let entries = state.artifacts.read().list(&ArtifactListParams {
+        kind: None,
+        name: None,
+        include_superseded: false,
+    })?;
+    let mut restored = 0usize;
+
+    for entry in entries
+        .into_iter()
+        .filter(|entry| entry.active)
+        .filter(|entry| {
+            matches!(
+                entry.kind,
+                artifacts::ArtifactKind::Workflow
+                    | artifacts::ArtifactKind::Packet
+                    | artifacts::ArtifactKind::Brofile
+            )
+        })
+    {
+        let Some(value) = state
+            .artifacts
+            .read()
+            .load_artifact_value(entry.kind, &entry.name)?
+        else {
+            tracing::warn!(
+                "active {} artifact '{}' has no catalog payload; runtime registry not restored",
+                entry.kind.as_str(),
+                entry.name
+            );
+            continue;
+        };
+
+        match entry.kind {
+            artifacts::ArtifactKind::Workflow => {
+                let spec: workflow::Workflow = serde_json::from_value(value.clone())
+                    .with_context(|| format!("parsing workflow artifact '{}'", entry.name))?;
+                let compiled = workflow::compile(spec.clone())
+                    .with_context(|| format!("compiling workflow artifact '{}'", entry.name))?;
+                validate_workflow_capabilities(&compiled, state)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
+                    .with_context(|| format!("validating workflow artifact '{}'", entry.name))?;
+
+                let dir = state.store_dir.join("workflows");
+                std::fs::create_dir_all(&dir)?;
+                std::fs::write(
+                    dir.join(format!("{}.json", entry.name)),
+                    serde_json::to_string_pretty(&spec).unwrap_or_default(),
+                )?;
+                state
+                    .workflow_registry
+                    .write()
+                    .insert(entry.name.clone(), spec);
+                restored += 1;
+            }
+            artifacts::ArtifactKind::Packet => {
+                let params: packets::CompileParams = serde_json::from_value(value.clone())
+                    .with_context(|| format!("parsing packet artifact '{}'", entry.name))?;
+                state
+                    .packets
+                    .read()
+                    .compile(&params)
+                    .with_context(|| format!("compiling packet artifact '{}'", entry.name))?;
+                restored += 1;
+            }
+            artifacts::ArtifactKind::Brofile => {
+                let brofile: orchestration::brofile::Brofile =
+                    serde_json::from_value(value.clone())
+                        .with_context(|| format!("parsing brofile artifact '{}'", entry.name))?;
+                let written = orchestration::brofile::save_brofile(
+                    &brofile,
+                    "global",
+                    &state.store_dir,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!("brofile registry write failed: {e}"))?;
+                if orchestration::brofile::resolve_brofile(&brofile.name, &state.store_dir, None)
+                    .is_none()
+                {
+                    anyhow::bail!(
+                        "brofile written to {} but resolve_brofile returned None — runtime registry desync",
+                        written.display()
+                    );
+                }
+                restored += 1;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(restored)
 }
 
 pub(crate) fn agent_install_warnings(

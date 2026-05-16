@@ -1,241 +1,239 @@
 #!/usr/bin/env python3
-"""Mechanical DAG shape, evidence-size, and acceptance-coverage lint."""
+import argparse, json, sys
 
-import argparse
-import json
-import sys
+TERM = {"satisfied", "work_remains", "untenable"}
 
 
-def load_json_arg(name: str, value: str):
+def load(name, raw):
     try:
-        return json.loads(value)
+        return json.loads(raw)
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"{name} is not valid JSON: {exc}") from exc
+        raise SystemExit(f"{name} invalid JSON: {exc}") from exc
 
 
-def criterion_ids(criteria):
-    ids = set()
-    for idx, item in enumerate(criteria or []):
-        if isinstance(item, dict):
-            cid = item.get("criterion_id") or item.get("id")
-        else:
-            cid = str(item)
-        if cid:
-            ids.add(str(cid))
-        else:
-            ids.add(f"criterion-{idx + 1}")
-    return ids
+def crit_id(item, idx=None):
+    v = item.get("criterion_id") or item.get("id") if isinstance(item, dict) else str(item) if item is not None else None
+    return str(v) if v else f"criterion-{idx + 1}" if idx is not None else None
 
 
-def iter_unit_refs(sub_units):
-    for unit in sub_units:
-        if not isinstance(unit, dict):
-            continue
-        refs = unit.get("refs")
-        if not isinstance(refs, list):
-            continue
-        for ref in refs:
-            if isinstance(ref, str) and ref:
-                yield ref
-
-
-def unique_refs(sub_units):
-    out = []
-    seen = set()
-    for ref in iter_unit_refs(sub_units):
-        if ref not in seen:
-            seen.add(ref)
-            out.append(ref)
+def unique_refs(units):
+    out, seen = [], set()
+    for u in units:
+        for r in u.get("refs") or [] if isinstance(u, dict) else []:
+            if isinstance(r, str) and r and r not in seen:
+                seen.add(r)
+                out.append(r)
     return out
 
 
-def ref_size_index(ref_size):
-    if not isinstance(ref_size, dict):
-        return {}, ["ref_size payload must be an object"]
-    errors = []
-    degraded = ref_size.get("degraded")
+def evidence_refs(evidence):
+    out = set()
+    for item in evidence.get("refs") or [] if isinstance(evidence, dict) else []:
+        r = item if isinstance(item, str) else item.get("ref") or item.get("entity_ref") if isinstance(item, dict) else None
+        if isinstance(r, str) and r:
+            out.add(r)
+    return out
+
+
+def degraded_refs(evidence):
+    degraded = evidence.get("degraded") if isinstance(evidence, dict) else None
+    out = []
+    for item in degraded.get("unresolved_refs") or [] if isinstance(degraded, dict) else []:
+        r = item.get("ref") or item.get("entity_ref") if isinstance(item, dict) else item
+        if isinstance(r, str) and r:
+            out.append(r)
+    return out
+
+
+def ref_size_index(payload):
+    if not isinstance(payload, dict):
+        return {}, ["ref_size not object"]
+    errors, sizes = [], {}
+    degraded = payload.get("degraded")
     if isinstance(degraded, dict):
         unresolved = degraded.get("unresolved_refs") or []
         if unresolved:
-            refs = []
-            for item in unresolved:
-                if isinstance(item, dict):
-                    refs.append(str(item.get("ref") or item.get("entity_ref") or item))
-                else:
-                    refs.append(str(item))
-            errors.append("bbox_ref_size unresolved refs: " + ", ".join(refs))
-        omitted = degraded.get("omitted_refs") or 0
-        if omitted:
-            errors.append(f"bbox_ref_size omitted {omitted} refs; DAG byte lint requires full coverage")
-    sizes = {}
-    per_ref = ref_size.get("per_ref") or []
+            refs = [str(x.get("ref") or x.get("entity_ref") or x) if isinstance(x, dict) else str(x) for x in unresolved]
+            errors.append("unresolved refs: " + ", ".join(refs))
+        if degraded.get("omitted_refs"):
+            errors.append(f"omitted refs: {degraded.get('omitted_refs')}")
+    per_ref = payload.get("per_ref") or []
     if not isinstance(per_ref, list):
-        errors.append("ref_size.per_ref must be an array")
-        return sizes, errors
+        return sizes, errors + ["ref_size.per_ref not array"]
     for item in per_ref:
-        if not isinstance(item, dict):
-            continue
-        ref = item.get("ref")
-        bytes_value = item.get("bytes")
-        if isinstance(ref, str) and isinstance(bytes_value, int):
-            sizes[ref] = bytes_value
+        if isinstance(item, dict) and isinstance(item.get("ref"), str) and isinstance(item.get("bytes"), int):
+            sizes[item["ref"]] = item["bytes"]
     return sizes, errors
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--dag", required=True)
-    parser.add_argument("--acceptance", default="[]")
-    parser.add_argument("--target-context-window", type=int)
-    parser.add_argument("--ref-size")
-    parser.add_argument("--emit-refs", action="store_true")
-    args = parser.parse_args()
-
-    dag = load_json_arg("dag", args.dag)
-    acceptance = load_json_arg("acceptance", args.acceptance)
-    errors = []
-
-    sub_units = dag.get("sub_units") if isinstance(dag, dict) else None
-    if not isinstance(sub_units, list) or not sub_units:
-        errors.append("dag.sub_units must be a non-empty array")
-        sub_units = []
-    elif len(sub_units) < 2:
-        errors.append("dag.sub_units must contain at least two sub-units for a decomposed path")
-
-    if args.emit_refs:
-        json.dump(unique_refs(sub_units), sys.stdout, separators=(",", ":"))
-        sys.stdout.write("\n")
-        return 0
-
-    measured_sizes = None
-    if args.ref_size is not None:
-        measured_sizes, ref_size_errors = ref_size_index(load_json_arg("ref-size", args.ref_size))
-        errors.extend(ref_size_errors)
-
-    ids = []
-    covered = set()
-    for idx, unit in enumerate(sub_units):
-        if not isinstance(unit, dict):
-            errors.append(f"sub_units[{idx}] must be an object")
+def check_units(units, measured, target):
+    errors, ids, covered = [], [], set()
+    for i, u in enumerate(units):
+        if not isinstance(u, dict):
+            errors.append(f"sub_units[{i}] not object")
             continue
-        sid = unit.get("sub_unit_id")
-        if not sid:
-            errors.append(f"sub_units[{idx}].sub_unit_id is required")
-        else:
+        sid, refs, declared = u.get("sub_unit_id"), u.get("refs"), u.get("bytes")
+        if sid:
             ids.append(str(sid))
-        refs = unit.get("refs")
+        else:
+            errors.append(f"sub_units[{i}].sub_unit_id required")
         if not isinstance(refs, list) or not refs:
-            errors.append(f"sub_units[{idx}].refs must be a non-empty array")
-        bytes_value = unit.get("bytes")
-        if not isinstance(bytes_value, int) or bytes_value < 0:
-            errors.append(f"sub_units[{idx}].bytes must be a non-negative integer")
-        elif args.target_context_window is not None and bytes_value > args.target_context_window:
-            errors.append(
-                f"sub_units[{idx}].bytes exceeds target_context_window "
-                f"({bytes_value} > {args.target_context_window})"
-            )
-        if measured_sizes is not None and isinstance(refs, list):
-            missing_refs = [ref for ref in refs if isinstance(ref, str) and ref not in measured_sizes]
-            if missing_refs:
-                errors.append(
-                    f"sub_units[{idx}].refs missing from measured ref-size output: "
-                    + ", ".join(missing_refs)
-                )
-            measured_bytes = sum(
-                measured_sizes.get(ref, 0) for ref in refs if isinstance(ref, str)
-            )
-            if args.target_context_window is not None and measured_bytes > args.target_context_window:
-                errors.append(
-                    f"sub_units[{idx}].measured_ref_bytes exceeds target_context_window "
-                    f"({measured_bytes} > {args.target_context_window})"
-                )
-            if isinstance(bytes_value, int) and bytes_value != measured_bytes:
-                errors.append(
-                    f"sub_units[{idx}].bytes must equal measured ref bytes "
-                    f"({bytes_value} != {measured_bytes})"
-                )
-        depends_on = unit.get("depends_on")
-        if depends_on is None:
-            errors.append(f"sub_units[{idx}].depends_on is required")
-        elif not isinstance(depends_on, list):
-            errors.append(f"sub_units[{idx}].depends_on must be an array")
-        if "assigned_brofile" in unit:
-            errors.append(
-                f"sub_units[{idx}].assigned_brofile is not allowed; "
-                "sub-unit execution uses the fixed supervised-impl workflow"
-            )
-        predicted_writes = unit.get("predicted_writes")
-        if predicted_writes is None:
-            errors.append(f"sub_units[{idx}].predicted_writes is required")
-        elif not isinstance(predicted_writes, list):
-            errors.append(f"sub_units[{idx}].predicted_writes must be an array")
-        subset = unit.get("acceptance_subset")
+            errors.append(f"sub_units[{i}].refs required")
+            refs = []
+        if not isinstance(declared, int) or declared < 0:
+            errors.append(f"sub_units[{i}].bytes invalid")
+        elif target is not None and declared > target:
+            errors.append(f"sub_units[{i}].bytes > target ({declared} > {target})")
+        if measured is not None:
+            missing = [r for r in refs if isinstance(r, str) and r not in measured]
+            if missing:
+                errors.append(f"sub_units[{i}].refs unmeasured: " + ", ".join(missing))
+            total = sum(measured.get(r, 0) for r in refs if isinstance(r, str))
+            if target is not None and total > target:
+                errors.append(f"sub_units[{i}].measured > target ({total} > {target})")
+            if isinstance(declared, int) and declared != total:
+                errors.append(f"sub_units[{i}].bytes != measured ({declared} != {total})")
+        if not isinstance(u.get("depends_on"), list):
+            errors.append(f"sub_units[{i}].depends_on not array")
+        if "assigned_brofile" in u:
+            errors.append(f"sub_units[{i}].assigned_brofile forbidden")
+        if not isinstance(u.get("predicted_writes"), list):
+            errors.append(f"sub_units[{i}].predicted_writes not array")
+        subset = u.get("acceptance_subset")
         if not isinstance(subset, list) or not subset:
-            errors.append(f"sub_units[{idx}].acceptance_subset must be a non-empty array")
-        for criterion in subset or []:
-            if isinstance(criterion, dict):
-                cid = criterion.get("criterion_id") or criterion.get("id")
-            else:
-                cid = str(criterion)
+            errors.append(f"sub_units[{i}].acceptance_subset required")
+        for item in subset or []:
+            cid = crit_id(item)
             if cid:
-                covered.add(str(cid))
-
+                covered.add(cid)
     if len(ids) != len(set(ids)):
-        errors.append("sub_unit_id values must be unique")
+        errors.append("duplicate sub_unit_id")
+    return errors, ids, covered
 
-    id_set = set(ids)
-    for idx, unit in enumerate(sub_units):
-        if not isinstance(unit, dict):
+
+def check_deps(units, ids):
+    errors, graph = [], {}
+    for i, u in enumerate(units):
+        if not isinstance(u, dict):
             continue
-        sid = str(unit.get("sub_unit_id", f"index-{idx}"))
-        for dep in unit.get("depends_on") or []:
+        sid = str(u.get("sub_unit_id") or f"index-{i}")
+        graph[sid] = []
+        for dep in u.get("depends_on") or []:
             dep = str(dep)
-            if dep not in id_set:
-                errors.append(f"{sid}.depends_on references unknown sub_unit_id {dep}")
-            if dep == sid:
-                errors.append(f"{sid}.depends_on must not reference itself")
+            if dep not in ids:
+                errors.append(f"{sid}.depends_on unknown {dep}")
+            elif dep == sid:
+                errors.append(f"{sid}.depends_on self")
+            else:
+                graph[sid].append(dep)
+    active, done, path = set(), set(), []
 
-    contract = dag.get("recompose_contract") if isinstance(dag, dict) else None
-    merge_order = contract.get("merge_order") if isinstance(contract, dict) else None
-    if not isinstance(merge_order, list):
-        errors.append("recompose_contract.merge_order must be an array")
-    elif set(map(str, merge_order)) != set(ids):
-        errors.append("merge_order must contain exactly the sub_unit_id set")
+    def walk(n):
+        if n in done:
+            return
+        if n in active:
+            start = path.index(n) if n in path else 0
+            errors.append("cycle: " + " -> ".join(path[start:] + [n]))
+            return
+        active.add(n)
+        path.append(n)
+        for d in graph.get(n, []):
+            walk(d)
+        path.pop()
+        active.remove(n)
+        done.add(n)
 
-    cross_tests = contract.get("cross_subunit_tests") if isinstance(contract, dict) else None
-    if not isinstance(cross_tests, list) or not cross_tests:
-        errors.append("recompose_contract.cross_subunit_tests must be a non-empty array")
-    else:
-        allowed_terminal = {"satisfied", "work_remains", "untenable"}
-        for idx, test in enumerate(cross_tests):
-            if not isinstance(test, dict):
-                errors.append(f"cross_subunit_tests[{idx}] must be an object")
-                continue
-            test_id = test.get("test_id")
-            if not isinstance(test_id, str) or not test_id:
-                errors.append(f"cross_subunit_tests[{idx}].test_id is required")
-            assertions = test.get("assertions")
-            if not isinstance(assertions, list) or not assertions:
-                errors.append(f"cross_subunit_tests[{idx}].assertions must be a non-empty array")
-            terminal_verdicts = test.get("terminal_verdicts")
-            if not isinstance(terminal_verdicts, list) or not terminal_verdicts:
-                errors.append(f"cross_subunit_tests[{idx}].terminal_verdicts must be a non-empty array")
-                continue
-            unknown = sorted({str(v) for v in terminal_verdicts} - allowed_terminal)
-            if unknown:
-                errors.append(
-                    f"cross_subunit_tests[{idx}].terminal_verdicts contains non-recompose verdicts: "
-                    + ", ".join(unknown)
-                )
+    for n in graph:
+        walk(n)
+    return errors
 
-    required = criterion_ids(acceptance)
-    missing = sorted(required - covered)
-    if missing:
-        errors.append("acceptance criteria not covered: " + ", ".join(missing))
 
-    result = {"ok": not errors, "errors": errors, "sub_unit_count": len(sub_units)}
-    json.dump(result, sys.stdout, separators=(",", ":"))
-    sys.stdout.write("\n")
+def check_contract(dag, ids):
+    errors = []
+    c = dag.get("recompose_contract") if isinstance(dag, dict) else None
+    order = c.get("merge_order") if isinstance(c, dict) else None
+    if not isinstance(order, list):
+        errors.append("merge_order required")
+    elif set(map(str, order)) != set(ids):
+        errors.append("merge_order must equal sub_unit ids")
+    tests = c.get("cross_subunit_tests") if isinstance(c, dict) else None
+    if not isinstance(tests, list) or not tests:
+        errors.append("cross_subunit_tests required")
+        return errors, c
+    for i, t in enumerate(tests):
+        if not isinstance(t, dict):
+            errors.append(f"cross_subunit_tests[{i}] not object")
+            continue
+        if not t.get("test_id"):
+            errors.append(f"cross_subunit_tests[{i}].test_id required")
+        if not isinstance(t.get("assertions"), list) or not t.get("assertions"):
+            errors.append(f"cross_subunit_tests[{i}].assertions required")
+        verdicts = t.get("terminal_verdicts")
+        if not isinstance(verdicts, list) or not verdicts:
+            errors.append(f"cross_subunit_tests[{i}].terminal_verdicts required")
+        elif set(map(str, verdicts)) != TERM:
+            errors.append(f"cross_subunit_tests[{i}].terminal_verdicts wrong")
+    return errors, c
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dag", required=True)
+    p.add_argument("--acceptance", default="[]")
+    p.add_argument("--target-context-window", type=int)
+    p.add_argument("--ref-size")
+    p.add_argument("--evidence", default="{}")
+    p.add_argument("--emit-refs", action="store_true")
+    a = p.parse_args()
+    dag, acceptance, evidence = load("dag", a.dag), load("acceptance", a.acceptance), load("evidence", a.evidence)
+    units, errors = dag.get("sub_units") if isinstance(dag, dict) else None, []
+    if not isinstance(units, list) or not units:
+        errors.append("dag.sub_units required")
+        units = []
+    elif len(units) < 2:
+        errors.append("dag.sub_units needs at least 2")
+    if a.emit_refs:
+        json.dump(unique_refs(units), sys.stdout, separators=(",", ":"))
+        print()
+        return 0
+    measured = None
+    if a.ref_size is not None:
+        measured, more = ref_size_index(load("ref-size", a.ref_size))
+        errors += more
+    more, ids, covered = check_units(units, measured, a.target_context_window)
+    errors += more + check_deps(units, set(ids))
+    more, contract = check_contract(dag, ids)
+    errors += more
+    unresolved = degraded_refs(evidence)
+    contract_degraded = set()
+    contract_degraded_field = None
+    if isinstance(contract, dict):
+        contract_degraded_field = contract.get("degraded_refs")
+        if isinstance(contract_degraded_field, list):
+            contract_degraded = {
+                str(x.get("ref"))
+                for x in contract_degraded_field
+                if isinstance(x, dict) and x.get("ref")
+            }
+    if unresolved:
+        if not isinstance(contract_degraded_field, list):
+            errors.append("degraded_refs required")
+        missing = sorted(set(unresolved) - contract_degraded)
+        if missing:
+            errors.append("degraded refs missing: " + ", ".join(missing))
+    extra_degraded = sorted(contract_degraded - set(unresolved))
+    if extra_degraded:
+        errors.append("unexpected degraded refs: " + ", ".join(extra_degraded))
+    unresolved_set = set(unresolved)
+    missing_evidence = sorted((evidence_refs(evidence) - unresolved_set) - set(unique_refs(units)))
+    if missing_evidence:
+        errors.append("evidence refs missing: " + ", ".join(missing_evidence))
+    needed = {crit_id(x, i) for i, x in enumerate(acceptance or [])}
+    missing_ac = sorted(needed - covered)
+    if missing_ac:
+        errors.append("acceptance not covered: " + ", ".join(missing_ac))
+    json.dump({"ok": not errors, "errors": errors, "sub_unit_count": len(units)}, sys.stdout, separators=(",", ":"))
+    print()
     if errors:
         print("phase-decompose DAG lint failed:", file=sys.stderr)
         for error in errors:

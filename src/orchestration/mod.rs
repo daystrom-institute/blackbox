@@ -17,7 +17,7 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::Notify;
 
@@ -43,6 +43,8 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "TRANSCRIPT_SEARCH_CODEX_ROOT",
     "TRANSCRIPT_SEARCH_INDEX_PATH",
 ];
+
+const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
 
 // ---------------------------------------------------------------------------
 // Task
@@ -1110,6 +1112,53 @@ pub fn spawn_task(
     spawn_task_reserved(task_id, params)
 }
 
+fn move_large_prompt_arg_to_stdin(provider: Provider, args: &mut Vec<String>) -> Option<String> {
+    if !matches!(
+        provider,
+        Provider::Claude | Provider::Glm | Provider::Deepseek
+    ) {
+        return None;
+    }
+    let mut idx = 0usize;
+    let mut prompt_idx = None;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "-p" || arg == "--print" {
+            let candidate_idx = idx + 1;
+            if args
+                .get(candidate_idx)
+                .is_some_and(|candidate| candidate.len() >= PROMPT_STDIN_ARG_BYTES_THRESHOLD)
+            {
+                prompt_idx = Some(candidate_idx);
+            }
+            break;
+        }
+        if claude_family_option_takes_value(arg) && idx + 1 < args.len() {
+            idx += 2;
+        } else {
+            idx += 1;
+        }
+    }
+    let prompt_idx = prompt_idx?;
+    Some(args.remove(prompt_idx))
+}
+
+fn claude_family_option_takes_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-m" | "--model"
+            | "--permission-mode"
+            | "--output-format"
+            | "--input-format"
+            | "--resume"
+            | "--add-dir"
+            | "--mcp-config"
+            | "--append-system-prompt"
+            | "--allowedTools"
+            | "--disallowedTools"
+    )
+}
+
 fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     let SpawnTaskParams {
         provider,
@@ -1149,9 +1198,15 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         provider.bin()
     };
     let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
+    let mut args = args;
+    let stdin_payload = move_large_prompt_arg_to_stdin(provider, &mut args);
     let mut cmd = Command::new(&bin);
     cmd.args(&args)
-        .stdin(std::process::Stdio::null())
+        .stdin(if stdin_payload.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("PATH", &path_env)
@@ -1210,6 +1265,13 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     };
 
     let pid = child.id();
+    if let Some(payload) = stdin_payload {
+        if let Some(mut stdin) = child.stdin.take() {
+            tokio::spawn(async move {
+                let _ = stdin.write_all(payload.as_bytes()).await;
+            });
+        }
+    }
     let task = Arc::new(Task {
         inner: Mutex::new(TaskInner {
             id: id.clone(),
@@ -2024,6 +2086,66 @@ mod tests {
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Failed.is_terminal());
         assert!(TaskStatus::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn large_claude_family_prompt_moves_to_stdin() {
+        let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
+        let mut args = vec![
+            "--resume".into(),
+            "session-1".into(),
+            "-p".into(),
+            prompt.clone(),
+            "--output-format".into(),
+            "stream-json".into(),
+        ];
+
+        let stdin = move_large_prompt_arg_to_stdin(Provider::Claude, &mut args);
+
+        assert_eq!(stdin.as_deref(), Some(prompt.as_str()));
+        assert_eq!(
+            args,
+            vec![
+                "--resume",
+                "session-1",
+                "-p",
+                "--output-format",
+                "stream-json"
+            ]
+        );
+    }
+
+    #[test]
+    fn small_or_non_claude_prompt_stays_in_argv() {
+        let mut small_args = vec!["-p".into(), "hello".into()];
+        assert!(move_large_prompt_arg_to_stdin(Provider::Claude, &mut small_args).is_none());
+        assert_eq!(small_args, vec!["-p", "hello"]);
+
+        let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
+        let mut codex_args = vec!["exec".into(), "--json".into(), prompt];
+        assert!(move_large_prompt_arg_to_stdin(Provider::Codex, &mut codex_args).is_none());
+        assert_eq!(codex_args.len(), 3);
+    }
+
+    #[test]
+    fn large_prompt_detection_skips_option_values_named_like_print_flag() {
+        let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
+        let mut args = vec![
+            "--resume".into(),
+            "-p".into(),
+            "-p".into(),
+            prompt.clone(),
+            "--output-format".into(),
+            "stream-json".into(),
+        ];
+
+        let stdin = move_large_prompt_arg_to_stdin(Provider::Claude, &mut args);
+
+        assert_eq!(stdin.as_deref(), Some(prompt.as_str()));
+        assert_eq!(
+            args,
+            vec!["--resume", "-p", "-p", "--output-format", "stream-json"]
+        );
     }
 
     #[test]

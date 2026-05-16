@@ -1,6 +1,6 @@
 {
   "name": "phase-decompose-main",
-  "version": 1,
+  "version": 4,
   "policy_packet": "domain:workflow-policy/arc-budget",
   "vars_schema": {
     "phase_doc_path": { "kind": "string", "required": true },
@@ -12,6 +12,7 @@
     "max_epochs": { "kind": "int" },
     "epoch_check": { "kind": "object" },
     "epoch_status": { "kind": "string" },
+    "live_parent_arc_id": { "kind": "string" },
     "evidence_bundle": { "kind": "object" },
     "triage_verdict": { "kind": "string" },
     "implementation_output": { "kind": "object" },
@@ -28,6 +29,13 @@
     "InitEpoch": {
       "actor": "",
       "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "live_parent_arc_id",
+            "value": "${meta.arc_id}"
+          }
+        },
         {
           "op": "inc_var",
           "args": {
@@ -68,8 +76,37 @@
           "fit_direct": "DirectImplement",
           "needs_decompose": "Decompose"
         },
-        "default": "Decompose"
+        "default": "TriageUnexpected"
       }
+    },
+    "TriageUnexpected": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "_structured_exit",
+            "value": {
+              "path": "triage_unexpected",
+              "triage_verdict": "${vars.triage_verdict}",
+              "error": "triage gate returned a verdict other than fit_direct or needs_decompose"
+            }
+          }
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": [
+              "python3",
+              "-c",
+              "import sys; sys.stderr.write('unexpected triage verdict\\n'); sys.exit(1)"
+            ],
+            "cwd": "${vars.project_dir}"
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
     },
     "DirectImplement": {
       "actor": "",
@@ -78,6 +115,7 @@
         "phase_doc_path",
         "phase_doc_text",
         "project_dir",
+        "live_parent_arc_id",
         "evidence_bundle",
         "acceptance_criteria"
       ],
@@ -129,7 +167,8 @@
           "phase_doc_path",
           "phase_doc_text",
           "project_dir",
-          "evidence_bundle",
+          "live_parent_arc_id",
+          "target_context_window",
           "acceptance_criteria"
         ],
         "exports": ["implementation_output", "advisor_verdict", "acceptance_status"],
@@ -147,9 +186,11 @@
         "phase_doc_path",
         "phase_doc_text",
         "project_dir",
+        "live_parent_arc_id",
         "acceptance_criteria",
         "dag",
         "sub_results",
+        "triage_verdict",
         "epoch",
         "max_epochs"
       ],

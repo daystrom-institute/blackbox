@@ -154,7 +154,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "whiteboard_annotate",
-        description = "Annotate a post during the validate or debate phase. Validate phase accepts only `validation` (with required `result`: confirmed / refuted / inconclusive). Debate phase accepts `challenge`, `corroborate`, or `resolve` (resolve must reference a challenge id via `resolves`)."
+        description = "Annotate a post during the validate or debate phase. Validate phase accepts only `validation` (with required `result`: confirmed / refuted / inconclusive). Debate phase accepts `challenge`, `corroborate`, or `resolve` (resolve must reference a challenge id via `resolves`; a post owner may resolve another agent's challenge on their own post)."
     )]
     async fn whiteboard_annotate(
         &self,

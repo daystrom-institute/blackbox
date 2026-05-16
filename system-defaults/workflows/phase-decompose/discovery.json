@@ -1,6 +1,6 @@
 {
   "name": "phase-decompose-discovery",
-  "version": 8,
+  "version": 9,
   "vars_schema": {
     "phase_doc_path": { "kind": "string", "required": true },
     "phase_doc_text": { "kind": "string", "required": true },
@@ -139,7 +139,7 @@
     },
     "Inlet": {
       "actor": "inlet",
-      "prompt": "Phase doc path: ${vars.phase_doc_path}\nProject: ${vars.project_dir}\nTarget context window bytes: ${vars.target_context_window}\nAcceptance criteria JSON: ${vars.acceptance_criteria}\n\nScout fanout results JSON:\n${vars.scout_results}\n\nAggregate only the scout evidence. Extract refs from each item.exports.scout_json.leads_entity_refs[*].ref and item.exports.scout_json.leads_symbols_files[*].entity_ref. Preserve path ids from leads_paths[*].path_id and bundle handles. Include only round-trippable entity refs. If a scout supplies a concrete path but no canonical chunk ref, normalize it to file:<project-relative-path>; never pass project_file:<slug> or bare slug aliases to bbox_ref_size. Call bbox_ref_size(refs=[...]) on the unique refs. Then make no more tool calls. Return one complete compact JSON object only with exactly two top-level keys. Minimal example: {\"triage_verdict\":\"needs_decompose\",\"evidence_bundle\":{\"total_bytes\":123,\"target_context_window\":1000,\"refs\":[],\"knowledge_ids\":[],\"path_ids\":[],\"scout_summaries\":[],\"degraded\":{\"unresolved_refs\":[],\"omitted_refs\":0}}}. The final three characters of your response must be }}}. Do not include rationale or any other top-level key. Keep degraded.unresolved_refs to at most five examples. Do not use markdown fences. Do not construct or mention a DAG.",
+      "prompt": "Phase doc path: ${vars.phase_doc_path}\nProject: ${vars.project_dir}\nTarget context window bytes: ${vars.target_context_window}\nAcceptance criteria JSON: ${vars.acceptance_criteria}\n\nScout fanout results JSON:\n${vars.scout_results}\n\nAggregate only the scout evidence. Extract refs from each item.exports.scout_json.leads_entity_refs[*].ref and item.exports.scout_json.leads_symbols_files[*].entity_ref. Preserve path ids from leads_paths[*].path_id and bundle handles. Include only round-trippable entity refs. If a scout supplies a concrete path but no canonical chunk ref, normalize it to file:<project-relative-path>; never pass project_file:<slug> or bare slug aliases to bbox_ref_size. Call bbox_ref_size(project_dir=\"${vars.project_dir}\", refs=[...]) on the unique refs so worktree-local files are measured from this project. Then make no more tool calls. Return one complete compact JSON object only with exactly two top-level keys. Minimal example: {\"triage_verdict\":\"needs_decompose\",\"evidence_bundle\":{\"total_bytes\":123,\"target_context_window\":1000,\"refs\":[],\"knowledge_ids\":[],\"path_ids\":[],\"scout_summaries\":[],\"degraded\":{\"unresolved_refs\":[],\"omitted_refs\":0}}}. The final three characters of your response must be }}}. Do not include rationale or any other top-level key. Keep degraded.unresolved_refs to at most five examples. Do not use markdown fences. Do not construct or mention a DAG.",
       "on_exit": [
         {
           "op": "parse_json",

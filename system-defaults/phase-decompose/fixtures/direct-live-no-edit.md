@@ -2,7 +2,7 @@
 question_shapes:
   - question_shape: where
     query: Locate the existing phase decomposer supervised implementation workflow, acceptance advisor brofile, and workflow registration docs for a no-edit smoke test.
-    scope_hint: system-defaults/workflows/phase-decompose/supervised-impl.json system-defaults/brofiles/phase-decompose/acceptance-advisor.json design/partial/phase-decomposer-impl.md
+    scope_hint: system-defaults/workflows/phase-decompose/supervised-impl.json system-defaults/brofiles/phase-decompose/acceptance-advisor.json design/archive/phase-decomposer-impl.md
     known_evidence: file:system-defaults/workflows/phase-decompose/supervised-impl.json
 ---
 

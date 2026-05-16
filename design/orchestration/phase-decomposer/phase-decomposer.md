@@ -14,12 +14,13 @@ brief: "Routes oversized phase docs through scouting, evidence sizing, optional 
 # Phase Decomposer — context-budget-aware execution of large phased plans
 
 Date: 2026-05-10
-Status: implemented, pending final validation as `system-defaults/phase-decompose`
-workflows, packets, brofiles, teamplates, fixtures, and the `corpus-pathfinder`
-agent manifest. Live no-edit smoke coverage currently includes the direct and
-decomposed paths, but measured-byte DAG lint was hardened after those smokes and
-still needs a fresh live run. Edit/merge mediation is explicitly out of v1
-rather than a shipped claim.
+Status: implemented after live no-edit validation on 2026-05-16. The shipped
+surface is `system-defaults/phase-decompose` workflows, packets, brofiles,
+teamplates, fixtures, and the `corpus-pathfinder` agent manifest. Final
+hardened live proof: `arc-5a5fd112da724ce7a06ab7d1fe007bd8` reached `Done`
+with `recompose_verdict=satisfied` after measured DAG lint, eight supervised
+no-edit subflows, and mechanical recomposition assertions. Edit/merge mediation
+is explicitly out of v1 rather than a shipped claim.
 Predecessor archived at `design/orchestration/phase-decomposer/phase-decomposer-archived.md`.
 
 ## 1. Problem

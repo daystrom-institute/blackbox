@@ -1,10 +1,12 @@
 {
   "name": "phase-decompose-recompose",
-  "version": 2,
+  "version": 6,
   "vars_schema": {
     "phase_doc_path": { "kind": "string", "required": true },
     "phase_doc_text": { "kind": "string", "required": true },
     "project_dir": { "kind": "string", "required": true },
+    "live_parent_arc_id": { "kind": "string" },
+    "triage_verdict": { "kind": "string" },
     "acceptance_criteria": { "kind": "array" },
     "dag": { "kind": "object" },
     "sub_results": { "kind": "array" },
@@ -32,7 +34,7 @@
   "nodes": {
     "CouncilEvaluate": {
       "actor": "council",
-      "prompt": "Project: ${vars.project_dir}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nPhase doc path: ${vars.phase_doc_path}\nPhase doc text:\n${vars.phase_doc_text}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nEvaluate integration and acceptance coverage. Do not edit files. Return concise findings for the facilitator.",
+      "prompt": "Project: ${vars.project_dir}\nLive parent arc id: ${vars.live_parent_arc_id}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nPhase doc path: ${vars.phase_doc_path}\nTriage verdict: ${vars.triage_verdict}\nPhase doc text:\n${vars.phase_doc_text}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nEvaluate integration and acceptance coverage. Do not edit files. Treat this recompose subworkflow as part of the named live parent phase-decompose arc. Check the field-shape bridge from sub_results exports into this council input and the full e2e conjunction in recompose_contract.cross_subunit_tests; do not downgrade the run to static-only when the parent arc is live. The Decompose subworkflow can only export DAG JSON after lint-dag.py has compared each final sub_unit.bytes value with bbox_ref_size measured bytes for that same sub_unit.refs cluster and checked the target_context_window. Do not compare proposal-round or ResolveDebate measurements for a different candidate ref cluster against the final DAG refs. Treat older phase-decompose thread ids inside evidence_bundle text as stale unless they match sub_results arc ids or the live parent arc id. Return concise findings for the facilitator.",
       "on_exit": [
         {
           "op": "set_var",
@@ -46,7 +48,7 @@
     },
     "FacilitateVerdict": {
       "actor": "facilitator",
-      "prompt": "Council findings:\n${vars.council_output}\n\nProject: ${vars.project_dir}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nReturn strict JSON only: {\"recompose_verdict\":\"satisfied|work_remains|untenable\",\"summary\":\"...\",\"remediation_packet\":{\"phase_doc_text\":\"...\",\"remaining_acceptance_ids\":[],\"conflicts\":[],\"prior_epoch_notes\":\"...\"},\"integration_tests\":[],\"halt_reason\":\"\"}. The only terminal verdict labels for AC-DECOMP-3 are satisfied, work_remains, and untenable. Epoch-ceiling halt is a control-flow stop, not an AC-DECOMP-3 terminal verdict. If a no-edit fixture has empty file writes, base satisfaction on explicit foreach completion, advisor verdicts, and recompose_contract.cross_subunit_tests assertions rather than treating zero writes as sufficient by itself.",
+      "prompt": "Council findings:\n${vars.council_output}\n\nProject: ${vars.project_dir}\nLive parent arc id: ${vars.live_parent_arc_id}\nEpoch: ${vars.epoch} / max ${vars.max_epochs}\nTriage verdict: ${vars.triage_verdict}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nDAG JSON:\n${vars.dag}\nSub-unit results JSON:\n${vars.sub_results}\n\nReturn strict JSON only: {\"recompose_verdict\":\"satisfied|work_remains|untenable\",\"summary\":\"...\",\"remediation_packet\":{\"phase_doc_text\":\"...\",\"remaining_acceptance_ids\":[],\"conflicts\":[],\"prior_epoch_notes\":\"...\"},\"integration_tests\":[],\"halt_reason\":\"\"}. The only terminal verdict labels for AC-DECOMP-3 are satisfied, work_remains, and untenable. Epoch-ceiling halt is a control-flow stop, not an AC-DECOMP-3 terminal verdict. If a no-edit fixture has empty file writes, base satisfaction on explicit foreach completion, advisor verdicts, the field-shape bridge in sub_results exports, implementation_output.live_arc_id matching the named parent arc, and the complete recompose_contract.cross_subunit_tests conjunction. The final DAG already passed lint-dag.py against bbox_ref_size for its own refs; proposal-round measurements for different ref clusters are not evidence that the final DAG bytes are decorative. Do not classify this live parent arc as static-only just because sub-units did not launch an additional top-level redispatch.",
       "gate": "domain:phase-decompose/recompose-verdict",
       "on_exit": [
         {
@@ -68,6 +70,26 @@
             "key": "remediation_packet",
             "value": "${vars.recompose_result.remediation_packet}"
           }
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": [
+              "python3",
+              "system-defaults/phase-decompose/scripts/recompose-assertions.py",
+              "--payload-stdin"
+            ],
+            "cwd": "${vars.project_dir}",
+            "stdin": {
+              "TRIAGE_VERDICT": "${vars.triage_verdict}",
+              "LIVE_PARENT_ARC_ID": "${vars.live_parent_arc_id}",
+              "RECOMPOSE_VERDICT": "${vars.recompose_verdict}",
+              "SUB_RESULTS": "${vars.sub_results}",
+              "DAG": "${vars.dag}",
+              "ACCEPTANCE_CRITERIA": "${vars.acceptance_criteria}"
+            }
+          },
+          "on_failure": "halt"
         }
       ],
       "next": { "type": "terminal" }

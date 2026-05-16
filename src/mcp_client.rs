@@ -146,8 +146,11 @@ async fn stdio_call(
         .call_tool(params)
         .await
         .with_context(|| format!("call_tool '{tool_name}'"))?;
-    // Best-effort cancel — we don't care if the child has already exited.
-    let _ = client.cancel().await;
+    // The tool result is already in hand. Some transports, especially
+    // loopback HTTP self-calls, can linger during shutdown; cleanup
+    // must not consume the caller's whole mcp_call timeout.
+    let mut client = client;
+    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
     extract_result_value(resp)
 }
 
@@ -178,7 +181,11 @@ async fn http_call(
         .call_tool(params)
         .await
         .with_context(|| format!("call_tool '{tool_name}'"))?;
-    let _ = client.cancel().await;
+    // The tool result is already in hand. Some transports, especially
+    // loopback HTTP self-calls, can linger during shutdown; cleanup
+    // must not consume the caller's whole mcp_call timeout.
+    let mut client = client;
+    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
     extract_result_value(resp)
 }
 
