@@ -16,8 +16,10 @@ brief: "Designs template-based context assembly for brofiles, turns, dispatch de
 
 Blackbox currently assembles prompt context in several ad hoc places:
 
-- `apply_ambient` prepends scope, pins, recall guidance, task-shape hints,
-  completion contracts, and optional workspace-tool guidance.
+- `apply_ambient` prepends scope, scoped pins, an unconditional recall
+  directive, an unconditional task-shape hint, an orchestrator hint when
+  `allow_recursion` is set, an optional completion contract, and an optional
+  workspace-tools appendix when the brofile coerces workspace tools.
 - `apply_brofile_lens` prepends brofile persona text.
 - profile-backed atoms expand `inputs.prompt_template` and then dispatch via a
   brofile.
@@ -74,9 +76,9 @@ Add an optional `context` block to brofiles:
 
 ```json
 {
-  "name": "drone-probe-codex-spark",
+  "name": "drone-probe-codex",
   "provider": "codex",
-  "model": "gpt-5.3-codex-spark",
+  "model": "gpt-5.5",
   "context": {
     "provider_defaults": "suppress_when_supported",
     "harness_markdown": {
@@ -107,21 +109,33 @@ Template source can be one of:
 
 ## Template Resolution
 
-`template_file` resolution is explicit and trust-scoped:
+`template_file` resolution is explicit and trust-scoped. Three roots are
+recognized:
 
-- Absolute paths are allowed only under configured builtin, project, or user
-  prompt roots.
+- `builtin`: shipped templates under `system-defaults/prompts/`. Not
+  configurable; tied to the running daemon binary.
+- `project`: `<project_dir>/.bbox/prompts/`. Resolved from the dispatch's
+  project scope; no env override.
+- `user`: `$XDG_CONFIG_HOME/blackbox/prompts/` by default, overridable via
+  `BLACKBOX_USER_PROMPTS_DIR` (allowlist-style env var, listed in
+  `config.rs`).
+
+Resolution rules:
+
+- Absolute paths are allowed only when they lie under one of the three roots
+  above.
 - Relative paths resolve first under the project root, then under builtin
   system defaults. A `project:` / `builtin:` / `user:` prefix can force a root.
-- Project prompt files should live under `.bbox/prompts/`; builtin templates
-  live under `system-defaults/prompts/`.
 - Paths are unsafe if they escape the selected root, traverse through `..`,
   resolve through a symlink outside the selected root, or are not UTF-8.
 
 `template_ref` resolves through the installed artifact catalog during brofile
-validation or dry-run. Missing refs fail closed. Runtime dispatch may use a
-cached resolved template body/hash from validation, but dry-run must still show
-the ref, source path, trust scope, and content hash.
+validation or dry-run. v1 adds a new `Prompt` variant to `ArtifactKind` in
+`src/artifacts.rs` so prompt templates participate in the same install / list /
+supersede / remove lifecycle as workflows, packets, brofiles, agents, atoms,
+teams, and crons. Missing refs fail closed. Runtime dispatch may use a cached
+resolved template body/hash from validation, but dry-run must still show the
+ref, source path, trust scope, and content hash.
 
 ## Turn Templates
 
@@ -177,6 +191,7 @@ struct PromptRenderContext {
     pins: Option<String>,
     recall_directive: Option<String>,
     task_shape_hint: Option<String>,
+    orchestrator_hint: Option<String>,
     completion_contract: Option<String>,
     workspace_tools_appendix: Option<String>,
     atom: Option<AtomRenderContext>,
@@ -197,17 +212,41 @@ belong in the base context. If a bro needs those, select a brofile whose
 context producer returns them as bounded `template_inputs`.
 
 Dispatch-specific context objects are bounded metadata, not full upstream
-state dumps:
+state dumps. The JSON shape Tera sees is the public contract — locked in v1
+so prompt templates do not break when the underlying runtimes evolve:
 
-- `AtomRenderContext`: present only when dispatch originates from an atom.
-  Includes atom ref, invocation ID when available, implementation kind, and
-  compact input/output schema names.
-- `WorkflowRenderContext`: present only when dispatch originates from a
-  workflow actor node. Includes workflow name/version, arc ID, node ID, actor
-  name, and declared imports/exports. It does not expose the full `ArcContext`
-  or arbitrary `vars`.
-- `AgentRenderContext`: present only when dispatch originates from
-  `bro_agent_dispatch`. Includes agent ref/label and manifest version.
+```rust
+struct AtomRenderContext {
+    atom_ref: String,                 // "atom:context/atom-signposts@v1"
+    invocation_id: Option<String>,
+    implementation_kind: String,      // "deterministic" | "adapter" | "workflow_backed" | "profile"
+    input_schema_name: Option<String>,
+    output_schema_name: Option<String>,
+}
+
+struct WorkflowRenderContext {
+    workflow_name: String,
+    workflow_version: String,
+    arc_id: String,
+    node_id: String,
+    actor_name: String,
+    imports: Vec<String>,             // declared import names only
+    exports: Vec<String>,             // declared export names only
+}
+
+struct AgentRenderContext {
+    agent_ref: String,                // "agent:reviewer/code-review@2"
+    agent_label: Option<String>,
+    manifest_version: String,
+}
+```
+
+`WorkflowRenderContext.imports` / `exports` are name lists, not values; full
+`ArcContext.vars` is never serialized into the render context. `AtomRenderContext`
+exposes schema *names*, not schema bodies. Changing or extending these structs
+in later versions requires versioning the field (e.g. adding fields is
+forward-compatible; removing or repurposing one is a template-break and must
+be coordinated through brofile schema versioning).
 
 If one of these fields is absent, templates see `null`. If richer upstream
 state is needed, it must be summarized by a context producer into
@@ -236,9 +275,9 @@ The producer input is a JSON object:
   "task_id": "task-...",
   "session_id": null,
   "project_dir": "/repo",
-  "brofile_name": "drone-probe-codex-spark",
+  "brofile_name": "drone-probe-codex",
   "provider": "codex",
-  "model": "gpt-5.3-codex-spark"
+  "model": "gpt-5.5"
 }
 ```
 
@@ -255,7 +294,38 @@ The producer output is:
 ```
 
 Dispatch attaches producer `template_inputs` to the render context. The
-producer owns its output schema, caps, warnings, and receipts.
+producer owns its output schema, warnings, and receipts.
+
+Output caps are enforced by dispatch, not by the producer, so a misbehaving
+producer cannot blow out the rendered prompt. v1 defaults:
+
+- 32 KB total across `template_inputs`.
+- 8 KB per top-level key.
+
+Both caps are overridable per turn via optional `context.first_turn.caps` /
+`context.resume_turn.caps` fields. When a cap is exceeded, dispatch truncates
+the offending value, drops it from `template_inputs`, and adds a structured
+warning to the receipt; the template renders without that key.
+
+Producer failure policy is render-without, never fail-closed by default.
+If the producer errors, times out, or returns malformed output, dispatch:
+
+1. logs a `dispatch.context_producer.failure` system event with the producer
+   ref, error, and elapsed time;
+2. emits a warning into the turn receipt;
+3. renders the template with empty `template_inputs`.
+
+Templates are responsible for handling absent inputs (the `{% if %}` guards in
+the examples above show the pattern). A future opt-in `on_failure: fail` knob
+can be added per turn, but the default keeps long-lived bros from getting
+stranded by a flaky producer.
+
+Producer results are not cached in v1. Every first turn invokes the
+first-turn producer; every resume turn invokes the resume-turn producer. v1
+producers are cheap by construction (`atom_search` / `atom_describe` /
+`bbox_knowledge` over local stores); when measured cost justifies it, a
+`(producer_ref@version, input_hash, brofile_hash)` task-scoped cache can be
+added without changing the contract.
 
 Context producers reuse the existing machinery:
 
@@ -287,6 +357,15 @@ through existing adapter/hook machinery, and may use rule packets to select,
 validate, or stop. A future phase can explicitly reopen provider-dispatching
 producers, but ordinary `bro_exec` / `bro_resume` must not silently spawn
 another agent before dispatching the requested bro.
+
+This is enforced mechanically, not by convention. Atoms gain a
+`capabilities: ["context_producer"]` flag in their manifest; the atom registry
+refuses to install or register an atom that combines this capability with a
+profile-backed implementation (the implementation kind that dispatches a
+provider actor). Workflow-backed producers go through the same capability
+check at registration time. Producer resolution at dispatch time then only
+verifies the capability is present and skips the agentic-shape check entirely,
+keeping the hot path simple.
 
 For atom signposting, the reusable producer can be an atom such as
 `atom:context/atom-signposts@v1`. Internally, that atom can call `atom_search`,
@@ -346,6 +425,12 @@ Modes:
 as `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `BLACKBOX.md`, `PROJECT.md`, and
 their `@` includes. It is intentionally separate from template rendering.
 
+For OpenCode/Inception, `harness_markdown` uniformly governs the generated
+opencode `instructions` array — including the current `BLACKBOX.md` entry and
+any future `AGENTS.md`-style entries. `build_opencode_config` filters the
+candidate list through the policy before writing the config; there is no
+secondary mechanism for opencode-specific exemptions.
+
 Fields:
 
 - `policy`: `default`, `suppress_all`, `allow_list`, or `deny_list`.
@@ -375,11 +460,19 @@ the provider reports unsupported suppression rather than pretending to be clean.
 | Copilot | `gh copilot -- -p <prompt>` and `--resume=<session>` | Provider behavior is inherited from Copilot CLI; no suppression control currently wired | Report suppression unsupported until a concrete CLI/config mechanism is verified. |
 | Gemini | `gemini -p <prompt>` and `gemini --resume <session> -p <prompt>` | Gemini CLI default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Gemini controls are verified. MCP tool exclusions are separate tool policy, not markdown suppression. |
 | Vibe | `vibe -p <prompt>` and `vibe --resume <session> -p <prompt>` | Vibe config/default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Vibe controls are verified. |
-| Inception/OpenCode | `opencode run <prompt>` / `opencode run --session <session> <prompt>` | blackbox currently injects `BLACKBOX.md` into generated OpenCode config when present | Move that injection behind `provider_defaults`; dry-run shows whether `BLACKBOX.md` is injected, suppressed, or replaced. |
+| Inception/OpenCode | `opencode run <prompt>` / `opencode run --session <session> <prompt>` | blackbox writes a generated `OPENCODE_CONFIG` file and, when `BLACKBOX.md` exists, lists it in the opencode `instructions` array so opencode merges it into the system prompt | Move the `instructions` write behind `provider_defaults`; dry-run shows whether `BLACKBOX.md` is included, suppressed, or replaced in the `instructions` array. |
 
 `suppress_when_supported` is therefore best-effort and warning-heavy. It must
 not pretend unsupported providers are clean. `strict_suppress` fails closed on
 any provider without a verified mechanism.
+
+The v1 deliverable for Phase 2 is the schema plus the report-and-warn
+behavior. Codex and OpenCode/Inception ship as enforcing providers (the
+former via verified CLI/config controls, the latter via the `instructions`
+array). Every other provider accepts the policy field, but dry-run reports
+it as `unsupported_suppression` and dispatch logs a warning at launch.
+Wiring additional providers as enforcing is a follow-up patch per provider,
+not a phase gate.
 
 ## Existing Layers As Templates
 
@@ -389,6 +482,7 @@ Current ambient sections become template variables or built-in partials:
 - `pins`
 - `recall_directive`
 - `task_shape_hint`
+- `orchestrator_hint` (currently emitted only when `allow_recursion` is set)
 - `completion_contract`
 - `workspace_tools_appendix`
 - `lens`
@@ -451,11 +545,25 @@ the current brofile policy instead of persisting a blackbox-owned session
 context object. Pinning old template behavior can be added later if operators
 actually need it, but it is not part of v1.
 
+To make brofile drift visible without inventing a pinning mechanism, every
+dispatch emits a `dispatch.template_resolved` system event with the brofile
+name, brofile version, resolved template ref (or inline-hash for literal
+templates), template content hash, and producer ref/version. A long-lived bro
+whose brofile is edited mid-arc therefore shows a clear event boundary on the
+first turn that picks up the new policy.
+
 ## Atoms And Workflows
 
 Profile-backed atoms already render atom input into a prompt and dispatch via a
 brofile. Under this design, the atom prompt becomes the `prompt` input to the
 brofile's first-turn template.
+
+Atom `inputs.prompt_template` keeps its existing simple-placeholder grammar:
+`{{name}}` references resolve against the atom's declared input schema and are
+validated by `validate_prompt_template` in `src/orchestration/atoms/validate.rs`.
+That grammar is intentionally distinct from the Tera grammar used by brofile
+turn templates — atom inputs render to a `prompt` string, and the brofile
+template then composes that string with scope, pins, lens, and template inputs.
 
 Workflow actor nodes already render `NodeSpec.prompt` from `ArcContext`. That
 rendered node prompt becomes the `prompt` input to the actor brofile's first or
@@ -526,27 +634,48 @@ to shipped templates, project refs resolve only within the current project, and
 user refs resolve only within configured user prompt roots. Do not make prompt
 templates a new agent/atom execution surface. They are text renderers.
 
+v1 adds a `Prompt` variant to the `ArtifactKind` enum in `src/artifacts.rs`
+(currently `Workflow`, `Packet`, `Brofile`, `Agent`, `Atom`, `Team`, `Cron`).
+Prompt templates participate in the same install / list / supersede / remove
+lifecycle as other artifacts so `template_ref` has a real backing catalog
+entry; resolution does not depend on filesystem layout alone.
+
 ## Migration Plan
 
 ### Phase 1: Template Renderer
 
-- Add brofile `context` schema.
-- Add Tera rendering for `first_turn` and `resume_turn`.
-- Add plain `.tera` prompt file loading with trust-scoped path/ref resolution.
+- Add brofile `context` schema (the `Brofile` struct in
+  `src/orchestration/brofile.rs` has no `context` field today).
+- Add a `Prompt` variant to `ArtifactKind` in `src/artifacts.rs` with the
+  standard install / list / supersede / remove plumbing.
+- Add Tera rendering for `first_turn` and `resume_turn` using the existing
+  `src/template.rs` helper.
+- Add plain `.tera` prompt file loading with trust-scoped path/ref resolution
+  using the builtin / project / user roots defined above.
 - Add `context_producer` references on turn templates. Producers are atoms or
   workflows, not inline brofile lookup declarations.
-- Add the non-agentic context-producer invocation contract and output schema.
-- Provide built-in template refs for legacy full behavior and minimal drone
-  behavior.
+- Add the non-agentic context-producer invocation contract, output schema,
+  and the `capabilities: ["context_producer"]` registry check.
+- Ship built-in legacy templates (`builtin:prompts/legacy-full@v1` and
+  `builtin:prompts/legacy-resume@v1`) reproducing the current
+  `apply_ambient` + `apply_brofile_lens` output. When a brofile has no
+  `context` block, the renderer resolves to those refs — there is one render
+  path, not two. The Phase 4 cleanup then has nothing to remove beyond the
+  Rust helpers themselves.
+- Ship a minimal drone template ref for lightweight executor brofiles.
+- Lock the `PromptRenderContext` / `AtomRenderContext` / `WorkflowRenderContext`
+  / `AgentRenderContext` JSON shapes as serde structs; field additions are
+  forward-compatible, removals require brofile schema version bumps.
 - Add `bro_context(action="dry_run")`.
-- Keep legacy behavior when no `context` block is present.
 
 ### Phase 2: Provider Defaults
 
 - Add provider-default suppression modes.
 - Add harness markdown file-level policy parsing and dry-run reporting.
 - Start by verifying and wiring the installed Codex CLI controls.
-- Move OpenCode `BLACKBOX.md` injection behind provider-default policy.
+- Move the OpenCode generated-config `instructions` array (currently always
+  including `BLACKBOX.md` when it exists, via `build_opencode_config`) behind
+  provider-default policy so suppression and replacement are explicit.
 - Report unsupported suppression in dry-run and dispatch warnings.
 
 ### Phase 3: Dispatch Integration
@@ -555,6 +684,13 @@ templates a new agent/atom execution surface. They are text renderers.
 - Route profile-backed atom dispatch through the target brofile template.
 - Route workflow executor/ensemble dispatch through actor brofile templates.
 - Fix broadcast resume inconsistency as part of this integration.
+- Add a regression test asserting that recursion-guard filters from
+  `resolve_dispatch_filters` appear in argv for both fresh and resumed
+  broadcast members. The textual ambient layer moving into a template must
+  not silently lift the mechanical guard.
+- Emit a `dispatch.template_resolved` system event per turn carrying brofile
+  name/version, template ref/hash, and producer ref/version, so brofile
+  drift mid-arc is visible in the event log.
 
 ### Phase 4: Cleanup
 
