@@ -13,7 +13,8 @@
     ],
     "anti_patterns": [
       "do not use on static methods — Method Object is an instance-method pattern; use a static factory class refactor instead",
-      "do not use on methods that touch enclosing state — v1 flags this/super references with FIXME comments; resolve them or lift state to parameters before re-running",
+      "do not use on methods that mutate enclosing fields — planner refuses with mutated_enclosing_field; refactor to return the new value instead",
+      "do not use on methods that call other enclosing-class methods receiverlessly — planner refuses; inline helpers first (java-inline-method) or thread them as params",
       "do not use on constructors — that needs a separate factory-class refactor"
     ],
     "inputs": {

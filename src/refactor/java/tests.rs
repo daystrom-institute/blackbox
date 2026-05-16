@@ -9311,7 +9311,11 @@ fn convert_method_to_class_default_class_name_derived_from_method() {
 }
 
 #[test]
-fn convert_method_to_class_flags_this_references_with_fixme() {
+fn convert_method_to_class_refuses_mutated_enclosing_field() {
+    // v2 behavior: rather than emit FIXMEs (which produces broken code
+    // that the operator has to hand-fix), the planner refuses with a
+    // clear operator-actionable error when the body mutates an
+    // enclosing-class field.
     let dir = tempfile::tempdir().unwrap();
     let source = dir.path().join("Has.java");
     let target = dir.path().join("PrintOperation.java");
@@ -9331,15 +9335,162 @@ fn convert_method_to_class_flags_this_references_with_fixme() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("print".to_string());
     params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(
+        err.contains("mutated_enclosing_field(counter)"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_captures_read_only_enclosing_field() {
+    // Read-only field accesses get threaded through the constructor.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Read.java");
+    let target = dir.path().join("EmitOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Read {\n\
+         \x20   private int counter;\n\
+         \x20   public int emit() {\n\
+         \x20       return this.counter + 1;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("emit".to_string());
+    params.target = Some(path_string(&target));
     let plan: RefactorPlan =
         serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
     let target_text = plan.edits[1].new_text.as_deref().unwrap();
     assert!(
-        target_text.contains("FIXME(method-object)"),
-        "FIXME header expected: {target_text}"
+        target_text.contains("private final int counter;"),
+        "MO field for counter: {target_text}"
     );
-    assert_eq!(plan.fixme_count.as_ref().unwrap().warning, 2);
-    assert!(!plan.leftovers.is_empty(), "leftovers documents the this refs");
+    assert!(
+        target_text.contains("public EmitOperation(int counter)"),
+        "MO ctor with counter: {target_text}"
+    );
+    // `this.counter` rewritten to bare `counter` (now a field on MO).
+    assert!(
+        target_text.contains("return counter + 1;"),
+        "body rewrite: {target_text}"
+    );
+    // Source-side delegate passes `this.counter` to the constructor.
+    let source_edit = &plan.edits[0].edits[0].replacement;
+    assert!(
+        source_edit.contains("new EmitOperation(this.counter).execute()"),
+        "delegate: {source_edit}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_refuses_enclosing_method_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Calls.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Calls {\n\
+         \x20   private void helper() {}\n\
+         \x20   public void run() {\n\
+         \x20       helper();\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("enclosing_method_call(helper)"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_super_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Sup.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Sup extends Object {\n\
+         \x20   public String run() {\n\
+         \x20       return super.toString();\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("super_reference"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_bare_this_value() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Self.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Self {\n\
+         \x20   public boolean run(Self other) {\n\
+         \x20       return this == other;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("bare_this_reference"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_captures_bare_field_reference() {
+    // Bare `counter` (without `this.`) referring to an enclosing field
+    // gets captured the same way as `this.counter`.
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Bare.java");
+    let target = dir.path().join("EmitOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Bare {\n\
+         \x20   private int counter;\n\
+         \x20   public int emit() {\n\
+         \x20       return counter + 1;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("emit".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("private final int counter;"),
+        "MO field: {target_text}"
+    );
+    let source_edit = &plan.edits[0].edits[0].replacement;
+    assert!(
+        source_edit.contains("new EmitOperation(this.counter).execute()"),
+        "delegate: {source_edit}"
+    );
 }
 
 #[test]
