@@ -461,6 +461,116 @@
         "expected_block_reason_substring": "external"
       },
       "done_note_required": true
+    },
+    {
+      "atom": "java-prune-orphans",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:prune_java_orphans",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-extract-code-block",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_code_block_to_method",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-convert-method-to-class",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:convert_method_to_class",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-inline-method",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:inline_java_method",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-extract-test-slice",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_test_slice",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-collapse-call-chain",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_collapse_call_chain",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-migrate-method-receiver",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:migrate_java_method_receiver",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-split-provider",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_split_provider",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-migrate-static-holder",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:replace_java_static_reference",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-singletonify-static-util",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:replace_java_static_reference",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-replace-vaadin-static-lookup",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:replace_java_static_reference",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

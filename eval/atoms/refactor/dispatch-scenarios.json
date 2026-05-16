@@ -619,6 +619,174 @@
         "target_file",
         "dependency_warnings"
       ]
+    },
+    {
+      "id": "dispatch-java-prune-orphans-planonly",
+      "atom": "java-prune-orphans",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "pruned_count",
+        "leftover_count"
+      ]
+    },
+    {
+      "id": "dispatch-java-extract-code-block-planonly",
+      "atom": "java-extract-code-block",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "old_text": "System.out.println(\"hi\");",
+        "module_name": "greet",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "helper_name",
+        "enclosing_method"
+      ]
+    },
+    {
+      "id": "dispatch-java-convert-method-to-class-planonly",
+      "atom": "java-convert-method-to-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "module_name": "process",
+        "target": "src/main/java/com/example/ProcessOperation.java",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "class_name"
+      ]
+    },
+    {
+      "id": "dispatch-java-inline-method-planonly",
+      "atom": "java-inline-method",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "module_name": "normalize",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "call_sites_inlined"
+      ]
+    },
+    {
+      "id": "dispatch-java-extract-test-slice-planonly",
+      "atom": "java-extract-test-slice",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/test/java/com/example/UtilitySourceTest.java",
+        "target": "src/test/java/com/example/UtilityTargetTest.java",
+        "item_names": ["normalize"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "migrated_tests"
+      ]
+    },
+    {
+      "id": "dispatch-java-collapse-call-chain-planonly",
+      "atom": "java-collapse-call-chain",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "SessionData",
+        "module_name": "getAuthLogRecord.getAuthLogId",
+        "new_text": "getAuthLogId",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "chains_collapsed"
+      ]
+    },
+    {
+      "id": "dispatch-java-migrate-method-receiver-planonly",
+      "atom": "java-migrate-method-receiver",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "delegate_field": "sessionData",
+        "new_text": "authz",
+        "item_names": ["isAuthorized"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "call_sites_rewritten"
+      ]
+    },
+    {
+      "id": "dispatch-java-split-provider-planonly",
+      "atom": "java-split-provider",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "delegate_field": "sessionDataProvider",
+        "getter_mapping": { "getAuthLogRecord": "authLogProvider" },
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "call_sites_rewritten"
+      ]
+    },
+    {
+      "id": "dispatch-java-migrate-static-holder-planonly",
+      "atom": "java-migrate-static-holder",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "ProductionDayColumns",
+        "new_text": "siteAdminProvider.get()",
+        "item_names": ["SITE_ADMIN"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "readers_rewritten"
+      ]
+    },
+    {
+      "id": "dispatch-java-singletonify-static-util-planonly",
+      "atom": "java-singletonify-static-util",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "UIUtils",
+        "new_text": "uiUtilsProvider.get()",
+        "item_names": ["formatName"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "callers_rewritten"
+      ]
+    },
+    {
+      "id": "dispatch-java-replace-vaadin-static-lookup-planonly",
+      "atom": "java-replace-vaadin-static-lookup",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "UI",
+        "new_text": "uiProvider.get()",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "lookups_rewritten"
+      ]
     }
   ]
 }

@@ -1353,6 +1353,15 @@ mod tests {
             "java_class_dependency_analysis",
             "java_public_api_guard",
             "java_lsp_organize_imports",
+            "prune_java_orphans",
+            "extract_java_code_block_to_method",
+            "convert_method_to_class",
+            "inline_java_method",
+            "extract_java_test_slice",
+            "java_collapse_call_chain",
+            "migrate_java_method_receiver",
+            "java_split_provider",
+            "replace_java_static_reference",
         ];
 
         for kind in java_plan_kinds {

@@ -267,6 +267,94 @@
         "java-extract-methods-light"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-prune-orphans",
+      "query": "delete unused private java methods fields and inner classes",
+      "expected_atoms": [
+        "java-prune-orphans"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-code-block",
+      "query": "extract a block of java statements out of a method body into a new private helper",
+      "expected_atoms": [
+        "java-extract-code-block"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-convert-method-to-class",
+      "query": "convert a java method to a method object class with execute and constructor fields",
+      "expected_atoms": [
+        "java-convert-method-to-class"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-inline-method",
+      "query": "inline a private java method into its call sites and delete the declaration",
+      "expected_atoms": [
+        "java-inline-method"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-test-slice",
+      "query": "migrate junit test methods to a new test class after extracting a production class",
+      "expected_atoms": [
+        "java-extract-test-slice"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-collapse-call-chain",
+      "query": "collapse verbose getter chain into convenience accessor on java receiver",
+      "expected_atoms": [
+        "java-collapse-call-chain"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-migrate-method-receiver",
+      "query": "rewrite java method receivers from old holder field to new holder field after extracting a class",
+      "expected_atoms": [
+        "java-migrate-method-receiver"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-split-provider",
+      "query": "split a guice or jakarta Provider field on a java class into typed providers across call sites",
+      "expected_atoms": [
+        "java-split-provider"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-migrate-static-holder",
+      "query": "rewrite readers of a public static final holder field to an injected provider expression",
+      "expected_atoms": [
+        "java-migrate-static-holder"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-singletonify-static-util",
+      "query": "rewrite callers of a java Util class static method to an injected provider singleton",
+      "expected_atoms": [
+        "java-singletonify-static-util"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-replace-vaadin-static-lookup",
+      "query": "replace vaadin ui getCurrent or vaadinSession getCurrent with injected provider",
+      "expected_atoms": [
+        "java-replace-vaadin-static-lookup"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

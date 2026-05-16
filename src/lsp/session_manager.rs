@@ -72,6 +72,7 @@ struct Config {
     idle_timeout: Duration,
     request_timeout: Duration,
     jdtls_init_timeout: Duration,
+    jdtls_ready_timeout: Duration,
     rust_analyzer_init_timeout: Duration,
     jdtls_bin: Option<String>,
     rust_analyzer_bin: Option<String>,
@@ -84,6 +85,10 @@ impl Default for Config {
             request_timeout: Duration::from_secs(env_u64("BLACKBOX_JDTLS_TIMEOUT_SECS", 30)),
             jdtls_init_timeout: Duration::from_secs(env_u64(
                 "BLACKBOX_JDTLS_INIT_TIMEOUT_SECS",
+                60,
+            )),
+            jdtls_ready_timeout: Duration::from_secs(env_u64(
+                "BLACKBOX_JDTLS_READY_TIMEOUT_SECS",
                 60,
             )),
             rust_analyzer_init_timeout: Duration::from_secs(env_u64(
@@ -106,6 +111,7 @@ impl Config {
             idle_timeout: Duration::from_secs(cfg.idle_timeout_secs),
             request_timeout: Duration::from_secs(cfg.request_timeout_secs),
             jdtls_init_timeout: Duration::from_secs(cfg.jdtls_init_timeout_secs),
+            jdtls_ready_timeout: Duration::from_secs(cfg.jdtls_ready_timeout_secs),
             rust_analyzer_init_timeout: Duration::from_secs(cfg.rust_analyzer_init_timeout_secs),
             jdtls_bin: cfg.jdtls_bin.clone(),
             rust_analyzer_bin: cfg.rust_analyzer_bin.clone(),
@@ -497,12 +503,98 @@ fn spawn_session(key: &SessionKey, config: &Config) -> Result<Session> {
             Duration::from_secs(env_u64("BLACKBOX_RUST_ANALYZER_READY_TIMEOUT_SECS", 30));
         wait_for_rust_analyzer_ready(&mut session, ready_timeout);
     }
+    if matches!(key.language, Language::Java) {
+        // JDTLS's `initialize` returns immediately, then performs gradle /
+        // maven / Buildship workspace import asynchronously. The
+        // `initialized` notification fires before any project class is
+        // loaded — organize-imports, references, and goto-definition all
+        // degrade silently on the cold workspace (no classpath ⇒ JDTLS
+        // can't tell whether a static import is used, returns empty edits
+        // or, worse, edits with broken boundary whitespace because its
+        // import-block computation has no real types to align against).
+        //
+        // Drain notifications until JDTLS reports `language/status { type:
+        // "Started" }` (Eclipse JDT.LS workspace-ready signal) or a
+        // Buildship `language/eventNotification` with `eventType == 100`
+        // (gradle project import complete). Bounded by
+        // BLACKBOX_JDTLS_READY_TIMEOUT_SECS (default 60s — gradle imports
+        // can be slow); on timeout we proceed and let the caller see the
+        // degraded behavior, matching the rust-analyzer policy.
+        wait_for_jdtls_ready(&mut session, config.jdtls_ready_timeout);
+    }
     tracing::info!(
         project = %key.project_root.display(),
         language = ?key.language,
         "spawned + initialized LSP session"
     );
     Ok(session)
+}
+
+/// Classify a JDT.LS server notification as a workspace-ready signal.
+/// Two accepted shapes (both observed in production Eclipse JDT.LS +
+/// Buildship installations):
+///
+/// - `language/status` with `params.type == "Started"` or
+///   `"ServiceReady"` — emitted once after Eclipse JDT.LS finishes
+///   bootstrapping the workspace and all registered projects.
+/// - `language/eventNotification` with `params.eventType == 100` —
+///   Buildship-specific signal that a Gradle project import finished.
+///
+/// Anything else (`window/showMessage`, `$/progress`, `language/status`
+/// with `type == "Starting"` or `"Error"`, etc.) is noise for ready-wait
+/// purposes and is ignored.
+fn is_jdtls_ready_notification(value: &Value) -> bool {
+    let method = value.get("method").and_then(Value::as_str).unwrap_or("");
+    match method {
+        "language/status" => {
+            let status_type = value
+                .get("params")
+                .and_then(|p| p.get("type"))
+                .and_then(Value::as_str);
+            matches!(status_type, Some("Started" | "ServiceReady"))
+        }
+        "language/eventNotification" => {
+            let event_type = value
+                .get("params")
+                .and_then(|p| p.get("eventType"))
+                .and_then(Value::as_u64);
+            event_type == Some(100)
+        }
+        _ => false,
+    }
+}
+
+/// Block until JDTLS signals it has finished workspace import (or until
+/// `timeout` elapses). Stashes any responses-by-id encountered along the
+/// way into `session.pending` so a subsequent `read_response` call won't
+/// lose them. See `is_jdtls_ready_notification` for the accepted ready
+/// signals.
+fn wait_for_jdtls_ready(session: &mut Session, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            tracing::debug!("JDTLS didn't signal ready within {timeout:?}; proceeding");
+            return;
+        }
+        let value = match read_message(&mut session.reader) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::debug!("JDTLS ready-wait read error: {e}");
+                return;
+            }
+        };
+        if let Some(other) = value.get("id").and_then(Value::as_u64) {
+            // Server-sent response to a request we made — stash it for the
+            // matching caller.
+            session.pending.insert(other, value);
+            continue;
+        }
+        if is_jdtls_ready_notification(&value) {
+            tracing::debug!("JDTLS reported workspace ready");
+            return;
+        }
+    }
 }
 
 /// Block until rust-analyzer signals it has finished workspace indexing
@@ -728,6 +820,104 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let res = m.with_session::<_, ()>(dir.path(), Language::Java, |_| Ok(()));
         assert!(res.is_err());
+    }
+
+    #[test]
+    fn jdtls_ready_notification_accepts_language_status_started() {
+        let value = serde_json::json!({
+            "method": "language/status",
+            "params": { "type": "Started", "message": "Ready" }
+        });
+        assert!(is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_accepts_language_status_service_ready() {
+        let value = serde_json::json!({
+            "method": "language/status",
+            "params": { "type": "ServiceReady" }
+        });
+        assert!(is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_accepts_buildship_event_type_100() {
+        let value = serde_json::json!({
+            "method": "language/eventNotification",
+            "params": { "eventType": 100, "data": "project imported" }
+        });
+        assert!(is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_rejects_language_status_starting() {
+        let value = serde_json::json!({
+            "method": "language/status",
+            "params": { "type": "Starting" }
+        });
+        assert!(!is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_rejects_language_status_error() {
+        let value = serde_json::json!({
+            "method": "language/status",
+            "params": { "type": "Error", "message": "could not import gradle" }
+        });
+        assert!(!is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_rejects_buildship_other_event_types() {
+        let value = serde_json::json!({
+            "method": "language/eventNotification",
+            "params": { "eventType": 200 }
+        });
+        assert!(!is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_rejects_window_show_message() {
+        let value = serde_json::json!({
+            "method": "window/showMessage",
+            "params": { "type": 3, "message": "JDTLS started" }
+        });
+        assert!(!is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_rejects_progress() {
+        let value = serde_json::json!({
+            "method": "$/progress",
+            "params": { "token": "abc", "value": { "kind": "report" } }
+        });
+        assert!(!is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_notification_rejects_request_responses() {
+        let value = serde_json::json!({
+            "id": 42,
+            "result": { "ok": true }
+        });
+        assert!(!is_jdtls_ready_notification(&value));
+    }
+
+    #[test]
+    fn jdtls_ready_timeout_env_override_is_picked_up() {
+        let _guard = blackbox::util::test_env_lock();
+        let orig = std::env::var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS").ok();
+        unsafe {
+            std::env::set_var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS", "12");
+        }
+        let config = Config::default();
+        assert_eq!(config.jdtls_ready_timeout, Duration::from_secs(12));
+        unsafe {
+            std::env::remove_var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS");
+        }
+        if let Some(v) = orig {
+            unsafe { std::env::set_var("BLACKBOX_JDTLS_READY_TIMEOUT_SECS", v) };
+        }
     }
 
     #[test]

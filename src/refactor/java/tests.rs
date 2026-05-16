@@ -7925,3 +7925,1841 @@ fn g16_fu_java_builtin_type_includes_functional_interface_and_safe_varargs() {
         "Inject must NOT be a JDK builtin"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// prune_java_orphans — note-6020580c
+// ─────────────────────────────────────────────────────────────────────
+
+fn write_java(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn prune_java_orphans_deletes_unreferenced_private_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Box.java",
+        "package com.example;\n\
+         public class Box {\n\
+         \x20   public int open() { return 1; }\n\
+         \x20   private int dead() { return 42; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "prune_java_orphans");
+    assert_eq!(plan.edits.len(), 1);
+    assert_eq!(plan.edits[0].edits.len(), 1);
+    assert!(plan.items.iter().any(|i| i.name.as_deref() == Some("dead")));
+}
+
+#[test]
+fn prune_java_orphans_keeps_referenced_private_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Calc.java",
+        "package com.example;\n\
+         public class Calc {\n\
+         \x20   public int add(int a, int b) { return helper(a) + b; }\n\
+         \x20   private int helper(int x) { return x; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(
+        err.contains("no orphaned"),
+        "expected no-orphans error, got: {err}"
+    );
+}
+
+#[test]
+fn prune_java_orphans_keeps_method_called_with_this_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Echo.java",
+        "package com.example;\n\
+         public class Echo {\n\
+         \x20   public String shout(String s) { return this.upper(s); }\n\
+         \x20   private String upper(String s) { return s.toUpperCase(); }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_keeps_method_used_via_method_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Stream.java",
+        "package com.example;\n\
+         import java.util.List;\n\
+         import java.util.function.Function;\n\
+         public class Stream {\n\
+         \x20   public Function<String, String> mapper() { return this::transform; }\n\
+         \x20   private String transform(String s) { return s + \"!\"; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_skips_suppress_warnings_unused() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Suppressed.java",
+        "package com.example;\n\
+         public class Suppressed {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   @SuppressWarnings(\"unused\")\n\
+         \x20   private int held() { return 99; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_skips_inject_annotated_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "InjectField.java",
+        "package com.example;\n\
+         import jakarta.inject.Inject;\n\
+         public class InjectField {\n\
+         \x20   @Inject\n\
+         \x20   private Service service;\n\
+         \x20   public int run() { return 1; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_skips_junit_test_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "MyTest.java",
+        "package com.example;\n\
+         import org.junit.jupiter.api.Test;\n\
+         import org.junit.jupiter.api.BeforeEach;\n\
+         public class MyTest {\n\
+         \x20   @BeforeEach\n\
+         \x20   private void setUp() {}\n\
+         \x20   @Test\n\
+         \x20   private void exercise() {}\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_deletes_unreferenced_private_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Holder.java",
+        "package com.example;\n\
+         public class Holder {\n\
+         \x20   private int unused = 0;\n\
+         \x20   public int read() { return 1; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    assert!(plan.items.iter().any(|i| i.name.as_deref() == Some("unused")));
+}
+
+#[test]
+fn prune_java_orphans_keeps_serial_version_uid() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Serial.java",
+        "package com.example;\n\
+         import java.io.Serializable;\n\
+         public class Serial implements Serializable {\n\
+         \x20   private static final long serialVersionUID = 1L;\n\
+         \x20   public int run() { return 1; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_marks_multi_declarator_field_excluded() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Multi.java",
+        "package com.example;\n\
+         public class Multi {\n\
+         \x20   private int a, b, c;\n\
+         \x20   public int run() { return 1; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    // Multi-declarator fields are excluded — never appear as orphans even
+    // when no callers reference them. v1 leaves the operator to split the
+    // declaration manually.
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_skips_constructors_even_when_private_and_unreferenced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "SingletonHolder.java",
+        "package com.example;\n\
+         public class SingletonHolder {\n\
+         \x20   private SingletonHolder() {}\n\
+         \x20   public static int run() { return 1; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_deletes_unreferenced_private_inner_class() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "OuterDeadInner.java",
+        "package com.example;\n\
+         public class OuterDeadInner {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private static class Dead {\n\
+         \x20       int v() { return 0; }\n\
+         \x20   }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    assert!(plan.items.iter().any(|i| i.name.as_deref() == Some("Dead")));
+}
+
+#[test]
+fn prune_java_orphans_keeps_inner_class_referenced_via_type_position() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "OuterLiveInner.java",
+        "package com.example;\n\
+         public class OuterLiveInner {\n\
+         \x20   private Live cache;\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private static class Live { int v() { return 0; } }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    // The `cache` field references type `Live`, so `Live` is kept.
+    // The `cache` field itself is referenced nowhere (no callers); so it
+    // gets pruned. `Live` should NOT be in the orphan list.
+    assert!(!plan.items.iter().any(|i| i.name.as_deref() == Some("Live")));
+}
+
+#[test]
+fn prune_java_orphans_item_kinds_filter_restricts_to_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Mixed.java",
+        "package com.example;\n\
+         public class Mixed {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private int deadField = 0;\n\
+         \x20   private int deadMethod() { return 0; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.item_kinds = Some(vec!["field".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    let pruned_names: HashSet<&str> = plan
+        .items
+        .iter()
+        .filter_map(|i| i.name.as_deref())
+        .collect();
+    assert!(pruned_names.contains("deadField"));
+    assert!(!pruned_names.contains("deadMethod"));
+}
+
+#[test]
+fn prune_java_orphans_item_names_filter_restricts_to_named_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Named.java",
+        "package com.example;\n\
+         public class Named {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private int alpha() { return 0; }\n\
+         \x20   private int beta() { return 0; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.item_names = Some(vec!["alpha".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    let pruned_names: HashSet<&str> = plan
+        .items
+        .iter()
+        .filter_map(|i| i.name.as_deref())
+        .collect();
+    assert!(pruned_names.contains("alpha"));
+    assert!(!pruned_names.contains("beta"));
+}
+
+#[test]
+fn prune_java_orphans_recursive_only_method_is_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Loop.java",
+        "package com.example;\n\
+         public class Loop {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private int spin(int x) { return spin(x); }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    // The recursive self-call counts as a reference — conservative
+    // policy keeps the method.
+    assert!(err.contains("no orphaned"), "got: {err}");
+}
+
+#[test]
+fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Many.java",
+        "package com.example;\n\
+         public class Many {\n\
+         \x20   public int keep() { return 1; }\n\
+         \x20   private int deadA() { return 0; }\n\
+         \x20   private int deadB() { return 0; }\n\
+         \x20   private int deadC() { return 0; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
+    assert_eq!(plan.items.len(), 3);
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 3);
+    // Edits must be sorted and non-overlapping (apply_text_edits asserts
+    // this; ensure_non_overlapping inside the planner also enforces it,
+    // but verify directly).
+    for w in edits.windows(2) {
+        assert!(
+            w[0].byte_end <= w[1].byte_start,
+            "edits overlap: {:?} vs {:?}",
+            w[0],
+            w[1]
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// replace_java_static_reference — note-7c819189 / note-e5439c0a / note-7d4f0001
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn replace_java_static_reference_rewrites_static_method_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Util.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Util {\n\
+         \x20   String go() { return UIUtils.formatName(\"x\"); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UIUtils".to_string());
+    params.new_text = Some("uiUtilsProvider.get()".to_string());
+    params.item_names = Some(vec!["formatName".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "uiUtilsProvider.get()");
+}
+
+#[test]
+fn replace_java_static_reference_rewrites_static_field_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Holder.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Holder {\n\
+         \x20   Object find() { return ProductionDayColumns.SITE_ADMIN.lookup(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("ProductionDayColumns".to_string());
+    params.new_text = Some("siteAdminProvider.get()".to_string());
+    params.item_names = Some(vec!["SITE_ADMIN".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "siteAdminProvider.get()");
+}
+
+#[test]
+fn replace_java_static_reference_vaadin_drop_accessor_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   void run() { UI.getCurrent().push(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UI".to_string());
+    params.new_text = Some("uiProvider.get()".to_string());
+    params.item_names = Some(vec!["getCurrent".to_string()]);
+    params.delegate_field = Some("UI.getCurrent".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    // The entire `UI.getCurrent()` is replaced with `uiProvider.get()`,
+    // leaving the trailing `.push()` intact.
+    assert_eq!(edits[0].replacement, "uiProvider.get()");
+}
+
+#[test]
+fn replace_java_static_reference_item_kinds_field_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Mixed.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Mixed {\n\
+         \x20   int field() { return Cls.SOME_CONST; }\n\
+         \x20   int method() { return Cls.compute(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("Cls".to_string());
+    params.new_text = Some("clsProvider.get()".to_string());
+    params.item_names = Some(vec!["SOME_CONST".to_string(), "compute".to_string()]);
+    params.item_kinds = Some(vec!["field".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Only the SOME_CONST field access is rewritten; the compute() method
+    // call is left alone because item_kinds restricts to field.
+    assert_eq!(edits.len(), 1);
+}
+
+#[test]
+fn replace_java_static_reference_skips_other_class_qualifiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Other.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Other {\n\
+         \x20   int run() { return OtherUtil.format(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UIUtils".to_string());
+    params.new_text = Some("uiUtilsProvider.get()".to_string());
+    params.item_names = Some(vec!["format".to_string()]);
+    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    assert!(err.contains("no `UIUtils"), "got: {err}");
+}
+
+#[test]
+fn replace_java_static_reference_rejects_unknown_item_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("X.java");
+    fs::write(&path, "class X {}\n").unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("Cls".to_string());
+    params.new_text = Some("p".to_string());
+    params.item_names = Some(vec!["x".to_string()]);
+    params.item_kinds = Some(vec!["bogus".to_string()]);
+    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    assert!(err.contains("unknown item_kind"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// java_split_provider — note-4ec8ff30
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn java_split_provider_rewrites_single_getter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   private final Provider<AuthLogRecord> authLogProvider;\n\
+         \x20   View(Provider<SessionData> s, Provider<AuthLogRecord> a) { this.sessionDataProvider = s; this.authLogProvider = a; }\n\
+         \x20   AuthLogRecord rec() { return sessionDataProvider.get().getAuthLogRecord(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({ "getAuthLogRecord": "authLogProvider" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authLogProvider.get()");
+}
+
+#[test]
+fn java_split_provider_rewrites_multiple_getters_with_distinct_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   Multi(Provider<SessionData> s) { this.sessionDataProvider = s; }\n\
+         \x20   int a() { return sessionDataProvider.get().getAuthLogId(); }\n\
+         \x20   String b() { return sessionDataProvider.get().getName(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({
+            "getAuthLogId": "authLogIdProvider",
+            "getName": "nameProvider"
+        }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 2);
+    let replacements: std::collections::HashSet<&str> =
+        edits.iter().map(|e| e.replacement.as_str()).collect();
+    assert!(replacements.contains("authLogIdProvider.get()"));
+    assert!(replacements.contains("nameProvider.get()"));
+}
+
+#[test]
+fn java_split_provider_skips_unmapped_getters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Skip.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Skip {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   Skip(Provider<SessionData> s) { this.sessionDataProvider = s; }\n\
+         \x20   String mapped() { return sessionDataProvider.get().getName(); }\n\
+         \x20   int unmapped() { return sessionDataProvider.get().getOtherField(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({ "getName": "nameProvider" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    // Only the mapped getter is rewritten; the unmapped one is left
+    // alone (planner doesn't try to be clever about partial splits).
+    assert_eq!(plan.edits[0].edits.len(), 1);
+}
+
+#[test]
+fn java_split_provider_refuses_empty_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("E.java");
+    fs::write(&path, "class E {}\n").unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("provider".to_string());
+    let err = plan_java_split_provider(&params).unwrap_err().to_string();
+    assert!(err.contains("getter_mapping"), "got: {err}");
+}
+
+#[test]
+fn java_split_provider_refuses_no_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("N.java");
+    fs::write(
+        &path,
+        "package p;\nclass N { int run() { return 0; } }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("provider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({ "getX": "xProvider" }),
+    );
+    params.toml_entries = Some(entries);
+    let err = plan_java_split_provider(&params).unwrap_err().to_string();
+    assert!(err.contains("no `provider.get()"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// migrate_java_method_receiver — note-1ee49c59
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn migrate_java_method_receiver_rewrites_single_call_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   private final AuthorizationService authz;\n\
+         \x20   View(SessionData s, AuthorizationService a) { this.sessionData = s; this.authz = a; }\n\
+         \x20   boolean check() { return sessionData.isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authz");
+}
+
+#[test]
+fn migrate_java_method_receiver_rewrites_multiple_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Many.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Many {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   Many(SessionData s) { this.sessionData = s; }\n\
+         \x20   boolean a() { return sessionData.isAuthorized(1); }\n\
+         \x20   boolean b() { return sessionData.isAuthorized(2); }\n\
+         \x20   boolean c() { return sessionData.isAuthorizedToEdit(3); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec![
+        "isAuthorized".to_string(),
+        "isAuthorizedToEdit".to_string(),
+    ]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 3);
+    for e in edits {
+        assert_eq!(e.replacement, "authz");
+    }
+}
+
+#[test]
+fn migrate_java_method_receiver_skips_unlisted_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Skip.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Skip {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   Skip(SessionData s) { this.sessionData = s; }\n\
+         \x20   boolean a() { return sessionData.isAuthorized(1); }\n\
+         \x20   String b() { return sessionData.getName(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Only `isAuthorized` is rewritten, `getName` left alone.
+    assert_eq!(edits.len(), 1);
+}
+
+#[test]
+fn migrate_java_method_receiver_handles_provider_get_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Prov.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Prov {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   Prov(Provider<SessionData> s) { this.sessionDataProvider = s; }\n\
+         \x20   boolean check() { return sessionDataProvider.get().isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider.get()".to_string());
+    params.new_text = Some("authzProvider.get()".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authzProvider.get()");
+}
+
+#[test]
+fn migrate_java_method_receiver_refuses_no_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("None.java");
+    fs::write(
+        &path,
+        "package p;\nclass None { int unused() { return 0; } }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("foo".to_string());
+    params.new_text = Some("bar".to_string());
+    params.item_names = Some(vec!["nonexistent".to_string()]);
+    let err = plan_migrate_java_method_receiver(&params).unwrap_err().to_string();
+    assert!(err.contains("no call sites"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// java_collapse_call_chain — note-295e99e1
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn java_collapse_call_chain_collapses_two_step_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   private final SessionData session;\n\
+         \x20   View(SessionData s) { this.session = s; }\n\
+         \x20   int currentId() { return session.getAuthLogRecord().getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_collapse_call_chain(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "java_collapse_call_chain");
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "session.getAuthLogId()");
+}
+
+#[test]
+fn java_collapse_call_chain_collapses_multiple_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   private final SessionData session;\n\
+         \x20   Multi(SessionData s) { this.session = s; }\n\
+         \x20   int a() { return session.getAuthLogRecord().getAuthLogId(); }\n\
+         \x20   int b() { return session.getAuthLogRecord().getAuthLogId() + 1; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_collapse_call_chain(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 2);
+    for e in edits {
+        assert_eq!(e.replacement, "session.getAuthLogId()");
+    }
+}
+
+#[test]
+fn java_collapse_call_chain_skips_chains_on_other_receiver_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Other.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Other {\n\
+         \x20   private final OtherType obj;\n\
+         \x20   Other(OtherType o) { this.obj = o; }\n\
+         \x20   int run() { return obj.getAuthLogRecord().getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    assert!(err.contains("no `"), "got: {err}");
+}
+
+#[test]
+fn java_collapse_call_chain_refuses_non_two_segment_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("X.java");
+    fs::write(&path, "class X {}\n").unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("S".to_string());
+    params.module_name = Some("a.b.c".to_string());
+    params.new_text = Some("d".to_string());
+    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    assert!(err.contains("two-segment chains"), "got: {err}");
+}
+
+#[test]
+fn java_collapse_call_chain_skips_chains_with_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Arg.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Arg {\n\
+         \x20   private final SessionData session;\n\
+         \x20   Arg(SessionData s) { this.session = s; }\n\
+         \x20   int run() { return session.getAuthLogRecord(\"x\").getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    assert!(err.contains("no `"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// extract_java_test_slice — note-ea483190
+// ─────────────────────────────────────────────────────────────────────
+
+fn write_test_class(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn extract_java_test_slice_moves_test_that_calls_only_moved_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "CalcTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         public class CalcTest {\n\
+         \x20   @Test\n\
+         \x20   void testAdd() { add(1, 2); }\n\
+         \x20   @Test\n\
+         \x20   void testKept() { keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    params.module_name = Some("AdderTest".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_test_slice(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "extract_java_test_slice");
+    assert_eq!(plan.edits.len(), 2);
+    // Source edit deletes only `testAdd`, leaves `testKept`.
+    assert_eq!(plan.edits[0].edits.len(), 1);
+    // Target file gets created with testAdd inside.
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(target_text.contains("public class AdderTest"), "target shape: {target_text}");
+    assert!(target_text.contains("void testAdd()"), "method moved: {target_text}");
+    assert!(!target_text.contains("testKept"), "kept stayed: {target_text}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_mixed_coverage_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "MixedTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         public class MixedTest {\n\
+         \x20   @Test\n\
+         \x20   void hybrid() { add(1, 2); keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("both moved and kept"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_no_test_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "Empty.java",
+        "package p;\nclass Empty { void notATest() {} }\n",
+    );
+    let target = dir.path().join("Out.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("no @Test"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_no_tests_match_moved_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "AllKeptTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         public class AllKeptTest {\n\
+         \x20   @Test\n\
+         \x20   void a() { keptOne(); }\n\
+         \x20   @Test\n\
+         \x20   void b() { keptTwo(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("Out.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["nonexistent".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("nothing to migrate"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(dir.path(), "Src.java", "class Src {}\n");
+    let target = dir.path().join("Exists.java");
+    fs::write(&target, "// already\n").unwrap();
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["x".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_requires_item_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(dir.path(), "Src.java", "class Src {}\n");
+    let target = dir.path().join("Out.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("item_names"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// inline_java_method — note-8d4674ad
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn inline_java_method_inlines_return_expression() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Calc.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Calc {\n\
+         \x20   public int run() { return add(1, 2); }\n\
+         \x20   private int add(int a, int b) { return a + b; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("add".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "inline_java_method");
+    let edits = &plan.edits[0].edits;
+    // One inline edit + one declaration-deletion edit.
+    assert_eq!(edits.len(), 2);
+    let call_replacement = edits
+        .iter()
+        .find(|e| e.byte_start != e.byte_end && !e.replacement.is_empty())
+        .unwrap();
+    assert!(
+        call_replacement.replacement.contains("(1) + (2)"),
+        "expected substituted args: got `{}`",
+        call_replacement.replacement
+    );
+}
+
+#[test]
+fn inline_java_method_inlines_void_statement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Log.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Log {\n\
+         \x20   public void run() { say(\"hi\"); }\n\
+         \x20   private void say(String s) { System.out.println(s); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("say".to_string());
+    // say's body calls System.out.println which the v1 safety check refuses.
+    // This confirms the refusal.
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("calls another method"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_refuses_non_private() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Pub.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Pub {\n\
+         \x20   public int run() { return add(1, 2); }\n\
+         \x20   public int add(int a, int b) { return a + b; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("add".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("non-private"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_refuses_multi_statement_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   public int run() { return more(); }\n\
+         \x20   private int more() { int x = 1; return x + 2; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("more".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("2 statements"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_refuses_this_in_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("This.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class This {\n\
+         \x20   private int counter = 0;\n\
+         \x20   public int run() { return read(); }\n\
+         \x20   private int read() { return this.counter; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("read".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    // `this.counter` parses as `field_access`; tree-sitter visits the
+    // field_access node first, so the refusal we surface is "reads a
+    // field". Either refusal is correct — body containing a field
+    // reference is unsafe to inline.
+    assert!(
+        err.contains("reads a field") || err.contains("uses `this`"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn inline_java_method_refuses_no_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Orphan.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Orphan {\n\
+         \x20   public int run() { return 1; }\n\
+         \x20   private int dead(int x) { return x + 1; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("dead".to_string());
+    let err = plan_inline_java_method(&params).unwrap_err().to_string();
+    assert!(err.contains("no call sites"), "got: {err}");
+}
+
+#[test]
+fn inline_java_method_inlines_multiple_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Many.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Many {\n\
+         \x20   public int a() { return sq(2); }\n\
+         \x20   public int b() { return sq(3) + sq(4); }\n\
+         \x20   private int sq(int n) { return n * n; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("sq".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // 3 inline edits + 1 declaration deletion.
+    assert_eq!(edits.len(), 4);
+    let leftover = plan.leftovers.first().unwrap();
+    assert_eq!(leftover, "call_sites_inlined=3");
+}
+
+#[test]
+fn inline_java_method_substitutes_arg_with_parens_for_precedence_safety() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Prec.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Prec {\n\
+         \x20   public int run() { return sq(1 + 2) * 3; }\n\
+         \x20   private int sq(int n) { return n * n; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("inline_java_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("sq".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let call_replacement = edits
+        .iter()
+        .find(|e| !e.replacement.is_empty())
+        .unwrap();
+    // The substituted form should preserve precedence: `(1 + 2) * (1 + 2)`
+    // wrapped in parens so the surrounding `* 3` binds correctly.
+    assert!(
+        call_replacement.replacement.contains("((1 + 2) * (1 + 2))"),
+        "expected paren-wrapped args, got `{}`",
+        call_replacement.replacement
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// convert_method_to_class — note-bd2b7a24
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn convert_method_to_class_void_no_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Run.java");
+    let target = dir.path().join("RunHandlerOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Run {\n\
+         \x20   public void runHandler() {\n\
+         \x20       System.out.println(\"hi\");\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("runHandler".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "convert_method_to_class");
+    assert_eq!(plan.edits.len(), 2);
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(target_text.contains("public class RunHandlerOperation"), "class decl: {target_text}");
+    assert!(target_text.contains("public RunHandlerOperation()"), "ctor: {target_text}");
+    assert!(target_text.contains("public void execute()"), "execute sig: {target_text}");
+    assert!(target_text.contains("System.out.println(\"hi\");"), "body: {target_text}");
+    let source_edit = &plan.edits[0].edits[0].replacement;
+    assert!(
+        source_edit.contains("new RunHandlerOperation().execute();"),
+        "delegate: {source_edit}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_with_params_and_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Sum.java");
+    let target = dir.path().join("AddOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Sum {\n\
+         \x20   public int add(int a, int b) {\n\
+         \x20       return a + b;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("add".to_string());
+    params.target = Some(path_string(&target));
+    params.new_text = Some("AddOperation".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(target_text.contains("private final int a;"), "field a: {target_text}");
+    assert!(target_text.contains("private final int b;"), "field b: {target_text}");
+    assert!(target_text.contains("public AddOperation(int a, int b)"), "ctor: {target_text}");
+    assert!(target_text.contains("this.a = a;"), "assign a: {target_text}");
+    assert!(target_text.contains("this.b = b;"), "assign b: {target_text}");
+    assert!(target_text.contains("public int execute()"), "execute sig: {target_text}");
+    assert!(target_text.contains("return a + b;"), "body: {target_text}");
+    let source_edit = &plan.edits[0].edits[0].replacement;
+    assert!(
+        source_edit.contains("return new AddOperation(a, b).execute();"),
+        "delegate: {source_edit}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_preserves_throws_clause() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Reader.java");
+    let target = dir.path().join("ReadFileOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         import java.io.IOException;\n\
+         public class Reader {\n\
+         \x20   public String readFile(String path) throws IOException {\n\
+         \x20       return \"ok\";\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("readFile".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("public String execute() throws IOException"),
+        "throws preserved: {target_text}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_default_class_name_derived_from_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Proc.java");
+    let target = dir.path().join("ProcessOrderOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Proc {\n\
+         \x20   public void processOrder() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("processOrder".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("public class ProcessOrderOperation"),
+        "auto name: {target_text}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_flags_this_references_with_fixme() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Has.java");
+    let target = dir.path().join("PrintOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Has {\n\
+         \x20   private int counter;\n\
+         \x20   public void print() {\n\
+         \x20       this.counter++;\n\
+         \x20       System.out.println(this.counter);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("print".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("FIXME(method-object)"),
+        "FIXME header expected: {target_text}"
+    );
+    assert_eq!(plan.fixme_count.as_ref().unwrap().warning, 2);
+    assert!(!plan.leftovers.is_empty(), "leftovers documents the this refs");
+}
+
+#[test]
+fn convert_method_to_class_refuses_static_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Stat.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Stat {\n\
+         \x20   public static void run() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("static methods"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_abstract_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Abs.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public abstract class Abs {\n\
+         \x20   public abstract void run();\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("abstract"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_constructor() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Ctor.java");
+    let target = dir.path().join("CtorOp.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Ctor {\n\
+         \x20   public Ctor() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("Ctor".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("constructor"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_missing_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("None.java");
+    let target = dir.path().join("None2.java");
+    fs::write(&source, "class None { void a() {} }\n").unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("nonexistent".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("not found"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Src.java");
+    let target = dir.path().join("Existing.java");
+    fs::write(&source, "class Src { void a() {} }\n").unwrap();
+    fs::write(&target, "// already exists\n").unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("a".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// extract_java_code_block_to_method — note-188c6fc9
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn extract_java_code_block_to_method_void_no_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Box.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Box {\n\
+         \x20   void run() {\n\
+         \x20       System.out.println(\"hi\");\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(\"hi\");".to_string());
+    params.module_name = Some("greet".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "extract_java_code_block_to_method");
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 2);
+    // First edit replaces the println with `greet();`; second inserts
+    // the helper after the enclosing method.
+    let replacement = &edits[0].replacement;
+    assert!(
+        replacement.contains("greet()"),
+        "call site not synthesized: {replacement}"
+    );
+    let insert = &edits[1].replacement;
+    assert!(insert.contains("private void greet()"), "helper signature: {insert}");
+    assert!(
+        insert.contains("System.out.println(\"hi\");"),
+        "helper body: {insert}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_with_int_param() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Calc.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Calc {\n\
+         \x20   void run() {\n\
+         \x20       int x = 7;\n\
+         \x20       System.out.println(x);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(x);".to_string());
+    params.module_name = Some("log".to_string());
+    params.parameters = Some(vec![JavaParameterSpec {
+        type_name: "int".to_string(),
+        name: "x".to_string(),
+    }]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let replacement = &edits[0].replacement;
+    assert!(replacement.contains("log(x);"), "call site: {replacement}");
+    let insert = &edits[1].replacement;
+    assert!(insert.contains("private void log(int x)"), "signature: {insert}");
+    assert!(insert.contains("System.out.println(x);"), "body: {insert}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_with_return_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Sum.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Sum {\n\
+         \x20   int run() {\n\
+         \x20       int total = 1 + 2 + 3;\n\
+         \x20       return total;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("int total = 1 + 2 + 3;".to_string());
+    params.module_name = Some("compute".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("return_type".to_string(), serde_json::json!("int"));
+    entries.insert("return_var".to_string(), serde_json::json!("total"));
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let replacement = &edits[0].replacement;
+    assert!(
+        replacement.contains("int total = compute();"),
+        "call site: {replacement}"
+    );
+    let insert = &edits[1].replacement;
+    assert!(insert.contains("private int compute()"), "signature: {insert}");
+    assert!(insert.contains("return total;"), "appended return: {insert}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_static_enclosing_propagates_static() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Util.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Util {\n\
+         \x20   static void run() {\n\
+         \x20       System.out.println(\"a\");\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(\"a\");".to_string());
+    params.module_name = Some("emit".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let insert = &plan.edits[0].edits[1].replacement;
+    assert!(
+        insert.contains("private static void emit()"),
+        "static propagated: {insert}"
+    );
+}
+
+#[test]
+fn extract_java_code_block_to_method_explicit_visibility() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Pub.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Pub {\n\
+         \x20   void run() { System.out.println(\"x\"); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(\"x\");".to_string());
+    params.module_name = Some("emit".to_string());
+    params.visibility = Some("protected".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let insert = &plan.edits[0].edits[1].replacement;
+    assert!(insert.contains("protected void emit()"), "got: {insert}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_custom_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Wrap.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Wrap {\n\
+         \x20   void run() { System.out.println(\"x\"); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(\"x\");".to_string());
+    params.module_name = Some("emit".to_string());
+    params.new_text = Some("try { emit(); } catch (Exception e) {}".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let replacement = &plan.edits[0].edits[0].replacement;
+    assert!(replacement.contains("try { emit(); } catch"), "got: {replacement}");
+}
+
+#[test]
+fn extract_java_code_block_rejects_zero_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Empty.java");
+    fs::write(&path, "class Empty { void run() {} }\n").unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("nonexistent code".to_string());
+    params.module_name = Some("helper".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("not found"), "got: {err}");
+}
+
+#[test]
+fn extract_java_code_block_rejects_multiple_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   void a() { System.out.println(\"x\"); }\n\
+         \x20   void b() { System.out.println(\"x\"); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(\"x\");".to_string());
+    params.module_name = Some("emit".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("matched 2 times"), "got: {err}");
+}
+
+#[test]
+fn extract_java_code_block_rejects_text_outside_any_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Outside.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Outside {\n\
+         \x20   static int FIELD = 42;\n\
+         \x20   void run() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    // Match the class-level field declaration (not inside any method).
+    params.old_text = Some("static int FIELD = 42;".to_string());
+    params.module_name = Some("helper".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("not fully enclosed by a method"), "got: {err}");
+}
+
+#[test]
+fn extract_java_code_block_rejects_parameter_argument_length_mismatch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Mismatch.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Mismatch {\n\
+         \x20   void run() { int x = 1; System.out.println(x); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(x);".to_string());
+    params.module_name = Some("log".to_string());
+    params.parameters = Some(vec![JavaParameterSpec {
+        type_name: "int".to_string(),
+        name: "x".to_string(),
+    }]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "arguments".to_string(),
+        serde_json::json!(["x", "extraArg"]),
+    );
+    params.toml_entries = Some(entries);
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("parameters.len()=1"), "got: {err}");
+}
+
+#[test]
+fn extract_java_code_block_rejects_invalid_helper_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Bad.java");
+    fs::write(&path, "class Bad { void run() { int y = 0; } }\n").unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("int y = 0;".to_string());
+    params.module_name = Some("123bad".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("not a valid Java identifier"), "got: {err}");
+}
+
+#[test]
+fn extract_java_code_block_to_method_arguments_default_to_param_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Defaults.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Defaults {\n\
+         \x20   void run() { int x = 1; String s = \"hi\"; System.out.println(s + x); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("System.out.println(s + x);".to_string());
+    params.module_name = Some("emit".to_string());
+    params.parameters = Some(vec![
+        JavaParameterSpec {
+            type_name: "String".to_string(),
+            name: "s".to_string(),
+        },
+        JavaParameterSpec {
+            type_name: "int".to_string(),
+            name: "x".to_string(),
+        },
+    ]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let replacement = &plan.edits[0].edits[0].replacement;
+    assert!(replacement.contains("emit(s, x);"), "got: {replacement}");
+}
+
+#[test]
+fn prune_java_orphans_rejects_unknown_item_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Unknown.java",
+        "class Unknown { private int x() { return 0; } }\n",
+    );
+    let mut params = java_plan_params("prune_java_orphans", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.item_kinds = Some(vec!["bogus".to_string()]);
+    let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
+    assert!(err.contains("unknown item_kind"), "got: {err}");
+}

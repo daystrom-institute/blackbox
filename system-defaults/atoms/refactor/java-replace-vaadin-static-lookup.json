@@ -1,0 +1,55 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-replace-vaadin-static-lookup",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Rewrite UI.getCurrent() / VaadinSession.getCurrent() (and similar accessor-style static lookups) to an injected Provider<UI> / Provider<VaadinSession> expression. v1 ships caller rewrites only (note-7d4f0001).",
+    "when_to_use": [
+      "remove Vaadin static-context escape hatches in DI-managed view code"
+    ],
+    "anti_patterns": [
+      "do not use without staging Provider<UI> / Provider<VaadinSession> @Inject fields on the caller's enclosing class — operator must add the injection first",
+      "do not use in method-reference contexts (`UI::getCurrent` passed as Supplier) — those need different rewriting"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "impl_name", "new_text"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "impl_name": { "type": "string", "description": "Class qualifier (e.g. `UI` or `VaadinSession`)." },
+          "new_text": { "type": "string", "description": "Replacement receiver expression (e.g. `uiProvider.get()`)." }
+        }
+      },
+      "prompt_template": "You are java-replace-vaadin-static-lookup. Charter: Replace `UI.getCurrent()` / `VaadinSession.getCurrent()` with injected provider expressions.\n\nProtocol:\n\n1. Ground.\n2. Verify the provider field is staged.\n3. Plan in drop-accessor mode:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      new_text=\"{{new_text}}\",\n                      item_names=[\"getCurrent\"],\n                      delegate_field=\"{{impl_name}}.getCurrent\")\n4. Apply and compile-verify.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{new_text}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": { "type": "object", "properties": { "plan_only": { "type": "integer", "minimum": 0 }, "warning": { "type": "integer", "minimum": 0 } } },
+          "deep_analysis_summary": { "type": "object", "additionalProperties": true },
+          "cargo_result": { "type": "object", "properties": { "command": { "type": "string" }, "exit_code": { "type": "integer" }, "summary": { "type": "string" }, "rolled_back": { "type": "boolean" } } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "lookups_rewritten": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-16T00:00:00Z" }
+  }
+}

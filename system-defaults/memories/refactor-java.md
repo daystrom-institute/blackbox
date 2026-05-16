@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "migrate_java_method_receiver", "java_split_provider", "replace_java_static_reference", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -464,20 +464,43 @@ The matching atom is `java-organize-imports`.
 The planner asks JDTLS for workspace-aware organize-import edits through a
 shared per-project session pool. The first call for a `(project_dir, java)`
 pair lazily spawns JDTLS, awaits a real `initialize` response (no fixed
-sleep), and sends `initialized`; subsequent calls reuse the same long-lived
-child. Idle sessions are evicted on a 60s tick after `BLACKBOX_LSP_IDLE_SECS`
-(default 600) of inactivity, and the daemon shuts every session down on stop.
-Tunables: `BLACKBOX_JDTLS_INIT_TIMEOUT_SECS` (default 60) for the cold-start
-window, `BLACKBOX_JDTLS_TIMEOUT_SECS` (default 30) per request,
-`BLACKBOX_JDTLS_BIN` to point at a non-default binary. If JDTLS is absent, the
-session is broken, or the request returns no edits, the tool falls back to a
-structural project scan: removes plain imports whose simple names are no
-longer referenced, keeps static and wildcard imports, and adds imports for
-uniquely named Java source files in the same `project_dir` when their simple
-type name is referenced. The fallback also detects inner-class-only simple
-names and skips synthesizing imports for them — references like
-`Outer.Inner` keep their qualified form rather than producing a non-resolving
-`import x.Inner;`. It is not a full classpath resolver.
+sleep), sends `initialized`, then **waits for the workspace to actually
+import** — JDTLS streams `language/status` notifications during gradle /
+maven / Buildship project import and signals `{ type: "Started" }` (Eclipse
+JDT.LS) or emits a Buildship `language/eventNotification { eventType: 100 }`
+when classpath resolution finishes. Until that drain completes, the session
+is "ready" by LSP-protocol semantics but JDTLS hasn't loaded a single
+project class — organize-imports can't tell whether statics are used,
+references return empty, and edits arrive with degenerate whitespace
+boundaries. The pool blocks on that signal up to
+`BLACKBOX_JDTLS_READY_TIMEOUT_SECS` (default 60s); on timeout the session
+proceeds and the caller sees degraded results rather than a hang.
+
+Per-file, the organize-imports call also opens the source via `didOpen` and
+waits for the first `publishDiagnostics` for that URI before issuing the
+code-action request — mirrors the rust-analyzer post-`didOpen` drain so the
+classpath-resolved request is what JDTLS actually sees, not a request that
+races ahead of JDTLS's lazy per-file type-check.
+
+Subsequent calls reuse the same long-lived child. Idle sessions are evicted
+on a 60s tick after `BLACKBOX_LSP_IDLE_SECS` (default 600) of inactivity,
+and the daemon shuts every session down on stop. Tunables:
+`BLACKBOX_JDTLS_INIT_TIMEOUT_SECS` (default 60) for the cold-start window,
+`BLACKBOX_JDTLS_READY_TIMEOUT_SECS` (default 60) for the post-`initialized`
+workspace-import drain, `BLACKBOX_JDTLS_TIMEOUT_SECS` (default 30) per
+request, `BLACKBOX_JDTLS_BIN` to point at a non-default binary.
+
+If JDTLS is absent, the session is broken, or the request returns no edits,
+the tool falls back to a structural project scan: removes plain imports
+whose simple names are no longer referenced, keeps static and wildcard
+imports, and adds imports for uniquely named Java source files in the same
+`project_dir` when their simple type name is referenced. The fallback also
+detects inner-class-only simple names and skips synthesizing imports for
+them — references like `Outer.Inner` keep their qualified form rather than
+producing a non-resolving `import x.Inner;`. The fallback is a structural
+heuristic, not a classpath resolver — it cannot identify unused static
+imports from third-party jars; only the LSP-backed path can, and only after
+the workspace-import drain has completed.
 
 14b. Lombokify hand-rolled POJO boilerplate — see
     `sm-refactor-java-lombokify` for `lombokify_java_class` (single-file
@@ -485,6 +508,252 @@ names and skips synthesizing imports for them — references like
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b9. Replace static references with provider expressions:
+
+```text
+bbox_refactor_plan(
+  kind="replace_java_static_reference",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  impl_name="UIUtils",
+  new_text="uiUtilsProvider.get()",
+  item_names=["formatName", "renderHeader"],
+  item_kinds=["method"]
+)
+```
+
+The plan kind `replace_java_static_reference` is the shared engine for
+three caller-side migrations. Three atoms wrap it with operator-friendly
+pre-configurations:
+
+- `java-migrate-static-holder` — rewrite readers of `HolderClass.STATIC_FIELD`
+  to `<provider>.get()` (note-7c819189 caller-rewrite half).
+- `java-singletonify-static-util` — rewrite callers of `*Util.staticMethod(...)`
+  to `<provider>.get().method(...)` (note-e5439c0a caller-rewrite half).
+- `java-replace-vaadin-static-lookup` — rewrite `UI.getCurrent()` /
+  `VaadinSession.getCurrent()` to `<provider>.get()`. Uses the
+  drop-accessor mode: pass `delegate_field="UI.getCurrent"` to collapse
+  the entire static accessor invocation (note-7d4f0001).
+
+All three v1 atoms require the @Inject provider field to already exist
+on the reader's enclosing class. The conversion of the production-side
+holder/util/Vaadin patterns to actual `@Singleton` services is operator-
+driven; the shared DI-plumbing helper (v2) will eventually automate
+that too.
+
+14b8. Split a Provider<Big> across call sites:
+
+```text
+bbox_refactor_plan(
+  kind="java_split_provider",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  delegate_field="sessionDataProvider",
+  toml_entries={
+    "getter_mapping": {
+      "getAuthLogRecord": "authLogProvider",
+      "getName":          "nameProvider"
+    }
+  }
+)
+```
+
+The matching atom is `java-split-provider`. Finds
+`<delegate_field>.get().<getter>()` chains and rewrites each to
+`<newProviderField>.get()` per the operator-supplied mapping. v1 only
+handles the call-site rewrite; auto-splitting the `@Inject Provider<T>`
+field on the enclosing class is deferred to the shared DI-plumbing
+helper (v2). Operator splits the field manually first, then runs this
+to drag callers.
+
+14b7. Migrate method receivers after a production move:
+
+```text
+bbox_refactor_plan(
+  kind="migrate_java_method_receiver",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  delegate_field="sessionData",
+  new_text="authz",
+  item_names=["isAuthorized", "isAuthorizedToEdit"]
+)
+```
+
+The matching atom is `java-migrate-method-receiver`. Finds
+`<old_recv>.<method>(...)` invocations where `<old_recv>` matches
+`delegate_field` exactly and `<method>` is in `item_names`, and
+rewrites just the receiver token to `new_text`. Works for both bare
+field references (`sessionData`) and `Provider<T>.get()` shapes
+(`sessionDataProvider.get()`) — pass whichever text matches the
+existing source.
+
+v1 single-file, manual mode: the new receiver must already exist as
+a field on the enclosing class. Auto `@Inject Provider<T>` insertion
+is v2 follow-up. Method-reference shapes (`oldHolder::foo`) are
+skipped in v1.
+
+14b6. Collapse verbose getter chains:
+
+```text
+bbox_refactor_plan(
+  kind="java_collapse_call_chain",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  impl_name="SessionData",
+  module_name="getAuthLogRecord.getAuthLogId",
+  new_text="getAuthLogId"
+)
+```
+
+The matching atom is `java-collapse-call-chain`. Walks the file for
+`<recv>.<A>().<B>()` chains where `<recv>` is a `private final
+<impl_name> <field>` on the enclosing class (find_java_usages
+receiver-resolution heuristic) and `<A>` / `<B>` match the
+`module_name` segments. Replaces each match with `<recv>.<new_text>()`.
+
+v1 supports exactly two-segment chains with no-arg intermediate calls.
+Side-effect-aware refusal: chains with arguments anywhere in the inner
+or outer call are skipped to avoid losing side-effecting calls. v2:
+multi-step chains, project-wide walks, method-reference support.
+
+14b5. Migrate tests after an extract_java_class production move:
+
+```text
+bbox_refactor_plan(
+  kind="extract_java_test_slice",
+  source="src/test/java/com/example/BigTest.java",
+  target="src/test/java/com/example/AdderTest.java",
+  project_dir="/absolute/project/root",
+  item_names=["add","subtract"]
+)
+```
+
+The matching atom is `java-extract-test-slice`. Walks `@Test` methods
+in the source test class and classifies each by which production
+methods it invokes: only-moved → migrate, only-kept → leave, mixed →
+refuse cleanly. The operator must split mixed-coverage tests via
+`extract_java_methods` on the test class before re-running. v1 does not
+synthesize Mockito stubs in remaining-source tests; that's a v2
+follow-up.
+
+14b4. Inline a private helper into its call sites:
+
+```text
+bbox_refactor_plan(
+  kind="inline_java_method",
+  source="src/main/java/com/example/Calc.java",
+  project_dir="/absolute/project/root",
+  module_name="add"
+)
+```
+
+The matching atom is `java-inline-method`. Finds every `method_invocation`
+of the named method (no receiver or `this` receiver) in the same file,
+substitutes each call's argument expressions (wrapped in parens for
+operator-precedence safety) into the method's body expression, replaces
+the call expression with the substituted form, and deletes the method
+declaration.
+
+**v1 scope**: private methods only, single-statement bodies only
+(return-expression for non-void, expression-statement for void). The
+body must reference only formal parameters — no `this`, `super`, field
+reads, or calls to other methods. Refuses cleanly on every violation;
+operator can lift state to parameters first or pick a different
+refactor. `inline_java_class` is a separate primitive not yet shipped.
+
+14b3. Method Object — convert a method into a standalone class:
+
+```text
+bbox_refactor_plan(
+  kind="convert_method_to_class",
+  source="src/main/java/com/example/Big.java",
+  project_dir="/absolute/project/root",
+  module_name="processOrder",
+  target="src/main/java/com/example/ProcessOrderOperation.java"
+)
+```
+
+The matching atom is `java-convert-method-to-class`. Generates a new
+class with private final fields for each parameter, a constructor that
+assigns them, and an `execute()` method carrying the original body
+verbatim (including throws clause). The original method body becomes
+`return new <Class>(<args>).execute();` (or void variant). New class
+name defaults to PascalCase of the method name + `"Operation"`;
+override via `new_text`.
+
+**v1 limitations**: the generated class has no reference to the
+enclosing instance. Original-body uses of `this.<field>` or `super.<x>`
+get flagged with a `// FIXME(method-object):` header inside `execute()`
+and counted in `fixme_count.warning`. The operator either lifts those
+references to parameters first or hand-edits the generated class to
+take an `Outer` constructor argument. v2 auto-capture is a planned
+follow-up. Refuses static methods, abstract methods, constructors, and
+interface methods.
+
+14b2. Intra-method extraction — lift a statement range into a private helper:
+
+```text
+bbox_refactor_plan(
+  kind="extract_java_code_block_to_method",
+  source="src/main/java/com/example/Big.java",
+  project_dir="/absolute/project/root",
+  old_text="<exact statement-range text>",
+  module_name="<new helper name>",
+  parameters=[{"type":"int","name":"x"},{"type":"String","name":"s"}],
+  toml_entries={"arguments":["x","s"], "return_type":"int", "return_var":"total"}
+)
+```
+
+The matching atom is `java-extract-code-block`. Finds the enclosing
+`method_declaration` (or `constructor_declaration`) by walking up from
+the `old_text` match position, generates a `private` helper appended
+after that method, and replaces the original range with a call to the
+helper. Static-ness is inherited from the enclosing method; visibility
+defaults to `private` and can be overridden with `visibility="protected"`
+etc. The synthesized call site is `<helper>(<args>);` for void returns
+and `<return_type> <return_var> = <helper>(<args>);` for non-void. Use
+`new_text` for unusual call-site shapes (chained call, try/catch wrap).
+
+**v1 is manual mode**: the operator owns the parameter and argument
+lists. The planner does NOT yet infer captures from the AST — if the
+extracted range reads three locals and you supply zero parameters, the
+helper compiles but won't see those locals. v2 inference (capture /
+mutated-capture / multi-return analysis) is a planned follow-up.
+
+14c. Janitor pass — delete unused private members:
+
+```text
+bbox_refactor_plan(
+  kind="prune_java_orphans",
+  source="src/main/java/com/example/Big.java",
+  project_dir="/absolute/project/root"
+)
+```
+
+The matching atom is `java-prune-orphans`. Walks every `private`
+method, field, and inner class in the source file, counts in-file
+references (identifier / type_identifier / method_invocation.name /
+field_access.field / method_reference on either side), and proposes
+delete edits for the zero-reference set. Conservative — over-counts
+references rather than under-counts so live members are never deleted.
+
+Pinning exclusions (kept even with zero textual references): constructors,
+`serialVersionUID`, and members annotated with `@Override`, `@Inject`,
+`@Resource`, `@Autowired`, `@PostConstruct`, `@PreDestroy`, `@Test`,
+`@ParameterizedTest`, `@RepeatedTest`, `@BeforeEach`, `@AfterEach`,
+`@BeforeAll`, `@AfterAll`, `@BeforeClass`, `@AfterClass`, or
+`@SuppressWarnings("unused")`. Multi-declarator field declarations
+(`private int a, b, c;`) are excluded in v1 — split manually and re-run.
+Inputs:
+- `source` — Java file to prune.
+- `item_kinds` — optional subset of `["method", "field", "inner_class"]`.
+- `item_names` — optional whitelist; when set, only candidates whose
+  simple name is in this list are considered.
+
+Recursive-only private methods stay alive (the self-call counts as a
+reference). Reflection-accessed members are invisible to the AST walk
+— annotate them with `@SuppressWarnings("unused")` before running.
 
 
 15. Compound run — full extract-interface flow with rollback:

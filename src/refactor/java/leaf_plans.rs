@@ -473,7 +473,9 @@ pub(crate) fn jdtls_organize_imports(
         .with_context(|| format!("reading {}", source_path.display()))?;
     let end_position = byte_to_lsp_position(&source, source.len());
     let code_action_params = CodeActionParams {
-        text_document: TextDocumentIdentifier { uri: source_uri },
+        text_document: TextDocumentIdentifier {
+            uri: source_uri.clone(),
+        },
         range: Range {
             start: Position {
                 line: 0,
@@ -491,6 +493,25 @@ pub(crate) fn jdtls_organize_imports(
     };
 
     let response = manager.with_session(project_dir, Language::Java, |mut client| {
+        // JDTLS indexes lazily per-file: even after the post-`initialized`
+        // workspace-ready drain, the very first source.organizeImports
+        // request against an unopened file returns degenerate edits (no
+        // classpath-aware unused-import pruning, and on some JDTLS
+        // versions an edit whose replacement drops the trailing newline
+        // before the type declaration). Open the file and wait for the
+        // first publishDiagnostics so JDTLS has actually loaded and
+        // type-checked it before we ask for the organize edit.
+        client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+            &lsp_types::DidOpenTextDocumentParams {
+                text_document: lsp_types::TextDocumentItem {
+                    uri: source_uri.clone(),
+                    language_id: "java".to_string(),
+                    version: 0,
+                    text: source.clone(),
+                },
+            },
+        )?;
+        client.wait_for_diagnostics(source_uri.as_str(), std::time::Duration::from_secs(60));
         let id = client.send_request::<CodeActionRequest>(&code_action_params)?;
         client
             .read_response::<CodeActionRequest>(id)
