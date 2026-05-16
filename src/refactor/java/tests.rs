@@ -9077,7 +9077,7 @@ fn extract_java_test_slice_moves_test_that_calls_only_moved_methods() {
 }
 
 #[test]
-fn extract_java_test_slice_refuses_mixed_coverage_test() {
+fn extract_java_test_slice_refuses_mixed_coverage_when_not_mockito() {
     let dir = tempfile::tempdir().unwrap();
     let source = write_test_class(
         dir.path(),
@@ -9095,7 +9095,117 @@ fn extract_java_test_slice_refuses_mixed_coverage_test() {
     params.target = Some(path_string(&target));
     params.item_names = Some(vec!["add".to_string()]);
     let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
-    assert!(err.contains("both moved and kept"), "got: {err}");
+    assert!(err.contains("mixed_coverage_without_mockito"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_mockito_synth_for_mixed_coverage() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "MixedTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         import org.junit.jupiter.api.extension.ExtendWith;\n\
+         import org.mockito.junit.jupiter.MockitoExtension;\n\
+         @ExtendWith(MockitoExtension.class)\n\
+         public class MixedTest {\n\
+         \x20   @Test\n\
+         \x20   void hybrid() { add(1, 2); keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    params.delegate_type = Some("Adder".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_test_slice(&params).unwrap()).unwrap();
+    let source_edits = &plan.edits[0].edits;
+    // Three edits: @Mock field decl, org.mockito.Mock import, and the
+    // call-site rewrite that inserts "mockAdder." before `add(1, 2)`.
+    assert!(
+        source_edits
+            .iter()
+            .any(|e| e.replacement.contains("@Mock") && e.replacement.contains("Adder mockAdder")),
+        "expected @Mock Adder mockAdder field decl: {source_edits:?}"
+    );
+    assert!(
+        source_edits
+            .iter()
+            .any(|e| e.replacement.contains("import org.mockito.Mock;")),
+        "expected Mock import: {source_edits:?}"
+    );
+    assert!(
+        source_edits.iter().any(|e| e.replacement == "mockAdder."),
+        "expected receiverless `add` rewrite to `mockAdder.add`: {source_edits:?}"
+    );
+    // Only mixed test exists → no target file created.
+    assert_eq!(plan.edits.len(), 1);
+}
+
+#[test]
+fn extract_java_test_slice_mockito_refuses_when_no_delegate_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "MixedTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         import org.junit.jupiter.api.extension.ExtendWith;\n\
+         import org.mockito.junit.jupiter.MockitoExtension;\n\
+         @ExtendWith(MockitoExtension.class)\n\
+         public class MixedTest {\n\
+         \x20   @Test\n\
+         \x20   void hybrid() { add(1, 2); keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("mixed_coverage_without_delegate_type"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_reuses_existing_mock_field() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "MixedTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         import org.mockito.Mock;\n\
+         import org.junit.jupiter.api.extension.ExtendWith;\n\
+         import org.mockito.junit.jupiter.MockitoExtension;\n\
+         @ExtendWith(MockitoExtension.class)\n\
+         public class MixedTest {\n\
+         \x20   @Mock Adder existingAdder;\n\
+         \x20   @Test\n\
+         \x20   void hybrid() { add(1, 2); keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    params.delegate_type = Some("Adder".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_test_slice(&params).unwrap()).unwrap();
+    let source_edits = &plan.edits[0].edits;
+    // No new @Mock field generated — operator's `existingAdder` is reused.
+    assert!(
+        !source_edits.iter().any(|e| e.replacement.contains("@Mock")),
+        "should reuse existing field, not generate new one: {source_edits:?}"
+    );
+    assert!(
+        source_edits.iter().any(|e| e.replacement == "existingAdder."),
+        "call rewrite should use existingAdder.: {source_edits:?}"
+    );
 }
 
 #[test]
