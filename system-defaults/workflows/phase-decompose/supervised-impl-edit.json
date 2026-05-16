@@ -1,0 +1,169 @@
+{
+  "name": "phase-decompose-supervised-impl-edit",
+  "version": 1,
+  "vars_schema": {
+    "phase_doc_path": { "kind": "string", "required": true },
+    "phase_doc_text": { "kind": "string", "required": true },
+    "project_dir": { "kind": "string", "required": true },
+    "live_parent_arc_id": { "kind": "string" },
+    "target_context_window": { "kind": "int" },
+    "evidence_bundle": { "kind": "object" },
+    "acceptance_criteria": { "kind": "array" },
+    "sub_unit": { "kind": "object" },
+    "edit_baseline": { "kind": "object" },
+    "edit_status": { "kind": "object" },
+    "edit_diff_stat": { "kind": "object" },
+    "edit_changed_paths": { "kind": "object" },
+    "implementation_output": { "kind": "object" },
+    "advisor_output": { "kind": "object" },
+    "advisor_verdict": { "kind": "string" },
+    "acceptance_status": { "kind": "string" }
+  },
+  "actors": {
+    "implementer": {
+      "kind": "executor",
+      "brofile": "phase-decomposer-edit-implementer",
+      "durable": false
+    },
+    "advisor": {
+      "kind": "executor",
+      "brofile": "phase-decomposer-acceptance-advisor",
+      "durable": false
+    }
+  },
+  "start": "InitDefaults",
+  "nodes": {
+    "InitDefaults": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "default_var",
+          "args": {
+            "key": "sub_unit",
+            "value": {}
+          }
+        },
+        {
+          "op": "default_var",
+          "args": {
+            "key": "evidence_bundle",
+            "value": {
+              "total_bytes": "${vars.sub_unit.bytes}",
+              "target_context_window": "${vars.target_context_window}",
+              "refs": "${vars.sub_unit.refs}",
+              "acceptance_subset": "${vars.sub_unit.acceptance_subset}",
+              "degraded": {
+                "unresolved_refs": [],
+                "omitted_refs": 0
+              }
+            }
+          }
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "status", "--porcelain=v1"],
+            "cwd": "${vars.project_dir}"
+          },
+          "into_var": "edit_baseline",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Implement" }
+    },
+    "Implement": {
+      "actor": "implementer",
+      "prompt": "Project: ${vars.project_dir}\nLive parent arc id: ${vars.live_parent_arc_id}\nPhase doc path: ${vars.phase_doc_path}\nPhase doc text, when present:\n${vars.phase_doc_text}\n\nEvidence bundle JSON bounded to this assignment:\n${vars.evidence_bundle}\n\nParent acceptance criteria JSON:\n${vars.acceptance_criteria}\n\nSub-unit JSON, when present:\n${vars.sub_unit}\n\nThis supervised-impl path is edit-capable. Execute only this bounded assignment. You may edit files and run validation commands. Do not commit, restart shared services, dispatch agents, or mutate durable memory. Respect existing worktree changes: do not revert or overwrite unrelated edits, and report any conflict that blocks the slice. In decomposed foreach runs, use only the sliced evidence bundle and sub_unit.refs/sub_unit.bytes; do not reload the full parent evidence surface unless a listed acceptance criterion explicitly requires it. Keep writes within sub_unit.predicted_writes when present. If a necessary change exceeds the predicted scope, stop with status=blocked and explain the required expansion in residual_risk. Return strict JSON only: {\"status\":\"completed|blocked|failed\",\"summary\":\"...\",\"files_touched\":[\"...\"],\"validation\":[\"...\"],\"acceptance_ids\":[\"...\"],\"live_arc_id\":\"${vars.live_parent_arc_id}\",\"residual_risk\":\"...\"}.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Implement.output}" },
+          "into_var": "implementation_output",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "CaptureDiff" }
+    },
+    "CaptureDiff": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "status", "--porcelain=v1"],
+            "cwd": "${vars.project_dir}"
+          },
+          "into_var": "edit_status",
+          "on_failure": "halt"
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "diff", "--stat"],
+            "cwd": "${vars.project_dir}"
+          },
+          "into_var": "edit_diff_stat",
+          "on_failure": "halt"
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "diff", "--name-only"],
+            "cwd": "${vars.project_dir}"
+          },
+          "into_var": "edit_changed_paths",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Advisor" }
+    },
+    "Advisor": {
+      "actor": "advisor",
+      "prompt": "Project: ${vars.project_dir}\nLive parent arc id: ${vars.live_parent_arc_id}\nEvidence bundle JSON bounded to this assignment:\n${vars.evidence_bundle}\nAcceptance criteria JSON:\n${vars.acceptance_criteria}\nSub-unit JSON:\n${vars.sub_unit}\nImplementer strict JSON:\n${vars.implementation_output}\nInitial git status before implementation:\n${vars.edit_baseline.stdout}\nCurrent git status after implementation:\n${vars.edit_status.stdout}\nChanged tracked paths after implementation:\n${vars.edit_changed_paths.stdout}\nDiff stat after implementation:\n${vars.edit_diff_stat.stdout}\n\nJudge whether the bounded sub-unit assignment is complete. Reject claims that depend on refs outside the bounded evidence bundle or sub_unit.refs unless the implementer explicitly reports a blocked scope expansion. Evaluate sub_unit.acceptance_subset as the local slice contract. Check that implementation_output.live_arc_id matches the supplied live parent arc id when present. Treat changed paths outside sub_unit.predicted_writes as a risk unless the implementer explained why they were required. Do not require this supervised subworkflow to observe the parent Recompose terminal verdict; that final cross-subunit assertion is checked after foreach drains. Return strict JSON only: {\"advisor_verdict\":\"accept|remediate|halt\",\"acceptance_status\":\"passed|failed|blocked\",\"summary\":\"...\",\"failed_acceptance_ids\":[],\"steer_prompt\":\"...\"}.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Advisor.output}" },
+          "into_var": "advisor_output",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "advisor_verdict",
+            "value": "${vars.advisor_output.advisor_verdict}"
+          }
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "acceptance_status",
+            "value": "${vars.advisor_output.acceptance_status}"
+          }
+        }
+      ],
+      "next": { "type": "goto", "to": "ExportOutcome" }
+    },
+    "ExportOutcome": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "set_var",
+          "args": {
+            "key": "_structured_exit",
+            "value": {
+              "implementation_output": "${vars.implementation_output}",
+              "advisor_verdict": "${vars.advisor_verdict}",
+              "acceptance_status": "${vars.acceptance_status}",
+              "advisor_output": "${vars.advisor_output}",
+              "edit_status": "${vars.edit_status}",
+              "edit_diff_stat": "${vars.edit_diff_stat}",
+              "edit_changed_paths": "${vars.edit_changed_paths}"
+            }
+          }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

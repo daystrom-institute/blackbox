@@ -694,6 +694,45 @@ mod tests {
         compile(spec).unwrap_err().to_string()
     }
 
+    fn phase_decompose_workflow_cases() -> &'static [(&'static str, &'static str)] {
+        &[
+            (
+                "phase-decompose-discovery",
+                include_str!("../../system-defaults/workflows/phase-decompose/discovery.json"),
+            ),
+            (
+                "phase-decompose-ensemble-decompose",
+                include_str!(
+                    "../../system-defaults/workflows/phase-decompose/ensemble-decompose.json"
+                ),
+            ),
+            (
+                "phase-decompose-supervised-impl",
+                include_str!(
+                    "../../system-defaults/workflows/phase-decompose/supervised-impl.json"
+                ),
+            ),
+            (
+                "phase-decompose-supervised-impl-edit",
+                include_str!(
+                    "../../system-defaults/workflows/phase-decompose/supervised-impl-edit.json"
+                ),
+            ),
+            (
+                "phase-decompose-recompose",
+                include_str!("../../system-defaults/workflows/phase-decompose/recompose.json"),
+            ),
+            (
+                "phase-decompose-main",
+                include_str!("../../system-defaults/workflows/phase-decompose/main.json"),
+            ),
+            (
+                "phase-decompose-main-edit",
+                include_str!("../../system-defaults/workflows/phase-decompose/main-edit.json"),
+            ),
+        ]
+    }
+
     #[test]
     fn atom_binding_workflow_loads_and_validates() {
         let json = r#"{
@@ -883,6 +922,14 @@ mod tests {
                 std::fs::read_to_string(&full).unwrap_or_else(|e| panic!("read {path}: {e}"));
             let spec = load_workflow(&json).unwrap_or_else(|e| panic!("parse {path}: {e:?}"));
             compile(spec).unwrap_or_else(|e| panic!("compile {path}: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn phase_decompose_workflows_compile() {
+        for (name, src) in phase_decompose_workflow_cases() {
+            let spec = load_workflow(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e:?}"));
+            compile(spec).unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
         }
     }
 
@@ -2132,7 +2179,7 @@ mod tests {
                 include_str!("../../system-defaults/workflows/atoms/echo-review.json"),
             ),
         ];
-        for (name, src) in cases {
+        for (name, src) in cases.iter().chain(phase_decompose_workflow_cases()) {
             let v: serde_json::Value = serde_json::from_str(src)
                 .unwrap_or_else(|e| panic!("{name}: JSON parse failed: {e}"));
             catalog

@@ -779,6 +779,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn phase_decomposer_edit_implementer_parses() {
+        let src =
+            include_str!("../../system-defaults/brofiles/phase-decompose/edit-implementer.json");
+        let bf: Brofile = serde_json::from_str(src).expect("phase-decomposer edit brofile parses");
+        assert_eq!(bf.name, "phase-decomposer-edit-implementer");
+        assert_eq!(bf.provider, Provider::Codex);
+        assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(bf.effort.as_deref(), Some("high"));
+        let lens = bf.lens.as_deref().unwrap_or("");
+        assert!(lens.contains("edit-capable bounded implementer"));
+        assert!(lens.contains("must not dispatch or resume agents"));
+        assert!(lens.contains("strict JSON only"));
+    }
+
     /// Rust + Java refactor personas should expose the same allow/disallow
     /// sets — the refactor + grounding tool surface is language-agnostic at
     /// the MCP layer. Only the lens prose differs. The cross-language symmetry
