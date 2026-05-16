@@ -5873,6 +5873,86 @@ impl Cache {
     }
 
     #[test]
+    fn migrate_rust_mods_to_lib_includes_add_use_decl_for_unqualified_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("Cargo.toml"),
+            "[package]\nname = \"my-crate\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[[bin]]\nname = \"my-crate\"\npath = \"src/main.rs\"\n",
+        )
+        .unwrap();
+        let src_dir = dir.path().join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        fs::write(
+            src_dir.join("main.rs"),
+            "mod utils;\nfn main() { utils::helper(); }\n",
+        )
+        .unwrap();
+        fs::write(src_dir.join("lib.rs"), "").unwrap();
+
+        let response = run(
+            &RefactorRunParams {
+                title: "migrate utils".into(),
+                project_dir: path_string(dir.path()),
+                steps: vec![RefactorRunStep::Plan {
+                    optional: false,
+                    params: RefactorPlanParams {
+                        kind: "migrate_rust_mods_to_lib".into(),
+                        source: "src/main.rs".into(),
+                        item_names: Some(vec!["utils".into()]),
+                        ..Default::default()
+                    },
+                }],
+                confirm: Some(false),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                dispatch_origin: None,
+            },
+            &[g15_project_record(dir.path())],
+        )
+        .unwrap();
+        let run_response: RefactorRunResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(run_response.status, "planned");
+
+        // Verify add_rust_use_decl steps are included
+        let use_decl_steps: Vec<_> = run_response
+            .steps
+            .iter()
+            .filter(|step| step.kind.as_deref() == Some("add_rust_use_decl"))
+            .collect();
+        assert!(!use_decl_steps.is_empty(), "should include add_rust_use_decl steps");
+
+        // Verify the use_path matches the expected pattern
+        // Note: crate name is my_crate (underscore), not my-crate (hyphen from Cargo.toml package name)
+        let has_correct_use_path = use_decl_steps.iter().any(|step| {
+            step.title
+                .as_deref()
+                .map(|t| t.contains("my_crate::utils"))
+                .unwrap_or(false)
+        });
+        assert!(
+            has_correct_use_path,
+            "use_decl step should have use_path like 'my_crate::utils'. Titles: {:?}",
+            use_decl_steps.iter().filter_map(|s| s.title.as_deref()).collect::<Vec<_>>()
+        );
+
+        // Verify execution order: copy, delete, add_use, rewrite, cargo check
+        let kinds: Vec<&str> = run_response
+            .steps
+            .iter()
+            .filter_map(|step| step.kind.as_deref())
+            .collect();
+        let copy_idx = kinds.iter().position(|k| *k == "copy_rust_mod_decls");
+        let delete_idx = kinds.iter().position(|k| *k == "delete_rust_items");
+        let use_decl_idx = kinds.iter().position(|k| *k == "add_rust_use_decl");
+        let rewrite_idx = kinds.iter().position(|k| *k == "rewrite_rust_bin_crate_paths");
+
+        assert!(
+            copy_idx < delete_idx && delete_idx < use_decl_idx && use_decl_idx < rewrite_idx,
+            "steps should execute in order: copy, delete, add_use_decl, rewrite"
+        );
+    }
+
+    #[test]
     fn split_rust_impl_methods_rejects_missing_target() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("server.rs");

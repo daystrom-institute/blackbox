@@ -2441,6 +2441,25 @@ fn expand_migrate_rust_mods_to_lib_step(
     }
     bin_sources.sort();
     bin_sources.dedup();
+
+    // Add use declarations for each migrated module in each binary source,
+    // so unqualified references (e.g., `slack_channel_bindings::Item`) resolve.
+    for bin_source in &bin_sources {
+        for module_name in &module_names {
+            let use_path = format!("{}::{}", crate_name, module_name);
+            steps.push(RefactorRunStep::Plan {
+                params: RefactorPlanParams {
+                    kind: "add_rust_use_decl".to_string(),
+                    source: bin_source.clone(),
+                    use_path: Some(use_path),
+                    project_dir: Some(project_dir_arg.clone()),
+                    ..Default::default()
+                },
+                optional: true,
+            });
+        }
+    }
+
     for bin_source in bin_sources {
         steps.push(RefactorRunStep::Plan {
             params: RefactorPlanParams {
