@@ -1,0 +1,59 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-migrate-method-receiver",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Rewrite the receiver of method invocations from one field to another (e.g. after extract_java_class moves methods from OldHolder to NewHolder). v1 single-file, operator-supplied old/new receiver text; auto-DI plumbing is v2.",
+    "when_to_use": [
+      "after extract_java_class moves a method cluster to a new class, drag callers' receiver token over so the source class can drop its delegate wrappers",
+      "swap one already-injected field for another across a file when both injection sites already exist"
+    ],
+    "anti_patterns": [
+      "do not use when the new receiver field doesn't exist on the enclosing class — v1 doesn't auto-inject; operator must add the @Inject field first",
+      "do not use to inline a method — that's `inline_java_method`",
+      "do not use for cross-file rewrites — v1 is single-file; widen scope by re-running per file"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "delegate_field", "new_text", "item_names"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "delegate_field": { "type": "string", "description": "OLD receiver text (e.g. `sessionData` or `sessionDataProvider.get()`)." },
+          "new_text": { "type": "string", "description": "NEW receiver text (must already exist as a field on the enclosing class)." },
+          "item_names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Method names whose receivers will be rewritten." },
+          "impl_name": { "type": "string", "description": "Optional class filter." }
+        }
+      },
+      "prompt_template": "You are java-migrate-method-receiver. Charter: After a production move, rewrite caller receivers so they point at the new holder.\n\nProtocol:\n\n1. Ground:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n\n2. Confirm the new receiver field exists:\n   bbox_code_symbols(query=\"{{new_text}}\", languages=[\"java\"])\n   If missing, refuse and tell the operator to add the @Inject field first.\n\n3. Plan:\n   bbox_refactor_plan(kind=\"migrate_java_method_receiver\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      delegate_field=\"{{delegate_field}}\",\n                      new_text=\"{{new_text}}\",\n                      item_names={{item_names}},\n                      impl_name=\"{{impl_name}}\")\n\n4. Apply and compile-verify:\n   bbox_refactor_apply(plan_path=\"<plan_path>\", confirm=true)\n\n5. Emit done note with call_sites_rewritten count.\n\nInputs:\n{{project_dir}} {{source}} {{delegate_field}} {{new_text}} {{item_names}} {{impl_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": { "type": "object", "properties": { "plan_only": { "type": "integer", "minimum": 0 }, "warning": { "type": "integer", "minimum": 0 } } },
+          "deep_analysis_summary": { "type": "object", "additionalProperties": true },
+          "cargo_result": { "type": "object", "properties": { "command": { "type": "string" }, "exit_code": { "type": "integer" }, "summary": { "type": "string" }, "rolled_back": { "type": "boolean" } } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "call_sites_rewritten": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-16T00:00:00Z" }
+  }
+}

@@ -709,6 +709,22 @@
         "status",
         "chains_collapsed"
       ]
+    },
+    {
+      "id": "dispatch-java-migrate-method-receiver-planonly",
+      "atom": "java-migrate-method-receiver",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "delegate_field": "sessionData",
+        "new_text": "authz",
+        "item_names": ["isAuthorized"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "call_sites_rewritten"
+      ]
     }
   ]
 }

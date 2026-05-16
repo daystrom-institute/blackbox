@@ -1359,6 +1359,7 @@ mod tests {
             "inline_java_method",
             "extract_java_test_slice",
             "java_collapse_call_chain",
+            "migrate_java_method_receiver",
         ];
 
         for kind in java_plan_kinds {

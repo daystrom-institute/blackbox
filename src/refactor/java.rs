@@ -3901,6 +3901,7 @@ pub(crate) use collapse_chain::plan_java_collapse_call_chain;
 pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use method_object::plan_convert_method_to_class;
+pub(crate) use migrate_receiver::plan_migrate_java_method_receiver;
 pub(crate) use prune_orphans::plan_prune_java_orphans;
 pub(crate) use test_slice::plan_extract_java_test_slice;
 
@@ -3911,6 +3912,7 @@ mod extract_code_block;
 mod extract_methods;
 mod inline_method;
 mod method_object;
+mod migrate_receiver;
 mod test_slice;
 mod find_usages;
 mod leaf_plans;

@@ -521,6 +521,16 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "java-migrate-method-receiver",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:migrate_java_method_receiver",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

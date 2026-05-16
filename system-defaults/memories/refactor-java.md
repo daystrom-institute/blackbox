@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "migrate_java_method_receiver", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -508,6 +508,32 @@ the workspace-import drain has completed.
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b7. Migrate method receivers after a production move:
+
+```text
+bbox_refactor_plan(
+  kind="migrate_java_method_receiver",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  delegate_field="sessionData",
+  new_text="authz",
+  item_names=["isAuthorized", "isAuthorizedToEdit"]
+)
+```
+
+The matching atom is `java-migrate-method-receiver`. Finds
+`<old_recv>.<method>(...)` invocations where `<old_recv>` matches
+`delegate_field` exactly and `<method>` is in `item_names`, and
+rewrites just the receiver token to `new_text`. Works for both bare
+field references (`sessionData`) and `Provider<T>.get()` shapes
+(`sessionDataProvider.get()`) — pass whichever text matches the
+existing source.
+
+v1 single-file, manual mode: the new receiver must already exist as
+a field on the enclosing class. Auto `@Inject Provider<T>` insertion
+is v2 follow-up. Method-reference shapes (`oldHolder::foo`) are
+skipped in v1.
 
 14b6. Collapse verbose getter chains:
 

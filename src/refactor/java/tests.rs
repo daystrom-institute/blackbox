@@ -8308,6 +8308,141 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// migrate_java_method_receiver — note-1ee49c59
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn migrate_java_method_receiver_rewrites_single_call_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   private final AuthorizationService authz;\n\
+         \x20   View(SessionData s, AuthorizationService a) { this.sessionData = s; this.authz = a; }\n\
+         \x20   boolean check() { return sessionData.isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authz");
+}
+
+#[test]
+fn migrate_java_method_receiver_rewrites_multiple_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Many.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Many {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   Many(SessionData s) { this.sessionData = s; }\n\
+         \x20   boolean a() { return sessionData.isAuthorized(1); }\n\
+         \x20   boolean b() { return sessionData.isAuthorized(2); }\n\
+         \x20   boolean c() { return sessionData.isAuthorizedToEdit(3); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec![
+        "isAuthorized".to_string(),
+        "isAuthorizedToEdit".to_string(),
+    ]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 3);
+    for e in edits {
+        assert_eq!(e.replacement, "authz");
+    }
+}
+
+#[test]
+fn migrate_java_method_receiver_skips_unlisted_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Skip.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Skip {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   Skip(SessionData s) { this.sessionData = s; }\n\
+         \x20   boolean a() { return sessionData.isAuthorized(1); }\n\
+         \x20   String b() { return sessionData.getName(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Only `isAuthorized` is rewritten, `getName` left alone.
+    assert_eq!(edits.len(), 1);
+}
+
+#[test]
+fn migrate_java_method_receiver_handles_provider_get_receiver() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Prov.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Prov {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   Prov(Provider<SessionData> s) { this.sessionDataProvider = s; }\n\
+         \x20   boolean check() { return sessionDataProvider.get().isAuthorized(42); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider.get()".to_string());
+    params.new_text = Some("authzProvider.get()".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authzProvider.get()");
+}
+
+#[test]
+fn migrate_java_method_receiver_refuses_no_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("None.java");
+    fs::write(
+        &path,
+        "package p;\nclass None { int unused() { return 0; } }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("foo".to_string());
+    params.new_text = Some("bar".to_string());
+    params.item_names = Some(vec!["nonexistent".to_string()]);
+    let err = plan_migrate_java_method_receiver(&params).unwrap_err().to_string();
+    assert!(err.contains("no call sites"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // java_collapse_call_chain — note-295e99e1
 // ─────────────────────────────────────────────────────────────────────
 

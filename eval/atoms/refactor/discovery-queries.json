@@ -315,6 +315,14 @@
         "java-collapse-call-chain"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-migrate-method-receiver",
+      "query": "rewrite java method receivers from old holder field to new holder field after extracting a class",
+      "expected_atoms": [
+        "java-migrate-method-receiver"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [
