@@ -1,0 +1,61 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-extract-module",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Move named def/defp/defmacro items from a source Elixir module to a new module file via extract_elixir_module. Attached @doc/@spec/@impl/etc move with their def; all clauses sharing a function name move as one unit.",
+    "when_to_use": [
+      "split a god-module by carving a named subset of public/private defs into a focused module",
+      "extract a cohesive cluster of helpers when their interface is stable"
+    ],
+    "anti_patterns": [
+      "do not use to move clauses of a multi-clause atom-dispatch function — chain elixir-shatter-dispatch-table",
+      "do not use when source has `use Foo` at module scope without acknowledge_use_at_scope (the planner can't see what use injects)",
+      "do not pass defmacro items in item_names without acknowledge_defmacro_move"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name", "item_names"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string"},
+          "target": {"type": "string", "description": "New module file (must not exist; merge mode is v2)."},
+          "module_name": {"type": "string", "description": "Target defmodule name."},
+          "item_names": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+          "target_prelude": {"type": "array", "items": {"type": "string"}},
+          "acknowledge_use_at_scope": {"type": "boolean"},
+          "acknowledge_quote_in_moved": {"type": "boolean"},
+          "acknowledge_defmacro_move": {"type": "boolean"},
+          "apply": {"type": "boolean"}
+        }
+      },
+      "prompt_template": "You are elixir-extract-module.\n\nProtocol:\n1. Ground: bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\", languages=[\"elixir\"]) — confirm every item_names entry exists.\n2. Plan: bbox_refactor_plan(kind=\"extract_elixir_module\", deep_analysis=true, source=\"{{source}}\", target=\"{{target}}\", module_name=\"{{module_name}}\", item_names={{item_names}}, project_dir=\"{{project_dir}}\", toml_entries={...}).\n3. Inspect moved_items + in_module_call_sites. The latter are advisory — operator handles caller rewriting in a follow-up.\n4. Refuse on: target_exists, item_not_found, use_at_scope, defmacro_move, quote_in_moved (each gated by its acknowledgment).\n5. Apply (if inputs.apply): bbox_refactor_run with mix compile + mix format --check-formatted + mix test.\n6. Emit bbox_note(kind=\"done\", body=<moved_items count + in_module_call_sites count + compile result>).\n\nInputs: {{project_dir}} {{source}} {{target}} {{module_name}} {{item_names}} {{target_prelude}} {{acknowledge_use_at_scope}} {{acknowledge_quote_in_moved}} {{acknowledge_defmacro_move}} {{apply}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "moved_items": {"type": "array"},
+          "in_module_call_sites": {"type": "array"}
+        }
+      },
+      "evidence_density": "normal"
+    },
+    "effects": {"writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

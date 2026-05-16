@@ -1,0 +1,59 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-test-fixture-extract",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Pull repeated setup/setup_all blocks across *_test.exs files into a fixture module exposed via `use FixtureModule, :name` via elixir_test_fixture_extract.",
+    "when_to_use": [
+      "a setup block is duplicated across 3+ test files verbatim (default min_duplicates)",
+      "test boilerplate has accumulated and a fixture module would clean it up"
+    ],
+    "anti_patterns": [
+      "do not use when setups depend on test-module @attributes without acknowledge_attribute_scope=true",
+      "do not use to merge setups that look similar but aren't byte-equal — hash equality is exact"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name", "fixture_name"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string", "description": "Directory containing *_test.exs files."},
+          "target": {"type": "string", "description": "Fixture module file path."},
+          "module_name": {"type": "string"},
+          "fixture_name": {"type": "string", "description": "The atom for `use FixtureModule, :fixture_name`."},
+          "min_duplicates": {"type": "integer", "minimum": 2},
+          "acknowledge_attribute_scope": {"type": "boolean"},
+          "acknowledge_describe_context": {"type": "boolean"}
+        }
+      },
+      "prompt_template": "You are elixir-test-fixture-extract.\n\nProtocol:\n1. bbox_refactor_plan(kind=\"elixir_test_fixture_extract\", source=\"{{source}}\", target=\"{{target}}\", module_name=\"{{module_name}}\", project_dir=\"{{project_dir}}\", toml_entries={\"fixture_name\": \"{{fixture_name}}\", \"min_duplicates\": {{min_duplicates}}, \"acknowledge_attribute_scope\": {{acknowledge_attribute_scope}}, \"acknowledge_describe_context\": {{acknowledge_describe_context}}}).\n2. Refuse on no_duplicates / setup_references_module_scope / describe_context_required.\n3. Emit bbox_note(kind=\"done\", body=<duplicate_groups count + occurrences>).\n\nInputs: {{project_dir}} {{source}} {{target}} {{module_name}} {{fixture_name}} {{min_duplicates}} {{acknowledge_attribute_scope}} {{acknowledge_describe_context}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "duplicate_groups": {"type": "array"},
+          "fixture_module": {"type": "string"},
+          "fixture_name": {"type": "string"}
+        }
+      },
+      "evidence_density": "normal"
+    },
+    "effects": {"writes_files": true, "dispatches_runs": 0, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

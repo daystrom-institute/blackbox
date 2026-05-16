@@ -1,0 +1,60 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-pipe-chain-extract",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Extract a contiguous subsequence of a |> pipe chain into a named private function via elixir_pipe_chain_extract. Replaces the subsequence with a single piped call.",
+    "when_to_use": [
+      "a pipe chain has a cohesive transformation segment that the operator wants named and reusable",
+      "a chain has grown long enough to obscure its intent and an extracted defp clarifies the data flow"
+    ],
+    "anti_patterns": [
+      "do not extract offset 0 (the chain head; refused with range_breaks_chain)",
+      "do not use to inline a piped function back into its caller's chain — that's the v2 direction=inline mode"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "module_name", "anchor_line", "anchor_column", "extract_range_start_offset", "extract_range_end_offset"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string"},
+          "module_name": {"type": "string", "description": "Extracted function name (e.g. \"normalize_input\")."},
+          "anchor_line": {"type": "integer", "minimum": 1},
+          "anchor_column": {"type": "integer", "minimum": 1},
+          "extract_range_start_offset": {"type": "integer", "minimum": 1, "description": "1-based step index, inclusive."},
+          "extract_range_end_offset": {"type": "integer", "minimum": 1, "description": "1-based step index, inclusive."},
+          "visibility": {"enum": ["def", "defp"]},
+          "apply": {"type": "boolean"}
+        }
+      },
+      "prompt_template": "You are elixir-pipe-chain-extract.\n\nProtocol:\n1. bbox_refactor_plan(kind=\"elixir_pipe_chain_extract\", source=\"{{source}}\", module_name=\"{{module_name}}\", project_dir=\"{{project_dir}}\", toml_entries={\"anchor_line\": {{anchor_line}}, \"anchor_column\": {{anchor_column}}, \"extract_range_start_offset\": {{extract_range_start_offset}}, \"extract_range_end_offset\": {{extract_range_end_offset}}, \"visibility\": \"{{visibility}}\"}).\n2. Refuse on no_pipe_chain / range_breaks_chain / range_out_of_bounds / range_inverted.\n3. Apply with mix compile + format check.\n4. Emit bbox_note(kind=\"done\", body=<extracted step count>).\n\nInputs: {{project_dir}} {{source}} {{module_name}} {{anchor_line}} {{anchor_column}} {{extract_range_start_offset}} {{extract_range_end_offset}} {{visibility}} {{apply}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "chain_steps": {"type": "array"},
+          "extracted_subsequence": {"type": "array"},
+          "captured_variables": {"type": "array"}
+        }
+      },
+      "evidence_density": "normal"
+    },
+    "effects": {"writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

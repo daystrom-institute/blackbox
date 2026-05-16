@@ -1,0 +1,60 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-move-across-apps",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Move an Elixir module from one umbrella apps/<src>/ to another apps/<dst>/ via elixir_move_module_across_apps. Emits FileMove + advisory mix.exs edits + config_references report.",
+    "when_to_use": [
+      "an umbrella project needs a module reassigned to a different app",
+      "consolidation pass after an app split where modules ended up in the wrong app"
+    ],
+    "anti_patterns": [
+      "do not use on non-umbrella projects (refused with source_not_in_apps_lib)",
+      "do not use when config files dynamically synthesize module names with Module.concat (refused with config_dynamic)",
+      "do not expect auto-edit of mix.exs — the atom reports proposed deps changes; operator applies manually"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target_app"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string", "description": "Module file under apps/<x>/lib/."},
+          "target_app": {"type": "string", "description": "Destination app, e.g. \"apps/witness\"."},
+          "target_path_in_app": {"type": "string", "description": "Override the default mirror path."},
+          "acknowledge_app_boundary_crossing": {"type": "boolean"}
+        }
+      },
+      "prompt_template": "You are elixir-move-across-apps.\n\nProtocol:\n1. bbox_refactor_plan(kind=\"elixir_move_module_across_apps\", source=\"{{source}}\", project_dir=\"{{project_dir}}\", toml_entries={\"target_app\": \"{{target_app}}\", \"target_path_in_app\": \"{{target_path_in_app}}\", \"acknowledge_app_boundary_crossing\": {{acknowledge_app_boundary_crossing}}}).\n2. Surface cross_app_dependencies, mix_exs_edits (advisory), config_references.\n3. Refuse on source_not_in_apps_lib / cyclical_app_dependency / config_dynamic.\n4. Emit bbox_note(kind=\"done\", body=<moved_module + advisory edits + config refs>).\n\nInputs: {{project_dir}} {{source}} {{target_app}} {{target_path_in_app}} {{acknowledge_app_boundary_crossing}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "cross_app_dependencies": {"type": "object"},
+          "mix_exs_edits": {"type": "array"},
+          "config_references": {"type": "array"},
+          "source_app": {"type": "string"},
+          "target_app": {"type": "string"},
+          "moved_module": {"type": "string"}
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {"writes_files": true, "dispatches_runs": 0, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}
