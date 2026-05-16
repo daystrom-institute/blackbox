@@ -4,7 +4,7 @@ tags:
 ---
 +++
 title = "Refactor mechanization catalog — language routing and support matrix"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "language", "catalog", "support-matrix", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "rust", "typescript", "javascript", "csharp", "python", "java", "go", "c", "cpp", "sm-refactor-rust", "sm-refactor-typescript", "sm-refactor-csharp", "sm-refactor-python", "sm-refactor-java", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify", "sm-refactor-go", "sm-refactor-c-cpp"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "language", "catalog", "support-matrix", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "rust", "typescript", "javascript", "csharp", "python", "java", "go", "c", "cpp", "elixir", "sm-refactor-rust", "sm-refactor-typescript", "sm-refactor-csharp", "sm-refactor-python", "sm-refactor-java", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify", "sm-refactor-go", "sm-refactor-c-cpp", "sm-refactor-elixir"]
 order = 7
 template = false
 +++
@@ -129,7 +129,8 @@ labelling invariant holds across both ok and error paths.
 - Go: `go`
 - C: `c`
 - C++: `cpp`
-- Additional inspect-only parser mappings: Erlang, Elixir, Ruby, OCaml,
+- Elixir: `elixir`
+- Additional inspect-only parser mappings: Erlang, Ruby, OCaml,
   Haskell, Swift, Kotlin, Scala, Lua, Bash, JSON, YAML, TOML, HTML, CSS, SQL
 
 Writable structural plans are narrower:
@@ -197,11 +198,24 @@ Writable structural plans are narrower:
   `RUST_ANALYZER_BIN` (binary override) and
   `BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS` (default 60).
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.
-- C#: inspect-only today. Use `sm-refactor-csharp`.
+- C#: supports LSP-backed rename / organize-usings / move-item / find-usages
+  through `Microsoft.CodeAnalysis.LanguageServer`, sidecar-backed RX-V4
+  partial-class / source-generator audit, IOperation awaited-query audit,
+  compile-fix-round, nullable-annotation repair, file-scoped namespace
+  conversion, type-to-file move, type-usage migration, record / primary-ctor
+  / async-dispose migrations, unseal, and partial-member move. Sidecar-backed
+  kinds RX-V3-fail-closed on Roslyn unavailability. Use `sm-refactor-csharp`.
 - Python: inspect-only today. Use `sm-refactor-python`.
 - Java: supports extract methods/classes, composite extract-class handoffs, field/constructor/delegate wiring, caller delegation, extract interface, add implements, visibility rewriting, type-use migration, and JDTLS/fallback import organize. Use `sm-refactor-java`.
 - Go: inspect-only today. Use `sm-refactor-go`.
 - C / C++: inspect-only today. Use `sm-refactor-c-cpp`.
+- Elixir: supports atom-tag dispatch decomposition, GenServer concern
+  extraction, module / behaviour / pipe / with-clause extraction, facade
+  delegation, alias organization, public-API guard, dependency / state
+  audits, codegen audit, test-fixture extraction, umbrella module moves,
+  and mix-diagnostic compile/credo/dialyzer fix rounds. `rename_elixir_symbol`
+  is structured-refusal only in v1 (no working LSP rename provider). Use
+  `sm-refactor-elixir`.
 - Other supported tree-sitter languages: inspect-only today unless a newer
   language memory says otherwise.
 
@@ -216,6 +230,7 @@ Writable structural plans are narrower:
 - Go files (`.go`) -> pull `sm-refactor-go`.
 - C/C++ files (`.c`, `.h`, `.cc`, `.cpp`, `.cxx`, `.hh`, `.hpp`, `.hxx`) ->
   pull `sm-refactor-c-cpp`.
+- Elixir files (`.ex`, `.exs`) -> pull `sm-refactor-elixir`.
 - Mixed-language projects -> pull every relevant language memory, then plan one
   language backend at a time.
 
@@ -339,28 +354,36 @@ mechanical boundary: profile-backed atom execution dispatches through that
 brofile, so the atom inherits the refactor + grounding tool surface rather
 than a general-purpose operator surface.
 
-Two personas ship as reference artifacts:
+Four personas ship as reference artifacts; all four share the same
+allow/disallow shape (refactor + grounding tool surface; `Bash` /
+`Write` / `Edit` / `bro_*` / knowledge-mutation tools denied). Only the
+lens prose differs per language. The persona allow list is verified by
+tests in `src/orchestration/brofile.rs`; allow/disallow drift fails the
+test.
 
 - **`rust-refactor-persona`** at `system-defaults/brofiles/refactor/rust-refactor-persona.json`.
-  Allows only `bbox_code_*` (symbols / node_describe / query / refs),
-  `bbox_refactor_*` (status / project_refs / plan / apply / run),
-  `bbox_note`, `bbox_thread`, `bbox_pin`, `bbox_inspect_entity`,
-  `bbox_hybrid_search`, `Read`, `Grep`, `Glob`.
-  Disallows `Bash`, `Write`, `Edit`, `bbox_learn` / `bbox_remember` /
-  `bbox_decide` / `bbox_forget` / `bbox_render`, and `bro_*`. Cargo
-  validation runs through `bbox_refactor_run` command steps, never via
-  `Bash`. The brofile spec is verified by
-  `rust_refactor_persona_matches_design_spec` in
-  `src/orchestration/brofile.rs`; allow/disallow drift fails the test.
+  Cargo validation runs through `bbox_refactor_run` command steps, never via
+  `Bash`. Spec verified by `rust_refactor_persona_matches_design_spec`.
 
 - **`java-refactor-persona`** at `system-defaults/brofiles/refactor/java-refactor-persona.json`.
-  Same allow/disallow shape as the Rust persona — the refactor + grounding
-  tool surface is language-agnostic at the MCP layer; only the lens prose
-  differs. Java lens calls out `mvn` / `gradle` validation and the
+  Lens calls out `mvn` / `gradle` validation and the
   annotation-processor-invisibility caveat (Lombok `@Slf4j` / `@Data`
-  generate members invisible to dependency analysis). Cross-language
-  symmetry verified by `rust_and_java_refactor_personas_share_tool_surface`
-  in `src/orchestration/brofile.rs`.
+  generate members invisible to dependency analysis).
+
+- **`csharp-refactor-persona`** at `system-defaults/brofiles/refactor/csharp-refactor-persona.json`.
+  Lens calls out `dotnet build` (capture=binlog) validation, the
+  Roslyn-LSP vs Roslyn-sidecar split, and RX-V3 fail-closed semantics on
+  unavailability of either backend.
+
+- **`elixir-refactor-persona`** at `system-defaults/brofiles/refactor/elixir-refactor-persona.json`.
+  Lens calls out the mix-only command allowlist
+  (`mix compile`/`test`/`credo`/`dialyzer`/`format`/`xref`) and the
+  EX-V6 round-trip preservation requirement for writable lanes.
+
+Cross-language symmetry between Rust and Java is verified by
+`rust_and_java_refactor_personas_share_tool_surface` in
+`src/orchestration/brofile.rs`; equivalent drift tests for the C# and
+Elixir personas are not yet in place.
 
 Refactor-atom manifests under `system-defaults/atoms/refactor/*.json` MUST
 bind to one of these personas via a typed ref such as
@@ -400,8 +423,11 @@ A manifest is treated as a refactor atom when it declares
 `subcontract: "refactor/v1"`. The atom install validator hard-rejects:
 
 - `manifest.implementation.kind` other than `profile`.
-- `manifest.implementation.brofile_ref` not in
-  `brofile:rust-refactor-persona@vN` or `brofile:java-refactor-persona@vN`.
+- `manifest.implementation.brofile_ref` not in the
+  `ALLOWED_PERSONAS` list in `src/orchestration/atoms/validate.rs`:
+  `brofile:rust-refactor-persona@vN`, `brofile:java-refactor-persona@vN`,
+  `brofile:csharp-refactor-persona@vN`, or
+  `brofile:elixir-refactor-persona@vN`.
 - `inputs.schema` declaring any `acknowledge_*` field with a `default` value.
   Operator-authority opt-outs must be operator-explicit.
 
