@@ -283,6 +283,14 @@
         "java-extract-code-block"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-convert-method-to-class",
+      "query": "convert a java method to a method object class with execute and constructor fields",
+      "expected_atoms": [
+        "java-convert-method-to-class"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

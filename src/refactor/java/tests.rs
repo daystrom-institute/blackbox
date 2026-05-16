@@ -8308,6 +8308,261 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// convert_method_to_class — note-bd2b7a24
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn convert_method_to_class_void_no_params() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Run.java");
+    let target = dir.path().join("RunHandlerOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Run {\n\
+         \x20   public void runHandler() {\n\
+         \x20       System.out.println(\"hi\");\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("runHandler".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "convert_method_to_class");
+    assert_eq!(plan.edits.len(), 2);
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(target_text.contains("public class RunHandlerOperation"), "class decl: {target_text}");
+    assert!(target_text.contains("public RunHandlerOperation()"), "ctor: {target_text}");
+    assert!(target_text.contains("public void execute()"), "execute sig: {target_text}");
+    assert!(target_text.contains("System.out.println(\"hi\");"), "body: {target_text}");
+    let source_edit = &plan.edits[0].edits[0].replacement;
+    assert!(
+        source_edit.contains("new RunHandlerOperation().execute();"),
+        "delegate: {source_edit}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_with_params_and_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Sum.java");
+    let target = dir.path().join("AddOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Sum {\n\
+         \x20   public int add(int a, int b) {\n\
+         \x20       return a + b;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("add".to_string());
+    params.target = Some(path_string(&target));
+    params.new_text = Some("AddOperation".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(target_text.contains("private final int a;"), "field a: {target_text}");
+    assert!(target_text.contains("private final int b;"), "field b: {target_text}");
+    assert!(target_text.contains("public AddOperation(int a, int b)"), "ctor: {target_text}");
+    assert!(target_text.contains("this.a = a;"), "assign a: {target_text}");
+    assert!(target_text.contains("this.b = b;"), "assign b: {target_text}");
+    assert!(target_text.contains("public int execute()"), "execute sig: {target_text}");
+    assert!(target_text.contains("return a + b;"), "body: {target_text}");
+    let source_edit = &plan.edits[0].edits[0].replacement;
+    assert!(
+        source_edit.contains("return new AddOperation(a, b).execute();"),
+        "delegate: {source_edit}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_preserves_throws_clause() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Reader.java");
+    let target = dir.path().join("ReadFileOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         import java.io.IOException;\n\
+         public class Reader {\n\
+         \x20   public String readFile(String path) throws IOException {\n\
+         \x20       return \"ok\";\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("readFile".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("public String execute() throws IOException"),
+        "throws preserved: {target_text}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_default_class_name_derived_from_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Proc.java");
+    let target = dir.path().join("ProcessOrderOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Proc {\n\
+         \x20   public void processOrder() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("processOrder".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("public class ProcessOrderOperation"),
+        "auto name: {target_text}"
+    );
+}
+
+#[test]
+fn convert_method_to_class_flags_this_references_with_fixme() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Has.java");
+    let target = dir.path().join("PrintOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Has {\n\
+         \x20   private int counter;\n\
+         \x20   public void print() {\n\
+         \x20       this.counter++;\n\
+         \x20       System.out.println(this.counter);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("print".to_string());
+    params.target = Some(path_string(&target));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(
+        target_text.contains("FIXME(method-object)"),
+        "FIXME header expected: {target_text}"
+    );
+    assert_eq!(plan.fixme_count.as_ref().unwrap().warning, 2);
+    assert!(!plan.leftovers.is_empty(), "leftovers documents the this refs");
+}
+
+#[test]
+fn convert_method_to_class_refuses_static_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Stat.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Stat {\n\
+         \x20   public static void run() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("static methods"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_abstract_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Abs.java");
+    let target = dir.path().join("RunOperation.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public abstract class Abs {\n\
+         \x20   public abstract void run();\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("run".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("abstract"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_constructor() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Ctor.java");
+    let target = dir.path().join("CtorOp.java");
+    fs::write(
+        &source,
+        "package p;\n\
+         public class Ctor {\n\
+         \x20   public Ctor() {}\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("Ctor".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("constructor"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_missing_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("None.java");
+    let target = dir.path().join("None2.java");
+    fs::write(&source, "class None { void a() {} }\n").unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("nonexistent".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("not found"), "got: {err}");
+}
+
+#[test]
+fn convert_method_to_class_refuses_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("Src.java");
+    let target = dir.path().join("Existing.java");
+    fs::write(&source, "class Src { void a() {} }\n").unwrap();
+    fs::write(&target, "// already exists\n").unwrap();
+    let mut params = java_plan_params("convert_method_to_class", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("a".to_string());
+    params.target = Some(path_string(&target));
+    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // extract_java_code_block_to_method — note-188c6fc9
 // ─────────────────────────────────────────────────────────────────────
 

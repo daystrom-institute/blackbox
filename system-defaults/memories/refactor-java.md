@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -508,6 +508,35 @@ the workspace-import drain has completed.
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b3. Method Object — convert a method into a standalone class:
+
+```text
+bbox_refactor_plan(
+  kind="convert_method_to_class",
+  source="src/main/java/com/example/Big.java",
+  project_dir="/absolute/project/root",
+  module_name="processOrder",
+  target="src/main/java/com/example/ProcessOrderOperation.java"
+)
+```
+
+The matching atom is `java-convert-method-to-class`. Generates a new
+class with private final fields for each parameter, a constructor that
+assigns them, and an `execute()` method carrying the original body
+verbatim (including throws clause). The original method body becomes
+`return new <Class>(<args>).execute();` (or void variant). New class
+name defaults to PascalCase of the method name + `"Operation"`;
+override via `new_text`.
+
+**v1 limitations**: the generated class has no reference to the
+enclosing instance. Original-body uses of `this.<field>` or `super.<x>`
+get flagged with a `// FIXME(method-object):` header inside `execute()`
+and counted in `fixme_count.warning`. The operator either lifts those
+references to parameters first or hand-edits the generated class to
+take an `Outer` constructor argument. v2 auto-capture is a planned
+follow-up. Refuses static methods, abstract methods, constructors, and
+interface methods.
 
 14b2. Intra-method extraction — lift a statement range into a private helper:
 

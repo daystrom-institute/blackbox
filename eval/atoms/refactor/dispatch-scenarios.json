@@ -649,6 +649,21 @@
         "helper_name",
         "enclosing_method"
       ]
+    },
+    {
+      "id": "dispatch-java-convert-method-to-class-planonly",
+      "atom": "java-convert-method-to-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "module_name": "process",
+        "target": "src/main/java/com/example/ProcessOperation.java",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "class_name"
+      ]
     }
   ]
 }

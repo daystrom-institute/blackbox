@@ -1355,6 +1355,7 @@ mod tests {
             "java_lsp_organize_imports",
             "prune_java_orphans",
             "extract_java_code_block_to_method",
+            "convert_method_to_class",
         ];
 
         for kind in java_plan_kinds {

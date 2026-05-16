@@ -481,6 +481,16 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "java-convert-method-to-class",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:convert_method_to_class",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }
