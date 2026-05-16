@@ -199,27 +199,234 @@ end
 }
 
 // ---------------------------------------------------------------------------
+// extract_elixir_module tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extract_module_moves_a_simple_def() {
+    let body = r#"defmodule Foo do
+  @moduledoc "demo"
+
+  def stay, do: :stay
+
+  @doc "hi"
+  def hello(x), do: x + 1
+
+  def hello(x, y) do
+    x + y
+  end
+
+  defp helper(z), do: z * 2
+end
+"#;
+    let (dir, src) = write_elixir_fixture("extract_src.ex", body);
+    let target = dir.path().join("foo/extracted.ex");
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_module".to_string(),
+        module_name: Some("Foo.Extracted".to_string()),
+        item_names: Some(vec!["hello".to_string()]),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["kind"], "extract_elixir_module");
+    assert_eq!(value["plan_status"], "planned");
+
+    // Confirm both edits emitted: source removal + target creation.
+    let edits = value["edits"].as_array().expect("edits");
+    assert_eq!(edits.len(), 2);
+
+    // Target content present in plan response.
+    let target_edit = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.contains("extracted.ex"))
+                .unwrap_or(false)
+        })
+        .expect("target file edit");
+    let target_content = target_edit["edits"][0]["replacement"].as_str().unwrap();
+    assert!(target_content.contains("defmodule Foo.Extracted do"));
+    assert!(target_content.contains("def hello(x), do: x + 1"));
+    assert!(target_content.contains("def hello(x, y) do"));
+    assert!(target_content.contains("@doc \"hi\""));
+    assert!(!target_content.contains("def stay"));
+    assert!(!target_content.contains("defp helper"));
+
+    // Source removal preserves the rest.
+    let new_source = apply_text_edits(body, &value);
+    assert!(new_source.contains("def stay"));
+    assert!(new_source.contains("defp helper"));
+    assert!(!new_source.contains("def hello"));
+    assert!(!new_source.contains("@doc \"hi\""));
+
+    // moved_items report.
+    let moved = value["moved_items"].as_array().expect("moved_items");
+    assert_eq!(moved.len(), 1);
+    assert_eq!(moved[0]["name"], "hello");
+    assert_eq!(moved[0]["clause_count"], 2);
+    assert_eq!(moved[0]["attached_attributes"], 1);
+    assert_eq!(moved[0]["is_macro"], false);
+}
+
+#[test]
+fn extract_module_refuses_on_missing_item() {
+    let body = r#"defmodule Foo do
+  def existing, do: :ok
+end
+"#;
+    let (dir, src) = write_elixir_fixture("extract_missing.ex", body);
+    let target = dir.path().join("missing.ex");
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_module".to_string(),
+        module_name: Some("Foo.X".to_string()),
+        item_names: Some(vec!["does_not_exist".to_string()]),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(
+        err.to_string().contains("item_not_found"),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn extract_module_refuses_on_use_at_scope_unless_acknowledged() {
+    let body = r#"defmodule Foo do
+  use GenServer
+
+  def hello, do: :world
+end
+"#;
+    let (dir, src) = write_elixir_fixture("extract_use.ex", body);
+    let target = dir.path().join("ext_use.ex");
+    let mut params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_module".to_string(),
+        module_name: Some("Foo.X".to_string()),
+        item_names: Some(vec!["hello".to_string()]),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(
+        err.to_string().contains("use_at_scope"),
+        "got: {err}"
+    );
+
+    // Acknowledge: should proceed.
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("acknowledge_use_at_scope".to_string(), serde_json::Value::Bool(true));
+    params.toml_entries = Some(entries);
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("with ack");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["kind"], "extract_elixir_module");
+}
+
+#[test]
+fn extract_module_refuses_on_defmacro_unless_acknowledged() {
+    let body = r#"defmodule Foo do
+  defmacro frob(x) do
+    quote do
+      unquote(x) + 1
+    end
+  end
+end
+"#;
+    let (dir, src) = write_elixir_fixture("extract_macro.ex", body);
+    let target = dir.path().join("ext_macro.ex");
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_module".to_string(),
+        module_name: Some("Foo.X".to_string()),
+        item_names: Some(vec!["frob".to_string()]),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    let s = err.to_string();
+    assert!(
+        s.contains("defmacro_move") || s.contains("quote_in_moved"),
+        "expected macro/quote refusal, got: {s}"
+    );
+}
+
+#[test]
+fn extract_module_refuses_when_target_exists() {
+    let body = "defmodule Foo do\n  def hi, do: :ok\nend\n";
+    let (dir, src) = write_elixir_fixture("extract_collision.ex", body);
+    let target = dir.path().join("collision.ex");
+    std::fs::write(&target, "defmodule Other do\nend\n").unwrap();
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_module".to_string(),
+        module_name: Some("Foo.X".to_string()),
+        item_names: Some(vec!["hi".to_string()]),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("target_exists"), "got: {err}");
+}
+
+#[test]
+fn extract_module_reports_in_module_call_sites() {
+    let body = r#"defmodule Foo do
+  def hello(x), do: x + 1
+  def caller, do: hello(1)
+  def stay, do: :ok
+end
+"#;
+    let (dir, src) = write_elixir_fixture("extract_callers.ex", body);
+    let target = dir.path().join("hellos.ex");
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_module".to_string(),
+        module_name: Some("Foo.Hellos".to_string()),
+        item_names: Some(vec!["hello".to_string()]),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let sites = value["in_module_call_sites"].as_array().expect("sites");
+    assert_eq!(sites.len(), 1, "got: {sites:?}");
+    assert_eq!(sites[0]["caller"], "hello");
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 
 fn apply_text_edits(source: &str, plan: &serde_json::Value) -> String {
+    // Applies only the edits for the FIRST FileEdit in the plan (i.e., source
+    // file). Target-creation edits are skipped.
     let Some(edits) = plan["edits"].as_array() else {
         return source.to_string();
     };
+    let Some(file_edit) = edits.first() else {
+        return source.to_string();
+    };
+    apply_file_edits_to(source, file_edit)
+}
+
+fn apply_file_edits_to(source: &str, file_edit: &serde_json::Value) -> String {
     let mut out = source.to_string();
-    for file_edit in edits {
-        let Some(text_edits) = file_edit["edits"].as_array() else {
-            continue;
-        };
-        // Apply in reverse byte order to preserve indices.
-        let mut sorted: Vec<&serde_json::Value> = text_edits.iter().collect();
-        sorted.sort_by_key(|e| std::cmp::Reverse(e["byte_start"].as_u64().unwrap_or(0)));
-        for e in sorted {
-            let start = e["byte_start"].as_u64().unwrap_or(0) as usize;
-            let end = e["byte_end"].as_u64().unwrap_or(0) as usize;
-            let replacement = e["replacement"].as_str().unwrap_or("");
-            out.replace_range(start..end, replacement);
-        }
+    let Some(text_edits) = file_edit["edits"].as_array() else {
+        return out;
+    };
+    let mut sorted: Vec<&serde_json::Value> = text_edits.iter().collect();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e["byte_start"].as_u64().unwrap_or(0)));
+    for e in sorted {
+        let start = e["byte_start"].as_u64().unwrap_or(0) as usize;
+        let end = e["byte_end"].as_u64().unwrap_or(0) as usize;
+        let replacement = e["replacement"].as_str().unwrap_or("");
+        out.replace_range(start..end, replacement);
     }
     out
 }

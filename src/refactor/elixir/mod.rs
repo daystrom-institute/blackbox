@@ -26,8 +26,10 @@ use tree_sitter::{Node, Tree};
 use super::ParsedSource;
 use crate::chunker::code::parser_for_language;
 
+pub(crate) mod extract_module;
 pub(crate) mod organize_aliases;
 
+pub(crate) use extract_module::plan_extract_module;
 pub(crate) use organize_aliases::plan_organize_aliases;
 
 // ---------------------------------------------------------------------------
