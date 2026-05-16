@@ -8338,6 +8338,151 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// singletonify_java_holder / singletonify_java_util — production-side
+// note-7c819189 / note-e5439c0a
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn singletonify_holder_converts_public_static_final_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Cols.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         public class Cols {\n\
+         \x20   public static final SiteAdmin SITE_ADMIN = injector.getInstance(SiteAdmin.class);\n\
+         \x20   public static final PlantRepository PLANT_REPO = injector.getInstance(PlantRepository.class);\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("singletonify_java_holder", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_singletonify_java_holder(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let has_singleton = edits.iter().any(|e| e.replacement.contains("@Singleton"));
+    let has_ctor = edits.iter().any(|e| {
+        e.replacement.contains("@Inject")
+            && e.replacement.contains("public Cols(SiteAdmin siteAdmin, PlantRepository plantRepo)")
+    });
+    let has_field_rewrite_a = edits
+        .iter()
+        .any(|e| e.replacement.contains("private final SiteAdmin siteAdmin;"));
+    let has_field_rewrite_b = edits
+        .iter()
+        .any(|e| e.replacement.contains("private final PlantRepository plantRepo;"));
+    assert!(has_singleton, "@Singleton class annotation: {edits:?}");
+    assert!(has_ctor, "@Inject constructor: {edits:?}");
+    assert!(has_field_rewrite_a, "siteAdmin field rewrite: {edits:?}");
+    assert!(has_field_rewrite_b, "plantRepo field rewrite: {edits:?}");
+}
+
+#[test]
+fn singletonify_holder_refuses_when_no_public_static_final_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Empty.java");
+    fs::write(&path, "package p; public class Empty {}\n").unwrap();
+    let mut params = java_plan_params("singletonify_java_holder", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_singletonify_java_holder(&params).unwrap_err().to_string();
+    assert!(err.contains("nothing to singletonify"), "got: {err}");
+}
+
+#[test]
+fn singletonify_holder_item_names_filter_restricts_selection() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Many.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         public class Many {\n\
+         \x20   public static final A A_FIELD = new A();\n\
+         \x20   public static final B B_FIELD = new B();\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("singletonify_java_holder", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.item_names = Some(vec!["A_FIELD".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_singletonify_java_holder(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Only A_FIELD should be in the constructor; B_FIELD untouched.
+    let ctor = edits
+        .iter()
+        .find(|e| e.replacement.contains("public Many("))
+        .unwrap();
+    assert!(ctor.replacement.contains("A aField"));
+    assert!(!ctor.replacement.contains("bField"));
+}
+
+#[test]
+fn singletonify_util_converts_impure_static_method_to_instance() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("UI.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         public class UI {\n\
+         \x20   private static int counter = 0;\n\
+         \x20   public static int next() { counter++; return counter; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("singletonify_java_util", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.item_names = Some(vec!["next".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_singletonify_java_util(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert!(edits.iter().any(|e| e.replacement.contains("@Singleton")));
+    // Static keyword on the `next` method is removed → corresponding
+    // edit deletes the "static " token from the modifiers list.
+    let removed_static = edits.iter().any(|e| {
+        e.replacement.is_empty() && e.byte_end > e.byte_start && {
+            let bytes = std::fs::read(&path).unwrap();
+            let s = std::str::from_utf8(&bytes[e.byte_start..e.byte_end]).unwrap_or("");
+            s.contains("static")
+        }
+    });
+    assert!(removed_static, "should delete `static` keyword: {edits:?}");
+}
+
+#[test]
+fn singletonify_util_refuses_pure_method() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Pure.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         public class Pure {\n\
+         \x20   public static int doubleIt(int n) { return n * 2; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("singletonify_java_util", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.item_names = Some(vec!["doubleIt".to_string()]);
+    let err = plan_singletonify_java_util(&params).unwrap_err().to_string();
+    assert!(err.contains("pure_methods_refused"), "got: {err}");
+}
+
+#[test]
+fn singletonify_util_requires_item_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("X.java");
+    fs::write(
+        &path,
+        "package p; public class X { public static void run() {} }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("singletonify_java_util", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_singletonify_java_util(&params).unwrap_err().to_string();
+    assert!(err.contains("item_names"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // replace_java_static_reference — note-7c819189 / note-e5439c0a / note-7d4f0001
 // ─────────────────────────────────────────────────────────────────────
 
