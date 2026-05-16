@@ -179,6 +179,9 @@ pub(crate) fn plan_test_fixture_extract(p: &RefactorPlanParams) -> Result<String
         replacement: fixture_content.clone(),
     };
 
+    // EX-V6 v1 floor: target file content parses cleanly.
+    super::roundtrip::verify_parse_clean(&fixture_content)?;
+
     let plan = RefactorPlan {
         title: format!(
             "elixir_test_fixture_extract: {} → {} ({} groups)",

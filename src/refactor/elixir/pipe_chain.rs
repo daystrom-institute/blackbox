@@ -151,6 +151,9 @@ pub(crate) fn plan_pipe_chain_extract(p: &RefactorPlanParams) -> Result<String> 
     let mut edits = vec![chain_edit, insert_edit];
     edits.sort_by_key(|e| e.byte_start);
 
+    // EX-V6 v1 floor: post-edit source parses cleanly.
+    super::roundtrip::verify_edits_parse_clean(&parsed.source, &edits)?;
+
     let plan = RefactorPlan {
         title: format!(
             "elixir_pipe_chain_extract: {} → {} ({}..={})",

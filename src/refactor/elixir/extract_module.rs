@@ -317,6 +317,13 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
         new_text: None,
     };
 
+    // EX-V6 v1 floor: verify the post-edit source and the target file body
+    // both parse cleanly.
+    super::roundtrip::verify_edits_parse_clean(&parsed.source, &source_file_edit.edits)?;
+    if let Some(target_text) = target_file_edit.new_text.as_deref() {
+        super::roundtrip::verify_parse_clean(target_text)?;
+    }
+
     // ── in-module call site report (caller rewrite advisory) ─────────────────
     let in_module_call_sites = scan_in_module_call_sites(&parsed.source, defmodule, &by_name);
 

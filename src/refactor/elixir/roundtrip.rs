@@ -40,6 +40,29 @@ pub(crate) fn verify_parse_clean(output: &str) -> Result<()> {
     Ok(())
 }
 
+/// Convenience wrapper used by writable plan kinds: apply the proposed
+/// `TextEdit`s to a copy of `source` (in reverse byte order to preserve
+/// indices) and call [`verify_parse_clean`] on the result.
+pub(crate) fn verify_edits_parse_clean(
+    source: &str,
+    edits: &[crate::refactor::TextEdit],
+) -> Result<()> {
+    let mut probe = source.to_string();
+    let mut sorted: Vec<&crate::refactor::TextEdit> = edits.iter().collect();
+    sorted.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+    for e in sorted {
+        if e.byte_end > probe.len() {
+            return Err(anyhow!(
+                "error.roundtrip_unstable: edit byte_end {} exceeds source length {}",
+                e.byte_end,
+                probe.len()
+            ));
+        }
+        probe.replace_range(e.byte_start..e.byte_end, &e.replacement);
+    }
+    verify_parse_clean(&probe)
+}
+
 /// Strict shape compare. Returns `Ok(())` when input and output trees match
 /// by kind + named-child count + leaf text. Reserved for refactor-no-op /
 /// idempotent flows; intentional restructure refactors don't use this surface

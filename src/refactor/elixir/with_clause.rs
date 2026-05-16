@@ -169,6 +169,9 @@ pub(crate) fn plan_with_clause_extract(p: &RefactorPlanParams) -> Result<String>
     let mut edits = vec![with_edit, insert_edit];
     edits.sort_by_key(|e| e.byte_start);
 
+    // EX-V6 v1 floor: post-edit source parses cleanly.
+    super::roundtrip::verify_edits_parse_clean(&parsed.source, &edits)?;
+
     let plan = RefactorPlan {
         title: format!(
             "elixir_with_clause_extract: {} → {}",

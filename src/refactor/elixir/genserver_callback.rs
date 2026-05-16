@@ -253,6 +253,10 @@ pub(crate) fn plan_extract_genserver_callback_group(p: &RefactorPlanParams) -> R
     source_edits.sort_by_key(|e| e.byte_start);
     source_edits.dedup_by(|a, b| a.byte_start == b.byte_start && a.byte_end == b.byte_end);
 
+    // EX-V6 v1 floor: post-edit source + target file body parse cleanly.
+    super::roundtrip::verify_edits_parse_clean(&parsed.source, &source_edits)?;
+    super::roundtrip::verify_parse_clean(&target_content)?;
+
     let plan = RefactorPlan {
         title: format!(
             "extract_genserver_callback_group: {} → {}",

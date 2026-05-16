@@ -197,6 +197,10 @@ pub(crate) fn plan_extract_behaviour(p: &RefactorPlanParams) -> Result<String> {
         a.byte_start == b.byte_start && a.byte_end == b.byte_end && a.replacement == b.replacement
     });
 
+    // EX-V6 v1 floor: verify the post-edit source + target file parse cleanly.
+    super::roundtrip::verify_edits_parse_clean(&parsed.source, &source_edits)?;
+    super::roundtrip::verify_parse_clean(&target_content)?;
+
     let plan = RefactorPlan {
         title: format!(
             "extract_elixir_behaviour: {} → {}",

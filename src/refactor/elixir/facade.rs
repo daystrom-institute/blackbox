@@ -259,6 +259,9 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
     }
     edits.sort_by_key(|e| e.byte_start);
 
+    // EX-V6 v1 floor: verify the post-edit facade parses cleanly.
+    super::roundtrip::verify_edits_parse_clean(&facade.source, &edits)?;
+
     let plan = RefactorPlan {
         title: format!(
             "add_elixir_facade_delegations: {} ← {}",
