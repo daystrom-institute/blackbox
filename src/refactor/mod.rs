@@ -1772,6 +1772,23 @@ pub fn run_with_ctx(
 
     let steps = expand_refactor_run_steps(&p.steps, &project_dir)?;
 
+    // Resolve the language-scoped workspace transaction adapter
+    // (Phase 2: C# Roslyn sidecar). Phase 1 always returns None — the
+    // adapter calls below are no-ops for Rust/Java/generic kinds and
+    // remain no-ops for C# until the sidecar lands. Mixed-language
+    // step lists refuse here via `error.mixed_workspace_adapters`.
+    let workspace_adapter =
+        workspace_adapter::resolve_workspace_adapter(&steps, &project_dir)?;
+    // Use a deterministic run-id derived from steps + project + now so
+    // sidecar logs are trace-able. We don't pull in the `uuid` crate
+    // just for this — a SHA hash of the structured input suffices.
+    let run_id = compute_run_id(p, &project_dir);
+    if let Some(adapter) = workspace_adapter.as_ref() {
+        // Per the design doc: failing here MUST be benign — the
+        // runner continues with disk-only semantics. Log + drop.
+        let _ = adapter.begin(&run_id, &project_dir);
+    }
+
     for (idx, step) in steps.iter().enumerate() {
         match step {
             RefactorRunStep::Plan { params, optional } => {
@@ -1821,7 +1838,7 @@ pub fn run_with_ctx(
                             }
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1932,7 +1949,7 @@ pub fn run_with_ctx(
                         }
                         Err(err) => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -1978,7 +1995,7 @@ pub fn run_with_ctx(
                         if p.allow_unregistered_paths != Some(true) {
                             if let Err(err) = ensure_path_in_registered_project(&path, projects) {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -1997,7 +2014,7 @@ pub fn run_with_ctx(
                                 if let Err(err) = ensure_git_clean_for_path(&path) {
                                     let cursor = capture_ctx.first_soft_fail_snapshot_idx();
                                     let rollback_errors =
-                                        restore_snapshots_from(&snapshots, cursor);
+                                        rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                     return Ok(serde_json::to_string_pretty(
                                         &RefactorRunResponse {
                                             status: "step_failed".to_string(),
@@ -2019,7 +2036,7 @@ pub fn run_with_ctx(
                                 Err(err) => {
                                     let cursor = capture_ctx.first_soft_fail_snapshot_idx();
                                     let rollback_errors =
-                                        restore_snapshots_from(&snapshots, cursor);
+                                        rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                     return Ok(serde_json::to_string_pretty(
                                         &RefactorRunResponse {
                                             status: "step_failed".to_string(),
@@ -2064,7 +2081,7 @@ pub fn run_with_ctx(
                         Ok(apply_text) => apply_text,
                         Err(err) => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -2083,7 +2100,7 @@ pub fn run_with_ctx(
                             Ok(response) => response,
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -2101,6 +2118,31 @@ pub fn run_with_ctx(
                     let validations = apply_response.validations.clone();
                     let step_written = apply_response.files_written.clone();
                     files_written.extend(step_written.iter().cloned());
+                    // Mirror the applied edit into the language-scoped
+                    // workspace snapshot, when an adapter is in scope.
+                    // We assemble an AppliedPlanDelta from the plan's
+                    // FileEdits / FileMoves and call apply_plan_step.
+                    if status == "ok"
+                        && let Some(adapter) = workspace_adapter.as_ref()
+                    {
+                        let edits: Vec<FileEdit> = refactor_plan.edits.clone();
+                        let moves: Vec<FileMove> = refactor_plan.file_moves.clone();
+                        let created: Vec<PathBuf> = moves
+                            .iter()
+                            .map(|m| PathBuf::from(&m.target_path))
+                            .collect();
+                        let deleted: Vec<PathBuf> = moves
+                            .iter()
+                            .map(|m| PathBuf::from(&m.source_path))
+                            .collect();
+                        let delta = workspace_adapter::AppliedPlanDelta {
+                            edits: &edits,
+                            file_moves: &moves,
+                            created: &created,
+                            deleted: &deleted,
+                        };
+                        let _ = adapter.apply_plan_step(&run_id, &delta);
+                    }
                     reports.push(RefactorRunStepReport {
                         index: idx,
                         op: "plan".to_string(),
@@ -2114,7 +2156,7 @@ pub fn run_with_ctx(
                     });
                     if status != "ok" {
                         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -2159,7 +2201,7 @@ pub fn run_with_ctx(
                 if agent_origin {
                     if let Err(err) = enforce_agent_command_allowlist(command, args, touches) {
                         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                         reports.push(RefactorRunStepReport {
                             index: idx,
                             op: "command".to_string(),
@@ -2216,7 +2258,7 @@ pub fn run_with_ctx(
                             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
                             Err(err) => {
                                 let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                                let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                                let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                                 return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                     status: "step_failed".to_string(),
                                     title: p.title.clone(),
@@ -2254,7 +2296,7 @@ pub fn run_with_ctx(
                             captured_diagnostics_summary: None,
                         });
                         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                             status: "step_failed".to_string(),
                             title: p.title.clone(),
@@ -2339,11 +2381,27 @@ pub fn run_with_ctx(
                     error: command_result.error,
                     captured_diagnostics_summary: captured_diag_summary,
                 });
+                // Mirror touched files into the workspace snapshot —
+                // but only on non-rollback outcomes. Required-failure
+                // takes the rollback branch below and never reaches
+                // this site; Optional / ContinueForRepair both keep
+                // the run going and may have mutated disk before the
+                // command failed.
+                if !touched_paths.is_empty()
+                    && let Some(adapter) = workspace_adapter.as_ref()
+                {
+                    let touches_owned: Vec<PathBuf> = touched_paths.clone();
+                    let mirror = workspace_adapter::AppliedCommandTouches {
+                        touches: &touches_owned,
+                        succeeded: command_result.success,
+                    };
+                    let _ = adapter.apply_command_touches(&run_id, &mirror);
+                }
                 if !command_result.success {
                     match effective_on_failure {
                         OnFailure::Required => {
                             let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-                            let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+                            let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
                             return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
                                 status: "step_failed".to_string(),
                                 title: p.title.clone(),
@@ -2382,7 +2440,7 @@ pub fn run_with_ctx(
     // rollback anchors until this terminal-success gate is passed.
     if confirmed && capture_ctx.has_any_obligation() && !capture_ctx.all_obligations_resolved() {
         let cursor = capture_ctx.first_soft_fail_snapshot_idx();
-        let rollback_errors = restore_snapshots_from(&snapshots, cursor);
+        let rollback_errors = rollback_run(&snapshots, cursor, workspace_adapter.as_ref(), &run_id);
         return Ok(serde_json::to_string_pretty(&RefactorRunResponse {
             status: "obligations_unresolved".to_string(),
             title: p.title.clone(),
@@ -2394,6 +2452,12 @@ pub fn run_with_ctx(
             rollback_errors,
             obligations: capture_ctx.obligation_reports(),
         })?);
+    }
+
+    // Success exit: commit the workspace transaction. Failure is
+    // non-fatal — disk is canonical and already reflects the run.
+    if let Some(adapter) = workspace_adapter.as_ref() {
+        let _ = adapter.commit(&run_id);
     }
 
     Ok(serde_json::to_string_pretty(&RefactorRunResponse {
@@ -4133,6 +4197,47 @@ fn restore_snapshots_from(
 ) -> Vec<String> {
     let start = cursor.unwrap_or(0);
     restore_snapshots(&snapshots[start..])
+}
+
+/// Run-rollback helper. Per the design doc's "Rollback ordering"
+/// rule: disk is canonical, restore it first, *then* tell the
+/// workspace adapter to roll back its in-memory snapshot. Returns
+/// the per-file restore errors from the disk pass (adapter rollback
+/// failure is non-fatal and logged via tracing instead of surfaced
+/// in the response).
+fn rollback_run(
+    snapshots: &[(PathBuf, Option<Vec<u8>>)],
+    cursor: Option<usize>,
+    adapter: Option<&std::sync::Arc<dyn workspace_adapter::WorkspaceTransactionAdapter>>,
+    run_id: &str,
+) -> Vec<String> {
+    let restore_errors = restore_snapshots_from(snapshots, cursor);
+    if let Some(adapter) = adapter
+        && let Err(_e) = adapter.rollback(run_id)
+    {
+        // Sidecar drift is recoverable; the next request relaods the
+        // Solution. We deliberately do not surface this to the
+        // operator response.
+    }
+    restore_errors
+}
+
+/// Deterministic-ish run id used by the workspace adapter for
+/// per-run logs. SHA over (project_dir, title, step count, current
+/// time). Truncated to 16 hex chars for log-line ergonomics.
+fn compute_run_id(p: &RefactorRunParams, project_dir: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(project_dir.to_string_lossy().as_bytes());
+    hasher.update(p.title.as_bytes());
+    let count = p.steps.len() as u64;
+    hasher.update(&count.to_le_bytes());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    hasher.update(&now.to_le_bytes());
+    let hex = format!("{:x}", hasher.finalize());
+    hex[..16].to_string()
 }
 
 fn ensure_non_overlapping(edits: &[TextEdit]) -> Result<()> {
