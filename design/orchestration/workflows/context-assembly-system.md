@@ -53,8 +53,9 @@ producer.
 3. Let callers suppress or replace provider-loaded markdown where providers
    support it.
 4. Add dry-run inspection for the rendered prompt and provider context controls.
-5. Let atoms/workflows populate template inputs without forcing that material
-   into prompt strings.
+5. Let atoms populate template inputs without forcing that material into
+   prompt strings (workflow-backed producers deferred — see Context
+   Producers).
 6. Fix the current `bro_broadcast` resume inconsistency.
 
 ## Non-Goals
@@ -274,9 +275,10 @@ state is needed, it must be summarized by a context producer into
 ## Context Producers
 
 Pre-turn lookup work belongs to an existing orchestration artifact, not to the
-brofile template. A turn may name a `context_producer`, which is an atom or
-workflow reference that returns bounded template input data before the brofile
-template renders.
+brofile template. A turn may name a `context_producer`, an atom reference that
+returns bounded template input data before the brofile template renders. In
+v1 only `atom:*` refs are accepted (see "Workflow producers deferred" below
+for the reasoning).
 
 `context_producer` is turn-local. `first_turn.context_producer` and
 `resume_turn.context_producer` may point at different producers, and either may
@@ -350,19 +352,31 @@ Producer failure policy is **per-turn opt-in**, default render-without:
   template with empty `template_inputs`. Suitable for enrichment producers
   (atom signposts, fresh deltas) where missing extras are acceptable.
 - `context.{first_turn,resume_turn}.on_failure: "fail"`: producer failure
-  fails the turn. To make "leaves the session untouched" precise, the
-  dispatch sequence runs producer invocation **before** any mutating
-  step: producer call → cap check → template render → only then task
-  reservation, task-store insertion, resume-lease acquisition (for
-  `bro_resume`), `dispatch.template_resolved` system event emission, and
-  provider launch. A producer failure on `bro_exec` returns
-  `error.context_producer_failed` to the caller and leaves the task
-  store, lease table, and system-event log unchanged. A producer
-  failure on `bro_resume` does the same: no lease is taken, no provider
-  process is spawned, the session's existing transcript and bro state
-  remain exactly as they were before the resume attempt. Suitable for
-  governance producers whose output is load-bearing (e.g. a
-  packet-derived completion contract a reviewer brofile depends on).
+  fails the turn. The dispatch sequence runs the producer before any
+  *external* side effect (provider launch, `dispatch.template_resolved`
+  system event emission, task-store insertion). The resume-lease table
+  is a special case: current `bro_resume` acquires the lease before
+  building args (`src/tools/dispatch.rs:517`), and broadcast resume does
+  the same (`src/tools/dispatch.rs:1155`). Moving lease acquisition
+  after producer success would let two concurrent resumes both run
+  producers before one wins the lease — a wasted-work race. v1 keeps
+  lease-first, then producer, then render, then external side effects:
+
+  1. Acquire resume lease (for `bro_resume` / broadcast resume).
+  2. Run producer.
+  3. On `on_failure: fail` producer failure, **release the lease** and
+     return `error.context_producer_failed`. The session's existing
+     transcript and bro state remain exactly as they were before the
+     resume attempt; no provider was spawned; no event was emitted; no
+     task-store row was inserted.
+  4. Cap-check, render, emit `dispatch.template_resolved`, insert task,
+     launch provider.
+
+  `bro_exec` follows the same ordering minus the lease step. A producer
+  failure on `bro_exec` returns `error.context_producer_failed` and
+  leaves the task store, lease table, and system-event log unchanged.
+  Suitable for governance producers whose output is load-bearing (e.g.
+  a packet-derived completion contract a reviewer brofile depends on).
 
 `fail` is a v1 flag, not a future knob. Brofile authors choose the mode
 that matches the producer's role; the default protects long-lived bros
@@ -378,10 +392,9 @@ added without changing the contract.
 
 Context producers reuse the existing atom machinery:
 
-- Atom-backed producers provide a compact reusable contract for common
-  population tasks. Deterministic atoms and adapter atoms cover the v1
-  cases; workflow-backed atoms remain allowed *as atoms* if the atom
-  registry's `context_producer` capability check (below) admits them.
+- v1 producers are **deterministic atoms** or **adapter atoms** only.
+  Workflow-backed atoms are excluded from `context_producer` in v1 — see
+  the "Workflow producers deferred" subsection below.
 - Rule packets remain deterministic classifiers/gates inside the atom.
   They select, validate, or stop context population; they do not fetch
   data by themselves.
@@ -390,82 +403,42 @@ Bro dispatch invokes a producer through the atom runtime and consumes only
 its declared output contract. It does not interpret atom internals or MCP
 call plans.
 
-Invocation is by ref kind. In v1 only `atom:*` is supported; see the
-workflow effect model below for why `workflow:*` ships in a follow-up
-phase.
+**Invocation contract:**
 
-- `atom:*`: call the internal atom invocation path with the producer input
-  JSON. The atom must declare a `context_producer` capability and an output
-  schema containing `template_inputs`, `warnings`, and `receipts`.
-- `workflow:*`: **deferred.** Brofile validation rejects workflow refs as
-  `error.workflow_producers_unsupported` until the workflow effect model
-  lands. Producers that need branching or retries should be authored as
-  workflow-backed atoms whose declared implementation kind keeps them
-  inside the atom registry's `context_producer` capability check.
+`atom:*` refs only in v1. The atom must declare
+`capabilities: ["context_producer"]` and an output schema containing
+`template_inputs`, `warnings`, and `receipts`. Brofile validation rejects
+`workflow:*` refs as `error.workflow_producers_unsupported`.
 
-V1 context producers are non-agentic: deterministic atoms, adapter atoms, or
-workflow-backed producers that do not dispatch provider actors. They may call
-read-only tools such as `atom_search`, `atom_describe`, and `bbox_knowledge`
-through existing adapter/hook machinery, and may use rule packets to select,
-validate, or stop. A future phase can explicitly reopen provider-dispatching
-producers, but ordinary `bro_exec` / `bro_resume` must not silently spawn
-another agent before dispatching the requested bro.
+**Atom-manifest enforcement.** Add a `capabilities: Vec<String>` field to
+the atom manifest (today, atoms in `src/orchestration/atoms/types.rs:27`
+and `:132` carry an implementation kind but no capability list). The atom
+registry refuses to install or register an atom that declares
+`context_producer` unless its implementation kind is `deterministic` or
+`adapter`. `profile` atoms (which dispatch provider sessions) and
+`workflow_backed` atoms (which currently cannot be statically verified
+read-only — see below) are both rejected at registration. The rejection
+is loud, not silent: an attempt to install such an atom returns
+`error.context_producer_capability_rejected` naming the disallowed
+implementation kind.
 
-This is enforced mechanically, not by convention. The enforcement points
-are concrete:
-
-**Atom manifests.** Add a `capabilities: Vec<String>` field to the atom
-manifest (today, atoms in `src/orchestration/atoms/types.rs` carry an
-implementation kind but no capability list). Producer atoms declare
-`capabilities: ["context_producer"]`. The atom registry refuses to install
-or register an atom that combines this capability with a `profile`
-implementation kind. Adapter atoms and deterministic atoms are allowed;
-workflow-backed atoms are allowed only if the backing workflow itself
-passes the read-only check below.
-
-**Workflow effect model.** Workflows have no `capabilities` field today
-(`src/workflow/schema.rs:18`) and the workflow spec carries actor nodes,
-hooks, inline subworkflows, and `subworkflow_ref` resolved at dispatch
-time (`src/workflow/schema.rs:208`). `McpCall` is arbitrary
+**Workflow producers deferred.** Workflows have no `capabilities` field
+today (`src/workflow/schema.rs:18`) and the workflow spec carries actor
+nodes, hooks, inline subworkflows, and `subworkflow_ref` resolved at
+dispatch time (`src/workflow/schema.rs:208`). `McpCall` is arbitrary
 `server` + `tool` invocation (`src/workflow/ops.rs:93,865`), and current
 tool filtering checks name-based surface permission, not read-only
-effect metadata (`src/server/surface.rs:203`). Engineering a full
-tool-descriptor "read-only" annotation system is out of scope for v1.
-
-Two concrete choices for v1:
-
-1. **Atom-only producers in v1** (default of this design). Workflow-backed
-   producers are explicitly out of scope for v1. The `context_producer`
-   capability is added to atom manifests only; workflow refs are rejected
-   at brofile validation with `error.workflow_producers_unsupported`.
-   Atom producers already cover the targeted v1 cases (atom signposts,
-   resume deltas) by invoking read-only tools through the adapter layer.
-   Workflow-backed producers can land in a follow-up phase once a real
-   tool-effect annotation lands.
-
-2. **Static-allowlist workflow check as a stretch goal.** If a small,
-   reviewed allowlist is acceptable, the workflow registry can accept
-   workflows that declare `capabilities: ["context_producer"]` and pass
-   a static check over the spec: no actor nodes; no hooks; no
-   subworkflows / `subworkflow_ref`; every `McpCall.tool` is in a
-   hardcoded read-only allowlist (`atom_search`, `atom_describe`,
-   `bbox_knowledge`, `bbox_describe_schema`, `bbox_hybrid_search`,
-   `bbox_inspect_entity`, `bbox_find_paths`, `bbox_ref_size`, plus other
-   names explicitly enumerated in this file when added). Anything not on
-   the allowlist is a reject, even if it is read-only in spirit — the
-   allowlist is the single source of truth and grows by patch.
-
-v1 ships choice 1 unless choice 2 lands as part of the Phase 1 patch
-series; the brofile schema accepts only `atom:*` for `context_producer`
-when choice 1 is in effect. The doc consciously avoids speculative
-workflow-effect plumbing; producers that need branching or retries can
-still be authored as workflow-backed atoms when the atom's implementation
-kind permits it, but the *brofile-visible* contract is atom-only in v1.
+effect metadata (`src/server/surface.rs:203`). A real
+tool-descriptor "read-only" annotation system is the work item that
+unblocks workflow-backed producers. Until that lands, both direct
+`workflow:*` refs and workflow-backed atoms are rejected at registration.
+This is the only loophole-free way to keep dispatch from silently
+acquiring side-effects through a workflow wrapper.
 
 **Producer resolution at dispatch time** then only verifies that the
-referenced atom or workflow carries the `context_producer` capability.
-The hot path does no agentic-shape re-check; registry-time enforcement
-is the single source of truth.
+referenced atom carries the `context_producer` capability and an
+allowed implementation kind. The hot path does no agentic-shape
+re-check; registry-time enforcement is the single source of truth.
 
 For atom signposting, the reusable producer can be an atom such as
 `atom:context/atom-signposts@v1`. Internally, that atom can call `atom_search`,
@@ -484,10 +457,14 @@ The matching template can decide how much of that material to expose:
 {{ prompt }}
 ```
 
-This keeps bro dispatch from becoming a second workflow runtime. If the needed
-population logic has branching, mutation, retries, or complex tool
-orchestration, put that logic in a workflow-backed context producer and pass
-only its summarized output as `template_inputs`.
+This keeps bro dispatch from becoming a second workflow runtime. If the
+needed population logic has branching, mutation, retries, or complex tool
+orchestration, that logic does not belong in a v1 context producer at all.
+Run it upstream of the dispatch — as a regular workflow, a separate
+orchestration arc, or the caller's own code — and let its summarized output
+flow into the brofile through the operator-provided `prompt` instead of
+through `template_inputs`. Workflow-backed producers ship later, once the
+tool-effect annotation work that gates them lands.
 
 Determinism is receipt-based. Search results may change as blackbox state
 changes, so dispatch records the producer ref/version, input hash, result IDs
@@ -626,10 +603,11 @@ remain in tree as the byte-for-byte oracle for the legacy template
 regression suite through Phase 3, and are deleted in Phase 4 once
 dispatch no longer calls them.
 
-The ordering matters because `on_failure: "fail"` must leave durable
-state untouched. All producer/cap/render work runs before any mutating
-step (task reservation, store insertion, lease acquisition, system-event
-emission, provider launch).
+The ordering matters because `on_failure: "fail"` must leave externally
+observable state untouched. The resume-lease step is kept ahead of the
+producer call to preserve current code's race-free single-flight property
+(see Context Producers for the rationale); a failed producer rolls the
+lease back before returning.
 
 `bro_exec`:
 
@@ -650,18 +628,20 @@ emission, provider launch).
 1. Use the requested provider/session ID or resolve the named bro's latest
    provider/session ID.
 2. Resolve the current brofile when a named bro is used.
-3. Build base `PromptRenderContext` for `turn=resume`.
-4. Resolve the resume-turn template (brofile-declared or builtin legacy).
-5. If `context.resume_turn.context_producer` is set, invoke the atom producer
-   and merge its capped `template_inputs`. On `on_failure: fail`, return
-   `error.context_producer_failed` here without proceeding — no lease is
-   taken, no provider process is spawned, the bro's session state is not
-   touched.
-6. Render the resolved template into the final prompt.
-7. Apply provider-default policy and assemble provider argv.
-8. Acquire resume lease, reserve task, insert into task store, emit
-   `dispatch.template_resolved`.
-9. Resume the provider session.
+3. Acquire the resume lease for `(provider, session_id)`. This stays
+   ahead of the producer call to preserve current single-flight
+   semantics.
+4. Build base `PromptRenderContext` for `turn=resume`.
+5. Resolve the resume-turn template (brofile-declared or builtin legacy).
+6. If `context.resume_turn.context_producer` is set, invoke the atom producer
+   and merge its capped `template_inputs`. On `on_failure: fail`, **release
+   the lease** and return `error.context_producer_failed` — no provider
+   process is spawned, no system event is emitted, the bro's session state
+   is not touched.
+7. Render the resolved template into the final prompt.
+8. Apply provider-default policy and assemble provider argv.
+9. Reserve task, insert into task store, emit `dispatch.template_resolved`.
+10. Resume the provider session.
 
 Provider conversation continuity requires only provider + session ID + rendered
 new prompt. The prior transcript remains provider-owned.
@@ -696,8 +676,8 @@ Workflow actor nodes already render `NodeSpec.prompt` from `ArcContext`. That
 rendered node prompt becomes the `prompt` input to the actor brofile's first or
 resume template. Workflow does not need a special context assembly system for
 v1; if workflow-specific context should influence rendering, the bounded
-`workflow` render context and/or a workflow-backed `context_producer` carries
-that contract.
+`workflow` render context carries that contract. (Workflow-backed
+`context_producer` refs ship later — see Context Producers.)
 
 Deterministic and adapter atoms do not use provider prompt templates.
 
@@ -755,21 +735,29 @@ Producer section depends on the `producers` argument on `bro_context`:
   output_hash, elapsed_ms }`. The rendered-prompt preview uses real
   `template_inputs`.
 
-Dry-run is non-dispatching, not pure. Under `producers: "run"`:
+Dry-run is non-dispatching and non-mutating end-to-end under
+`producers: "run"`:
 
-- The producer **may** emit a `dispatch.context_producer.invocation`
-  system event (read-only event log; produces no observable side effect
-  on bros, tasks, knowledge, threads, notes, pins, or whiteboards).
-- The producer **must not** write to the task store, the resume-lease
-  table, the knowledge store, threads, notes, pins, roadmap, or
-  whiteboards, and **must not** call agent-dispatching tools. Since the
-  producer effect model already forbids those tools at registry time,
-  dry-run does not need a separate runtime check; it inherits the
-  guarantee.
+- The producer **must not** emit system events, write to the task store,
+  the resume-lease table, the knowledge store, threads, notes, pins,
+  roadmap, or whiteboards, and **must not** call agent-dispatching tools.
+  System events are durable in current code (`EventHub::emit` at
+  `src/system_events/hub.rs:319` appends to the journal,
+  `src/system_events/store.rs:74` writes and `sync_all`s it, and
+  `src/system_events/hub.rs:324,359` enqueues matching reactions). The
+  producer effect model already forbids agent-dispatching tools and all
+  durable-write tools at registry time; the dry-run runtime adds a
+  blanket "suppress system event emission for this producer invocation"
+  guard at the dispatch layer so even legitimate read-only event reads
+  do not turn into writes through reaction side effects.
 - The producer input carries `dry_run: true` so atoms with optional
   internal bookkeeping (telemetry counters, etc.) can branch if they
   choose. v1 producers are expected to behave identically in either
   mode; the flag is informational, not policy.
+
+The non-dispatching dry-run path also does not call `bro_exec`,
+`bro_resume`, `bro_broadcast`, or any other dispatch tool — the
+non-dispatching property is part of the contract, not just a behavior.
 
 Brofile validation that needs to exercise caps and failure paths should
 use `producers: "run"`. Routine "what would this look like" inspection
@@ -815,10 +803,13 @@ entry; resolution does not depend on filesystem layout alone.
   `BLACKBOX_USER_PROMPTS_DIR` to the env-override allowlist in
   `src/config.rs` (see the existing pattern at `src/config.rs:454` and
   `src/config.rs:1018`); it is not picked up automatically.
-- Add `context_producer` references on turn templates. Producers are atoms or
-  workflows, not inline brofile lookup declarations.
-- Add the non-agentic context-producer invocation contract, output schema,
-  and the `capabilities: ["context_producer"]` registry check.
+- Add `context_producer` references on turn templates. Producers are
+  `atom:*` refs only in v1; `workflow:*` refs are rejected by brofile
+  validation.
+- Add the non-agentic context-producer invocation contract and output
+  schema, the atom-manifest `capabilities: Vec<String>` field, and the
+  registry check that rejects `context_producer` on `profile` or
+  `workflow_backed` atoms.
 - Ship built-in legacy templates (`builtin:prompts/legacy-full@v1` and
   `builtin:prompts/legacy-resume@v1`) reproducing the current
   `apply_ambient` + `apply_brofile_lens` output. When a brofile has no
