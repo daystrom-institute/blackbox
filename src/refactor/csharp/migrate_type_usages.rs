@@ -30,8 +30,7 @@ use walkdir::WalkDir;
 
 use super::lex::{is_ident_char, skip_lex_atom};
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_migrate_type_usages(p: &RefactorPlanParams) -> Result<String> {
@@ -71,8 +70,8 @@ pub fn plan_migrate_type_usages(p: &RefactorPlanParams) -> Result<String> {
         if !is_csharp_source(path) {
             continue;
         }
-        let source = fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let source =
+            fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let text_edits = find_identifier_occurrences(&source, old_text, new_text);
         if text_edits.is_empty() {
             continue;
@@ -178,8 +177,8 @@ fn find_identifier_occurrences(source: &str, old: &str, new: &str) -> Vec<TextEd
         }
         if &bytes[i..i + needle.len()] == needle {
             let before_ok = i == 0 || !is_ident_char(bytes[i - 1]);
-            let after_ok = i + needle.len() == bytes.len()
-                || !is_ident_char(bytes[i + needle.len()]);
+            let after_ok =
+                i + needle.len() == bytes.len() || !is_ident_char(bytes[i + needle.len()]);
             if before_ok && after_ok {
                 edits.push(TextEdit {
                     byte_start: i,

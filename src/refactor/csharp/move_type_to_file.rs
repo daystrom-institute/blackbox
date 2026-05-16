@@ -39,8 +39,7 @@ use super::lex::{
     skip_whitespace,
 };
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_move_type_to_file(p: &RefactorPlanParams) -> Result<String> {
@@ -186,9 +185,7 @@ fn path_string(path: &Path) -> String {
 
 fn refuse_generated_file(path: &Path) -> Result<()> {
     let lower = path.to_str().unwrap_or("").to_ascii_lowercase();
-    if lower.contains("/generated/")
-        || lower.ends_with(".g.cs")
-        || lower.ends_with(".designer.cs")
+    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs")
     {
         bail!("error.generated_file_refusal: `{}`", path.display());
     }
@@ -277,9 +274,7 @@ fn locate_top_level_type(source: &str, type_name: &str) -> Result<TypeLoc> {
                 }
                 let max_back = i.saturating_sub(256);
                 let prefix = std::str::from_utf8(&bytes[max_back..i]).unwrap_or("");
-                let is_partial = prefix
-                    .split_whitespace()
-                    .any(|tok| tok == "partial");
+                let is_partial = prefix.split_whitespace().any(|tok| tok == "partial");
                 let head_start = find_decl_head_start(bytes, i, max_back);
                 // For delegates (single-line), the "body" is up to the `;`.
                 if *kw == b"delegate" {
@@ -489,7 +484,8 @@ mod tests {
 
     #[test]
     fn moves_filescoped_namespaced_class_to_new_file() {
-        let src = "using System;\n\nnamespace Foo.Bar;\n\npublic class A { }\n\npublic class B { }\n";
+        let src =
+            "using System;\n\nnamespace Foo.Bar;\n\npublic class A { }\n\npublic class B { }\n";
         let dir = tempfile::tempdir().unwrap();
         let s = dir.path().join("AB.cs");
         let t = dir.path().join("A.cs");
@@ -501,13 +497,18 @@ mod tests {
         let source_edit = &edits[0];
         let target_edit = &edits[1];
         let mut source_after = src.to_string();
-        let te: Vec<TextEdit> =
-            serde_json::from_value(source_edit["edits"].clone()).unwrap();
+        let te: Vec<TextEdit> = serde_json::from_value(source_edit["edits"].clone()).unwrap();
         for e in te.iter().rev() {
             source_after.replace_range(e.byte_start..e.byte_end, &e.replacement);
         }
-        assert!(!source_after.contains("public class A"), "source still has A: {source_after}");
-        assert!(source_after.contains("public class B"), "source lost B: {source_after}");
+        assert!(
+            !source_after.contains("public class A"),
+            "source still has A: {source_after}"
+        );
+        assert!(
+            source_after.contains("public class B"),
+            "source lost B: {source_after}"
+        );
         let target_text: Vec<TextEdit> =
             serde_json::from_value(target_edit["edits"].clone()).unwrap();
         let target_body = &target_text[0].replacement;

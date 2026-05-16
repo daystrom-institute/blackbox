@@ -132,10 +132,7 @@ impl ScopeTree {
     fn rebuild_name_index(&mut self) {
         self.by_name.clear();
         for (idx, decl) in self.declarations.iter().enumerate() {
-            self.by_name
-                .entry(decl.name.clone())
-                .or_default()
-                .push(idx);
+            self.by_name.entry(decl.name.clone()).or_default().push(idx);
         }
     }
 }
@@ -272,8 +269,13 @@ fn collect_block(block: Node<'_>, source: &str, tree: &mut ScopeTree) {
             "try_statement" | "try_with_resources_statement" => {
                 collect_try_like(stmt, source, tree);
             }
-            "if_statement" | "while_statement" | "do_statement" | "synchronized_statement"
-            | "switch_expression" | "switch_statement" | "labeled_statement" => {
+            "if_statement"
+            | "while_statement"
+            | "do_statement"
+            | "synchronized_statement"
+            | "switch_expression"
+            | "switch_statement"
+            | "labeled_statement" => {
                 descend_for_nested(stmt, source, tree);
             }
             "block" => {
@@ -461,14 +463,12 @@ fn collect_catch_param(param: Node<'_>, body: Node<'_>, source: &str, tree: &mut
     let name_node = param.child_by_field_name("name");
     // tree-sitter-java catch_formal_parameter has a `catch_type` child
     // without a field name (rather than `type` field used by formal_parameter).
-    let type_node = param
-        .child_by_field_name("type")
-        .or_else(|| {
-            let mut cursor = param.walk();
-            param
-                .named_children(&mut cursor)
-                .find(|c| c.kind() == "catch_type")
-        });
+    let type_node = param.child_by_field_name("type").or_else(|| {
+        let mut cursor = param.walk();
+        param
+            .named_children(&mut cursor)
+            .find(|c| c.kind() == "catch_type")
+    });
     let (Some(name_n), Some(type_n)) = (name_node, type_node) else {
         return;
     };
@@ -646,14 +646,14 @@ pub fn analyze_range(
                                         && decl.name_byte_end <= range_end;
                                     if !decl_inside {
                                         let mutated = is_mutation_target(n);
-                                        let entry = capture_map
-                                            .entry(text.to_string())
-                                            .or_insert(CapturedRef {
+                                        let entry = capture_map.entry(text.to_string()).or_insert(
+                                            CapturedRef {
                                                 name: text.to_string(),
                                                 type_text: decl.type_text.clone(),
                                                 is_final: decl.is_final,
                                                 mutated: false,
-                                            });
+                                            },
+                                        );
                                         if mutated {
                                             entry.mutated = true;
                                         }
@@ -729,8 +729,7 @@ pub fn analyze_range(
             if n.start_byte() >= method_end {
                 continue;
             }
-            let fully_after =
-                n.start_byte() >= range_end && n.end_byte() <= method_end;
+            let fully_after = n.start_byte() >= range_end && n.end_byte() <= method_end;
             if fully_after
                 && matches!(n.kind(), "identifier" | "type_identifier")
                 && !is_declaration_site(n)
@@ -860,7 +859,10 @@ mod tests {
     }
 
     fn byte_after_first(source: &str, needle: &str) -> usize {
-        source.find(needle).unwrap_or_else(|| panic!("needle `{needle}` not found")) + needle.len()
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("needle `{needle}` not found"))
+            + needle.len()
     }
 
     #[test]
@@ -869,7 +871,11 @@ mod tests {
         let tree = parse_java(src);
         let method = find_method(tree.root_node(), src, "run");
         let scope = ScopeTree::build_from_method(method, src);
-        let names: Vec<&str> = scope.declarations().iter().map(|d| d.name.as_str()).collect();
+        let names: Vec<&str> = scope
+            .declarations()
+            .iter()
+            .map(|d| d.name.as_str())
+            .collect();
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));
     }
@@ -1110,7 +1116,9 @@ mod tests {
         let r_end = src[r_start..].find(';').unwrap() + r_start + 1;
         let analysis = analyze_range(&scope, method, r_start, r_end, src);
         assert!(
-            analysis.enclosing_class_refs.contains(&"counter".to_string()),
+            analysis
+                .enclosing_class_refs
+                .contains(&"counter".to_string()),
             "enclosing_refs={:?}",
             analysis.enclosing_class_refs
         );
@@ -1128,7 +1136,9 @@ mod tests {
         let r_end = src[r_start..].find(';').unwrap() + r_start + 1;
         let analysis = analyze_range(&scope, method, r_start, r_end, src);
         assert!(
-            !analysis.enclosing_class_refs.contains(&"Integer".to_string()),
+            !analysis
+                .enclosing_class_refs
+                .contains(&"Integer".to_string()),
             "type names should not appear in enclosing_class_refs"
         );
     }
@@ -1195,4 +1205,3 @@ mod tests {
         assert_eq!(resolved.kind, DeclKind::TryResource);
     }
 }
-

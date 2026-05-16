@@ -47,7 +47,10 @@ fn strip_optional_obsidian_front_matter(raw: &str) -> &str {
     let Some(rest) = raw.strip_prefix(YAML_DELIMITER) else {
         return raw;
     };
-    let Some(rest) = rest.strip_prefix('\n').or_else(|| rest.strip_prefix("\r\n")) else {
+    let Some(rest) = rest
+        .strip_prefix('\n')
+        .or_else(|| rest.strip_prefix("\r\n"))
+    else {
         return raw;
     };
 

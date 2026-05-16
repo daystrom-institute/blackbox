@@ -15,8 +15,8 @@
     }
   ],
   "expected_entity_refs": [
-    "project_file:af6f7145:e4a35df8:fcfb818c512192e0eb153ded50c813e3c509a2fa889c8004af700738e192509f:2",
-    "project_file:af6f7145:3f15b6df:6204cfe9b46e90cd26cf0bdbff71b95a1f39fec84d16d46b7c2408dfb7ae4c4c:46"
+    "project_file:d723917f:e4a35df8:fcfb818c512192e0eb153ded50c813e3c509a2fa889c8004af700738e192509f:2",
+    "project_file:d723917f:3f15b6df:6204cfe9b46e90cd26cf0bdbff71b95a1f39fec84d16d46b7c2408dfb7ae4c4c:46"
   ],
   "required_evidence": {
     "kind": "path",

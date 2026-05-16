@@ -25,7 +25,10 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
-use super::{call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file, top_level_defmodule};
+use super::{
+    call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file,
+    top_level_defmodule,
+};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
     ValidationStep, resolve_path, sha256_hex, toml_bool,
@@ -146,8 +149,7 @@ pub(crate) fn plan_extract_genserver_callback_group(p: &RefactorPlanParams) -> R
                         entry.client_api = true;
                     }
                     // Async if the def body invokes Task.* or async_request.
-                    let is_async = parsed.source[stmt.byte_range()]
-                        .contains("Task.")
+                    let is_async = parsed.source[stmt.byte_range()].contains("Task.")
                         || parsed.source[stmt.byte_range()].contains("async_nolink");
                     async_classification.insert(fname.clone(), is_async);
                 }
@@ -254,7 +256,10 @@ pub(crate) fn plan_extract_genserver_callback_group(p: &RefactorPlanParams) -> R
     let plan = RefactorPlan {
         title: format!(
             "extract_genserver_callback_group: {} → {}",
-            source_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             target_module
         ),
         kind: "extract_genserver_callback_group".to_string(),
@@ -325,7 +330,10 @@ fn first_arg_pattern_text(def_call: Node<'_>, source: &str) -> Option<String> {
 fn pat_matches_msg_tag(pat: &str, wanted: &HashSet<&str>) -> Option<String> {
     let trimmed = pat.trim();
     if let Some(rest) = trimmed.strip_prefix(':') {
-        let name = rest.split(|c: char| !c.is_ascii_alphanumeric() && c != '_').next().unwrap_or("");
+        let name = rest
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or("");
         if wanted.contains(name) {
             return Some(name.to_string());
         }

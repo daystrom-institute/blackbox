@@ -98,9 +98,11 @@ pub(crate) fn plan_inline_module(p: &RefactorPlanParams) -> Result<String> {
         )
     })?;
     let source_module_name =
-        super::module_deps::defmodule_full_name_pub(source_defmod, &source.source).unwrap_or_else(|| "Inlined".to_string());
+        super::module_deps::defmodule_full_name_pub(source_defmod, &source.source)
+            .unwrap_or_else(|| "Inlined".to_string());
     let target_module_name =
-        super::module_deps::defmodule_full_name_pub(target_defmod, &target.source).unwrap_or_else(|| "Target".to_string());
+        super::module_deps::defmodule_full_name_pub(target_defmod, &target.source)
+            .unwrap_or_else(|| "Target".to_string());
 
     // Inject the source's entire defmodule (verbatim) before the target's
     // closing `end`.
@@ -128,7 +130,10 @@ pub(crate) fn plan_inline_module(p: &RefactorPlanParams) -> Result<String> {
     super::roundtrip::verify_edits_parse_clean(&target.source, std::slice::from_ref(&target_edit))?;
 
     let plan = RefactorPlan {
-        title: format!("inline_elixir_module: {} → {}", source_module_name, target_module_name),
+        title: format!(
+            "inline_elixir_module: {} → {}",
+            source_module_name, target_module_name
+        ),
         kind: "inline_elixir_module".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
@@ -147,12 +152,10 @@ pub(crate) fn plan_inline_module(p: &RefactorPlanParams) -> Result<String> {
                 new_text: None,
             },
         ],
-        validations: vec![
-            ValidationStep::TreeSitterNoErrors {
-                path: target_path.to_string_lossy().into_owned(),
-                byte_range: None,
-            },
-        ],
+        validations: vec![ValidationStep::TreeSitterNoErrors {
+            path: target_path.to_string_lossy().into_owned(),
+            byte_range: None,
+        }],
         items: Vec::new(),
         leftovers: Vec::new(),
         captured_variables: Vec::new(),

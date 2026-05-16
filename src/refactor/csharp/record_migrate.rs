@@ -24,8 +24,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_to_record_migrate(p: &RefactorPlanParams) -> Result<String> {
@@ -118,9 +117,7 @@ fn operator_flag(p: &RefactorPlanParams, name: &str) -> bool {
 
 fn refuse_generated_file(path: &Path) -> Result<()> {
     let lower = path.to_str().unwrap_or("").to_ascii_lowercase();
-    if lower.contains("/generated/")
-        || lower.ends_with(".g.cs")
-        || lower.ends_with(".designer.cs")
+    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs")
     {
         bail!(
             "error.generated_file_refusal: `{}` matches the generated-file guard pattern",
@@ -189,8 +186,7 @@ fn locate_class(source: &str, class_name: &str) -> Result<ClassLocation> {
                 let body_start = j;
                 let body_end = find_matching_close_brace(bytes, body_start)
                     .ok_or_else(|| anyhow!("error.unbalanced_class_braces"))?;
-                let access_modifier =
-                    find_access_modifier_for_class(bytes, i);
+                let access_modifier = find_access_modifier_for_class(bytes, i);
                 let head_start = find_statement_start(bytes, i);
                 return Ok(ClassLocation {
                     head_start,
@@ -399,10 +395,7 @@ struct RecordProperty {
     name: String,
 }
 
-fn extract_record_properties(
-    source: &str,
-    class: &ClassLocation,
-) -> Result<Vec<RecordProperty>> {
+fn extract_record_properties(source: &str, class: &ClassLocation) -> Result<Vec<RecordProperty>> {
     // Properties look like: `<modifiers> <Type> <Name> { get; ... }`
     // We accept get-only (`get;` or `get; init;` or `get; private set;`).
     let body = &source[class.body_start + 1..class.body_end];
@@ -492,8 +485,7 @@ fn extract_record_properties(
                 i += 1;
                 continue;
             };
-            let prop_body =
-                std::str::from_utf8(&bytes[i + 1..prop_body_end]).unwrap_or("");
+            let prop_body = std::str::from_utf8(&bytes[i + 1..prop_body_end]).unwrap_or("");
             if !prop_body.contains("get;") {
                 i = prop_body_end + 1;
                 continue;
@@ -640,6 +632,9 @@ mod tests {
             serde_json::from_value(plan["edits"][0]["edits"].clone()).unwrap();
         assert_eq!(text_edits.len(), 1);
         let rep = &text_edits[0].replacement;
-        assert!(rep.contains("public record Foo(int X, string Name);"), "{rep}");
+        assert!(
+            rep.contains("public record Foo(int X, string Name);"),
+            "{rep}"
+        );
     }
 }

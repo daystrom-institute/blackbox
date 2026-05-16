@@ -47,8 +47,8 @@
 //!   `this.X`). The Method Object isn't the same identity as the
 //!   enclosing instance; refuse.
 
-use super::*;
 use super::scope::{ScopeTree, analyze_range};
+use super::*;
 use crate::refactor::java::lombokify::formal_parameters;
 use std::collections::HashMap;
 
@@ -98,7 +98,9 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
     let method_node = find_method_in_class(class_node, method_name, &parsed.source)
         .ok_or_else(|| anyhow!("method `{method_name}` not found"))?;
     if method_node.kind() == "constructor_declaration" {
-        bail!("convert_method_to_class does not operate on constructors (use a factory-class refactor instead)");
+        bail!(
+            "convert_method_to_class does not operate on constructors (use a factory-class refactor instead)"
+        );
     }
     if has_java_modifier_node(method_node, "static") {
         bail!(
@@ -134,9 +136,7 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
         .map(str::to_string)
         .unwrap_or_else(|| derive_class_name(method_name));
     if !is_pascal_case_identifier(&class_name) {
-        bail!(
-            "class name `{class_name}` is not a valid PascalCase Java identifier"
-        );
+        bail!("class name `{class_name}` is not a valid PascalCase Java identifier");
     }
 
     // -----------------------------------------------------------------
@@ -183,7 +183,11 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
     // rewritten to bare `field` references.
     // -----------------------------------------------------------------
 
-    let rewritten_body = rewrite_body(&body_text, body_node.start_byte(), &this_field_access_ranges);
+    let rewritten_body = rewrite_body(
+        &body_text,
+        body_node.start_byte(),
+        &this_field_access_ranges,
+    );
 
     let target_pkg = resolve_java_target_package(p, &parsed.source, &source_path, &target_path)
         .ok()
@@ -191,10 +195,8 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
     let prelude = java_default_target_prelude(p, &parsed.source, target_pkg.as_deref());
 
     // Constructor param list = (original method params) + (captured fields).
-    let mut all_ctor_params: Vec<(String, String)> = params
-        .iter()
-        .map(|(t, n)| (t.clone(), n.clone()))
-        .collect();
+    let mut all_ctor_params: Vec<(String, String)> =
+        params.iter().map(|(t, n)| (t.clone(), n.clone())).collect();
     for (name, type_text) in &enclosing_field_captures {
         all_ctor_params.push((type_text.clone(), name.clone()));
     }
@@ -210,8 +212,7 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
     );
 
     // Caller-side call: `new MO(originalArgs..., this.captured...).execute()`.
-    let mut all_call_args: Vec<String> =
-        params.iter().map(|(_, n)| n.clone()).collect();
+    let mut all_call_args: Vec<String> = params.iter().map(|(_, n)| n.clone()).collect();
     for (name, _) in &enclosing_field_captures {
         all_call_args.push(format!("this.{name}"));
     }
@@ -245,7 +246,8 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
     let plan = RefactorPlan {
         title: format!(
             "convert {}.{} → Method Object class {} ({} captured field(s)) at {}",
-            java_class_simple_name(class_node, &parsed.source).unwrap_or_else(|| "(unnamed)".into()),
+            java_class_simple_name(class_node, &parsed.source)
+                .unwrap_or_else(|| "(unnamed)".into()),
             method_name,
             class_name,
             enclosing_field_captures.len(),
@@ -322,7 +324,10 @@ fn collect_class_fields(class_node: Node<'_>, source: &str) -> HashMap<String, S
     out
 }
 
-fn collect_class_method_names(class_node: Node<'_>, source: &str) -> std::collections::HashSet<String> {
+fn collect_class_method_names(
+    class_node: Node<'_>,
+    source: &str,
+) -> std::collections::HashSet<String> {
     let bytes = source.as_bytes();
     let mut out = std::collections::HashSet::new();
     let Some(body) = class_node.child_by_field_name("body") else {
@@ -541,8 +546,7 @@ fn refuse_mutated_enclosing_fields(
     captures: &[(String, String)],
 ) -> Result<()> {
     let bytes = source.as_bytes();
-    let names: std::collections::HashSet<&str> =
-        captures.iter().map(|(n, _)| n.as_str()).collect();
+    let names: std::collections::HashSet<&str> = captures.iter().map(|(n, _)| n.as_str()).collect();
     let mut stack = vec![body_node];
     while let Some(n) = stack.pop() {
         let mut c = n.walk();
@@ -584,7 +588,11 @@ fn refuse_mutated_enclosing_fields(
     Ok(())
 }
 
-fn mutation_target_name(node: Node<'_>, bytes: &[u8], names: &std::collections::HashSet<&str>) -> Option<String> {
+fn mutation_target_name(
+    node: Node<'_>,
+    bytes: &[u8],
+    names: &std::collections::HashSet<&str>,
+) -> Option<String> {
     match node.kind() {
         "field_access" => {
             let obj = node.child_by_field_name("object")?;
@@ -631,11 +639,7 @@ fn rewrite_body(body_text: &str, body_start: usize, prefix_ranges: &[(usize, usi
     out
 }
 
-fn find_method_in_class<'a>(
-    class_node: Node<'a>,
-    name: &str,
-    source: &str,
-) -> Option<Node<'a>> {
+fn find_method_in_class<'a>(class_node: Node<'a>, name: &str, source: &str) -> Option<Node<'a>> {
     let body = class_node.child_by_field_name("body")?;
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
@@ -667,7 +671,10 @@ fn collect_throws_clause(method_node: Node<'_>, source: &str) -> String {
 
 fn derive_class_name(method_name: &str) -> String {
     let mut chars = method_name.chars();
-    let first = chars.next().map(|c| c.to_uppercase().to_string()).unwrap_or_default();
+    let first = chars
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_default();
     let rest: String = chars.collect();
     format!("{first}{rest}Operation")
 }

@@ -13,15 +13,14 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lsp_types::{
-    RenameParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, request::Rename,
+    RenameParams, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    request::Rename,
 };
 use reqwest::Url;
 
 use crate::projects::Language;
 use crate::refactor::{
-    PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep,
-    csharp::empty_plan, rust,
+    PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan, rust,
 };
 
 pub fn plan_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
@@ -64,9 +63,7 @@ pub fn plan_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<Stri
     let position = rust::byte_to_lsp_position(&source, position_byte);
 
     let manager = ctx.lsp.as_ref().ok_or_else(|| {
-        anyhow!(
-            "error.lsp_unavailable: csharp_lsp_rename requires the LSP session manager (RX-V3)"
-        )
+        anyhow!("error.lsp_unavailable: csharp_lsp_rename requires the LSP session manager (RX-V3)")
     })?;
 
     let source_uri = Url::from_file_path(&source_path)

@@ -24,8 +24,7 @@ use super::lex::{
     skip_lex_atom, skip_whitespace,
 };
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_primary_ctor_migrate(p: &RefactorPlanParams) -> Result<String> {
@@ -55,7 +54,7 @@ pub fn plan_primary_ctor_migrate(p: &RefactorPlanParams) -> Result<String> {
             .iter()
             .map(|c| format!("({})", c.param_signature))
             .collect();
-    bail!(
+        bail!(
             "error.multiple_constructors: class `{class_name}` has {} constructors {}; primary-ctor migration requires exactly one assignment-only ctor",
             ctors.len(),
             names.join(", ")
@@ -146,14 +145,9 @@ fn path_string(path: &Path) -> String {
 
 fn refuse_generated_file(path: &Path) -> Result<()> {
     let lower = path.to_str().unwrap_or("").to_ascii_lowercase();
-    if lower.contains("/generated/")
-        || lower.ends_with(".g.cs")
-        || lower.ends_with(".designer.cs")
+    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs")
     {
-        bail!(
-            "error.generated_file_refusal: `{}`",
-            path.display()
-        );
+        bail!("error.generated_file_refusal: `{}`", path.display());
     }
     Ok(())
 }
@@ -370,8 +364,8 @@ fn find_constructors(source: &str, class: &ClassLoc, class_name: &str) -> Result
             }
             let body_close = find_matching_close_brace(body, body_open)
                 .ok_or_else(|| anyhow!("error.unbalanced_ctor_braces"))?;
-            let ctor_body_text = std::str::from_utf8(&body[body_open + 1..body_close])
-                .unwrap_or("");
+            let ctor_body_text =
+                std::str::from_utf8(&body[body_open + 1..body_close]).unwrap_or("");
             let assignment_only = is_assignment_only(ctor_body_text);
             let head_start = find_ctor_head_start(body, i);
             out.push(Ctor {
@@ -438,10 +432,7 @@ fn chain_args_match_param_names(args_text: &str, names: &[String]) -> bool {
     if provided.len() != names.len() {
         return false;
     }
-    provided
-        .iter()
-        .zip(names.iter())
-        .all(|(p, n)| p == n)
+    provided.iter().zip(names.iter()).all(|(p, n)| p == n)
 }
 
 fn is_assignment_only(body_text: &str) -> bool {
@@ -458,9 +449,7 @@ fn is_assignment_only(body_text: &str) -> bool {
             }
             (b'/', Some(b'*')) => {
                 i += 2;
-                while i + 1 < bytes.len()
-                    && !(bytes[i] == b'*' && bytes[i + 1] == b'/')
-                {
+                while i + 1 < bytes.len() && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
                     i += 1;
                 }
                 i = (i + 2).min(bytes.len());
@@ -499,8 +488,10 @@ fn find_simple_assign_op(s: &str) -> Option<usize> {
         if b == b'=' {
             let prev = if i > 0 { bytes[i - 1] } else { b' ' };
             let next = bytes.get(i + 1).copied().unwrap_or(b' ');
-            if matches!(prev, b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^')
-                || next == b'='
+            if matches!(
+                prev,
+                b'=' | b'!' | b'<' | b'>' | b'+' | b'-' | b'*' | b'/' | b'%' | b'&' | b'|' | b'^'
+            ) || next == b'='
             {
                 continue;
             }

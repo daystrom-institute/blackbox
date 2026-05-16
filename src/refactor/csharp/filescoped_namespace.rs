@@ -34,8 +34,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 use sha2::{Digest, Sha256};
 
@@ -51,11 +50,10 @@ pub fn plan_filescoped_namespace(p: &RefactorPlanParams) -> Result<String> {
         format!("convert {display} to file-scoped namespace"),
         SemanticStatus::SyntaxOnly,
     );
-    plan.validations
-        .push(ValidationStep::TreeSitterNoErrors {
-            path: display.clone(),
-            byte_range: None,
-        });
+    plan.validations.push(ValidationStep::TreeSitterNoErrors {
+        path: display.clone(),
+        byte_range: None,
+    });
     plan.edits = edits;
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -113,12 +111,9 @@ fn compute_edit(source: &str, path: &Path) -> Result<Vec<FileEdit>> {
                 // Block-scoped — record. Find the matching close brace.
                 let open = scan.cursor;
                 scan.cursor += 1;
-                let close = scan
-                    .find_matching_close_brace()
-                    .ok_or_else(|| anyhow!(
-                        "error.unbalanced_namespace_braces in {}",
-                        path.display()
-                    ))?;
+                let close = scan.find_matching_close_brace().ok_or_else(|| {
+                    anyhow!("error.unbalanced_namespace_braces in {}", path.display())
+                })?;
                 // Advance past the close brace so the next find_top_level_keyword
                 // call doesn't decrement depth below zero on it.
                 scan.cursor = close + 1;
@@ -242,9 +237,7 @@ impl<'a> Scanner<'a> {
                 Some(b'/') if self.bytes.get(self.cursor + 1) == Some(&b'*') => {
                     self.cursor += 2;
                     while self.cursor + 1 < self.bytes.len() {
-                        if self.bytes[self.cursor] == b'*'
-                            && self.bytes[self.cursor + 1] == b'/'
-                        {
+                        if self.bytes[self.cursor] == b'*' && self.bytes[self.cursor + 1] == b'/' {
                             self.cursor += 2;
                             break;
                         }
@@ -301,14 +294,11 @@ impl<'a> Scanner<'a> {
                 continue;
             }
             if depth == 0
-                && (self.cursor == 0
-                    || !is_ident_char(self.bytes[self.cursor - 1]))
+                && (self.cursor == 0 || !is_ident_char(self.bytes[self.cursor - 1]))
                 && self.bytes[self.cursor..].starts_with(keyword)
             {
                 let after = self.cursor + keyword.len();
-                if after >= self.bytes.len()
-                    || !is_ident_char(self.bytes[after])
-                {
+                if after >= self.bytes.len() || !is_ident_char(self.bytes[after]) {
                     let pos = self.cursor;
                     self.cursor = after;
                     return Some(pos);
@@ -431,9 +421,7 @@ impl<'a> Scanner<'a> {
             (Some(b'/'), Some(b'*')) => {
                 self.cursor += 2;
                 while self.cursor + 1 < self.bytes.len() {
-                    if self.bytes[self.cursor] == b'*'
-                        && self.bytes[self.cursor + 1] == b'/'
-                    {
+                    if self.bytes[self.cursor] == b'*' && self.bytes[self.cursor + 1] == b'/' {
                         self.cursor += 2;
                         return true;
                     }

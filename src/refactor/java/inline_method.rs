@@ -184,7 +184,11 @@ pub(crate) fn plan_inline_java_method(p: &RefactorPlanParams) -> Result<String> 
             if other_parsed.language != "java" {
                 continue;
             }
-            let calls = collect_call_sites(other_parsed.tree.root_node(), method_name, &other_parsed.source);
+            let calls = collect_call_sites(
+                other_parsed.tree.root_node(),
+                method_name,
+                &other_parsed.source,
+            );
             if calls.is_empty() {
                 continue;
             }
@@ -282,9 +286,7 @@ fn classify_body(
     if stmts.is_empty() {
         bail!("method `{method_name}` has an empty body");
     }
-    let stmt_text = |n: Node<'_>| -> String {
-        source[n.start_byte()..n.end_byte()].to_string()
-    };
+    let stmt_text = |n: Node<'_>| -> String { source[n.start_byte()..n.end_byte()].to_string() };
     if stmts.len() == 1 {
         let n = stmts[0];
         match n.kind() {
@@ -429,12 +431,16 @@ fn body_shape_to_text(
     arguments: &[String],
 ) -> Result<String> {
     match shape {
-        BodyShape::SingleReturn(expr) => {
-            Ok(substitute_params_in_expression(expr, param_names, arguments))
-        }
-        BodyShape::SingleVoidStmt(stmt) => {
-            Ok(substitute_params_in_expression(stmt, param_names, arguments))
-        }
+        BodyShape::SingleReturn(expr) => Ok(substitute_params_in_expression(
+            expr,
+            param_names,
+            arguments,
+        )),
+        BodyShape::SingleVoidStmt(stmt) => Ok(substitute_params_in_expression(
+            stmt,
+            param_names,
+            arguments,
+        )),
         BodyShape::MultiVoidStmts(stmts) => Ok(stmts
             .iter()
             .map(|s| substitute_params_in_expression(s, param_names, arguments))
@@ -443,11 +449,7 @@ fn body_shape_to_text(
     }
 }
 
-fn find_method_by_name<'a>(
-    class_node: Node<'a>,
-    name: &str,
-    source: &str,
-) -> Option<Node<'a>> {
+fn find_method_by_name<'a>(class_node: Node<'a>, name: &str, source: &str) -> Option<Node<'a>> {
     let body = class_node.child_by_field_name("body")?;
     let mut cursor = body.walk();
     for child in body.named_children(&mut cursor) {
@@ -499,19 +501,13 @@ fn check_stmt_safe(
         let kind = n.kind();
         match kind {
             "this" | "super" => {
-                bail!(
-                    "inline_java_method: body of `{method_name}` uses `{kind}` — refuse"
-                );
+                bail!("inline_java_method: body of `{method_name}` uses `{kind}` — refuse");
             }
             "method_invocation" => {
-                bail!(
-                    "inline_java_method: body of `{method_name}` calls another method — refuse"
-                );
+                bail!("inline_java_method: body of `{method_name}` calls another method — refuse");
             }
             "field_access" => {
-                bail!(
-                    "inline_java_method: body of `{method_name}` reads a field — refuse"
-                );
+                bail!("inline_java_method: body of `{method_name}` reads a field — refuse");
             }
             "identifier" => {
                 let Ok(text) = n.utf8_text(bytes) else {
@@ -534,11 +530,7 @@ fn check_stmt_safe(
     Ok(())
 }
 
-fn collect_call_sites<'a>(
-    node: Node<'a>,
-    method_name: &str,
-    source: &str,
-) -> Vec<Node<'a>> {
+fn collect_call_sites<'a>(node: Node<'a>, method_name: &str, source: &str) -> Vec<Node<'a>> {
     let bytes = source.as_bytes();
     let mut out = Vec::new();
     let mut stack = vec![node];

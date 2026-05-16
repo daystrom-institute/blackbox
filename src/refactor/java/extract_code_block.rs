@@ -49,8 +49,8 @@
 //! - `impl_name` — enclosing class name when source has multiple
 //!   classes.
 
-use super::*;
 use super::scope::{ScopeTree, analyze_range};
+use super::*;
 
 pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
@@ -63,11 +63,11 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         .old_text
         .as_deref()
         .filter(|text| !text.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow!("old_text is required for extract_java_code_block_to_method")
-        })?;
+        .ok_or_else(|| anyhow!("old_text is required for extract_java_code_block_to_method"))?;
     let helper_name = p.module_name.as_deref().ok_or_else(|| {
-        anyhow!("module_name (the new helper's name) is required for extract_java_code_block_to_method")
+        anyhow!(
+            "module_name (the new helper's name) is required for extract_java_code_block_to_method"
+        )
     })?;
     if !is_java_identifier(helper_name) {
         bail!("module_name `{helper_name}` is not a valid Java identifier");
@@ -99,8 +99,8 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
             .ok_or_else(|| anyhow!("no class declaration found in {}", source_path.display()))?
     };
 
-    let enclosing_method =
-        find_enclosing_method_node(class_node, region_start, region_end).ok_or_else(|| {
+    let enclosing_method = find_enclosing_method_node(class_node, region_start, region_end)
+        .ok_or_else(|| {
             anyhow!(
                 "old_text is not fully enclosed by a method_declaration or \
                  constructor_declaration inside class `{}`",
@@ -238,9 +238,7 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
             (Some("void"), _) => ("void".to_string(), None),
             (Some(t), _) => (
                 t.to_string(),
-                operator_return_var.or_else(|| {
-                    inferred_return.as_ref().map(|(_, n)| n.clone())
-                }),
+                operator_return_var.or_else(|| inferred_return.as_ref().map(|(_, n)| n.clone())),
             ),
             (None, Some((ty, name))) => (ty.clone(), Some(name.clone())),
             (None, None) => ("void".to_string(), None),
@@ -277,7 +275,9 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
     // operator-confirmed) variable declared INSIDE the range, the
     // extracted text already contains its declaration; the return is
     // synthesized after.
-    let extracted = selected.trim_end_matches(|c: char| c.is_whitespace()).to_string();
+    let extracted = selected
+        .trim_end_matches(|c: char| c.is_whitespace())
+        .to_string();
     let helper_body = if is_void {
         extracted.clone()
     } else {
@@ -490,9 +490,7 @@ fn method_body_indent_for(class_node: Node<'_>, source: &str) -> String {
         }
         let mut bc = child.walk();
         for member in child.named_children(&mut bc) {
-            if member.kind() == "method_declaration"
-                || member.kind() == "constructor_declaration"
-            {
+            if member.kind() == "method_declaration" || member.kind() == "constructor_declaration" {
                 let start = member.start_byte();
                 let bytes = source.as_bytes();
                 let mut line_start = start;
@@ -523,10 +521,7 @@ fn reindent_block(text: &str, indent: &str) -> String {
 fn format_helper_insert(source: &str, enclosing_end: usize, helper_decl: &str) -> String {
     let bytes = source.as_bytes();
     let after = enclosing_end;
-    let next_two = (
-        bytes.get(after).copied(),
-        bytes.get(after + 1).copied(),
-    );
+    let next_two = (bytes.get(after).copied(), bytes.get(after + 1).copied());
     let prefix = match next_two {
         (Some(b'\n'), Some(b'\n')) => "",
         (Some(b'\n'), _) => "\n",

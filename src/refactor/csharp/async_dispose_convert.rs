@@ -44,8 +44,7 @@ use super::lex::{
     skip_whitespace,
 };
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_async_dispose_convert(p: &RefactorPlanParams) -> Result<String> {
@@ -157,9 +156,7 @@ fn path_string(path: &Path) -> String {
 
 fn refuse_generated_file(path: &Path) -> Result<()> {
     let lower = path.to_str().unwrap_or("").to_ascii_lowercase();
-    if lower.contains("/generated/")
-        || lower.ends_with(".g.cs")
-        || lower.ends_with(".designer.cs")
+    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs")
     {
         bail!("error.generated_file_refusal: `{}`", path.display());
     }
@@ -197,9 +194,7 @@ fn locate_class(source: &str, class_name: &str) -> Result<ClassLoc> {
                 // Lookback to detect `partial`.
                 let max_back = i.saturating_sub(256);
                 let prefix = std::str::from_utf8(&bytes[max_back..i]).unwrap_or("");
-                let is_partial = prefix
-                    .split_whitespace()
-                    .any(|tok| tok == "partial");
+                let is_partial = prefix.split_whitespace().any(|tok| tok == "partial");
                 // Forward: find inheritance clause and body.
                 let mut j = name_end;
                 let mut inh_start: Option<usize> = None;
@@ -228,7 +223,9 @@ fn locate_class(source: &str, class_name: &str) -> Result<ClassLoc> {
                         end -= 1;
                     }
                     inh_end = Some(end);
-                    std::str::from_utf8(&bytes[s..end]).unwrap_or("").to_string()
+                    std::str::from_utf8(&bytes[s..end])
+                        .unwrap_or("")
+                        .to_string()
                 });
                 let body_end = find_matching_close_brace(bytes, body_start)
                     .ok_or_else(|| anyhow!("error.unbalanced_class_braces"))?;
@@ -322,16 +319,12 @@ mod tests {
     fn adds_iasyncdisposable_and_dispose_async() {
         let src = "public class Foo : IDisposable {\n    public void Dispose() {\n        // cleanup\n    }\n}\n";
         let dir = write(src);
-        let json =
-            plan_async_dispose_convert(&p(&dir.path().join("Foo.cs"), "Foo")).unwrap();
+        let json = plan_async_dispose_convert(&p(&dir.path().join("Foo.cs"), "Foo")).unwrap();
         let plan: serde_json::Value = serde_json::from_str(&json).unwrap();
         let text_edits: Vec<TextEdit> =
             serde_json::from_value(plan["edits"][0]["edits"].clone()).unwrap();
         let out = apply(src, &text_edits);
-        assert!(
-            out.contains(": IDisposable, IAsyncDisposable"),
-            "{out}"
-        );
+        assert!(out.contains(": IDisposable, IAsyncDisposable"), "{out}");
         assert!(
             out.contains("public async global::System.Threading.Tasks.ValueTask DisposeAsync()"),
             "{out}"

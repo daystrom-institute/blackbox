@@ -44,18 +44,20 @@ pub(crate) fn plan_with_clause_extract(p: &RefactorPlanParams) -> Result<String>
         .and_then(|m| m.get("anchor_line"))
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow!("toml_entries.anchor_line is required"))? as usize;
-    let column = toml
-        .and_then(|m| m.get("anchor_column"))
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.anchor_column is required"))? as usize;
+    let column =
+        toml.and_then(|m| m.get("anchor_column"))
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow!("toml_entries.anchor_column is required"))? as usize;
     let start_idx = toml
         .and_then(|m| m.get("extract_start_clause"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.extract_start_clause (1-based) is required"))? as usize;
+        .ok_or_else(|| anyhow!("toml_entries.extract_start_clause (1-based) is required"))?
+        as usize;
     let end_idx = toml
         .and_then(|m| m.get("extract_end_clause"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.extract_end_clause (1-based) is required"))? as usize;
+        .ok_or_else(|| anyhow!("toml_entries.extract_end_clause (1-based) is required"))?
+        as usize;
     let extracted_name = p
         .module_name
         .as_deref()
@@ -73,9 +75,7 @@ pub(crate) fn plan_with_clause_extract(p: &RefactorPlanParams) -> Result<String>
         bail!("error.bad_input(code=invalid_range): clause indices are 1-based");
     }
     if end_idx < start_idx {
-        bail!(
-            "error.bad_input(code=range_inverted): end {end_idx} < start {start_idx}"
-        );
+        bail!("error.bad_input(code=range_inverted): end {end_idx} < start {start_idx}");
     }
     if end_idx > clauses.len() {
         bail!(
@@ -123,7 +123,10 @@ pub(crate) fn plan_with_clause_extract(p: &RefactorPlanParams) -> Result<String>
 
     // Rewrite the with block: replace the extracted range with
     // `{:ok, last_binding} <- extracted_name(params)`.
-    let replacement_clause = format!("{{:ok, {last_binding}}} <- {extracted_name_clone}({})", params.join(", "));
+    let replacement_clause = format!(
+        "{{:ok, {last_binding}}} <- {extracted_name_clone}({})",
+        params.join(", ")
+    );
 
     let mut rebuilt = String::new();
     rebuilt.push_str("with ");
@@ -157,8 +160,12 @@ pub(crate) fn plan_with_clause_extract(p: &RefactorPlanParams) -> Result<String>
     };
 
     // Insert extracted_fn before defmodule's closing end.
-    let defmod = top_level_defmodule(&parsed.tree, &parsed.source)
-        .ok_or_else(|| anyhow!("error.bad_input(code=no_defmodule): {}", source_path.display()))?;
+    let defmod = top_level_defmodule(&parsed.tree, &parsed.source).ok_or_else(|| {
+        anyhow!(
+            "error.bad_input(code=no_defmodule): {}",
+            source_path.display()
+        )
+    })?;
     let insert_at = defmodule_body_end(defmod, &parsed.source);
     let insert_edit = TextEdit {
         byte_start: insert_at,
@@ -175,7 +182,10 @@ pub(crate) fn plan_with_clause_extract(p: &RefactorPlanParams) -> Result<String>
     let plan = RefactorPlan {
         title: format!(
             "elixir_with_clause_extract: {} → {}",
-            source_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             extracted_name
         ),
         kind: "elixir_with_clause_extract".to_string(),

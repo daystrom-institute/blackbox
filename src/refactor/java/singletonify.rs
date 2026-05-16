@@ -458,7 +458,8 @@ pub(crate) fn plan_singletonify_java_util(p: &RefactorPlanParams) -> Result<Stri
         bail!("no public static methods found on class `{class_name}`");
     }
     let static_field_names = collect_class_static_field_names(class_node, &parsed.source);
-    let class_method_names_static: HashSet<String> = methods.iter().map(|m| m.name.clone()).collect();
+    let class_method_names_static: HashSet<String> =
+        methods.iter().map(|m| m.name.clone()).collect();
 
     let mut to_convert: Vec<&UtilMethod> = Vec::new();
     let mut refused_pure: Vec<String> = Vec::new();
@@ -469,8 +470,12 @@ pub(crate) fn plan_singletonify_java_util(p: &RefactorPlanParams) -> Result<Stri
             not_found.push(sel.clone());
             continue;
         };
-        if is_pure_method(m.node, &parsed.source, &static_field_names, &class_method_names_static)
-        {
+        if is_pure_method(
+            m.node,
+            &parsed.source,
+            &static_field_names,
+            &class_method_names_static,
+        ) {
             refused_pure.push(sel.clone());
         } else {
             to_convert.push(m);
@@ -502,7 +507,9 @@ pub(crate) fn plan_singletonify_java_util(p: &RefactorPlanParams) -> Result<Stri
             // Delete the `static ` token (including trailing space).
             let mut delete_end = e;
             let bytes = parsed.source.as_bytes();
-            while delete_end < bytes.len() && (bytes[delete_end] == b' ' || bytes[delete_end] == b'\t') {
+            while delete_end < bytes.len()
+                && (bytes[delete_end] == b' ' || bytes[delete_end] == b'\t')
+            {
                 delete_end += 1;
             }
             edits.push(TextEdit {

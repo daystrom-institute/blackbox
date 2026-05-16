@@ -131,7 +131,9 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
     let partition_obj = toml
         .and_then(|m| m.get("partition"))
         .and_then(|v| v.as_object())
-        .ok_or_else(|| anyhow!("toml_entries.partition is required (object: target_module → [tags])"))?;
+        .ok_or_else(|| {
+            anyhow!("toml_entries.partition is required (object: target_module → [tags])")
+        })?;
     let partition = parse_partition(partition_obj)?;
 
     let selection_mode = match toml
@@ -150,12 +152,8 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         .and_then(|v| v.as_str())
     {
         Some("group_to_same_bucket") | None => DuplicatePolicy::GroupToSameBucket,
-        Some("explicit_subkeys") => bail!(
-            "explicit_subkeys policy is v2 — not implemented in v1"
-        ),
-        Some(other) => bail!(
-            "error.bad_input(code=invalid_duplicate_tag_policy): `{other}`"
-        ),
+        Some("explicit_subkeys") => bail!("explicit_subkeys policy is v2 — not implemented in v1"),
+        Some(other) => bail!("error.bad_input(code=invalid_duplicate_tag_policy): `{other}`"),
     };
 
     let target_dir = toml
@@ -210,7 +208,10 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
     let mut non_tag_clauses: Vec<usize> = Vec::new();
     for (i, clause) in clauses.iter().enumerate() {
         match &clause.primary_tag {
-            Some(tag) => primary_tag_to_clauses.entry(tag.clone()).or_default().push(i),
+            Some(tag) => primary_tag_to_clauses
+                .entry(tag.clone())
+                .or_default()
+                .push(i),
             None => non_tag_clauses.push(i),
         }
     }
@@ -291,7 +292,8 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
     // Walk all moved-clause bodies. Local calls (bare identifier or
     // __MODULE__.fn) resolve to defps in the parent module if a defp by that
     // name exists. Record the resolution.
-    let local_defps: BTreeMap<(String, usize), Node<'_>> = collect_local_defps(&body_stmts, &parsed.source);
+    let local_defps: BTreeMap<(String, usize), Node<'_>> =
+        collect_local_defps(&body_stmts, &parsed.source);
     let mut helper_reach: HelperReach = HelperReach::default();
     for &i in &moved_indices {
         let clause = &clauses[i];
@@ -437,10 +439,8 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
             if let Some(tag) = &clause.primary_tag {
                 if let Some(idxs) = primary_tag_to_clauses.get(tag) {
                     if idxs.len() > 1 {
-                        dup_groups.insert(
-                            tag.clone(),
-                            idxs.iter().map(|&i| clauses[i].line).collect(),
-                        );
+                        dup_groups
+                            .insert(tag.clone(), idxs.iter().map(|&i| clauses[i].line).collect());
                     }
                 }
             }
@@ -494,13 +494,8 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
             let clause = &clauses[i];
             if k == 0 {
                 // First clause of this tag: replace with dispatch wrapper.
-                let dispatch = render_dispatch_wrapper(
-                    &fn_name,
-                    arity,
-                    tag,
-                    &parsed_matcher,
-                    bucket,
-                );
+                let dispatch =
+                    render_dispatch_wrapper(&fn_name, arity, tag, &parsed_matcher, bucket);
                 source_edits.push(TextEdit {
                     byte_start: clause.attr_start,
                     byte_end: trailing_newline_end(&parsed.source, clause.byte_end),
@@ -662,10 +657,7 @@ impl HeadMatcher {
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| anyhow!("discriminator.binding is required"))?
                     .to_string(),
-                primary: o
-                    .get("primary")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
+                primary: o.get("primary").and_then(|v| v.as_bool()).unwrap_or(false),
                 secondary: o
                     .get("secondary")
                     .and_then(|v| v.as_bool())
@@ -708,11 +700,7 @@ impl HeadMatcher {
     /// The discriminator binding may be e.g. `"%Op{kind: $TAG}"` — we look for
     /// the literal sub-pattern that matches a `:atom` at the discriminator's
     /// arg_index.
-    fn extract_primary_tag(
-        &self,
-        clause_sig: Node<'_>,
-        source: &str,
-    ) -> Option<String> {
+    fn extract_primary_tag(&self, clause_sig: Node<'_>, source: &str) -> Option<String> {
         let arg_idx = self.primary_arg_index();
         let arg_node = clause_signature_arg_at(clause_sig, source, arg_idx)?;
         // The arg node could be `map`, `struct`, etc. Walk it looking for a
@@ -979,12 +967,10 @@ fn scan_helper_calls(
     // as arity 0; resolving by exact arity would miss pipe-fed calls. v1
     // accepts the over-approximation: every local-name match is recorded.
     let local_names_to_keys: HashMap<&str, Vec<&(String, usize)>> =
-        local_defps
-            .keys()
-            .fold(HashMap::new(), |mut m, k| {
-                m.entry(k.0.as_str()).or_default().push(k);
-                m
-            });
+        local_defps.keys().fold(HashMap::new(), |mut m, k| {
+            m.entry(k.0.as_str()).or_default().push(k);
+            m
+        });
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         if n.kind() == "call" {
@@ -1013,11 +999,40 @@ fn guard_is_preservable(guard_text: &str, bucket_helpers: &BTreeSet<(String, usi
     // guard OR present in bucket_helpers, the guard is preservable.
     // Built-in Elixir guard set (partial).
     const BUILTIN_GUARDS: &[&str] = &[
-        "is_atom", "is_binary", "is_bitstring", "is_boolean", "is_float", "is_function",
-        "is_integer", "is_list", "is_map", "is_nil", "is_number", "is_pid", "is_port",
-        "is_reference", "is_tuple", "is_map_key", "abs", "byte_size", "div", "elem",
-        "hd", "length", "map_size", "node", "rem", "round", "self", "tl", "trunc",
-        "tuple_size", "in", "and", "or", "not",
+        "is_atom",
+        "is_binary",
+        "is_bitstring",
+        "is_boolean",
+        "is_float",
+        "is_function",
+        "is_integer",
+        "is_list",
+        "is_map",
+        "is_nil",
+        "is_number",
+        "is_pid",
+        "is_port",
+        "is_reference",
+        "is_tuple",
+        "is_map_key",
+        "abs",
+        "byte_size",
+        "div",
+        "elem",
+        "hd",
+        "length",
+        "map_size",
+        "node",
+        "rem",
+        "round",
+        "self",
+        "tl",
+        "trunc",
+        "tuple_size",
+        "in",
+        "and",
+        "or",
+        "not",
     ];
     // Crude: extract bare-identifier-followed-by-paren occurrences.
     let mut i = 0;
@@ -1033,7 +1048,11 @@ fn guard_is_preservable(guard_text: &str, bucket_helpers: &BTreeSet<(String, usi
         }
         let ident = &guard_text[start..i];
         // Skip `Foo.bar`-style (preceding dot already consumed; rare in guards)
-        let prev = if start > 0 { Some(bytes[start - 1]) } else { None };
+        let prev = if start > 0 {
+            Some(bytes[start - 1])
+        } else {
+            None
+        };
         if prev == Some(b'.') {
             continue;
         }
@@ -1083,9 +1102,9 @@ fn parse_partition(
             .ok_or_else(|| anyhow!("partition[{bucket}] must be a list of atom strings"))?;
         let mut tags = Vec::new();
         for t in arr {
-            let s = t
-                .as_str()
-                .ok_or_else(|| anyhow!("partition[{bucket}] entries must be atom strings like \":foo\""))?;
+            let s = t.as_str().ok_or_else(|| {
+                anyhow!("partition[{bucket}] entries must be atom strings like \":foo\"")
+            })?;
             let cleaned = s.trim().trim_start_matches(':');
             tags.push(cleaned.to_string());
         }

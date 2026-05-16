@@ -28,8 +28,8 @@
 //! - `error.empty_mapping`
 //! - `error.no_matches`
 
-use super::*;
 use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
+use super::*;
 use std::collections::HashMap;
 
 pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String> {
@@ -126,12 +126,12 @@ pub(crate) fn plan_java_split_provider(p: &RefactorPlanParams) -> Result<String>
     // delegate_field;` declaration has no remaining consumers in this
     // file — delete it.
     let called_getters = collect_called_getters_on_delegate(class_node, &parsed, &delegate_field);
-    let mapped_getters: std::collections::HashSet<&str> = effective_mapping
-        .keys()
-        .map(String::as_str)
-        .collect();
-    let full_coverage =
-        !called_getters.is_empty() && called_getters.iter().all(|g| mapped_getters.contains(g.as_str()));
+    let mapped_getters: std::collections::HashSet<&str> =
+        effective_mapping.keys().map(String::as_str).collect();
+    let full_coverage = !called_getters.is_empty()
+        && called_getters
+            .iter()
+            .all(|g| mapped_getters.contains(g.as_str()));
     let mut field_deleted = false;
     if full_coverage {
         if let Some(field_decl) =

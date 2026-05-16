@@ -90,9 +90,7 @@ pub(crate) fn verify_structural_equivalence(input: &str, output: &str) -> Result
         Vec::new(),
     );
     if let Some(d) = diff {
-        return Err(anyhow!(
-            "error.roundtrip_unstable: {d}"
-        ));
+        return Err(anyhow!("error.roundtrip_unstable: {d}"));
     }
     Ok(())
 }

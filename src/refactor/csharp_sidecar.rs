@@ -62,8 +62,12 @@ impl CsharpWorkerPool {
         if let Some(w) = workers.get(&canonical) {
             return Ok(Arc::clone(w));
         }
-        let worker = CsharpWorker::spawn(&canonical)
-            .with_context(|| format!("spawning blackbox-csharp-worker for {}", canonical.display()))?;
+        let worker = CsharpWorker::spawn(&canonical).with_context(|| {
+            format!(
+                "spawning blackbox-csharp-worker for {}",
+                canonical.display()
+            )
+        })?;
         let arc = Arc::new(Mutex::new(worker));
         workers.insert(canonical, Arc::clone(&arc));
         Ok(arc)
@@ -194,11 +198,7 @@ impl RoslynWorkspaceTransactionAdapter {
         let params = BeginTransactionParams {
             run_id: run_id.to_string(),
         };
-        let _: TransactionResult = self
-            .worker
-            .lock()
-            .unwrap()
-            .call(method, params)?;
+        let _: TransactionResult = self.worker.lock().unwrap().call(method, params)?;
         Ok(())
     }
 }
@@ -336,8 +336,10 @@ pub(crate) fn resolve_csharp_adapter(
     // semantics. RX-V3 fail-closed applies at the plan-kind level, not
     // here — the adapter is best-effort for snapshot coherence.
     match pool().worker_for(project) {
-        Ok(worker) => Ok(Some(Arc::new(RoslynWorkspaceTransactionAdapter::new(worker))
-            as Arc<dyn WorkspaceTransactionAdapter>)),
+        Ok(worker) => Ok(Some(
+            Arc::new(RoslynWorkspaceTransactionAdapter::new(worker))
+                as Arc<dyn WorkspaceTransactionAdapter>,
+        )),
         Err(_) => Ok(None),
     }
 }
@@ -401,7 +403,10 @@ mod tests {
         let steps = vec![plan_step("csharp_lsp_rename")];
         let dir = tempfile::tempdir().unwrap();
         let result = resolve_csharp_adapter(&steps, dir.path()).unwrap();
-        assert!(result.is_some(), "expected adapter when worker is available");
+        assert!(
+            result.is_some(),
+            "expected adapter when worker is available"
+        );
     }
 
     #[test]

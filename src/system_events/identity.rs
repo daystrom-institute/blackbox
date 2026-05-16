@@ -620,12 +620,13 @@ mod tests {
 
     #[test]
     fn system_events_readme_shows_catalog_model_and_bounded_username() {
-        // examples/system-events/README.md drives operator copy-paste —
-        // it must use the catalog model ID and the bounded username
-        // shape produced by IdentityRequest::username() for the long ID.
+        // examples/system-events/system-events-example.md drives operator
+        // copy-paste — it must use the catalog model ID and the bounded
+        // username shape produced by IdentityRequest::username() for the long
+        // ID.
         let readme = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/examples/system-events/README.md"
+            "/examples/system-events/system-events-example.md"
         ))
         .unwrap();
         assert!(

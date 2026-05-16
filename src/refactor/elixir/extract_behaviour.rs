@@ -30,7 +30,10 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
-use super::{call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file, top_level_defmodule};
+use super::{
+    call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file,
+    top_level_defmodule,
+};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
     ValidationStep, resolve_path, sha256_hex, toml_bool,
@@ -198,7 +201,10 @@ pub(crate) fn plan_extract_behaviour(p: &RefactorPlanParams) -> Result<String> {
     let plan = RefactorPlan {
         title: format!(
             "extract_elixir_behaviour: {} → {}",
-            source_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             behaviour_module
         ),
         kind: "extract_elixir_behaviour".to_string(),
@@ -265,10 +271,7 @@ fn render_callback(name: &str, arity: usize, spec: Option<&str>) -> String {
         format!("@callback {name}() :: any()")
     } else {
         let arg_types: Vec<&str> = args.iter().map(|_| "any()").collect();
-        format!(
-            "@callback {name}({}) :: any()",
-            arg_types.join(", ")
-        )
+        format!("@callback {name}({}) :: any()", arg_types.join(", "))
     }
 }
 

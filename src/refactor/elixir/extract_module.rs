@@ -39,7 +39,10 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
-use super::{call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file, top_level_defmodule};
+use super::{
+    call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file,
+    top_level_defmodule,
+};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
     ValidationStep, resolve_path, sha256_hex, toml_bool, toml_str_array,
@@ -106,10 +109,9 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
             target_path.display()
         );
     }
-    let target_module_name = p
-        .module_name
-        .as_deref()
-        .ok_or_else(|| anyhow!("module_name (target defmodule name) is required for extract_elixir_module"))?;
+    let target_module_name = p.module_name.as_deref().ok_or_else(|| {
+        anyhow!("module_name (target defmodule name) is required for extract_elixir_module")
+    })?;
 
     let item_names: Vec<String> = p.item_names.as_deref().unwrap_or(&[]).to_vec();
     if item_names.is_empty() {
@@ -146,7 +148,8 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
                 .to_string();
             bail!(
                 "error.bad_input(code=use_at_scope): source has `{}` at line {} (use injects callbacks/imports/macros the planner cannot see); pass acknowledge_use_at_scope=true to proceed",
-                preview, line
+                preview,
+                line
             );
         }
     }
@@ -158,7 +161,8 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
     let wanted: HashSet<&str> = item_names.iter().map(String::as_str).collect();
     let mut moved: Vec<MovedItem> = Vec::new();
     let mut selected_indices: Vec<usize> = Vec::new();
-    let mut by_name: std::collections::BTreeMap<String, Vec<usize>> = std::collections::BTreeMap::new();
+    let mut by_name: std::collections::BTreeMap<String, Vec<usize>> =
+        std::collections::BTreeMap::new();
     for (idx, entry) in classified.iter().enumerate() {
         if let ClassifiedKind::Definition { name, .. } = &entry.kind {
             if wanted.contains(name.as_str()) {
@@ -170,7 +174,10 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
 
     // Verify every requested name found at least one clause.
     let found_names: HashSet<&str> = by_name.keys().map(String::as_str).collect();
-    let missing: Vec<&&str> = wanted.iter().filter(|n| !found_names.contains(*n)).collect();
+    let missing: Vec<&&str> = wanted
+        .iter()
+        .filter(|n| !found_names.contains(*n))
+        .collect();
     if !missing.is_empty() {
         let names: Vec<String> = missing.iter().map(|n| (**n).to_string()).collect();
         bail!(
@@ -189,7 +196,13 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
         for &i in idxs {
             clause_count += 1;
             attached_attrs += classified[i].attached_attr_idxs.len();
-            if let ClassifiedKind::Definition { arity, is_macro: m, contains_quote: q, .. } = &classified[i].kind {
+            if let ClassifiedKind::Definition {
+                arity,
+                is_macro: m,
+                contains_quote: q,
+                ..
+            } = &classified[i].kind
+            {
                 arity_set.insert(*arity);
                 is_macro |= *m;
                 contains_quote |= *q;
@@ -324,7 +337,10 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
     let plan = RefactorPlan {
         title: format!(
             "extract_elixir_module: {} → {}",
-            source_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             target_module_name
         ),
         kind: "extract_elixir_module".to_string(),
@@ -461,14 +477,22 @@ fn is_attached_attribute_name(name: &str) -> bool {
 }
 
 /// Public-def restricted variant used by `add_elixir_facade_delegations`.
-pub(super) fn def_name_and_arity_public(def_call: Node<'_>, source: &str) -> Option<(String, usize)> {
+pub(super) fn def_name_and_arity_public(
+    def_call: Node<'_>,
+    source: &str,
+) -> Option<(String, usize)> {
     if call_target_name(def_call, source)? != "def" {
         return None;
     }
     def_name_and_arity(def_call, source)
 }
 
-fn stmt_contains_kind(node: Node<'_>, kind: &str, source: &str, target_filter: impl Fn(&str) -> bool) -> bool {
+fn stmt_contains_kind(
+    node: Node<'_>,
+    kind: &str,
+    source: &str,
+    target_filter: impl Fn(&str) -> bool,
+) -> bool {
     let mut stack = vec![node];
     while let Some(n) = stack.pop() {
         if n.kind() == kind {

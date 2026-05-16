@@ -39,12 +39,12 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use crate::refactor::RefactorPlanParams;
 use crate::refactor::csharp_sidecar::CsharpWorkerPool;
 use crate::refactor::csharp_sidecar_protocol::{
     DiscoveredGenerator, EnumerateGeneratorsResult, LoadParams, LoadResult, LoadStatusResult,
     METHOD_ENUMERATE_GENERATORS, METHOD_GET_LOAD_STATUS, METHOD_LOAD_SOLUTION,
 };
-use crate::refactor::RefactorPlanParams;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GeneratorInputsManifest {
@@ -175,9 +175,12 @@ pub fn plan_partial_class_audit(p: &RefactorPlanParams) -> Result<String> {
         generators: generators_result.generators.clone(),
         undetected_generators: undetected,
         unknown_external_generators: unknown_external,
-        manifest_path: manifest
-            .as_ref()
-            .map(|_| project_root.join(".blackbox/csharp.json").to_string_lossy().to_string()),
+        manifest_path: manifest.as_ref().map(|_| {
+            project_root
+                .join(".blackbox/csharp.json")
+                .to_string_lossy()
+                .to_string()
+        }),
         manifest_declared_count: manifest_lookup.len(),
         partial_type_files,
         recommended_acknowledge_flag,
@@ -215,9 +218,12 @@ fn resolve_workspace_path(project_root: &Path, source: &str) -> Result<PathBuf> 
             _ => continue,
         };
     }
-    slnx.or(sln)
-        .or(csproj)
-        .ok_or_else(|| anyhow!("error.no_workspace_found: no .sln/.slnx/.csproj under {}", project_root.display()))
+    slnx.or(sln).or(csproj).ok_or_else(|| {
+        anyhow!(
+            "error.no_workspace_found: no .sln/.slnx/.csproj under {}",
+            project_root.display()
+        )
+    })
 }
 
 fn load_manifest(project_root: &Path) -> Result<Option<GeneratorInputsManifest>> {
@@ -271,7 +277,12 @@ fn contains_partial_type(text: &str) -> bool {
         // Modifier-prefixed: `public partial class Foo`. Require the
         // `partial <keyword>` token sequence and ensure everything
         // before it is a recognized modifier (or empty).
-        for kw in [" partial class ", " partial record ", " partial struct ", " partial interface "] {
+        for kw in [
+            " partial class ",
+            " partial record ",
+            " partial struct ",
+            " partial interface ",
+        ] {
             if let Some(pos) = trimmed.find(kw) {
                 let prefix = trimmed[..pos].trim();
                 if is_pure_modifier_prefix(prefix) {
@@ -287,9 +298,21 @@ fn is_pure_modifier_prefix(prefix: &str) -> bool {
     if prefix.is_empty() {
         return true;
     }
-    let modifiers = ["public", "internal", "private", "protected", "static",
-                     "sealed", "abstract", "unsafe", "new", "ref"];
-    prefix.split_whitespace().all(|tok| modifiers.contains(&tok))
+    let modifiers = [
+        "public",
+        "internal",
+        "private",
+        "protected",
+        "static",
+        "sealed",
+        "abstract",
+        "unsafe",
+        "new",
+        "ref",
+    ];
+    prefix
+        .split_whitespace()
+        .all(|tok| modifiers.contains(&tok))
 }
 
 fn is_skipped_dir(path: &Path) -> bool {

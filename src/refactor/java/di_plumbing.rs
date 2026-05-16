@@ -221,9 +221,7 @@ pub fn ensure_inject_field(
     let field_name = derive_field_name(type_name, prefer_provider);
     let (decl_text, decl_kind) = if prefer_provider {
         (
-            format!(
-                "    @Inject\n    private Provider<{type_name}> {field_name};\n"
-            ),
+            format!("    @Inject\n    private Provider<{type_name}> {field_name};\n"),
             FieldKind::Provider,
         )
     } else {
@@ -450,16 +448,14 @@ mod tests {
 
     #[test]
     fn find_existing_returns_none_when_no_match() {
-        let src =
-            "package p;\nimport jakarta.inject.Inject;\nclass T { @Inject private Bar bar; }";
+        let src = "package p;\nimport jakarta.inject.Inject;\nclass T { @Inject private Bar bar; }";
         let (_tree, class_node) = parse(src);
         assert!(find_existing_field(class_node, src, "Foo").is_none());
     }
 
     #[test]
     fn ensure_field_returns_existing_when_present() {
-        let src =
-            "package p;\nimport jakarta.inject.Inject;\nclass T { @Inject private Foo foo; }";
+        let src = "package p;\nimport jakarta.inject.Inject;\nclass T { @Inject private Foo foo; }";
         let (_tree, class_node) = parse(src);
         let ensured = ensure_inject_field(class_node, src, "Foo", false).unwrap();
         assert_eq!(ensured.field.name, "foo");
@@ -487,8 +483,7 @@ mod tests {
 
     #[test]
     fn ensure_field_generates_provider_when_preferred() {
-        let src =
-            "package p;\nimport jakarta.inject.Inject;\nimport jakarta.inject.Provider;\nclass T {\n}";
+        let src = "package p;\nimport jakarta.inject.Inject;\nimport jakarta.inject.Provider;\nclass T {\n}";
         let (_tree, class_node) = parse(src);
         let ensured = ensure_inject_field(class_node, src, "Foo", true).unwrap();
         assert_eq!(ensured.field.name, "fooProvider");

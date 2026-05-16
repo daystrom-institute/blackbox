@@ -24,8 +24,7 @@ use crate::refactor::csharp_sidecar_protocol::{
     GetDiagnosticsParams, GetDiagnosticsResult, METHOD_GET_DIAGNOSTICS, SidecarDiagnostic,
 };
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_nullable_annotation_repair(p: &RefactorPlanParams) -> Result<String> {
@@ -78,8 +77,8 @@ pub fn plan_nullable_annotation_repair(p: &RefactorPlanParams) -> Result<String>
         // De-dup: same property might be reported by multiple diagnostics.
         text_edits.sort_by_key(|e| e.byte_start);
         text_edits.dedup_by_key(|e| e.byte_start);
-        let source = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading {}", &path))?;
+        let source =
+            std::fs::read_to_string(&path).with_context(|| format!("reading {}", &path))?;
         let mut hasher = Sha256::new();
         hasher.update(source.as_bytes());
         let sha = format!("{:x}", hasher.finalize());
@@ -151,9 +150,19 @@ fn synthesize_required_edit(path: &str, line: u32, _character: u32) -> Result<Op
             // token.
             let mut pos = start;
             let modifier_set = [
-                "public", "internal", "private", "protected", "static",
-                "readonly", "virtual", "override", "abstract", "new",
-                "sealed", "extern", "unsafe",
+                "public",
+                "internal",
+                "private",
+                "protected",
+                "static",
+                "readonly",
+                "virtual",
+                "override",
+                "abstract",
+                "new",
+                "sealed",
+                "extern",
+                "unsafe",
             ];
             loop {
                 let token_start = skip_ws(bytes, pos);

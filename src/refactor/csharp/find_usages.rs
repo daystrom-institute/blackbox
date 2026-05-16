@@ -58,19 +58,12 @@ pub fn plan_find_csharp_usages(p: &RefactorPlanParams, ctx: &PlanContext) -> Res
         .and_then(|names| names.first())
         .map(String::as_str)
         .or(p.old_text.as_deref())
-        .ok_or_else(|| {
-            anyhow!("item_names[0] or old_text is required for find_csharp_usages")
-        })?;
+        .ok_or_else(|| anyhow!("item_names[0] or old_text is required for find_csharp_usages"))?;
 
     let source = fs::read_to_string(&source_path)
         .with_context(|| format!("reading {}", source_path.display()))?;
     let position_byte = lsp_rename_helpers::find_first_identifier_byte(&source, symbol)
-        .ok_or_else(|| {
-            anyhow!(
-                "symbol `{symbol}` not found in {}",
-                source_path.display()
-            )
-        })?;
+        .ok_or_else(|| anyhow!("symbol `{symbol}` not found in {}", source_path.display()))?;
     let position = rust::byte_to_lsp_position(&source, position_byte);
 
     let manager = ctx.lsp.as_ref().ok_or_else(|| {
@@ -83,10 +76,14 @@ pub fn plan_find_csharp_usages(p: &RefactorPlanParams, ctx: &PlanContext) -> Res
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
     let params = ReferenceParams {
         text_document_position: TextDocumentPositionParams {
-            text_document: TextDocumentIdentifier { uri: source_uri.clone() },
+            text_document: TextDocumentIdentifier {
+                uri: source_uri.clone(),
+            },
             position,
         },
-        context: ReferenceContext { include_declaration: true },
+        context: ReferenceContext {
+            include_declaration: true,
+        },
         work_done_progress_params: Default::default(),
         partial_result_params: Default::default(),
     };

@@ -82,9 +82,7 @@ pub(crate) fn plan_java_collapse_call_chain(p: &RefactorPlanParams) -> Result<St
             .project_dir
             .as_deref()
             .map(PathBuf::from)
-            .ok_or_else(|| {
-                anyhow!("project_dir is required for project_wide=true")
-            })?;
+            .ok_or_else(|| anyhow!("project_dir is required for project_wide=true"))?;
         for entry in walkdir::WalkDir::new(&project_dir).into_iter().flatten() {
             let path = entry.path();
             if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("java") {

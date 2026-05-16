@@ -33,8 +33,8 @@ use tree_sitter::Node;
 
 use super::{call_target_name, defmodule_body_statements, parse_elixir_file, top_level_defmodule};
 use crate::refactor::{
-    FileEdit, ParsedSource, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus,
-    TextEdit, ValidationStep, resolve_path, sha256_hex,
+    FileEdit, ParsedSource, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
+    ValidationStep, resolve_path, sha256_hex,
 };
 
 #[derive(Debug, Serialize)]
@@ -55,8 +55,12 @@ pub(crate) fn plan_organize_aliases(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
     let parsed = parse_elixir_file(&source_path)?;
 
-    let defmodule = top_level_defmodule(&parsed.tree, &parsed.source)
-        .ok_or_else(|| anyhow!("error.bad_input(code=no_defmodule): {} has no top-level defmodule", source_path.display()))?;
+    let defmodule = top_level_defmodule(&parsed.tree, &parsed.source).ok_or_else(|| {
+        anyhow!(
+            "error.bad_input(code=no_defmodule): {} has no top-level defmodule",
+            source_path.display()
+        )
+    })?;
 
     let body_stmts = defmodule_body_statements(defmodule, &parsed.source);
     let block = locate_directive_block(&body_stmts, &parsed.source)?;
@@ -106,14 +110,20 @@ pub(crate) fn plan_organize_aliases(p: &RefactorPlanParams) -> Result<String> {
     // strict structural-equivalence check would refuse legitimate output.
     {
         let mut probe = parsed.source.clone();
-        probe.replace_range(block.byte_start..block.byte_end, &file_edit.edits[0].replacement);
+        probe.replace_range(
+            block.byte_start..block.byte_end,
+            &file_edit.edits[0].replacement,
+        );
         super::roundtrip::verify_parse_clean(&probe)?;
     }
 
     let plan = RefactorPlan {
         title: format!(
             "elixir_organize_aliases: {}",
-            source_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            source_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
         ),
         kind: "elixir_organize_aliases".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
@@ -149,7 +159,11 @@ fn empty_plan(parsed: &ParsedSource) -> RefactorPlan {
     RefactorPlan {
         title: format!(
             "elixir_organize_aliases: {} (no directives)",
-            parsed.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+            parsed
+                .path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
         ),
         kind: "elixir_organize_aliases".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
@@ -497,25 +511,13 @@ fn render_family(
         members.sort();
         let line = if members.len() == 1 {
             match suffix.as_deref() {
-                Some(s) => format!(
-                    "{} {}.{}, {}",
-                    family.keyword(),
-                    parent,
-                    members[0],
-                    s
-                ),
+                Some(s) => format!("{} {}.{}, {}", family.keyword(), parent, members[0], s),
                 None => format!("{} {}.{}", family.keyword(), parent, members[0]),
             }
         } else {
             let inner = members.join(", ");
             let merged_line = match suffix.as_deref() {
-                Some(s) => format!(
-                    "{} {}.{{{}}}, {}",
-                    family.keyword(),
-                    parent,
-                    inner,
-                    s
-                ),
+                Some(s) => format!("{} {}.{{{}}}, {}", family.keyword(), parent, inner, s),
                 None => format!("{} {}.{{{}}}", family.keyword(), parent, inner),
             };
             report.merged.push(merged_line.clone());

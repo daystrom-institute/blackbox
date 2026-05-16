@@ -27,7 +27,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use super::{call_target_name, parse_elixir, top_level_defmodule, defmodule_body_statements};
+use super::{call_target_name, defmodule_body_statements, parse_elixir, top_level_defmodule};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
     ValidationStep, resolve_path, sha256_hex, toml_bool,
@@ -108,10 +108,12 @@ pub(crate) fn plan_test_fixture_extract(p: &RefactorPlanParams) -> Result<String
                         && !body_text.contains("@moduledoc")
                         && !body_text.contains("@doc");
                     let in_describe = false; // v1: heuristic — describe-context detection deferred
-                    bodies_by_hash
-                        .entry(hash.clone())
-                        .or_default()
-                        .push((file.to_string_lossy().into_owned(), body_text, refs_module_attr, in_describe));
+                    bodies_by_hash.entry(hash.clone()).or_default().push((
+                        file.to_string_lossy().into_owned(),
+                        body_text,
+                        refs_module_attr,
+                        in_describe,
+                    ));
                 }
             }
         }

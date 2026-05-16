@@ -22,8 +22,8 @@ use serde::Serialize;
 
 use super::helper::{MixDiagnostic, parse_mix_compile_stderr};
 use crate::refactor::{
-    CaptureSpec, FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus,
-    TextEdit, ValidationStep, resolve_path, sha256_hex,
+    CaptureSpec, FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
+    ValidationStep, resolve_path, sha256_hex,
 };
 
 #[derive(Debug, Serialize)]
@@ -74,8 +74,8 @@ pub(crate) fn plan_compile_fix_round(p: &RefactorPlanParams) -> Result<String> {
 
     let mut file_edits: Vec<FileEdit> = Vec::new();
     for (file, edits) in edits_by_file {
-        let abs_path = resolve_path(project_dir, &file)
-            .map_err(|e| anyhow!("resolving {file}: {e}"))?;
+        let abs_path =
+            resolve_path(project_dir, &file).map_err(|e| anyhow!("resolving {file}: {e}"))?;
         let original = std::fs::read_to_string(&abs_path).unwrap_or_default();
         file_edits.push(FileEdit {
             path: abs_path.to_string_lossy().into_owned(),

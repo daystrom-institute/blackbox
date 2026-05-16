@@ -89,7 +89,9 @@ pub fn plan_lsp_move_item(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<S
         CodeActionKind::new("refactor.move.file"),
     ];
     let code_action_params = CodeActionParams {
-        text_document: TextDocumentIdentifier { uri: source_uri.clone() },
+        text_document: TextDocumentIdentifier {
+            uri: source_uri.clone(),
+        },
         range,
         context: CodeActionContext {
             diagnostics: vec![],
@@ -130,8 +132,7 @@ pub fn plan_lsp_move_item(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<S
                 .as_ref()
                 .map(|k| {
                     let s = k.as_str();
-                    s.starts_with("refactor.move")
-                        || s.starts_with("refactor.move.file")
+                    s.starts_with("refactor.move") || s.starts_with("refactor.move.file")
                 })
                 .unwrap_or(false);
             if !kind_match {
@@ -145,9 +146,10 @@ pub fn plan_lsp_move_item(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<S
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("");
-            let title_match = action.title.to_ascii_lowercase().contains(
-                &target_basename.to_ascii_lowercase(),
-            );
+            let title_match = action
+                .title
+                .to_ascii_lowercase()
+                .contains(&target_basename.to_ascii_lowercase());
             if let Some(workspace_edit) = action.edit {
                 if title_match || found_workspace_edit.is_none() {
                     found_workspace_edit = Some(workspace_edit);
@@ -215,7 +217,14 @@ fn path_string(path: &Path) -> String {
 /// the code action.
 fn locate_type_decl(source: &str, type_name: &str) -> Result<usize> {
     let bytes = source.as_bytes();
-    let keywords = [b"class".as_ref(), b"record", b"struct", b"interface", b"enum", b"delegate"];
+    let keywords = [
+        b"class".as_ref(),
+        b"record",
+        b"struct",
+        b"interface",
+        b"enum",
+        b"delegate",
+    ];
     let mut i = 0usize;
     while i < bytes.len() {
         if let Some(next) = skip_lex_atom(bytes, i) {

@@ -175,7 +175,8 @@ pub(crate) fn defmodule_body_statements<'tree>(
 /// or call nodes without a block body.
 pub(crate) fn call_do_block<'tree>(call: Node<'tree>) -> Option<Node<'tree>> {
     let mut cursor = call.walk();
-    call.named_children(&mut cursor).find(|n| n.kind() == "do_block")
+    call.named_children(&mut cursor)
+        .find(|n| n.kind() == "do_block")
 }
 
 /// Return the `arguments` child of a `call` node, if any.

@@ -9,8 +9,8 @@
 //! toolchain, etc.), callers fall back to stderr-parsing fallbacks per the
 //! design's "subprocess fallback" path in Substrate decisions.
 
-use std::process::{Command, Stdio};
 use std::io::Write;
+use std::process::{Command, Stdio};
 
 use anyhow::{Result, anyhow};
 use serde_json::Value;
@@ -91,10 +91,7 @@ pub(crate) fn one_shot(
     let parsed: Value = serde_json::from_str(first_line)
         .map_err(|e| anyhow!("helper response not JSON: {e}: line={first_line}"))?;
     Ok(HelperResponse {
-        ok: parsed
-            .get("ok")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false),
+        ok: parsed.get("ok").and_then(|v| v.as_bool()).unwrap_or(false),
         result: parsed.get("result").cloned(),
         error: parsed
             .get("error")

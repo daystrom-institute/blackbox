@@ -36,8 +36,8 @@
 //! When both `new_text` and `delegate_type` are supplied, `new_text`
 //! wins.
 
-use super::*;
 use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
+use super::*;
 
 pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
@@ -79,9 +79,7 @@ pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Resul
         .item_names
         .as_deref()
         .filter(|names| !names.is_empty())
-        .ok_or_else(|| {
-            anyhow!("item_names (list of moved method names) is required")
-        })?
+        .ok_or_else(|| anyhow!("item_names (list of moved method names) is required"))?
         .iter()
         .cloned()
         .collect();
@@ -309,7 +307,8 @@ fn walk_for_call_sites(
                 if !item_names.contains(name_text) {
                     continue;
                 }
-                let qualifier_text = parsed.source[qualifier.start_byte()..qualifier.end_byte()].to_string();
+                let qualifier_text =
+                    parsed.source[qualifier.start_byte()..qualifier.end_byte()].to_string();
                 if qualifier_text != old_receiver {
                     continue;
                 }

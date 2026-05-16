@@ -36,8 +36,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use sha2::{Digest, Sha256};
 
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_unseal(p: &RefactorPlanParams) -> Result<String> {
@@ -48,7 +47,9 @@ pub fn plan_unseal(p: &RefactorPlanParams) -> Result<String> {
         .as_deref()
         .and_then(|names| names.first())
         .map(String::as_str)
-        .ok_or_else(|| anyhow!("item_names[0] (target class) is required for unseal_csharp_class"))?;
+        .ok_or_else(|| {
+            anyhow!("item_names[0] (target class) is required for unseal_csharp_class")
+        })?;
     validate_simple_identifier(class_name)?;
 
     let acknowledged = operator_flag(p, "acknowledge_subclass_surface_change");
@@ -68,19 +69,21 @@ pub fn plan_unseal(p: &RefactorPlanParams) -> Result<String> {
     let mut already_unsealed = false;
 
     match class_match {
-        ClassMatch::Sealed { sealed_start, sealed_end, body_start, body_end } => {
+        ClassMatch::Sealed {
+            sealed_start,
+            sealed_end,
+            body_start,
+            body_end,
+        } => {
             text_edits.push(TextEdit {
                 byte_start: sealed_start,
                 byte_end: sealed_end,
                 replacement: String::new(),
             });
             for method_name in &virtualize_methods {
-                if let Some(edit) = locate_method_for_virtualize(
-                    &source,
-                    method_name,
-                    body_start,
-                    body_end,
-                )? {
+                if let Some(edit) =
+                    locate_method_for_virtualize(&source, method_name, body_start, body_end)?
+                {
                     text_edits.push(edit);
                 }
             }
@@ -187,9 +190,7 @@ fn parse_virtualize_methods(p: &RefactorPlanParams) -> Result<Vec<String>> {
 fn refuse_generated_file(path: &Path) -> Result<()> {
     let path_str = path.to_str().unwrap_or("");
     let lower = path_str.to_ascii_lowercase();
-    if lower.contains("/generated/")
-        || lower.ends_with(".g.cs")
-        || lower.ends_with(".designer.cs")
+    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs")
     {
         bail!(
             "error.generated_file_refusal: `{}` matches the generated-file guard pattern; refuse to edit (Safety Rules)",
@@ -256,12 +257,7 @@ fn locate_sealed_class(source: &str, class_name: &str) -> Result<ClassMatch> {
                                 "error.ambiguous_class_match: multiple `sealed class {class_name}` declarations in the same file"
                             );
                         }
-                        sealed_match = Some((
-                            sealed_span.0,
-                            sealed_span.1,
-                            body_start,
-                            body_end,
-                        ));
+                        sealed_match = Some((sealed_span.0, sealed_span.1, body_start, body_end));
                     } else {
                         unsealed_match_present = true;
                     }
@@ -304,8 +300,18 @@ fn lookback_modifiers(bytes: &[u8], class_kw_start: usize) -> ModifierLookback {
     // Tokens we treat as modifiers. We scan token positions in the
     // region and check each against the set.
     let modifier_set = [
-        "public", "internal", "private", "protected", "sealed", "partial", "static",
-        "abstract", "virtual", "override", "unsafe", "new",
+        "public",
+        "internal",
+        "private",
+        "protected",
+        "sealed",
+        "partial",
+        "static",
+        "abstract",
+        "virtual",
+        "override",
+        "unsafe",
+        "new",
     ];
     let mut pos = 0usize;
     while pos < region_text.len() {
@@ -455,7 +461,9 @@ fn find_virtual_insert_point(region: &[u8], stmt_start: usize, name_start: usize
     let head = &region[stmt_start..name_start];
     let head_text = std::str::from_utf8(head).unwrap_or("");
     let access_set = ["public", "internal", "private", "protected"];
-    let other_modifiers = ["static", "new", "unsafe", "extern", "async", "sealed", "partial"];
+    let other_modifiers = [
+        "static", "new", "unsafe", "extern", "async", "sealed", "partial",
+    ];
     let mut pos = 0usize;
     let mut last_modifier_end_in_head: Option<usize> = None;
     while pos < head_text.len() {
@@ -468,9 +476,7 @@ fn find_virtual_insert_point(region: &[u8], stmt_start: usize, name_start: usize
         if token.is_empty() {
             break;
         }
-        if access_set.contains(&token.as_str())
-            || other_modifiers.contains(&token.as_str())
-        {
+        if access_set.contains(&token.as_str()) || other_modifiers.contains(&token.as_str()) {
             last_modifier_end_in_head = Some(end);
             pos = end;
         } else {
@@ -578,7 +584,8 @@ mod tests {
 
     #[test]
     fn virtualizes_named_method() {
-        let src = "public sealed class Foo {\n    public void Bar() {}\n    private int Baz() => 1;\n}\n";
+        let src =
+            "public sealed class Foo {\n    public void Bar() {}\n    private int Baz() => 1;\n}\n";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Foo.cs");
         std::fs::write(&path, src).unwrap();

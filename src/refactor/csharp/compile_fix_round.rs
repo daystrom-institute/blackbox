@@ -28,8 +28,7 @@ use crate::refactor::csharp_sidecar_protocol::{
     GetDiagnosticsParams, GetDiagnosticsResult, METHOD_GET_DIAGNOSTICS, SidecarDiagnostic,
 };
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -67,10 +66,7 @@ pub fn plan_compile_fix_round(p: &RefactorPlanParams) -> Result<String> {
                     Some(if PathBuf::from(&p.source).is_absolute() {
                         p.source.clone()
                     } else {
-                        project_root
-                            .join(&p.source)
-                            .to_string_lossy()
-                            .to_string()
+                        project_root.join(&p.source).to_string_lossy().to_string()
                     })
                 },
                 include_analyzers: false,

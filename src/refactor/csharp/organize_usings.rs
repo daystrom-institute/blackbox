@@ -15,8 +15,8 @@ use reqwest::Url;
 
 use crate::projects::Language;
 use crate::refactor::{
-    FileEdit, PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep,
-    csharp::empty_plan, rust,
+    FileEdit, PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan,
+    rust,
 };
 
 pub fn plan_organize_usings(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
@@ -91,9 +91,14 @@ fn roslyn_organize_usings(
         .with_context(|| format!("reading {}", source_path.display()))?;
     let end_position = rust::byte_to_lsp_position(&source, source.len());
     let code_action_params = CodeActionParams {
-        text_document: TextDocumentIdentifier { uri: source_uri.clone() },
+        text_document: TextDocumentIdentifier {
+            uri: source_uri.clone(),
+        },
         range: Range {
-            start: Position { line: 0, character: 0 },
+            start: Position {
+                line: 0,
+                character: 0,
+            },
             end: end_position,
         },
         context: CodeActionContext {

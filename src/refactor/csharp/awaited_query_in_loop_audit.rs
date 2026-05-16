@@ -21,11 +21,11 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::refactor::RefactorPlanParams;
 use crate::refactor::csharp_sidecar::CsharpWorkerPool;
 use crate::refactor::csharp_sidecar_protocol::{
     GetOperationsParams, GetOperationsResult, METHOD_GET_OPERATIONS, OperationNode,
 };
-use crate::refactor::RefactorPlanParams;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AwaitedQuerySite {
@@ -217,7 +217,10 @@ mod tests {
         walk_for_loops(&loop_node, &mut findings);
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].classification, "per_iteration_await");
-        assert_eq!(findings[0].target_full_name.as_deref(), Some("FooStore.AnyAsync"));
+        assert_eq!(
+            findings[0].target_full_name.as_deref(),
+            Some("FooStore.AnyAsync")
+        );
     }
 
     #[test]

@@ -38,8 +38,8 @@
 //! - `error.no_matches`
 //! - `error.invalid_item_kind`
 
-use super::*;
 use super::di_plumbing::{dedupe_insertion_edits, ensure_inject_field};
+use super::*;
 use std::collections::HashSet;
 
 const ALLOWED_KINDS: &[&str] = &["field", "method"];
@@ -138,17 +138,14 @@ pub(crate) fn plan_replace_java_static_reference(p: &RefactorPlanParams) -> Resu
 
     // Drop-the-accessor mode: `delegate_field = "<Class>.<accessor>"`.
     // When set, also collapse `<Class>.<accessor>()` to `<new_text>`.
-    let drop_accessor: Option<String> = p
-        .delegate_field
-        .as_deref()
-        .and_then(|s| {
-            let (cls, acc) = s.split_once('.')?;
-            if cls == qualifier && !acc.is_empty() {
-                Some(acc.to_string())
-            } else {
-                None
-            }
-        });
+    let drop_accessor: Option<String> = p.delegate_field.as_deref().and_then(|s| {
+        let (cls, acc) = s.split_once('.')?;
+        if cls == qualifier && !acc.is_empty() {
+            Some(acc.to_string())
+        } else {
+            None
+        }
+    });
 
     let mut edits = Vec::new();
     walk(

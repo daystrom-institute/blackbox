@@ -109,7 +109,9 @@ pub(crate) fn plan_rename_symbol(p: &RefactorPlanParams) -> Result<String> {
     ];
 
     let report = RefusalReport {
-        error: "error.symbol_not_renameable: capability matrix marks every symbol kind as v1-refuses".to_string(),
+        error:
+            "error.symbol_not_renameable: capability matrix marks every symbol kind as v1-refuses"
+                .to_string(),
         capability_matrix: matrix,
         advisory,
     };

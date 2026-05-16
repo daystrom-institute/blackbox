@@ -6,16 +6,16 @@
     {
       "description": "The eval harness and workflow fanout design note that shell iteration is a bootstrap path until foreach/matrix runtime support lands.",
       "entity_type_hint": "project_file",
-      "path_hint": "design/archive/agentic-corpus.md"
+      "path_hint": "design/corpus/agentic-corpus/agentic-corpus.md"
     }
   ],
   "expected_entity_refs": [
-    "project_file:af6f7145:4593ef20:1a5c6e7d2b39b86f4313f0ec6b6a8f074321c62ce82e81b8c596fe7002918026:12"
+    "project_file:d723917f:2f4b614d:1a5c6e7d2b39b86f4313f0ec6b6a8f074321c62ce82e81b8c596fe7002918026:12"
   ],
   "required_evidence": {
     "kind": "path",
     "value": {
-      "from": "design/archive/agentic-corpus.md",
+      "from": "design/corpus/agentic-corpus/agentic-corpus.md",
       "to": "thread-cba8bfa1",
       "edge_types": [
         "REFERENCES"

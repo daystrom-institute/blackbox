@@ -17,12 +17,12 @@
 //! `error.unimplemented_csharp_kind` so the dispatcher recognizes them
 //! and surfaces the contract.
 
-pub(crate) mod lex;
 pub mod async_dispose_convert;
 pub mod awaited_query_in_loop_audit;
 pub mod compile_fix_round;
 pub mod filescoped_namespace;
 pub mod find_usages;
+pub(crate) mod lex;
 pub mod lsp_move_item;
 pub mod lsp_rename;
 pub mod migrate_type_usages;
@@ -100,4 +100,3 @@ pub(crate) fn empty_plan(kind: &str, title: String, status: SemanticStatus) -> R
         fixme_count: None,
     }
 }
-

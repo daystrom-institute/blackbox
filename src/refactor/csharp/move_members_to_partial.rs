@@ -34,8 +34,7 @@ use super::lex::{
     skip_whitespace,
 };
 use crate::refactor::{
-    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep,
-    csharp::empty_plan,
+    FileEdit, RefactorPlanParams, SemanticStatus, TextEdit, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_move_members_to_partial(p: &RefactorPlanParams) -> Result<String> {
@@ -61,7 +60,10 @@ pub fn plan_move_members_to_partial(p: &RefactorPlanParams) -> Result<String> {
     if target_path.exists() {
         let existing = fs::read_to_string(&target_path).unwrap_or_default();
         if !existing.trim().is_empty() {
-            bail!("error.target_exists: `{}` is non-empty", target_path.display());
+            bail!(
+                "error.target_exists: `{}` is non-empty",
+                target_path.display()
+            );
         }
     }
 
@@ -185,7 +187,8 @@ fn path_string(path: &Path) -> String {
 
 fn refuse_generated_file(path: &Path) -> Result<()> {
     let lower = path.to_str().unwrap_or("").to_ascii_lowercase();
-    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs") {
+    if lower.contains("/generated/") || lower.ends_with(".g.cs") || lower.ends_with(".designer.cs")
+    {
         bail!("error.generated_file_refusal");
     }
     Ok(())
@@ -533,12 +536,17 @@ mod tests {
         assert!(!s_after.contains("public int Move()"), "{s_after}");
         assert!(s_after.contains("public int Keep()"), "{s_after}");
         // Target side: contains the moved method.
-        let target_text: Vec<TextEdit> =
-            serde_json::from_value(edits[1]["edits"].clone()).unwrap();
+        let target_text: Vec<TextEdit> = serde_json::from_value(edits[1]["edits"].clone()).unwrap();
         let target_body = &target_text[0].replacement;
         assert!(target_body.contains("namespace Foo;"), "{target_body}");
-        assert!(target_body.contains("public partial class Bar"), "{target_body}");
-        assert!(target_body.contains("public int Move() => 2"), "{target_body}");
+        assert!(
+            target_body.contains("public partial class Bar"),
+            "{target_body}"
+        );
+        assert!(
+            target_body.contains("public int Move() => 2"),
+            "{target_body}"
+        );
     }
 
     #[test]

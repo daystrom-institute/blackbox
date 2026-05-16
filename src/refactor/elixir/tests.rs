@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::refactor::{RefactorPlanParams, plan_with_ctx, PlanContext};
+use crate::refactor::{PlanContext, RefactorPlanParams, plan_with_ctx};
 
 // ---------------------------------------------------------------------------
 // Test fixture helpers
@@ -130,7 +130,9 @@ end
     let value: serde_json::Value = serde_json::from_str(&json).expect("json");
     let new_text = apply_text_edits(body, &value);
     let ecto = new_text.find("use Ecto.Schema").expect("Ecto present");
-    let bar_use = new_text.find("use Bar.MyMacro").expect("Bar.MyMacro present");
+    let bar_use = new_text
+        .find("use Bar.MyMacro")
+        .expect("Bar.MyMacro present");
     assert!(
         ecto < bar_use,
         "use directives should preserve textual order: \n{new_text}"
@@ -289,10 +291,7 @@ end
         ..Default::default()
     };
     let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
-    assert!(
-        err.to_string().contains("item_not_found"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("item_not_found"), "got: {err}");
 }
 
 #[test]
@@ -314,14 +313,14 @@ end
         ..Default::default()
     };
     let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
-    assert!(
-        err.to_string().contains("use_at_scope"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("use_at_scope"), "got: {err}");
 
     // Acknowledge: should proceed.
     let mut entries = std::collections::BTreeMap::new();
-    entries.insert("acknowledge_use_at_scope".to_string(), serde_json::Value::Bool(true));
+    entries.insert(
+        "acknowledge_use_at_scope".to_string(),
+        serde_json::Value::Bool(true),
+    );
     params.toml_entries = Some(entries);
     let json = plan_with_ctx(&params, &PlanContext::default()).expect("with ack");
     let value: serde_json::Value = serde_json::from_str(&json).expect("json");
@@ -439,7 +438,10 @@ end
     assert!(new_text.contains("defdelegate get_decision(arg1), to: Substrate.Graph"));
     assert!(new_text.contains("defdelegate all_decisions, to: Substrate.Graph"));
     assert!(new_text.contains("defdelegate put_concept(arg1), to: Substrate.Graph"));
-    assert!(!new_text.contains("internal"), "defp should not be mirrored");
+    assert!(
+        !new_text.contains("internal"),
+        "defp should not be mirrored"
+    );
 }
 
 #[test]
@@ -566,7 +568,12 @@ end
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| (e["from"].as_str().unwrap().to_string(), e["to"].as_str().unwrap().to_string()))
+        .map(|e| {
+            (
+                e["from"].as_str().unwrap().to_string(),
+                e["to"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     // v1 records call targets verbatim (no alias resolution); `B.bye()` after
     // `alias App.B` is recorded as `B`, not `App.B`. `App.C.world()` is fully
@@ -595,7 +602,12 @@ end
         .as_array()
         .unwrap()
         .iter()
-        .map(|e| (e["from"].as_str().unwrap().to_string(), e["to"].as_str().unwrap().to_string()))
+        .map(|e| {
+            (
+                e["from"].as_str().unwrap().to_string(),
+                e["to"].as_str().unwrap().to_string(),
+            )
+        })
         .collect();
     assert!(ct_edges.iter().any(|(f, t)| f == "App.A" && t == "App.B"));
     assert!(ct_edges.iter().any(|(f, t)| f == "App.A" && t == "App.C"));
@@ -869,7 +881,10 @@ fn split_clauses_refuses_on_unknown_tag_in_partition() {
         "exhaustive",
     );
     let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
-    assert!(err.to_string().contains("unknown_tag_in_partition"), "got: {err}");
+    assert!(
+        err.to_string().contains("unknown_tag_in_partition"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -990,16 +1005,18 @@ end
     // Callbacks rendered.
     let callbacks = value["callback_signatures"].as_array().unwrap();
     assert_eq!(callbacks.len(), 2);
-    assert!(
-        callbacks
-            .iter()
-            .any(|c| c["rendered"].as_str().unwrap().contains("@callback hello(String.t)"))
-    );
-    assert!(
-        callbacks
-            .iter()
-            .any(|c| c["rendered"].as_str().unwrap().contains("@callback world(any(), any())"))
-    );
+    assert!(callbacks.iter().any(|c| {
+        c["rendered"]
+            .as_str()
+            .unwrap()
+            .contains("@callback hello(String.t)")
+    }));
+    assert!(callbacks.iter().any(|c| {
+        c["rendered"]
+            .as_str()
+            .unwrap()
+            .contains("@callback world(any(), any())")
+    }));
 
     // Target file content.
     let edits = value["edits"].as_array().unwrap();
@@ -1071,7 +1088,10 @@ fn inline_module_refuses_on_defstruct() {
         ..Default::default()
     };
     let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
-    assert!(err.to_string().contains("module_is_struct_carrier"), "got: {err}");
+    assert!(
+        err.to_string().contains("module_is_struct_carrier"),
+        "got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1183,9 +1203,18 @@ end
     let (dir, src) = write_elixir_fixture("admin.ex", body);
     let target = dir.path().join("admin/checkpoint.ex");
     let mut entries = std::collections::BTreeMap::new();
-    entries.insert("dispatch_pattern".to_string(), serde_json::json!("single_dispatch_fn"));
-    entries.insert("client_api_strategy".to_string(), serde_json::json!("rewrite_callers"));
-    entries.insert("acknowledge_use_at_scope".to_string(), serde_json::json!(true));
+    entries.insert(
+        "dispatch_pattern".to_string(),
+        serde_json::json!("single_dispatch_fn"),
+    );
+    entries.insert(
+        "client_api_strategy".to_string(),
+        serde_json::json!("rewrite_callers"),
+    );
+    entries.insert(
+        "acknowledge_use_at_scope".to_string(),
+        serde_json::json!(true),
+    );
     let params = RefactorPlanParams {
         source: src.to_string_lossy().into_owned(),
         target: Some(target.to_string_lossy().into_owned()),
@@ -1235,8 +1264,14 @@ end
         "dispatch_pattern".to_string(),
         serde_json::json!("per_message_handle_call"),
     );
-    entries.insert("client_api_strategy".to_string(), serde_json::json!("delegate"));
-    entries.insert("acknowledge_use_at_scope".to_string(), serde_json::json!(true));
+    entries.insert(
+        "client_api_strategy".to_string(),
+        serde_json::json!("delegate"),
+    );
+    entries.insert(
+        "acknowledge_use_at_scope".to_string(),
+        serde_json::json!(true),
+    );
     let params = RefactorPlanParams {
         source: src.to_string_lossy().into_owned(),
         target: Some(target.to_string_lossy().into_owned()),
@@ -1279,7 +1314,10 @@ end
     let mut entries = std::collections::BTreeMap::new();
     entries.insert("anchor_line".to_string(), serde_json::json!(3));
     entries.insert("anchor_column".to_string(), serde_json::json!(5));
-    entries.insert("extract_range_start_offset".to_string(), serde_json::json!(2));
+    entries.insert(
+        "extract_range_start_offset".to_string(),
+        serde_json::json!(2),
+    );
     entries.insert("extract_range_end_offset".to_string(), serde_json::json!(3));
     let params = RefactorPlanParams {
         source: src.to_string_lossy().into_owned(),
@@ -1307,7 +1345,10 @@ end
     let mut entries = std::collections::BTreeMap::new();
     entries.insert("anchor_line".to_string(), serde_json::json!(2));
     entries.insert("anchor_column".to_string(), serde_json::json!(20));
-    entries.insert("extract_range_start_offset".to_string(), serde_json::json!(0));
+    entries.insert(
+        "extract_range_start_offset".to_string(),
+        serde_json::json!(0),
+    );
     entries.insert("extract_range_end_offset".to_string(), serde_json::json!(1));
     let params = RefactorPlanParams {
         source: src.to_string_lossy().into_owned(),
@@ -1391,7 +1432,10 @@ fn rename_elixir_symbol_refuses_always_in_v1() {
         ..Default::default()
     };
     let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
-    assert!(err.to_string().contains("symbol_not_renameable"), "got: {err}");
+    assert!(
+        err.to_string().contains("symbol_not_renameable"),
+        "got: {err}"
+    );
     // Refusal carries the capability matrix (encoded in the error body).
     assert!(err.to_string().contains("capability_matrix"));
 }
@@ -1441,9 +1485,7 @@ fn test_fixture_extract_pulls_duplicated_setup() {
     let setup_body = "setup do\n  ctx = %{user: :alice, db: :test}\n  {:ok, ctx}\nend";
     for i in 0..3 {
         let test_file = dir.path().join(format!("test_{i}_test.exs"));
-        let content = format!(
-            "defmodule Test{i} do\n  use ExUnit.Case\n  {setup_body}\nend\n"
-        );
+        let content = format!("defmodule Test{i} do\n  use ExUnit.Case\n  {setup_body}\nend\n");
         std::fs::write(&test_file, content).unwrap();
     }
     let target = dir.path().join("test/support/fixtures.ex");
@@ -1508,7 +1550,12 @@ fn move_across_apps_basic_scaffold() {
     let moves = value["file_moves"].as_array().unwrap();
     assert_eq!(moves.len(), 1);
     let mv = &moves[0];
-    assert!(mv["target_path"].as_str().unwrap().contains("apps/witness/lib"));
+    assert!(
+        mv["target_path"]
+            .as_str()
+            .unwrap()
+            .contains("apps/witness/lib")
+    );
 }
 
 #[test]
@@ -1526,7 +1573,10 @@ fn move_across_apps_refuses_when_source_not_in_apps() {
         ..Default::default()
     };
     let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
-    assert!(err.to_string().contains("source_not_in_apps_lib"), "got: {err}");
+    assert!(
+        err.to_string().contains("source_not_in_apps_lib"),
+        "got: {err}"
+    );
 }
 
 // ---------------------------------------------------------------------------

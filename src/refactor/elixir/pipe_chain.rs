@@ -26,7 +26,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
-use super::{parse_elixir_file, top_level_defmodule, defmodule_body_statements};
+use super::{defmodule_body_statements, parse_elixir_file, top_level_defmodule};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
     ValidationStep, resolve_path, sha256_hex,
@@ -49,19 +49,27 @@ pub(crate) fn plan_pipe_chain_extract(p: &RefactorPlanParams) -> Result<String> 
     let line = toml
         .and_then(|m| m.get("anchor_line"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.anchor_line is required (1-based)"))? as usize;
+        .ok_or_else(|| anyhow!("toml_entries.anchor_line is required (1-based)"))?
+        as usize;
     let column = toml
         .and_then(|m| m.get("anchor_column"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.anchor_column is required (1-based)"))? as usize;
+        .ok_or_else(|| anyhow!("toml_entries.anchor_column is required (1-based)"))?
+        as usize;
     let start_offset = toml
         .and_then(|m| m.get("extract_range_start_offset"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.extract_range_start_offset is required (1-based step index)"))? as usize;
+        .ok_or_else(|| {
+            anyhow!("toml_entries.extract_range_start_offset is required (1-based step index)")
+        })? as usize;
     let end_offset = toml
         .and_then(|m| m.get("extract_range_end_offset"))
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("toml_entries.extract_range_end_offset is required (1-based step index, inclusive)"))? as usize;
+        .ok_or_else(|| {
+            anyhow!(
+                "toml_entries.extract_range_end_offset is required (1-based step index, inclusive)"
+            )
+        })? as usize;
     let extracted_name = p
         .module_name
         .as_deref()
@@ -73,9 +81,7 @@ pub(crate) fn plan_pipe_chain_extract(p: &RefactorPlanParams) -> Result<String> 
         .unwrap_or("defp")
         .to_string();
     if !matches!(visibility.as_str(), "def" | "defp") {
-        bail!(
-            "error.bad_input(code=invalid_visibility): visibility must be `def` or `defp`"
-        );
+        bail!("error.bad_input(code=invalid_visibility): visibility must be `def` or `defp`");
     }
 
     // Locate the pipe chain by byte position derived from line/column.
@@ -139,8 +145,12 @@ pub(crate) fn plan_pipe_chain_extract(p: &RefactorPlanParams) -> Result<String> 
     // Insert the extracted function inside the enclosing defmodule, before
     // its closing `end`. (We default to defp; placement at the bottom of the
     // module body is fine for v1.)
-    let defmod = top_level_defmodule(&parsed.tree, &parsed.source)
-        .ok_or_else(|| anyhow!("error.bad_input(code=no_defmodule): {}", source_path.display()))?;
+    let defmod = top_level_defmodule(&parsed.tree, &parsed.source).ok_or_else(|| {
+        anyhow!(
+            "error.bad_input(code=no_defmodule): {}",
+            source_path.display()
+        )
+    })?;
     let insert_at = defmodule_body_end(defmod, &parsed.source);
     let insert_edit = TextEdit {
         byte_start: insert_at,
@@ -157,7 +167,10 @@ pub(crate) fn plan_pipe_chain_extract(p: &RefactorPlanParams) -> Result<String> 
     let plan = RefactorPlan {
         title: format!(
             "elixir_pipe_chain_extract: {} → {} ({}..={})",
-            source_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            source_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             extracted_name,
             start_offset,
             end_offset
@@ -223,7 +236,10 @@ fn line_col_to_byte(source: &str, line: usize, col: usize) -> usize {
     source.len()
 }
 
-fn find_pipe_chain_root<'tree>(tree: &'tree tree_sitter::Tree, anchor: usize) -> Option<Node<'tree>> {
+fn find_pipe_chain_root<'tree>(
+    tree: &'tree tree_sitter::Tree,
+    anchor: usize,
+) -> Option<Node<'tree>> {
     // Walk the tree, find the smallest binary_operator with operator "|>"
     // containing anchor, then walk up while parent is also "|>" binary_operator.
     let root = tree.root_node();

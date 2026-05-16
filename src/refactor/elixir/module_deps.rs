@@ -182,7 +182,10 @@ pub(crate) fn plan_module_dependency_analysis(p: &RefactorPlanParams) -> Result<
     nodes.sort_by(|a, b| a.module.cmp(&b.module));
 
     let plan = RefactorPlan {
-        title: format!("elixir_module_dependency_analysis: {}", source_root.display()),
+        title: format!(
+            "elixir_module_dependency_analysis: {}",
+            source_root.display()
+        ),
         kind: "elixir_module_dependency_analysis".to_string(),
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
@@ -237,17 +240,17 @@ fn collect_elixir_files(root: &Path, include_exs: bool) -> Result<Vec<PathBuf>> 
     }
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|e| anyhow!("read_dir {}: {e}", dir.display()))?;
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| anyhow!("read_dir {}: {e}", dir.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
                 // Skip _build, deps, .git, .claude
-                let name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                if matches!(name, "_build" | "deps" | ".git" | ".claude" | "node_modules") {
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if matches!(
+                    name,
+                    "_build" | "deps" | ".git" | ".claude" | "node_modules"
+                ) {
                     continue;
                 }
                 stack.push(path);
@@ -269,7 +272,10 @@ fn is_elixir_file(path: &Path, include_exs: bool) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Public re-export so other elixir submodules can reuse the helper.
-pub(super) fn defmodule_full_name_pub(defmod_call: tree_sitter::Node<'_>, source: &str) -> Option<String> {
+pub(super) fn defmodule_full_name_pub(
+    defmod_call: tree_sitter::Node<'_>,
+    source: &str,
+) -> Option<String> {
     defmodule_full_name(defmod_call, source)
 }
 
@@ -342,7 +348,14 @@ fn find_cycles(adj: &HashMap<String, BTreeSet<String>>) -> Vec<Vec<String>> {
         if visited.contains(root) {
             continue;
         }
-        dfs(root, adj, &mut visited, &mut stack, &mut on_stack, &mut cycles);
+        dfs(
+            root,
+            adj,
+            &mut visited,
+            &mut stack,
+            &mut on_stack,
+            &mut cycles,
+        );
     }
     // Deduplicate by normalized cycle (rotate to canonical start).
     let mut seen: HashSet<Vec<String>> = HashSet::new();
@@ -367,7 +380,11 @@ fn dfs(
     if on_stack.contains(node) {
         // Found a cycle — slice from where node first appears.
         if let Some(pos) = stack.iter().position(|s| s == node) {
-            let cycle: Vec<String> = stack[pos..].iter().cloned().chain(std::iter::once(node.to_string())).collect();
+            let cycle: Vec<String> = stack[pos..]
+                .iter()
+                .cloned()
+                .chain(std::iter::once(node.to_string()))
+                .collect();
             cycles.push(cycle);
         }
         return;

@@ -162,10 +162,7 @@ pub(crate) fn plan_prune_java_orphans(p: &RefactorPlanParams) -> Result<String> 
                 );
             }
         }
-        kinds
-            .iter()
-            .map(String::as_str)
-            .collect::<HashSet<&str>>()
+        kinds.iter().map(String::as_str).collect::<HashSet<&str>>()
     } else {
         PRUNE_KINDS.iter().copied().collect()
     };
@@ -216,9 +213,9 @@ pub(crate) fn plan_prune_java_orphans(p: &RefactorPlanParams) -> Result<String> 
             .get(cand.name.as_str())
             .map(Vec::as_slice)
             .unwrap_or(&[]);
-        let referenced = refs.iter().any(|(s, e)| {
-            !(*s == cand.name_byte_start && *e == cand.name_byte_end)
-        });
+        let referenced = refs
+            .iter()
+            .any(|(s, e)| !(*s == cand.name_byte_start && *e == cand.name_byte_end));
         if referenced {
             leftovers.push(format!("{} {}: referenced", cand.kind.as_str(), cand.name));
         } else {
@@ -522,12 +519,11 @@ fn consider_field(
             };
             // serialVersionUID guard also applies to multi-declarator
             // declarators.
-            let reason =
-                if name == "serialVersionUID" && field_is_long_type(node, &parsed.source) {
-                    Some("excluded_serial_version_uid".to_string())
-                } else {
-                    method_or_field_exclusion_reason(node, parsed)
-                };
+            let reason = if name == "serialVersionUID" && field_is_long_type(node, &parsed.source) {
+                Some("excluded_serial_version_uid".to_string())
+            } else {
+                method_or_field_exclusion_reason(node, parsed)
+            };
             out.push((candidate, reason));
         }
         return;

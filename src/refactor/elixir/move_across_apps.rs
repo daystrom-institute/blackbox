@@ -102,19 +102,32 @@ pub(crate) fn plan_move_across_apps(p: &RefactorPlanParams) -> Result<String> {
         .project_dir
         .as_deref()
         .map(PathBuf::from)
-        .unwrap_or_else(|| source_app_root.parent().unwrap().parent().unwrap().to_path_buf());
+        .unwrap_or_else(|| {
+            source_app_root
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        });
     let target_path = match target_path_str {
         Some(s) => resolve_path(p.project_dir.as_deref(), &s)?,
-        None => project_dir.join(&target_app).join("lib").join(&rel_from_app_lib),
+        None => project_dir
+            .join(&target_app)
+            .join("lib")
+            .join(&rel_from_app_lib),
     };
 
     // Parse source to extract module name + dependencies.
     let parsed = parse_elixir_file(&source_path)?;
-    let defmod = top_level_defmodule(&parsed.tree, &parsed.source)
-        .ok_or_else(|| anyhow!("error.bad_input(code=no_defmodule): {}", source_path.display()))?;
-    let moved_module =
-        super::module_deps::defmodule_full_name_pub(defmod, &parsed.source)
-            .ok_or_else(|| anyhow!("error.bad_input(code=defmodule_unnamed)"))?;
+    let defmod = top_level_defmodule(&parsed.tree, &parsed.source).ok_or_else(|| {
+        anyhow!(
+            "error.bad_input(code=no_defmodule): {}",
+            source_path.display()
+        )
+    })?;
+    let moved_module = super::module_deps::defmodule_full_name_pub(defmod, &parsed.source)
+        .ok_or_else(|| anyhow!("error.bad_input(code=defmodule_unnamed)"))?;
 
     // Cross-app dependency analysis: scan the source body for cross-module
     // calls and aliases; classify by which app they belong to.
@@ -140,8 +153,11 @@ pub(crate) fn plan_move_across_apps(p: &RefactorPlanParams) -> Result<String> {
 
     // Walk config for module references.
     let mut config_refs: Vec<ConfigRef> = Vec::new();
-    for config_root in ["config", &format!("{source_app}/config"), &format!("{target_app}/config")]
-    {
+    for config_root in [
+        "config",
+        &format!("{source_app}/config"),
+        &format!("{target_app}/config"),
+    ] {
         let dir = project_dir.join(config_root);
         if !dir.exists() {
             continue;
@@ -318,7 +334,10 @@ fn walkdir_simple(dir: &std::path::Path) -> Vec<PathBuf> {
             let path = entry.path();
             if path.is_dir() {
                 let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-                if matches!(name, "_build" | "deps" | ".git" | ".claude" | "node_modules") {
+                if matches!(
+                    name,
+                    "_build" | "deps" | ".git" | ".claude" | "node_modules"
+                ) {
                     continue;
                 }
                 stack.push(path);

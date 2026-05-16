@@ -13,12 +13,12 @@
     {
       "description": "The implementation skeleton phase describing knowledge entry indexing.",
       "entity_type_hint": "project_file",
-      "path_hint": "design/archive/agentic-corpus-impl.md"
+      "path_hint": "design/corpus/agentic-corpus/agentic-corpus-impl.md"
     }
   ],
   "expected_entity_refs": [
     "symbol:d723917f:KnowledgeStore:3867906959e7ff9c5c0c893d30ba43ea2663089aec664a3da19dffca6dd0df0d",
-    "project_file:af6f7145:7b78a787:27d2fd2f429156f3f0c78da5e98d061e3603a1c226d8d070934ab18c2c882ed6:2"
+    "project_file:d723917f:486a1738:c6894708384c91c8523198da5ad347696fae2ee0bbed186613b497f2012ea2d7:2"
   ],
   "required_evidence": {
     "kind": "entity_set",

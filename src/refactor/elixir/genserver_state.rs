@@ -74,7 +74,12 @@ pub(crate) fn plan_genserver_state_audit(p: &RefactorPlanParams) -> Result<Strin
             continue;
         }
         // Walk body looking for `{:ok, %{...}}` or `%{...}` returns.
-        infer_state_from_init(*stmt, &parsed.source, &mut state_fields, &mut init_initializers);
+        infer_state_from_init(
+            *stmt,
+            &parsed.source,
+            &mut state_fields,
+            &mut init_initializers,
+        );
     }
 
     // Per-callback scan.
@@ -93,20 +98,27 @@ pub(crate) fn plan_genserver_state_audit(p: &RefactorPlanParams) -> Result<Strin
         };
         if !matches!(
             name.as_str(),
-            "handle_call" | "handle_cast" | "handle_info" | "handle_continue" | "init" | "terminate" | "code_change"
+            "handle_call"
+                | "handle_cast"
+                | "handle_info"
+                | "handle_continue"
+                | "init"
+                | "terminate"
+                | "code_change"
         ) {
             continue;
         }
-        let label = format!("{}:line_{}", name, super::byte_to_line_col(&parsed.source, stmt.start_byte()).0);
+        let label = format!(
+            "{}:line_{}",
+            name,
+            super::byte_to_line_col(&parsed.source, stmt.start_byte()).0
+        );
         let touches = per_callback.entry(label.clone()).or_default();
         scan_state_touches(*stmt, &parsed.source, touches, &mut unresolved, &label);
     }
 
     let plan = RefactorPlan {
-        title: format!(
-            "elixir_genserver_state_audit: {}",
-            source_path.display()
-        ),
+        title: format!("elixir_genserver_state_audit: {}", source_path.display()),
         kind: "elixir_genserver_state_audit".to_string(),
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
@@ -192,9 +204,10 @@ fn harvest_map_keys(
 }
 
 fn is_simple_field_name(s: &str) -> bool {
-    s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+    s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
 }
 
 fn scan_state_touches(

@@ -3887,21 +3887,21 @@ pub(crate) use atom_plans::{
     plan_add_java_constructor, plan_add_java_delegate_field, plan_add_java_fields,
     plan_extract_java_nested_classes, plan_move_java_field, plan_rewrite_java_visibility,
 };
+pub(crate) use collapse_chain::plan_java_collapse_call_chain;
 use cross_file::{MovedStaticItem, compute_cross_file_static_caller_edits};
 pub(crate) use extract_class::plan_extract_java_class;
+pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use extract_methods::plan_extract_java_methods;
+pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use leaf_plans::{
     jdtls_organize_imports, plan_add_java_implements, plan_extract_java_interface,
     plan_java_lsp_organize_imports, plan_migrate_java_type_usages,
 };
 pub(crate) use lombokify::plan_lombokify_java_class;
-pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
-pub(crate) use promote_inner::plan_promote_java_inner_class;
-pub(crate) use collapse_chain::plan_java_collapse_call_chain;
-pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
-pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use method_object::plan_convert_method_to_class;
 pub(crate) use migrate_receiver::plan_migrate_java_method_receiver;
+pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
+pub(crate) use promote_inner::plan_promote_java_inner_class;
 pub(crate) use prune_orphans::plan_prune_java_orphans;
 pub(crate) use replace_static_ref::plan_replace_java_static_reference;
 pub(crate) use singletonify::{plan_singletonify_java_holder, plan_singletonify_java_util};
@@ -3914,20 +3914,20 @@ mod di_plumbing;
 mod extract_class;
 mod extract_code_block;
 mod extract_methods;
+mod find_usages;
 mod inline_method;
+mod leaf_plans;
+mod lombokify;
 mod method_object;
 mod migrate_receiver;
+mod move_and_callers;
+mod promote_inner;
+mod prune_orphans;
 mod replace_static_ref;
 mod scope;
 mod singletonify;
 mod split_provider;
 mod test_slice;
-mod find_usages;
-mod leaf_plans;
-mod lombokify;
-mod move_and_callers;
-mod promote_inner;
-mod prune_orphans;
 #[cfg(test)]
 mod tests;
 pub(crate) use find_usages::plan_find_java_usages;

@@ -5920,7 +5920,10 @@ impl Cache {
             .iter()
             .filter(|step| step.kind.as_deref() == Some("add_rust_use_decl"))
             .collect();
-        assert!(!use_decl_steps.is_empty(), "should include add_rust_use_decl steps");
+        assert!(
+            !use_decl_steps.is_empty(),
+            "should include add_rust_use_decl steps"
+        );
 
         // Verify the use_path matches the expected pattern
         // Note: crate name is my_crate (underscore), not my-crate (hyphen from Cargo.toml package name)
@@ -5933,7 +5936,10 @@ impl Cache {
         assert!(
             has_correct_use_path,
             "use_decl step should have use_path like 'my_crate::utils'. Titles: {:?}",
-            use_decl_steps.iter().filter_map(|s| s.title.as_deref()).collect::<Vec<_>>()
+            use_decl_steps
+                .iter()
+                .filter_map(|s| s.title.as_deref())
+                .collect::<Vec<_>>()
         );
 
         // Verify execution order: copy, delete, add_use, rewrite, cargo check
@@ -5945,7 +5951,9 @@ impl Cache {
         let copy_idx = kinds.iter().position(|k| *k == "copy_rust_mod_decls");
         let delete_idx = kinds.iter().position(|k| *k == "delete_rust_items");
         let use_decl_idx = kinds.iter().position(|k| *k == "add_rust_use_decl");
-        let rewrite_idx = kinds.iter().position(|k| *k == "rewrite_rust_bin_crate_paths");
+        let rewrite_idx = kinds
+            .iter()
+            .position(|k| *k == "rewrite_rust_bin_crate_paths");
 
         assert!(
             copy_idx < delete_idx && delete_idx < use_decl_idx && use_decl_idx < rewrite_idx,

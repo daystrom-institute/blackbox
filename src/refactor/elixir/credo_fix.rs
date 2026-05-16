@@ -52,7 +52,9 @@ pub(crate) fn plan_credo_fix_round(p: &RefactorPlanParams) -> Result<String> {
         .as_ref()
         .and_then(|m| m.get("credo_json"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("toml_entries.credo_json is required (mix credo --format=json stdout)"))?;
+        .ok_or_else(|| {
+            anyhow!("toml_entries.credo_json is required (mix credo --format=json stdout)")
+        })?;
     let output: CredoOutput = serde_json::from_str(json_text)
         .map_err(|e| anyhow!("error.bad_input(code=credo_json_invalid): {e}"))?;
 
@@ -74,8 +76,8 @@ pub(crate) fn plan_credo_fix_round(p: &RefactorPlanParams) -> Result<String> {
 
     let mut file_edits: Vec<FileEdit> = Vec::new();
     for (file, edits) in edits_by_file {
-        let abs_path = resolve_path(project_dir, &file)
-            .map_err(|e| anyhow!("resolving {file}: {e}"))?;
+        let abs_path =
+            resolve_path(project_dir, &file).map_err(|e| anyhow!("resolving {file}: {e}"))?;
         let original = std::fs::read_to_string(&abs_path).unwrap_or_default();
         file_edits.push(FileEdit {
             path: abs_path.to_string_lossy().into_owned(),

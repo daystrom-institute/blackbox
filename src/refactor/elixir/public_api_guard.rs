@@ -22,7 +22,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use super::{call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir, top_level_defmodule};
+use super::{
+    call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir,
+    top_level_defmodule,
+};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, ValidationStep,
     resolve_path,
@@ -63,7 +66,9 @@ pub(crate) fn plan_public_api_guard(p: &RefactorPlanParams) -> Result<String> {
         .as_ref()
         .and_then(|m| m.get("proposed_changes"))
     {
-        Some(serde_json::Value::Array(arr)) => arr.iter().filter_map(ProposedChange::from_json).collect(),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().filter_map(ProposedChange::from_json).collect()
+        }
         _ => Vec::new(),
     };
 
@@ -203,7 +208,10 @@ impl ProposedChange {
             name: obj.get("name")?.as_str()?.to_string(),
             arity: obj.get("arity")?.as_u64()? as usize,
             action: obj.get("action")?.as_str()?.to_string(),
-            rename_to: obj.get("rename_to").and_then(|v| v.as_str()).map(String::from),
+            rename_to: obj
+                .get("rename_to")
+                .and_then(|v| v.as_str())
+                .map(String::from),
         })
     }
 }
@@ -230,10 +238,12 @@ fn parse_defdelegate_sig(call: tree_sitter::Node<'_>, source: &str) -> Option<(S
     let args = super::call_arguments(call)?;
     let mut c = args.walk();
     let sig = args.named_children(&mut c).next()?;
-    Some(super::extract_module::def_name_and_arity_public(call, source).unwrap_or_else(|| {
-        let text = &source[sig.byte_range()];
-        crude_sig_parse(text)
-    }))
+    Some(
+        super::extract_module::def_name_and_arity_public(call, source).unwrap_or_else(|| {
+            let text = &source[sig.byte_range()];
+            crude_sig_parse(text)
+        }),
+    )
 }
 
 fn crude_sig_parse(text: &str) -> (String, usize) {

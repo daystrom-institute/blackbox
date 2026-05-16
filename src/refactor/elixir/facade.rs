@@ -86,16 +86,13 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
             _ => None,
         };
 
-    let name_filter_regex: Option<Regex> = match p
-        .toml_entries
-        .as_ref()
-        .and_then(|e| e.get("name_filter"))
-    {
-        Some(serde_json::Value::String(s)) => Some(
-            Regex::new(s).map_err(|e| anyhow!("invalid name_filter regex `{s}`: {e}"))?,
-        ),
-        _ => None,
-    };
+    let name_filter_regex: Option<Regex> =
+        match p.toml_entries.as_ref().and_then(|e| e.get("name_filter")) {
+            Some(serde_json::Value::String(s)) => {
+                Some(Regex::new(s).map_err(|e| anyhow!("invalid name_filter regex `{s}`: {e}"))?)
+            }
+            _ => None,
+        };
     let name_filter_list: Option<HashSet<String>> =
         match p.toml_entries.as_ref().and_then(|e| e.get("name_filter")) {
             Some(serde_json::Value::Array(arr)) => Some(
@@ -105,17 +102,14 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
             ),
             _ => None,
         };
-    let as_renames: BTreeMap<String, String> = match p
-        .toml_entries
-        .as_ref()
-        .and_then(|e| e.get("as_renames"))
-    {
-        Some(serde_json::Value::Object(obj)) => obj
-            .iter()
-            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-            .collect(),
-        _ => BTreeMap::new(),
-    };
+    let as_renames: BTreeMap<String, String> =
+        match p.toml_entries.as_ref().and_then(|e| e.get("as_renames")) {
+            Some(serde_json::Value::Object(obj)) => obj
+                .iter()
+                .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                .collect(),
+            _ => BTreeMap::new(),
+        };
 
     // ── parse facade & backing ────────────────────────────────────────────────
     let facade = parse_elixir_file(&facade_path)?;
@@ -128,12 +122,13 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
     let facade_body = defmodule_body_statements(facade_defmodule, &facade.source);
 
     let backing = parse_elixir_file(&backing_path)?;
-    let backing_defmodule = top_level_defmodule(&backing.tree, &backing.source).ok_or_else(|| {
-        anyhow!(
-            "error.bad_input(code=backing_no_defmodule): {} has no top-level defmodule",
-            backing_path.display()
-        )
-    })?;
+    let backing_defmodule =
+        top_level_defmodule(&backing.tree, &backing.source).ok_or_else(|| {
+            anyhow!(
+                "error.bad_input(code=backing_no_defmodule): {} has no top-level defmodule",
+                backing_path.display()
+            )
+        })?;
     let backing_body = defmodule_body_statements(backing_defmodule, &backing.source);
 
     // ── inventory backing publics ────────────────────────────────────────────
@@ -219,13 +214,13 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
             // Only drop if no backing-public matches this facade key (after
             // reverse-rename lookup). Approximation: drop if not in candidate
             // by facade_name.
-            if !candidate
-                .iter()
-                .any(|(bname, _)| {
-                    let fname = as_renames.get(bname).cloned().unwrap_or_else(|| bname.clone());
-                    fname == *name
-                })
-            {
+            if !candidate.iter().any(|(bname, _)| {
+                let fname = as_renames
+                    .get(bname)
+                    .cloned()
+                    .unwrap_or_else(|| bname.clone());
+                fname == *name
+            }) {
                 removed.push(format!("{name}/{arity}"));
                 let start = entry.byte_start;
                 let end = trailing_newline_end(&facade.source, entry.byte_end);
@@ -265,7 +260,10 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
     let plan = RefactorPlan {
         title: format!(
             "add_elixir_facade_delegations: {} ← {}",
-            facade_path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            facade_path
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default(),
             backing_module
         ),
         kind: "add_elixir_facade_delegations".to_string(),
@@ -391,9 +389,7 @@ fn render_delegate(
     };
     if facade_name != backing_name || renames.contains_key(backing_name) {
         // when renaming, emit `defdelegate facade(...), to: Backing, as: :backing_name`
-        format!(
-            "defdelegate {sig}, to: {backing_module}, as: :{backing_name}"
-        )
+        format!("defdelegate {sig}, to: {backing_module}, as: :{backing_name}")
     } else {
         format!("defdelegate {sig}, to: {backing_module}")
     }

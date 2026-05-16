@@ -188,9 +188,7 @@ pub(crate) fn plan_extract_java_test_slice(p: &RefactorPlanParams) -> Result<Str
         .map(|t| reindent_method_to_block(&parsed.source, t.byte_start, t.byte_end))
         .collect();
     let body_joined = body_blocks.join("\n\n");
-    let target_text = format!(
-        "{prelude}public class {target_class_name} {{\n{body_joined}\n}}\n"
-    );
+    let target_text = format!("{prelude}public class {target_class_name} {{\n{body_joined}\n}}\n");
 
     // Build the source-side edits.
     let mut source_edits: Vec<TextEdit> = to_move
@@ -488,7 +486,11 @@ fn is_mockito_driven(class_node: Node<'_>, source: &str) -> bool {
 
 /// Find an existing `@Mock <Target>` field, or generate an edit that
 /// adds one. Also generates `import org.mockito.Mock;` if needed.
-fn ensure_mock_field(class_node: Node<'_>, source: &str, target_type: &str) -> (String, Vec<TextEdit>) {
+fn ensure_mock_field(
+    class_node: Node<'_>,
+    source: &str,
+    target_type: &str,
+) -> (String, Vec<TextEdit>) {
     let bytes = source.as_bytes();
     if let Some(body) = class_node.child_by_field_name("body") {
         let mut bc = body.walk();
@@ -680,4 +682,3 @@ fn find_moved_invocation_rewrites(
     }
     out
 }
-

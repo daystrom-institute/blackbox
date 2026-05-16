@@ -8094,7 +8094,11 @@ fn prune_java_orphans_deletes_unreferenced_private_field() {
     params.project_dir = Some(path_string(dir.path()));
     let plan: RefactorPlan =
         serde_json::from_str(&plan_prune_java_orphans(&params).unwrap()).unwrap();
-    assert!(plan.items.iter().any(|i| i.name.as_deref() == Some("unused")));
+    assert!(
+        plan.items
+            .iter()
+            .any(|i| i.name.as_deref() == Some("unused"))
+    );
 }
 
 #[test]
@@ -8363,14 +8367,16 @@ fn singletonify_holder_converts_public_static_final_fields() {
     let has_singleton = edits.iter().any(|e| e.replacement.contains("@Singleton"));
     let has_ctor = edits.iter().any(|e| {
         e.replacement.contains("@Inject")
-            && e.replacement.contains("public Cols(SiteAdmin siteAdmin, PlantRepository plantRepo)")
+            && e.replacement
+                .contains("public Cols(SiteAdmin siteAdmin, PlantRepository plantRepo)")
     });
     let has_field_rewrite_a = edits
         .iter()
         .any(|e| e.replacement.contains("private final SiteAdmin siteAdmin;"));
-    let has_field_rewrite_b = edits
-        .iter()
-        .any(|e| e.replacement.contains("private final PlantRepository plantRepo;"));
+    let has_field_rewrite_b = edits.iter().any(|e| {
+        e.replacement
+            .contains("private final PlantRepository plantRepo;")
+    });
     assert!(has_singleton, "@Singleton class annotation: {edits:?}");
     assert!(has_ctor, "@Inject constructor: {edits:?}");
     assert!(has_field_rewrite_a, "siteAdmin field rewrite: {edits:?}");
@@ -8384,7 +8390,9 @@ fn singletonify_holder_refuses_when_no_public_static_final_fields() {
     fs::write(&path, "package p; public class Empty {}\n").unwrap();
     let mut params = java_plan_params("singletonify_java_holder", &path);
     params.project_dir = Some(path_string(dir.path()));
-    let err = plan_singletonify_java_holder(&params).unwrap_err().to_string();
+    let err = plan_singletonify_java_holder(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("nothing to singletonify"), "got: {err}");
 }
 
@@ -8463,7 +8471,9 @@ fn singletonify_util_refuses_pure_method() {
     let mut params = java_plan_params("singletonify_java_util", &path);
     params.project_dir = Some(path_string(dir.path()));
     params.item_names = Some(vec!["doubleIt".to_string()]);
-    let err = plan_singletonify_java_util(&params).unwrap_err().to_string();
+    let err = plan_singletonify_java_util(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("pure_methods_refused"), "got: {err}");
 }
 
@@ -8478,7 +8488,9 @@ fn singletonify_util_requires_item_names() {
     .unwrap();
     let mut params = java_plan_params("singletonify_java_util", &path);
     params.project_dir = Some(path_string(dir.path()));
-    let err = plan_singletonify_java_util(&params).unwrap_err().to_string();
+    let err = plan_singletonify_java_util(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("item_names"), "got: {err}");
 }
 
@@ -8605,7 +8617,9 @@ fn replace_java_static_reference_skips_other_class_qualifiers() {
     params.impl_name = Some("UIUtils".to_string());
     params.new_text = Some("uiUtilsProvider.get()".to_string());
     params.item_names = Some(vec!["format".to_string()]);
-    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    let err = plan_replace_java_static_reference(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no `UIUtils"), "got: {err}");
 }
 
@@ -8649,8 +8663,13 @@ fn replace_java_static_reference_requires_new_text_or_delegate_type() {
     params.project_dir = Some(path_string(dir.path()));
     params.impl_name = Some("Cls".to_string());
     params.item_names = Some(vec!["x".to_string()]);
-    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
-    assert!(err.contains("new_text") && err.contains("delegate_type"), "got: {err}");
+    let err = plan_replace_java_static_reference(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("new_text") && err.contains("delegate_type"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -8664,7 +8683,9 @@ fn replace_java_static_reference_rejects_unknown_item_kind() {
     params.new_text = Some("p".to_string());
     params.item_names = Some(vec!["x".to_string()]);
     params.item_kinds = Some(vec!["bogus".to_string()]);
-    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    let err = plan_replace_java_static_reference(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("unknown item_kind"), "got: {err}");
 }
 
@@ -8861,7 +8882,10 @@ fn java_split_provider_v2_deletes_original_field_on_full_coverage() {
                 .unwrap_or(false)
         }
     });
-    assert!(has_field_delete, "expected original field delete: {edits:?}");
+    assert!(
+        has_field_delete,
+        "expected original field delete: {edits:?}"
+    );
 }
 
 #[test]
@@ -8903,18 +8927,17 @@ fn java_split_provider_v2_keeps_original_field_on_partial_coverage() {
                 .unwrap_or(false)
         }
     });
-    assert!(!has_field_delete, "should NOT delete original field on partial coverage: {edits:?}");
+    assert!(
+        !has_field_delete,
+        "should NOT delete original field on partial coverage: {edits:?}"
+    );
 }
 
 #[test]
 fn java_split_provider_refuses_no_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("N.java");
-    fs::write(
-        &path,
-        "package p;\nclass N { int run() { return 0; } }\n",
-    )
-    .unwrap();
+    fs::write(&path, "package p;\nclass N { int run() { return 0; } }\n").unwrap();
     let mut params = java_plan_params("java_split_provider", &path);
     params.project_dir = Some(path_string(dir.path()));
     params.delegate_field = Some("provider".to_string());
@@ -9073,7 +9096,8 @@ fn migrate_java_method_receiver_auto_injects_when_field_absent() {
         .any(|e| e.replacement == "authorizationService");
     let has_inject_field = edits.iter().any(|e| {
         e.replacement.contains("@Inject")
-            && e.replacement.contains("private AuthorizationService authorizationService;")
+            && e.replacement
+                .contains("private AuthorizationService authorizationService;")
     });
     assert!(has_receiver_rewrite, "receiver rewrite missing: {edits:?}");
     assert!(has_inject_field, "inject field missing: {edits:?}");
@@ -9133,10 +9157,15 @@ fn migrate_java_method_receiver_provider_mode() {
     let plan: RefactorPlan =
         serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
     let edits = &plan.edits[0].edits;
-    assert!(edits.iter().any(|e| e.replacement == "authorizationServiceProvider.get()"));
-    assert!(edits.iter().any(|e| e
-        .replacement
-        .contains("private Provider<AuthorizationService> authorizationServiceProvider;")));
+    assert!(
+        edits
+            .iter()
+            .any(|e| e.replacement == "authorizationServiceProvider.get()")
+    );
+    assert!(edits.iter().any(|e| {
+        e.replacement
+            .contains("private Provider<AuthorizationService> authorizationServiceProvider;")
+    }));
 }
 
 #[test]
@@ -9148,8 +9177,13 @@ fn migrate_java_method_receiver_refuses_when_no_new_text_or_delegate_type() {
     params.project_dir = Some(path_string(dir.path()));
     params.delegate_field = Some("x".to_string());
     params.item_names = Some(vec!["foo".to_string()]);
-    let err = plan_migrate_java_method_receiver(&params).unwrap_err().to_string();
-    assert!(err.contains("new_text") && err.contains("delegate_type"), "got: {err}");
+    let err = plan_migrate_java_method_receiver(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("new_text") && err.contains("delegate_type"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -9235,7 +9269,9 @@ fn migrate_java_method_receiver_refuses_no_matches() {
     params.delegate_field = Some("foo".to_string());
     params.new_text = Some("bar".to_string());
     params.item_names = Some(vec!["nonexistent".to_string()]);
-    let err = plan_migrate_java_method_receiver(&params).unwrap_err().to_string();
+    let err = plan_migrate_java_method_receiver(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no call sites"), "got: {err}");
 }
 
@@ -9318,7 +9354,9 @@ fn java_collapse_call_chain_skips_chains_on_other_receiver_types() {
     params.impl_name = Some("SessionData".to_string());
     params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
     params.new_text = Some("getAuthLogId".to_string());
-    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    let err = plan_java_collapse_call_chain(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no `"), "got: {err}");
 }
 
@@ -9332,7 +9370,9 @@ fn java_collapse_call_chain_refuses_single_segment_spec() {
     params.impl_name = Some("S".to_string());
     params.module_name = Some("just_one".to_string());
     params.new_text = Some("d".to_string());
-    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    let err = plan_java_collapse_call_chain(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("chain_too_short"), "got: {err}");
 }
 
@@ -9423,7 +9463,9 @@ fn java_collapse_call_chain_skips_chains_with_args() {
     params.impl_name = Some("SessionData".to_string());
     params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
     params.new_text = Some("getAuthLogId".to_string());
-    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    let err = plan_java_collapse_call_chain(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no `"), "got: {err}");
 }
 
@@ -9466,9 +9508,18 @@ fn extract_java_test_slice_moves_test_that_calls_only_moved_methods() {
     assert_eq!(plan.edits[0].edits.len(), 1);
     // Target file gets created with testAdd inside.
     let target_text = plan.edits[1].new_text.as_deref().unwrap();
-    assert!(target_text.contains("public class AdderTest"), "target shape: {target_text}");
-    assert!(target_text.contains("void testAdd()"), "method moved: {target_text}");
-    assert!(!target_text.contains("testKept"), "kept stayed: {target_text}");
+    assert!(
+        target_text.contains("public class AdderTest"),
+        "target shape: {target_text}"
+    );
+    assert!(
+        target_text.contains("void testAdd()"),
+        "method moved: {target_text}"
+    );
+    assert!(
+        !target_text.contains("testKept"),
+        "kept stayed: {target_text}"
+    );
 }
 
 #[test]
@@ -9489,7 +9540,9 @@ fn extract_java_test_slice_refuses_mixed_coverage_when_not_mockito() {
     params.project_dir = Some(path_string(dir.path()));
     params.target = Some(path_string(&target));
     params.item_names = Some(vec!["add".to_string()]);
-    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    let err = plan_extract_java_test_slice(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("mixed_coverage_without_mockito"), "got: {err}");
 }
 
@@ -9561,8 +9614,13 @@ fn extract_java_test_slice_mockito_refuses_when_no_delegate_type() {
     params.project_dir = Some(path_string(dir.path()));
     params.target = Some(path_string(&target));
     params.item_names = Some(vec!["add".to_string()]);
-    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
-    assert!(err.contains("mixed_coverage_without_delegate_type"), "got: {err}");
+    let err = plan_extract_java_test_slice(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("mixed_coverage_without_delegate_type"),
+        "got: {err}"
+    );
 }
 
 #[test]
@@ -9598,7 +9656,9 @@ fn extract_java_test_slice_reuses_existing_mock_field() {
         "should reuse existing field, not generate new one: {source_edits:?}"
     );
     assert!(
-        source_edits.iter().any(|e| e.replacement == "existingAdder."),
+        source_edits
+            .iter()
+            .any(|e| e.replacement == "existingAdder."),
         "call rewrite should use existingAdder.: {source_edits:?}"
     );
 }
@@ -9616,7 +9676,9 @@ fn extract_java_test_slice_refuses_no_test_methods() {
     params.project_dir = Some(path_string(dir.path()));
     params.target = Some(path_string(&target));
     params.item_names = Some(vec!["add".to_string()]);
-    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    let err = plan_extract_java_test_slice(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("no @Test"), "got: {err}");
 }
 
@@ -9640,7 +9702,9 @@ fn extract_java_test_slice_refuses_no_tests_match_moved_set() {
     params.project_dir = Some(path_string(dir.path()));
     params.target = Some(path_string(&target));
     params.item_names = Some(vec!["nonexistent".to_string()]);
-    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    let err = plan_extract_java_test_slice(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("nothing to migrate"), "got: {err}");
 }
 
@@ -9654,7 +9718,9 @@ fn extract_java_test_slice_refuses_existing_target() {
     params.project_dir = Some(path_string(dir.path()));
     params.target = Some(path_string(&target));
     params.item_names = Some(vec!["x".to_string()]);
-    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    let err = plan_extract_java_test_slice(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("already exists"), "got: {err}");
 }
 
@@ -9666,7 +9732,9 @@ fn extract_java_test_slice_requires_item_names() {
     let mut params = java_plan_params("extract_java_test_slice", &source);
     params.project_dir = Some(path_string(dir.path()));
     params.target = Some(path_string(&target));
-    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    let err = plan_extract_java_test_slice(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("item_names"), "got: {err}");
 }
 
@@ -9985,10 +10053,7 @@ fn inline_java_method_substitutes_arg_with_parens_for_precedence_safety() {
     let plan: RefactorPlan =
         serde_json::from_str(&plan_inline_java_method(&params).unwrap()).unwrap();
     let edits = &plan.edits[0].edits;
-    let call_replacement = edits
-        .iter()
-        .find(|e| !e.replacement.is_empty())
-        .unwrap();
+    let call_replacement = edits.iter().find(|e| !e.replacement.is_empty()).unwrap();
     // The substituted form should preserve precedence: `(1 + 2) * (1 + 2)`
     // wrapped in parens so the surrounding `* 3` binds correctly.
     assert!(
@@ -10026,10 +10091,22 @@ fn convert_method_to_class_void_no_params() {
     assert_eq!(plan.kind, "convert_method_to_class");
     assert_eq!(plan.edits.len(), 2);
     let target_text = plan.edits[1].new_text.as_deref().unwrap();
-    assert!(target_text.contains("public class RunHandlerOperation"), "class decl: {target_text}");
-    assert!(target_text.contains("public RunHandlerOperation()"), "ctor: {target_text}");
-    assert!(target_text.contains("public void execute()"), "execute sig: {target_text}");
-    assert!(target_text.contains("System.out.println(\"hi\");"), "body: {target_text}");
+    assert!(
+        target_text.contains("public class RunHandlerOperation"),
+        "class decl: {target_text}"
+    );
+    assert!(
+        target_text.contains("public RunHandlerOperation()"),
+        "ctor: {target_text}"
+    );
+    assert!(
+        target_text.contains("public void execute()"),
+        "execute sig: {target_text}"
+    );
+    assert!(
+        target_text.contains("System.out.println(\"hi\");"),
+        "body: {target_text}"
+    );
     let source_edit = &plan.edits[0].edits[0].replacement;
     assert!(
         source_edit.contains("new RunHandlerOperation().execute();"),
@@ -10060,12 +10137,30 @@ fn convert_method_to_class_with_params_and_return() {
     let plan: RefactorPlan =
         serde_json::from_str(&plan_convert_method_to_class(&params).unwrap()).unwrap();
     let target_text = plan.edits[1].new_text.as_deref().unwrap();
-    assert!(target_text.contains("private final int a;"), "field a: {target_text}");
-    assert!(target_text.contains("private final int b;"), "field b: {target_text}");
-    assert!(target_text.contains("public AddOperation(int a, int b)"), "ctor: {target_text}");
-    assert!(target_text.contains("this.a = a;"), "assign a: {target_text}");
-    assert!(target_text.contains("this.b = b;"), "assign b: {target_text}");
-    assert!(target_text.contains("public int execute()"), "execute sig: {target_text}");
+    assert!(
+        target_text.contains("private final int a;"),
+        "field a: {target_text}"
+    );
+    assert!(
+        target_text.contains("private final int b;"),
+        "field b: {target_text}"
+    );
+    assert!(
+        target_text.contains("public AddOperation(int a, int b)"),
+        "ctor: {target_text}"
+    );
+    assert!(
+        target_text.contains("this.a = a;"),
+        "assign a: {target_text}"
+    );
+    assert!(
+        target_text.contains("this.b = b;"),
+        "assign b: {target_text}"
+    );
+    assert!(
+        target_text.contains("public int execute()"),
+        "execute sig: {target_text}"
+    );
     assert!(target_text.contains("return a + b;"), "body: {target_text}");
     let source_edit = &plan.edits[0].edits[0].replacement;
     assert!(
@@ -10154,7 +10249,9 @@ fn convert_method_to_class_refuses_mutated_enclosing_field() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("print".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(
         err.contains("mutated_enclosing_field(counter)"),
         "got: {err}"
@@ -10226,7 +10323,9 @@ fn convert_method_to_class_refuses_enclosing_method_call() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("run".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("enclosing_method_call(helper)"), "got: {err}");
 }
 
@@ -10249,7 +10348,9 @@ fn convert_method_to_class_refuses_super_reference() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("run".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("super_reference"), "got: {err}");
 }
 
@@ -10272,7 +10373,9 @@ fn convert_method_to_class_refuses_bare_this_value() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("run".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("bare_this_reference"), "got: {err}");
 }
 
@@ -10329,7 +10432,9 @@ fn convert_method_to_class_refuses_static_method() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("run".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("static methods"), "got: {err}");
 }
 
@@ -10350,7 +10455,9 @@ fn convert_method_to_class_refuses_abstract_method() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("run".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("abstract"), "got: {err}");
 }
 
@@ -10371,7 +10478,9 @@ fn convert_method_to_class_refuses_constructor() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("Ctor".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("constructor"), "got: {err}");
 }
 
@@ -10385,7 +10494,9 @@ fn convert_method_to_class_refuses_missing_method() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("nonexistent".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not found"), "got: {err}");
 }
 
@@ -10400,7 +10511,9 @@ fn convert_method_to_class_refuses_existing_target() {
     params.project_dir = Some(path_string(dir.path()));
     params.module_name = Some("a".to_string());
     params.target = Some(path_string(&target));
-    let err = plan_convert_method_to_class(&params).unwrap_err().to_string();
+    let err = plan_convert_method_to_class(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("already exists"), "got: {err}");
 }
 
@@ -10439,7 +10552,10 @@ fn extract_java_code_block_to_method_void_no_params() {
         "call site not synthesized: {replacement}"
     );
     let insert = &edits[1].replacement;
-    assert!(insert.contains("private void greet()"), "helper signature: {insert}");
+    assert!(
+        insert.contains("private void greet()"),
+        "helper signature: {insert}"
+    );
     assert!(
         insert.contains("System.out.println(\"hi\");"),
         "helper body: {insert}"
@@ -10475,7 +10591,10 @@ fn extract_java_code_block_to_method_with_int_param() {
     let replacement = &edits[0].replacement;
     assert!(replacement.contains("log(x);"), "call site: {replacement}");
     let insert = &edits[1].replacement;
-    assert!(insert.contains("private void log(int x)"), "signature: {insert}");
+    assert!(
+        insert.contains("private void log(int x)"),
+        "signature: {insert}"
+    );
     assert!(insert.contains("System.out.println(x);"), "body: {insert}");
 }
 
@@ -10511,8 +10630,14 @@ fn extract_java_code_block_to_method_with_return_type() {
         "call site: {replacement}"
     );
     let insert = &edits[1].replacement;
-    assert!(insert.contains("private int compute()"), "signature: {insert}");
-    assert!(insert.contains("return total;"), "appended return: {insert}");
+    assert!(
+        insert.contains("private int compute()"),
+        "signature: {insert}"
+    );
+    assert!(
+        insert.contains("return total;"),
+        "appended return: {insert}"
+    );
 }
 
 #[test]
@@ -10585,7 +10710,10 @@ fn extract_java_code_block_to_method_custom_replacement() {
     let plan: RefactorPlan =
         serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
     let replacement = &plan.edits[0].edits[0].replacement;
-    assert!(replacement.contains("try { emit(); } catch"), "got: {replacement}");
+    assert!(
+        replacement.contains("try { emit(); } catch"),
+        "got: {replacement}"
+    );
 }
 
 #[test]
@@ -10597,7 +10725,9 @@ fn extract_java_code_block_rejects_zero_matches() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("nonexistent code".to_string());
     params.module_name = Some("helper".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not found"), "got: {err}");
 }
 
@@ -10618,7 +10748,9 @@ fn extract_java_code_block_rejects_multiple_matches() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("System.out.println(\"x\");".to_string());
     params.module_name = Some("emit".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("matched 2 times"), "got: {err}");
 }
 
@@ -10640,7 +10772,9 @@ fn extract_java_code_block_rejects_text_outside_any_method() {
     // Match the class-level field declaration (not inside any method).
     params.old_text = Some("static int FIELD = 42;".to_string());
     params.module_name = Some("helper".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not fully enclosed by a method"), "got: {err}");
 }
 
@@ -10670,7 +10804,9 @@ fn extract_java_code_block_rejects_parameter_argument_length_mismatch() {
         serde_json::json!(["x", "extraArg"]),
     );
     params.toml_entries = Some(entries);
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("parameters.len()=1"), "got: {err}");
 }
 
@@ -10683,7 +10819,9 @@ fn extract_java_code_block_rejects_invalid_helper_name() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("int y = 0;".to_string());
     params.module_name = Some("123bad".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("not a valid Java identifier"), "got: {err}");
 }
 
@@ -10712,12 +10850,16 @@ fn extract_code_block_infers_single_capture_without_operator_help() {
     // edits[0] = call-site replacement (smaller byte position);
     // edits[1] = helper-insert (at enclosing-method end).
     assert!(
-        edits[1].replacement.contains("private int doubleIt(int seed)"),
+        edits[1]
+            .replacement
+            .contains("private int doubleIt(int seed)"),
         "expected inferred sig with seed capture, got: {}",
         edits[1].replacement
     );
     assert!(
-        edits[0].replacement.contains("int doubled = doubleIt(seed);"),
+        edits[0]
+            .replacement
+            .contains("int doubled = doubleIt(seed);"),
         "call site: {}",
         edits[0].replacement
     );
@@ -10772,7 +10914,9 @@ fn extract_code_block_refuses_mutated_capture() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("seed = seed + 1;".to_string());
     params.module_name = Some("bump".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("mutated_capture(seed)"), "got: {err}");
 }
 
@@ -10796,7 +10940,9 @@ fn extract_code_block_refuses_multi_return() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("int a = 1;\n        int b = 2;".to_string());
     params.module_name = Some("prep".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("multi_return_needs_record"), "got: {err}");
 }
 
@@ -10819,7 +10965,9 @@ fn extract_code_block_refuses_non_local_return() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("if (n < 0) return -1;".to_string());
     params.module_name = Some("guard".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("non_local_control_flow"), "got: {err}");
 }
 
@@ -10843,7 +10991,9 @@ fn extract_code_block_refuses_non_local_break() {
     params.project_dir = Some(path_string(dir.path()));
     params.old_text = Some("if (i == 5) break;".to_string());
     params.module_name = Some("check".to_string());
-    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    let err = plan_extract_java_code_block_to_method(&params)
+        .unwrap_err()
+        .to_string();
     assert!(err.contains("non_local_control_flow"), "got: {err}");
 }
 

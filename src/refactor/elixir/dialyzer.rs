@@ -51,7 +51,9 @@ pub(crate) fn plan_dialyzer_attribution(p: &RefactorPlanParams) -> Result<String
         .as_ref()
         .and_then(|m| m.get("dialyzer_short"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("toml_entries.dialyzer_short is required (mix dialyzer --format=short stdout)"))?;
+        .ok_or_else(|| {
+            anyhow!("toml_entries.dialyzer_short is required (mix dialyzer --format=short stdout)")
+        })?;
     let warnings = parse_dialyzer_short(text);
     let mut categorized: std::collections::BTreeMap<String, usize> = Default::default();
     for w in &warnings {

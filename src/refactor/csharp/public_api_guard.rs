@@ -60,8 +60,8 @@ pub fn plan_public_api_guard(p: &crate::refactor::RefactorPlanParams) -> Result<
     let mut symbols = Vec::new();
     let mut files_scanned = 0usize;
     if let Some(ref file) = single_file {
-        let source = fs::read_to_string(file)
-            .with_context(|| format!("reading {}", file.display()))?;
+        let source =
+            fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
         extract_public_symbols(&source, file, &mut symbols);
         files_scanned = 1;
     } else {
@@ -74,8 +74,8 @@ pub fn plan_public_api_guard(p: &crate::refactor::RefactorPlanParams) -> Result<
             if !is_csharp_source(path) {
                 continue;
             }
-            let source = fs::read_to_string(path)
-                .with_context(|| format!("reading {}", path.display()))?;
+            let source =
+                fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
             extract_public_symbols(&source, path, &mut symbols);
             files_scanned += 1;
         }
@@ -96,9 +96,7 @@ pub fn plan_public_api_guard(p: &crate::refactor::RefactorPlanParams) -> Result<
     Ok(serde_json::to_string_pretty(&report)?)
 }
 
-fn resolve_scope(
-    p: &crate::refactor::RefactorPlanParams,
-) -> Result<(PathBuf, Option<PathBuf>)> {
+fn resolve_scope(p: &crate::refactor::RefactorPlanParams) -> Result<(PathBuf, Option<PathBuf>)> {
     // Per the design doc this kind accepts either a project_dir
     // (whole-project surface) or a single source file (file-scoped).
     let single_file = if !p.source.is_empty() && p.source != "." {
@@ -199,8 +197,7 @@ fn extract_public_symbols(source: &str, path: &Path, out: &mut Vec<PublicSymbol>
             // modifier tokens until we hit a type keyword (class /
             // record / struct / interface / enum / delegate) or a
             // type-name token (for fields/methods/properties).
-            let (modifiers, type_kind, type_name, line) =
-                classify_public_decl(bytes, end, source);
+            let (modifiers, type_kind, type_name, line) = classify_public_decl(bytes, end, source);
             if let Some(kind) = type_kind {
                 out.push(PublicSymbol {
                     path: path.to_string_lossy().to_string(),
@@ -234,8 +231,8 @@ fn classify_public_decl(
         ("delegate", "delegate"),
     ];
     let other_modifiers = [
-        "static", "sealed", "abstract", "partial", "readonly", "virtual", "override",
-        "async", "extern", "unsafe", "new", "ref",
+        "static", "sealed", "abstract", "partial", "readonly", "virtual", "override", "async",
+        "extern", "unsafe", "new", "ref",
     ];
     loop {
         let pos_after_ws = skip_ws_keep_newline(bytes, pos);
@@ -284,7 +281,8 @@ fn walk_member_name(bytes: &[u8], mut from: usize) -> (String, usize) {
         }
     }
     // Skip nullable `?` and array `[]`.
-    while from < bytes.len() && (bytes[from] == b'?' || bytes[from] == b'[' || bytes[from] == b']') {
+    while from < bytes.len() && (bytes[from] == b'?' || bytes[from] == b'[' || bytes[from] == b']')
+    {
         from += 1;
     }
     from = skip_ws_keep_newline(bytes, from);
