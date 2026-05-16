@@ -88,11 +88,14 @@ Add an optional `context` block to brofiles:
     },
     "first_turn": {
       "template_file": "system-defaults/prompts/bro/drone-first.tera",
-      "context_producer": "atom:context/atom-signposts@v1"
+      "context_producer": "atom:context/atom-signposts@v1",
+      "on_failure": "render_without",
+      "caps": { "total_bytes": 32768, "per_key_bytes": 8192 }
     },
     "resume_turn": {
       "template_file": "system-defaults/prompts/bro/drone-resume.tera",
-      "context_producer": "atom:context/resume-delta-light@v1"
+      "context_producer": "atom:context/resume-delta-light@v1",
+      "on_failure": "render_without"
     }
   }
 }
@@ -162,12 +165,27 @@ the prior persona and task history:
 {{ prompt }}
 ```
 
-The template language is the "AST-shaped lambda": it provides conditionals,
-loops, includes, macros, and composition without blackbox inventing another
-workflow runtime.
+The template language in v1 is Tera with a deliberately narrow subset:
+conditionals (`{% if %}`), loops (`{% for %}`), variables, and the standard
+Tera filter set. **Includes (`{% include %}`), macros (`{% macro %}` /
+`{% import %}`), and `extends` are not supported in v1.** Composition across
+templates needs a trust-scoped multi-template loader, an include-resolution
+policy (can a `project:` template `include` a `user:` template? a `builtin:`
+template? what about symlinks across roots?), and either a Tera
+`MultiTemplateRegistry` shim or a custom resolver layered on top of
+`tera::Tera::add_raw_template`. None of that exists today and adding it
+without a security model is a path-traversal hole. v2 may add includes once
+the loader and cross-root policy are designed.
+
+This shapes how the legacy builtin templates are written: they are
+self-contained, not assembled from partials. Operators who want a shared
+header today copy-paste; v2 with includes will let them factor.
 
 Templates do not call tools directly in v1. The existing `src/template.rs`
-helper renders Tera from a JSON context and does not register custom functions.
+helper renders Tera from a JSON context, registers exactly one raw template
+per render call (see `Tera::add_raw_template` at `src/template.rs:13` and
+the matching call site at `src/template.rs:23`), and does not register
+custom functions.
 Dynamic inputs are produced before Tera rendering by the turn's configured
 context producer. Do not hide tool calls inside template rendering.
 
@@ -299,26 +317,47 @@ producer owns its output schema, warnings, and receipts.
 Output caps are enforced by dispatch, not by the producer, so a misbehaving
 producer cannot blow out the rendered prompt. v1 defaults:
 
-- 32 KB total across `template_inputs`.
-- 8 KB per top-level key.
+- 32 KB total across `template_inputs` (sum of serialized JSON byte lengths
+  of top-level values).
+- 8 KB per top-level key (serialized JSON byte length of that value).
 
 Both caps are overridable per turn via optional `context.first_turn.caps` /
-`context.resume_turn.caps` fields. When a cap is exceeded, dispatch truncates
-the offending value, drops it from `template_inputs`, and adds a structured
-warning to the receipt; the template renders without that key.
+`context.resume_turn.caps` fields with the shape
+`{ "total_bytes": <u32>, "per_key_bytes": <u32> }`.
 
-Producer failure policy is render-without, never fail-closed by default.
-If the producer errors, times out, or returns malformed output, dispatch:
+Cap enforcement is **drop-then-warn**, not truncate. Truncating a JSON
+value mid-structure produces invalid input the template would then
+render against. Instead:
 
-1. logs a `dispatch.context_producer.failure` system event with the producer
-   ref, error, and elapsed time;
-2. emits a warning into the turn receipt;
-3. renders the template with empty `template_inputs`.
+1. Per-key cap: each top-level key whose serialized value exceeds
+   `per_key_bytes` is removed from `template_inputs` and a
+   `cap.per_key_exceeded` warning is added to the receipt naming the
+   dropped key and its measured size.
+2. Total cap: if the surviving keys' total size still exceeds
+   `total_bytes`, dispatch drops keys in descending size order until
+   the remaining total fits and adds a `cap.total_exceeded` warning
+   listing each dropped key.
+3. The template then renders with the surviving subset of keys. Templates
+   are already required to handle absent inputs via `{% if %}` guards.
 
-Templates are responsible for handling absent inputs (the `{% if %}` guards in
-the examples above show the pattern). A future opt-in `on_failure: fail` knob
-can be added per turn, but the default keeps long-lived bros from getting
-stranded by a flaky producer.
+Producer failure policy is **per-turn opt-in**, default render-without:
+
+- `context.{first_turn,resume_turn}.on_failure: "render_without"` (default):
+  if the producer errors, times out, or returns output that fails its
+  declared schema, dispatch logs a `dispatch.context_producer.failure`
+  system event, emits a warning into the turn receipt, and renders the
+  template with empty `template_inputs`. Suitable for enrichment producers
+  (atom signposts, fresh deltas) where missing extras are acceptable.
+- `context.{first_turn,resume_turn}.on_failure: "fail"`: producer failure
+  fails the turn. `bro_exec` returns an error to the caller; `bro_resume`
+  leaves the session untouched. Suitable for governance producers whose
+  output is load-bearing (e.g. a packet-derived completion contract a
+  reviewer brofile depends on).
+
+`fail` is a v1 flag, not a future knob. Brofile authors choose the mode
+that matches the producer's role; the default protects long-lived bros
+from flaky enrichment producers without preventing governance producers
+from gating dispatch.
 
 Producer results are not cached in v1. Every first turn invokes the
 first-turn producer; every resume turn invokes the resume-turn producer. v1
@@ -358,14 +397,44 @@ validate, or stop. A future phase can explicitly reopen provider-dispatching
 producers, but ordinary `bro_exec` / `bro_resume` must not silently spawn
 another agent before dispatching the requested bro.
 
-This is enforced mechanically, not by convention. Atoms gain a
-`capabilities: ["context_producer"]` flag in their manifest; the atom registry
-refuses to install or register an atom that combines this capability with a
-profile-backed implementation (the implementation kind that dispatches a
-provider actor). Workflow-backed producers go through the same capability
-check at registration time. Producer resolution at dispatch time then only
-verifies the capability is present and skips the agentic-shape check entirely,
-keeping the hot path simple.
+This is enforced mechanically, not by convention. The enforcement points
+are concrete:
+
+**Atom manifests.** Add a `capabilities: Vec<String>` field to the atom
+manifest (today, atoms in `src/orchestration/atoms/types.rs` carry an
+implementation kind but no capability list). Producer atoms declare
+`capabilities: ["context_producer"]`. The atom registry refuses to install
+or register an atom that combines this capability with a `profile`
+implementation kind. Adapter atoms and deterministic atoms are allowed;
+workflow-backed atoms are allowed only if the backing workflow itself
+passes the read-only check below.
+
+**Workflow effect model.** A workflow is read-only-producer-safe iff
+**none** of the following appear anywhere in its spec
+(`src/workflow/schema.rs`):
+
+- actor nodes (any node that dispatches a provider session);
+- calls to `bro_agent_dispatch`, `bro_exec`, `bro_resume`, `bro_broadcast`,
+  or any other agent-dispatching tool;
+- hook ops that write to durable stores (`bbox_learn`, `bbox_remember`,
+  `bbox_decide`, `bbox_pin` action=set, `bbox_note`, `bbox_thread`
+  action=open/resolve/promote, `bbox_roadmap` action=add/update,
+  `whiteboard_post`, `whiteboard_annotate`, `whiteboard_transition`,
+  etc.);
+- MCP tool calls whose tool descriptor is not annotated read-only.
+
+The workflow registry runs this check at install time and refuses to
+register a workflow that declares `capabilities: ["context_producer"]`
+while containing any of the above. The check is static over the workflow
+spec; it does not depend on runtime input. A workflow that needs one of
+these effects is not a producer — push it earlier in the caller's
+orchestration so its output lands in the brofile's render context via
+ordinary dispatch.
+
+**Producer resolution at dispatch time** then only verifies that the
+referenced atom or workflow carries the `context_producer` capability.
+The hot path does no agentic-shape re-check; registry-time enforcement
+is the single source of truth.
 
 For atom signposting, the reusable producer can be an atom such as
 `atom:context/atom-signposts@v1`. Internally, that atom can call `atom_search`,
@@ -434,10 +503,13 @@ secondary mechanism for opencode-specific exemptions.
 Fields:
 
 - `policy`: `default`, `suppress_all`, `allow_list`, or `deny_list`.
-- `allow`: file basenames, absolute paths, or project-relative globs allowed
-  when `policy=allow_list`.
-- `deny`: file basenames, absolute paths, or project-relative globs suppressed
-  when `policy=deny_list`.
+- `allow`: list of entries allowed when `policy=allow_list`. Each entry is a
+  file basename (`AGENTS.md`), a project-relative glob (`docs/*.md`), or an
+  absolute path that **must** resolve under one of the trust roots
+  (`<project_dir>`, `<project_dir>/.bbox/`, builtin system-defaults). Absolute
+  paths outside the trust roots are rejected at brofile validation time.
+- `deny`: same shape and rules as `allow`, but suppressed when
+  `policy=deny_list`.
 - `follow_includes`: whether provider/harness `@` includes are allowed to pull
   additional files after the root file is allowed.
 
@@ -513,16 +585,27 @@ Example lightweight drone:
 
 ## Dispatch Behavior
 
+There is one render path: the renderer always resolves a template. When a
+brofile has no `context.first_turn` (or `context.resume_turn`) block, the
+turn resolves to the corresponding builtin legacy template ref
+(`builtin:prompts/legacy-full@v1` / `builtin:prompts/legacy-resume@v1`),
+which reproduces the current `apply_ambient` + `apply_brofile_lens` output
+byte-for-byte. The Rust `apply_ambient` / `apply_brofile_lens` helpers
+remain in tree as the byte-for-byte oracle for the legacy template
+regression suite through Phase 3, and are deleted in Phase 4 once
+dispatch no longer calls them.
+
 `bro_exec`:
 
 1. Resolve brofile.
 2. Build base `PromptRenderContext` for `turn=first`.
-3. If `context.first_turn.context_producer` is set, invoke that atom/workflow
-   producer and merge its capped `template_inputs`.
-4. Render `context.first_turn` if present; otherwise use current legacy
-   `apply_ambient` + `apply_brofile_lens` behavior.
-5. Apply provider-default policy.
-6. Launch provider.
+3. Resolve the first-turn template (brofile-declared or builtin legacy).
+4. If `context.first_turn.context_producer` is set, invoke that atom/workflow
+   producer and merge its capped `template_inputs` (subject to the failure
+   and cap policy in Context Producers).
+5. Render the resolved template.
+6. Apply provider-default policy.
+7. Launch provider.
 
 `bro_resume`:
 
@@ -530,11 +613,11 @@ Example lightweight drone:
    provider/session ID.
 2. Resolve the current brofile when a named bro is used.
 3. Build base `PromptRenderContext` for `turn=resume`.
-4. If `context.resume_turn.context_producer` is set, invoke that atom/workflow
+4. Resolve the resume-turn template (brofile-declared or builtin legacy).
+5. If `context.resume_turn.context_producer` is set, invoke that atom/workflow
    producer and merge its capped `template_inputs`.
-5. Render `context.resume_turn` if present; otherwise use current legacy
-   resume behavior.
-6. Resume the provider session.
+6. Render the resolved template.
+7. Resume the provider session.
 
 Provider conversation continuity requires only provider + session ID + rendered
 new prompt. The prior transcript remains provider-owned.
@@ -617,6 +700,30 @@ Dry-run returns:
 
 Dry-run must not create provider sessions or mutate task stores.
 
+Producer execution under dry-run is controlled by a `producers` argument on
+`bro_context`:
+
+- `producers: "skip"` (default): producers are not invoked. Dry-run returns
+  the producer ref/version, input hash, and a `planned` status. The
+  rendered-prompt section uses empty `template_inputs` and the rendered
+  output is labeled `template_inputs_omitted`. Cheapest and safe by
+  construction.
+- `producers: "run"`: producers are invoked live. v1 producers are required
+  to be non-agentic and read-only by the registry-time effect-model check,
+  so this mode is safe to execute. The producer input includes
+  `dry_run: true` so producers that have legitimate side effects in some
+  internal path (e.g. emitting receipts to a system event log) can elide
+  them; emitting a receipt or writing to a read-only cache is fine. Dry-run
+  with `producers: "run"` still must not call `bbox_learn`, `bbox_remember`,
+  `bbox_decide`, `bbox_pin` action=set, `bbox_note`, `bbox_thread` lifecycle
+  ops, or any agent-dispatching tool — but since those are already
+  forbidden by the producer effect model, the dry-run case piggybacks on
+  the same enforcement and does not need its own runtime check.
+
+Brofile validation that exercises caps/failure paths should use
+`producers: "run"`; routine "what would this look like" inspection should
+use the default `skip`.
+
 ## Template Registry
 
 Prompt templates can be stored as normal installed artifacts or system-default
@@ -647,11 +754,16 @@ entry; resolution does not depend on filesystem layout alone.
 - Add brofile `context` schema (the `Brofile` struct in
   `src/orchestration/brofile.rs` has no `context` field today).
 - Add a `Prompt` variant to `ArtifactKind` in `src/artifacts.rs` with the
-  standard install / list / supersede / remove plumbing.
+  standard install / list / supersede / remove plumbing. Also update the
+  directory-name mapping at `src/artifacts.rs:1091` (and any matching
+  reverse map) so prompt artifacts have a stable on-disk location.
 - Add Tera rendering for `first_turn` and `resume_turn` using the existing
   `src/template.rs` helper.
 - Add plain `.tera` prompt file loading with trust-scoped path/ref resolution
-  using the builtin / project / user roots defined above.
+  using the builtin / project / user roots defined above. Add
+  `BLACKBOX_USER_PROMPTS_DIR` to the env-override allowlist in
+  `src/config.rs` (see the existing pattern at `src/config.rs:454` and
+  `src/config.rs:1018`); it is not picked up automatically.
 - Add `context_producer` references on turn templates. Producers are atoms or
   workflows, not inline brofile lookup declarations.
 - Add the non-agentic context-producer invocation contract, output schema,
@@ -660,8 +772,12 @@ entry; resolution does not depend on filesystem layout alone.
   `builtin:prompts/legacy-resume@v1`) reproducing the current
   `apply_ambient` + `apply_brofile_lens` output. When a brofile has no
   `context` block, the renderer resolves to those refs — there is one render
-  path, not two. The Phase 4 cleanup then has nothing to remove beyond the
-  Rust helpers themselves.
+  path, not two.
+- Add a byte-equivalence regression test that, for a representative set of
+  `AmbientContext` inputs, the legacy templates produce output identical to
+  `apply_ambient(prompt, &ctx)` + `apply_brofile_lens`. The Rust helpers
+  stay in tree as the oracle through Phase 3 specifically so this test
+  keeps the templates honest. They are deleted only in Phase 4.
 - Ship a minimal drone template ref for lightweight executor brofiles.
 - Lock the `PromptRenderContext` / `AtomRenderContext` / `WorkflowRenderContext`
   / `AgentRenderContext` JSON shapes as serde structs; field additions are
@@ -694,12 +810,23 @@ entry; resolution does not depend on filesystem layout alone.
 
 ### Phase 4: Cleanup
 
-- Convert current `apply_ambient` / `apply_brofile_lens` behavior into built-in
-  templates or template partials.
-- Keep `apply_ambient` compatibility wrappers only as transitional helpers.
-- Add regression tests for legacy full rendering, minimal drone rendering,
-  resume template rendering, context producer invocation,
-  provider-default suppression warnings, and broadcast fresh/resume consistency.
+By the start of Phase 4, every dispatch path goes through the template
+renderer (Phase 3) and the legacy templates have been proven
+byte-equivalent (Phase 1 regression). Phase 4 then:
+
+- Deletes the `apply_ambient` / `apply_brofile_lens` Rust helpers from
+  `src/orchestration/mod.rs` and removes their last call sites in
+  `src/tools/dispatch.rs` (`build_exec_prompt`, the broadcast assembler,
+  and the `bro_resume` wrap call). The byte-equivalence regression
+  becomes a pure template test against fixture inputs.
+- Removes the constants the helpers fed on (`RECALL_DIRECTIVE`,
+  `TASK_SHAPE_HINT`, `ORCHESTRATOR_HINT`, `WORKSPACE_TOOLS_APPENDIX`,
+  `DEFAULT_COMPLETION_CONTRACT`) or moves them into the builtin template
+  body where they belong.
+- Adds the remaining regression suite: minimal drone rendering, resume
+  template rendering, context-producer invocation with both `on_failure`
+  modes, cap drop-then-warn paths, provider-default suppression warnings,
+  and broadcast fresh/resume consistency.
 
 ## Consensus Defaults
 
