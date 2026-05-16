@@ -28,10 +28,12 @@ use crate::chunker::code::parser_for_language;
 
 pub(crate) mod extract_module;
 pub(crate) mod facade;
+pub(crate) mod module_deps;
 pub(crate) mod organize_aliases;
 
 pub(crate) use extract_module::plan_extract_module;
 pub(crate) use facade::plan_facade_delegations;
+pub(crate) use module_deps::plan_module_dependency_analysis;
 pub(crate) use organize_aliases::plan_organize_aliases;
 
 // ---------------------------------------------------------------------------
