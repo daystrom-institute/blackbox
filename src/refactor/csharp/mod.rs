@@ -22,10 +22,12 @@ use anyhow::{Result, bail};
 use crate::refactor::RefactorPlanParams;
 
 pub(crate) mod lex;
+pub mod async_dispose_convert;
 pub mod filescoped_namespace;
 pub mod find_usages;
 pub mod lsp_rename;
 pub mod migrate_type_usages;
+pub mod move_type_to_file;
 pub mod organize_usings;
 pub mod primary_ctor_migrate;
 pub mod public_api_guard;
@@ -37,10 +39,12 @@ pub mod workspace_probe;
 // helpers via `super::unseal_lex::*` keep working.
 pub(crate) use lex as unseal_lex;
 
+pub use async_dispose_convert::plan_async_dispose_convert;
 pub use filescoped_namespace::plan_filescoped_namespace;
 pub use find_usages::plan_find_csharp_usages;
 pub use lsp_rename::plan_lsp_rename;
 pub use migrate_type_usages::plan_migrate_type_usages;
+pub use move_type_to_file::plan_move_type_to_file;
 pub use organize_usings::plan_organize_usings;
 pub use primary_ctor_migrate::plan_primary_ctor_migrate;
 pub use public_api_guard::plan_public_api_guard;

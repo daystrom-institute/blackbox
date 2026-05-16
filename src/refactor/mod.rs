@@ -1236,11 +1236,11 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "csharp_lsp_move_item" => csharp::plan_unimplemented(p, "csharp_lsp_move_item"),
         "find_csharp_usages" => csharp::plan_find_csharp_usages(p, ctx),
         "csharp_public_api_guard" => csharp::plan_public_api_guard(p),
-        "move_csharp_type_to_file" => csharp::plan_unimplemented(p, "move_csharp_type_to_file"),
+        "move_csharp_type_to_file" => csharp::plan_move_type_to_file(p),
         "migrate_csharp_type_usages" => csharp::plan_migrate_type_usages(p),
         "csharp_to_record_migrate" => csharp::plan_to_record_migrate(p),
         "csharp_primary_ctor_migrate" => csharp::plan_primary_ctor_migrate(p),
-        "csharp_async_dispose_convert" => csharp::plan_unimplemented(p, "csharp_async_dispose_convert"),
+        "csharp_async_dispose_convert" => csharp::plan_async_dispose_convert(p),
         // Phase 2 (sidecar-required) — distinct error so callers
         // distinguish "not built yet" from "needs sidecar".
         "csharp_partial_class_audit" => csharp::plan_sidecar_required(p, "csharp_partial_class_audit"),
