@@ -1,7 +1,7 @@
 {
   "suite": "refactor-atom-behavior-smoke",
   "version": 1,
-  "notes": "Per-atom minimal behavior smoke. NOT exhaustive semantic testing — that's RX-per-plan-kind territory. The recording AtomInvocation recorder (follow-up) parses the manifest's prompt_template for the expected bbox_refactor_* markers in order and asserts the simulated tool-call sequence matches `expected_plan_sequence`. This makes the test deterministic and CI-stable. Live LLM behavior is the secondary integration check, marked slow/live and not covered here.",
+  "notes": "Per-atom minimal behavior smoke. NOT exhaustive semantic testing \u2014 that's RX-per-plan-kind territory. The recording AtomInvocation recorder (follow-up) parses the manifest's prompt_template for the expected bbox_refactor_* markers in order and asserts the simulated tool-call sequence matches `expected_plan_sequence`. This makes the test deterministic and CI-stable. Live LLM behavior is the secondary integration check, marked slow/live and not covered here.",
   "atoms": [
     {
       "atom": "rust-impl-partition-graph",
@@ -649,6 +649,177 @@
         "fixture": "roslyn-sidecar-unavailable",
         "expected_block_reason_substring": "lsp_unavailable"
       },
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-codegen-audit",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_codegen-audit",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-compile-fix-round",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_compile-fix-round",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-credo-fix-round",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_credo-fix-round",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-dialyzer-attribution",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_dialyzer-attribution",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-extract-behaviour",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_extract-behaviour",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-extract-module",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_extract-module",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-facade-wire",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_facade-wire",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-genserver-state-audit",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_genserver-state-audit",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-inline-module",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_inline-module",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-module-dependency-graph",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_module-dependency-graph",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-move-across-apps",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_move-across-apps",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-organize-aliases",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_organize-aliases",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-pipe-chain-extract",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_pipe-chain-extract",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-public-api-guard",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_public-api-guard",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-rename-symbol",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_rename-symbol",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-shatter-dispatch-table",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_shatter-dispatch-table",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-split-genserver",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_split-genserver",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-test-fixture-extract",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_test-fixture-extract",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "elixir-with-clause-extract",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:elixir_with-clause-extract",
+        "bbox_note:done"
+      ],
       "done_note_required": true
     }
   ]

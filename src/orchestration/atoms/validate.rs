@@ -28,6 +28,7 @@ pub const RECOGNIZED_REFACTOR_PERSONAS: &[&str] = &[
     "rust-refactor-persona",
     "java-refactor-persona",
     "csharp-refactor-persona",
+    "elixir-refactor-persona",
 ];
 
 const REF_PREFIX_BROFILE: &str = "brofile:";

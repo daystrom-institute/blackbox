@@ -42,7 +42,7 @@
           "fixture_name": {"type": "string"}
         }
       },
-      "evidence_density": "normal"
+      "evidence_density": "medium"
     },
     "effects": {"writes_files": true, "dispatches_runs": 0, "max_depth": 0, "uses_network": false},
     "composition": {"may_invoke_atoms": {"kind": "none"}},

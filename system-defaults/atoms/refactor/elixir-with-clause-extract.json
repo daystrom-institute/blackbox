@@ -43,7 +43,7 @@
           "has_else_arm": {"type": "boolean"}
         }
       },
-      "evidence_density": "normal"
+      "evidence_density": "medium"
     },
     "effects": {"writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false},
     "composition": {"may_invoke_atoms": {"kind": "none"}},

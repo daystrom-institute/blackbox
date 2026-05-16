@@ -403,6 +403,158 @@
         "csharp-awaited-query-audit"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-codegen-audit",
+      "query": "elixir codegen audit via blackbox refactor",
+      "expected_atoms": [
+        "elixir-codegen-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-compile-fix-round",
+      "query": "elixir compile fix round via blackbox refactor",
+      "expected_atoms": [
+        "elixir-compile-fix-round"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-credo-fix-round",
+      "query": "elixir credo fix round via blackbox refactor",
+      "expected_atoms": [
+        "elixir-credo-fix-round"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-dialyzer-attribution",
+      "query": "elixir dialyzer attribution via blackbox refactor",
+      "expected_atoms": [
+        "elixir-dialyzer-attribution"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-extract-behaviour",
+      "query": "elixir extract behaviour via blackbox refactor",
+      "expected_atoms": [
+        "elixir-extract-behaviour"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-extract-module",
+      "query": "elixir extract module via blackbox refactor",
+      "expected_atoms": [
+        "elixir-extract-module"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-facade-wire",
+      "query": "elixir facade wire via blackbox refactor",
+      "expected_atoms": [
+        "elixir-facade-wire"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-genserver-state-audit",
+      "query": "elixir genserver state audit via blackbox refactor",
+      "expected_atoms": [
+        "elixir-genserver-state-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-inline-module",
+      "query": "elixir inline module via blackbox refactor",
+      "expected_atoms": [
+        "elixir-inline-module"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-module-dependency-graph",
+      "query": "elixir module dependency graph via blackbox refactor",
+      "expected_atoms": [
+        "elixir-module-dependency-graph"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-move-across-apps",
+      "query": "elixir move across apps via blackbox refactor",
+      "expected_atoms": [
+        "elixir-move-across-apps"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-organize-aliases",
+      "query": "elixir organize aliases via blackbox refactor",
+      "expected_atoms": [
+        "elixir-organize-aliases"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-pipe-chain-extract",
+      "query": "elixir pipe chain extract via blackbox refactor",
+      "expected_atoms": [
+        "elixir-pipe-chain-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-public-api-guard",
+      "query": "elixir public api guard via blackbox refactor",
+      "expected_atoms": [
+        "elixir-public-api-guard"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-rename-symbol",
+      "query": "elixir rename symbol via blackbox refactor",
+      "expected_atoms": [
+        "elixir-rename-symbol"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-shatter-dispatch-table",
+      "query": "elixir shatter dispatch table via blackbox refactor",
+      "expected_atoms": [
+        "elixir-shatter-dispatch-table"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-split-genserver",
+      "query": "elixir split genserver via blackbox refactor",
+      "expected_atoms": [
+        "elixir-split-genserver"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-test-fixture-extract",
+      "query": "elixir test fixture extract via blackbox refactor",
+      "expected_atoms": [
+        "elixir-test-fixture-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-elixir-with-clause-extract",
+      "query": "elixir with clause extract via blackbox refactor",
+      "expected_atoms": [
+        "elixir-with-clause-extract"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [
@@ -411,7 +563,7 @@
       "query": "decide partition for rust impl",
       "atom": "rust-impl-partition-graph",
       "expect_matched_anti_pattern": true,
-      "notes": "anti-pattern query — should match anti_pattern field when exclude_anti_pattern_matches=false; should NOT return when exclude_anti_pattern_matches=true."
+      "notes": "anti-pattern query \u2014 should match anti_pattern field when exclude_anti_pattern_matches=false; should NOT return when exclude_anti_pattern_matches=true."
     },
     {
       "id": "anti-guard-as-permission",

@@ -38,7 +38,7 @@
           "state_field_touches_unresolved": {"type": "array"}
         }
       },
-      "evidence_density": "normal"
+      "evidence_density": "medium"
     },
     "effects": {"writes_files": false, "dispatches_runs": 0, "max_depth": 0, "uses_network": false},
     "composition": {"may_invoke_atoms": {"kind": "none"}},

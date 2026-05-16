@@ -686,7 +686,9 @@
         "project_dir": "${FIXTURE_JAVA_PROJECT}",
         "source": "src/test/java/com/example/UtilitySourceTest.java",
         "target": "src/test/java/com/example/UtilityTargetTest.java",
-        "item_names": ["normalize"],
+        "item_names": [
+          "normalize"
+        ],
         "apply": false
       },
       "expect_response_fields": [
@@ -718,7 +720,9 @@
         "source": "src/main/java/com/example/UtilitySource.java",
         "delegate_field": "sessionData",
         "new_text": "authz",
-        "item_names": ["isAuthorized"],
+        "item_names": [
+          "isAuthorized"
+        ],
         "apply": false
       },
       "expect_response_fields": [
@@ -733,7 +737,9 @@
         "project_dir": "${FIXTURE_JAVA_PROJECT}",
         "source": "src/main/java/com/example/UtilitySource.java",
         "delegate_field": "sessionDataProvider",
-        "getter_mapping": { "getAuthLogRecord": "authLogProvider" },
+        "getter_mapping": {
+          "getAuthLogRecord": "authLogProvider"
+        },
         "apply": false
       },
       "expect_response_fields": [
@@ -749,7 +755,9 @@
         "source": "src/main/java/com/example/UtilitySource.java",
         "impl_name": "ProductionDayColumns",
         "new_text": "siteAdminProvider.get()",
-        "item_names": ["SITE_ADMIN"],
+        "item_names": [
+          "SITE_ADMIN"
+        ],
         "apply": false
       },
       "expect_response_fields": [
@@ -765,7 +773,9 @@
         "source": "src/main/java/com/example/UtilitySource.java",
         "impl_name": "UIUtils",
         "new_text": "uiUtilsProvider.get()",
-        "item_names": ["formatName"],
+        "item_names": [
+          "formatName"
+        ],
         "apply": false
       },
       "expect_response_fields": [
@@ -861,6 +871,196 @@
         "status",
         "per_iteration_count",
         "collection_await_count"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-codegen-audit-planonly",
+      "atom": "elixir-codegen-audit",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-compile-fix-round-planonly",
+      "atom": "elixir-compile-fix-round",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-credo-fix-round-planonly",
+      "atom": "elixir-credo-fix-round",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-dialyzer-attribution-planonly",
+      "atom": "elixir-dialyzer-attribution",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-extract-behaviour-planonly",
+      "atom": "elixir-extract-behaviour",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-extract-module-planonly",
+      "atom": "elixir-extract-module",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-facade-wire-planonly",
+      "atom": "elixir-facade-wire",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-genserver-state-audit-planonly",
+      "atom": "elixir-genserver-state-audit",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-inline-module-planonly",
+      "atom": "elixir-inline-module",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-module-dependency-graph-planonly",
+      "atom": "elixir-module-dependency-graph",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-move-across-apps-planonly",
+      "atom": "elixir-move-across-apps",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-organize-aliases-planonly",
+      "atom": "elixir-organize-aliases",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-pipe-chain-extract-planonly",
+      "atom": "elixir-pipe-chain-extract",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-public-api-guard-planonly",
+      "atom": "elixir-public-api-guard",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-rename-symbol-planonly",
+      "atom": "elixir-rename-symbol",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-shatter-dispatch-table-planonly",
+      "atom": "elixir-shatter-dispatch-table",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-split-genserver-planonly",
+      "atom": "elixir-split-genserver",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-test-fixture-extract-planonly",
+      "atom": "elixir-test-fixture-extract",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
+      ]
+    },
+    {
+      "id": "dispatch-elixir-with-clause-extract-planonly",
+      "atom": "elixir-with-clause-extract",
+      "args": {
+        "project_dir": "${FIXTURE_ELIXIR_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status"
       ]
     }
   ]
