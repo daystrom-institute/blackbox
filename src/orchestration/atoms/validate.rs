@@ -1358,6 +1358,7 @@ mod tests {
             "convert_method_to_class",
             "inline_java_method",
             "extract_java_test_slice",
+            "java_collapse_call_chain",
         ];
 
         for kind in java_plan_kinds {

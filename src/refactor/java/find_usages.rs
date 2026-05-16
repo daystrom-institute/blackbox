@@ -456,7 +456,7 @@ fn collect_usages_in_file(
 /// - Chained receivers (`service.getDao().save()`) are not resolved.
 /// - No type hierarchy / import resolution — the field type must be a
 ///   simple name matching `declaring_class` exactly.
-fn method_invocation_receiver_matches_declaring_class(
+pub(super) fn method_invocation_receiver_matches_declaring_class(
     parsed: &ParsedSource,
     method_node: Node<'_>,
     declaring_class: &str,

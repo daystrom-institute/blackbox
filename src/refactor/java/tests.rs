@@ -8308,6 +8308,126 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// java_collapse_call_chain — note-295e99e1
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn java_collapse_call_chain_collapses_two_step_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   private final SessionData session;\n\
+         \x20   View(SessionData s) { this.session = s; }\n\
+         \x20   int currentId() { return session.getAuthLogRecord().getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_collapse_call_chain(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "java_collapse_call_chain");
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "session.getAuthLogId()");
+}
+
+#[test]
+fn java_collapse_call_chain_collapses_multiple_call_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   private final SessionData session;\n\
+         \x20   Multi(SessionData s) { this.session = s; }\n\
+         \x20   int a() { return session.getAuthLogRecord().getAuthLogId(); }\n\
+         \x20   int b() { return session.getAuthLogRecord().getAuthLogId() + 1; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_collapse_call_chain(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 2);
+    for e in edits {
+        assert_eq!(e.replacement, "session.getAuthLogId()");
+    }
+}
+
+#[test]
+fn java_collapse_call_chain_skips_chains_on_other_receiver_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Other.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Other {\n\
+         \x20   private final OtherType obj;\n\
+         \x20   Other(OtherType o) { this.obj = o; }\n\
+         \x20   int run() { return obj.getAuthLogRecord().getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    assert!(err.contains("no `"), "got: {err}");
+}
+
+#[test]
+fn java_collapse_call_chain_refuses_non_two_segment_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("X.java");
+    fs::write(&path, "class X {}\n").unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("S".to_string());
+    params.module_name = Some("a.b.c".to_string());
+    params.new_text = Some("d".to_string());
+    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    assert!(err.contains("two-segment chains"), "got: {err}");
+}
+
+#[test]
+fn java_collapse_call_chain_skips_chains_with_args() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Arg.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Arg {\n\
+         \x20   private final SessionData session;\n\
+         \x20   Arg(SessionData s) { this.session = s; }\n\
+         \x20   int run() { return session.getAuthLogRecord(\"x\").getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
+    assert!(err.contains("no `"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // extract_java_test_slice — note-ea483190
 // ─────────────────────────────────────────────────────────────────────
 

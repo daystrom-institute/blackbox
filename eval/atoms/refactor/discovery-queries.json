@@ -307,6 +307,14 @@
         "java-extract-test-slice"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-collapse-call-chain",
+      "query": "collapse verbose getter chain into convenience accessor on java receiver",
+      "expected_atoms": [
+        "java-collapse-call-chain"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

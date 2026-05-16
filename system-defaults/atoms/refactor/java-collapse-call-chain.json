@@ -1,0 +1,58 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-collapse-call-chain",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Rewrite recv.A().B() call chains into recv.C() across a Java file when the convenience accessor C already exists on the receiver type. v1 supports two-segment chains with no-arg intermediate calls.",
+    "when_to_use": [
+      "collapse a long-form getter chain into the convenience accessor that nobody is using (e.g. session.getAuthLogRecord().getAuthLogId() → session.getAuthLogId() across 284 sites)",
+      "post-refactor cleanup when a fluent intermediate has been added but callers haven't been migrated"
+    ],
+    "anti_patterns": [
+      "do not use to collapse chains with side-effecting intermediates — v1 only collapses no-arg getter shapes",
+      "do not use for multi-step chains in v1 — split into successive two-step collapses or wait for v2",
+      "do not use across files in v1 — single-file rewrites only; widen the operator's scope by re-running on each file"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "impl_name", "module_name", "new_text"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "impl_name": { "type": "string", "description": "Receiver type. Used by the receiver-resolution heuristic." },
+          "module_name": { "type": "string", "description": "Old chain spec as `methodA.methodB`." },
+          "new_text": { "type": "string", "description": "Target method name." }
+        }
+      },
+      "prompt_template": "You are java-collapse-call-chain. Charter: Rewrite verbose chains into the convenience accessor.\n\nProtocol:\n\n1. Ground:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n\n2. Confirm the target accessor exists on the receiver type:\n   bbox_code_symbols(query=\"{{new_text}}\", languages=[\"java\"])\n\n3. Plan:\n   bbox_refactor_plan(kind=\"java_collapse_call_chain\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      module_name=\"{{module_name}}\",\n                      new_text=\"{{new_text}}\")\n\n4. Apply and compile-verify:\n   bbox_refactor_apply(plan_path=\"<plan_path>\", confirm=true)\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<chain_count, receiver_type>)\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{module_name}} {{new_text}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fixme_count": { "type": "object", "properties": { "plan_only": { "type": "integer", "minimum": 0 }, "warning": { "type": "integer", "minimum": 0 } } },
+          "deep_analysis_summary": { "type": "object", "additionalProperties": true },
+          "cargo_result": { "type": "object", "properties": { "command": { "type": "string" }, "exit_code": { "type": "integer" }, "summary": { "type": "string" }, "rolled_back": { "type": "boolean" } } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "chains_collapsed": { "type": "integer", "minimum": 0 }
+        }
+      },
+      "evidence_density": "medium"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "cheap",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-16T00:00:00Z" }
+  }
+}

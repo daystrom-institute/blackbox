@@ -511,6 +511,16 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "java-collapse-call-chain",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_collapse_call_chain",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

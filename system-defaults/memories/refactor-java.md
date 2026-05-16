@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -508,6 +508,30 @@ the workspace-import drain has completed.
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b6. Collapse verbose getter chains:
+
+```text
+bbox_refactor_plan(
+  kind="java_collapse_call_chain",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  impl_name="SessionData",
+  module_name="getAuthLogRecord.getAuthLogId",
+  new_text="getAuthLogId"
+)
+```
+
+The matching atom is `java-collapse-call-chain`. Walks the file for
+`<recv>.<A>().<B>()` chains where `<recv>` is a `private final
+<impl_name> <field>` on the enclosing class (find_java_usages
+receiver-resolution heuristic) and `<A>` / `<B>` match the
+`module_name` segments. Replaces each match with `<recv>.<new_text>()`.
+
+v1 supports exactly two-segment chains with no-arg intermediate calls.
+Side-effect-aware refusal: chains with arguments anywhere in the inner
+or outer call are skipped to avoid losing side-effecting calls. v2:
+multi-step chains, project-wide walks, method-reference support.
 
 14b5. Migrate tests after an extract_java_class production move:
 

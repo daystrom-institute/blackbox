@@ -3897,6 +3897,7 @@ pub(crate) use leaf_plans::{
 pub(crate) use lombokify::plan_lombokify_java_class;
 pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
 pub(crate) use promote_inner::plan_promote_java_inner_class;
+pub(crate) use collapse_chain::plan_java_collapse_call_chain;
 pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use method_object::plan_convert_method_to_class;
@@ -3904,6 +3905,7 @@ pub(crate) use prune_orphans::plan_prune_java_orphans;
 pub(crate) use test_slice::plan_extract_java_test_slice;
 
 mod atom_plans;
+mod collapse_chain;
 mod extract_class;
 mod extract_code_block;
 mod extract_methods;

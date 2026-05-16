@@ -693,6 +693,22 @@
         "status",
         "migrated_tests"
       ]
+    },
+    {
+      "id": "dispatch-java-collapse-call-chain-planonly",
+      "atom": "java-collapse-call-chain",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "SessionData",
+        "module_name": "getAuthLogRecord.getAuthLogId",
+        "new_text": "getAuthLogId",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "chains_collapsed"
+      ]
     }
   ]
 }
