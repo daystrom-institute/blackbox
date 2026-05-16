@@ -678,6 +678,21 @@
         "status",
         "call_sites_inlined"
       ]
+    },
+    {
+      "id": "dispatch-java-extract-test-slice-planonly",
+      "atom": "java-extract-test-slice",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/test/java/com/example/UtilitySourceTest.java",
+        "target": "src/test/java/com/example/UtilityTargetTest.java",
+        "item_names": ["normalize"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "migrated_tests"
+      ]
     }
   ]
 }

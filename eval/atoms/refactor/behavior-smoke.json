@@ -501,6 +501,16 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "java-extract-test-slice",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_test_slice",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

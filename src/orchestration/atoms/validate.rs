@@ -1357,6 +1357,7 @@ mod tests {
             "extract_java_code_block_to_method",
             "convert_method_to_class",
             "inline_java_method",
+            "extract_java_test_slice",
         ];
 
         for kind in java_plan_kinds {

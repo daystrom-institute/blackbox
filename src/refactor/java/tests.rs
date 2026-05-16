@@ -8308,6 +8308,139 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// extract_java_test_slice — note-ea483190
+// ─────────────────────────────────────────────────────────────────────
+
+fn write_test_class(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, body).unwrap();
+    path
+}
+
+#[test]
+fn extract_java_test_slice_moves_test_that_calls_only_moved_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "CalcTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         public class CalcTest {\n\
+         \x20   @Test\n\
+         \x20   void testAdd() { add(1, 2); }\n\
+         \x20   @Test\n\
+         \x20   void testKept() { keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    params.module_name = Some("AdderTest".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_test_slice(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "extract_java_test_slice");
+    assert_eq!(plan.edits.len(), 2);
+    // Source edit deletes only `testAdd`, leaves `testKept`.
+    assert_eq!(plan.edits[0].edits.len(), 1);
+    // Target file gets created with testAdd inside.
+    let target_text = plan.edits[1].new_text.as_deref().unwrap();
+    assert!(target_text.contains("public class AdderTest"), "target shape: {target_text}");
+    assert!(target_text.contains("void testAdd()"), "method moved: {target_text}");
+    assert!(!target_text.contains("testKept"), "kept stayed: {target_text}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_mixed_coverage_test() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "MixedTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         public class MixedTest {\n\
+         \x20   @Test\n\
+         \x20   void hybrid() { add(1, 2); keptMethod(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("AdderTest.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("both moved and kept"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_no_test_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "Empty.java",
+        "package p;\nclass Empty { void notATest() {} }\n",
+    );
+    let target = dir.path().join("Out.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["add".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("no @Test"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_no_tests_match_moved_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(
+        dir.path(),
+        "AllKeptTest.java",
+        "package p;\n\
+         import org.junit.jupiter.api.Test;\n\
+         public class AllKeptTest {\n\
+         \x20   @Test\n\
+         \x20   void a() { keptOne(); }\n\
+         \x20   @Test\n\
+         \x20   void b() { keptTwo(); }\n\
+         }\n",
+    );
+    let target = dir.path().join("Out.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["nonexistent".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("nothing to migrate"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_refuses_existing_target() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(dir.path(), "Src.java", "class Src {}\n");
+    let target = dir.path().join("Exists.java");
+    fs::write(&target, "// already\n").unwrap();
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    params.item_names = Some(vec!["x".to_string()]);
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("already exists"), "got: {err}");
+}
+
+#[test]
+fn extract_java_test_slice_requires_item_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = write_test_class(dir.path(), "Src.java", "class Src {}\n");
+    let target = dir.path().join("Out.java");
+    let mut params = java_plan_params("extract_java_test_slice", &source);
+    params.project_dir = Some(path_string(dir.path()));
+    params.target = Some(path_string(&target));
+    let err = plan_extract_java_test_slice(&params).unwrap_err().to_string();
+    assert!(err.contains("item_names"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // inline_java_method — note-8d4674ad
 // ─────────────────────────────────────────────────────────────────────
 

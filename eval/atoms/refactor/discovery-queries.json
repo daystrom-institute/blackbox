@@ -299,6 +299,14 @@
         "java-inline-method"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-test-slice",
+      "query": "migrate junit test methods to a new test class after extracting a production class",
+      "expected_atoms": [
+        "java-extract-test-slice"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

@@ -3901,6 +3901,7 @@ pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use method_object::plan_convert_method_to_class;
 pub(crate) use prune_orphans::plan_prune_java_orphans;
+pub(crate) use test_slice::plan_extract_java_test_slice;
 
 mod atom_plans;
 mod extract_class;
@@ -3908,6 +3909,7 @@ mod extract_code_block;
 mod extract_methods;
 mod inline_method;
 mod method_object;
+mod test_slice;
 mod find_usages;
 mod leaf_plans;
 mod lombokify;
