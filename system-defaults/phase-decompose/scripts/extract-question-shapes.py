@@ -100,6 +100,10 @@ def parse_frontmatter_shapes(text: str) -> list[dict]:
             current[key.strip()] = strip_quotes(value)
     if current:
         shapes.append(current)
+    if not shapes:
+        # Frontmatter exists but declared no question_shapes; let the caller
+        # fall back to heading-derived shapes instead of failing.
+        return []
     return normalize_shapes(shapes)
 
 

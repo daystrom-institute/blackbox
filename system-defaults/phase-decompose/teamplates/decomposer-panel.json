@@ -1,5 +1,6 @@
 {
   "name": "phase-decomposer-panel",
+  "version": 1,
   "members": [
     { "brofile": "phase-decomposer-architecture", "alias": "architecture", "count": 1 },
     { "brofile": "phase-decomposer-implementation", "alias": "implementation", "count": 1 },
