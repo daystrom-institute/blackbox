@@ -303,14 +303,38 @@ pub struct AllocationContext {
 static LEASE_STORE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static ALLOCATION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
-pub fn try_allocation_lock() -> Result<std::sync::MutexGuard<'static, ()>, String> {
-    match ALLOCATION_LOCK.get_or_init(|| Mutex::new(())).try_lock() {
-        Ok(guard) => Ok(guard),
-        Err(std::sync::TryLockError::WouldBlock) => Err(
-            "error.allocation_busy: another runtime allocation is in progress; retry shortly"
-                .into(),
-        ),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+/// Acquire the process-wide allocation lock, blocking until it is free.
+///
+/// Runtime allocation (capability-/tier-/pool-based lane selection) serializes
+/// so concurrent dispatches do not race on lease/probe state. Importantly,
+/// the caller in `dispatch_fresh_bro_task` holds this guard for the full
+/// dispatch — lane selection + trace write *and* through ambient build, arg
+/// construction, provider spawn, task-store insertion, and lease recording.
+/// The long hold is intentional: `allocation_context` only counts running
+/// tasks that have a recorded lease, so releasing the lock between
+/// `save_trace` and `record_lease` would let the next waiter allocate from
+/// stale capacity and pick the same capped lane.
+///
+/// Previous shape was `try_lock` returning `error.allocation_busy: ...; retry
+/// shortly`, but no caller-side retry helper existed; workflow runners just
+/// propagated the error up through `on_failure: halt` and killed the arc.
+/// Blocking is the right shape here.
+///
+/// Poisoned-mutex recovery is preserved (recover the inner data rather than
+/// propagate panic state).
+///
+/// Note: this is `std::sync::Mutex::lock()` called from `async fn` handlers
+/// like `bro_agent_dispatch`. The held section currently includes filesystem
+/// IO and `Command::spawn`, so the executor thread is blocked for the
+/// dispatch duration. Acceptable at current `parallelism: 3` fanout. If
+/// fanout grows materially, migrate `dispatch_fresh_bro_task` to async,
+/// change this to `OnceLock<tokio::sync::Mutex<()>>`, and replace `lock()`
+/// with `lock().await` — keeping the same long-scope semantics unless a
+/// pre-spawn lease reservation is also introduced.
+pub fn acquire_allocation_lock() -> std::sync::MutexGuard<'static, ()> {
+    match ALLOCATION_LOCK.get_or_init(|| Mutex::new(())).lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
     }
 }
 
@@ -2134,5 +2158,64 @@ mod tests {
 
         let created = with_derived_capability(None, Capability::ToolUse).unwrap();
         assert_eq!(created.derived_capabilities, vec![Capability::ToolUse]);
+    }
+
+    /// Regression for the `try_lock`-fails-on-contention bug that used to
+    /// surface `error.allocation_busy` to callers. Spawns N threads, parks
+    /// them on a `Barrier` so they all race for the lock at the same
+    /// instant, holds it briefly inside the guarded section, and asserts
+    /// every thread successfully acquired and released. With the old
+    /// `try_lock` shape, the loser(s) would error immediately; with the new
+    /// blocking `lock`, every caller queues and proceeds.
+    #[test]
+    fn acquire_allocation_lock_queues_concurrent_callers() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        const THREADS: usize = 8;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_observed = Arc::new(AtomicUsize::new(0));
+        let acquired = Arc::new(AtomicUsize::new(0));
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                let in_flight = Arc::clone(&in_flight);
+                let max_observed = Arc::clone(&max_observed);
+                let acquired = Arc::clone(&acquired);
+                thread::spawn(move || {
+                    // Park all threads at the same wall-clock point so the
+                    // lock acquisition is genuinely contended rather than
+                    // staggered by spawn latency.
+                    barrier.wait();
+                    let _guard = acquire_allocation_lock();
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Track peak concurrency seen inside the guarded section;
+                    // mutual exclusion means this must stay at 1.
+                    max_observed.fetch_max(now, Ordering::SeqCst);
+                    thread::sleep(Duration::from_millis(5));
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    acquired.fetch_add(1, Ordering::SeqCst);
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("thread panicked acquiring allocation lock");
+        }
+
+        assert_eq!(
+            acquired.load(Ordering::SeqCst),
+            THREADS,
+            "every thread should successfully acquire the allocation lock"
+        );
+        assert_eq!(
+            max_observed.load(Ordering::SeqCst),
+            1,
+            "allocation lock must serialize callers"
+        );
     }
 }

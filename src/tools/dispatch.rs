@@ -220,7 +220,7 @@ impl BlackboxServer {
     ) -> Result<FreshDispatchResult, String> {
         let store_dir = self.state.store_dir.clone();
         let allocation_guard = if request.allocation_request.is_some() {
-            Some(orchestration::allocator::try_allocation_lock()?)
+            Some(orchestration::allocator::acquire_allocation_lock())
         } else {
             None
         };
