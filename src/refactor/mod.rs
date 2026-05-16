@@ -1233,7 +1233,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "migrate_csharp_to_filescoped_namespace" => csharp::plan_filescoped_namespace(p),
         "csharp_lsp_rename" => csharp::plan_lsp_rename(p, ctx),
         "csharp_organize_usings" => csharp::plan_organize_usings(p, ctx),
-        "csharp_lsp_move_item" => csharp::plan_unimplemented(p, "csharp_lsp_move_item"),
+        "csharp_lsp_move_item" => csharp::plan_lsp_move_item(p, ctx),
         "find_csharp_usages" => csharp::plan_find_csharp_usages(p, ctx),
         "csharp_public_api_guard" => csharp::plan_public_api_guard(p),
         "move_csharp_type_to_file" => csharp::plan_move_type_to_file(p),
