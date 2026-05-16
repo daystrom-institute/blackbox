@@ -43,6 +43,7 @@ pub(crate) mod organize_aliases;
 pub(crate) mod pipe_chain;
 pub(crate) mod public_api_guard;
 pub(crate) mod rename;
+pub(crate) mod roundtrip;
 pub(crate) mod split_clauses;
 pub(crate) mod test_fixture;
 pub(crate) mod with_clause;

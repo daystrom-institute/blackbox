@@ -101,6 +101,15 @@ pub(crate) fn plan_organize_aliases(p: &RefactorPlanParams) -> Result<String> {
         new_text: None,
     };
 
+    // EX-V6 v1 floor: verify the proposed output parses cleanly. organize_aliases
+    // intentionally restructures the alias section (merges, dedupes), so the
+    // strict structural-equivalence check would refuse legitimate output.
+    {
+        let mut probe = parsed.source.clone();
+        probe.replace_range(block.byte_start..block.byte_end, &file_edit.edits[0].replacement);
+        super::roundtrip::verify_parse_clean(&probe)?;
+    }
+
     let plan = RefactorPlan {
         title: format!(
             "elixir_organize_aliases: {}",

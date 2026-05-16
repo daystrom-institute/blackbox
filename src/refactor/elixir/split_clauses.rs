@@ -549,6 +549,26 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         a.byte_start == b.byte_start && a.byte_end == b.byte_end && a.replacement == b.replacement
     });
 
+    // EX-V6 v1 floor: apply the source edits to a probe copy and verify it
+    // parses cleanly. Catches dispatch-wrapper construction bugs that emit
+    // syntactically invalid Elixir.
+    {
+        let mut probe = parsed.source.clone();
+        // Apply in reverse byte order to preserve indices.
+        let mut sorted_edits = source_edits.clone();
+        sorted_edits.sort_by_key(|e| std::cmp::Reverse(e.byte_start));
+        for e in &sorted_edits {
+            probe.replace_range(e.byte_start..e.byte_end, &e.replacement);
+        }
+        super::roundtrip::verify_parse_clean(&probe)?;
+        // Also verify each generated target file parses.
+        for fe in &file_edits {
+            if let Some(new_text) = fe.new_text.as_deref() {
+                super::roundtrip::verify_parse_clean(new_text)?;
+            }
+        }
+    }
+
     // Push source edits as the FIRST file_edit.
     file_edits.insert(
         0,
