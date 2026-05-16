@@ -221,6 +221,11 @@ enum EdgeKind {
 // File walking
 // ---------------------------------------------------------------------------
 
+/// Public re-export so other elixir submodules can reuse the file walker.
+pub(super) fn collect_elixir_files_pub(root: &Path, include_exs: bool) -> Result<Vec<PathBuf>> {
+    collect_elixir_files(root, include_exs)
+}
+
 fn collect_elixir_files(root: &Path, include_exs: bool) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if root.is_file() {

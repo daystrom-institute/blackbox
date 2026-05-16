@@ -958,6 +958,163 @@ end
 }
 
 // ---------------------------------------------------------------------------
+// extract_elixir_behaviour tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn extract_behaviour_lifts_named_defs_to_callbacks() {
+    let body = r#"defmodule MyApp.Impl do
+  @moduledoc "demo"
+
+  @spec hello(String.t) :: String.t
+  def hello(name), do: "hi " <> name
+
+  def world(x, y), do: x + y
+
+  def private_helper(_), do: :secret
+end
+"#;
+    let (dir, src) = write_elixir_fixture("behaviour_src.ex", body);
+    let target = dir.path().join("behaviour.ex");
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        target: Some(target.to_string_lossy().into_owned()),
+        kind: "extract_elixir_behaviour".to_string(),
+        module_name: Some("MyApp.Behaviour".to_string()),
+        item_names: Some(vec!["hello".to_string(), "world".to_string()]),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+    // Callbacks rendered.
+    let callbacks = value["callback_signatures"].as_array().unwrap();
+    assert_eq!(callbacks.len(), 2);
+    assert!(
+        callbacks
+            .iter()
+            .any(|c| c["rendered"].as_str().unwrap().contains("@callback hello(String.t)"))
+    );
+    assert!(
+        callbacks
+            .iter()
+            .any(|c| c["rendered"].as_str().unwrap().contains("@callback world(any(), any())"))
+    );
+
+    // Target file content.
+    let edits = value["edits"].as_array().unwrap();
+    let target_edit = edits
+        .iter()
+        .find(|e| {
+            e["path"]
+                .as_str()
+                .map(|p| p.ends_with("/behaviour.ex"))
+                .unwrap_or(false)
+        })
+        .expect("behaviour file");
+    let target_text = target_edit["new_text"].as_str().unwrap();
+    assert!(target_text.contains("defmodule MyApp.Behaviour do"));
+    assert!(target_text.contains("@callback hello"));
+    assert!(target_text.contains("@callback world"));
+    assert!(!target_text.contains("@callback private_helper"));
+
+    // Source edits: @behaviour decl + @impl prefixes for lifted defs only.
+    let new_source = apply_file_edits_to(body, &edits[0]);
+    assert!(new_source.contains("@behaviour MyApp.Behaviour"));
+    assert_eq!(new_source.matches("@impl MyApp.Behaviour").count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// inline_elixir_module tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inline_module_inlines_simple_module() {
+    let source = "defmodule App.Tiny do\n  def hi, do: :ok\nend\n";
+    let target = r#"defmodule App.Big do
+  def hello, do: :world
+end
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("tiny.ex");
+    let tgt_path = dir.path().join("big.ex");
+    std::fs::write(&src_path, source).unwrap();
+    std::fs::write(&tgt_path, target).unwrap();
+
+    let params = RefactorPlanParams {
+        source: src_path.to_string_lossy().into_owned(),
+        target: Some(tgt_path.to_string_lossy().into_owned()),
+        kind: "inline_elixir_module".to_string(),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["inlined_module"], "App.Tiny");
+    assert_eq!(value["target_module"], "App.Big");
+    let edits = value["edits"].as_array().unwrap();
+    assert_eq!(edits.len(), 2);
+}
+
+#[test]
+fn inline_module_refuses_on_defstruct() {
+    let source = "defmodule App.Carrier do\n  defstruct [:a, :b]\nend\n";
+    let target = "defmodule App.Big do\nend\n";
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("carrier.ex");
+    let tgt_path = dir.path().join("big.ex");
+    std::fs::write(&src_path, source).unwrap();
+    std::fs::write(&tgt_path, target).unwrap();
+    let params = RefactorPlanParams {
+        source: src_path.to_string_lossy().into_owned(),
+        target: Some(tgt_path.to_string_lossy().into_owned()),
+        kind: "inline_elixir_module".to_string(),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("module_is_struct_carrier"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// public_api_guard tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn public_api_guard_inventories_publics() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("a.ex"),
+        "defmodule App.A do\n  def public_one, do: 1\n  def public_two(x), do: x\n  defp private_helper, do: :secret\nend\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.path().join("b.ex"),
+        "defmodule App.B do\n  @moduledoc false\n  def hidden, do: :secret\nend\n",
+    )
+    .unwrap();
+
+    let params = RefactorPlanParams {
+        source: dir.path().to_string_lossy().into_owned(),
+        kind: "elixir_public_api_guard".to_string(),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+
+    let touched = value["public_items_touched"].as_object().unwrap();
+    let a_items: Vec<&str> = touched["App.A"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert!(a_items.contains(&"public_one/0"));
+    assert!(a_items.contains(&"public_two/1"));
+    assert!(!a_items.contains(&"private_helper/0"));
+    // App.B is @moduledoc false; excluded.
+    assert!(!touched.contains_key("App.B"));
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 
