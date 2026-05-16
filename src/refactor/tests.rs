@@ -5824,6 +5824,7 @@ impl Cache {
             .collect();
         assert!(kinds.contains(&"copy_rust_mod_decls"));
         assert!(kinds.contains(&"delete_rust_items"));
+        assert!(kinds.contains(&"add_rust_use_decl"));
         assert!(kinds.contains(&"rewrite_rust_bin_crate_paths"));
         assert!(kinds.contains(&"rust_compile_fix_round"));
         assert!(run_response.steps.iter().any(|step| {
