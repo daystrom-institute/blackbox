@@ -1254,6 +1254,121 @@ end
 }
 
 // ---------------------------------------------------------------------------
+// elixir_pipe_chain_extract tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pipe_chain_extract_middle_subsequence() {
+    let body = r#"defmodule Demo do
+  def calc(x) do
+    x
+    |> double()
+    |> square()
+    |> add_one()
+    |> stringify()
+  end
+
+  defp double(n), do: n * 2
+  defp square(n), do: n * n
+  defp add_one(n), do: n + 1
+  defp stringify(n), do: to_string(n)
+end
+"#;
+    let (_dir, src) = write_elixir_fixture("pipe.ex", body);
+    // Find the line/column of the pipe chain head `x` (line 3).
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("anchor_line".to_string(), serde_json::json!(3));
+    entries.insert("anchor_column".to_string(), serde_json::json!(5));
+    entries.insert("extract_range_start_offset".to_string(), serde_json::json!(2));
+    entries.insert("extract_range_end_offset".to_string(), serde_json::json!(3));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_pipe_chain_extract".to_string(),
+        module_name: Some("middle".to_string()),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["kind"], "elixir_pipe_chain_extract");
+    let extracted = value["extracted_subsequence"].as_array().unwrap();
+    assert!(extracted.len() >= 1, "got: {extracted:?}");
+}
+
+#[test]
+fn pipe_chain_extract_refuses_offset_zero() {
+    let body = r#"defmodule Demo do
+  def calc(x), do: x |> double() |> square()
+  defp double(n), do: n * 2
+  defp square(n), do: n * n
+end
+"#;
+    let (_dir, src) = write_elixir_fixture("pipe_zero.ex", body);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("anchor_line".to_string(), serde_json::json!(2));
+    entries.insert("anchor_column".to_string(), serde_json::json!(20));
+    entries.insert("extract_range_start_offset".to_string(), serde_json::json!(0));
+    entries.insert("extract_range_end_offset".to_string(), serde_json::json!(1));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_pipe_chain_extract".to_string(),
+        module_name: Some("bad".to_string()),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("range_breaks_chain"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
+// elixir_with_clause_extract tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn with_clause_extract_simple_prefix() {
+    let body = r#"defmodule Demo do
+  def handle(input) do
+    with {:ok, validated} <- validate(input),
+         {:ok, parsed} <- parse(validated),
+         {:ok, result} <- compute(parsed) do
+      {:ok, result}
+    end
+  end
+
+  defp validate(_), do: {:ok, :v}
+  defp parse(_), do: {:ok, :p}
+  defp compute(_), do: {:ok, :r}
+end
+"#;
+    let (_dir, src) = write_elixir_fixture("with_block.ex", body);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("anchor_line".to_string(), serde_json::json!(3));
+    entries.insert("anchor_column".to_string(), serde_json::json!(5));
+    entries.insert("extract_start_clause".to_string(), serde_json::json!(1));
+    entries.insert("extract_end_clause".to_string(), serde_json::json!(2));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        kind: "elixir_with_clause_extract".to_string(),
+        module_name: Some("validate_and_parse".to_string()),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let extracted = value["extracted_clauses"].as_array().unwrap();
+    assert_eq!(extracted.len(), 2);
+    let new_text = apply_text_edits(body, &value);
+    assert!(
+        new_text.contains("defp validate_and_parse"),
+        "expected new fn def, got:\n{new_text}"
+    );
+    assert!(
+        new_text.contains("validate_and_parse()"),
+        "expected call in with, got:\n{new_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 

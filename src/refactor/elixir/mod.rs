@@ -34,8 +34,10 @@ pub(crate) mod genserver_state;
 pub(crate) mod inline_module;
 pub(crate) mod module_deps;
 pub(crate) mod organize_aliases;
+pub(crate) mod pipe_chain;
 pub(crate) mod public_api_guard;
 pub(crate) mod split_clauses;
+pub(crate) mod with_clause;
 
 pub(crate) use extract_behaviour::plan_extract_behaviour;
 pub(crate) use extract_module::plan_extract_module;
@@ -45,8 +47,10 @@ pub(crate) use genserver_state::plan_genserver_state_audit;
 pub(crate) use inline_module::plan_inline_module;
 pub(crate) use module_deps::plan_module_dependency_analysis;
 pub(crate) use organize_aliases::plan_organize_aliases;
+pub(crate) use pipe_chain::plan_pipe_chain_extract;
 pub(crate) use public_api_guard::plan_public_api_guard;
 pub(crate) use split_clauses::plan_split_clauses_by_tag;
+pub(crate) use with_clause::plan_with_clause_extract;
 
 // Shared helper used by sibling submodules + tests for line/col reporting.
 pub(crate) fn byte_to_line_col(source: &str, byte: usize) -> (usize, usize) {
