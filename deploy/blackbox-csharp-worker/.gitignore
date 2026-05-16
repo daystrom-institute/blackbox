@@ -1,0 +1,9 @@
+# Standard .NET build output.
+bin/
+obj/
+
+# Linux quirk: Roslyn's MSBuild host creates directories with literal
+# backslashes (`bin\Debug/`, `obj\Release/`) on Linux. The standard
+# patterns above don't match those.
+bin\*/
+obj\*/
