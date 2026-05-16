@@ -1,0 +1,55 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-genserver-state-audit",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Analyze a GenServer module: infer state schema from init/1, report per-callback state-field reads/writes via the recognized syntactic catalog, surface unresolved access sites for operator review. Analysis-only; precondition for elixir-split-genserver.",
+    "when_to_use": [
+      "about to run elixir-split-genserver and want to inspect state-field reach across callbacks first",
+      "diagnostic: identify which callbacks touch which state fields to plan a clean concern partition"
+    ],
+    "anti_patterns": [
+      "do not use as a permission grant; analysis is honestly advisory at indexed_hints tier (deepseek R2-C1)",
+      "do not trust state_field_touches for callback isolation without reviewing state_field_touches_unresolved manually"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string"}
+        }
+      },
+      "prompt_template": "You are elixir-genserver-state-audit.\n\nProtocol:\n1. bbox_refactor_plan(kind=\"elixir_genserver_state_audit\", source=\"{{source}}\", project_dir=\"{{project_dir}}\").\n2. Surface state_fields, per_callback {reads, writes}, init_initializers, state_field_touches_unresolved.\n3. When state_field_touches_unresolved is non-empty, recommend the operator review before chaining into elixir-split-genserver.\n4. Emit bbox_note(kind=\"done\").\n\nInputs: {{project_dir}} {{source}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "state_fields": {"type": "object"},
+          "per_callback": {"type": "object"},
+          "init_initializers": {"type": "object"},
+          "supervisor_child_specs": {"type": "array"},
+          "state_field_touches_unresolved": {"type": "array"}
+        }
+      },
+      "evidence_density": "normal"
+    },
+    "effects": {"writes_files": false, "dispatches_runs": 0, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

@@ -1,0 +1,61 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-facade-wire",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Maintenance tool: regenerate defdelegate blocks on a facade module to mirror backing modules' public def surface via add_elixir_facade_delegations.",
+    "when_to_use": [
+      "a facade module (e.g. Substrate) re-exports many backing modules and one or more backings have gained/lost public defs",
+      "operator wants to incrementally widen a facade by mirroring a specific backing module's surface"
+    ],
+    "anti_patterns": [
+      "do not use to invent a new facade — the facade module file must exist",
+      "do not use when backing modules emit functions through defmacro (defdelegate can't dispatch macros)"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string", "description": "Facade file."},
+          "target": {"type": "string", "description": "Backing module file."},
+          "module_name": {"type": "string", "description": "Backing module atom name."},
+          "name_filter": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]},
+          "arity_filter": {"type": "array", "items": {"type": "integer"}},
+          "as_renames": {"type": "object", "additionalProperties": {"type": "string"}},
+          "keep_existing": {"type": "boolean"},
+          "apply": {"type": "boolean"}
+        }
+      },
+      "prompt_template": "You are elixir-facade-wire. Charter: regenerate defdelegate lines on a facade.\n\nProtocol:\n1. Plan: bbox_refactor_plan(kind=\"add_elixir_facade_delegations\", source=\"{{source}}\", target=\"{{target}}\", module_name=\"{{module_name}}\", project_dir=\"{{project_dir}}\", toml_entries={...}). Inspect added/removed/kept_existing/renames.\n2. Refuse on no_filters (>= 50 backing publics + no filter set).\n3. Apply with mix compile.\n4. Emit bbox_note(kind=\"done\", body=<added count + removed count + renames count>).\n\nInputs: {{project_dir}} {{source}} {{target}} {{module_name}} {{name_filter}} {{arity_filter}} {{as_renames}} {{keep_existing}} {{apply}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "added": {"type": "array"},
+          "removed": {"type": "array"},
+          "kept_existing": {"type": "array"},
+          "renames": {"type": "object"}
+        }
+      },
+      "evidence_density": "low"
+    },
+    "effects": {"writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}

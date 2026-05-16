@@ -1,0 +1,56 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "elixir-organize-aliases",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Sort, dedupe, and collapse module-level alias/import/require/use directives in an Elixir defmodule body via the elixir_organize_aliases plan kind.",
+    "when_to_use": [
+      "an Elixir module's alias section has drifted out of alphabetical order or has duplicates",
+      "an alias group can be collapsed (alias Foo.A; alias Foo.B → alias Foo.{A, B})",
+      "an organize pass before/after a structural refactor that drops or adds aliases"
+    ],
+    "anti_patterns": [
+      "do not use on modules with `use Foo` whose macros emit conditional aliases",
+      "do not use on non-Elixir files (.ex/.exs)",
+      "do not use as a substitute for elixir_compile_fix_round when the goal is fixing unused-alias warnings — that needs the compile gate, not a syntactic rewrite"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source"],
+        "properties": {
+          "project_dir": {"type": "string"},
+          "source": {"type": "string"},
+          "apply": {"type": "boolean"}
+        }
+      },
+      "prompt_template": "You are elixir-organize-aliases. Charter: sort/dedupe/collapse alias|import|require|use directives via elixir_organize_aliases.\n\nProtocol:\n1. Ground: bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\") confirms file parses.\n2. Plan: bbox_refactor_plan(kind=\"elixir_organize_aliases\", source=\"{{source}}\", project_dir=\"{{project_dir}}\"). Inspect directives_sorted, directives_merged, directives_dropped.\n3. Refuse on error.bad_input(code=directive_in_macro | no_defmodule).\n4. Apply if inputs.apply: bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[<plan>, {\"op\":\"command\",\"command\":\"mix\",\"args\":[\"compile\",\"--warnings-as-errors\"],\"required\":true}, {\"op\":\"command\",\"command\":\"mix\",\"args\":[\"format\",\"--check-formatted\"],\"required\":true}]).\n5. Emit bbox_note(kind=\"done\", body=<directives sorted/merged/dropped counts + compile result>).\n\nInputs: {{project_dir}} {{source}} {{apply}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": {"enum": ["planned", "applied", "blocked", "errored"]},
+          "directives_sorted": {"type": "array", "items": {"type": "string"}},
+          "directives_merged": {"type": "array", "items": {"type": "string"}},
+          "directives_dropped": {"type": "array", "items": {"type": "string"}}
+        }
+      },
+      "evidence_density": "low"
+    },
+    "effects": {"writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false},
+    "composition": {"may_invoke_atoms": {"kind": "none"}},
+    "implementation": {"kind": "profile", "brofile_ref": "brofile:elixir-refactor-persona@v1"},
+    "supervision": {"oracle": "default"},
+    "trace": {"retain": "summary", "portal_focus": "on_attention"},
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-16T00:00:00Z"
+    }
+  }
+}
