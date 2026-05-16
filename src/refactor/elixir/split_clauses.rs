@@ -102,13 +102,7 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         .or_else(|| super::module_deps::defmodule_full_name_pub(defmodule, &parsed.source))
         .ok_or_else(|| anyhow!("module_name (source's defmodule name) is required"))?;
 
-    let item_names: Vec<String> = p
-        .item_names
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .cloned()
-        .collect();
+    let item_names: Vec<String> = p.item_names.as_deref().unwrap_or(&[]).to_vec();
     if item_names.len() != 1 {
         bail!(
             "v1 supports exactly one function name in item_names (got {:?})",
@@ -376,7 +370,7 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
     let mut partitions_report: Vec<PartitionReport> = Vec::new();
     let mut file_edits: Vec<FileEdit> = Vec::new();
 
-    for (bucket, _) in &partition {
+    for bucket in partition.keys() {
         let target_file = derive_target_filename(&target_dir_path, bucket);
         let bucket_clauses: Vec<&ClauseInfo> = partition[bucket]
             .iter()
@@ -1051,7 +1045,7 @@ fn guard_is_preservable(guard_text: &str, bucket_helpers: &BTreeSet<(String, usi
         }
         if j < bytes.len() && bytes[j] == b'(' {
             // It's a call to `ident`.
-            if BUILTIN_GUARDS.iter().any(|b| *b == ident) {
+            if BUILTIN_GUARDS.contains(&ident) {
                 continue;
             }
             // Otherwise look up in bucket_helpers (any arity).

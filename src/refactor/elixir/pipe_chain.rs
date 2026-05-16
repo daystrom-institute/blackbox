@@ -200,7 +200,11 @@ pub(crate) fn plan_pipe_chain_extract(p: &RefactorPlanParams) -> Result<String> 
 #[derive(Debug, Clone)]
 struct ChainStep {
     text: String,
+    /// Reserved for v2 — caller-rewrite mode needs the byte ranges to
+    /// rebuild call sites at exact positions.
+    #[allow(dead_code)]
     byte_start: usize,
+    #[allow(dead_code)]
     byte_end: usize,
 }
 
@@ -227,12 +231,10 @@ fn find_pipe_chain_root<'tree>(tree: &'tree tree_sitter::Tree, anchor: usize) ->
     let mut stack = vec![root];
     while let Some(n) = stack.pop() {
         if n.start_byte() <= anchor && anchor < n.end_byte() && n.kind() == "binary_operator" {
-            if let Some(op) = n.child_by_field_name("operator") {
-                if op.start_byte() == 0 || true {
-                    // can't check operator string by field; we'll re-check below.
-                }
-            }
-            // Check operator text by scanning between left and right children.
+            // tree-sitter-elixir doesn't expose operator strings via a named
+            // field at the binary_operator level; we scan the source slice
+            // between children for "|>". This is the canonical pipe-chain
+            // detection in the elixir grammar.
             let txt = full_node_text_between_children(n);
             if txt.contains("|>") {
                 hit = Some(n);

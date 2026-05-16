@@ -237,12 +237,8 @@ fn sig_name_arity(sig: Node<'_>, source: &str) -> (String, usize) {
 pub(crate) fn top_level_defmodule<'tree>(tree: &'tree Tree, source: &str) -> Option<Node<'tree>> {
     let root = tree.root_node();
     let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        if call_target_name(child, source) == Some("defmodule") {
-            return Some(child);
-        }
-    }
-    None
+    root.named_children(&mut cursor)
+        .find(|child| call_target_name(*child, source) == Some("defmodule"))
 }
 
 #[cfg(test)]

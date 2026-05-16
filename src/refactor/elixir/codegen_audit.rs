@@ -52,7 +52,7 @@ pub(crate) fn plan_codegen_audit(p: &RefactorPlanParams) -> Result<String> {
     let body = defmodule_body_statements(defmodule, &parsed.source);
 
     let mut sites: Vec<CodegenSite> = Vec::new();
-    let mut stack: Vec<tree_sitter::Node<'_>> = body.iter().copied().collect();
+    let mut stack: Vec<tree_sitter::Node<'_>> = body.to_vec();
     while let Some(n) = stack.pop() {
         if n.kind() == "call" && call_target_name(n, &parsed.source) == Some("quote") {
             // Detect inner `defmodule unquote(...)` pattern.

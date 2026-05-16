@@ -125,7 +125,7 @@ pub(crate) fn plan_inline_module(p: &RefactorPlanParams) -> Result<String> {
 
     // EX-V6 v1 floor: verify the post-edit target parses cleanly. (The source
     // stub is just comments and trivially valid.)
-    super::roundtrip::verify_edits_parse_clean(&target.source, &[target_edit.clone()])?;
+    super::roundtrip::verify_edits_parse_clean(&target.source, std::slice::from_ref(&target_edit))?;
 
     let plan = RefactorPlan {
         title: format!("inline_elixir_module: {} → {}", source_module_name, target_module_name),

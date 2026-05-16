@@ -162,17 +162,17 @@ pub(crate) fn plan_module_dependency_analysis(p: &RefactorPlanParams) -> Result<
 
     // ── fan-in-max ──────────────────────────────────────────────────────────
     let mut fan_in: BTreeMap<String, usize> = BTreeMap::new();
-    for ((_, to, _), _) in &edges {
+    for (_, to, _) in edges.keys() {
         *fan_in.entry(to.clone()).or_default() += 1;
     }
     // Keep top 20.
     let mut top: Vec<(String, usize)> = fan_in.into_iter().collect();
-    top.sort_by(|a, b| b.1.cmp(&a.1));
+    top.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     let fan_in_max: BTreeMap<String, usize> = top.into_iter().take(20).collect();
 
     // ── cycle detection (only consider intra-project edges) ─────────────────
     let mut adj: HashMap<String, BTreeSet<String>> = HashMap::new();
-    for ((from, to, _), _) in &edges {
+    for (from, to, _) in edges.keys() {
         if module_set.contains(from) && module_set.contains(to) && from != to {
             adj.entry(from.clone()).or_default().insert(to.clone());
         }

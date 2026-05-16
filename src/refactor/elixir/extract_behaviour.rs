@@ -72,13 +72,7 @@ pub(crate) fn plan_extract_behaviour(p: &RefactorPlanParams) -> Result<String> {
         .ok_or_else(|| anyhow!("module_name (behaviour module name) is required"))?
         .to_string();
 
-    let item_names: Vec<String> = p
-        .item_names
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .cloned()
-        .collect();
+    let item_names: Vec<String> = p.item_names.as_deref().unwrap_or(&[]).to_vec();
     if item_names.is_empty() {
         bail!("item_names is required (list of function names to lift)");
     }
@@ -333,27 +327,27 @@ fn leading_indent_of(source: &str, byte: usize) -> String {
 
 fn behaviour_inject_position(body: &[Node<'_>], source: &str) -> usize {
     // Insert after the leading `@moduledoc` if any; otherwise at the start
-    // of the first body stmt.
-    for stmt in body {
-        if stmt.kind() == "unary_operator" {
-            let mut c = stmt.walk();
-            if let Some(inner) = stmt.named_children(&mut c).next() {
-                if call_target_name(inner, source) == Some("moduledoc") {
-                    // Inject after this stmt + trailing newline.
-                    let end = stmt.end_byte();
-                    let bytes = source.as_bytes();
-                    let mut idx = end;
-                    while idx < bytes.len() && bytes[idx] != b'\n' {
-                        idx += 1;
-                    }
-                    if idx < bytes.len() && bytes[idx] == b'\n' {
-                        idx += 1;
-                    }
-                    return idx;
+    // of the first body stmt. Empty body returns 0.
+    let Some(first) = body.first() else {
+        return 0;
+    };
+    if first.kind() == "unary_operator" {
+        let mut c = first.walk();
+        if let Some(inner) = first.named_children(&mut c).next() {
+            if call_target_name(inner, source) == Some("moduledoc") {
+                // Inject after this stmt + trailing newline.
+                let end = first.end_byte();
+                let bytes = source.as_bytes();
+                let mut idx = end;
+                while idx < bytes.len() && bytes[idx] != b'\n' {
+                    idx += 1;
                 }
+                if idx < bytes.len() && bytes[idx] == b'\n' {
+                    idx += 1;
+                }
+                return idx;
             }
         }
-        return stmt.start_byte();
     }
-    0
+    first.start_byte()
 }

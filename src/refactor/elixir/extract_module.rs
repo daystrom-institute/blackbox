@@ -111,13 +111,7 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
         .as_deref()
         .ok_or_else(|| anyhow!("module_name (target defmodule name) is required for extract_elixir_module"))?;
 
-    let item_names: Vec<String> = p
-        .item_names
-        .as_deref()
-        .unwrap_or(&[])
-        .iter()
-        .cloned()
-        .collect();
+    let item_names: Vec<String> = p.item_names.as_deref().unwrap_or(&[]).to_vec();
     if item_names.is_empty() {
         bail!("item_names is required (list of function names to move)");
     }
