@@ -1245,7 +1245,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "csharp_async_dispose_convert" => csharp::plan_async_dispose_convert(p),
         // Phase 2 (sidecar-required) — distinct error so callers
         // distinguish "not built yet" from "needs sidecar".
-        "csharp_partial_class_audit" => csharp::plan_sidecar_required(p, "csharp_partial_class_audit"),
+        "csharp_partial_class_audit" => csharp::plan_partial_class_audit(p),
         "csharp_awaited_query_in_loop_audit" => {
             csharp::plan_sidecar_required(p, "csharp_awaited_query_in_loop_audit")
         }
