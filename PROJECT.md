@@ -230,7 +230,10 @@ or system memories and link/pointer from here.
   provider transcript read planes.
 - `design/operations/` - topic home for config/artifact lifecycle, bundles,
   doctor, and system-event coordination.
-- `design/archive/`, `design/proposed/`, and `design/partial/` - legacy
-  lifecycle folders for designs not yet migrated into a topic home. Prefer
-  frontmatter `lifecycle` over path when determining currentness, and verify
-  against code before treating any design as current behavior.
+- `design/partial/` - legacy lifecycle folder for designs not yet migrated
+  into a topic home. `design/archive/` and `design/proposed/` no longer
+  exist as folders; lifecycle is tracked via frontmatter (`lifecycle:
+  proposed`, `archived`, etc.) inside the topic homes. To find current
+  proposals, grep `lifecycle: proposed` across `design/` rather than
+  looking for a folder. Always verify against code before treating any
+  design as current behavior.
