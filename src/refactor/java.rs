@@ -3916,6 +3916,7 @@ mod inline_method;
 mod method_object;
 mod migrate_receiver;
 mod replace_static_ref;
+mod scope;
 mod split_provider;
 mod test_slice;
 mod find_usages;

@@ -1,71 +1,56 @@
 //! `extract_java_code_block_to_method` — pull a statement range out of a
 //! method body into a new private helper.
 //!
-//! Mirrors the shape of `extract_rust_function_region`: the operator
-//! supplies the exact text to extract (`old_text`), the new helper's
-//! name (`module_name`), parameter list (`parameters` field), arguments
-//! at the call site (`toml_entries.arguments`), and optional return
-//! type (`toml_entries.return_type`). v1 does no automatic capture
-//! analysis — the operator is the source of truth for the new method's
-//! signature.
+//! The planner builds a lexical scope tree for the enclosing method
+//! (via `super::scope`) and analyzes the selected byte range to
+//! automatically compute:
 //!
-//! Inputs
+//! - **Parameter list**: variables read inside the range whose
+//!   declarations are outside the range. Each becomes a parameter of
+//!   the new helper with its declared type.
+//! - **Arguments**: at the call site, the captures pass through with
+//!   their existing names.
+//! - **Return value**: a variable declared inside the range and used
+//!   at a later byte position in the enclosing method. The helper
+//!   returns it; the call site captures it into a variable of the
+//!   matching type. Zero such variables → helper returns `void`.
 //!
-//! - `source` — Java file containing the enclosing method.
-//! - `project_dir` — project root.
-//! - `old_text` — exact text of the statement range to extract. Must
-//!   match the source file exactly once, must fit cleanly inside one
-//!   `method_declaration` or `constructor_declaration`'s body.
-//! - `module_name` — name of the new private helper.
-//! - `parameters` — list of `JavaParameterSpec` entries (existing
-//!   RefactorPlanParams field). When omitted, the helper takes no
-//!   parameters.
-//! - `toml_entries.arguments` — `Vec<String>` of expressions to pass at
-//!   the call site. Length must match `parameters`. When omitted,
-//!   defaults to the parameter names (most common case: the operator
-//!   captures locals whose names are already in scope at the call
-//!   site).
-//! - `toml_entries.return_type` — optional return type (e.g. `"int"`,
-//!   `"String"`). When omitted or `"void"`, the helper returns `void`
-//!   and the call site is a statement; otherwise the call site is the
-//!   expression `<helper>(<args>)`.
-//! - `toml_entries.return_var` — when `return_type` is non-void, the
-//!   name of the variable on the call site that captures the helper's
-//!   return value. Defaults to `result`.
-//! - `new_text` — optional explicit call-site replacement. When set,
-//!   overrides the synthesized call expression. Use this for unusual
-//!   shapes (chained call, exception-handling wrapper) that the default
-//!   renderer doesn't cover.
-//! - `visibility` — optional. Defaults to `private`. The helper is
-//!   marked `static` automatically when the enclosing method is
-//!   `static`.
-//! - `impl_name` — optional class name when the source file has
-//!   multiple classes (matches `extract_java_methods` semantics).
+//! ## Refusals (the extract is unsafe / impossible at the requested range)
 //!
-//! v1 refusals (the operator should fix and re-run, not pave over):
+//! - `error.mutated_capture(name)` — a captured variable is reassigned
+//!   inside the range. Java has no out-params, so the post-call value
+//!   wouldn't propagate back. Restructure the algorithm so the mutation
+//!   happens at the call site, or extract a smaller range that doesn't
+//!   include the reassignment.
+//! - `error.multi_return_needs_record` — more than one variable
+//!   declared inside the range is used after. Write a record class
+//!   yourself, then re-run with a smaller range that produces a single
+//!   record value.
+//! - `error.non_local_control_flow(kind)` — a `return` / `break` /
+//!   `continue` inside the range targets a method or loop outside the
+//!   range. The extract would change control-flow semantics. Either
+//!   widen the range to include the target, or refactor the early-exit
+//!   into a single return at the end of the range.
+//! - `old_text` doesn't match exactly once.
+//! - The matched range isn't inside any method or constructor body.
 //!
-//! - `old_text` matches zero or more than one place in the file —
-//!   provide more surrounding context so the match is unique.
-//! - The enclosing node isn't a method or constructor body (e.g. the
-//!   range is a class-level static initializer).
-//! - The range crosses a `method_declaration` boundary (extracts from
-//!   two methods at once).
-//! - `parameters.len() != arguments.len()` — the operator must keep
-//!   the two lists aligned.
+//! ## Operator overrides
 //!
-//! v2 follow-ups (filed separately):
-//!
-//! - Automatic capture inference: walk the range for `identifier`
-//!   references, classify by lexical scope, build the parameter list
-//!   without operator help.
-//! - Mutated-capture detection: refuse when a captured local is
-//!   reassigned inside the range (Java has no out-params).
-//! - Multi-value return: synthesize a `record` result type when the
-//!   range produces more than one out-value.
-//! - Control-flow safety: refuse non-local `return` / `break` /
-//!   `continue` referring to labels outside the range.
+//! - `parameters` (`Vec<JavaParameterSpec>`) — when set, REPLACES the
+//!   inferred parameter list. Use this when the operator wants
+//!   different param names (e.g. `total` instead of inferred `sum`) or
+//!   different types (e.g. an interface instead of a concrete class).
+//!   When override is used, `toml_entries.arguments` is required and
+//!   must align in length.
+//! - `new_text` — explicit call-site replacement, overrides the
+//!   synthesized call expression.
+//! - `visibility` — `private` / `protected` / `public` /
+//!   `package-private`. Default `private`.
+//! - `impl_name` — enclosing class name when source has multiple
+//!   classes.
 
 use super::*;
+use super::scope::{ScopeTree, analyze_range};
 
 pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
@@ -129,23 +114,109 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         .unwrap_or("(unnamed)")
         .to_string();
 
-    let parameters_specs = p.parameters.as_deref().unwrap_or(&[]);
-    let arguments = toml_str_array(&p.toml_entries, "arguments");
-    let effective_arguments: Vec<String> = if arguments.is_empty() {
-        parameters_specs.iter().map(|spec| spec.name.clone()).collect()
-    } else {
-        arguments
-    };
-    if effective_arguments.len() != parameters_specs.len() {
+    // -----------------------------------------------------------------
+    // Scope analysis — the load-bearing inference.
+    // -----------------------------------------------------------------
+
+    let scope_tree = ScopeTree::build_from_method(enclosing_method, &parsed.source);
+    let analysis = analyze_range(
+        &scope_tree,
+        enclosing_method,
+        region_start,
+        region_end,
+        &parsed.source,
+    );
+
+    // Refuse: mutated capture.
+    if let Some(bad) = analysis.captures.iter().find(|c| c.mutated) {
         bail!(
-            "extract_java_code_block_to_method: parameters.len()={} but arguments.len()={} \
-             — supply matching lists (or omit arguments to default to parameter names)",
-            parameters_specs.len(),
-            effective_arguments.len()
+            "error.mutated_capture({}): captured variable `{}` is reassigned inside the range. \
+             Java has no out-parameters; extracting would silently drop the post-call value. \
+             Restructure the algorithm so the reassignment happens at the call site, or pick a \
+             smaller range.",
+            bad.name,
+            bad.name
         );
     }
 
-    let return_type = p
+    // Refuse: multi-return.
+    if analysis.inner_decls_used_after.len() > 1 {
+        let names: Vec<&str> = analysis
+            .inner_decls_used_after
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        bail!(
+            "error.multi_return_needs_record: the range declares {} variables that are read after \
+             ({}). Java methods return a single value; declare a `record` type for the bundle \
+             yourself, then re-run with a smaller range that produces a single record value.",
+            names.len(),
+            names.join(", ")
+        );
+    }
+
+    // Refuse: non-local control flow.
+    if let Some(bad) = analysis.non_local_control_flow.first() {
+        bail!(
+            "error.non_local_control_flow({}): the range contains a `{}` that targets a method \
+             or loop outside the selection. Extracting would change control-flow semantics. \
+             Either widen the range to include the target, or refactor the early-exit into a \
+             single return at the end of the range.",
+            bad.kind,
+            bad.kind.trim_end_matches("_statement")
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Parameter/argument list — infer unless operator overrides.
+    // -----------------------------------------------------------------
+
+    let (inferred_params, inferred_args): (Vec<(String, String)>, Vec<String>) = {
+        let params = analysis
+            .captures
+            .iter()
+            .map(|c| (c.type_text.clone(), c.name.clone()))
+            .collect::<Vec<_>>();
+        let args = analysis.captures.iter().map(|c| c.name.clone()).collect();
+        (params, args)
+    };
+
+    let (effective_params, effective_args): (Vec<(String, String)>, Vec<String>) =
+        match p.parameters.as_deref() {
+            Some(specs) if !specs.is_empty() => {
+                let supplied_args = toml_str_array(&p.toml_entries, "arguments");
+                let args = if supplied_args.is_empty() {
+                    specs.iter().map(|s| s.name.clone()).collect::<Vec<_>>()
+                } else {
+                    supplied_args
+                };
+                if args.len() != specs.len() {
+                    bail!(
+                        "operator-supplied parameters.len()={} but arguments.len()={} — must match",
+                        specs.len(),
+                        args.len()
+                    );
+                }
+                let params = specs
+                    .iter()
+                    .map(|s| (s.type_name.clone(), s.name.clone()))
+                    .collect();
+                (params, args)
+            }
+            _ => (inferred_params, inferred_args),
+        };
+
+    // -----------------------------------------------------------------
+    // Return type — infer from inner_decls_used_after (single var) or
+    // operator-supplied toml_entries.return_type override.
+    // -----------------------------------------------------------------
+
+    let inferred_return: Option<(String, String)> = analysis
+        .inner_decls_used_after
+        .first()
+        .map(|(name, ty)| (ty.clone(), name.clone()));
+
+    let operator_return_type = p
         .toml_entries
         .as_ref()
         .and_then(|entries| entries.get("return_type"))
@@ -153,19 +224,28 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
-    let is_void = match return_type.as_deref() {
-        None | Some("void") => true,
-        Some(_) => false,
-    };
-    let return_var_name = p
+    let operator_return_var = p
         .toml_entries
         .as_ref()
         .and_then(|entries| entries.get("return_var"))
         .and_then(|value| value.as_str())
         .map(str::trim)
         .filter(|value| !value.is_empty() && is_java_identifier(value))
-        .unwrap_or("result")
-        .to_string();
+        .map(str::to_string);
+
+    let (return_type, return_var): (String, Option<String>) =
+        match (operator_return_type.as_deref(), &inferred_return) {
+            (Some("void"), _) => ("void".to_string(), None),
+            (Some(t), _) => (
+                t.to_string(),
+                operator_return_var.or_else(|| {
+                    inferred_return.as_ref().map(|(_, n)| n.clone())
+                }),
+            ),
+            (None, Some((ty, name))) => (ty.clone(), Some(name.clone())),
+            (None, None) => ("void".to_string(), None),
+        };
+    let is_void = return_type == "void";
 
     let enclosing_is_static = has_java_modifier_node(enclosing_method, "static");
 
@@ -186,55 +266,47 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         other => format!("{other} "),
     };
     let static_prefix = if enclosing_is_static { "static " } else { "" };
-    let signature_return = return_type.as_deref().unwrap_or("void");
-    let param_list = parameters_specs
+    let param_list = effective_params
         .iter()
-        .map(|spec| format!("{} {}", spec.type_name.trim(), spec.name.trim()))
+        .map(|(ty, name)| format!("{} {}", ty.trim(), name.trim()))
         .collect::<Vec<_>>()
         .join(", ");
 
-    // Construct the helper body. For void return type, just use the
-    // extracted text. For non-void, append a `return result;` synthetic
-    // — operator must structure the extracted text so the helper's last
-    // expression produces the return value (manual-mode, operator owns
-    // correctness). If the operator's extracted block already ends with
-    // a `return ...;` statement the helper compiles fine; the extra
-    // `return result;` is unreachable. v2 inference would fix this.
+    // Helper body. For non-void return type, the helper must end with
+    // `return <return_var>;`. Since `return_var` is the inferred (or
+    // operator-confirmed) variable declared INSIDE the range, the
+    // extracted text already contains its declaration; the return is
+    // synthesized after.
     let extracted = selected.trim_end_matches(|c: char| c.is_whitespace()).to_string();
     let helper_body = if is_void {
         extracted.clone()
     } else {
-        format!("{extracted}\nreturn {return_var_name};")
+        let ret_name = return_var.as_deref().unwrap_or("result");
+        format!("{extracted}\nreturn {ret_name};")
     };
     let helper_indent = method_body_indent_for(class_node, &parsed.source);
     let helper_inner_indent = format!("{helper_indent}    ");
     let helper_body_indented = reindent_block(&helper_body, &helper_inner_indent);
     let helper_decl = format!(
-        "{helper_indent}{visibility_prefix}{static_prefix}{signature_return} {helper_name}({param_list}) {{\n\
+        "{helper_indent}{visibility_prefix}{static_prefix}{return_type} {helper_name}({param_list}) {{\n\
          {helper_body_indented}\n\
          {helper_indent}}}\n"
     );
 
-    // Synthesize the call-site replacement. Operator-supplied
-    // `new_text` overrides for unusual shapes.
-    let arg_list = effective_arguments.join(", ");
+    // Call site.
+    let arg_list = effective_args.join(", ");
     let replacement = if let Some(text) = p.new_text.clone() {
         text
     } else if is_void {
         format!("{helper_name}({arg_list});")
     } else {
-        format!(
-            "{rt} {var} = {name}({args});",
-            rt = signature_return,
-            var = return_var_name,
-            name = helper_name,
-            args = arg_list,
-        )
+        // The call site captures the helper's return into a local of
+        // the matching type, named to match the inner declaration we
+        // hoisted (so post-range uses still bind correctly).
+        let var = return_var.as_deref().unwrap_or("result");
+        format!("{return_type} {var} = {helper_name}({arg_list});")
     };
 
-    // Where to insert the helper: immediately after the enclosing
-    // method's closing brace, with one blank-line separation if the
-    // surrounding source isn't already double-newline-terminated there.
     let enclosing_end = enclosing_method.end_byte();
     let helper_insert_text = format_helper_insert(&parsed.source, enclosing_end, &helper_decl);
 
@@ -252,12 +324,34 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
     edits.sort_by_key(|e| e.byte_start);
     ensure_non_overlapping(&edits)?;
 
+    let mut leftovers = vec![format!(
+        "enclosing {enclosing_method_kind} `{enclosing_method_name}` (static={enclosing_is_static})"
+    )];
+    if !analysis.enclosing_class_refs.is_empty() {
+        leftovers.push(format!(
+            "enclosing_class_refs={:?} (resolved via `this` at the helper site; safe)",
+            analysis.enclosing_class_refs
+        ));
+    }
+    if analysis.this_super_refs > 0 {
+        leftovers.push(format!(
+            "this_super_refs={} (preserved verbatim; helper is on the same class)",
+            analysis.this_super_refs
+        ));
+    }
+
     let plan = RefactorPlan {
         title: format!(
-            "extract code block from {}.{} into `{}` in {}",
+            "extract code block from {}.{} into `{}` ({} param(s){}) in {}",
             java_class_name(class_node, &parsed.source).unwrap_or_else(|| "(unnamed)".into()),
             enclosing_method_name,
             helper_name,
+            effective_params.len(),
+            if is_void {
+                String::new()
+            } else {
+                format!(", returns {return_type}")
+            },
             path_string(&source_path)
         ),
         kind: "extract_java_code_block_to_method".to_string(),
@@ -272,9 +366,7 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         }],
         validations: parse_validation_step_for_path(&source_path),
         items: Vec::new(),
-        leftovers: vec![format!(
-            "enclosing {enclosing_method_kind} `{enclosing_method_name}` (static={enclosing_is_static})"
-        )],
+        leftovers,
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
         remaining_source_constant_refs: Vec::new(),
@@ -304,10 +396,6 @@ fn find_text_matches(haystack: &str, needle: &str) -> Vec<(usize, usize)> {
     out
 }
 
-/// Walk the class body looking for the method (or constructor) whose
-/// body byte range encloses `[region_start, region_end)`. Returns the
-/// `method_declaration` / `constructor_declaration` node, NOT the body
-/// node itself.
 fn find_enclosing_method_node<'a>(
     class_node: Node<'a>,
     region_start: usize,
@@ -394,9 +482,6 @@ fn toml_str_array(
         .collect()
 }
 
-/// Walk a class node's first method to extract the canonical indent
-/// prefix (whitespace before the method declaration). Used so the
-/// inserted helper aligns with the surrounding members.
 fn method_body_indent_for(class_node: Node<'_>, source: &str) -> String {
     let mut cursor = class_node.walk();
     for child in class_node.named_children(&mut cursor) {
@@ -421,10 +506,6 @@ fn method_body_indent_for(class_node: Node<'_>, source: &str) -> String {
     "    ".to_string()
 }
 
-/// Re-indent a multi-line block so every non-empty line starts with
-/// `indent`. The first line is treated identically; leading whitespace
-/// on each input line is replaced with `indent`. Empty lines stay
-/// empty.
 fn reindent_block(text: &str, indent: &str) -> String {
     text.lines()
         .map(|line| {
@@ -439,10 +520,6 @@ fn reindent_block(text: &str, indent: &str) -> String {
         .join("\n")
 }
 
-/// Construct the insertion text for the helper, ensuring a blank-line
-/// separator between the enclosing method's closing brace and the new
-/// helper. If the source already has a trailing newline or two after
-/// the enclosing method, avoid double-spacing.
 fn format_helper_insert(source: &str, enclosing_end: usize, helper_decl: &str) -> String {
     let bytes = source.as_bytes();
     let after = enclosing_end;

@@ -9718,6 +9718,225 @@ fn extract_java_code_block_rejects_invalid_helper_name() {
 }
 
 #[test]
+fn extract_code_block_infers_single_capture_without_operator_help() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Auto.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Auto {\n\
+         \x20   int compute(int seed) {\n\
+         \x20       int doubled = seed * 2;\n\
+         \x20       return doubled;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("int doubled = seed * 2;".to_string());
+    params.module_name = Some("doubleIt".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // edits[0] = call-site replacement (smaller byte position);
+    // edits[1] = helper-insert (at enclosing-method end).
+    assert!(
+        edits[1].replacement.contains("private int doubleIt(int seed)"),
+        "expected inferred sig with seed capture, got: {}",
+        edits[1].replacement
+    );
+    assert!(
+        edits[0].replacement.contains("int doubled = doubleIt(seed);"),
+        "call site: {}",
+        edits[0].replacement
+    );
+}
+
+#[test]
+fn extract_code_block_infers_void_when_no_return_needed() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Side.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Side {\n\
+         \x20   void run(int n) {\n\
+         \x20       int doubled = n * 2;\n\
+         \x20       System.out.println(doubled);\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text =
+        Some("int doubled = n * 2;\n        System.out.println(doubled);".to_string());
+    params.module_name = Some("emit".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert!(
+        edits[1].replacement.contains("private void emit(int n)"),
+        "expected void emit(int n), got: {}",
+        edits[1].replacement
+    );
+}
+
+#[test]
+fn extract_code_block_refuses_mutated_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Mut.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Mut {\n\
+         \x20   int run(int seed) {\n\
+         \x20       seed = seed + 1;\n\
+         \x20       return seed;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("seed = seed + 1;".to_string());
+    params.module_name = Some("bump".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("mutated_capture(seed)"), "got: {err}");
+}
+
+#[test]
+fn extract_code_block_refuses_multi_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   int run() {\n\
+         \x20       int a = 1;\n\
+         \x20       int b = 2;\n\
+         \x20       return a + b;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("int a = 1;\n        int b = 2;".to_string());
+    params.module_name = Some("prep".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("multi_return_needs_record"), "got: {err}");
+}
+
+#[test]
+fn extract_code_block_refuses_non_local_return() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Ret.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Ret {\n\
+         \x20   int run(int n) {\n\
+         \x20       if (n < 0) return -1;\n\
+         \x20       return n;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("if (n < 0) return -1;".to_string());
+    params.module_name = Some("guard".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("non_local_control_flow"), "got: {err}");
+}
+
+#[test]
+fn extract_code_block_refuses_non_local_break() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Brk.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Brk {\n\
+         \x20   void run() {\n\
+         \x20       for (int i = 0; i < 10; i++) {\n\
+         \x20           if (i == 5) break;\n\
+         \x20       }\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("if (i == 5) break;".to_string());
+    params.module_name = Some("check".to_string());
+    let err = plan_extract_java_code_block_to_method(&params).unwrap_err().to_string();
+    assert!(err.contains("non_local_control_flow"), "got: {err}");
+}
+
+#[test]
+fn extract_code_block_this_field_reference_does_not_add_parameter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Field.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Field {\n\
+         \x20   private int counter = 0;\n\
+         \x20   int run() {\n\
+         \x20       int next = this.counter + 1;\n\
+         \x20       return next;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("int next = this.counter + 1;".to_string());
+    params.module_name = Some("advance".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert!(
+        edits[1].replacement.contains("private int advance()"),
+        "expected no-param sig (this.counter resolves via this), got: {}",
+        edits[1].replacement
+    );
+}
+
+#[test]
+fn extract_code_block_inferred_return_uses_inferred_var_name_at_call_site() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Ret2.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Ret2 {\n\
+         \x20   String run(String input) {\n\
+         \x20       String result = input.toUpperCase();\n\
+         \x20       return result;\n\
+         \x20   }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("extract_java_code_block_to_method", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.old_text = Some("String result = input.toUpperCase();".to_string());
+    params.module_name = Some("upper".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_extract_java_code_block_to_method(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    let call = &edits[0].replacement;
+    assert!(
+        call.contains("String result = upper(input);"),
+        "call site: {call}"
+    );
+}
+
+#[test]
 fn extract_java_code_block_to_method_arguments_default_to_param_names() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("Defaults.java");

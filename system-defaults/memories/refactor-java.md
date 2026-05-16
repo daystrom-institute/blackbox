@@ -715,11 +715,26 @@ etc. The synthesized call site is `<helper>(<args>);` for void returns
 and `<return_type> <return_var> = <helper>(<args>);` for non-void. Use
 `new_text` for unusual call-site shapes (chained call, try/catch wrap).
 
-**v1 is manual mode**: the operator owns the parameter and argument
-lists. The planner does NOT yet infer captures from the AST — if the
-extracted range reads three locals and you supply zero parameters, the
-helper compiles but won't see those locals. v2 inference (capture /
-mutated-capture / multi-return analysis) is a planned follow-up.
+The planner builds a lexical scope tree for the enclosing method and
+analyzes the selected byte range. **Inferred automatically**:
+- parameters (variables read inside the range whose declarations are
+  outside) — typed via the scope's declared types
+- return type and return variable (a variable declared inside the
+  range and read after it)
+- refusals: `error.mutated_capture(name)` (captured local reassigned
+  in range; Java has no out-params), `error.multi_return_needs_record`
+  (multiple inner declarations used after; operator must write a
+  record type first), `error.non_local_control_flow(kind)` (return /
+  break / continue inside the range targeting outside).
+
+References to `this.field`, `super`, and bare identifiers that resolve
+to enclosing-class members do NOT need parameters — the generated
+helper is on the same class and resolves them via `this` directly.
+
+The operator can override inferred parameters by supplying
+`parameters` + `toml_entries.arguments`. Use this when you specifically
+want different parameter names (e.g. interface type instead of concrete
+implementation) — otherwise let inference run.
 
 14c. Janitor pass — delete unused private members:
 
