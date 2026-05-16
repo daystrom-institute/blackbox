@@ -1361,6 +1361,7 @@ mod tests {
             "java_collapse_call_chain",
             "migrate_java_method_receiver",
             "java_split_provider",
+            "replace_java_static_reference",
         ];
 
         for kind in java_plan_kinds {

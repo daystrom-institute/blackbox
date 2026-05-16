@@ -740,6 +740,53 @@
         "status",
         "call_sites_rewritten"
       ]
+    },
+    {
+      "id": "dispatch-java-migrate-static-holder-planonly",
+      "atom": "java-migrate-static-holder",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "ProductionDayColumns",
+        "new_text": "siteAdminProvider.get()",
+        "item_names": ["SITE_ADMIN"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "readers_rewritten"
+      ]
+    },
+    {
+      "id": "dispatch-java-singletonify-static-util-planonly",
+      "atom": "java-singletonify-static-util",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "UIUtils",
+        "new_text": "uiUtilsProvider.get()",
+        "item_names": ["formatName"],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "callers_rewritten"
+      ]
+    },
+    {
+      "id": "dispatch-java-replace-vaadin-static-lookup-planonly",
+      "atom": "java-replace-vaadin-static-lookup",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "impl_name": "UI",
+        "new_text": "uiProvider.get()",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "lookups_rewritten"
+      ]
     }
   ]
 }

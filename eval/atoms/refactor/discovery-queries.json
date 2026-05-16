@@ -331,6 +331,30 @@
         "java-split-provider"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-migrate-static-holder",
+      "query": "rewrite readers of a public static final holder field to an injected provider expression",
+      "expected_atoms": [
+        "java-migrate-static-holder"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-singletonify-static-util",
+      "query": "rewrite callers of a java Util class static method to an injected provider singleton",
+      "expected_atoms": [
+        "java-singletonify-static-util"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-replace-vaadin-static-lookup",
+      "query": "replace vaadin ui getCurrent or vaadinSession getCurrent with injected provider",
+      "expected_atoms": [
+        "java-replace-vaadin-static-lookup"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

@@ -8308,6 +8308,148 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// replace_java_static_reference — note-7c819189 / note-e5439c0a / note-7d4f0001
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn replace_java_static_reference_rewrites_static_method_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Util.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Util {\n\
+         \x20   String go() { return UIUtils.formatName(\"x\"); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UIUtils".to_string());
+    params.new_text = Some("uiUtilsProvider.get()".to_string());
+    params.item_names = Some(vec!["formatName".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "uiUtilsProvider.get()");
+}
+
+#[test]
+fn replace_java_static_reference_rewrites_static_field_access() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Holder.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Holder {\n\
+         \x20   Object find() { return ProductionDayColumns.SITE_ADMIN.lookup(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("ProductionDayColumns".to_string());
+    params.new_text = Some("siteAdminProvider.get()".to_string());
+    params.item_names = Some(vec!["SITE_ADMIN".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "siteAdminProvider.get()");
+}
+
+#[test]
+fn replace_java_static_reference_vaadin_drop_accessor_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   void run() { UI.getCurrent().push(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UI".to_string());
+    params.new_text = Some("uiProvider.get()".to_string());
+    params.item_names = Some(vec!["getCurrent".to_string()]);
+    params.delegate_field = Some("UI.getCurrent".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    // The entire `UI.getCurrent()` is replaced with `uiProvider.get()`,
+    // leaving the trailing `.push()` intact.
+    assert_eq!(edits[0].replacement, "uiProvider.get()");
+}
+
+#[test]
+fn replace_java_static_reference_item_kinds_field_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Mixed.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Mixed {\n\
+         \x20   int field() { return Cls.SOME_CONST; }\n\
+         \x20   int method() { return Cls.compute(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("Cls".to_string());
+    params.new_text = Some("clsProvider.get()".to_string());
+    params.item_names = Some(vec!["SOME_CONST".to_string(), "compute".to_string()]);
+    params.item_kinds = Some(vec!["field".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_replace_java_static_reference(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    // Only the SOME_CONST field access is rewritten; the compute() method
+    // call is left alone because item_kinds restricts to field.
+    assert_eq!(edits.len(), 1);
+}
+
+#[test]
+fn replace_java_static_reference_skips_other_class_qualifiers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Other.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Other {\n\
+         \x20   int run() { return OtherUtil.format(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("UIUtils".to_string());
+    params.new_text = Some("uiUtilsProvider.get()".to_string());
+    params.item_names = Some(vec!["format".to_string()]);
+    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    assert!(err.contains("no `UIUtils"), "got: {err}");
+}
+
+#[test]
+fn replace_java_static_reference_rejects_unknown_item_kind() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("X.java");
+    fs::write(&path, "class X {}\n").unwrap();
+    let mut params = java_plan_params("replace_java_static_reference", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("Cls".to_string());
+    params.new_text = Some("p".to_string());
+    params.item_names = Some(vec!["x".to_string()]);
+    params.item_kinds = Some(vec!["bogus".to_string()]);
+    let err = plan_replace_java_static_reference(&params).unwrap_err().to_string();
+    assert!(err.contains("unknown item_kind"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // java_split_provider — note-4ec8ff30
 // ─────────────────────────────────────────────────────────────────────
 
