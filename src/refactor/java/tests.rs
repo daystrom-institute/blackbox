@@ -9008,6 +9008,75 @@ fn migrate_java_method_receiver_refuses_when_no_new_text_or_delegate_type() {
 }
 
 #[test]
+fn migrate_java_method_receiver_v2_handles_method_reference() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Ref.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         import java.util.function.IntPredicate;\n\
+         class Ref {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   private final AuthorizationService authz;\n\
+         \x20   Ref(SessionData s, AuthorizationService a) { this.sessionData = s; this.authz = a; }\n\
+         \x20   IntPredicate test() { return sessionData::isAuthorized; }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authz");
+}
+
+#[test]
+fn migrate_java_method_receiver_v2_project_wide_walks_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("CallerA.java");
+    let file_b = dir.path().join("CallerB.java");
+    fs::write(
+        &file_a,
+        "package p;\n\
+         class CallerA {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   CallerA(SessionData s) { this.sessionData = s; }\n\
+         \x20   boolean a() { return sessionData.isAuthorized(1); }\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        &file_b,
+        "package p;\n\
+         class CallerB {\n\
+         \x20   private final SessionData sessionData;\n\
+         \x20   CallerB(SessionData s) { this.sessionData = s; }\n\
+         \x20   boolean b() { return sessionData.isAuthorized(2); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("migrate_java_method_receiver", &file_a);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionData".to_string());
+    params.new_text = Some("authz".to_string());
+    params.item_names = Some(vec!["isAuthorized".to_string()]);
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("project_wide".to_string(), serde_json::json!(true));
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_migrate_java_method_receiver(&params).unwrap()).unwrap();
+    let paths: std::collections::HashSet<&str> =
+        plan.edits.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.iter().any(|p| p.ends_with("CallerA.java")));
+    assert!(paths.iter().any(|p| p.ends_with("CallerB.java")));
+}
+
+#[test]
 fn migrate_java_method_receiver_refuses_no_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("None.java");
@@ -9109,17 +9178,85 @@ fn java_collapse_call_chain_skips_chains_on_other_receiver_types() {
 }
 
 #[test]
-fn java_collapse_call_chain_refuses_non_two_segment_spec() {
+fn java_collapse_call_chain_refuses_single_segment_spec() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("X.java");
     fs::write(&path, "class X {}\n").unwrap();
     let mut params = java_plan_params("java_collapse_call_chain", &path);
     params.project_dir = Some(path_string(dir.path()));
     params.impl_name = Some("S".to_string());
-    params.module_name = Some("a.b.c".to_string());
+    params.module_name = Some("just_one".to_string());
     params.new_text = Some("d".to_string());
     let err = plan_java_collapse_call_chain(&params).unwrap_err().to_string();
-    assert!(err.contains("two-segment chains"), "got: {err}");
+    assert!(err.contains("chain_too_short"), "got: {err}");
+}
+
+#[test]
+fn java_collapse_call_chain_v2_collapses_three_segment_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("V3.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class V3 {\n\
+         \x20   private final SessionData session;\n\
+         \x20   V3(SessionData s) { this.session = s; }\n\
+         \x20   int currentId() { return session.getOuter().getMiddle().getInner(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getOuter.getMiddle.getInner".to_string());
+    params.new_text = Some("getInnerDirectly".to_string());
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_collapse_call_chain(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "session.getInnerDirectly()");
+}
+
+#[test]
+fn java_collapse_call_chain_v2_project_wide_walks_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let file_a = dir.path().join("ViewA.java");
+    let file_b = dir.path().join("ViewB.java");
+    fs::write(
+        &file_a,
+        "package p;\n\
+         class ViewA {\n\
+         \x20   private final SessionData session;\n\
+         \x20   ViewA(SessionData s) { this.session = s; }\n\
+         \x20   int a() { return session.getAuthLogRecord().getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    fs::write(
+        &file_b,
+        "package p;\n\
+         class ViewB {\n\
+         \x20   private final SessionData session;\n\
+         \x20   ViewB(SessionData s) { this.session = s; }\n\
+         \x20   int b() { return session.getAuthLogRecord().getAuthLogId(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_collapse_call_chain", &file_a);
+    params.project_dir = Some(path_string(dir.path()));
+    params.impl_name = Some("SessionData".to_string());
+    params.module_name = Some("getAuthLogRecord.getAuthLogId".to_string());
+    params.new_text = Some("getAuthLogId".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("project_wide".to_string(), serde_json::json!(true));
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_collapse_call_chain(&params).unwrap()).unwrap();
+    // Both files should be in the plan.
+    let paths: std::collections::HashSet<&str> =
+        plan.edits.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.iter().any(|p| p.ends_with("ViewA.java")));
+    assert!(paths.iter().any(|p| p.ends_with("ViewB.java")));
 }
 
 #[test]

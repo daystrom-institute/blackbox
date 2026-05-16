@@ -111,49 +111,133 @@ pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Resul
         _ => unreachable!("guarded above"),
     };
 
-    let mut edits = Vec::new();
-    walk_for_call_sites(
-        class_node_for_inject,
-        &parsed,
-        &old_receiver,
-        &new_receiver,
-        &item_names,
-        &mut edits,
-    );
+    let project_wide = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("project_wide"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    if edits.is_empty() {
-        bail!(
-            "no call sites match receiver `{old_receiver}` + method in [{}] in {}",
-            item_names.iter().cloned().collect::<Vec<_>>().join(", "),
-            source_path.display()
+    let mut file_edits: Vec<FileEdit> = Vec::new();
+    let mut validations = Vec::new();
+    let mut total_edits = 0usize;
+
+    // Source-file rewrite (also covers the auto-inject edits, which
+    // attach to the source file's enclosing class).
+    {
+        let mut edits = Vec::new();
+        walk_for_call_sites(
+            class_node_for_inject,
+            &parsed,
+            &old_receiver,
+            &new_receiver,
+            &item_names,
+            &mut edits,
         );
+        if edits.is_empty() && !project_wide {
+            bail!(
+                "no call sites match receiver `{old_receiver}` + method in [{}] in {}",
+                item_names.iter().cloned().collect::<Vec<_>>().join(", "),
+                source_path.display()
+            );
+        }
+        edits.extend(aux_edits);
+        edits = dedupe_insertion_edits(edits);
+        if !edits.is_empty() {
+            edits.sort_by_key(|e| e.byte_start);
+            ensure_non_overlapping(&edits)?;
+            total_edits += edits.len();
+            file_edits.push(FileEdit {
+                path: path_string(&source_path),
+                original_sha256: sha256_hex(parsed.source.as_bytes()),
+                edits,
+                new_text: None,
+            });
+            validations.extend(parse_validation_step_for_path(&source_path));
+        }
     }
 
-    edits.extend(aux_edits);
-    edits = dedupe_insertion_edits(edits);
-    edits.sort_by_key(|e| e.byte_start);
-    ensure_non_overlapping(&edits)?;
+    // Project-wide pass: walk every other .java file and rewrite call
+    // sites without touching DI plumbing (the new receiver must
+    // already exist on those files' enclosing classes; otherwise
+    // per-file refusal would block aggregation. v2 caller-side
+    // primitives are best paired with operator-precomputed
+    // `delegate_type` on the source file; downstream files inherit
+    // the canonical receiver text.)
+    if project_wide {
+        let project_dir = p
+            .project_dir
+            .as_deref()
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| anyhow!("project_dir is required for project_wide=true"))?;
+        for entry in walkdir::WalkDir::new(&project_dir).into_iter().flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("java") {
+                continue;
+            }
+            if path.components().any(|c| {
+                matches!(
+                    c.as_os_str().to_str(),
+                    Some("target" | "build" | ".gradle" | "node_modules" | ".git")
+                )
+            }) {
+                continue;
+            }
+            if path == source_path.as_path() {
+                continue; // already handled
+            }
+            let Ok(other_parsed) = parse_source_file(path) else {
+                continue;
+            };
+            if other_parsed.language != "java" {
+                continue;
+            }
+            let mut edits = Vec::new();
+            walk_for_call_sites(
+                other_parsed.tree.root_node(),
+                &other_parsed,
+                &old_receiver,
+                &new_receiver,
+                &item_names,
+                &mut edits,
+            );
+            if edits.is_empty() {
+                continue;
+            }
+            edits.sort_by_key(|e| e.byte_start);
+            ensure_non_overlapping(&edits)?;
+            total_edits += edits.len();
+            file_edits.push(FileEdit {
+                path: path_string(path),
+                original_sha256: sha256_hex(other_parsed.source.as_bytes()),
+                edits,
+                new_text: None,
+            });
+            validations.extend(parse_validation_step_for_path(path));
+        }
+        if file_edits.is_empty() {
+            bail!(
+                "no call sites match receiver `{old_receiver}` + method in [{}] across project_dir",
+                item_names.iter().cloned().collect::<Vec<_>>().join(", ")
+            );
+        }
+    }
 
     let plan = RefactorPlan {
         title: format!(
-            "migrate {} method receiver(s) from `{old_receiver}` to `{new_receiver}` in {}",
-            edits.len(),
-            path_string(&source_path)
+            "migrate {} method receiver(s) from `{old_receiver}` to `{new_receiver}` across {} file(s)",
+            total_edits,
+            file_edits.len()
         ),
         kind: "migrate_java_method_receiver".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
-        edits: vec![FileEdit {
-            path: path_string(&source_path),
-            original_sha256: sha256_hex(parsed.source.as_bytes()),
-            edits,
-            new_text: None,
-        }],
-        validations: parse_validation_step_for_path(&source_path),
+        edits: file_edits,
+        validations,
         items: Vec::new(),
         leftovers: vec![format!(
-            "old_receiver={old_receiver}, new_receiver={new_receiver}, methods={:?}",
+            "old_receiver={old_receiver}, new_receiver={new_receiver}, methods={:?}, project_wide={project_wide}",
             item_names
         )],
         captured_variables: Vec::new(),
@@ -183,29 +267,60 @@ fn walk_for_call_sites(
         for child in n.named_children(&mut c) {
             stack.push(child);
         }
-        if n.kind() != "method_invocation" {
-            continue;
+        match n.kind() {
+            "method_invocation" => {
+                let Some(name_node) = n.child_by_field_name("name") else {
+                    continue;
+                };
+                let Ok(name_text) = name_node.utf8_text(bytes) else {
+                    continue;
+                };
+                if !item_names.contains(name_text) {
+                    continue;
+                }
+                let Some(object) = n.child_by_field_name("object") else {
+                    continue;
+                };
+                let object_text = parsed.source[object.start_byte()..object.end_byte()].to_string();
+                if object_text != old_receiver {
+                    continue;
+                }
+                out.push(TextEdit {
+                    byte_start: object.start_byte(),
+                    byte_end: object.end_byte(),
+                    replacement: new_receiver.to_string(),
+                });
+            }
+            "method_reference" => {
+                // Shape: `<qualifier>::<name>`. The qualifier is the
+                // first named child; the name (identifier) is the
+                // second. Rewrite qualifier from old to new when the
+                // method name is in item_names.
+                let mut mc = n.walk();
+                let kids: Vec<Node<'_>> = n.named_children(&mut mc).collect();
+                if kids.len() != 2 {
+                    continue;
+                }
+                let qualifier = kids[0];
+                let name_node = kids[1];
+                let Ok(name_text) = name_node.utf8_text(bytes) else {
+                    continue;
+                };
+                if !item_names.contains(name_text) {
+                    continue;
+                }
+                let qualifier_text = parsed.source[qualifier.start_byte()..qualifier.end_byte()].to_string();
+                if qualifier_text != old_receiver {
+                    continue;
+                }
+                out.push(TextEdit {
+                    byte_start: qualifier.start_byte(),
+                    byte_end: qualifier.end_byte(),
+                    replacement: new_receiver.to_string(),
+                });
+            }
+            _ => {}
         }
-        let Some(name_node) = n.child_by_field_name("name") else {
-            continue;
-        };
-        let Ok(name_text) = name_node.utf8_text(bytes) else {
-            continue;
-        };
-        if !item_names.contains(name_text) {
-            continue;
-        }
-        let Some(object) = n.child_by_field_name("object") else {
-            continue;
-        };
-        let object_text = parsed.source[object.start_byte()..object.end_byte()].to_string();
-        if object_text != old_receiver {
-            continue;
-        }
-        out.push(TextEdit {
-            byte_start: object.start_byte(),
-            byte_end: object.end_byte(),
-            replacement: new_receiver.to_string(),
-        });
+        continue;
     }
 }

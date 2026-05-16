@@ -1,49 +1,40 @@
-//! `java_collapse_call_chain` — rewrite `recv.A().B()` chains across a
-//! single Java file into `recv.C()` when the target convenience
-//! accessor already exists on the receiver's class.
+//! `java_collapse_call_chain` — rewrite `recv.A().B()...` chains
+//! across one or many Java files into `recv.C()` when the target
+//! convenience accessor already exists on the receiver's class.
 //!
-//! v1 scope: two-step chains, single-file rewrites, no-arg intermediate
-//! calls only. Operator supplies:
+//! ## Modes
 //!
-//! - `impl_name` — receiver type (e.g. `"SessionData"`). The planner
-//!   uses the find_java_usages receiver-resolution heuristic
-//!   (`private final <impl_name> <field>;` on the enclosing class) to
-//!   confirm each chain's receiver actually resolves to that type.
-//! - `module_name` — old chain spec as dot-joined method names, e.g.
-//!   `"getAuthLogRecord.getAuthLogId"`. v1 requires exactly two
-//!   segments.
-//! - `new_text` — target method name (e.g. `"getAuthLogId"`).
+//! - **Single file** (default): operator passes `source`. Planner
+//!   rewrites matching chains in just that file.
+//! - **Project-wide**: operator passes `project_dir` plus
+//!   `toml_entries.project_wide = true`. Planner walks every `.java`
+//!   file under `project_dir` (skipping `target/`, `build/`,
+//!   `.gradle/`, `node_modules/`, `.git/`) and applies the rewrite to
+//!   each file that has matching chains. Emits one `FileEdit` per
+//!   file touched.
 //!
-//! Each match at `<recv>.<A>().<B>()` is replaced with
-//! `<recv>.<new_text>()`. The intermediate call `<A>()` must be no-arg
-//! (v1's purity heuristic: getter shape, name starts with `get`, no
-//! arguments). Non-getter chains are skipped to avoid losing
-//! side-effecting calls in the surrounding expression.
+//! ## Chain shapes supported
 //!
-//! ## v1 refusals
+//! - `module_name = "A.B"` — two-segment chain (`recv.A().B()` →
+//!   `recv.C()`)
+//! - `module_name = "A.B.C..."` — N-segment chain (`recv.A().B().C()`
+//!   → `recv.target()`). The receiver type filter checks the leftmost
+//!   (innermost) call's receiver. All intermediate calls must be
+//!   no-arg.
+//! - Method references (`recv::A`): not collapsible (the chain shape
+//!   has no method-reference equivalent for `recv::C`); skipped. v3
+//!   may add method-reference rewriting; v2 does not because the
+//!   semantic guarantees are different.
 //!
-//! - `error.old_chain_must_have_two_segments`
-//! - `error.no_matches` — zero collapsible chains found in the file.
+//! ## Refusals
 //!
-//! ## v1 limitations
-//!
-//! - Two-step chains only. Multi-step (`a.A().B().C()` → `a.D()`) is
-//!   v2 follow-up.
-//! - Single-file. Project-wide walks are v2 follow-up.
-//! - No method-reference handling (`Recv::A` is not collapsible
-//!   without context; v1 silently skips method_reference nodes).
-//! - No return-type compat check — operator confirms `<recv>.<C>()`
-//!   returns the same type as `<recv>.<A>().<B>()`.
+//! - `error.chain_too_short` — `module_name` segments < 2
+//! - `error.no_matches` — zero collapsible chains found
 
 use super::*;
+use std::path::PathBuf;
 
 pub(crate) fn plan_java_collapse_call_chain(p: &RefactorPlanParams) -> Result<String> {
-    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
-    let parsed = parse_source_file(&source_path)?;
-    if parsed.language != "java" {
-        bail!("java_collapse_call_chain only supports java files");
-    }
-
     let receiver_type = p
         .impl_name
         .as_deref()
@@ -53,17 +44,20 @@ pub(crate) fn plan_java_collapse_call_chain(p: &RefactorPlanParams) -> Result<St
         .module_name
         .as_deref()
         .ok_or_else(|| {
-            anyhow!("module_name (old chain as `methodA.methodB`) is required")
+            anyhow!("module_name (old chain as `methodA.methodB[.methodC...]`) is required")
         })?
         .to_string();
-    let segments: Vec<&str> = chain_spec.split('.').collect();
-    if segments.len() != 2 {
+    let segments: Vec<String> = chain_spec
+        .split('.')
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if segments.len() < 2 {
         bail!(
-            "java_collapse_call_chain v1 supports exactly two-segment chains; got `{chain_spec}`"
+            "error.chain_too_short: java_collapse_call_chain requires at least 2 chain segments; \
+             got `{chain_spec}`"
         );
     }
-    let outer_method = segments[1];
-    let inner_method = segments[0];
     let target = p
         .new_text
         .as_deref()
@@ -72,49 +66,133 @@ pub(crate) fn plan_java_collapse_call_chain(p: &RefactorPlanParams) -> Result<St
         .ok_or_else(|| anyhow!("new_text (target method name) is required"))?
         .to_string();
 
-    let mut edits = Vec::new();
-    collect_chain_matches(
-        parsed.tree.root_node(),
-        &parsed,
-        &receiver_type,
-        inner_method,
-        outer_method,
-        &target,
-        &mut edits,
-    );
+    let project_wide = p
+        .toml_entries
+        .as_ref()
+        .and_then(|m| m.get("project_wide"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    if edits.is_empty() {
-        bail!(
-            "no `<recv>.{inner_method}().{outer_method}()` chains with receiver of type \
-             `{receiver_type}` found in {}",
-            source_path.display()
+    let mut file_edits: Vec<FileEdit> = Vec::new();
+    let mut validations = Vec::new();
+    let mut total_edits = 0usize;
+
+    if project_wide {
+        let project_dir = p
+            .project_dir
+            .as_deref()
+            .map(PathBuf::from)
+            .ok_or_else(|| {
+                anyhow!("project_dir is required for project_wide=true")
+            })?;
+        for entry in walkdir::WalkDir::new(&project_dir).into_iter().flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("java") {
+                continue;
+            }
+            if path.components().any(|c| {
+                matches!(
+                    c.as_os_str().to_str(),
+                    Some("target" | "build" | ".gradle" | "node_modules" | ".git")
+                )
+            }) {
+                continue;
+            }
+            let Ok(parsed) = parse_source_file(path) else {
+                continue;
+            };
+            if parsed.language != "java" {
+                continue;
+            }
+            let mut edits = Vec::new();
+            collect_chain_matches(
+                parsed.tree.root_node(),
+                &parsed,
+                &receiver_type,
+                &segments,
+                &target,
+                &mut edits,
+            );
+            if edits.is_empty() {
+                continue;
+            }
+            edits.sort_by_key(|e| e.byte_start);
+            ensure_non_overlapping(&edits)?;
+            total_edits += edits.len();
+            file_edits.push(FileEdit {
+                path: path_string(path),
+                original_sha256: sha256_hex(parsed.source.as_bytes()),
+                edits,
+                new_text: None,
+            });
+            validations.extend(parse_validation_step_for_path(path));
+        }
+        if file_edits.is_empty() {
+            bail!(
+                "no matching chains found under project_dir={} for chain `{chain_spec}` with \
+                 receiver type `{receiver_type}`",
+                project_dir.display()
+            );
+        }
+    } else {
+        let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+        let parsed = parse_source_file(&source_path)?;
+        if parsed.language != "java" {
+            bail!("java_collapse_call_chain only supports java files");
+        }
+        let mut edits = Vec::new();
+        collect_chain_matches(
+            parsed.tree.root_node(),
+            &parsed,
+            &receiver_type,
+            &segments,
+            &target,
+            &mut edits,
         );
+        if edits.is_empty() {
+            bail!(
+                "no `<recv>.{}` chains with receiver of type `{receiver_type}` found in {}",
+                segments.join(".").to_string() + "()",
+                source_path.display()
+            );
+        }
+        edits.sort_by_key(|e| e.byte_start);
+        ensure_non_overlapping(&edits)?;
+        total_edits = edits.len();
+        file_edits.push(FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits,
+            new_text: None,
+        });
+        validations.extend(parse_validation_step_for_path(&source_path));
     }
 
-    edits.sort_by_key(|e| e.byte_start);
-    ensure_non_overlapping(&edits)?;
+    let scope_label = if project_wide {
+        format!(
+            "project_dir={}",
+            p.project_dir.as_deref().unwrap_or("<unspecified>")
+        )
+    } else {
+        path_string(&PathBuf::from(p.source.as_str()))
+    };
 
     let plan = RefactorPlan {
         title: format!(
-            "collapse {} call chain(s) `{chain_spec}` → `{target}` on receivers of type \
-             `{receiver_type}` in {}",
-            edits.len(),
-            path_string(&source_path)
+            "collapse {} call chain(s) `{chain_spec}` → `{target}` across {} file(s) in {}",
+            total_edits,
+            file_edits.len(),
+            scope_label
         ),
         kind: "java_collapse_call_chain".to_string(),
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
-        edits: vec![FileEdit {
-            path: path_string(&source_path),
-            original_sha256: sha256_hex(parsed.source.as_bytes()),
-            edits,
-            new_text: None,
-        }],
-        validations: parse_validation_step_for_path(&source_path),
+        edits: file_edits,
+        validations,
         items: Vec::new(),
         leftovers: vec![format!(
-            "receiver_type={receiver_type}, chain={chain_spec}, target={target}"
+            "receiver_type={receiver_type}, chain={chain_spec}, target={target}, project_wide={project_wide}"
         )],
         captured_variables: Vec::new(),
         remaining_source_accessors: Vec::new(),
@@ -128,12 +206,13 @@ pub(crate) fn plan_java_collapse_call_chain(p: &RefactorPlanParams) -> Result<St
     Ok(serde_json::to_string_pretty(&plan)?)
 }
 
+/// Walk for chains matching `segments[0]().segments[1]()...segments[N-1]()`
+/// with the leftmost (innermost) receiver resolving to `receiver_type`.
 fn collect_chain_matches(
     node: Node<'_>,
     parsed: &ParsedSource,
     receiver_type: &str,
-    inner_method: &str,
-    outer_method: &str,
+    segments: &[String],
     target: &str,
     out: &mut Vec<TextEdit>,
 ) {
@@ -146,61 +225,72 @@ fn collect_chain_matches(
         if n.kind() != "method_invocation" {
             continue;
         }
-        // Outer call's name must match outer_method.
-        let outer_name = n
-            .child_by_field_name("name")
-            .and_then(|nm| nm.utf8_text(parsed.source.as_bytes()).ok())
-            .map(str::to_string)
-            .unwrap_or_default();
-        if outer_name != outer_method {
-            continue;
+        // Try to match this method_invocation as the OUTERMOST call of
+        // the chain (last segment).
+        if let Some(replacement) = try_match_chain(n, parsed, receiver_type, segments, target) {
+            out.push(TextEdit {
+                byte_start: n.start_byte(),
+                byte_end: n.end_byte(),
+                replacement,
+            });
         }
-        // Outer must be no-arg (or any-arg matching target's arity — v1
-        // requires outer no-arg to keep semantics safe).
-        if !invocation_is_zero_arg(n) {
-            continue;
-        }
-        // Outer's object must be the INNER method_invocation.
-        let Some(object) = n.child_by_field_name("object") else {
-            continue;
-        };
-        if object.kind() != "method_invocation" {
-            continue;
-        }
-        let inner_name = object
-            .child_by_field_name("name")
-            .and_then(|nm| nm.utf8_text(parsed.source.as_bytes()).ok())
-            .map(str::to_string)
-            .unwrap_or_default();
-        if inner_name != inner_method {
-            continue;
-        }
-        if !invocation_is_zero_arg(object) {
-            continue;
-        }
-        // Inner's receiver must resolve to the requested type.
-        if !crate::refactor::java::find_usages::method_invocation_receiver_matches_declaring_class(
-            parsed,
-            object,
-            receiver_type,
-        ) {
-            continue;
-        }
-        // Build the replacement: <recv>.<target>()
-        let Some(recv_node) = object.child_by_field_name("object") else {
-            continue;
-        };
-        let recv_text = match recv_node.utf8_text(parsed.source.as_bytes()) {
-            Ok(t) => t.to_string(),
-            Err(_) => continue,
-        };
-        let replacement = format!("{recv_text}.{target}()");
-        out.push(TextEdit {
-            byte_start: n.start_byte(),
-            byte_end: n.end_byte(),
-            replacement,
-        });
     }
+}
+
+/// Match `node` as the outermost call in a chain whose names (from
+/// innermost to outermost) equal `segments`. Returns the replacement
+/// text on success.
+fn try_match_chain(
+    node: Node<'_>,
+    parsed: &ParsedSource,
+    receiver_type: &str,
+    segments: &[String],
+    target: &str,
+) -> Option<String> {
+    let bytes = parsed.source.as_bytes();
+    // Walk DOWN the chain: current = outer call; segment index = N-1
+    // matches outer call's name; step into object's method_invocation
+    // for the next inner segment.
+    let mut current = node;
+    let mut segment_idx = segments.len();
+    while segment_idx > 0 {
+        if current.kind() != "method_invocation" {
+            return None;
+        }
+        let name = current
+            .child_by_field_name("name")
+            .and_then(|nm| nm.utf8_text(bytes).ok())
+            .map(str::to_string)
+            .unwrap_or_default();
+        if name != segments[segment_idx - 1] {
+            return None;
+        }
+        if !invocation_is_zero_arg(current) {
+            return None;
+        }
+        if segment_idx > 1 {
+            // Step into the object for the next-inner segment.
+            let object = current.child_by_field_name("object")?;
+            current = object;
+        } else {
+            // Innermost segment: receiver is `current.object` (might
+            // be missing if it's `methodA()` receiverless — refuse
+            // those, the receiver type check needs an actual receiver).
+            let object = current.child_by_field_name("object")?;
+            // Verify receiver type matches.
+            if !crate::refactor::java::find_usages::method_invocation_receiver_matches_declaring_class(
+                parsed,
+                current,
+                receiver_type,
+            ) {
+                return None;
+            }
+            let recv_text = object.utf8_text(bytes).ok()?;
+            return Some(format!("{recv_text}.{target}()"));
+        }
+        segment_idx -= 1;
+    }
+    None
 }
 
 fn invocation_is_zero_arg(node: Node<'_>) -> bool {
