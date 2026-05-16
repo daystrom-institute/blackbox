@@ -27,9 +27,11 @@ use super::ParsedSource;
 use crate::chunker::code::parser_for_language;
 
 pub(crate) mod extract_module;
+pub(crate) mod facade;
 pub(crate) mod organize_aliases;
 
 pub(crate) use extract_module::plan_extract_module;
+pub(crate) use facade::plan_facade_delegations;
 pub(crate) use organize_aliases::plan_organize_aliases;
 
 // ---------------------------------------------------------------------------
@@ -136,6 +138,51 @@ pub(crate) fn call_arguments<'tree>(call: Node<'tree>) -> Option<Node<'tree>> {
     let mut cursor = call.walk();
     call.named_children(&mut cursor)
         .find(|n| n.kind() == "arguments")
+}
+
+/// Extract the `(name, arity)` of a `def`/`defp`/`defmacro`/`defmacrop` call.
+///
+/// Handles:
+///   - bare name with no args: `def hello, do: ...`        → ("hello", 0)
+///   - parenthesized args:     `def hello(x, y), do: ...`  → ("hello", 2)
+///   - guarded sig:            `def hello(x) when ...`     → ("hello", 1)
+pub(crate) fn def_name_and_arity(def_call: Node<'_>, source: &str) -> Option<(String, usize)> {
+    let arguments = call_arguments(def_call)?;
+    let mut arg_cursor = arguments.walk();
+    let sig = arguments.named_children(&mut arg_cursor).next()?;
+    Some(sig_name_arity(sig, source))
+}
+
+fn sig_name_arity(sig: Node<'_>, source: &str) -> (String, usize) {
+    match sig.kind() {
+        "identifier" => (source[sig.byte_range()].to_string(), 0),
+        "call" => {
+            let mut cursor = sig.walk();
+            let mut iter = sig.named_children(&mut cursor);
+            let name_node = iter.next();
+            let args = iter.next();
+            let name = name_node
+                .map(|n| source[n.byte_range()].to_string())
+                .unwrap_or_default();
+            let arity = args
+                .map(|a| {
+                    let mut c = a.walk();
+                    a.named_children(&mut c).count()
+                })
+                .unwrap_or(0);
+            (name, arity)
+        }
+        "binary_operator" => {
+            // `hello(x) when guard(x)` — recurse into the left side
+            let mut cursor = sig.walk();
+            let left = sig.named_children(&mut cursor).next();
+            match left {
+                Some(l) => sig_name_arity(l, source),
+                None => (String::from("__unknown__"), 0),
+            }
+        }
+        _ => (String::from("__unknown__"), 0),
+    }
 }
 
 /// Find the (single) top-level `defmodule` call in a source tree, if any.

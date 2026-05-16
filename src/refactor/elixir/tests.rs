@@ -400,6 +400,120 @@ end
 }
 
 // ---------------------------------------------------------------------------
+// add_elixir_facade_delegations tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn facade_generates_delegations_from_backing() {
+    let backing = r#"defmodule Substrate.Graph do
+  def put_decision(d), do: :ok
+  def get_decision(id), do: id
+  def all_decisions(), do: []
+  defp internal, do: :secret
+  def put_concept(c), do: c
+end
+"#;
+    let facade = r#"defmodule Substrate do
+  @moduledoc "facade"
+end
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let facade_path = dir.path().join("substrate.ex");
+    let backing_path = dir.path().join("graph.ex");
+    std::fs::write(&facade_path, facade).unwrap();
+    std::fs::write(&backing_path, backing).unwrap();
+
+    let params = RefactorPlanParams {
+        source: facade_path.to_string_lossy().into_owned(),
+        target: Some(backing_path.to_string_lossy().into_owned()),
+        kind: "add_elixir_facade_delegations".to_string(),
+        module_name: Some("Substrate.Graph".to_string()),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let added = value["added"].as_array().expect("added").len();
+    assert_eq!(added, 4, "should add all 4 public defs, got {added}");
+    let new_text = apply_text_edits(facade, &value);
+    assert!(new_text.contains("defdelegate put_decision(arg1), to: Substrate.Graph"));
+    assert!(new_text.contains("defdelegate get_decision(arg1), to: Substrate.Graph"));
+    assert!(new_text.contains("defdelegate all_decisions, to: Substrate.Graph"));
+    assert!(new_text.contains("defdelegate put_concept(arg1), to: Substrate.Graph"));
+    assert!(!new_text.contains("internal"), "defp should not be mirrored");
+}
+
+#[test]
+fn facade_respects_name_filter_regex() {
+    let backing = r#"defmodule Backing do
+  def put_x(x), do: x
+  def put_y(y), do: y
+  def get_x(), do: 0
+end
+"#;
+    let facade = "defmodule Facade do\nend\n";
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("facade.ex");
+    let b = dir.path().join("backing.ex");
+    std::fs::write(&f, facade).unwrap();
+    std::fs::write(&b, backing).unwrap();
+
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "name_filter".to_string(),
+        serde_json::Value::String("^put_".to_string()),
+    );
+    let params = RefactorPlanParams {
+        source: f.to_string_lossy().into_owned(),
+        target: Some(b.to_string_lossy().into_owned()),
+        kind: "add_elixir_facade_delegations".to_string(),
+        module_name: Some("Backing".to_string()),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let added: Vec<String> = value["added"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(added.len(), 2);
+    assert!(added.iter().any(|s| s.starts_with("put_x")));
+    assert!(added.iter().any(|s| s.starts_with("put_y")));
+}
+
+#[test]
+fn facade_keep_existing_skips_already_delegated() {
+    let backing = "defmodule B do\n  def x(a), do: a\n  def y(a), do: a\nend\n";
+    let facade = r#"defmodule F do
+  defdelegate x(arg1), to: B
+end
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.ex");
+    let b = dir.path().join("b.ex");
+    std::fs::write(&f, facade).unwrap();
+    std::fs::write(&b, backing).unwrap();
+
+    let params = RefactorPlanParams {
+        source: f.to_string_lossy().into_owned(),
+        target: Some(b.to_string_lossy().into_owned()),
+        kind: "add_elixir_facade_delegations".to_string(),
+        module_name: Some("B".to_string()),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let kept = value["kept_existing"].as_array().expect("kept");
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0], "x/1");
+    let added = value["added"].as_array().expect("added");
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0], "y/1");
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 

@@ -39,7 +39,7 @@ use anyhow::{Result, anyhow, bail};
 use serde::Serialize;
 use tree_sitter::Node;
 
-use super::{call_target_name, defmodule_body_statements, parse_elixir_file, top_level_defmodule};
+use super::{call_target_name, def_name_and_arity, defmodule_body_statements, parse_elixir_file, top_level_defmodule};
 use crate::refactor::{
     FileEdit, PlanStatus, RefactorPlan, RefactorPlanParams, SemanticStatus, TextEdit,
     ValidationStep, resolve_path, sha256_hex, toml_bool, toml_str_array,
@@ -459,48 +459,12 @@ fn is_attached_attribute_name(name: &str) -> bool {
     ATTACHED_ATTR_NAMES.contains(&name)
 }
 
-fn def_name_and_arity(def_call: Node<'_>, source: &str) -> Option<(String, usize)> {
-    // `def`/`defp`/`defmacro` have arguments[0] = the signature.
-    let mut cursor = def_call.walk();
-    let arguments = def_call
-        .named_children(&mut cursor)
-        .find(|n| n.kind() == "arguments")?;
-    let mut arg_cursor = arguments.walk();
-    let sig = arguments.named_children(&mut arg_cursor).next()?;
-    Some(sig_name_arity(sig, source))
-}
-
-fn sig_name_arity(sig: Node<'_>, source: &str) -> (String, usize) {
-    match sig.kind() {
-        "identifier" => (source[sig.byte_range()].to_string(), 0),
-        "call" => {
-            // hello(x, y) → identifier "hello", arguments with N children
-            let mut cursor = sig.walk();
-            let mut iter = sig.named_children(&mut cursor);
-            let name_node = iter.next();
-            let args = iter.next();
-            let name = name_node
-                .map(|n| source[n.byte_range()].to_string())
-                .unwrap_or_default();
-            let arity = args
-                .map(|a| {
-                    let mut c = a.walk();
-                    a.named_children(&mut c).count()
-                })
-                .unwrap_or(0);
-            (name, arity)
-        }
-        "binary_operator" => {
-            // `hello(x) when guard(x)` — recurse into the left side
-            let mut cursor = sig.walk();
-            let left = sig.named_children(&mut cursor).next();
-            match left {
-                Some(l) => sig_name_arity(l, source),
-                None => (String::from("__unknown__"), 0),
-            }
-        }
-        _ => (String::from("__unknown__"), 0),
+/// Public-def restricted variant used by `add_elixir_facade_delegations`.
+pub(super) fn def_name_and_arity_public(def_call: Node<'_>, source: &str) -> Option<(String, usize)> {
+    if call_target_name(def_call, source)? != "def" {
+        return None;
     }
+    def_name_and_arity(def_call, source)
 }
 
 fn stmt_contains_kind(node: Node<'_>, kind: &str, source: &str, target_filter: impl Fn(&str) -> bool) -> bool {
