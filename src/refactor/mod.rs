@@ -16,6 +16,7 @@ use rust::*;
 mod java;
 use java::*;
 pub(crate) mod csharp;
+pub(crate) mod workspace_adapter;
 pub(crate) mod plan_slot;
 pub(crate) mod rust_compile_fix;
 pub(crate) mod rust_deep;
