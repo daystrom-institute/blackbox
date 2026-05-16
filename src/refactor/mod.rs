@@ -1238,8 +1238,8 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "csharp_public_api_guard" => csharp::plan_unimplemented(p, "csharp_public_api_guard"),
         "move_csharp_type_to_file" => csharp::plan_unimplemented(p, "move_csharp_type_to_file"),
         "migrate_csharp_type_usages" => csharp::plan_unimplemented(p, "migrate_csharp_type_usages"),
-        "csharp_to_record_migrate" => csharp::plan_unimplemented(p, "csharp_to_record_migrate"),
-        "csharp_primary_ctor_migrate" => csharp::plan_unimplemented(p, "csharp_primary_ctor_migrate"),
+        "csharp_to_record_migrate" => csharp::plan_to_record_migrate(p),
+        "csharp_primary_ctor_migrate" => csharp::plan_primary_ctor_migrate(p),
         "csharp_async_dispose_convert" => csharp::plan_unimplemented(p, "csharp_async_dispose_convert"),
         // Phase 2 (sidecar-required) — distinct error so callers
         // distinguish "not built yet" from "needs sidecar".
@@ -1251,7 +1251,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "csharp_nullable_annotation_repair" => {
             csharp::plan_sidecar_required(p, "csharp_nullable_annotation_repair")
         }
-        "unseal_csharp_class" => csharp::plan_sidecar_required(p, "unseal_csharp_class"),
+        "unseal_csharp_class" => csharp::plan_unseal(p),
         "move_csharp_members_to_partial" => {
             csharp::plan_sidecar_required(p, "move_csharp_members_to_partial")
         }

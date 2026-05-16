@@ -21,16 +21,27 @@ use anyhow::{Result, bail};
 
 use crate::refactor::RefactorPlanParams;
 
+pub(crate) mod lex;
 pub mod filescoped_namespace;
 pub mod find_usages;
 pub mod lsp_rename;
 pub mod organize_usings;
+pub mod primary_ctor_migrate;
+pub mod record_migrate;
+pub mod unseal;
 pub mod workspace_probe;
+
+// Compatibility alias so submodules that referenced the old inline lex
+// helpers via `super::unseal_lex::*` keep working.
+pub(crate) use lex as unseal_lex;
 
 pub use filescoped_namespace::plan_filescoped_namespace;
 pub use find_usages::plan_find_csharp_usages;
 pub use lsp_rename::plan_lsp_rename;
 pub use organize_usings::plan_organize_usings;
+pub use primary_ctor_migrate::plan_primary_ctor_migrate;
+pub use record_migrate::plan_to_record_migrate;
+pub use unseal::plan_unseal;
 pub use workspace_probe::plan_workspace_probe;
 
 /// Re-exported helpers for sibling submodules. Lives here so the LSP
