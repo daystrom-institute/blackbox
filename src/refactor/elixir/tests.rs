@@ -1467,6 +1467,69 @@ fn test_fixture_extract_pulls_duplicated_setup() {
 }
 
 // ---------------------------------------------------------------------------
+// elixir_move_module_across_apps tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn move_across_apps_basic_scaffold() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path();
+    let src_app = project.join("apps/substrate/lib/substrate");
+    let dst_app = project.join("apps/witness/lib/witness");
+    std::fs::create_dir_all(&src_app).unwrap();
+    std::fs::create_dir_all(&dst_app).unwrap();
+    std::fs::write(
+        src_app.join("helper.ex"),
+        "defmodule Substrate.Helper do\n  def hi, do: :ok\nend\n",
+    )
+    .unwrap();
+    // Need a stub defmodule for the witness app too so module collection works.
+    std::fs::write(
+        dst_app.join("placeholder.ex"),
+        "defmodule Witness.Placeholder do\n  def x, do: :y\nend\n",
+    )
+    .unwrap();
+
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("target_app".to_string(), serde_json::json!("apps/witness"));
+    let params = RefactorPlanParams {
+        source: src_app.join("helper.ex").to_string_lossy().into_owned(),
+        project_dir: Some(project.to_string_lossy().into_owned()),
+        kind: "elixir_move_module_across_apps".to_string(),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let json = plan_with_ctx(&params, &PlanContext::default()).expect("plan");
+    let value: serde_json::Value = serde_json::from_str(&json).expect("json");
+    assert_eq!(value["kind"], "elixir_move_module_across_apps");
+    assert_eq!(value["moved_module"], "Substrate.Helper");
+    assert_eq!(value["source_app"], "apps/substrate");
+    assert_eq!(value["target_app"], "apps/witness");
+    let moves = value["file_moves"].as_array().unwrap();
+    assert_eq!(moves.len(), 1);
+    let mv = &moves[0];
+    assert!(mv["target_path"].as_str().unwrap().contains("apps/witness/lib"));
+}
+
+#[test]
+fn move_across_apps_refuses_when_source_not_in_apps() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("loose.ex");
+    std::fs::write(&src, "defmodule Loose do\nend\n").unwrap();
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert("target_app".to_string(), serde_json::json!("apps/witness"));
+    let params = RefactorPlanParams {
+        source: src.to_string_lossy().into_owned(),
+        project_dir: Some(dir.path().to_string_lossy().into_owned()),
+        kind: "elixir_move_module_across_apps".to_string(),
+        toml_entries: Some(entries),
+        ..Default::default()
+    };
+    let err = plan_with_ctx(&params, &PlanContext::default()).expect_err("refuse");
+    assert!(err.to_string().contains("source_not_in_apps_lib"), "got: {err}");
+}
+
+// ---------------------------------------------------------------------------
 // Text-edit application helper for tests
 // ---------------------------------------------------------------------------
 
