@@ -1,0 +1,154 @@
+//! Elixir refactor plan kinds.
+//!
+//! Per `design/refactor-tools/elixir/refactor-elixir-expansion.md` the Elixir
+//! surface lives behind the same `bbox_refactor_plan` MCP entry point as Rust
+//! and Java. This module owns the per-plan-kind implementations; dispatch
+//! routing happens in `src/refactor/mod.rs::plan_dispatch`.
+//!
+//! Two AST lanes per EX-V6:
+//!  - **Writable lane** — `Code.string_to_quoted_with_comments!/2` round-trip
+//!    via the daemon-managed escript helper (Open Question 1 resolution).
+//!    Required for every plan kind that emits `FileEdit`s.
+//!  - **Analysis lane** — tree-sitter Elixir grammar through
+//!    `tree_sitter_language_pack::get_parser("elixir")`. Used for
+//!    analysis-only plan kinds and for cheap structural inventory inside
+//!    writable plans (the actual edits still round-trip the writable lane).
+//!
+//! In v1 the writable lane lives behind a feature flag — the escript helper
+//! is added in a later milestone. Plan kinds that don't yet use it operate
+//! syntactically on tree-sitter output and rely on EX-V6 being enforced at
+//! apply time once the helper exists. Each plan kind documents which lane
+//! it operates in.
+
+use anyhow::{Result, anyhow};
+use tree_sitter::{Node, Tree};
+
+use super::ParsedSource;
+use crate::chunker::code::parser_for_language;
+
+pub(crate) mod organize_aliases;
+
+pub(crate) use organize_aliases::plan_organize_aliases;
+
+// ---------------------------------------------------------------------------
+// AST lane plumbing
+// ---------------------------------------------------------------------------
+
+/// Parse an Elixir source file through tree-sitter.
+///
+/// Analysis-only path; never emit FileEdits based purely on this parse unless
+/// the plan kind is itself analysis-only. Writable plan kinds must additionally
+/// round-trip through the escript writable lane (EX-V6).
+pub(super) fn parse_elixir(source: &str) -> Result<Tree> {
+    let mut parser = parser_for_language("elixir")?;
+    parser
+        .parse(source, None)
+        .ok_or_else(|| anyhow!("tree-sitter elixir parser returned no tree"))
+}
+
+/// Read and parse an Elixir source file. Mirrors `parse_source_file` in
+/// `mod.rs` but bound to the elixir grammar; returns a `ParsedSource` so
+/// downstream helpers (`syntax_item`, `line_col`, attribute capture) work
+/// uniformly across languages.
+pub(super) fn parse_elixir_file(path: &std::path::Path) -> Result<ParsedSource> {
+    let source = std::fs::read_to_string(path)
+        .map_err(|e| anyhow!("failed to read {}: {e}", path.display()))?;
+    let tree = parse_elixir(&source)?;
+    Ok(ParsedSource {
+        path: path.to_path_buf(),
+        language: "elixir",
+        source,
+        tree,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tree shape primitives
+// ---------------------------------------------------------------------------
+//
+// tree-sitter-elixir represents Elixir's "everything is a function call"
+// uniformly: `defmodule X do ... end`, `alias Foo`, `def f, do: ...` are all
+// `call` nodes whose target identifier is `defmodule`, `alias`, `def`, etc.
+// The do/end body is a `do_block` field on the call.
+//
+// Common node kinds we care about:
+//   - `source`           — root
+//   - `call`             — any function call; target is `identifier` field
+//   - `arguments`        — call arguments list
+//   - `do_block`         — body of `defmodule` / `def` / etc.
+//   - `alias`            — capitalized module ref (Foo, Foo.Bar)
+//   - `identifier`       — lowercase identifier or function name
+//   - `atom`             — `:atom` literal
+//   - `binary_operator`  — `|>`, `==`, etc.
+
+/// Returns the `identifier`/`alias` text that names the target of a `call`
+/// node — e.g., `"alias"` for `alias Foo.Bar`, `"defmodule"` for
+/// `defmodule Foo do ... end`. Returns `None` for non-call nodes or calls
+/// whose first named child isn't a bare identifier/alias.
+///
+/// tree-sitter-elixir represents the call shape as
+/// `call { identifier; arguments; [do_block?] }` without field names; we
+/// rely on the first named child being the target.
+pub(crate) fn call_target_name<'a>(node: Node<'_>, source: &'a str) -> Option<&'a str> {
+    if node.kind() != "call" {
+        return None;
+    }
+    let target = node.named_child(0)?;
+    let kind = target.kind();
+    if kind == "identifier" || kind == "alias" {
+        return Some(&source[target.byte_range()]);
+    }
+    None
+}
+
+/// Iterate the top-level statements inside a `defmodule X do ... end` body.
+/// Returns an empty list if the node isn't a `defmodule` call or has no body.
+pub(crate) fn defmodule_body_statements<'tree>(
+    defmodule_call: Node<'tree>,
+    source: &str,
+) -> Vec<Node<'tree>> {
+    if call_target_name(defmodule_call, source) != Some("defmodule") {
+        return Vec::new();
+    }
+    let Some(do_block) = call_do_block(defmodule_call) else {
+        return Vec::new();
+    };
+    let mut cursor = do_block.walk();
+    do_block
+        .named_children(&mut cursor)
+        .filter(|n| n.kind() != "end")
+        .collect()
+}
+
+/// Find the `do_block` child of a `call` node (e.g., for `defmodule … do … end`
+/// or `def foo do … end`). Returns `None` for inline `do:` keyword-arg form
+/// or call nodes without a block body.
+pub(crate) fn call_do_block<'tree>(call: Node<'tree>) -> Option<Node<'tree>> {
+    let mut cursor = call.walk();
+    call.named_children(&mut cursor).find(|n| n.kind() == "do_block")
+}
+
+/// Return the `arguments` child of a `call` node, if any.
+#[allow(dead_code)] // used by later milestones (extract_module, split_clauses)
+pub(crate) fn call_arguments<'tree>(call: Node<'tree>) -> Option<Node<'tree>> {
+    let mut cursor = call.walk();
+    call.named_children(&mut cursor)
+        .find(|n| n.kind() == "arguments")
+}
+
+/// Find the (single) top-level `defmodule` call in a source tree, if any.
+/// Elixir convention is one defmodule per file; nested defmodules are rare
+/// but legal — this returns the first top-level one.
+pub(crate) fn top_level_defmodule<'tree>(tree: &'tree Tree, source: &str) -> Option<Node<'tree>> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        if call_target_name(child, source) == Some("defmodule") {
+            return Some(child);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests;
