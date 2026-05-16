@@ -8308,6 +8308,143 @@ fn prune_java_orphans_emits_non_overlapping_edits_when_multiple_orphans() {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// java_split_provider — note-4ec8ff30
+// ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn java_split_provider_rewrites_single_getter() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("View.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class View {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   private final Provider<AuthLogRecord> authLogProvider;\n\
+         \x20   View(Provider<SessionData> s, Provider<AuthLogRecord> a) { this.sessionDataProvider = s; this.authLogProvider = a; }\n\
+         \x20   AuthLogRecord rec() { return sessionDataProvider.get().getAuthLogRecord(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({ "getAuthLogRecord": "authLogProvider" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 1);
+    assert_eq!(edits[0].replacement, "authLogProvider.get()");
+}
+
+#[test]
+fn java_split_provider_rewrites_multiple_getters_with_distinct_targets() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Multi.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Multi {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   Multi(Provider<SessionData> s) { this.sessionDataProvider = s; }\n\
+         \x20   int a() { return sessionDataProvider.get().getAuthLogId(); }\n\
+         \x20   String b() { return sessionDataProvider.get().getName(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({
+            "getAuthLogId": "authLogIdProvider",
+            "getName": "nameProvider"
+        }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    let edits = &plan.edits[0].edits;
+    assert_eq!(edits.len(), 2);
+    let replacements: std::collections::HashSet<&str> =
+        edits.iter().map(|e| e.replacement.as_str()).collect();
+    assert!(replacements.contains("authLogIdProvider.get()"));
+    assert!(replacements.contains("nameProvider.get()"));
+}
+
+#[test]
+fn java_split_provider_skips_unmapped_getters() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("Skip.java");
+    fs::write(
+        &path,
+        "package p;\n\
+         class Skip {\n\
+         \x20   private final Provider<SessionData> sessionDataProvider;\n\
+         \x20   Skip(Provider<SessionData> s) { this.sessionDataProvider = s; }\n\
+         \x20   String mapped() { return sessionDataProvider.get().getName(); }\n\
+         \x20   int unmapped() { return sessionDataProvider.get().getOtherField(); }\n\
+         }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("sessionDataProvider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({ "getName": "nameProvider" }),
+    );
+    params.toml_entries = Some(entries);
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_split_provider(&params).unwrap()).unwrap();
+    // Only the mapped getter is rewritten; the unmapped one is left
+    // alone (planner doesn't try to be clever about partial splits).
+    assert_eq!(plan.edits[0].edits.len(), 1);
+}
+
+#[test]
+fn java_split_provider_refuses_empty_mapping() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("E.java");
+    fs::write(&path, "class E {}\n").unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("provider".to_string());
+    let err = plan_java_split_provider(&params).unwrap_err().to_string();
+    assert!(err.contains("getter_mapping"), "got: {err}");
+}
+
+#[test]
+fn java_split_provider_refuses_no_matches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("N.java");
+    fs::write(
+        &path,
+        "package p;\nclass N { int run() { return 0; } }\n",
+    )
+    .unwrap();
+    let mut params = java_plan_params("java_split_provider", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    params.delegate_field = Some("provider".to_string());
+    let mut entries = std::collections::BTreeMap::new();
+    entries.insert(
+        "getter_mapping".to_string(),
+        serde_json::json!({ "getX": "xProvider" }),
+    );
+    params.toml_entries = Some(entries);
+    let err = plan_java_split_provider(&params).unwrap_err().to_string();
+    assert!(err.contains("no `provider.get()"), "got: {err}");
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // migrate_java_method_receiver — note-1ee49c59
 // ─────────────────────────────────────────────────────────────────────
 

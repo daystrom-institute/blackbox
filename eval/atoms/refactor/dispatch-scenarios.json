@@ -725,6 +725,21 @@
         "status",
         "call_sites_rewritten"
       ]
+    },
+    {
+      "id": "dispatch-java-split-provider-planonly",
+      "atom": "java-split-provider",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UtilitySource.java",
+        "delegate_field": "sessionDataProvider",
+        "getter_mapping": { "getAuthLogRecord": "authLogProvider" },
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "call_sites_rewritten"
+      ]
     }
   ]
 }

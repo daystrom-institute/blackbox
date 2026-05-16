@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "migrate_java_method_receiver", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "migrate_java_method_receiver", "java_split_provider", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
 order = 12
 template = false
 +++
@@ -508,6 +508,31 @@ the workspace-import drain has completed.
     refusal heuristics, `boolean_getter_strategy`, and prerequisites.
     Lombok must already be on the classpath; the planner does not
     modify the build.
+
+14b8. Split a Provider<Big> across call sites:
+
+```text
+bbox_refactor_plan(
+  kind="java_split_provider",
+  source="src/main/java/com/example/View.java",
+  project_dir="/absolute/project/root",
+  delegate_field="sessionDataProvider",
+  toml_entries={
+    "getter_mapping": {
+      "getAuthLogRecord": "authLogProvider",
+      "getName":          "nameProvider"
+    }
+  }
+)
+```
+
+The matching atom is `java-split-provider`. Finds
+`<delegate_field>.get().<getter>()` chains and rewrites each to
+`<newProviderField>.get()` per the operator-supplied mapping. v1 only
+handles the call-site rewrite; auto-splitting the `@Inject Provider<T>`
+field on the enclosing class is deferred to the shared DI-plumbing
+helper (v2). Operator splits the field manually first, then runs this
+to drag callers.
 
 14b7. Migrate method receivers after a production move:
 

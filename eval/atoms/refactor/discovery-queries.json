@@ -323,6 +323,14 @@
         "java-migrate-method-receiver"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-split-provider",
+      "query": "split a guice or jakarta Provider field on a java class into typed providers across call sites",
+      "expected_atoms": [
+        "java-split-provider"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [
