@@ -28,6 +28,8 @@ use crate::chunker::code::parser_for_language;
 
 pub(crate) mod codegen_audit;
 pub(crate) mod compile_fix;
+pub(crate) mod credo_fix;
+pub(crate) mod dialyzer;
 pub(crate) mod extract_behaviour;
 pub(crate) mod extract_module;
 pub(crate) mod facade;
@@ -47,6 +49,8 @@ pub(crate) mod with_clause;
 
 pub(crate) use codegen_audit::plan_codegen_audit;
 pub(crate) use compile_fix::plan_compile_fix_round;
+pub(crate) use credo_fix::plan_credo_fix_round;
+pub(crate) use dialyzer::plan_dialyzer_attribution;
 pub(crate) use extract_behaviour::plan_extract_behaviour;
 pub(crate) use extract_module::plan_extract_module;
 pub(crate) use facade::plan_facade_delegations;
