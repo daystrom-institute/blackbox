@@ -61,6 +61,10 @@ chains see drift between source files and the daemon's view.
 
 ```text
 # MCP form (preferred):
+bbox_artifact_install(kind="brofile", source="system-defaults/badgey/brofiles/badgey-persona.json")
+bbox_artifact_install(kind="brofile", source="system-defaults/badgey/brofiles/badgey-scout-persona.json")
+bbox_artifact_install(kind="agent",   source="system-defaults/badgey/agents/badgey.json")
+bbox_artifact_install(kind="agent",   source="system-defaults/badgey/agents/badgey-scout.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-scout-arc.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-slack-emit-proposal-arc.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-triage-channel-arc.json")

@@ -4,6 +4,9 @@
   "provider": "claude",
   "model": "claude-sonnet-4-6",
   "effort": "medium",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  },
   "filters": {
     "disallow": ["mcp__blackbox__bro_*"]
   },

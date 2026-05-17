@@ -222,6 +222,12 @@ short-circuit paths.
 Install the Badgey system-default artifacts from `system-defaults/badgey/`:
 
 ```
+# Brofiles and agents
+bbox_artifact_install(kind="brofile", source="system-defaults/badgey/brofiles/badgey-persona.json")
+bbox_artifact_install(kind="brofile", source="system-defaults/badgey/brofiles/badgey-scout-persona.json")
+bbox_artifact_install(kind="agent", source="system-defaults/badgey/agents/badgey.json")
+bbox_artifact_install(kind="agent", source="system-defaults/badgey/agents/badgey-scout.json")
+
 # Workflows
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-scout-arc.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/badgey/workflows/badgey-slack-emit-proposal-arc.json")

@@ -29,9 +29,8 @@ bbox_artifact_install(kind="packet", source="system-defaults/agentic-corpus/pack
 bbox_artifact_install(kind="packet", source="system-defaults/agentic-corpus/packets/phase-decompose/recompose-verdict.json")
 bbox_artifact_install(kind="packet", source="system-defaults/agentic-corpus/packets/phase-decompose/epoch-ceiling.json")
 
-bbox_artifact_install(kind="agent", source="system-defaults/agents/corpus-pathfinder.json")
-
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/inlet.json")
+bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/corpus-pathfinder.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/decomposer-facilitator.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/decomposer-architecture.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/decomposer-implementation.json")
@@ -42,6 +41,8 @@ bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-dec
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/recompose-acceptance.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/implementer.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/phase-decompose/edit-implementer.json")
+
+bbox_artifact_install(kind="agent", source="system-defaults/agents/corpus-pathfinder.json")
 
 bbox_artifact_install(kind="team", source="system-defaults/phase-decompose/teamplates/decomposer-panel.json")
 bbox_artifact_install(kind="team", source="system-defaults/phase-decompose/teamplates/recompose-council.json")

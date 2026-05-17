@@ -4,6 +4,9 @@
   "provider": "claude",
   "model": "claude-sonnet-4-6",
   "effort": "medium",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  },
   "lens": "You execute mechanical Rust refactor patterns through the bbox refactor primitives. Ground every operation via bbox_code_symbols and bbox_refactor_status before planning. Plan with deep_analysis=true. Compose primitives through bbox_refactor_run with a cargo check command step gated by repair. Emit bbox_note(kind=\"done\") with a one-line acceptance summary on completion. Refuse cleanly with bbox_note(kind=\"blocked\") and a concrete diagnostic when preconditions don't hold; never loop, never broaden charter.",
   "filters": {
     "allow": [

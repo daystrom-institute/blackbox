@@ -849,11 +849,16 @@ mod tests {
         let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
         assert_eq!(bf.name, "rust-refactor-persona");
         assert_eq!(bf.provider, Provider::Claude);
-        assert!(bf
-            .lens
-            .as_deref()
-            .unwrap_or("")
-            .contains("bbox refactor primitives"));
+        assert_eq!(
+            bf.context.as_ref().and_then(|c| c.provider_defaults),
+            Some(ProviderDefaultsMode::SuppressWhenSupported)
+        );
+        assert!(
+            bf.lens
+                .as_deref()
+                .unwrap_or("")
+                .contains("bbox refactor primitives")
+        );
 
         let f = bf.filters.expect("filters present");
 
@@ -916,6 +921,10 @@ mod tests {
         assert_eq!(bf.provider, Provider::Codex);
         assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(bf.effort.as_deref(), Some("medium"));
+        assert_eq!(
+            bf.context.as_ref().and_then(|c| c.provider_defaults),
+            Some(ProviderDefaultsMode::SuppressWhenSupported)
+        );
         let lens = bf.lens.as_deref().unwrap_or("");
         assert!(lens.contains("bbox refactor primitives"));
         assert!(
@@ -984,6 +993,10 @@ mod tests {
         assert_eq!(bf.provider, Provider::Codex);
         assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(bf.effort.as_deref(), Some("high"));
+        assert_eq!(
+            bf.context.as_ref().and_then(|c| c.provider_defaults),
+            Some(ProviderDefaultsMode::SuppressWhenSupported)
+        );
         let lens = bf.lens.as_deref().unwrap_or("");
         assert!(lens.contains("edit-capable bounded implementer"));
         assert!(lens.contains("must not dispatch or resume agents"));
@@ -1020,6 +1033,64 @@ mod tests {
         assert_eq!(
             r_disallow, j_disallow,
             "refactor personas should expose identical disallow sets"
+        );
+        assert_eq!(
+            rust.context.as_ref().and_then(|c| c.provider_defaults),
+            java.context.as_ref().and_then(|c| c.provider_defaults),
+            "refactor personas should share context policy"
+        );
+    }
+
+    #[test]
+    fn refactor_atom_brofiles_suppress_provider_defaults() {
+        for (name, src) in [
+            (
+                "rust-refactor-persona",
+                include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json"),
+            ),
+            (
+                "java-refactor-persona",
+                include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json"),
+            ),
+            (
+                "csharp-refactor-persona",
+                include_str!(
+                    "../../system-defaults/brofiles/refactor/csharp-refactor-persona.json"
+                ),
+            ),
+            (
+                "elixir-refactor-persona",
+                include_str!(
+                    "../../system-defaults/brofiles/refactor/elixir-refactor-persona.json"
+                ),
+            ),
+        ] {
+            let bf: Brofile = serde_json::from_str(src)
+                .unwrap_or_else(|e| panic!("{name} brofile should parse: {e}"));
+            assert_eq!(
+                bf.context.as_ref().and_then(|c| c.provider_defaults),
+                Some(ProviderDefaultsMode::SuppressWhenSupported),
+                "{name} should suppress provider defaults for profile-backed atoms"
+            );
+        }
+    }
+
+    #[test]
+    fn phase_decomposer_scout_brofile_suppresses_defaults() {
+        let src =
+            include_str!("../../system-defaults/brofiles/phase-decompose/corpus-pathfinder.json");
+        let bf: Brofile = serde_json::from_str(src).expect("corpus-pathfinder brofile parses");
+        assert_eq!(bf.name, "corpus-pathfinder");
+        assert_eq!(bf.provider, Provider::Codex);
+        assert_eq!(
+            bf.context.as_ref().and_then(|c| c.provider_defaults),
+            Some(ProviderDefaultsMode::SuppressWhenSupported)
+        );
+        assert!(
+            bf.lens
+                .as_deref()
+                .unwrap_or("")
+                .contains("one focused discovery charter")
         );
     }
 

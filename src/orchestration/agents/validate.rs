@@ -644,6 +644,10 @@ mod tests {
                 "badgey",
                 include_str!("../../../system-defaults/agents/badgey.json"),
             ),
+            (
+                "corpus-pathfinder",
+                include_str!("../../../system-defaults/agents/corpus-pathfinder.json"),
+            ),
         ] {
             let value: serde_json::Value =
                 serde_json::from_str(raw).expect("reference agent must be valid JSON");
@@ -1316,6 +1320,22 @@ mod tests {
             )
             .expect("brofile install");
 
+        let pathfinder_src = include_str!(
+            "../../../system-defaults/brofiles/phase-decompose/corpus-pathfinder.json"
+        );
+        let pathfinder_v: serde_json::Value =
+            serde_json::from_str(pathfinder_src).expect("corpus-pathfinder brofile parses");
+        catalog
+            .install_value(
+                crate::artifacts::ArtifactKind::Brofile,
+                "corpus-pathfinder.json".into(),
+                &pathfinder_v,
+                Some("corpus-pathfinder".into()),
+                None,
+                None,
+            )
+            .expect("corpus-pathfinder brofile install");
+
         let mut registry = AgentAdapterRegistry::new();
         struct TestBadgeyAdapter;
         impl super::super::adapter::AgentDispatchAdapter for TestBadgeyAdapter {
@@ -1350,6 +1370,7 @@ mod tests {
             include_str!("../../../system-defaults/agents/code-reviewer.json"),
             include_str!("../../../system-defaults/agents/diff-narrator.json"),
             include_str!("../../../system-defaults/agents/badgey.json"),
+            include_str!("../../../system-defaults/agents/corpus-pathfinder.json"),
         ];
         for src in agents {
             let v: serde_json::Value = serde_json::from_str(src).expect("agent JSON parses");
@@ -1402,6 +1423,10 @@ mod tests {
             "diff-narrator not in catalog"
         );
         assert!(names.contains(&"badgey"), "badgey not in catalog");
+        assert!(
+            names.contains(&"corpus-pathfinder"),
+            "corpus-pathfinder not in catalog"
+        );
     }
 
     #[test]
