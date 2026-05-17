@@ -1,0 +1,35 @@
+{
+  "name": "drone-probe",
+  "members": [
+    {
+      "brofile": "drone-probe-vibe-high",
+      "alias": "vibe",
+      "count": 1
+    },
+    {
+      "brofile": "drone-probe-claude-sonnet-medium",
+      "alias": "claude",
+      "count": 1
+    },
+    {
+      "brofile": "drone-probe-codex-spark",
+      "alias": "codex",
+      "count": 1
+    },
+    {
+      "brofile": "drone-probe-gemini-pro",
+      "alias": "gemini",
+      "count": 1
+    },
+    {
+      "brofile": "drone-probe-glm-turbo",
+      "alias": "glm",
+      "count": 1
+    },
+    {
+      "brofile": "drone-probe-deepseek-flash",
+      "alias": "deepseek",
+      "count": 1
+    }
+  ]
+}

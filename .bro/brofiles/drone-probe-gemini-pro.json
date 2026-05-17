@@ -1,0 +1,9 @@
+{
+  "name": "drone-probe-gemini-pro",
+  "provider": "gemini",
+  "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
+  "model": "gemini-3.1-pro-preview",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "name": "drone-probe-claude-sonnet-medium",
+  "provider": "claude",
+  "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
+  "model": "claude-sonnet-4-6",
+  "effort": "medium",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  }
+}

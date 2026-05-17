@@ -1,0 +1,9 @@
+{
+  "name": "drone-probe-deepseek-flash",
+  "provider": "deepseek",
+  "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
+  "model": "deepseek-v4-flash",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  }
+}

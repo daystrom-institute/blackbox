@@ -1,0 +1,9 @@
+{
+  "name": "drone-probe-codex-spark",
+  "provider": "codex",
+  "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
+  "model": "gpt-5.3-codex-spark",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  }
+}

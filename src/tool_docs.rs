@@ -874,7 +874,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_brofile",
         category: ToolCategory::Orchestration,
-        summary: "Manage brofile templates + accounts (provider+account+lens).",
+        summary: "Manage brofile templates + accounts (provider+account+lens+context).",
         when_to_use: "Create, inspect, and manage reusable bro blueprints. Before `action=create`, call `action=list` first to avoid duplicates. See `sm-create-etiquette` via `bbox_knowledge` for dedupe hygiene.",
         example: Some(r#"bro_brofile(action="list")"#),
     },

@@ -3,6 +3,7 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -56,7 +57,7 @@ pub struct Brofile {
 // Context-assembly policy
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct BrofileContext {
     /// Suppression mode for provider-loaded harness markdown and
     /// default system-prompt material. See `ProviderDefaultsMode`.
@@ -64,7 +65,9 @@ pub struct BrofileContext {
     pub provider_defaults: Option<ProviderDefaultsMode>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderDefaultsMode {
     /// Let the provider load its normal global/user/project markdown

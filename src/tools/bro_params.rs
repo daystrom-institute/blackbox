@@ -568,6 +568,10 @@ pub(crate) struct BrofileParams {
     /// using this brofile. Default off (absent / false).
     #[serde(default)]
     pub(crate) coerce_workspace: Option<bool>,
+    /// Optional context-assembly policy, including provider default
+    /// suppression for providers that support it.
+    #[serde(default)]
+    pub(crate) context: Option<orchestration::brofile::BrofileContext>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

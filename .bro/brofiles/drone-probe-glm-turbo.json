@@ -1,0 +1,9 @@
+{
+  "name": "drone-probe-glm-turbo",
+  "provider": "glm",
+  "lens": "You are a minimal probe drone. Follow the prompt exactly. Return only the requested output.",
+  "model": "glm-5-turbo",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  }
+}

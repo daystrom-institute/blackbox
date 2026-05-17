@@ -251,7 +251,7 @@ impl BlackboxServer {
                     filters,
                     coerce_workspace: p.coerce_workspace,
                     runtime: None,
-                    context: None,
+                    context: p.context.clone(),
                 };
                 if let Err(e) =
                     brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
