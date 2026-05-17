@@ -89,6 +89,10 @@ impl BlackboxServer {
             .and_then(|l| l.brofile_context.as_ref())
             .or(brofile_context.as_ref());
         orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
+        exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            exec_opts,
+            effective_context,
+        );
 
         if !is_resume {
             let brofile_runtime = self

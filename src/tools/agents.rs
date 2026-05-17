@@ -696,10 +696,15 @@ impl BlackboxServer {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
+                    provider_defaults: None,
                 })
             } else {
                 None
             };
+            let opts = orchestration::providers::exec_opts_with_provider_defaults(
+                opts,
+                bf.context.as_ref(),
+            );
             (
                 bf.provider,
                 bf.lens,
@@ -753,6 +758,7 @@ impl BlackboxServer {
                         .get("effort")
                         .and_then(|v| v.as_str())
                         .map(String::from),
+                    provider_defaults: None,
                 })
             } else {
                 None

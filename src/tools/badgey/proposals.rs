@@ -628,8 +628,12 @@ impl BlackboxServer {
             cwd,
             brofile_filters,
             _coerce_workspace,
-            _brofile_context,
+            brofile_context,
         ) = self.resolve_exec_target(Some(brofile), None, Some(project_dir))?;
+        let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            exec_opts,
+            brofile_context.as_ref(),
+        );
         let session_id = "pending".to_string();
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.to_string()),

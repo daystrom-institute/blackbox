@@ -1070,10 +1070,15 @@ impl BlackboxServer {
             Some(orchestration::providers::ExecOpts {
                 model: bf.model.clone(),
                 effort: bf.effort.clone(),
+                provider_defaults: None,
             })
         } else {
             None
         };
+        let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            exec_opts,
+            bf.context.as_ref(),
+        );
 
         let prompt = match (&manifest.inputs, args_to_validate) {
             (Some(spec), _) if spec.prompt_template.is_some() => {
@@ -1547,8 +1552,7 @@ impl BlackboxServer {
         drop(store);
 
         self.refresh_atom_invocation_from_task(&mut primary_invocation);
-        self
-            .state
+        self.state
             .atom_invocation_store
             .write()
             .update(primary_invocation.clone());
@@ -2080,10 +2084,15 @@ impl BlackboxServer {
             Some(ExecOpts {
                 model: bf.model.clone(),
                 effort: bf.effort.clone(),
+                provider_defaults: None,
             })
         } else {
             None
         };
+        let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            exec_opts,
+            effective_context,
+        );
         let (env_account, env_model) = if let Some(lease) = &selected_lease {
             (lease.account.as_deref(), lease.model.as_deref())
         } else {

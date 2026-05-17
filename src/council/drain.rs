@@ -440,29 +440,59 @@ fn build_dispatch(
         .get(&member.name)
         .cloned();
     let resume_lease = existing_session.as_ref().and_then(|sid| {
-        crate::orchestration::allocator::lookup_lease_for_session(
+        crate::orchestration::allocator::lookup_lease_for_session_any_provider(
             store_dir,
             &shared.task_store.read(),
-            bf.provider,
             sid,
         )
     });
+    let effective_provider = resume_lease
+        .as_ref()
+        .map(|lease| lease.provider)
+        .unwrap_or(bf.provider);
     let effective_context = resume_lease
         .as_ref()
         .and_then(|l| l.brofile_context.as_ref())
         .or(bf.context.as_ref());
-    enforce_provider_defaults(bf.provider, effective_context)?;
+    enforce_provider_defaults(effective_provider, effective_context)?;
     let env = resolve_provider_env(
-        bf.provider,
-        bf.account.as_deref(),
-        bf.model.as_deref(),
+        effective_provider,
+        resume_lease
+            .as_ref()
+            .and_then(|lease| lease.account.as_deref())
+            .or(bf.account.as_deref()),
+        resume_lease
+            .as_ref()
+            .and_then(|lease| lease.model.as_deref())
+            .or(bf.model.as_deref()),
         store_dir,
         effective_context,
     );
-    let exec_opts = (bf.model.is_some() || bf.effort.is_some()).then(|| ExecOpts {
-        model: bf.model.clone(),
-        effort: bf.effort.clone(),
-    });
+    let exec_opts = resume_lease
+        .as_ref()
+        .and_then(|lease| {
+            crate::orchestration::allocator::exec_opts_for_lane(
+                &crate::orchestration::allocator::RuntimeLane {
+                    provider: lease.provider,
+                    account: lease.account.clone(),
+                    tier: lease.tier.clone(),
+                    model: lease.model.clone(),
+                    effort: lease.effort.clone(),
+                    capabilities: lease.capabilities.clone(),
+                },
+            )
+        })
+        .or_else(|| {
+            (bf.model.is_some() || bf.effort.is_some()).then(|| ExecOpts {
+                model: bf.model.clone(),
+                effort: bf.effort.clone(),
+                provider_defaults: None,
+            })
+        });
+    let exec_opts = crate::orchestration::providers::exec_opts_with_provider_defaults(
+        exec_opts,
+        effective_context,
+    );
     // Council project_dir wins over team's — councils carry their own
     // project scope (set at create time, defaults to the user's cwd if
     // unspecified), and the deliberation should happen in that tree
@@ -476,8 +506,11 @@ fn build_dispatch(
 
     let is_resume = existing_session.is_some();
 
-    if is_resume && !bf.provider.supports_resume() {
-        return Err(format!("provider {} does not support resume", bf.provider));
+    if is_resume && !effective_provider.supports_resume() {
+        return Err(format!(
+            "provider {} does not support resume",
+            effective_provider
+        ));
     }
 
     let task_id = uuid::Uuid::new_v4().to_string();
@@ -562,7 +595,7 @@ fn build_dispatch(
             }),
         completion_contract: None,
         allow_recursion: false,
-        provider: Some(bf.provider),
+        provider: Some(effective_provider),
         coerce_workspace: bf.coerce_workspace.unwrap_or(false),
     };
     let with_ambient = orch::apply_ambient(&body_with_council, &ambient_ctx);
@@ -580,10 +613,9 @@ fn build_dispatch(
     };
 
     let mut args = if is_resume {
-        bf.provider
-            .build_resume_args(&session_id, &final_prompt, exec_opts.as_ref())
+        effective_provider.build_resume_args(&session_id, &final_prompt, exec_opts.as_ref())
     } else {
-        bf.provider.build_exec_args(
+        effective_provider.build_exec_args(
             &final_prompt,
             &session_id,
             cwd.as_deref(),
@@ -591,13 +623,17 @@ fn build_dispatch(
         )
     };
 
-    let filter_pieces =
-        build_filter_args(bf.provider, cwd.as_deref(), &task_id, bf.filters.as_ref());
+    let filter_pieces = build_filter_args(
+        effective_provider,
+        cwd.as_deref(),
+        &task_id,
+        bf.filters.as_ref(),
+    );
     args.extend(filter_pieces.args);
 
     Ok(Dispatch {
         task_id,
-        provider: bf.provider,
+        provider: effective_provider,
         args,
         session_id,
         cwd,

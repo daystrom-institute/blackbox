@@ -271,6 +271,10 @@ impl BlackboxServer {
             );
             allocation = Some(selected);
         }
+        request.exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            request.exec_opts,
+            request.brofile_context.as_ref(),
+        );
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = if matches!(request.provider, Provider::Claude) {
@@ -1162,10 +1166,15 @@ impl BlackboxServer {
                 Some(ExecOpts {
                     model: brofile.model.clone(),
                     effort: brofile.effort.clone(),
+                    provider_defaults: None,
                 })
             } else {
                 None
             };
+            let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+                exec_opts,
+                effective_context,
+            );
             // Per-member combined extra: brofile.filters + broadcast-level
             // params overlay. Recursion guard is added inside
             // resolve_dispatch_filters; both layers above merge on top.
@@ -1530,10 +1539,15 @@ impl BlackboxServer {
                         Some(ExecOpts {
                             model: bf.model.clone(),
                             effort: bf.effort.clone(),
+                            provider_defaults: None,
                         })
                     } else {
                         None
                     };
+                    let opts = orchestration::providers::exec_opts_with_provider_defaults(
+                        opts,
+                        bf.context.as_ref(),
+                    );
                     let cwd = project_dir
                         .map(String::from)
                         .or(bro_match.team.project_dir.clone());
@@ -1566,10 +1580,15 @@ impl BlackboxServer {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
+                    provider_defaults: None,
                 })
             } else {
                 None
             };
+            let opts = orchestration::providers::exec_opts_with_provider_defaults(
+                opts,
+                bf.context.as_ref(),
+            );
             return Ok((
                 bf.provider,
                 bf.lens,
@@ -1662,10 +1681,7 @@ impl BlackboxServer {
             // lease-captured runtime provider AND brofile context when
             // a lease exists; fall back to the current brofile only
             // when no lease was recorded (fresh / never-allocated).
-            let runtime_provider = lease
-                .as_ref()
-                .map(|l| l.provider)
-                .unwrap_or(bf.provider);
+            let runtime_provider = lease.as_ref().map(|l| l.provider).unwrap_or(bf.provider);
             let effective_context = lease
                 .as_ref()
                 .and_then(|l| l.brofile_context.as_ref())
@@ -1703,10 +1719,15 @@ impl BlackboxServer {
                     Some(ExecOpts {
                         model: bf.model.clone(),
                         effort: bf.effort.clone(),
+                        provider_defaults: None,
                     })
                 } else {
                     None
                 };
+                let opts = orchestration::providers::exec_opts_with_provider_defaults(
+                    opts,
+                    effective_context,
+                );
                 (bf.provider, opts, env)
             };
             let cwd = project_dir
@@ -1776,13 +1797,12 @@ impl BlackboxServer {
                     Some(lease),
                 ));
             }
-            // No lease — original dispatch's brofile_context is unrecoverable.
-            // Preserve any existing provider-side config file (Inception's
-            // OPENCODE_CONFIG) instead of regenerating with defaults, so a
-            // raw resume can't silently undo the original suppression intent.
-            let env = orchestration::brofile::resolve_provider_env_for_resume_without_brofile(
-                provider, None, None, store_dir,
-            );
+            // No lease and no brofile: the original context policy is
+            // unrecoverable. Resolve provider env from explicit raw inputs
+            // only; do not preserve a provider-wide generated config because
+            // it may belong to a different Inception dispatch.
+            let env =
+                orchestration::brofile::resolve_provider_env(provider, None, None, store_dir, None);
             return Ok((
                 provider,
                 sid.to_string(),

@@ -89,11 +89,16 @@ impl ProviderDefaultsMode {
 }
 
 /// Whether `provider` can honor a non-`Default` `ProviderDefaultsMode`
-/// in v1. Only OpenCode-backed providers have a wired enforcement path
-/// (the generated config's `instructions` array). Other providers are
-/// recorded but unsupported until per-provider wiring lands.
+/// in v1. Claude-compatible transports use `--system-prompt ""` so the
+/// provider default system prompt / CLAUDE.md-derived prompt material is
+/// replaced while transient MCP config is still injected. OpenCode-backed
+/// providers suppress generated `instructions` config entries. Other
+/// providers are recorded but unsupported until per-provider wiring lands.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
-    matches!(provider, Provider::Inception)
+    matches!(
+        provider,
+        Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Inception
+    )
 }
 
 /// Reject dispatch when the brofile demands suppression the provider
@@ -309,9 +314,11 @@ fn write_json_file(path: &Path, value: &Value) {
 }
 
 fn default_opencode_config_path(store_dir: &Path, provider: Provider) -> PathBuf {
-    store_dir
-        .join("generated")
-        .join(format!("{}-opencode.json", provider.as_str()))
+    store_dir.join("generated").join(format!(
+        "{}-opencode-{}.json",
+        provider.as_str(),
+        uuid::Uuid::new_v4().simple()
+    ))
 }
 
 struct OpencodeProfile {
@@ -386,22 +393,13 @@ fn default_opencode_env(
     store_dir: &Path,
     model: Option<&str>,
     suppress_instructions: bool,
-    preserve_existing_config: bool,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
     let config_path = default_opencode_config_path(store_dir, provider);
-    // On resume paths without an authoritative brofile context (raw
-    // bro_resume(session_id, provider) without a recorded lease),
-    // preserve the existing OPENCODE_CONFIG to honor the original
-    // dispatch's suppression intent. Without this, regenerating with
-    // suppress_instructions=false would silently undo a strict_suppress
-    // brofile's intent. Falls through to write if the file is missing.
-    if !(preserve_existing_config && config_path.exists()) {
-        write_json_file(
-            &config_path,
-            &build_opencode_config(provider, model, suppress_instructions),
-        );
-    }
+    write_json_file(
+        &config_path,
+        &build_opencode_config(provider, model, suppress_instructions),
+    );
     env.insert(
         "OPENCODE_CONFIG".into(),
         config_path.to_string_lossy().into_owned(),
@@ -489,19 +487,7 @@ pub fn resolve_provider_env(
     store_dir: &Path,
     brofile_context: Option<&BrofileContext>,
 ) -> Option<HashMap<String, String>> {
-    resolve_provider_env_inner(provider, account_name, model, store_dir, brofile_context, false)
-}
-
-/// Resume-aware variant that preserves an existing provider config
-/// file when no brofile context is available — closes the raw
-/// `bro_resume(session_id, provider)` policy bypass on Inception.
-pub fn resolve_provider_env_for_resume_without_brofile(
-    provider: Provider,
-    account_name: Option<&str>,
-    model: Option<&str>,
-    store_dir: &Path,
-) -> Option<HashMap<String, String>> {
-    resolve_provider_env_inner(provider, account_name, model, store_dir, None, true)
+    resolve_provider_env_inner(provider, account_name, model, store_dir, brofile_context)
 }
 
 fn resolve_provider_env_inner(
@@ -510,27 +496,20 @@ fn resolve_provider_env_inner(
     model: Option<&str>,
     store_dir: &Path,
     brofile_context: Option<&BrofileContext>,
-    preserve_existing_config_when_no_context: bool,
 ) -> Option<HashMap<String, String>> {
     let account_name = effective_account(provider, account_name, store_dir);
     let suppress_instructions = brofile_context
         .and_then(|c| c.provider_defaults)
         .map(ProviderDefaultsMode::suppresses)
         .unwrap_or(false);
-    let preserve_existing_config =
-        preserve_existing_config_when_no_context && brofile_context.is_none();
     let mut env = match provider {
         Provider::Glm | Provider::Deepseek => dirs::home_dir()
             .as_deref()
             .and_then(|home| default_claude_compatible_env(provider, home))
             .unwrap_or_default(),
-        Provider::Inception => default_opencode_env(
-            provider,
-            store_dir,
-            model,
-            suppress_instructions,
-            preserve_existing_config,
-        ),
+        Provider::Inception => {
+            default_opencode_env(provider, store_dir, model, suppress_instructions)
+        }
         _ => HashMap::new(),
     };
 
@@ -1076,7 +1055,8 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved =
-            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None).unwrap();
+            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None)
+                .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(
             resolved
@@ -1120,7 +1100,8 @@ mod tests {
         );
         save_config(&config, store.path());
 
-        let resolved = resolve_provider_env(Provider::Claude, None, None, store.path(), None).unwrap();
+        let resolved =
+            resolve_provider_env(Provider::Claude, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(
             resolved
@@ -1166,8 +1147,14 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, Some("zai2"), Some("glm-4.7"), store.path(), None)
-                .unwrap()
+            resolve_provider_env(
+                Provider::Glm,
+                Some("zai2"),
+                Some("glm-4.7"),
+                store.path(),
+                None,
+            )
+            .unwrap()
         });
         assert!(
             resolved
@@ -1227,23 +1214,78 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_provider_env_inception_uses_distinct_config_paths() {
+        let store = temp_store();
+        let home = temp_store();
+        let blackbox_dir = home.path().join(".blackbox");
+        fs::create_dir_all(&blackbox_dir).unwrap();
+        fs::write(blackbox_dir.join("BLACKBOX.md"), "# global guidance").unwrap();
+
+        let (first, second) = with_fake_home(home.path(), || {
+            let first = resolve_provider_env(
+                Provider::Inception,
+                None,
+                Some("inception/mercury-2"),
+                store.path(),
+                None,
+            )
+            .unwrap();
+            let ctx = BrofileContext {
+                provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
+            };
+            let second = resolve_provider_env(
+                Provider::Inception,
+                None,
+                Some("inception/mercury-2"),
+                store.path(),
+                Some(&ctx),
+            )
+            .unwrap();
+            (first, second)
+        });
+
+        let first_path = first.get("OPENCODE_CONFIG").unwrap();
+        let second_path = second.get("OPENCODE_CONFIG").unwrap();
+        assert_ne!(
+            first_path, second_path,
+            "different launches must not race through a provider-wide generated opencode config"
+        );
+        assert!(
+            serde_json::from_str::<Value>(&fs::read_to_string(first_path).unwrap())
+                .unwrap()
+                .get("instructions")
+                .is_some()
+        );
+        assert!(
+            serde_json::from_str::<Value>(&fs::read_to_string(second_path).unwrap())
+                .unwrap()
+                .get("instructions")
+                .is_none(),
+            "strict suppression launch config must omit opencode instructions"
+        );
+    }
+
+    #[test]
     fn test_enforce_provider_defaults_strict_unsupported_fails() {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        let err = enforce_provider_defaults(Provider::Claude, Some(&ctx))
-            .expect_err("strict_suppress on Claude should fail closed");
+        let err = enforce_provider_defaults(Provider::Codex, Some(&ctx)).expect_err(
+            "strict_suppress on Codex should fail closed until verified controls exist",
+        );
         assert!(err.contains("error.provider_defaults_unsupported"));
-        assert!(err.contains("Claude") || err.contains("claude"));
+        assert!(err.contains("codex"));
     }
 
     #[test]
-    fn test_enforce_provider_defaults_strict_inception_ok() {
+    fn test_enforce_provider_defaults_strict_supported_ok() {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
         enforce_provider_defaults(Provider::Inception, Some(&ctx))
             .expect("strict_suppress on Inception is honored");
+        enforce_provider_defaults(Provider::Claude, Some(&ctx))
+            .expect("strict_suppress on Claude is honored via --system-prompt override");
     }
 
     #[test]
@@ -1253,46 +1295,6 @@ mod tests {
         };
         enforce_provider_defaults(Provider::Claude, Some(&ctx))
             .expect("suppress_when_supported is best-effort and never fails closed");
-    }
-
-    #[test]
-    fn test_resume_without_brofile_preserves_existing_opencode_config() {
-        // Raw bro_resume(session_id, provider) cannot recover the original
-        // brofile context. Regenerating OPENCODE_CONFIG with defaults
-        // would silently undo a strict_suppress brofile's intent. Verify
-        // the resume-aware variant preserves any existing config file.
-        let store = temp_store();
-        let home = temp_store();
-        let config_path = default_opencode_config_path(store.path(), Provider::Inception);
-        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
-        // Write a deliberately-empty instructions config (simulating what
-        // an original suppressing brofile would have written).
-        let suppressed = serde_json::json!({
-            "$schema": "https://opencode.ai/config.json",
-            "model": "inception/mercury-2",
-            "small_model": "inception/mercury-2",
-            "tools": {"blackbox_bro_*": false},
-            "marker": "preserved"
-        });
-        fs::write(&config_path, serde_json::to_string(&suppressed).unwrap()).unwrap();
-
-        let _env = with_fake_home(home.path(), || {
-            resolve_provider_env_for_resume_without_brofile(
-                Provider::Inception,
-                None,
-                None,
-                store.path(),
-            )
-            .expect("env should resolve")
-        });
-
-        let on_disk: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
-        assert_eq!(
-            on_disk.get("marker").and_then(|v| v.as_str()),
-            Some("preserved"),
-            "raw-resume must preserve existing OPENCODE_CONFIG when brofile context is unrecoverable"
-        );
     }
 
     #[test]
@@ -1315,9 +1317,11 @@ mod tests {
     fn test_resolve_provider_env_defaults_inception_opencode_config() {
         let store = temp_store();
 
-        let resolved = resolve_provider_env(Provider::Inception, None, None, store.path(), None).unwrap();
+        let resolved =
+            resolve_provider_env(Provider::Inception, None, None, store.path(), None).unwrap();
         let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
-        assert!(config_path.ends_with("inception-opencode.json"));
+        assert!(config_path.contains("inception-opencode-"));
+        assert!(config_path.ends_with(".json"));
         let config = fs::read_to_string(config_path).unwrap();
         assert!(config.contains("\"model\": \"inception/mercury-2\""));
         assert!(config.contains("\"small_model\": \"inception/mercury-2\""));

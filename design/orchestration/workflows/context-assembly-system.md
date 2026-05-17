@@ -533,10 +533,10 @@ the provider reports unsupported suppression rather than pretending to be clean.
 
 | Provider | Current exec/resume prompt path | Current default-context behavior | V1 provider-default control |
 |---|---|---|---|
-| Claude | `claude -p <prompt>` and `claude --resume <session> -p <prompt>` with transient `--mcp-config` | CLI loads its normal Claude settings/instruction files; blackbox does not currently suppress them | Initially report suppression unsupported unless verified CLI flags/config are implemented. If implemented, dry-run must show exact args/config. |
-| GLM | Claude-compatible CLI path using `claude -p` / `--resume` with GLM model/env | Same as Claude-compatible transport | Same as Claude-compatible path; no silent claim of suppression. |
-| DeepSeek | Claude-compatible CLI path using `claude -p` / `--resume` with DeepSeek model/env | Same as Claude-compatible transport | Same as Claude-compatible path; no silent claim of suppression. |
-| Codex | `codex exec <prompt>` and `codex exec resume <session> <prompt>` | CLI may load Codex rules/user config; blackbox currently passes only prompt/model/effort/cwd | Add and dry-run verified Codex controls such as rule/user-config suppression flags or generated instruction-file controls where supported. |
+| Claude | `claude -p <prompt>` and `claude --resume <session> -p <prompt>` with transient `--mcp-config` | CLI loads its normal Claude settings/instruction files unless the system prompt is explicitly overridden | Emit `--system-prompt ""` while preserving transient `--mcp-config`; do not use `--bare`, because that disables the MCP path blackbox needs. |
+| GLM | Claude-compatible CLI path using `claude -p` / `--resume` with GLM model/env | Same as Claude-compatible transport | Same as Claude-compatible path: emit `--system-prompt ""` and keep transient MCP config. |
+| DeepSeek | Claude-compatible CLI path using `claude -p` / `--resume` with DeepSeek model/env | Same as Claude-compatible transport | Same as Claude-compatible path: emit `--system-prompt ""` and keep transient MCP config. |
+| Codex | `codex exec <prompt>` and `codex exec resume <session> <prompt>` | CLI may load Codex rules/user config; blackbox currently passes only prompt/model/effort/cwd | Report suppression unsupported until a verified control suppresses both provider system prompt defaults and `AGENTS.md`-style harness context. |
 | Copilot | `gh copilot -- -p <prompt>` and `--resume=<session>` | Provider behavior is inherited from Copilot CLI; no suppression control currently wired | Report suppression unsupported until a concrete CLI/config mechanism is verified. |
 | Gemini | `gemini -p <prompt>` and `gemini --resume <session> -p <prompt>` | Gemini CLI default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Gemini controls are verified. MCP tool exclusions are separate tool policy, not markdown suppression. |
 | Vibe | `vibe -p <prompt>` and `vibe --resume <session> -p <prompt>` | Vibe config/default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Vibe controls are verified. |
@@ -547,12 +547,13 @@ not pretend unsupported providers are clean. `strict_suppress` fails closed on
 any provider without a verified mechanism.
 
 The v1 deliverable for Phase 2 is the schema plus the report-and-warn
-behavior. Codex and OpenCode/Inception ship as enforcing providers (the
-former via verified CLI/config controls, the latter via the `instructions`
-array). Every other provider accepts the policy field, but dry-run reports
-it as `unsupported_suppression` and dispatch logs a warning at launch.
-Wiring additional providers as enforcing is a follow-up patch per provider,
-not a phase gate.
+behavior. Claude-compatible transports and OpenCode/Inception ship as
+enforcing providers: Claude-compatible launches override the provider system
+prompt with `--system-prompt ""` while preserving MCP injection; OpenCode
+omits generated `instructions` entries. Codex and every other provider accept
+the policy field, but strict modes fail until a verified suppression mechanism
+exists. Wiring additional providers as enforcing is a follow-up patch per
+provider, not a phase gate.
 
 ## Existing Layers As Templates
 

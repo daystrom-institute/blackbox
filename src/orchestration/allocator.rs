@@ -127,7 +127,6 @@ pub enum SelectionPolicy {
     },
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct AllocatorConfig {
     #[serde(default)]
@@ -1311,13 +1310,30 @@ pub fn lookup_lease_for_session(
     provider: Provider,
     session_id: &str,
 ) -> Option<RuntimeLease> {
+    lookup_lease_for_session_filtered(store_dir, task_store, Some(provider), session_id)
+}
+
+pub fn lookup_lease_for_session_any_provider(
+    store_dir: &Path,
+    task_store: &TaskStore,
+    session_id: &str,
+) -> Option<RuntimeLease> {
+    lookup_lease_for_session_filtered(store_dir, task_store, None, session_id)
+}
+
+fn lookup_lease_for_session_filtered(
+    store_dir: &Path,
+    task_store: &TaskStore,
+    provider: Option<Provider>,
+    session_id: &str,
+) -> Option<RuntimeLease> {
     let leases = lease_store_load(store_dir);
     let live_task_lease = task_store
         .all_tasks()
         .into_iter()
         .filter_map(|task| {
             let inner = task.inner.lock();
-            (inner.provider == provider
+            (provider.is_none_or(|provider| inner.provider == provider)
                 && inner.session_id == session_id
                 && !inner.status.is_terminal())
             .then(|| {
@@ -1337,7 +1353,9 @@ pub fn lookup_lease_for_session(
             .leases
             .values()
             .filter(|lease| {
-                lease.durable && lease.provider == provider && lease.session_id == session_id
+                lease.durable
+                    && provider.is_none_or(|provider| lease.provider == provider)
+                    && lease.session_id == session_id
             })
             .max_by_key(|lease| (lease.last_seen_at, lease.created_at))
             .cloned()
@@ -1439,6 +1457,7 @@ pub fn exec_opts_for_lane(lane: &RuntimeLane) -> Option<ExecOpts> {
     (lane.model.is_some() || lane.effort.is_some()).then(|| ExecOpts {
         model: lane.model.clone(),
         effort: lane.effort.clone(),
+        provider_defaults: None,
     })
 }
 
@@ -2120,6 +2139,60 @@ mod tests {
         assert_eq!(loaded.task_id, "task-2");
         assert_eq!(loaded.account.as_deref(), Some("codex-new"));
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.3-codex-spark"));
+    }
+
+    #[test]
+    fn session_lease_lookup_any_provider_returns_runtime_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lease = RuntimeLease {
+            task_id: "task-runtime".into(),
+            session_id: "session-allocator-swapped".into(),
+            provider: Provider::Claude,
+            account: Some("claude-alt".into()),
+            model: Some("claude-sonnet-4-6".into()),
+            effort: Some("medium".into()),
+            tier: Some("standard".into()),
+            durable: true,
+            capabilities: vec![Capability::ToolUse],
+            project_dir: None,
+            cwd: None,
+            selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
+            created_at: 1,
+            last_seen_at: 1,
+            brofile_context: Some(crate::orchestration::brofile::BrofileContext {
+                provider_defaults: Some(
+                    crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
+                ),
+            }),
+        };
+        lease_store_save(
+            tmp.path(),
+            &RuntimeLeaseStore {
+                leases: BTreeMap::from([(lease.task_id.clone(), lease)]),
+            },
+        );
+
+        assert!(
+            lookup_lease_for_session(
+                tmp.path(),
+                &TaskStore::new(),
+                Provider::Codex,
+                "session-allocator-swapped",
+            )
+            .is_none(),
+            "provider-filtered lookup should not pretend nominal provider equals runtime provider",
+        );
+        let loaded = lookup_lease_for_session_any_provider(
+            tmp.path(),
+            &TaskStore::new(),
+            "session-allocator-swapped",
+        )
+        .unwrap();
+        assert_eq!(loaded.provider, Provider::Claude);
+        assert_eq!(
+            loaded.brofile_context.and_then(|ctx| ctx.provider_defaults),
+            Some(crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress)
+        );
     }
 
     #[test]

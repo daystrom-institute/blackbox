@@ -284,6 +284,32 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
 pub struct ExecOpts {
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub provider_defaults: Option<super::brofile::ProviderDefaultsMode>,
+}
+
+const EMPTY_SYSTEM_PROMPT_OVERRIDE: &str = "";
+
+impl ExecOpts {
+    pub fn with_provider_defaults(
+        mut self,
+        context: Option<&super::brofile::BrofileContext>,
+    ) -> Self {
+        if self.provider_defaults.is_none() {
+            self.provider_defaults = context.and_then(|c| c.provider_defaults);
+        }
+        self
+    }
+}
+
+pub fn exec_opts_with_provider_defaults(
+    opts: Option<ExecOpts>,
+    context: Option<&super::brofile::BrofileContext>,
+) -> Option<ExecOpts> {
+    let mode = context.and_then(|c| c.provider_defaults);
+    if opts.is_none() && mode.is_none() {
+        return None;
+    }
+    Some(opts.unwrap_or_default().with_provider_defaults(context))
 }
 
 fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
@@ -313,6 +339,9 @@ impl Provider {
             .and_then(|o| o.model.as_deref())
             .map(|m| normalize_model_for_provider(*self, m));
         let effort = opts.and_then(|o| o.effort.as_deref());
+        let suppress_provider_defaults = opts
+            .and_then(|o| o.provider_defaults)
+            .is_some_and(super::brofile::ProviderDefaultsMode::suppresses);
 
         match self {
             Provider::Claude | Provider::Glm | Provider::Deepseek => {
@@ -325,6 +354,12 @@ impl Provider {
                     "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
+                if suppress_provider_defaults {
+                    args.extend([
+                        "--system-prompt".into(),
+                        EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
+                    ]);
+                }
                 if !session_id.is_empty() && session_id != "pending" {
                     args.extend(["--session-id".into(), session_id.into()]);
                 }
@@ -457,6 +492,9 @@ impl Provider {
             .and_then(|o| o.model.as_deref())
             .map(|m| normalize_model_for_provider(*self, m));
         let effort = opts.and_then(|o| o.effort.as_deref());
+        let suppress_provider_defaults = opts
+            .and_then(|o| o.provider_defaults)
+            .is_some_and(super::brofile::ProviderDefaultsMode::suppresses);
 
         match self {
             Provider::Claude | Provider::Glm | Provider::Deepseek => {
@@ -471,6 +509,12 @@ impl Provider {
                     "--include-partial-messages".into(),
                     "--dangerously-skip-permissions".into(),
                 ];
+                if suppress_provider_defaults {
+                    args.extend([
+                        "--system-prompt".into(),
+                        EMPTY_SYSTEM_PROMPT_OVERRIDE.into(),
+                    ]);
+                }
                 if let Some(m) = model.as_deref() {
                     args.extend(["--model".into(), m.into()]);
                 }
@@ -2372,10 +2416,42 @@ mod tests {
     }
 
     #[test]
+    fn test_claude_suppression_uses_system_prompt_override_not_bare() {
+        let _guard = crate::util::test_env_lock();
+        let prior = std::env::var_os("BLACKBOX_MCP_URL");
+        unsafe {
+            std::env::set_var("BLACKBOX_MCP_URL", "http://127.0.0.1:7264/mcp");
+        }
+        let opts = ExecOpts {
+            model: None,
+            effort: None,
+            provider_defaults: Some(
+                crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
+            ),
+        };
+        let args = Provider::Claude.build_exec_args("hello", "sid-1", None, Some(&opts));
+        assert!(args.contains(&"--system-prompt".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--system-prompt" && w[1].is_empty())
+        );
+        assert!(!args.contains(&"--bare".to_string()));
+        assert!(
+            args.contains(&"--mcp-config".to_string()),
+            "suppression must not disable transient MCP injection"
+        );
+        match prior {
+            Some(value) => unsafe { std::env::set_var("BLACKBOX_MCP_URL", value) },
+            None => unsafe { std::env::remove_var("BLACKBOX_MCP_URL") },
+        }
+    }
+
+    #[test]
     fn test_glm_and_deepseek_use_claude_print_args() {
         let glm_opts = ExecOpts {
             model: Some("zai-coding-plan/glm-5.1".into()),
             effort: Some("high".into()),
+            provider_defaults: None,
         };
         let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
         assert_eq!(glm[0], "-p");
@@ -2392,6 +2468,7 @@ mod tests {
         let ds_opts = ExecOpts {
             model: Some("deepseek/deepseek-v4-pro".into()),
             effort: None,
+            provider_defaults: None,
         };
         let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&ds_opts));
         assert!(deepseek.contains(&"--resume".to_string()));
@@ -2407,6 +2484,7 @@ mod tests {
         let opts = ExecOpts {
             model: Some("gpt-5.4".into()),
             effort: Some("high".into()),
+            provider_defaults: None,
         };
         let args = Provider::Codex.build_exec_args("do stuff", "", None, Some(&opts));
         assert!(args.contains(&"--model".to_string()));
@@ -2452,6 +2530,7 @@ mod tests {
         let opts = ExecOpts {
             model: Some("devstral-2".into()),
             effort: None,
+            provider_defaults: None,
         };
         let exec_args = Provider::Vibe.build_exec_args("hi", "sid", None, Some(&opts));
         assert!(

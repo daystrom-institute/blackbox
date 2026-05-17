@@ -750,20 +750,23 @@ Next step: <one concrete steering suggestion>\n",
             .as_deref()
             .filter(|s| !s.is_empty() && *s != "pending")
             .and_then(|sid| {
-                orchestration::allocator::lookup_lease_for_session(
+                orchestration::allocator::lookup_lease_for_session_any_provider(
                     &store_dir,
                     &self.state.task_store.read(),
-                    provider,
                     sid,
                 )
             });
+        let effective_provider = advisor_lease
+            .as_ref()
+            .map(|lease| lease.provider)
+            .unwrap_or(provider);
         let effective_context = advisor_lease
             .as_ref()
             .and_then(|l| l.brofile_context.as_ref())
             .or(brofile.context.as_ref());
-        orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
+        orchestration::brofile::enforce_provider_defaults(effective_provider, effective_context)?;
         let env_overrides = orchestration::brofile::resolve_provider_env(
-            provider,
+            effective_provider,
             advisor_lease
                 .as_ref()
                 .and_then(|l| l.account.as_deref())
@@ -788,10 +791,15 @@ Next step: <one concrete steering suggestion>\n",
             Some(ExecOpts {
                 model: brofile.model.clone(),
                 effort: brofile.effort.clone(),
+                provider_defaults: None,
             })
         } else {
             None
         };
+        let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            exec_opts,
+            effective_context,
+        );
         let task_id = uuid::Uuid::new_v4().to_string();
         let timeout = advisor.config.timeout_seconds;
         let cwd = team.project_dir.clone();
@@ -806,7 +814,7 @@ Next step: <one concrete steering suggestion>\n",
                 let resume_lease = try_acquire_resume_lease(
                     &self.state.task_store,
                     self.state.resume_leases.as_ref(),
-                    provider,
+                    effective_provider,
                     session_id,
                 )?;
                 let ambient_ctx = orch::AmbientContext {
@@ -825,14 +833,17 @@ Next step: <one concrete steering suggestion>\n",
                     ),
                     completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
                     allow_recursion: false,
-                    provider: Some(provider),
+                    provider: Some(effective_provider),
                     coerce_workspace: brofile.coerce_workspace.unwrap_or(false),
                 };
                 let wrapped_prompt = orch::apply_ambient(&prompt, &ambient_ctx);
-                let mut args =
-                    provider.build_resume_args(session_id, &wrapped_prompt, exec_opts.as_ref());
+                let mut args = effective_provider.build_resume_args(
+                    session_id,
+                    &wrapped_prompt,
+                    exec_opts.as_ref(),
+                );
                 let dispatch_filters = match resolve_dispatch_filters(
-                    provider,
+                    effective_provider,
                     cwd.as_deref(),
                     false,
                     &task_id,
@@ -846,7 +857,7 @@ Next step: <one concrete steering suggestion>\n",
                 args.extend(dispatch_filters.args);
                 let task = orch::spawn_task(
                     task_id.clone(),
-                    provider,
+                    effective_provider,
                     args,
                     session_id.to_string(),
                     cwd.clone(),

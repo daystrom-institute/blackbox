@@ -126,8 +126,12 @@ impl BlackboxServer {
             cwd,
             brofile_filters,
             _coerce_workspace,
-            _brofile_context,
+            brofile_context,
         ) = self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
+        let exec_opts = orchestration::providers::exec_opts_with_provider_defaults(
+            exec_opts,
+            brofile_context.as_ref(),
+        );
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = "pending".to_string();
@@ -524,23 +528,47 @@ impl BlackboxServer {
         // was launched under, not whatever badgey-persona says today.
         // Look up the lease for this provider-session and prefer its
         // captured brofile_context for both enforcement and env.
-        let resume_lease = crate::orchestration::allocator::lookup_lease_for_session(
+        let resume_lease = crate::orchestration::allocator::lookup_lease_for_session_any_provider(
             &self.state.store_dir,
             &self.state.task_store.read(),
-            provider,
             &instance.provider_session_id,
         );
+        let effective_provider = resume_lease
+            .as_ref()
+            .map(|lease| lease.provider)
+            .unwrap_or(instance.provider);
+        let effective_context = resume_lease
+            .as_ref()
+            .and_then(|lease| lease.brofile_context.as_ref())
+            .or(brofile_context.as_ref());
+        crate::orchestration::brofile::enforce_provider_defaults(
+            effective_provider,
+            effective_context,
+        )?;
         if let Some(lease) = resume_lease.as_ref() {
-            let effective_context = lease.brofile_context.as_ref().or(brofile_context.as_ref());
-            crate::orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
             env_overrides = crate::orchestration::brofile::resolve_provider_env(
-                provider,
+                effective_provider,
                 lease.account.as_deref(),
                 lease.model.as_deref(),
                 &self.state.store_dir,
                 effective_context,
             );
         }
+        let exec_opts = resume_lease
+            .as_ref()
+            .and_then(|lease| {
+                crate::orchestration::allocator::exec_opts_for_lane(
+                    &crate::orchestration::allocator::RuntimeLane {
+                        provider: lease.provider,
+                        account: lease.account.clone(),
+                        tier: lease.tier.clone(),
+                        model: lease.model.clone(),
+                        effort: lease.effort.clone(),
+                        capabilities: lease.capabilities.clone(),
+                    },
+                )
+            })
+            .or(exec_opts);
         let scope_bind =
             self.badgey_scope_bind(&id, &instance.thread_of_record_id, &instance.scope);
         let wrapped_user_prompt = format!("{scope_bind}\n{prompt}");
@@ -560,17 +588,21 @@ impl BlackboxServer {
             ),
             completion_contract: Some(orch::DEFAULT_COMPLETION_CONTRACT.to_string()),
             allow_recursion: false,
-            provider: Some(provider),
+            provider: Some(effective_provider),
             coerce_workspace: false,
         };
         let final_prompt = orch::apply_ambient(&wrapped_user_prompt, &ambient_ctx);
-        let mut args = provider.build_resume_args(
+        let mut args = effective_provider.build_resume_args(
             &instance.provider_session_id,
             &final_prompt,
-            exec_opts.as_ref(),
+            orchestration::providers::exec_opts_with_provider_defaults(
+                exec_opts,
+                effective_context,
+            )
+            .as_ref(),
         );
         let dispatch_filters = match resolve_dispatch_filters(
-            provider,
+            effective_provider,
             cwd.as_deref(),
             false,
             &task_id,
@@ -585,7 +617,7 @@ impl BlackboxServer {
         args.extend(dispatch_filters.args);
         let task = orch::spawn_task(
             task_id.clone(),
-            provider,
+            effective_provider,
             args,
             instance.provider_session_id.clone(),
             cwd.clone(),
@@ -614,7 +646,7 @@ impl BlackboxServer {
                 turn_id: self.badgey_next_turn_id(&instance.thread_of_record_id),
                 mode: "answer".to_string(),
                 caller: orchestration::badgey::events::CallerRef {
-                    provider,
+                    provider: effective_provider,
                     session_id: instance.provider_session_id.clone(),
                 },
                 question: prompt.to_string(),
