@@ -135,7 +135,6 @@ static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = O
 use artifacts::{
     ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
-pub(crate) use dispatch_mcp::dispatch_mcp_url;
 use embed::ReembedParams;
 use inbox::InboxParams;
 use index::{

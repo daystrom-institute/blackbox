@@ -5,6 +5,7 @@ pub mod response;
 pub mod routes;
 mod run;
 pub mod schema;
+mod startup;
 pub mod state;
 pub mod storage_gc;
 pub mod store_helpers;

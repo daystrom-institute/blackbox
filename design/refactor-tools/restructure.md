@@ -12,7 +12,7 @@ brief: Live topology cleanup record for the crate restructure that drove the ref
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; refreshed 2026-05-14
+Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; refreshed 2026-05-17
 Related: `design/refactor-tools/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
@@ -35,17 +35,23 @@ the decomposition cleanup that the topology move exposed:
    - Remove root-level imports/re-exports from `src/lib.rs` once no module
      depends on them implicitly.
    - Prefer small compile-checked batches over a whole-crate import rewrite.
+   - First small cuts landed: `src/tools/notes.rs` now uses explicit imports,
+     and `dispatch_mcp_url` is imported directly by `server/startup.rs` instead
+     of being re-exported from the lib root.
 
 2. **Split `src/server/run.rs` by startup concern.**
-   - Candidate modules: `server/startup.rs` for logging/config/transcript-root
-     discovery, `server/restore.rs` for registry restoration, and
-     `server/http.rs` or `server/mcp.rs` for router/MCP service assembly.
+   - `server/startup.rs` now owns logging, transcript-root discovery, Codex root
+     resolution, and dispatch MCP env setup.
+   - Remaining candidate modules: `server/restore.rs` for registry restoration
+     and `server/http.rs` or `server/mcp.rs` for router/MCP service assembly.
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
 3. **Continue large-module decomposition where there is a cohesive boundary.**
    - `src/tools/atoms.rs`: keep public tool wrappers in the facade and move
-     private implementation clusters into child modules.
+     private implementation clusters into child modules. The first helper
+     cluster now lives in `src/tools/atoms/helpers.rs`; the large
+     `impl BlackboxServer` remains the main follow-up.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
      landed `engine/fanout.rs` split.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
@@ -100,14 +106,15 @@ lines. It is no longer the 17K-line god file described above or even the
 |------|-------|---------|
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
 | `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
-| `src/server/mod.rs` | 63 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
-| `src/server/run.rs` | 998 | Daemon bootstrap: config, logging, state open, router assembly, background tasks, graceful shutdown |
+| `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
+| `src/server/run.rs` | 882 | Daemon bootstrap glue: state open, registry restoration, router assembly, background tasks, graceful shutdown |
+| `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
 
 The highest-value remaining topology work is no longer in `main.rs`. It is:
 
 1. Reduce the temporary lib-root prelude by replacing broad `use crate::*`
    dependencies with explicit imports in touched modules.
-2. Split `server/run.rs` by startup concern once the bootstrap shape stabilizes.
+2. Continue splitting `server/run.rs` by startup concern.
 3. Continue domain-local decomposition in the remaining large modules.
 
 ## Current Packets Breakdown
@@ -164,8 +171,11 @@ src/
                                 # tiny ServerHandler impl (7 lines, just
                                 # `get_info`) — no need for its own file.
     run.rs                      # Daemon bootstrap extracted from main.rs.
-                                # Split into startup submodules only when the
-                                # next edits justify the boundary.
+                                # Keep as orchestration glue while startup,
+                                # restore, HTTP/MCP, and shutdown pieces split
+                                # into child modules.
+    startup.rs                  # Logging/config-root discovery helpers and
+                                # dispatch MCP env setup.
     state.rs                    # SharedState struct + impl + build_app_state()
                                 # (extracted from main.rs lines 89-316)
     progress.rs                 # MCP progress-token plumbing for blocking
@@ -260,6 +270,8 @@ src/
   workflow/                     # Existing directory — fine as-is.
     engine/fanout.rs            # Dynamic fanout runner plus fanout support
                                 # structs/helpers.
+  tools/atoms/helpers.rs        # Atom invocation helper functions split from
+                                # the large atom tool facade.
   orchestration/                # Existing directory — fine as-is.
   index/                        # Existing directory — fine as-is.
   chunker/, council/, providers/, system_memory/  # Existing — fine.
@@ -509,6 +521,13 @@ Landed:
 7. `BlackboxServer::new` and the tool-router sum live in `src/server/mod.rs`.
 8. Daemon bootstrap lives in `src/server/run.rs`.
 9. Empty legacy `bbox_tools` / `bro_tools` router impls were removed.
+10. `src/server/startup.rs` owns startup helper functions previously at the top
+    of `server/run.rs`.
+11. `src/tools/atoms/helpers.rs` owns the atom helper tail previously embedded
+    after the `BlackboxServer` atom impl.
+12. `src/tools/notes.rs` uses explicit imports instead of the lib-root
+    compatibility prelude, and `dispatch_mcp_url` no longer needs a lib-root
+    re-export for startup setup.
 
 Next useful cuts:
 
@@ -520,11 +539,10 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Split daemon bootstrap by startup concern.**
-   - Candidate boundaries: transcript root discovery, config/state opening,
-     registry restoration, MCP service construction, background task spawning,
-     and shutdown wiring.
-   - Likely target files: `server/startup.rs`, `server/restore.rs`, and
-     `server/http.rs` or `server/mcp.rs`.
+   - Candidate boundaries: config/state opening, registry restoration, MCP
+     service construction, background task spawning, and shutdown wiring.
+   - Likely next target files: `server/restore.rs` and `server/http.rs` or
+     `server/mcp.rs`.
    - Keep `server/run.rs` as orchestration glue rather than moving everything
      into another catch-all file.
 
@@ -532,7 +550,8 @@ Next useful cuts:
    - `workflow/engine.rs`: continue with runner subsystems after fanout.
    - `workflow/ops.rs`: split hook/action families if they continue to grow.
    - `tools/atoms.rs`: keep the public tool facade and move implementation
-     clusters into child modules.
+     clusters into child modules; the helper tail has already moved to
+     `tools/atoms/helpers.rs`.
    - `orchestration/providers.rs`: split catalog, credentials, and provider
      resolution when touching nearby code.
 

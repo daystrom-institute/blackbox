@@ -1,5 +1,9 @@
-use crate::server::*;
-use crate::*;
+use crate::notes::{NoteListParams, NoteParams, NoteResolveParams};
+use crate::server::BlackboxServer;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::notes_tools()
