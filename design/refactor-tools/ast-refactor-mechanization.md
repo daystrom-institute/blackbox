@@ -20,7 +20,7 @@ lines, `src/packets.rs` 6,365 lines, tool routers at `src/main.rs:3140` and
 
 ## Problem
 
-`design/restructure.md` proposes a large but mostly mechanical crate split:
+`design/refactor-tools/restructure.md` proposes a large but mostly mechanical crate split:
 moving binary-owned modules into a new library crate, splitting `main.rs` into
 `server/` and `tools/`, and converting `packets.rs` into a module directory.
 Doing that by hand is possible, but the review burden is high: large byte
@@ -312,7 +312,7 @@ This policy is load-bearing for `#[tool_router]`, `#[tool]`, `#[derive(...)]`,
 
 ### Split `main.rs`
 
-The lib reparent from `design/restructure.md` is the real proof-of-concept, not
+The lib reparent from `design/refactor-tools/restructure.md` is the real proof-of-concept, not
 a later `server/progress.rs` extraction. It has two distinct edit categories:
 
 1. Module ownership migration:
@@ -493,7 +493,7 @@ the failed validation step.
    modified ranges.
 5. Prove the planner on a checked-in fixture mini-crate before touching the real
    crate.
-6. Build the lib-reparent dry-run plan from `design/restructure.md` step 1.
+6. Build the lib-reparent dry-run plan from `design/refactor-tools/restructure.md` step 1.
 7. Apply the lib-reparent plan only after dry-run review; gate it with
    tree-sitter validation and `cargo test`.
 8. Add extraction recipes for `server/state.rs`, `server/progress.rs`, and one

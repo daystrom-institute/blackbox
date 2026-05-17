@@ -217,6 +217,8 @@ or system memories and link/pointer from here.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
   `docs/councils-whiteboards.md` - agentic coordination surfaces.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
+- `design/list-design-docs.sh` - list design docs whose frontmatter lifecycle
+  is `proposed` or `partial`.
 - `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,
   storage, code navigation, provenance, roadmap, and Badgey designs.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
@@ -230,7 +232,7 @@ or system memories and link/pointer from here.
   provider transcript read planes.
 - `design/operations/` - topic home for config/artifact lifecycle, bundles,
   doctor, and system-event coordination.
-- `design/archive/`, `design/proposed/`, and `design/partial/` - legacy
-  lifecycle folders for designs not yet migrated into a topic home. Prefer
-  frontmatter `lifecycle` over path when determining currentness, and verify
-  against code before treating any design as current behavior.
+- Legacy lifecycle folders such as `design/archive/`, `design/proposed/`, and
+  `design/partial/` may appear in old checkouts. Prefer frontmatter
+  `lifecycle` over path when determining currentness, and verify against code
+  before treating any design as current behavior.

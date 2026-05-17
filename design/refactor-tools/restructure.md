@@ -12,16 +12,16 @@ brief: Live topology cleanup record for the crate restructure that drove the ref
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; refreshed 2026-05-14
+Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; refreshed 2026-05-14
 Related: `design/refactor-tools/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
 target, `src/packets/`, `src/server/`, `src/tools/`, and first-pass child
 splits under `src/tools/badgey/` and `src/workflow/engine/`. `src/main.rs` is
 now only the binary entry point, module declarations are owned by `src/lib.rs`,
-and daemon bootstrap has moved to `src/server/run.rs`. Keep this in
-`design/partial/` until the remaining live work below is either implemented or
-moved to roadmap/thread entries; then archive this doc as the completed topology
+and daemon bootstrap has moved to `src/server/run.rs`. Keep this document
+`lifecycle: partial` until the remaining live work below is either implemented
+or moved to roadmap/thread entries; then archive it as the completed topology
 design.
 
 ## Remaining Work Before Archive
@@ -59,11 +59,12 @@ the decomposition cleanup that the topology move exposed:
    - Move daemon-startup-shaped tests to integration tests using `blackbox::`
      imports.
 
-Archive criteria: this doc can move to `design/archive/` once these follow-ups
-are either complete or represented as accepted roadmap/thread items with enough
-detail that agents do not need this historical proposal to proceed. The
-companion AST execution plan was a checkpoint artifact for the old mechanized
-sequence and now lives at `design/refactor-tools/restructure-ast.md`.
+Archive criteria: this doc can become `lifecycle: archived` once these
+follow-ups are either complete or represented as accepted roadmap/thread items
+with enough detail that agents do not need this historical proposal to proceed.
+The companion AST execution plan was a checkpoint artifact for the old
+mechanized sequence and now lives at
+`design/refactor-tools/restructure-ast.md`.
 
 ## Original Problem
 

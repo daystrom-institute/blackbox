@@ -14,11 +14,11 @@ brief: "AST-grounded execution plan for the crate restructure, retained as a ref
 
 # AST-Grounded Restructure Execution Plan
 
-Related: `design/partial/restructure.md`
+Related: `design/refactor-tools/restructure.md`
 
 ## Purpose
 
-This restates `design/partial/restructure.md` as a sequence of grounding calls and
+This restates `design/refactor-tools/restructure.md` as a sequence of grounding calls and
 `bbox_refactor_*` plans. It is the worker-facing plan for a disposable practice
 worktree. The goal is to prove the refactor MCP surface can mechanize the
 restructure without benchmark-only shortcuts.

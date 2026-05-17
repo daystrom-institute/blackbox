@@ -1,5 +1,5 @@
 ---
-title: "Refactor Surface Benchmark - design/restructure.md"
+title: "Refactor Surface Benchmark - design/refactor-tools/restructure.md"
 kind: design
 lifecycle: archived
 corpus: blackbox-design
@@ -12,11 +12,11 @@ status: "working benchmark"
 brief: "Benchmark record for exercising the refactor MCP surface against the crate restructure design."
 ---
 
-# Refactor Surface Benchmark: `design/restructure.md`
+# Refactor Surface Benchmark: `design/refactor-tools/restructure.md`
 
 ## Purpose
 
-`design/restructure.md` is the exemplar for the `bbox_refactor_*` MCP surface.
+`design/refactor-tools/restructure.md` is the exemplar for the `bbox_refactor_*` MCP surface.
 The goal is not to manually perform that restructure in this repository. The
 goal is to make the MCP surface general enough that an agent could honestly do
 all or most of that restructure through reusable refactor operations.
