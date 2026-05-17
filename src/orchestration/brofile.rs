@@ -91,13 +91,20 @@ impl ProviderDefaultsMode {
 /// Whether `provider` can honor a non-`Default` `ProviderDefaultsMode`
 /// in v1. Claude-compatible transports use `--system-prompt ""` so the
 /// provider default system prompt / CLAUDE.md-derived prompt material is
-/// replaced while transient MCP config is still injected. OpenCode-backed
+/// replaced while transient MCP config is still injected. Codex overrides
+/// base instructions, suppresses injected instruction blocks, caps project
+/// docs at zero, and runs through a CODEX_HOME overlay that omits global
+/// AGENTS files while preserving config/auth/MCP entries. OpenCode-backed
 /// providers suppress generated `instructions` config entries. Other
 /// providers are recorded but unsupported until per-provider wiring lands.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Inception
+        Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Codex
+            | Provider::Inception
     )
 }
 
@@ -321,6 +328,52 @@ fn default_opencode_config_path(store_dir: &Path, provider: Provider) -> PathBuf
     ))
 }
 
+fn skipped_codex_home_entry(name: &std::ffi::OsStr) -> bool {
+    name == "AGENTS.md" || name == "AGENTS.override.md"
+}
+
+#[cfg(unix)]
+fn symlink_codex_home_entry(source: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(source, link)
+}
+
+#[cfg(not(unix))]
+fn symlink_codex_home_entry(source: &Path, link: &Path) -> std::io::Result<()> {
+    if source.is_file() {
+        fs::copy(source, link).map(|_| ())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Codex suppressed home overlays require symlink support for directories",
+        ))
+    }
+}
+
+fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io::Result<PathBuf> {
+    let overlay = store_dir.join("generated").join(format!(
+        "codex-home-suppressed-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&overlay)?;
+
+    let entries = match fs::read_dir(base_home) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(overlay),
+        Err(err) => return Err(err),
+    };
+
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if skipped_codex_home_entry(&name) {
+            continue;
+        }
+        symlink_codex_home_entry(&entry.path(), &overlay.join(name))?;
+    }
+
+    Ok(overlay)
+}
+
 struct OpencodeProfile {
     default_model: &'static str,
     small_model: &'static str,
@@ -530,6 +583,30 @@ fn resolve_provider_env_inner(
     if let Some(account_name) = account_name.as_deref() {
         if let Some(overrides) = load_account(account_name, store_dir).and_then(|a| a.env) {
             env.extend(overrides);
+        }
+    }
+
+    if provider == Provider::Codex && suppress_instructions {
+        let base_home = env
+            .get("CODEX_HOME")
+            .map(PathBuf::from)
+            .or_else(|| dirs::home_dir().map(|home| home.join(".codex")));
+        if let Some(base_home) = base_home {
+            match prepare_codex_suppressed_home(&base_home, store_dir) {
+                Ok(overlay) => {
+                    env.insert(
+                        "CODEX_HOME".to_string(),
+                        overlay.to_string_lossy().into_owned(),
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        base_home = %base_home.display(),
+                        error = %err,
+                        "failed to prepare Codex suppressed home overlay"
+                    );
+                }
+            }
         }
     }
 
@@ -769,12 +846,11 @@ mod tests {
         let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
         assert_eq!(bf.name, "rust-refactor-persona");
         assert_eq!(bf.provider, Provider::Claude);
-        assert!(
-            bf.lens
-                .as_deref()
-                .unwrap_or("")
-                .contains("bbox refactor primitives")
-        );
+        assert!(bf
+            .lens
+            .as_deref()
+            .unwrap_or("")
+            .contains("bbox refactor primitives"));
 
         let f = bf.filters.expect("filters present");
 
@@ -1058,11 +1134,9 @@ mod tests {
             resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None)
                 .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-account2"))
-        );
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-account2")));
     }
 
     #[test]
@@ -1103,11 +1177,9 @@ mod tests {
         let resolved =
             resolve_provider_env(Provider::Claude, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-account2"))
-        );
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-account2")));
     }
 
     #[test]
@@ -1119,11 +1191,9 @@ mod tests {
             resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-zai"))
-        );
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-zai")));
     }
 
     #[test]
@@ -1156,11 +1226,9 @@ mod tests {
             )
             .unwrap()
         });
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-zai-account2"))
-        );
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-zai-account2")));
     }
 
     #[test]
@@ -1270,11 +1338,11 @@ mod tests {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        let err = enforce_provider_defaults(Provider::Codex, Some(&ctx)).expect_err(
-            "strict_suppress on Codex should fail closed until verified controls exist",
+        let err = enforce_provider_defaults(Provider::Copilot, Some(&ctx)).expect_err(
+            "strict_suppress on Copilot should fail closed until verified controls exist",
         );
         assert!(err.contains("error.provider_defaults_unsupported"));
-        assert!(err.contains("codex"));
+        assert!(err.contains("copilot"));
     }
 
     #[test]
@@ -1286,6 +1354,38 @@ mod tests {
             .expect("strict_suppress on Inception is honored");
         enforce_provider_defaults(Provider::Claude, Some(&ctx))
             .expect("strict_suppress on Claude is honored via --system-prompt override");
+        enforce_provider_defaults(Provider::Codex, Some(&ctx))
+            .expect("strict_suppress on Codex is honored via config overrides");
+    }
+
+    #[test]
+    fn test_resolve_provider_env_codex_suppression_overlays_home_without_agents() {
+        let store = temp_store();
+        let home = temp_store();
+        let codex_home = home.path().join(".codex");
+        fs::create_dir_all(&codex_home).unwrap();
+        fs::write(codex_home.join("AGENTS.md"), "global instructions").unwrap();
+        fs::write(
+            codex_home.join("AGENTS.override.md"),
+            "override instructions",
+        )
+        .unwrap();
+        fs::write(codex_home.join("config.toml"), "model = \"gpt-5.4\"\n").unwrap();
+        fs::write(codex_home.join("auth.json"), "{}\n").unwrap();
+
+        let ctx = BrofileContext {
+            provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
+        };
+        let env = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Codex, None, None, store.path(), Some(&ctx)).unwrap()
+        });
+        let overlay = PathBuf::from(env.get("CODEX_HOME").unwrap());
+
+        assert_ne!(overlay, codex_home);
+        assert!(overlay.join("config.toml").exists());
+        assert!(overlay.join("auth.json").exists());
+        assert!(!overlay.join("AGENTS.md").exists());
+        assert!(!overlay.join("AGENTS.override.md").exists());
     }
 
     #[test]
@@ -1306,11 +1406,9 @@ mod tests {
             resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-ds"))
-        );
+        assert!(resolved
+            .get("CLAUDE_CONFIG_DIR")
+            .is_some_and(|path| path.ends_with("/.claude-ds")));
     }
 
     #[test]

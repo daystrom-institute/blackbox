@@ -536,7 +536,7 @@ the provider reports unsupported suppression rather than pretending to be clean.
 | Claude | `claude -p <prompt>` and `claude --resume <session> -p <prompt>` with transient `--mcp-config` | CLI loads its normal Claude settings/instruction files unless the system prompt is explicitly overridden | Emit `--system-prompt ""` while preserving transient `--mcp-config`; do not use `--bare`, because that disables the MCP path blackbox needs. |
 | GLM | Claude-compatible CLI path using `claude -p` / `--resume` with GLM model/env | Same as Claude-compatible transport | Same as Claude-compatible path: emit `--system-prompt ""` and keep transient MCP config. |
 | DeepSeek | Claude-compatible CLI path using `claude -p` / `--resume` with DeepSeek model/env | Same as Claude-compatible transport | Same as Claude-compatible path: emit `--system-prompt ""` and keep transient MCP config. |
-| Codex | `codex exec <prompt>` and `codex exec resume <session> <prompt>` | CLI may load Codex rules/user config; blackbox currently passes only prompt/model/effort/cwd | Report suppression unsupported until a verified control suppresses both provider system prompt defaults and `AGENTS.md`-style harness context. |
+| Codex | `codex exec <prompt>` and `codex exec resume <session> <prompt>` | CLI loads base `instructions`, Codex developer/user scaffolding, `$CODEX_HOME/AGENTS.md`, and project `AGENTS.md` by default | Emit `-c instructions=""`, disable Codex injected instruction blocks, set `project_doc_max_bytes=0`, and run through a per-dispatch `CODEX_HOME` overlay that symlinks config/auth/MCP state while omitting `AGENTS.md` / `AGENTS.override.md`. |
 | Copilot | `gh copilot -- -p <prompt>` and `--resume=<session>` | Provider behavior is inherited from Copilot CLI; no suppression control currently wired | Report suppression unsupported until a concrete CLI/config mechanism is verified. |
 | Gemini | `gemini -p <prompt>` and `gemini --resume <session> -p <prompt>` | Gemini CLI default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Gemini controls are verified. MCP tool exclusions are separate tool policy, not markdown suppression. |
 | Vibe | `vibe -p <prompt>` and `vibe --resume <session> -p <prompt>` | Vibe config/default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Vibe controls are verified. |
@@ -549,9 +549,11 @@ any provider without a verified mechanism.
 The v1 deliverable for Phase 2 is the schema plus the report-and-warn
 behavior. Claude-compatible transports and OpenCode/Inception ship as
 enforcing providers: Claude-compatible launches override the provider system
-prompt with `--system-prompt ""` while preserving MCP injection; OpenCode
-omits generated `instructions` entries. Codex and every other provider accept
-the policy field, but strict modes fail until a verified suppression mechanism
+prompt with `--system-prompt ""` while preserving MCP injection; Codex
+overrides base instructions, disables injected instruction blocks, suppresses
+project docs, and omits global AGENTS files via an overlayed `CODEX_HOME`;
+OpenCode omits generated `instructions` entries. Other providers accept the
+policy field, but strict modes fail until a verified suppression mechanism
 exists. Wiring additional providers as enforcing is a follow-up patch per
 provider, not a phase gate.
 

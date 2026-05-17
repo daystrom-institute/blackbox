@@ -273,7 +273,11 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
         return None;
     }
     let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if path.is_empty() { None } else { Some(path) }
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +292,31 @@ pub struct ExecOpts {
 }
 
 const EMPTY_SYSTEM_PROMPT_OVERRIDE: &str = "";
+const CODEX_EMPTY_INSTRUCTIONS_OVERRIDE: &str = "instructions=\"\"";
+const CODEX_EMPTY_DEVELOPER_INSTRUCTIONS_OVERRIDE: &str = "developer_instructions=\"\"";
+const CODEX_DISABLE_PROJECT_DOCS_OVERRIDE: &str = "project_doc_max_bytes=0";
+const CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE: &str =
+    "include_permissions_instructions=false";
+const CODEX_DISABLE_APPS_INSTRUCTIONS_OVERRIDE: &str = "include_apps_instructions=false";
+const CODEX_DISABLE_COLLABORATION_INSTRUCTIONS_OVERRIDE: &str =
+    "include_collaboration_mode_instructions=false";
+const CODEX_DISABLE_ENVIRONMENT_CONTEXT_OVERRIDE: &str = "include_environment_context=false";
+const CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE: &str = "skills.include_instructions=false";
+
+fn append_codex_suppression_config(args: &mut Vec<String>) {
+    for override_value in [
+        CODEX_EMPTY_INSTRUCTIONS_OVERRIDE,
+        CODEX_EMPTY_DEVELOPER_INSTRUCTIONS_OVERRIDE,
+        CODEX_DISABLE_PROJECT_DOCS_OVERRIDE,
+        CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE,
+        CODEX_DISABLE_APPS_INSTRUCTIONS_OVERRIDE,
+        CODEX_DISABLE_COLLABORATION_INSTRUCTIONS_OVERRIDE,
+        CODEX_DISABLE_ENVIRONMENT_CONTEXT_OVERRIDE,
+        CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE,
+    ] {
+        args.extend(["-c".into(), override_value.into()]);
+    }
+}
 
 impl ExecOpts {
     pub fn with_provider_defaults(
@@ -410,6 +439,9 @@ impl Provider {
                 }
                 if let Some(e) = effort {
                     args.extend(["-c".into(), format!("model_reasoning_effort=\"{e}\"")]);
+                }
+                if suppress_provider_defaults {
+                    append_codex_suppression_config(&mut args);
                 }
                 if let Some(c) = cwd {
                     args.extend(["-C".into(), c.into()]);
@@ -557,6 +589,9 @@ impl Provider {
                 }
                 if let Some(e) = effort {
                     args.extend(["-c".into(), format!("model_reasoning_effort=\"{e}\"")]);
+                }
+                if suppress_provider_defaults {
+                    append_codex_suppression_config(&mut args);
                 }
                 args.push(session_id.into());
                 args.push(prompt.into());
@@ -2431,10 +2466,9 @@ mod tests {
         };
         let args = Provider::Claude.build_exec_args("hello", "sid-1", None, Some(&opts));
         assert!(args.contains(&"--system-prompt".to_string()));
-        assert!(
-            args.windows(2)
-                .any(|w| w[0] == "--system-prompt" && w[1].is_empty())
-        );
+        assert!(args
+            .windows(2)
+            .any(|w| w[0] == "--system-prompt" && w[1].is_empty()));
         assert!(!args.contains(&"--bare".to_string()));
         assert!(
             args.contains(&"--mcp-config".to_string()),
@@ -2490,6 +2524,49 @@ mod tests {
         assert!(args.contains(&"--model".to_string()));
         assert!(args.contains(&"gpt-5.4".to_string()));
         assert!(args.iter().any(|a| a.contains("model_reasoning_effort")));
+    }
+
+    #[test]
+    fn test_codex_suppression_uses_config_overrides_not_ignore_user_config() {
+        let opts = ExecOpts {
+            model: None,
+            effort: None,
+            provider_defaults: Some(
+                crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
+            ),
+        };
+        let args = Provider::Codex.build_exec_args("do stuff", "", None, Some(&opts));
+        assert!(!args.contains(&"--ignore-user-config".to_string()));
+        assert!(args
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_EMPTY_INSTRUCTIONS_OVERRIDE }));
+        assert!(args
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE }));
+        assert!(args
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE }));
+        assert!(args
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE }));
+    }
+
+    #[test]
+    fn test_codex_resume_suppression_uses_config_overrides() {
+        let opts = ExecOpts {
+            model: None,
+            effort: None,
+            provider_defaults: Some(
+                crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
+            ),
+        };
+        let args = Provider::Codex.build_resume_args("sid-1", "continue", Some(&opts));
+        assert!(args
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_EMPTY_INSTRUCTIONS_OVERRIDE }));
+        assert!(args
+            .windows(2)
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE }));
     }
 
     #[test]
@@ -2970,16 +3047,12 @@ mod tests {
         assert!(g.iter().any(|a| a == "-s"));
         assert!(g.contains(&u.to_string()));
 
-        assert!(
-            Provider::Inception
-                .build_mcp_add_http_args("x", "y", &[])
-                .is_none()
-        );
-        assert!(
-            Provider::Vibe
-                .build_mcp_add_http_args("x", "y", &[])
-                .is_none()
-        );
+        assert!(Provider::Inception
+            .build_mcp_add_http_args("x", "y", &[])
+            .is_none());
+        assert!(Provider::Vibe
+            .build_mcp_add_http_args("x", "y", &[])
+            .is_none());
     }
 
     #[test]
@@ -3026,11 +3099,9 @@ mod tests {
         assert!(args[1].contains("Bash(rm -rf *)"));
         // The raw glob should NOT appear — it'd be treated as a literal
         // tool name by Claude and match nothing.
-        assert!(
-            !args[1]
-                .split_whitespace()
-                .any(|t| t == "mcp__blackbox__bro_*")
-        );
+        assert!(!args[1]
+            .split_whitespace()
+            .any(|t| t == "mcp__blackbox__bro_*"));
     }
 
     #[test]
@@ -3256,72 +3327,48 @@ mod tests {
     #[test]
     fn test_scoped_arg_builders_honor_scope_capability() {
         // Claude-compatible providers + Gemini support both user and project.
-        assert!(
-            Provider::Claude
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_some()
-        );
-        assert!(
-            Provider::Claude
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_some()
-        );
-        assert!(
-            Provider::Glm
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_some()
-        );
-        assert!(
-            Provider::Deepseek
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_some()
-        );
-        assert!(
-            Provider::Gemini
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_some()
-        );
+        assert!(Provider::Claude
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_some());
+        assert!(Provider::Claude
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_some());
+        assert!(Provider::Glm
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_some());
+        assert!(Provider::Deepseek
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_some());
+        assert!(Provider::Gemini
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_some());
 
         // Codex has no project scope (single config file).
-        assert!(
-            Provider::Codex
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_some()
-        );
-        assert!(
-            Provider::Codex
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_none()
-        );
-        assert!(
-            Provider::Codex
-                .build_mcp_remove_args_scoped("x", "project")
-                .is_none()
-        );
+        assert!(Provider::Codex
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_some());
+        assert!(Provider::Codex
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_none());
+        assert!(Provider::Codex
+            .build_mcp_remove_args_scoped("x", "project")
+            .is_none());
 
         // Copilot only user (no documented project flag).
-        assert!(
-            Provider::Copilot
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_none()
-        );
+        assert!(Provider::Copilot
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_none());
 
         // Vibe never.
-        assert!(
-            Provider::Inception
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_none()
-        );
-        assert!(
-            Provider::Vibe
-                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-                .is_none()
-        );
-        assert!(
-            Provider::Vibe
-                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-                .is_none()
-        );
+        assert!(Provider::Inception
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_none());
+        assert!(Provider::Vibe
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_none());
+        assert!(Provider::Vibe
+            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+            .is_none());
 
         // Claude project scope emits -s project.
         let claude_proj = Provider::Claude
