@@ -238,7 +238,8 @@ impl TranscriptReadAdapter for ClaudeTranscriptAdapter {
             {
                 let path = entry.path();
                 if path
-                    .file_name().is_none_or(|name| name != filename.as_str())
+                    .file_name()
+                    .is_none_or(|name| name != filename.as_str())
                 {
                     continue;
                 }

@@ -33,8 +33,7 @@ pub struct StorageFileInfo {
     pub reason: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct StorageHealthTotals {
     pub active_legacy_bytes: u64,
     pub active_legacy_files: u64,
@@ -53,7 +52,6 @@ pub struct StorageHealthTotals {
     pub total_bytes: u64,
     pub total_files: u64,
 }
-
 
 impl StorageHealthTotals {
     fn accumulate(&mut self, kind: FileKind, bytes: u64) {
@@ -828,15 +826,13 @@ pub struct GcParams {
     pub keep_newest_backup_per_source: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct GcPolicy {
     pub materialized_snapshots: SnapshotRetentionPolicy,
     pub backups: BackupRetentionPolicy,
     pub orphans: OrphanRetentionPolicy,
     pub observed: ObservedRetentionPolicy,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotRetentionPolicy {
@@ -887,12 +883,10 @@ impl Default for OrphanRetentionPolicy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ObservedRetentionPolicy {
     pub max_bytes_per_project: Option<u64>,
 }
-
 
 const TEMP_GRACE_SECS: u64 = 24 * 3600;
 

@@ -17,10 +17,7 @@ enum MigrateReplacementKind {
 
 impl MigrateReplacementKind {
     fn parse(raw: &str) -> Result<Self> {
-        let normalized = raw
-            .trim()
-            .replace(['-', '_', ' '], "")
-            .to_ascii_lowercase();
+        let normalized = raw.trim().replace(['-', '_', ' '], "").to_ascii_lowercase();
 
         match normalized.as_str() {
             "bareconcrete" => Ok(Self::BareConcrete),
@@ -728,11 +725,13 @@ fn build_where_clause_edit(item: &Node<'_>, source: &str, bound_text: &str) -> O
             byte_end: insert_at,
             replacement: format!(", T: {bound_text}"),
         })
-    } else { end_of_item_header(item, source).map(|header_end| TextEdit {
+    } else {
+        end_of_item_header(item, source).map(|header_end| TextEdit {
             byte_start: header_end,
             byte_end: header_end,
             replacement: format!(" where T: {bound_text}"),
-        }) }
+        })
+    }
 }
 
 fn end_of_item_header(item: &Node<'_>, source: &str) -> Option<usize> {

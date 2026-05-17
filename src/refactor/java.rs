@@ -1602,10 +1602,7 @@ fn select_java_methods_by_name(parsed: &ParsedSource, names: &[String]) -> Resul
                 let params: Vec<String> = if inside.trim().is_empty() {
                     Vec::new()
                 } else {
-                    inside
-                        .split(',')
-                        .map(normalize_param_type_text)
-                        .collect()
+                    inside.split(',').map(normalize_param_type_text).collect()
                 };
                 (name, Some(params))
             }
@@ -3664,9 +3661,11 @@ fn extracted_methods_write_to(
             if let Some(parent) = target.parent() {
                 match parent.kind() {
                     "assignment_expression"
-                        if parent.child_by_field_name("left").map(|c| c.id()) == Some(target.id()) => {
-                            return true;
-                        }
+                        if parent.child_by_field_name("left").map(|c| c.id())
+                            == Some(target.id()) =>
+                    {
+                        return true;
+                    }
                     "update_expression" => return true,
                     _ => {}
                 }

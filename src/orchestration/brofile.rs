@@ -1208,9 +1208,11 @@ mod tests {
             resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None)
                 .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-account2")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-account2"))
+        );
     }
 
     #[test]
@@ -1251,9 +1253,11 @@ mod tests {
         let resolved =
             resolve_provider_env(Provider::Claude, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-account2")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-account2"))
+        );
     }
 
     #[test]
@@ -1265,9 +1269,11 @@ mod tests {
             resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-zai")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        );
     }
 
     #[test]
@@ -1300,9 +1306,11 @@ mod tests {
             )
             .unwrap()
         });
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-zai-account2")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-zai-account2"))
+        );
     }
 
     #[test]
@@ -1480,9 +1488,11 @@ mod tests {
             resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
-        assert!(resolved
-            .get("CLAUDE_CONFIG_DIR")
-            .is_some_and(|path| path.ends_with("/.claude-ds")));
+        assert!(
+            resolved
+                .get("CLAUDE_CONFIG_DIR")
+                .is_some_and(|path| path.ends_with("/.claude-ds"))
+        );
     }
 
     #[test]

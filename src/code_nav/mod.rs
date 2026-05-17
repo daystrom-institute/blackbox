@@ -1738,10 +1738,12 @@ pub fn code_refs(p: &CodeRefsParams) -> Result<String> {
                      `identifiers` is the only kind that falls back to the generic walker.",
                     kind = p.kind
                 ),
-                suggestion: "Either pass kind=\"identifiers\" (shape-only fallback — emits records \
+                suggestion:
+                    "Either pass kind=\"identifiers\" (shape-only fallback — emits records \
                      for nodes literally named `identifier`; may return zero on grammars \
                      that use different identifier-like kinds, e.g. Erlang's `atom`/`variable`), \
-                     or use bbox_code_query with a grammar-native S-expression.".to_string(),
+                     or use bbox_code_query with a grammar-native S-expression."
+                        .to_string(),
                 file: Some(path.to_string_lossy().into_owned()),
                 file_bytes: None,
                 max_bytes: None,

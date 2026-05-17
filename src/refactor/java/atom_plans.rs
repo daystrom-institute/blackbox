@@ -337,10 +337,9 @@ fn constructor_visibility_edits(
         for child in ctor.children(&mut c) {
             match child.kind() {
                 "modifiers" => ctor_modifiers = Some(child),
-                "identifier"
-                    if name_node.is_none() => {
-                        name_node = Some(child);
-                    }
+                "identifier" if name_node.is_none() => {
+                    name_node = Some(child);
+                }
                 _ => {}
             }
         }

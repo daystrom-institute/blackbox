@@ -3020,11 +3020,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src_dir = dir.path().join("src");
         fs::create_dir_all(src_dir.join("parent")).unwrap();
-        fs::write(
-            src_dir.join("parent.rs"),
-            "pub(crate) trait Extension {}\n",
-        )
-        .unwrap();
+        fs::write(src_dir.join("parent.rs"), "pub(crate) trait Extension {}\n").unwrap();
         let child = src_dir.join("parent").join("child.rs");
         fs::write(&child, "use super::*;\n\nfn run() {}\n").unwrap();
 

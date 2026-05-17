@@ -51,10 +51,7 @@ pub fn plan_match_to_strategy(p: &crate::refactor::RefactorPlanParams) -> anyhow
         bail!("module_name must not be empty");
     }
 
-    let behavior_names: Vec<String> = p
-        .item_names
-        .as_deref()
-        .unwrap_or(&[]).to_vec();
+    let behavior_names: Vec<String> = p.item_names.as_deref().unwrap_or(&[]).to_vec();
 
     let toml = p.toml_entries.as_ref();
 

@@ -641,45 +641,39 @@ pub fn analyze_range(
                 "this" | "super" => {
                     analysis.this_super_refs += 1;
                 }
-                "identifier" | "type_identifier"
-                    if !is_declaration_site(n) => {
-                        if let Ok(text) = n.utf8_text(bytes) {
-                            let resolved = scope.resolve(text, n.start_byte());
-                            match resolved {
-                                Some(decl) => {
-                                    let decl_inside = decl.name_byte_start >= range_start
-                                        && decl.name_byte_end <= range_end;
-                                    if !decl_inside {
-                                        let mutated = is_mutation_target(n);
-                                        let entry = capture_map.entry(text.to_string()).or_insert(
-                                            CapturedRef {
-                                                name: text.to_string(),
-                                                type_text: decl.type_text.clone(),
-                                                is_final: decl.is_final,
-                                                mutated: false,
-                                            },
-                                        );
-                                        if mutated {
-                                            entry.mutated = true;
-                                        }
+                "identifier" | "type_identifier" if !is_declaration_site(n) => {
+                    if let Ok(text) = n.utf8_text(bytes) {
+                        let resolved = scope.resolve(text, n.start_byte());
+                        match resolved {
+                            Some(decl) => {
+                                let decl_inside = decl.name_byte_start >= range_start
+                                    && decl.name_byte_end <= range_end;
+                                if !decl_inside {
+                                    let mutated = is_mutation_target(n);
+                                    let entry = capture_map.entry(text.to_string()).or_insert(
+                                        CapturedRef {
+                                            name: text.to_string(),
+                                            type_text: decl.type_text.clone(),
+                                            is_final: decl.is_final,
+                                            mutated: false,
+                                        },
+                                    );
+                                    if mutated {
+                                        entry.mutated = true;
                                     }
                                 }
-                                None => {
-                                    if n.kind() == "identifier"
-                                        && text
-                                            .chars()
-                                            .next()
-                                            .is_some_and(|c| c.is_ascii_lowercase())
-                                        && !analysis
-                                            .enclosing_class_refs
-                                            .contains(&text.to_string())
-                                    {
-                                        analysis.enclosing_class_refs.push(text.to_string());
-                                    }
+                            }
+                            None => {
+                                if n.kind() == "identifier"
+                                    && text.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+                                    && !analysis.enclosing_class_refs.contains(&text.to_string())
+                                {
+                                    analysis.enclosing_class_refs.push(text.to_string());
                                 }
                             }
                         }
                     }
+                }
                 "return_statement" => {
                     analysis.non_local_control_flow.push(NonLocalControlFlow {
                         kind: "return".to_string(),
@@ -688,13 +682,14 @@ pub fn analyze_range(
                     });
                 }
                 "break_statement" | "continue_statement"
-                    if non_local_break_continue(n, range_start, range_end) => {
-                        analysis.non_local_control_flow.push(NonLocalControlFlow {
-                            kind: n.kind().to_string(),
-                            byte_start: n.start_byte(),
-                            byte_end: n.end_byte(),
-                        });
-                    }
+                    if non_local_break_continue(n, range_start, range_end) =>
+                {
+                    analysis.non_local_control_flow.push(NonLocalControlFlow {
+                        kind: n.kind().to_string(),
+                        byte_start: n.start_byte(),
+                        byte_end: n.end_byte(),
+                    });
+                }
                 _ => {}
             }
         }

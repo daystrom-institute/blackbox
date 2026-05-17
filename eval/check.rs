@@ -170,7 +170,6 @@ pub enum PassStrictness {
     First,
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TargetLocator {
     pub description: String,

@@ -132,10 +132,15 @@ pub fn plan_compile_fix_round(p: &RefactorPlanParams) -> Result<String> {
 }
 
 enum Classification {
-    Leftover { hint: Option<String> },
+    Leftover {
+        hint: Option<String>,
+    },
     // kept: variant matched but not yet constructed; sidecar-resolution path lands in follow-up
     #[allow(dead_code)]
-    AddUsingDirective { file: String, directive: String },
+    AddUsingDirective {
+        file: String,
+        directive: String,
+    },
 }
 
 fn classify(d: &SidecarDiagnostic) -> Classification {

@@ -250,13 +250,15 @@ fn collect_rename_edits(
             // Reference sites: type_identifier in any position.
             "type_identifier"
                 if node.utf8_text(src_bytes).ok() == Some(old_name)
-                    && !is_declaration_name(node) && kind_passes(kind_filter, "type_reference") => {
-                        out.push(TextEdit {
-                            byte_start: node.start_byte(),
-                            byte_end: node.end_byte(),
-                            replacement: new_name.to_string(),
-                        });
-                    }
+                    && !is_declaration_name(node)
+                    && kind_passes(kind_filter, "type_reference") =>
+            {
+                out.push(TextEdit {
+                    byte_start: node.start_byte(),
+                    byte_end: node.end_byte(),
+                    replacement: new_name.to_string(),
+                });
+            }
             // method_invocation.name.
             "method_invocation" => {
                 if let Some(name_node) = node.child_by_field_name("name") {

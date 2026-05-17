@@ -273,11 +273,7 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
         return None;
     }
     let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
+    if path.is_empty() { None } else { Some(path) }
 }
 
 // ---------------------------------------------------------------------------
@@ -2471,9 +2467,10 @@ mod tests {
         };
         let args = Provider::Claude.build_exec_args("hello", "sid-1", None, Some(&opts));
         assert!(args.contains(&"--system-prompt".to_string()));
-        assert!(args
-            .windows(2)
-            .any(|w| w[0] == "--system-prompt" && w[1].is_empty()));
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--system-prompt" && w[1].is_empty())
+        );
         assert!(!args.contains(&"--bare".to_string()));
         assert!(
             args.contains(&"--mcp-config".to_string()),
@@ -2542,18 +2539,23 @@ mod tests {
         };
         let args = Provider::Codex.build_exec_args("do stuff", "", None, Some(&opts));
         assert!(!args.contains(&"--ignore-user-config".to_string()));
-        assert!(args
-            .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE }));
-        assert!(args
-            .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE }));
-        assert!(args
-            .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE }));
-        assert!(args
-            .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE }));
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE })
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE })
+        );
+        assert!(
+            args.windows(2).any(|w| {
+                w[0] == "-c" && w[1] == CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE
+            })
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE })
+        );
     }
 
     #[test]
@@ -2566,12 +2568,14 @@ mod tests {
             ),
         };
         let args = Provider::Codex.build_resume_args("sid-1", "continue", Some(&opts));
-        assert!(args
-            .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE }));
-        assert!(args
-            .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE }));
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE })
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE })
+        );
     }
 
     #[test]
@@ -3052,12 +3056,16 @@ mod tests {
         assert!(g.iter().any(|a| a == "-s"));
         assert!(g.contains(&u.to_string()));
 
-        assert!(Provider::Inception
-            .build_mcp_add_http_args("x", "y", &[])
-            .is_none());
-        assert!(Provider::Vibe
-            .build_mcp_add_http_args("x", "y", &[])
-            .is_none());
+        assert!(
+            Provider::Inception
+                .build_mcp_add_http_args("x", "y", &[])
+                .is_none()
+        );
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args("x", "y", &[])
+                .is_none()
+        );
     }
 
     #[test]
@@ -3104,9 +3112,11 @@ mod tests {
         assert!(args[1].contains("Bash(rm -rf *)"));
         // The raw glob should NOT appear — it'd be treated as a literal
         // tool name by Claude and match nothing.
-        assert!(!args[1]
-            .split_whitespace()
-            .any(|t| t == "mcp__blackbox__bro_*"));
+        assert!(
+            !args[1]
+                .split_whitespace()
+                .any(|t| t == "mcp__blackbox__bro_*")
+        );
     }
 
     #[test]
@@ -3332,48 +3342,72 @@ mod tests {
     #[test]
     fn test_scoped_arg_builders_honor_scope_capability() {
         // Claude-compatible providers + Gemini support both user and project.
-        assert!(Provider::Claude
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_some());
-        assert!(Provider::Claude
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some());
-        assert!(Provider::Glm
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some());
-        assert!(Provider::Deepseek
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some());
-        assert!(Provider::Gemini
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some());
+        assert!(
+            Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_some()
+        );
+        assert!(
+            Provider::Claude
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Glm
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Deepseek
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
+        assert!(
+            Provider::Gemini
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_some()
+        );
 
         // Codex has no project scope (single config file).
-        assert!(Provider::Codex
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_some());
-        assert!(Provider::Codex
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_none());
-        assert!(Provider::Codex
-            .build_mcp_remove_args_scoped("x", "project")
-            .is_none());
+        assert!(
+            Provider::Codex
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_some()
+        );
+        assert!(
+            Provider::Codex
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
+        assert!(
+            Provider::Codex
+                .build_mcp_remove_args_scoped("x", "project")
+                .is_none()
+        );
 
         // Copilot only user (no documented project flag).
-        assert!(Provider::Copilot
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_none());
+        assert!(
+            Provider::Copilot
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
 
         // Vibe never.
-        assert!(Provider::Inception
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_none());
-        assert!(Provider::Vibe
-            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
-            .is_none());
-        assert!(Provider::Vibe
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_none());
+        assert!(
+            Provider::Inception
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_none()
+        );
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+                .is_none()
+        );
+        assert!(
+            Provider::Vibe
+                .build_mcp_add_http_args_scoped("x", "u", &[], "project")
+                .is_none()
+        );
 
         // Claude project scope emits -s project.
         let claude_proj = Provider::Claude

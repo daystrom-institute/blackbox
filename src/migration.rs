@@ -1,6 +1,6 @@
-use std::collections::HashSet;
 #[cfg(test)]
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};

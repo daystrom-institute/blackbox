@@ -374,12 +374,11 @@ fn enforce_no_method_bodies(source: &str, class: &ClassLocation) -> Result<()> {
                 body_check_start
             };
             match bytes.get(body_check_start).copied() {
-                Some(b'{') | Some(b'=')
-                    if !canonical => {
-                        bail!(
-                            "error.non_canonical_method: type contains method `{name}` with a body; refuse to convert to record"
-                        );
-                    }
+                Some(b'{') | Some(b'=') if !canonical => {
+                    bail!(
+                        "error.non_canonical_method: type contains method `{name}` with a body; refuse to convert to record"
+                    );
+                }
                 _ => {}
             }
             i = body_check_start + 1;

@@ -163,8 +163,7 @@ fn default_supervision_advisor() -> String {
 // Runtime supervision plan
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct SupervisionPlan {
     pub classifier: SupervisionClassifierPlan,
     pub advisor: SupervisionAdvisorPlan,
@@ -173,7 +172,6 @@ pub struct SupervisionPlan {
     pub tail_policy: SupervisionTailPolicy,
     pub alert_dedup: SupervisionAlertDedupPolicy,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SupervisionClassifierPlan {

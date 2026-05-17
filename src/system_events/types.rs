@@ -192,7 +192,6 @@ pub enum OutboxStatus {
     DeadLettered,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct OutboxRecord {
     pub id: String,
@@ -304,7 +303,6 @@ pub enum FailurePolicy {
     #[default]
     DeadLetter,
 }
-
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActionStatus {

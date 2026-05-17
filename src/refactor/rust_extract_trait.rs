@@ -586,7 +586,8 @@ fn method_decl_node_by_start(
 ) -> Option<tree_sitter::Node<'_>> {
     let root = parsed.tree.root_node();
     let mut cursor = root.walk();
-    root.named_children(&mut cursor).find(|&node| node.kind() == "impl_item" && node.start_byte() == byte_start)
+    root.named_children(&mut cursor)
+        .find(|&node| node.kind() == "impl_item" && node.start_byte() == byte_start)
 }
 
 fn discover_impl_associated_constants(

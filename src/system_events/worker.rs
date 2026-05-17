@@ -339,7 +339,7 @@ fn compute_next_attempt(record: &OutboxRecord) -> String {
         .id
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_add(b as u64))
-        % 3 ;
+        % 3;
     let delay_secs = capped + jitter;
     let now = chrono::Utc::now();
     let next = now + chrono::Duration::seconds(delay_secs as i64);

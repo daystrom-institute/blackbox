@@ -1285,10 +1285,9 @@ fn append_missing_json_closers(s: &str) -> Option<String> {
             '"' => in_string = true,
             '{' => stack.push('}'),
             '[' => stack.push(']'),
-            '}' | ']'
-                if stack.pop() != Some(ch) => {
-                    return None;
-                }
+            '}' | ']' if stack.pop() != Some(ch) => {
+                return None;
+            }
             _ => {}
         }
     }

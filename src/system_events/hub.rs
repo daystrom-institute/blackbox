@@ -467,7 +467,6 @@ fn load_all_reactions_raw(dir: &Path) -> Vec<RawReaction> {
     out
 }
 
-
 fn scan_reaction_warnings(dir: &Path) -> Vec<ReactionLoadWarning> {
     load_all_reactions_raw(dir)
         .into_iter()
