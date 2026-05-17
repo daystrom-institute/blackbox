@@ -47,6 +47,8 @@ Files in `system-defaults/memories/` use bare slugs such as
 
 - [sm-bro-dispatch-patterns](bro-dispatch-patterns.md) - exec, resume, wait,
   race, and deliberation patterns for bro dispatch.
+- [sm-brofile-context](brofile-context.md) - brofile context policy,
+  provider-default suppression, and minimal probe/team validation.
 - [sm-workflow-orchestration](workflow-orchestration.md) - daemon-owned
   multi-phase workflow arcs.
 - [sm-atoms](atoms.md) - public reusable capability contracts and invocation

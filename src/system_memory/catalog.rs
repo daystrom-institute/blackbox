@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn load_and_keep_default_order() {
         let catalog = fixture_default_catalog();
-        assert_eq!(catalog.memories.len(), 27);
+        assert_eq!(catalog.memories.len(), 28);
         assert_eq!(catalog.memories[0].id, "sm-agentic-opening-sequence");
         assert_eq!(catalog.memories[1].id, "sm-atoms");
     }

@@ -213,7 +213,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_brofile",
-        description = "Manage brofile templates + accounts (provider+account+lens)."
+        description = "Manage brofile templates + accounts (provider+account+lens+context)."
     )]
     pub(crate) fn bro_brofile(&self, Parameters(p): Parameters<BrofileParams>) -> CallToolResult {
         use orchestration::brofile;
