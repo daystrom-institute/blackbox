@@ -292,7 +292,12 @@ pub struct ExecOpts {
 }
 
 const EMPTY_SYSTEM_PROMPT_OVERRIDE: &str = "";
-const CODEX_EMPTY_INSTRUCTIONS_OVERRIDE: &str = "instructions=\"\"";
+const CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE: &str = concat!(
+    "instructions=\"",
+    "You are operating autonomously in non-interactive mode. ",
+    "Do not use AskUserQuestion tools; halt if you encounter an unresolvable ambiguity.",
+    "\""
+);
 const CODEX_EMPTY_DEVELOPER_INSTRUCTIONS_OVERRIDE: &str = "developer_instructions=\"\"";
 const CODEX_DISABLE_PROJECT_DOCS_OVERRIDE: &str = "project_doc_max_bytes=0";
 const CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE: &str =
@@ -305,7 +310,7 @@ const CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE: &str = "skills.include_instruct
 
 fn append_codex_suppression_config(args: &mut Vec<String>) {
     for override_value in [
-        CODEX_EMPTY_INSTRUCTIONS_OVERRIDE,
+        CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE,
         CODEX_EMPTY_DEVELOPER_INSTRUCTIONS_OVERRIDE,
         CODEX_DISABLE_PROJECT_DOCS_OVERRIDE,
         CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE,
@@ -2539,7 +2544,7 @@ mod tests {
         assert!(!args.contains(&"--ignore-user-config".to_string()));
         assert!(args
             .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_EMPTY_INSTRUCTIONS_OVERRIDE }));
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE }));
         assert!(args
             .windows(2)
             .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE }));
@@ -2563,7 +2568,7 @@ mod tests {
         let args = Provider::Codex.build_resume_args("sid-1", "continue", Some(&opts));
         assert!(args
             .windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_EMPTY_INSTRUCTIONS_OVERRIDE }));
+            .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE }));
         assert!(args
             .windows(2)
             .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE }));
