@@ -1058,11 +1058,13 @@ impl BlackboxServer {
             Some(f) => (f.allow.clone(), f.disallow.clone()),
             None => (Vec::new(), Vec::new()),
         };
+        orchestration::brofile::enforce_provider_defaults(bf.provider, bf.context.as_ref())?;
         let env_overrides = orchestration::brofile::resolve_provider_env(
             bf.provider,
             bf.account.as_deref(),
             bf.model.as_deref(),
             &self.state.store_dir,
+            bf.context.as_ref(),
         );
         let exec_opts = if bf.model.is_some() || bf.effort.is_some() {
             Some(orchestration::providers::ExecOpts {
@@ -1130,6 +1132,7 @@ impl BlackboxServer {
                 spawn_bro_label: Some(atom_label.clone()),
                 spawn_agent_label: Some(atom_label.clone()),
                 record_to_bro: None,
+                brofile_context: bf.context,
             })?;
         let (task_id, session_id, selected_provider) = {
             let inner = dispatched.task.inner.lock();
@@ -2054,6 +2057,16 @@ impl BlackboxServer {
                 provider.as_str()
             ));
         }
+        // Enforce against the post-lease runtime provider AND the
+        // lease-captured brofile context, not the current `bf.context`.
+        // The brofile may have been edited between dispatch and resume —
+        // resume must honor the policy the session was launched under,
+        // not whatever the brofile says today.
+        let effective_context = selected_lease
+            .as_ref()
+            .and_then(|l| l.brofile_context.as_ref())
+            .or(bf.context.as_ref());
+        orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
         let exec_opts = if let Some(lease) = &selected_lease {
             orchestration::allocator::exec_opts_for_lane(&orchestration::allocator::RuntimeLane {
                 provider,
@@ -2081,6 +2094,7 @@ impl BlackboxServer {
             env_account,
             env_model,
             &self.state.store_dir,
+            effective_context,
         );
 
         let resume_cwd: Option<String> = provider

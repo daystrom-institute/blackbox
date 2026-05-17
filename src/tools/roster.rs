@@ -251,6 +251,7 @@ impl BlackboxServer {
                     filters,
                     coerce_workspace: p.coerce_workspace,
                     runtime: None,
+                    context: None,
                 };
                 if let Err(e) =
                     brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
@@ -741,13 +742,49 @@ Next step: <one concrete steering suggestion>\n",
         )
         .ok_or_else(|| format!("Brofile not found: {}", advisor.config.brofile))?;
         let provider = brofile.provider;
+        // For an advisor resume, prefer the lease-captured policy from
+        // the original dispatch over the current brofile — resume must
+        // honor dispatch-time suppression intent.
+        let advisor_lease = advisor
+            .session_id
+            .as_deref()
+            .filter(|s| !s.is_empty() && *s != "pending")
+            .and_then(|sid| {
+                orchestration::allocator::lookup_lease_for_session(
+                    &store_dir,
+                    &self.state.task_store.read(),
+                    provider,
+                    sid,
+                )
+            });
+        let effective_context = advisor_lease
+            .as_ref()
+            .and_then(|l| l.brofile_context.as_ref())
+            .or(brofile.context.as_ref());
+        orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
         let env_overrides = orchestration::brofile::resolve_provider_env(
             provider,
-            brofile.account.as_deref(),
-            brofile.model.as_deref(),
+            advisor_lease
+                .as_ref()
+                .and_then(|l| l.account.as_deref())
+                .or(brofile.account.as_deref()),
+            advisor_lease
+                .as_ref()
+                .and_then(|l| l.model.as_deref())
+                .or(brofile.model.as_deref()),
             &store_dir,
+            effective_context,
         );
-        let exec_opts = if brofile.model.is_some() || brofile.effort.is_some() {
+        let exec_opts = if let Some(lease) = advisor_lease.as_ref() {
+            orchestration::allocator::exec_opts_for_lane(&orchestration::allocator::RuntimeLane {
+                provider: lease.provider,
+                account: lease.account.clone(),
+                tier: lease.tier.clone(),
+                model: lease.model.clone(),
+                effort: lease.effort.clone(),
+                capabilities: lease.capabilities.clone(),
+            })
+        } else if brofile.model.is_some() || brofile.effort.is_some() {
             Some(ExecOpts {
                 model: brofile.model.clone(),
                 effort: brofile.effort.clone(),

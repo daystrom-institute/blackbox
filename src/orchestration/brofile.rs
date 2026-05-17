@@ -44,6 +44,79 @@ pub struct Brofile {
     /// allocator before falling through to the normal spawn path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeRequest>,
+    /// Optional context-assembly policy. v1 carries only
+    /// `provider_defaults`, the knob that suppresses provider-loaded
+    /// harness markdown and default system prompts. Template and
+    /// context-producer fields are not part of v1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<BrofileContext>,
+}
+
+// ---------------------------------------------------------------------------
+// Context-assembly policy
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct BrofileContext {
+    /// Suppression mode for provider-loaded harness markdown and
+    /// default system-prompt material. See `ProviderDefaultsMode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_defaults: Option<ProviderDefaultsMode>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDefaultsMode {
+    /// Let the provider load its normal global/user/project markdown
+    /// and system prompt. Current behavior.
+    #[default]
+    Default,
+    /// Suppress provider markdown / default prompt material when the
+    /// provider has known controls; warn when unsupported.
+    SuppressWhenSupported,
+    /// Fail closed if suppression is requested but unsupported by
+    /// the provider.
+    StrictSuppress,
+    /// Use only operator-supplied prompt material; fail closed where
+    /// the provider cannot honor suppression.
+    ExplicitOnly,
+}
+
+impl ProviderDefaultsMode {
+    pub fn suppresses(self) -> bool {
+        !matches!(self, ProviderDefaultsMode::Default)
+    }
+}
+
+/// Whether `provider` can honor a non-`Default` `ProviderDefaultsMode`
+/// in v1. Only OpenCode-backed providers have a wired enforcement path
+/// (the generated config's `instructions` array). Other providers are
+/// recorded but unsupported until per-provider wiring lands.
+pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
+    matches!(provider, Provider::Inception)
+}
+
+/// Reject dispatch when the brofile demands suppression the provider
+/// cannot enforce. `SuppressWhenSupported` is best-effort and never
+/// fails closed; `StrictSuppress` and `ExplicitOnly` do.
+pub fn enforce_provider_defaults(
+    provider: Provider,
+    context: Option<&BrofileContext>,
+) -> Result<(), String> {
+    let mode = context
+        .and_then(|c| c.provider_defaults)
+        .unwrap_or_default();
+    if !mode.suppresses() || provider_supports_defaults_suppression(provider) {
+        return Ok(());
+    }
+    match mode {
+        ProviderDefaultsMode::StrictSuppress | ProviderDefaultsMode::ExplicitOnly => Err(format!(
+            "error.provider_defaults_unsupported: provider {} cannot enforce {:?}",
+            provider.as_str(),
+            mode
+        )),
+        _ => Ok(()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -256,7 +329,11 @@ fn opencode_profile(provider: Provider) -> Option<OpencodeProfile> {
     }
 }
 
-fn build_opencode_config(provider: Provider, model: Option<&str>) -> Value {
+fn build_opencode_config(
+    provider: Provider,
+    model: Option<&str>,
+    suppress_instructions: bool,
+) -> Value {
     let profile = opencode_profile(provider).expect("provider must be OpenCode-backed");
     let model = model
         .map(str::trim)
@@ -278,11 +355,16 @@ fn build_opencode_config(provider: Provider, model: Option<&str>) -> Value {
     // and merges into the system prompt at the `Instructions from: <path>`
     // header. Existing files are added to the `instructions` array; missing
     // files are silently skipped by opencode (`fs.glob` returns `[]`).
-    if let Some(home) = dirs::home_dir() {
-        let blackbox_md = crate::util::blackbox_global_common_md_path(&home);
-        if blackbox_md.exists() {
-            config["instructions"] =
-                serde_json::json!([blackbox_md.to_string_lossy().into_owned()]);
+    // When the caller's brofile asks for harness-defaults suppression,
+    // omit the array entirely so opencode loads no blackbox-controlled
+    // instructions.
+    if !suppress_instructions {
+        if let Some(home) = dirs::home_dir() {
+            let blackbox_md = crate::util::blackbox_global_common_md_path(&home);
+            if blackbox_md.exists() {
+                config["instructions"] =
+                    serde_json::json!([blackbox_md.to_string_lossy().into_owned()]);
+            }
         }
     }
 
@@ -303,10 +385,23 @@ fn default_opencode_env(
     provider: Provider,
     store_dir: &Path,
     model: Option<&str>,
+    suppress_instructions: bool,
+    preserve_existing_config: bool,
 ) -> HashMap<String, String> {
     let mut env = HashMap::new();
     let config_path = default_opencode_config_path(store_dir, provider);
-    write_json_file(&config_path, &build_opencode_config(provider, model));
+    // On resume paths without an authoritative brofile context (raw
+    // bro_resume(session_id, provider) without a recorded lease),
+    // preserve the existing OPENCODE_CONFIG to honor the original
+    // dispatch's suppression intent. Without this, regenerating with
+    // suppress_instructions=false would silently undo a strict_suppress
+    // brofile's intent. Falls through to write if the file is missing.
+    if !(preserve_existing_config && config_path.exists()) {
+        write_json_file(
+            &config_path,
+            &build_opencode_config(provider, model, suppress_instructions),
+        );
+    }
     env.insert(
         "OPENCODE_CONFIG".into(),
         config_path.to_string_lossy().into_owned(),
@@ -392,14 +487,50 @@ pub fn resolve_provider_env(
     account_name: Option<&str>,
     model: Option<&str>,
     store_dir: &Path,
+    brofile_context: Option<&BrofileContext>,
+) -> Option<HashMap<String, String>> {
+    resolve_provider_env_inner(provider, account_name, model, store_dir, brofile_context, false)
+}
+
+/// Resume-aware variant that preserves an existing provider config
+/// file when no brofile context is available — closes the raw
+/// `bro_resume(session_id, provider)` policy bypass on Inception.
+pub fn resolve_provider_env_for_resume_without_brofile(
+    provider: Provider,
+    account_name: Option<&str>,
+    model: Option<&str>,
+    store_dir: &Path,
+) -> Option<HashMap<String, String>> {
+    resolve_provider_env_inner(provider, account_name, model, store_dir, None, true)
+}
+
+fn resolve_provider_env_inner(
+    provider: Provider,
+    account_name: Option<&str>,
+    model: Option<&str>,
+    store_dir: &Path,
+    brofile_context: Option<&BrofileContext>,
+    preserve_existing_config_when_no_context: bool,
 ) -> Option<HashMap<String, String>> {
     let account_name = effective_account(provider, account_name, store_dir);
+    let suppress_instructions = brofile_context
+        .and_then(|c| c.provider_defaults)
+        .map(ProviderDefaultsMode::suppresses)
+        .unwrap_or(false);
+    let preserve_existing_config =
+        preserve_existing_config_when_no_context && brofile_context.is_none();
     let mut env = match provider {
         Provider::Glm | Provider::Deepseek => dirs::home_dir()
             .as_deref()
             .and_then(|home| default_claude_compatible_env(provider, home))
             .unwrap_or_default(),
-        Provider::Inception => default_opencode_env(provider, store_dir, model),
+        Provider::Inception => default_opencode_env(
+            provider,
+            store_dir,
+            model,
+            suppress_instructions,
+            preserve_existing_config,
+        ),
         _ => HashMap::new(),
     };
 
@@ -466,6 +597,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -494,6 +626,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -521,6 +654,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
@@ -534,6 +668,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(
             &project_bf,
@@ -566,6 +701,7 @@ mod tests {
                 filters: None,
                 coerce_workspace: None,
                 runtime: None,
+                context: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -588,6 +724,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -636,6 +773,7 @@ mod tests {
             }),
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -840,6 +978,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
@@ -860,6 +999,7 @@ mod tests {
             filters: None,
             coerce_workspace: Some(true),
             runtime: None,
+            context: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
@@ -875,6 +1015,7 @@ mod tests {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
         let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();
@@ -935,7 +1076,7 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved =
-            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path()).unwrap();
+            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(
             resolved
@@ -979,7 +1120,7 @@ mod tests {
         );
         save_config(&config, store.path());
 
-        let resolved = resolve_provider_env(Provider::Claude, None, None, store.path()).unwrap();
+        let resolved = resolve_provider_env(Provider::Claude, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(
             resolved
@@ -994,7 +1135,7 @@ mod tests {
         let home = temp_store();
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, None, None, store.path()).unwrap()
+            resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
         assert!(
@@ -1025,7 +1166,7 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Glm, Some("zai2"), Some("glm-4.7"), store.path())
+            resolve_provider_env(Provider::Glm, Some("zai2"), Some("glm-4.7"), store.path(), None)
                 .unwrap()
         });
         assert!(
@@ -1044,7 +1185,7 @@ mod tests {
         fs::write(&blackbox_md, "# global guidance").unwrap();
 
         let config = with_fake_home(home.path(), || {
-            build_opencode_config(Provider::Inception, None)
+            build_opencode_config(Provider::Inception, None, false)
         });
         let instructions = config
             .get("instructions")
@@ -1061,11 +1202,96 @@ mod tests {
     fn test_build_opencode_config_omits_instructions_when_blackbox_md_missing() {
         let home = temp_store();
         let config = with_fake_home(home.path(), || {
-            build_opencode_config(Provider::Inception, None)
+            build_opencode_config(Provider::Inception, None, false)
         });
         assert!(
             config.get("instructions").is_none(),
             "instructions field should be absent when BLACKBOX.md does not exist"
+        );
+    }
+
+    #[test]
+    fn test_build_opencode_config_suppresses_instructions_when_requested() {
+        let home = temp_store();
+        let blackbox_dir = home.path().join(".blackbox");
+        fs::create_dir_all(&blackbox_dir).unwrap();
+        fs::write(blackbox_dir.join("BLACKBOX.md"), "# global guidance").unwrap();
+
+        let config = with_fake_home(home.path(), || {
+            build_opencode_config(Provider::Inception, None, true)
+        });
+        assert!(
+            config.get("instructions").is_none(),
+            "suppress_instructions=true must omit the instructions array even when BLACKBOX.md exists"
+        );
+    }
+
+    #[test]
+    fn test_enforce_provider_defaults_strict_unsupported_fails() {
+        let ctx = BrofileContext {
+            provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
+        };
+        let err = enforce_provider_defaults(Provider::Claude, Some(&ctx))
+            .expect_err("strict_suppress on Claude should fail closed");
+        assert!(err.contains("error.provider_defaults_unsupported"));
+        assert!(err.contains("Claude") || err.contains("claude"));
+    }
+
+    #[test]
+    fn test_enforce_provider_defaults_strict_inception_ok() {
+        let ctx = BrofileContext {
+            provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
+        };
+        enforce_provider_defaults(Provider::Inception, Some(&ctx))
+            .expect("strict_suppress on Inception is honored");
+    }
+
+    #[test]
+    fn test_enforce_provider_defaults_suppress_when_supported_never_fails() {
+        let ctx = BrofileContext {
+            provider_defaults: Some(ProviderDefaultsMode::SuppressWhenSupported),
+        };
+        enforce_provider_defaults(Provider::Claude, Some(&ctx))
+            .expect("suppress_when_supported is best-effort and never fails closed");
+    }
+
+    #[test]
+    fn test_resume_without_brofile_preserves_existing_opencode_config() {
+        // Raw bro_resume(session_id, provider) cannot recover the original
+        // brofile context. Regenerating OPENCODE_CONFIG with defaults
+        // would silently undo a strict_suppress brofile's intent. Verify
+        // the resume-aware variant preserves any existing config file.
+        let store = temp_store();
+        let home = temp_store();
+        let config_path = default_opencode_config_path(store.path(), Provider::Inception);
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        // Write a deliberately-empty instructions config (simulating what
+        // an original suppressing brofile would have written).
+        let suppressed = serde_json::json!({
+            "$schema": "https://opencode.ai/config.json",
+            "model": "inception/mercury-2",
+            "small_model": "inception/mercury-2",
+            "tools": {"blackbox_bro_*": false},
+            "marker": "preserved"
+        });
+        fs::write(&config_path, serde_json::to_string(&suppressed).unwrap()).unwrap();
+
+        let _env = with_fake_home(home.path(), || {
+            resolve_provider_env_for_resume_without_brofile(
+                Provider::Inception,
+                None,
+                None,
+                store.path(),
+            )
+            .expect("env should resolve")
+        });
+
+        let on_disk: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.get("marker").and_then(|v| v.as_str()),
+            Some("preserved"),
+            "raw-resume must preserve existing OPENCODE_CONFIG when brofile context is unrecoverable"
         );
     }
 
@@ -1075,7 +1301,7 @@ mod tests {
         let home = temp_store();
 
         let resolved = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Deepseek, None, None, store.path()).unwrap()
+            resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
         assert!(
@@ -1089,7 +1315,7 @@ mod tests {
     fn test_resolve_provider_env_defaults_inception_opencode_config() {
         let store = temp_store();
 
-        let resolved = resolve_provider_env(Provider::Inception, None, None, store.path()).unwrap();
+        let resolved = resolve_provider_env(Provider::Inception, None, None, store.path(), None).unwrap();
         let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
         assert!(config_path.ends_with("inception-opencode.json"));
         let config = fs::read_to_string(config_path).unwrap();

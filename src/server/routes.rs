@@ -2071,6 +2071,7 @@ pub(crate) async fn admin_brofile_upsert(
         filters: None,
         coerce_workspace: None,
         runtime: None,
+        context: None,
     };
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (

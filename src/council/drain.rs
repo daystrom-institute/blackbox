@@ -30,7 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::SharedState;
 use crate::orchestration::{
     self as orch, AmbientContext,
-    brofile::{resolve_brofile, resolve_provider_env},
+    brofile::{enforce_provider_defaults, resolve_brofile, resolve_provider_env},
     mcp::{
         McpFilters, McpStore, global_store_path, project_store_path, resolve_effective,
         write_gemini_policy_file,
@@ -429,11 +429,35 @@ fn build_dispatch(
     let store_dir = &shared.store_dir;
     let bf = resolve_brofile(&member.brofile, store_dir, team.project_dir.as_deref())
         .ok_or_else(|| format!("brofile not found: {}", member.brofile))?;
+    // For a member with an existing council session, prefer the
+    // lease-captured policy from the original dispatch over whatever
+    // the brofile says today — resume must honor dispatch-time
+    // suppression intent, not whatever an operator edited in between.
+    let existing_session = council
+        .session
+        .read()
+        .member_sessions
+        .get(&member.name)
+        .cloned();
+    let resume_lease = existing_session.as_ref().and_then(|sid| {
+        crate::orchestration::allocator::lookup_lease_for_session(
+            store_dir,
+            &shared.task_store.read(),
+            bf.provider,
+            sid,
+        )
+    });
+    let effective_context = resume_lease
+        .as_ref()
+        .and_then(|l| l.brofile_context.as_ref())
+        .or(bf.context.as_ref());
+    enforce_provider_defaults(bf.provider, effective_context)?;
     let env = resolve_provider_env(
         bf.provider,
         bf.account.as_deref(),
         bf.model.as_deref(),
         store_dir,
+        effective_context,
     );
     let exec_opts = (bf.model.is_some() || bf.effort.is_some()).then(|| ExecOpts {
         model: bf.model.clone(),
@@ -450,20 +474,14 @@ fn build_dispatch(
         .clone()
         .or_else(|| team.project_dir.clone());
 
-    let existing = council
-        .session
-        .read()
-        .member_sessions
-        .get(&member.name)
-        .cloned();
-    let is_resume = existing.is_some();
+    let is_resume = existing_session.is_some();
 
     if is_resume && !bf.provider.supports_resume() {
         return Err(format!("provider {} does not support resume", bf.provider));
     }
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    let session_id = match &existing {
+    let session_id = match &existing_session {
         Some(s) => s.clone(),
         None if matches!(bf.provider, Provider::Claude) => uuid::Uuid::new_v4().to_string(),
         None => "pending".to_string(),

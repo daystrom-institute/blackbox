@@ -662,7 +662,7 @@ fn capture_cli_with_timeout(
     let bin = super::providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let mut cmd = Command::new(&bin);
     cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
-    if let Some(env) = brofile::resolve_provider_env(*provider, None, None, Path::new("")) {
+    if let Some(env) = brofile::resolve_provider_env(*provider, None, None, Path::new(""), None) {
         cmd.envs(env);
     }
     if let Some(dir) = cwd {

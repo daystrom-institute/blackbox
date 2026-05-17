@@ -664,6 +664,7 @@ impl BlackboxServer {
             env_overrides,
             runtime,
             coerce_workspace,
+            brofile_context,
         ) = if let Some(ref br) = manifest.brofile_ref {
             let bf = match orchestration::brofile::resolve_brofile(
                 br,
@@ -679,11 +680,17 @@ impl BlackboxServer {
                 Some(f) => (f.allow.clone(), f.disallow.clone()),
                 None => (Vec::new(), Vec::new()),
             };
+            if let Err(err) =
+                orchestration::brofile::enforce_provider_defaults(bf.provider, bf.context.as_ref())
+            {
+                return Self::err_text(&err);
+            }
             let env = orchestration::brofile::resolve_provider_env(
                 bf.provider,
                 bf.account.as_deref(),
                 bf.model.as_deref(),
                 &self.state.store_dir,
+                bf.context.as_ref(),
             );
             let opts = if bf.model.is_some() || bf.effort.is_some() {
                 Some(ExecOpts {
@@ -703,6 +710,7 @@ impl BlackboxServer {
                 env,
                 bf.runtime,
                 bf.coerce_workspace.unwrap_or(false),
+                bf.context,
             )
         } else if let Some(ref inline) = manifest.brofile_inline {
             let prov_str = inline
@@ -717,12 +725,23 @@ impl BlackboxServer {
                     ));
                 }
             };
+            // Inline brofiles don't carry context-assembly policy in
+            // v1 — the field is only honored on disk-resolved brofiles.
+            // Reject rather than silently drop, otherwise an inline
+            // strict_suppress declaration would launch without honoring
+            // the suppression intent.
+            if inline.get("context").is_some() {
+                return Self::err_text(
+                    "error.bad_input(code=inline_context_unsupported): inline brofile may not declare `context`; use a saved brofile",
+                );
+            }
             let (ba, bd) = Self::extract_inline_filters(inline);
             let env = orchestration::brofile::resolve_provider_env(
                 provider,
                 None,
                 inline.get("model").and_then(|v| v.as_str()),
                 &self.state.store_dir,
+                None,
             );
             let opts = if inline.get("model").is_some() || inline.get("effort").is_some() {
                 Some(ExecOpts {
@@ -758,6 +777,7 @@ impl BlackboxServer {
                     .get("coerce_workspace")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
+                None,
             )
         } else {
             return Self::err_text("manifest has neither brofile_ref nor brofile_inline");
@@ -859,6 +879,7 @@ impl BlackboxServer {
                 spawn_bro_label: Some(bro_label.clone()),
                 spawn_agent_label: Some(bro_label.clone()),
                 record_to_bro: p.bro.clone(),
+                brofile_context,
             }) {
                 Ok(result) => result,
                 Err(e) => return Self::err_text(&e),

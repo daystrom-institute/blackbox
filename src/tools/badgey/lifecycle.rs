@@ -118,8 +118,16 @@ impl BlackboxServer {
         String,
     > {
         let store_dir = self.state.store_dir.clone();
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters, _coerce_workspace) =
-            self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
+        let (
+            provider,
+            lens,
+            exec_opts,
+            env_overrides,
+            cwd,
+            brofile_filters,
+            _coerce_workspace,
+            _brofile_context,
+        ) = self.resolve_exec_target(Some("badgey-persona"), None, Some(&scope.project_id))?;
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = "pending".to_string();
@@ -506,11 +514,33 @@ impl BlackboxServer {
             provider,
             _lens,
             exec_opts,
-            env_overrides,
+            mut env_overrides,
             _resolved_cwd,
             brofile_filters,
             _coerce_workspace,
+            brofile_context,
         ) = self.resolve_exec_target(Some("badgey-persona"), None, cwd.as_deref())?;
+        // Resume must honor the policy the original badgey dispatch
+        // was launched under, not whatever badgey-persona says today.
+        // Look up the lease for this provider-session and prefer its
+        // captured brofile_context for both enforcement and env.
+        let resume_lease = crate::orchestration::allocator::lookup_lease_for_session(
+            &self.state.store_dir,
+            &self.state.task_store.read(),
+            provider,
+            &instance.provider_session_id,
+        );
+        if let Some(lease) = resume_lease.as_ref() {
+            let effective_context = lease.brofile_context.as_ref().or(brofile_context.as_ref());
+            crate::orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
+            env_overrides = crate::orchestration::brofile::resolve_provider_env(
+                provider,
+                lease.account.as_deref(),
+                lease.model.as_deref(),
+                &self.state.store_dir,
+                effective_context,
+            );
+        }
         let scope_bind =
             self.badgey_scope_bind(&id, &instance.thread_of_record_id, &instance.scope);
         let wrapped_user_prompt = format!("{scope_bind}\n{prompt}");

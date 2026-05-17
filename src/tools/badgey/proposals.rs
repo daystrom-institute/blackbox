@@ -620,8 +620,16 @@ impl BlackboxServer {
         work_item_id: Option<&str>,
         label: Option<String>,
     ) -> Result<Arc<orch::Task>, String> {
-        let (provider, lens, exec_opts, env_overrides, cwd, brofile_filters, _coerce_workspace) =
-            self.resolve_exec_target(Some(brofile), None, Some(project_dir))?;
+        let (
+            provider,
+            lens,
+            exec_opts,
+            env_overrides,
+            cwd,
+            brofile_filters,
+            _coerce_workspace,
+            _brofile_context,
+        ) = self.resolve_exec_target(Some(brofile), None, Some(project_dir))?;
         let session_id = "pending".to_string();
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.to_string()),

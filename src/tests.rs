@@ -130,6 +130,7 @@ fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {
             filters: None,
             coerce_workspace: None,
             runtime: None,
+            context: None,
         },
         "global",
         &tmp.path().join("bro"),
@@ -152,6 +153,7 @@ fn save_badgey_test_brofile(tmp: &tempfile::TempDir) {
             }),
             coerce_workspace: None,
             runtime: None,
+            context: None,
         },
         "global",
         &tmp.path().join("bro"),
@@ -4798,6 +4800,7 @@ fn bro_agent_describe_brofile_ref_resolved() {
         }),
         coerce_workspace: None,
         runtime: None,
+        context: None,
     };
     let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
     let manifest = serde_json::json!({

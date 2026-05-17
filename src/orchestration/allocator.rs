@@ -164,6 +164,12 @@ pub struct RuntimeLease {
     pub selection_trace_id: String,
     pub created_at: u64,
     pub last_seen_at: u64,
+    /// Brofile context-assembly policy at the time of original
+    /// dispatch. Carried so raw `bro_resume(session_id, provider)`
+    /// can re-enforce suppression intent against the runtime provider
+    /// without the caller re-supplying the brofile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brofile_context: Option<crate::orchestration::brofile::BrofileContext>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1383,6 +1389,7 @@ pub fn lease_from_allocation(
     allocation: &Allocation,
     project_dir: Option<String>,
     cwd: Option<String>,
+    brofile_context: Option<crate::orchestration::brofile::BrofileContext>,
 ) -> RuntimeLease {
     RuntimeLease {
         task_id,
@@ -1399,6 +1406,7 @@ pub fn lease_from_allocation(
         selection_trace_id: allocation.trace.id.clone(),
         created_at: super::now_ms(),
         last_seen_at: super::now_ms(),
+        brofile_context,
     }
 }
 
@@ -1423,6 +1431,7 @@ pub fn lease_for_resume_task(
         selection_trace_id: previous.selection_trace_id.clone(),
         created_at: super::now_ms(),
         last_seen_at: super::now_ms(),
+        brofile_context: previous.brofile_context.clone(),
     }
 }
 
@@ -2037,6 +2046,7 @@ mod tests {
             selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
             created_at: 1,
             last_seen_at: 1,
+            brofile_context: None,
         };
         lease_store_save(
             tmp.path(),
@@ -2069,6 +2079,7 @@ mod tests {
             selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
             created_at: 1,
             last_seen_at: 1,
+            brofile_context: None,
         };
         let newer = RuntimeLease {
             task_id: "task-2".into(),
@@ -2085,6 +2096,7 @@ mod tests {
             selection_trace_id: "alloc-fedcba9876543210fedcba9876543210".into(),
             created_at: 2,
             last_seen_at: 3,
+            brofile_context: None,
         };
         let wrong_provider = RuntimeLease {
             provider: Provider::Claude,
@@ -2127,6 +2139,7 @@ mod tests {
             selection_trace_id: "alloc-0123456789abcdef0123456789abcdef".into(),
             created_at: 1,
             last_seen_at: 1,
+            brofile_context: None,
         };
 
         let resumed = lease_for_resume_task(

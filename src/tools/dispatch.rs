@@ -24,6 +24,12 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) spawn_bro_label: Option<String>,
     pub(crate) spawn_agent_label: Option<String>,
     pub(crate) record_to_bro: Option<String>,
+    /// Context-assembly policy from the resolved brofile (if any).
+    /// Threaded through so post-allocator/lease provider swaps can
+    /// be re-validated against the actual runtime provider — the
+    /// initial enforce in resolve_*_target only sees the brofile's
+    /// nominal provider, not the allocator's selected lane.
+    pub(crate) brofile_context: Option<orchestration::brofile::BrofileContext>,
 }
 
 pub(crate) struct FreshDispatchResult {
@@ -248,11 +254,20 @@ impl BlackboxServer {
             }
             request.provider = selected.lane.provider;
             request.exec_opts = orchestration::allocator::exec_opts_for_lane(&selected.lane);
+            // Re-enforce against the allocator-selected provider — the
+            // initial check in resolve_exec_target saw only the brofile's
+            // nominal provider. A strict_suppress brofile reallocated
+            // onto an unsupported runtime provider must fail here.
+            orchestration::brofile::enforce_provider_defaults(
+                request.provider,
+                request.brofile_context.as_ref(),
+            )?;
             request.env_overrides = orchestration::brofile::resolve_provider_env(
                 request.provider,
                 selected.lane.account.as_deref(),
                 selected.lane.model.as_deref(),
                 &store_dir,
+                request.brofile_context.as_ref(),
             );
             allocation = Some(selected);
         }
@@ -345,6 +360,7 @@ impl BlackboxServer {
                     allocation,
                     request.project_dir_for_lease,
                     cwd,
+                    request.brofile_context.clone(),
                 ),
             );
         }
@@ -374,6 +390,7 @@ impl BlackboxServer {
             cwd,
             brofile_filters,
             brofile_coerce_workspace,
+            brofile_context,
         ) = if p.bro.is_some() || p.provider.is_some() {
             match self.resolve_exec_target(
                 p.bro.as_deref(),
@@ -392,6 +409,7 @@ impl BlackboxServer {
                 p.project_dir.clone(),
                 None,
                 false,
+                None,
             )
         } else {
             return Self::err_text(
@@ -440,6 +458,7 @@ impl BlackboxServer {
             spawn_bro_label: None,
             spawn_agent_label: None,
             record_to_bro: p.bro.clone(),
+            brofile_context,
         }) {
             Ok(result) => result,
             Err(e) => return Self::err_text(&e),
@@ -1081,13 +1100,65 @@ impl BlackboxServer {
             };
 
             let member_coerce_workspace = brofile.coerce_workspace.unwrap_or(false);
+
+            // For an existing-session member (resume), bind to the
+            // lease-captured runtime so the provider, account/model
+            // pinning, AND brofile-context policy follow the original
+            // dispatch rather than whatever the brofile says today.
+            // Fall back to the current brofile only when no lease is
+            // recorded for the most recent task (fresh member or
+            // never-allocated history).
+            let is_member_resume = member
+                .session_id
+                .as_deref()
+                .is_some_and(|s| !s.is_empty() && s != "pending");
+            let member_lease = if is_member_resume {
+                member.task_history.last().and_then(|task_id| {
+                    orchestration::allocator::lookup_lease_for_task(&store_dir, task_id)
+                })
+            } else {
+                None
+            };
+            let effective_provider = member_lease
+                .as_ref()
+                .map(|l| l.provider)
+                .unwrap_or(brofile.provider);
+            let effective_context = member_lease
+                .as_ref()
+                .and_then(|l| l.brofile_context.as_ref())
+                .or(brofile.context.as_ref());
+            if let Err(err) = orchestration::brofile::enforce_provider_defaults(
+                effective_provider,
+                effective_context,
+            ) {
+                launched.push(json!({"bro": member.name, "error": err}));
+                continue;
+            }
             let env_overrides = orchestration::brofile::resolve_provider_env(
-                brofile.provider,
-                brofile.account.as_deref(),
-                brofile.model.as_deref(),
+                effective_provider,
+                member_lease
+                    .as_ref()
+                    .and_then(|l| l.account.as_deref())
+                    .or(brofile.account.as_deref()),
+                member_lease
+                    .as_ref()
+                    .and_then(|l| l.model.as_deref())
+                    .or(brofile.model.as_deref()),
                 &store_dir,
+                effective_context,
             );
-            let exec_opts = if brofile.model.is_some() || brofile.effort.is_some() {
+            let exec_opts = if let Some(lease) = member_lease.as_ref() {
+                orchestration::allocator::exec_opts_for_lane(
+                    &orchestration::allocator::RuntimeLane {
+                        provider: lease.provider,
+                        account: lease.account.clone(),
+                        tier: lease.tier.clone(),
+                        model: lease.model.clone(),
+                        effort: lease.effort.clone(),
+                        capabilities: lease.capabilities.clone(),
+                    },
+                )
+            } else if brofile.model.is_some() || brofile.effort.is_some() {
                 Some(ExecOpts {
                     model: brofile.model.clone(),
                     effort: brofile.effort.clone(),
@@ -1141,9 +1212,9 @@ impl BlackboxServer {
                     // member's session was recorded. Gemini refuses on
                     // miss (silent-fork aliasing); claude/codex fall
                     // through and error loudly themselves.
-                    let member_cwd = match brofile.provider.resolve_session_cwd(sid) {
+                    let member_cwd = match effective_provider.resolve_session_cwd(sid) {
                         Some(p) => Some(p.to_string_lossy().into_owned()),
-                        None if brofile.provider == Provider::Gemini => {
+                        None if effective_provider == Provider::Gemini => {
                             launched.push(json!({
                                 "bro": member.name,
                                 "error": format!("Gemini session {sid} not found in ~/.gemini/tmp/*/chats — refusing to resume (silent-fork aliasing)"),
@@ -1156,7 +1227,7 @@ impl BlackboxServer {
                     let resume_lease = match try_acquire_resume_lease(
                         &self.state.task_store,
                         self.state.resume_leases.as_ref(),
-                        brofile.provider,
+                        effective_provider,
                         sid,
                     ) {
                         Ok(lease) => lease,
@@ -1169,11 +1240,9 @@ impl BlackboxServer {
                         }
                     };
                     let mut args =
-                        brofile
-                            .provider
-                            .build_resume_args(sid, &p.prompt, exec_opts.as_ref());
+                        effective_provider.build_resume_args(sid, &p.prompt, exec_opts.as_ref());
                     let df = match resolve_dispatch_filters(
-                        brofile.provider,
+                        effective_provider,
                         member_cwd.as_deref(),
                         allow_recursion,
                         &task_id,
@@ -1187,7 +1256,7 @@ impl BlackboxServer {
                     args.extend(df.args);
                     let t = orch::spawn_task(
                         task_id,
-                        brofile.provider,
+                        effective_provider,
                         args,
                         sid.clone(),
                         member_cwd,
@@ -1429,6 +1498,7 @@ impl BlackboxServer {
             Option<String>,
             Option<orchestration::mcp::McpFilters>,
             bool,
+            Option<orchestration::brofile::BrofileContext>,
         ),
         String,
     > {
@@ -1445,11 +1515,16 @@ impl BlackboxServer {
                         bro_match.team.project_dir.as_deref(),
                     )
                     .ok_or(format!("Brofile not found: {}", member.brofile))?;
+                    orchestration::brofile::enforce_provider_defaults(
+                        bf.provider,
+                        bf.context.as_ref(),
+                    )?;
                     let env = orchestration::brofile::resolve_provider_env(
                         bf.provider,
                         bf.account.as_deref(),
                         bf.model.as_deref(),
                         store_dir,
+                        bf.context.as_ref(),
                     );
                     let opts = if bf.model.is_some() || bf.effort.is_some() {
                         Some(ExecOpts {
@@ -1470,6 +1545,7 @@ impl BlackboxServer {
                         cwd,
                         bf.filters,
                         bf.coerce_workspace.unwrap_or(false),
+                        bf.context,
                     ));
                 }
                 None => {
@@ -1478,11 +1554,13 @@ impl BlackboxServer {
             }
             let bf = orchestration::brofile::resolve_brofile(name, store_dir, project_dir)
                 .ok_or(format!("Unknown bro or brofile: {name}"))?;
+            orchestration::brofile::enforce_provider_defaults(bf.provider, bf.context.as_ref())?;
             let env = orchestration::brofile::resolve_provider_env(
                 bf.provider,
                 bf.account.as_deref(),
                 bf.model.as_deref(),
                 store_dir,
+                bf.context.as_ref(),
             );
             let opts = if bf.model.is_some() || bf.effort.is_some() {
                 Some(ExecOpts {
@@ -1500,6 +1578,7 @@ impl BlackboxServer {
                 project_dir.map(String::from),
                 bf.filters,
                 bf.coerce_workspace.unwrap_or(false),
+                bf.context,
             ));
         }
 
@@ -1507,7 +1586,8 @@ impl BlackboxServer {
             let provider = p
                 .parse::<Provider>()
                 .map_err(|_| format!("Unknown provider: {p}"))?;
-            let env = orchestration::brofile::resolve_provider_env(provider, None, None, store_dir);
+            let env =
+                orchestration::brofile::resolve_provider_env(provider, None, None, store_dir, None);
             return Ok((
                 provider,
                 None,
@@ -1516,6 +1596,7 @@ impl BlackboxServer {
                 project_dir.map(String::from),
                 None,
                 false,
+                None,
             ));
         }
 
@@ -1576,6 +1657,20 @@ impl BlackboxServer {
             let lease = member.task_history.last().and_then(|task_id| {
                 orchestration::allocator::lookup_lease_for_task(store_dir, task_id)
             });
+            // Resume must honor the policy the session was launched
+            // under, not whatever the brofile says today. Bind to the
+            // lease-captured runtime provider AND brofile context when
+            // a lease exists; fall back to the current brofile only
+            // when no lease was recorded (fresh / never-allocated).
+            let runtime_provider = lease
+                .as_ref()
+                .map(|l| l.provider)
+                .unwrap_or(bf.provider);
+            let effective_context = lease
+                .as_ref()
+                .and_then(|l| l.brofile_context.as_ref())
+                .or(bf.context.as_ref());
+            orchestration::brofile::enforce_provider_defaults(runtime_provider, effective_context)?;
             let (provider, opts, env) = if let Some(lease) = lease.as_ref() {
                 let provider = lease.provider;
                 let opts = orchestration::allocator::exec_opts_for_lane(
@@ -1593,6 +1688,7 @@ impl BlackboxServer {
                     lease.account.as_deref(),
                     lease.model.as_deref(),
                     store_dir,
+                    effective_context,
                 );
                 (provider, opts, env)
             } else {
@@ -1601,6 +1697,7 @@ impl BlackboxServer {
                     bf.account.as_deref(),
                     bf.model.as_deref(),
                     store_dir,
+                    effective_context,
                 );
                 let opts = if bf.model.is_some() || bf.effort.is_some() {
                     Some(ExecOpts {
@@ -1638,11 +1735,21 @@ impl BlackboxServer {
                 provider,
                 sid,
             ) {
+                // The lease carries the original dispatch's brofile_context.
+                // Enforce against the resume's runtime provider and honor the
+                // recorded suppression intent — raw bro_resume must not
+                // silently regenerate provider config with defaults a
+                // strict_suppress brofile refused.
+                orchestration::brofile::enforce_provider_defaults(
+                    provider,
+                    lease.brofile_context.as_ref(),
+                )?;
                 let env = orchestration::brofile::resolve_provider_env(
                     provider,
                     lease.account.as_deref(),
                     lease.model.as_deref(),
                     store_dir,
+                    lease.brofile_context.as_ref(),
                 );
                 let opts = orchestration::allocator::exec_opts_for_lane(
                     &orchestration::allocator::RuntimeLane {
@@ -1669,7 +1776,13 @@ impl BlackboxServer {
                     Some(lease),
                 ));
             }
-            let env = orchestration::brofile::resolve_provider_env(provider, None, None, store_dir);
+            // No lease — original dispatch's brofile_context is unrecoverable.
+            // Preserve any existing provider-side config file (Inception's
+            // OPENCODE_CONFIG) instead of regenerating with defaults, so a
+            // raw resume can't silently undo the original suppression intent.
+            let env = orchestration::brofile::resolve_provider_env_for_resume_without_brofile(
+                provider, None, None, store_dir,
+            );
             return Ok((
                 provider,
                 sid.to_string(),

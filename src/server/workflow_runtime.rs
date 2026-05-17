@@ -44,6 +44,7 @@ impl BlackboxServer {
             cwd,
             brofile_filters,
             coerce_workspace,
+            brofile_context,
         ) = self.resolve_exec_target(Some(brofile), None, project_dir)?;
         let mut runtime_lease = None;
         if is_resume {
@@ -61,11 +62,16 @@ impl BlackboxServer {
                         capabilities: lease.capabilities.clone(),
                     },
                 );
+                // Use the lease-captured brofile context, not whatever the
+                // current brofile says — workflow actor brofiles can be
+                // edited between turns, and resume must honor the
+                // dispatch-time policy.
                 env_overrides = orchestration::brofile::resolve_provider_env(
                     provider,
                     lease.account.as_deref(),
                     lease.model.as_deref(),
                     &store_dir,
+                    lease.brofile_context.as_ref(),
                 );
                 runtime_lease = Some(lease);
             }
@@ -74,6 +80,15 @@ impl BlackboxServer {
         if is_resume && !provider.supports_resume() {
             return Err(format!("provider {provider} does not support resume"));
         }
+
+        // Re-enforce against the post-lease runtime provider AND the
+        // lease-captured policy. Falls back to the current brofile's
+        // context only when there is no lease (fresh dispatch).
+        let effective_context = runtime_lease
+            .as_ref()
+            .and_then(|l| l.brofile_context.as_ref())
+            .or(brofile_context.as_ref());
+        orchestration::brofile::enforce_provider_defaults(provider, effective_context)?;
 
         if !is_resume {
             let brofile_runtime = self
@@ -101,6 +116,7 @@ impl BlackboxServer {
                     spawn_bro_label: None,
                     spawn_agent_label: None,
                     record_to_bro: Some(brofile.to_string()),
+                    brofile_context,
                 })?;
             return Ok(dispatched.task);
         }
