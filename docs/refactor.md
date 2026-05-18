@@ -241,8 +241,11 @@ general install order and supersession; this section focuses on refactor choices
 
 ```text
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-refactor-persona.json")
+bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-architecture-pathologist.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-extract-cohesive-class.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-role-behavior-coherence.json")
+bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/arch-pathology-java.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-rename-symbol.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-split-god-impl.json")
 ```
@@ -260,6 +263,14 @@ agent follows.
 | `atom:java-add-delegate-field@v1` | Add a delegate field and constructor initialization. |
 | `atom:java-add-fields@v1` | Add field declarations to a Java class. |
 | `atom:java-add-implements@v1` | Add an implements clause to a Java class. |
+| `atom:java-architecture-anemic-data-remote-behavior@v1` | Diagnose behavior living outside the Java data holder or domain concept it belongs with. |
+| `atom:java-architecture-conceptual-duplicate-discovery@v1` | Discover semantically duplicate Java behavior that clone detectors will not catch. |
+| `atom:java-architecture-framework-contract-violation@v1` | Diagnose framework API lifecycle/role misuse beyond raw call detection. |
+| `atom:java-architecture-responsibility-bleed@v1` | Diagnose one conceptual responsibility scattered across Java units without a canonical owner. |
+| `atom:java-architecture-role-behavior-coherence@v1` | Diagnose declared-role versus actual-behavior mismatch in Java classes. |
+| `atom:java-architecture-scoped-context-capture@v1` | Diagnose short-lived request/session/UI/transaction/security context captured into longer-lived state. |
+| `atom:java-architecture-test-implied-architecture@v1` | Infer missing production seams from Java test pain. |
+| `atom:java-architecture-transcript-anchored-pressure@v1` | Link prior Blackbox/operator history to current Java architectural pressure. |
 | `atom:java-class-dependency-graph@v2` | Inventory a Java class before deciding what can be extracted. |
 | `atom:java-extract-cohesive-class@v3` | Extract methods plus field moves, delegate wiring, caller rewrites, and visibility fixes. |
 | `atom:java-extract-interface@v2` | Extract an interface and optionally migrate callers to the interface type. |
@@ -276,6 +287,15 @@ agent follows.
 | `atom:java-rename-symbol@v1` | Project-wide Java symbol rename with usage inventory, public-API preflight, optional file rename handling, and validation. |
 | `atom:java-rewrite-visibility@v1` | Rewrite Java method or field visibility with public-API preflight. |
 | `atom:java-update-callers@v1` | Rewrite source-local calls through a delegate field. |
+
+### Architecture Pathology
+
+`workflow:arch-pathology-java@v1` implements the diagnosis loop from
+`design/refactor-tools/arch-pathology.md`: cheap survey, bounded atom selection,
+focused diagnosis, whiteboard review, and correction-plan markdown under
+`design/refactor/plans/`. It is analysis-only for source code; the only file it
+writes is the reviewed plan document that PD later consumes as normal
+`phase_doc_text` plus explicit acceptance criteria.
 
 ### Rust Refactor Atoms
 

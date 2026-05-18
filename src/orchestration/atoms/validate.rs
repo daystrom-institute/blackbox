@@ -27,6 +27,7 @@ pub const REFACTOR_SUBCONTRACT: &str = "refactor/v1";
 pub const RECOGNIZED_REFACTOR_PERSONAS: &[&str] = &[
     "rust-refactor-persona",
     "java-refactor-persona",
+    "java-architecture-pathologist",
     "csharp-refactor-persona",
     "elixir-refactor-persona",
 ];

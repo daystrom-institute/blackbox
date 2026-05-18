@@ -1,0 +1,64 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-architecture-responsibility-bleed",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Diagnose a conceptual Java responsibility scattered across units with no canonical owner.",
+    "when_to_use": [
+      "one policy, formatting rule, validation rule, or workflow appears in several Java services, UI paths, adapters, or imports",
+      "static overlap is visible but the conceptual responsibility and canonical owner require semantic judgment",
+      "a correction plan needs migration order for consolidating scattered behavior"
+    ],
+    "anti_patterns": [
+      "do not use for lexical clones a clone detector can classify",
+      "do not use for broad package metrics without a named responsibility",
+      "do not use on non-Java targets"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "scope_filter"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "scope_filter": { "type": "string" },
+          "target_loci": { "type": "array", "items": { "type": "string" } },
+          "operator_hints": { "type": "array", "items": { "type": "string" } },
+          "layer_model_path": { "type": "string" },
+          "survey_json": { "type": "object", "additionalProperties": true },
+          "target_context_window": { "type": "integer", "minimum": 1000 },
+          "whole_project_mode": { "type": "boolean" },
+          "whiteboard_id": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are java-architecture-responsibility-bleed. Diagnostic question: is one conceptual responsibility scattered across multiple Java units with no canonical home?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols and bbox_code_refs to find the candidate responsibility vocabulary across target_loci or scope_filter. Use bbox_refactor_status for concrete files. For class loci, use bbox_refactor_plan:java_class_dependency_analysis through bbox_refactor_plan(kind=\"java_class_dependency_analysis\", deep_analysis=true, project_dir=\"{{project_dir}}\", source=<file>, module_name=<class>).\n2. Apply the SAST gate. Dependency overlap is a measurement; the pathology claim must name the conceptual responsibility, loci, semantic divergences, proposed owner, and architectural migration order. Otherwise status=blocked with block_reason=\"sast_shaped\" and bbox_note(kind=\"blocked\").\n3. Separate intentional variants from accidental drift. Identify canonical owner candidates and the blast radius of moving responsibility there.\n4. If whiteboard_id is non-empty, post one whiteboard_post proposal or concern for each surviving responsibility cluster.\n5. Emit bbox_note:done with responsibility count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, evidence_refs, remediation_slices, acceptance_criteria, deferred, block_reason."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "pathology_atom": { "const": "java-architecture-responsibility-bleed" },
+          "sast_gate": { "type": "object", "additionalProperties": true },
+          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "remediation_slices": { "type": "array", "items": { "type": "object" } },
+          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
+          "deferred": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-architecture-pathologist@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-arch-pathology", "created_at": "2026-05-18T00:00:00Z" }
+  }
+}

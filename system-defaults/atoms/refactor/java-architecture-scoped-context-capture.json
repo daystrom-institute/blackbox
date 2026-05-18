@@ -1,0 +1,64 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-architecture-scoped-context-capture",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Diagnose short-lived Java framework context captured into longer-lived state through paths the container cannot police.",
+    "when_to_use": [
+      "request, session, UI, transaction, security, or DSL context may be stored in a field, cache, static, singleton, or async closure",
+      "framework annotations do not expose the lifetime mismatch directly",
+      "a correction plan needs parameter passing, Provider use, scope bridge, or state relocation"
+    ],
+    "anti_patterns": [
+      "do not use for annotation scope mismatches the framework already reports",
+      "do not use for transient local reads that are not stored or escaped",
+      "do not use on non-Java targets"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "scope_filter"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "scope_filter": { "type": "string" },
+          "target_loci": { "type": "array", "items": { "type": "string" } },
+          "operator_hints": { "type": "array", "items": { "type": "string" } },
+          "layer_model_path": { "type": "string" },
+          "survey_json": { "type": "object", "additionalProperties": true },
+          "target_context_window": { "type": "integer", "minimum": 1000 },
+          "whole_project_mode": { "type": "boolean" },
+          "whiteboard_id": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are java-architecture-scoped-context-capture. Diagnostic question: is a short-lived runtime context stored into longer-lived Java state through a path the framework or DI container cannot police?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols and bbox_code_refs to trace UI.getCurrent, VaadinSession, request attributes, transactions, DSLContext, security context, Provider, fields, statics, caches, and async closures. Use bbox_refactor_status for concrete files. For class loci, use bbox_refactor_plan:java_class_dependency_analysis through bbox_refactor_plan(kind=\"java_class_dependency_analysis\", deep_analysis=true, project_dir=\"{{project_dir}}\", source=<file>, module_name=<class>).\n2. Apply the SAST gate. A context API call is not enough. A valid pathology claim includes capture site, storage path, holder lifetime, captured lifetime, and predicted failure mode.\n3. Distinguish transient boundary access from escaped/captured state. Propose parameter passing, Provider<T>, scoped adapter, or state relocation slices.\n4. If whiteboard_id is non-empty, post one whiteboard_post concern or proposal for each surviving context-capture diagnosis.\n5. Emit bbox_note:done with capture count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, evidence_refs, remediation_slices, acceptance_criteria, deferred, block_reason."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "pathology_atom": { "const": "java-architecture-scoped-context-capture" },
+          "sast_gate": { "type": "object", "additionalProperties": true },
+          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "remediation_slices": { "type": "array", "items": { "type": "object" } },
+          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
+          "deferred": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-architecture-pathologist@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-arch-pathology", "created_at": "2026-05-18T00:00:00Z" }
+  }
+}

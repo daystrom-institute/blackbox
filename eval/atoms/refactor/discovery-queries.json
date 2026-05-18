@@ -277,6 +277,70 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-java-architecture-role-behavior-coherence",
+      "query": "diagnose java service whose behavior does not match its declared role",
+      "expected_atoms": [
+        "java-architecture-role-behavior-coherence"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-responsibility-bleed",
+      "query": "diagnose one java responsibility scattered across services ui and import paths",
+      "expected_atoms": [
+        "java-architecture-responsibility-bleed"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-conceptual-duplicate-discovery",
+      "query": "find semantically duplicate java behavior under different method names",
+      "expected_atoms": [
+        "java-architecture-conceptual-duplicate-discovery"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-anemic-data-remote-behavior",
+      "query": "diagnose java dto whose domain behavior lives in remote helpers",
+      "expected_atoms": [
+        "java-architecture-anemic-data-remote-behavior"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-scoped-context-capture",
+      "query": "diagnose vaadin session or request context captured into longer lived java state",
+      "expected_atoms": [
+        "java-architecture-scoped-context-capture"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-framework-contract-violation",
+      "query": "diagnose spring vaadin jooq framework lifecycle contract misuse in java service",
+      "expected_atoms": [
+        "java-architecture-framework-contract-violation"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-test-implied-architecture",
+      "query": "infer missing java production seam from reflection visiblefortesting and long mock setup",
+      "expected_atoms": [
+        "java-architecture-test-implied-architecture"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-architecture-transcript-anchored-pressure",
+      "query": "connect prior operator complaints and blackbox notes to current java architecture pain",
+      "expected_atoms": [
+        "java-architecture-transcript-anchored-pressure"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-csharp-filescoped-batch",
       "query": "convert csharp file from block scoped to file scoped namespace",
       "expected_atoms": [

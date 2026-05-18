@@ -1,0 +1,64 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-architecture-role-behavior-coherence",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Diagnose whether a Java class's actual behavior matches its declared role, annotations, package, interfaces, and docs.",
+    "when_to_use": [
+      "a service, view, controller, repository, adapter, or session class appears to own responsibilities outside its declared role",
+      "imports and metrics are legal but the operator needs semantic judgment about what the class really does",
+      "preparing a correction plan that may extract foreign behavior clusters from one Java class"
+    ],
+    "anti_patterns": [
+      "do not use for layer violations a static rule can prove",
+      "do not use for local cleanup that does not change ownership or boundaries",
+      "do not use on non-Java targets"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "scope_filter"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "scope_filter": { "type": "string" },
+          "target_loci": { "type": "array", "items": { "type": "string" } },
+          "operator_hints": { "type": "array", "items": { "type": "string" } },
+          "layer_model_path": { "type": "string" },
+          "survey_json": { "type": "object", "additionalProperties": true },
+          "target_context_window": { "type": "integer", "minimum": 1000 },
+          "whole_project_mode": { "type": "boolean" },
+          "whiteboard_id": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are java-architecture-role-behavior-coherence. Diagnostic question: does this class do what its name, package, annotations, interfaces, and docs claim it does?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols and bbox_code_refs for target_loci or scope_filter. Use bbox_refactor_status on concrete files. For candidate classes, call bbox_refactor_plan:java_class_dependency_analysis through bbox_refactor_plan(kind=\"java_class_dependency_analysis\", deep_analysis=true, project_dir=\"{{project_dir}}\", source=<file>, module_name=<class>).\n2. Apply the SAST gate. Static tools may say fan-out, imports, or method count; they cannot decide role mismatch. If the surviving claim is just a metric or forbidden import, return status=blocked with block_reason=\"sast_shaped\" and bbox_note(kind=\"blocked\").\n3. Classify methods into responsibility families, compare them to declared role signals, and identify foreign clusters. Preserve uncertainty when names/annotations are ambiguous.\n4. If whiteboard_id is non-empty, post one whiteboard_post claim or concern for each surviving diagnosis candidate.\n5. Emit bbox_note:done with class count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, evidence_refs, remediation_slices, acceptance_criteria, deferred, block_reason."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "pathology_atom": { "const": "java-architecture-role-behavior-coherence" },
+          "sast_gate": { "type": "object", "additionalProperties": true },
+          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "remediation_slices": { "type": "array", "items": { "type": "object" } },
+          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
+          "deferred": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-architecture-pathologist@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-arch-pathology", "created_at": "2026-05-18T00:00:00Z" }
+  }
+}

@@ -635,6 +635,110 @@
       ]
     },
     {
+      "id": "dispatch-java-architecture-role-behavior-coherence",
+      "atom": "java-architecture-role-behavior-coherence",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example/DashboardView.java"],
+        "operator_hints": ["DashboardView may mix UI rendering and service policy"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-responsibility-bleed",
+      "atom": "java-architecture-responsibility-bleed",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example"],
+        "operator_hints": ["validation policy appears in multiple entry points"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-conceptual-duplicate-discovery",
+      "atom": "java-architecture-conceptual-duplicate-discovery",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example"],
+        "operator_hints": ["account validation may be duplicated under different names"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-anemic-data-remote-behavior",
+      "atom": "java-architecture-anemic-data-remote-behavior",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example"],
+        "operator_hints": ["DTO behavior may live in helper classes"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-scoped-context-capture",
+      "atom": "java-architecture-scoped-context-capture",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example/DashboardView.java"],
+        "operator_hints": ["request or UI context may be stored too long"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-framework-contract-violation",
+      "atom": "java-architecture-framework-contract-violation",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example/DashboardView.java"],
+        "operator_hints": ["framework lifecycle calls may occur from the wrong role"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-test-implied-architecture",
+      "atom": "java-architecture-test-implied-architecture",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/test/java/com/example",
+        "target_loci": ["src/test/java/com/example"],
+        "operator_hints": ["tests may expose a missing production seam"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-java-architecture-transcript-anchored-pressure",
+      "atom": "java-architecture-transcript-anchored-pressure",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "scope_filter": "src/main/java/com/example",
+        "target_loci": ["src/main/java/com/example"],
+        "operator_hints": ["prior operator complaints should be checked against current code"],
+        "target_context_window": 10000,
+        "whole_project_mode": false
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
       "id": "dispatch-java-extract-code-block-planonly",
       "atom": "java-extract-code-block",
       "args": {

@@ -1,0 +1,64 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-architecture-framework-contract-violation",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Diagnose Java framework API use that violates caller role or lifecycle contracts static tools cannot fully infer.",
+    "when_to_use": [
+      "Spring, Guice, Vaadin, JOOQ, servlet, validation, or async lifecycle use looks valid syntactically but wrong for the caller role",
+      "the same API call is legitimate in bootstrap or adapter code but suspect in domain or service code",
+      "a correction plan needs the framework contract, failure mode, and idiomatic replacement"
+    ],
+    "anti_patterns": [
+      "do not use for framework violations a static checker already proves",
+      "do not use for ordinary API misuse unrelated to architecture or lifecycle",
+      "do not use on non-Java targets"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "scope_filter"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "scope_filter": { "type": "string" },
+          "target_loci": { "type": "array", "items": { "type": "string" } },
+          "operator_hints": { "type": "array", "items": { "type": "string" } },
+          "layer_model_path": { "type": "string" },
+          "survey_json": { "type": "object", "additionalProperties": true },
+          "target_context_window": { "type": "integer", "minimum": 1000 },
+          "whole_project_mode": { "type": "boolean" },
+          "whiteboard_id": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are java-architecture-framework-contract-violation. Diagnostic question: is Java framework API use valid for the caller's role and lifecycle?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols and bbox_code_refs to inspect framework calls, annotations, caller roles, self-invocation, UI thread access, service locators, JOOQ contexts, validation groups, and async closures. Use bbox_refactor_status for concrete files. For class loci, use bbox_refactor_plan:java_class_dependency_analysis through bbox_refactor_plan(kind=\"java_class_dependency_analysis\", deep_analysis=true, project_dir=\"{{project_dir}}\", source=<file>, module_name=<class>).\n2. Apply the SAST gate. A raw API call is not enough. A valid pathology claim states the framework contract, caller role, why the call violates or satisfies the contract, and the idiomatic replacement.\n3. Separate legitimate bootstrap/adapter/configuration sites from service/domain misuse. Surface uncertainty when lifecycle evidence is incomplete.\n4. If whiteboard_id is non-empty, post one whiteboard_post concern or proposal for each surviving framework-contract diagnosis.\n5. Emit bbox_note:done with contract count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, evidence_refs, remediation_slices, acceptance_criteria, deferred, block_reason."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "pathology_atom": { "const": "java-architecture-framework-contract-violation" },
+          "sast_gate": { "type": "object", "additionalProperties": true },
+          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "remediation_slices": { "type": "array", "items": { "type": "object" } },
+          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
+          "deferred": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-architecture-pathologist@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-arch-pathology", "created_at": "2026-05-18T00:00:00Z" }
+  }
+}

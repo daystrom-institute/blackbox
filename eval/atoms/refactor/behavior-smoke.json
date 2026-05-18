@@ -473,6 +473,97 @@
       "done_note_required": true
     },
     {
+      "atom": "java-architecture-role-behavior-coherence",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-responsibility-bleed",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-conceptual-duplicate-discovery",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-anemic-data-remote-behavior",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-scoped-context-capture",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-framework-contract-violation",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-test-implied-architecture",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-architecture-transcript-anchored-pressure",
+      "expected_plan_sequence": [
+        "bbox_hybrid_search",
+        "bbox_search",
+        "bbox_notes",
+        "bbox_code_symbols",
+        "bbox_code_refs",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
       "atom": "java-extract-code-block",
       "expected_plan_sequence": [
         "bbox_refactor_status",

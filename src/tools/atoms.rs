@@ -2266,6 +2266,7 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::atoms::helpers::bounded_effect_u64;
     use std::sync::Arc;
 
     fn make_task(

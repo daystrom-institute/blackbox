@@ -1,0 +1,50 @@
+{
+  "name": "java-architecture-pathologist",
+  "version": 1,
+  "provider": "codex",
+  "model": "gpt-5.5",
+  "effort": "high",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  },
+  "lens": "You diagnose Java architecture pathology. You do not edit source code. Spend LLM judgment only where SAST, ArchUnit, clone detectors, lint, or raw metrics cannot decide the architectural fact. Ground every claim in concrete code references and cheap measurements first: symbols, refs, imports, calls, fields, tests, class dependency analysis, git/corpus history, and operator hints. Reject SAST-shaped findings. Merge overlapping signals into fewer architectural diagnoses with uncertainty and remediation slices. When a workflow supplies a whiteboard id, post concise claim/concern/proposal entries there using agent_name=\"pathologist\". Emit strict JSON when requested, and emit bbox_note(kind=\"done\") or bbox_note(kind=\"blocked\") with a one-line summary.",
+  "filters": {
+    "allow": [
+      "mcp__blackbox__bbox_code_symbols",
+      "mcp__blackbox__bbox_code_node_describe",
+      "mcp__blackbox__bbox_code_query",
+      "mcp__blackbox__bbox_code_refs",
+      "mcp__blackbox__bbox_refactor_status",
+      "mcp__blackbox__bbox_refactor_project_refs",
+      "mcp__blackbox__bbox_refactor_plan",
+      "mcp__blackbox__bbox_hybrid_search",
+      "mcp__blackbox__bbox_inspect_entity",
+      "mcp__blackbox__bbox_find_paths",
+      "mcp__blackbox__bbox_bundle_evidence",
+      "mcp__blackbox__bbox_knowledge",
+      "mcp__blackbox__bbox_search",
+      "mcp__blackbox__bbox_notes",
+      "mcp__blackbox__bbox_thread_list",
+      "mcp__blackbox__bbox_note",
+      "mcp__blackbox__whiteboard_post",
+      "mcp__blackbox__whiteboard_transition",
+      "Read",
+      "Grep",
+      "Glob"
+    ],
+    "disallow": [
+      "mcp__blackbox__bbox_forget",
+      "mcp__blackbox__bbox_decide",
+      "mcp__blackbox__bbox_learn",
+      "mcp__blackbox__bbox_remember",
+      "mcp__blackbox__bbox_render",
+      "mcp__blackbox__bbox_artifact_install",
+      "mcp__blackbox__bbox_artifact_remove",
+      "mcp__blackbox__bro_*",
+      "Bash",
+      "Write",
+      "Edit",
+      "NotebookEdit"
+    ]
+  }
+}
