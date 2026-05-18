@@ -23,6 +23,7 @@ projects them into a typed entity graph, and exposes search/provenance surfaces.
 - [Agentic Corpus Tier B AST Depth](agentic-corpus-tier-b-ast.md)
 - [Agentic Corpus Multimodal Chunkers](agentic-corpus-multimodal-chunkers.md)
 - [Multimodal And Embedding Routing](multimodal-embedding-routing.md)
+- [Reflective Project Graph](reflective-project-graph.md)
 
 ## Crosscuts
 
