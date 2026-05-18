@@ -28,6 +28,7 @@ The crate is `blackbox`. It produces four binaries:
 | [Index And Embedding Internals](index-embedding-internals.md) | Tantivy indexing, embedding queues, schema migration, vector and edge compaction |
 | [Workflow Engine](workflows.md) | Canonical reference for authoring and running workflows |
 | [Phase-Decomposer Dispatch](pd-dispatch.md) | Run large implementation docs through read-only or edit-capable PD-dispatch |
+| [Architecture Pathology Dispatch](pathology-dispatch.md) | Diagnose Java architecture pressure and emit correction plans for PD handoff |
 | [Reference Implementations](reference-implementations.md) | Narrative reference walks for Keystone, Sastquatch, and related demo arcs |
 | [Atoms](atoms.md) | Install, discover, invoke, resume, and bind reusable capabilities |
 | [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |
