@@ -21,6 +21,7 @@ atomized refactor workflows.
 - [Java Refactor Gap Inventory](java-refactor-gaps.md)
 - [Java Refactor Remaining Notes](java-refactor-remaining-notes.md)
 - [Vaadin Refactor Tools (archived implemented design)](vaadin-refactor-tools-proposal.md)
+- [jOOQ Refactor Tools Proposal](jooq-refactor-tools-proposal.md)
 
 ## Crosscuts
 
