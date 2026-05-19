@@ -43,9 +43,10 @@ the decomposition cleanup that the topology move exposed:
      `src/tools/workspace.rs`, `src/tools/agents.rs`,
      `src/tools/badgey.rs`, `src/tools/badgey_adapter.rs`,
      `src/tools/badgey/` child modules, and packet implementation modules
-     `apply`, `audit`, `compile`, and `scanner` now use explicit imports, and
-     `dispatch_mcp_url` is imported directly by `server/startup.rs` instead of
-     being re-exported from the lib root.
+     `apply`, `audit`, `compile`, and `scanner` now use explicit imports,
+     `src/workflow/engine/tests.rs` no longer imports the engine prelude
+     wholesale, and `dispatch_mcp_url` is imported directly by
+     `server/startup.rs` instead of being re-exported from the lib root.
 
 2. **Split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root
@@ -108,7 +109,9 @@ the decomposition cleanup that the topology move exposed:
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
      as packet modules change. Packet event/gap logging tests now live under
      `src/packets/events.rs` via `src/packets/events_tests.rs`, and
-     self-heal scanner tests now live under `src/packets/scanner.rs`.
+   self-heal scanner tests now live under `src/packets/scanner.rs`.
+   - Workflow engine unit tests now import the exact parent symbols they cover
+     instead of using the parent module prelude.
    - Move daemon-startup-shaped tests to integration tests using `blackbox::`
      imports.
    - First locality cut landed outside packets: secret-header helper tests moved
