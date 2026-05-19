@@ -69,7 +69,8 @@ the decomposition cleanup that the topology move exposed:
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
      in `src/workflow/ops/worktree.rs`. System-event hook helpers now live in
      `src/workflow/ops/system_events.rs`, and JSON parse/normalization helpers
-     now live in `src/workflow/ops/json_ops.rs`.
+     now live in `src/workflow/ops/json_ops.rs`. Auto-digest and semantic-edge
+     hook helpers now live in `src/workflow/ops/auto_digest.rs`.
    - `src/orchestration/providers.rs`: split catalog, credentials, and provider
      resolution when touching that area.
 
@@ -568,6 +569,8 @@ Landed:
     `workflow/ops.rs`.
 21. `src/workflow/ops/json_ops.rs` owns JSON parse, fence stripping, repair, and
     object/array coercion helpers previously embedded in `workflow/ops.rs`.
+22. `src/workflow/ops/auto_digest.rs` owns auto-digest, semantic-edge, and
+    knowledge-link hook-op helpers previously embedded in `workflow/ops.rs`.
 
 Next useful cuts:
 
