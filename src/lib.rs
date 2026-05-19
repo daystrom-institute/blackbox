@@ -114,7 +114,7 @@ use orchestration::providers::{ExecOpts, Provider};
 use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
 use packets::Packets;
-use pins::{AmbientPinQuery, PinParams, Pins};
+use pins::{PinParams, Pins};
 use projects::{
     ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry,
     ProjectRenameParams, ProjectUnregisterParams,
