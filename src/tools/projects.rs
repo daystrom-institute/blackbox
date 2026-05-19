@@ -1,9 +1,27 @@
-use crate::projects::ProjectInitParams;
-use crate::server::*;
-use crate::*;
 use anyhow::Context;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use crate::artifacts;
+use crate::config;
+use crate::edge_index;
+use crate::index::{self, ReindexParams};
+use crate::mcp_tools;
+use crate::mcp_tools::provenance::ProvenanceParams;
+use crate::orchestration;
+use crate::projects::{
+    ProjectInitParams, ProjectListResponse, ProjectRegisterParams, ProjectRenameParams,
+    ProjectUnregisterParams,
+};
+use crate::server::routes::{
+    migrate_project_refs, project_ref_counts, trigger_project_bootstrap_arc,
+};
+use crate::server::state::BlackboxServer;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
+use serde_json::json;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::projects_tools()
@@ -54,7 +72,7 @@ fn write_or_skip_mcp(
         path.parent()
             .context("target path has no parent for initialization")?,
     )?;
-    crate::orchestration::mcp::McpStore::new().save(path)?;
+    orchestration::mcp::McpStore::new().save(path)?;
     created.push(path_display);
     Ok(())
 }
@@ -130,10 +148,10 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_project_register", || {
             let record = self.state.projects.write().register_path(&p.path)?;
-            crate::orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(
+            orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(
                 &record.canonical_path,
             ))?;
-            let project_config = crate::config::load_project(Path::new(&record.canonical_path))?;
+            let project_config = config::load_project(Path::new(&record.canonical_path))?;
             let project_config_loaded = true;
             if project_config.mcp.enabled == Some(false) {
                 tracing::info!(
@@ -147,7 +165,7 @@ impl BlackboxServer {
             // Auto-discover and install .bbox/ artifacts unless explicitly disabled.
             if project_config.artifacts.auto_discover != Some(false) {
                 let catalog = self.state.artifacts.read();
-                match crate::artifacts::discover_and_install_project_artifacts(
+                match artifacts::discover_and_install_project_artifacts(
                     Path::new(&record.canonical_path),
                     &record.project_id,
                     &catalog,
@@ -193,7 +211,7 @@ impl BlackboxServer {
                 let reindex_cfg = self.state.idx.read().reindex_config();
                 let project_for_backfill = record.clone();
                 std::thread::spawn(move || {
-                    match crate::index::backfill_tool_edges_for_project(
+                    match index::backfill_tool_edges_for_project(
                         &reindex_cfg,
                         &project_for_backfill,
                     ) {
@@ -400,7 +418,7 @@ mod tests {
                 .created
                 .contains(&cfg_path.to_string_lossy().into_owned())
         );
-        let store = crate::orchestration::mcp::McpStore::load(&mcp_path).unwrap();
+        let store = orchestration::mcp::McpStore::load(&mcp_path).unwrap();
         assert_eq!(store.version, 1);
         assert_eq!(
             result.canonical,
@@ -468,9 +486,9 @@ mod tests {
         .unwrap();
 
         let catalog_dir = dir.path().join("catalog");
-        let catalog = crate::artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
+        let catalog = artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
 
-        let installed = crate::artifacts::discover_and_install_project_artifacts(
+        let installed = artifacts::discover_and_install_project_artifacts(
             &project_dir,
             "proj-abc",
             &catalog,
@@ -510,15 +528,15 @@ mod tests {
         .unwrap();
 
         let catalog_dir = dir.path().join("catalog");
-        let catalog = crate::artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
+        let catalog = artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
 
-        let first = crate::artifacts::discover_and_install_project_artifacts(
+        let first = artifacts::discover_and_install_project_artifacts(
             &project_dir,
             "proj-xyz",
             &catalog,
         )
         .unwrap();
-        let second = crate::artifacts::discover_and_install_project_artifacts(
+        let second = artifacts::discover_and_install_project_artifacts(
             &project_dir,
             "proj-xyz",
             &catalog,
