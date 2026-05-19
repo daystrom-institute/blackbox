@@ -13,7 +13,7 @@
 //!   node entry before running its body
 //! - `${NodeName.output}` prompt substitution + retry-context prepend
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
