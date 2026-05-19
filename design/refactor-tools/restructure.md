@@ -51,6 +51,9 @@ the decomposition cleanup that the topology move exposed:
    - `server/background.rs` now owns post-state startup tasks such as Badgey
      restore, embed/vector warmup, watchers, event bridges, runtime restore,
      event compaction, outbox worker, and packet scanner startup.
+   - `server/open.rs` now owns config loading, store/index opening, system
+     memory/tool-doc initialization, `SharedState` construction, and startup
+     EdgeIndex/reindex setup.
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
@@ -114,8 +117,9 @@ lines. It is no longer the 17K-line god file described above or even the
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
 | `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
-| `src/server/run.rs` | 283 | Daemon bootstrap glue: state open, bind/listen |
+| `src/server/run.rs` | 45 | Daemon bootstrap glue: logging, open state, start background tasks, bind/listen |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
+| `src/server/open.rs` | 286 | Config loading, store/index opening, system memory/tool-doc setup, SharedState construction |
 | `src/server/background.rs` | 243 | Post-state startup tasks, watchers, event bridges, runtime restore, and scanner startup |
 | `src/server/restore.rs` | 161 | Registry/runtime restoration and crash recovery helpers called by `server/run.rs` |
 | `src/server/mcp.rs` | 131 | Axum route assembly plus Streamable HTTP MCP service construction |
@@ -548,6 +552,8 @@ Landed:
 16. `src/server/background.rs` owns post-state startup tasks previously embedded
     in `server/run.rs`; the move also removed three now-unused compatibility
     prelude exports/imports from `src/lib.rs` and `src/server/mod.rs`.
+17. `src/server/open.rs` owns config/store/index opening and `SharedState`
+    construction previously embedded in `server/run.rs`.
 
 Next useful cuts:
 
@@ -558,21 +564,16 @@ Next useful cuts:
      anyway, then remove the corresponding root import/re-export from `lib.rs`.
    - Keep each batch `cargo check --bin blackboxd` verified.
 
-2. **Split daemon bootstrap by startup concern.**
-   - Candidate boundary: config/state opening.
-   - Keep `server/run.rs` as orchestration glue rather than moving everything
-     into another catch-all file.
-
-3. **Keep splitting large domain modules by cohesive internals.**
+2. **Keep splitting large domain modules by cohesive internals.**
    - `workflow/engine.rs`: continue with runner subsystems after fanout.
    - `workflow/ops.rs`: split hook/action families if they continue to grow.
    - `tools/atoms.rs`: keep the public tool facade and move implementation
      clusters into child modules; the helper tail has already moved to
      `tools/atoms/helpers.rs`.
    - `orchestration/providers.rs`: split catalog, credentials, and provider
-     resolution when touching nearby code.
+   resolution when touching nearby code.
 
-4. **Improve test locality.**
+3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
      change.
    - Move daemon-startup-shaped tests to top-level integration tests using

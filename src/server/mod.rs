@@ -2,6 +2,7 @@ mod background;
 pub mod dispatch;
 pub mod handler;
 mod mcp;
+mod open;
 pub mod progress;
 pub mod response;
 mod restore;
