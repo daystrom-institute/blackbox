@@ -2707,14 +2707,6 @@ fn build_advisor_checkpoint_flattens_note_counts_for_packets() {
     assert_eq!(checkpoint.notes.dispute_count, 1);
 }
 
-#[test]
-fn mcp_response_cap_limits_large_text() {
-    let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
-    let capped = BlackboxServer::cap_response_text(&huge);
-    assert!(capped.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
-    assert!(capped.contains("response truncated"));
-}
-
 #[tokio::test]
 async fn run_workflow_at_depth_rejects_past_ceiling() {
     // A direct smoke test for the fix driven by the self-audit

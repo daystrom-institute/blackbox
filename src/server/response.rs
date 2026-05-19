@@ -83,3 +83,15 @@ impl BlackboxServer {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_response_cap_limits_large_text() {
+        let huge = "x".repeat(BlackboxServer::MCP_RESPONSE_CAP_BYTES + 1024);
+        let capped = BlackboxServer::cap_response_text(&huge);
+        assert!(capped.len() <= BlackboxServer::MCP_RESPONSE_CAP_BYTES);
+        assert!(capped.contains("response truncated"));
+    }
+}
