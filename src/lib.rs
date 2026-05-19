@@ -122,10 +122,7 @@ use artifacts::{
 };
 use inbox::InboxParams;
 use index::ReindexParams;
-use knowledge::{
-    DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
-    RememberParams, ResponseFormat,
-};
+use knowledge::KnowledgeListParams;
 use mcp_tools::blame::BlameParams;
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
 use mcp_tools::find_paths::FindPathsParams;

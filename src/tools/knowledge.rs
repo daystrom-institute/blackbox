@@ -1,6 +1,18 @@
-use crate::server::*;
-use crate::*;
+use std::collections::BTreeMap;
+
+use crate::knowledge::{
+    DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
+    RememberParams, ResponseFormat,
+};
 use crate::packets::packet_matches_query;
+use crate::server::BlackboxServer;
+use crate::system_memory;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
+use serde_json::json;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::knowledge_tools()
