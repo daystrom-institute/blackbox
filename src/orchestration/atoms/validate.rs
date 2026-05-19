@@ -1356,17 +1356,22 @@ mod tests {
             "lombokify_java_class",
             "find_java_usages",
             "java_class_dependency_analysis",
+            "extract_java_class_cohesive_clusters",
+            "cluster_inject_params_java",
+            "java_concurrency_antipattern_audit",
             "java_public_api_guard",
             "java_lsp_organize_imports",
             "prune_java_orphans",
             "extract_java_code_block_to_method",
             "convert_method_to_class",
+            "inline_java_class",
             "inline_java_method",
             "extract_java_test_slice",
             "java_collapse_call_chain",
             "migrate_java_method_receiver",
             "java_split_provider",
             "replace_java_static_reference",
+            "java_vaadin_provider_binding_generation",
         ];
 
         for kind in java_plan_kinds {

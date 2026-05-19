@@ -157,6 +157,70 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-java-concurrency-antipattern-audit",
+      "query": "audit java file for unsafe computeIfAbsent on Collections.synchronizedMap or removeIf on synchronizedSet outside synchronized block",
+      "expected_atoms": [
+        "java-concurrency-antipattern-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-cluster-inject-params",
+      "query": "cluster constructor parameters of a java inject constructor into cohesive parameter object groups",
+      "expected_atoms": [
+        "java-cluster-inject-params"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-extract-class-cohesive-clusters",
+      "query": "suggest cohesive method and field clusters inside a java god class before extract_java_class",
+      "expected_atoms": [
+        "java-extract-class-cohesive-clusters"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-decompose-god-class",
+      "query": "decompose a java god class into cohesive sibling classes with operator approval",
+      "expected_atoms": [
+        "java-decompose-god-class"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-introduce-repository-pattern",
+      "query": "introduce repository pattern for java package with raw jdbc entitymanager persistence access",
+      "expected_atoms": [
+        "java-introduce-repository-pattern"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-split-god-method",
+      "query": "split a long java god method into a method object and private helper methods",
+      "expected_atoms": [
+        "java-split-god-method"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-eliminate-dead-code",
+      "query": "loop java orphan pruning and organize imports until dead private code cleanup converges",
+      "expected_atoms": [
+        "java-eliminate-dead-code"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-provider-binding-generation",
+      "query": "generate Guice Provider UI and VaadinSession bindings for a Vaadin project",
+      "expected_atoms": [
+        "java-vaadin-provider-binding-generation"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-find-usages",
       "query": "find every project wide caller of a java method or field",
       "expected_atoms": [
@@ -377,6 +441,14 @@
       "query": "remove sealed modifier from csharp service class so tests can subclass",
       "expected_atoms": [
         "csharp-unseal-strangler"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-inline-class",
+      "query": "inline a one shot java helper class into its only caller and remove the class declaration",
+      "expected_atoms": [
+        "java-inline-class"
       ],
       "forbidden_atoms": []
     },
@@ -669,6 +741,12 @@
       "id": "anti-dep-graph-as-clusterer",
       "query": "decide partition for a java class",
       "atom": "java-class-dependency-graph",
+      "expect_matched_anti_pattern": true
+    },
+    {
+      "id": "anti-cluster-inject-params-as-extractor",
+      "query": "extract the parameter object holder class from a java inject constructor",
+      "atom": "java-cluster-inject-params",
       "expect_matched_anti_pattern": true
     },
     {

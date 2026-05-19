@@ -1,0 +1,222 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-extract-class-cohesive-clusters",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Suggest cohesive method/field clusters inside a Java god-class for partition-decision review. Analysis-only — walks the method-to-field and method-to-method affinity graph and proposes extract_java_class-shaped clusters with name hints, move_fields, cross-cluster calls, and expected delegate/callback wiring. Operator picks which (if any) to round-trip into extract_java_class.",
+    "when_to_use": [
+      "auditing a god-class and wanting partition suggestions before committing to extract_java_class",
+      "the dependency graph already exists (java-class-dependency-graph) and the operator wants the next step — proposed splits, not raw inventory",
+      "scoring competing partition shapes by internal cohesion vs cross-cluster coupling"
+    ],
+    "anti_patterns": [
+      "do not use as a refactor — this atom emits proposals, not edits",
+      "do not auto-apply a suggested cluster — operator must review move_fields, expected_wiring, and cross_cluster_calls before issuing extract_java_class",
+      "do not use on a class with a single method or no instance fields — clustering signal is undefined"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "File containing the target class, relative to project_dir."
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Class name to cluster. Defaults to the first top-level class in the file."
+          },
+          "impl_name": {
+            "type": "string",
+            "description": "Alternate way to name the class — the plan kind accepts either module_name or impl_name."
+          }
+        }
+      },
+      "prompt_template": "You are java-extract-class-cohesive-clusters. Charter: Propose cohesive method/field clusters inside a Java god-class to guide partition decisions before any extract_java_class run.\n\nProtocol (analysis-only — no apply step):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\",\n                     languages=[\"java\"], item_kinds=[\"class_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the target class exists.\n\n2. Plan the cluster suggestion:\n   bbox_refactor_plan(kind=\"extract_java_class_cohesive_clusters\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\",\n                      impl_name=\"{{impl_name}}\")\n   The response is analysis-only (analysis_only=true, dry_run=true,\n   edits=[]) and carries:\n     - class {name, package, source_path}\n     - suggested_clusters: list of {id, name_hint, item_names,\n       move_fields, score, internal_field_touches, internal_calls,\n       inbound_calls, outbound_calls, expected_wiring}.\n       expected_wiring is one of:\n         - \"delegate\": source class can hold this cluster as a private\n           delegate field; no callbacks needed.\n         - \"callback\": this cluster invokes methods still on the source;\n           operator must thread those as functional callbacks\n           (Runnable/Consumer/Supplier) when extracting.\n         - \"source_instance\": bidirectional coupling — both inbound and\n           outbound calls cross the seam. The split is not clean; the\n           operator should rethink the partition or share a source\n           instance reference.\n     - cross_cluster_calls: every method-to-method edge whose endpoints\n       fall in different clusters, with from_method/to_method named so\n       the operator can audit which seams pay coupling cost.\n\n3. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: class name, number of\n     clusters, total cross_cluster_calls, and which clusters have\n     expected_wiring=\"source_instance\" (the seams that aren't clean)>).\n   When the response surfaces zero or one cluster, say so plainly — the\n   class is not god-ish enough to warrant a partition. When two-plus\n   clusters appear with zero cross_cluster_calls, that is the cleanest\n   possible split and the operator should be told.\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never propose an extract_java_class plan from this atom — that is a\n  separate atom (java-extract-cohesive-class) the operator runs after\n  reviewing the suggestion.\n- Never collapse cross_cluster_calls into a single number; the operator\n  needs to see which methods cross the seam.\n- Never invent class names from the user prompt — re-derive from\n  bbox_code_symbols.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}} {{impl_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "class": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "package": {
+                "type": "string"
+              },
+              "source_path": {
+                "type": "string"
+              }
+            }
+          },
+          "suggested_clusters": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "item_names",
+                "move_fields",
+                "expected_wiring"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "name_hint": {
+                  "type": "string"
+                },
+                "item_names": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "move_fields": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "score": {
+                  "type": "number"
+                },
+                "expected_wiring": {
+                  "enum": [
+                    "delegate",
+                    "callback",
+                    "source_instance"
+                  ]
+                }
+              }
+            }
+          },
+          "cross_cluster_calls": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "from_cluster": {
+                  "type": "string"
+                },
+                "to_cluster": {
+                  "type": "string"
+                },
+                "from_method": {
+                  "type": "string"
+                },
+                "to_method": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "analysis_only": {
+            "type": "boolean"
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-19T00:00:00Z"
+    }
+  }
+}

@@ -11102,3 +11102,282 @@ fn prune_java_orphans_rejects_unknown_item_kind() {
     let err = plan_prune_java_orphans(&params).unwrap_err().to_string();
     assert!(err.contains("unknown item_kind"), "got: {err}");
 }
+
+#[test]
+fn inline_java_class_inlines_one_shot_method_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = write_java(
+        dir.path(),
+        "AddOne.java",
+        "package p;\n\
+         class AddOne {\n\
+        \x20   private final int base;\n\
+        \x20   AddOne(int base) { this.base = base; }\n\
+        \x20   int execute(int delta) { return base + delta; }\n\
+         }\n",
+    );
+    let caller = write_java(
+        dir.path(),
+        "Caller.java",
+        "package p;\n\
+         class Caller {\n\
+        \x20   int run(int value) {\n\
+        \x20       AddOne op = new AddOne(value);\n\
+        \x20       return op.execute(2);\n\
+        \x20   }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("inline_java_class", &helper);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("AddOne".to_string());
+    params.impl_name = Some("execute".to_string());
+
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_inline_java_class(&params).unwrap()).unwrap();
+    assert_eq!(plan.kind, "inline_java_class");
+    assert_eq!(plan.edits.len(), 2);
+
+    let rewritten_caller = apply_source_edits(&plan, &caller);
+    assert!(
+        rewritten_caller.contains("final int addOneBase = value;"),
+        "caller rewrite: {rewritten_caller}"
+    );
+    assert!(
+        rewritten_caller.contains("return (addOneBase + (2));"),
+        "caller rewrite: {rewritten_caller}"
+    );
+
+    let rewritten_helper = apply_source_edits(&plan, &helper);
+    assert!(
+        !rewritten_helper.contains("class AddOne"),
+        "helper should be removed: {rewritten_helper}"
+    );
+}
+
+#[test]
+fn inline_java_class_refuses_multiple_construction_sites() {
+    let dir = tempfile::tempdir().unwrap();
+    let helper = write_java(
+        dir.path(),
+        "Worker.java",
+        "package p;\n\
+         class Worker {\n\
+        \x20   private final int base;\n\
+        \x20   Worker(int base) { this.base = base; }\n\
+        \x20   int execute() { return base; }\n\
+         }\n",
+    );
+    write_java(
+        dir.path(),
+        "Caller.java",
+        "package p;\n\
+         class Caller {\n\
+        \x20   int a() { Worker w = new Worker(1); return w.execute(); }\n\
+        \x20   int b() { Worker w = new Worker(2); return w.execute(); }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("inline_java_class", &helper);
+    params.project_dir = Some(path_string(dir.path()));
+    params.module_name = Some("Worker".to_string());
+    let err = plan_inline_java_class(&params).unwrap_err().to_string();
+    assert!(err.contains("exactly one construction site"), "got: {err}");
+}
+
+#[test]
+fn java_concurrency_audit_flags_unsafe_compute_if_absent_on_synchronized_map() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Cache.java",
+        "package p;\n\
+         import java.util.Collections;\n\
+         import java.util.HashMap;\n\
+         import java.util.Map;\n\
+         class Cache {\n\
+        \x20   private final Map<String, String> store =\n\
+        \x20       Collections.synchronizedMap(new HashMap<>());\n\
+        \x20   String lookup(String key) {\n\
+        \x20       return store.computeIfAbsent(key, k -> compute(k));\n\
+        \x20   }\n\
+        \x20   String compute(String k) { return k; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("java_concurrency_antipattern_audit", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan_text = plan_java_concurrency_antipattern_audit(&params).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+    let declarations = value["declarations"].as_array().unwrap();
+    assert_eq!(declarations.len(), 1, "got declarations: {declarations:?}");
+    assert_eq!(declarations[0]["variable"], "store");
+    assert_eq!(declarations[0]["wrapper"], "map");
+    assert_eq!(declarations[0]["scope"], "field");
+
+    let findings = value["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "got findings: {findings:?}");
+    assert_eq!(findings[0]["variable"], "store");
+    assert_eq!(findings[0]["collection_wrapper"], "map");
+    assert_eq!(findings[0]["operation"], "computeIfAbsent");
+    assert_eq!(findings[0]["confidence"], "high");
+    let reason = findings[0]["reason"].as_str().unwrap();
+    assert!(
+        reason.contains("computeIfAbsent") && reason.contains("synchronized"),
+        "reason: {reason}"
+    );
+}
+
+#[test]
+fn java_concurrency_audit_suppresses_compute_inside_explicit_synchronized_block() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Guarded.java",
+        "package p;\n\
+         import java.util.Collections;\n\
+         import java.util.HashMap;\n\
+         import java.util.Map;\n\
+         class Guarded {\n\
+        \x20   private final Map<String, String> store =\n\
+        \x20       Collections.synchronizedMap(new HashMap<>());\n\
+        \x20   String lookup(String key) {\n\
+        \x20       synchronized (store) {\n\
+        \x20           return store.computeIfAbsent(key, k -> k);\n\
+        \x20       }\n\
+        \x20   }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("java_concurrency_antipattern_audit", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan_text = plan_java_concurrency_antipattern_audit(&params).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+    let findings = value["findings"].as_array().unwrap();
+    assert!(
+        findings.is_empty(),
+        "expected suppression inside synchronized(store); got: {findings:?}"
+    );
+}
+
+#[test]
+fn java_concurrency_audit_flags_unsafe_remove_if_on_synchronized_set() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_java(
+        dir.path(),
+        "Watchers.java",
+        "package p;\n\
+         import java.util.Collections;\n\
+         import java.util.HashSet;\n\
+         import java.util.Set;\n\
+         class Watchers {\n\
+        \x20   private final Set<String> ids =\n\
+        \x20       Collections.synchronizedSet(new HashSet<>());\n\
+        \x20   void purge(String prefix) {\n\
+        \x20       ids.removeIf(id -> id.startsWith(prefix));\n\
+        \x20   }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("java_concurrency_antipattern_audit", &path);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan_text = plan_java_concurrency_antipattern_audit(&params).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+    let declarations = value["declarations"].as_array().unwrap();
+    assert_eq!(declarations.len(), 1);
+    assert_eq!(declarations[0]["wrapper"], "set");
+
+    let findings = value["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "got findings: {findings:?}");
+    assert_eq!(findings[0]["variable"], "ids");
+    assert_eq!(findings[0]["collection_wrapper"], "set");
+    assert_eq!(findings[0]["operation"], "removeIf");
+    assert_eq!(findings[0]["confidence"], "high");
+}
+
+#[test]
+fn java_vaadin_provider_bindings_adds_missing_guice_provider_methods() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = write_java(
+        dir.path(),
+        "UiModule.java",
+        "package p;\n\
+         import com.google.inject.AbstractModule;\n\
+         import com.vaadin.flow.component.UI;\n\
+         final class UiModule extends AbstractModule {\n\
+        \x20   @Override protected void configure() { }\n\
+         }\n",
+    );
+    write_java(
+        dir.path(),
+        "View.java",
+        "package p;\n\
+         import com.vaadin.flow.server.VaadinSession;\n\
+         final class View { VaadinSession session() { return VaadinSession.getCurrent(); } }\n",
+    );
+
+    let mut params = java_plan_params("java_vaadin_provider_binding_generation", &module);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_vaadin_provider_binding_generation(&params).unwrap())
+            .unwrap();
+    assert_eq!(plan.kind, "java_vaadin_provider_binding_generation");
+    assert_eq!(plan.edits.len(), 1);
+    let replacements = plan.edits[0]
+        .edits
+        .iter()
+        .map(|edit| edit.replacement.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(replacements.contains("import com.google.inject.Provider;"));
+    assert!(replacements.contains("import com.google.inject.Provides;"));
+    assert!(replacements.contains("import com.vaadin.flow.server.VaadinSession;"));
+    assert!(replacements.contains("Provider<UI> provideUiProvider()"));
+    assert!(replacements.contains("return UI::getCurrent;"));
+    assert!(replacements.contains("Provider<VaadinSession> provideVaadinSessionProvider()"));
+    assert!(replacements.contains("return VaadinSession::getCurrent;"));
+}
+
+#[test]
+fn java_vaadin_provider_bindings_is_idempotent_when_bindings_exist() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = write_java(
+        dir.path(),
+        "UiModule.java",
+        "package p;\n\
+         import com.google.inject.AbstractModule;\n\
+         import com.google.inject.Provider;\n\
+         import com.google.inject.Provides;\n\
+         import com.vaadin.flow.component.UI;\n\
+         import com.vaadin.flow.server.VaadinSession;\n\
+         final class UiModule extends AbstractModule {\n\
+        \x20   @Provides Provider<UI> provideUiProvider() { return UI::getCurrent; }\n\
+        \x20   @Provides Provider<VaadinSession> provideVaadinSessionProvider() { return VaadinSession::getCurrent; }\n\
+         }\n",
+    );
+    let mut params = java_plan_params("java_vaadin_provider_binding_generation", &module);
+    params.project_dir = Some(path_string(dir.path()));
+    let plan: RefactorPlan =
+        serde_json::from_str(&plan_java_vaadin_provider_binding_generation(&params).unwrap())
+            .unwrap();
+    assert!(
+        plan.edits.is_empty(),
+        "expected no-op plan, got {:?}",
+        plan.edits
+    );
+}
+
+#[test]
+fn java_vaadin_provider_bindings_refuses_spring_vaadin_projects() {
+    let dir = tempfile::tempdir().unwrap();
+    let module = write_java(
+        dir.path(),
+        "SpringConfig.java",
+        "package p;\n\
+         import com.google.inject.AbstractModule;\n\
+         import com.vaadin.flow.component.UI;\n\
+         import org.springframework.context.annotation.Configuration;\n\
+         @Configuration final class SpringConfig extends AbstractModule { }\n",
+    );
+    let mut params = java_plan_params("java_vaadin_provider_binding_generation", &module);
+    params.project_dir = Some(path_string(dir.path()));
+    let err = plan_java_vaadin_provider_binding_generation(&params)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("refuses Spring/Vaadin projects"), "err: {err}");
+}

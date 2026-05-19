@@ -358,6 +358,135 @@
       ]
     },
     {
+      "id": "dispatch-java-cluster-inject-params-planonly",
+      "atom": "java-cluster-inject-params",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "DashboardView"
+      },
+      "expect_response_fields": [
+        "status",
+        "class",
+        "constructor",
+        "parameters",
+        "parameter_method_edges",
+        "suggested_groups",
+        "spanning_methods",
+        "analysis_only"
+      ]
+    },
+    {
+      "id": "dispatch-java-extract-class-cohesive-clusters-planonly",
+      "atom": "java-extract-class-cohesive-clusters",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "DashboardView"
+      },
+      "expect_response_fields": [
+        "status",
+        "class",
+        "suggested_clusters",
+        "cross_cluster_calls",
+        "analysis_only"
+      ]
+    },
+    {
+      "id": "dispatch-java-concurrency-antipattern-audit-planonly",
+      "atom": "java-concurrency-antipattern-audit",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "source",
+        "declarations",
+        "findings"
+      ]
+    },
+    {
+      "id": "dispatch-java-vaadin-provider-binding-generation-planonly",
+      "atom": "java-vaadin-provider-binding-generation",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UiModule.java",
+        "module_name": "UiModule",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "binding_module"
+      ]
+    },
+    {
+      "id": "dispatch-java-decompose-god-class-planonly",
+      "atom": "java-decompose-god-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "DashboardView",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "phase",
+        "clusters_proposed"
+      ]
+    },
+    {
+      "id": "dispatch-java-introduce-repository-pattern-planonly",
+      "atom": "java-introduce-repository-pattern",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "package_dir": "src/main/java/com/example/service",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "phase",
+        "candidates"
+      ]
+    },
+    {
+      "id": "dispatch-java-split-god-method-planonly",
+      "atom": "java-split-god-method",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "refreshGrid",
+        "target": "src/main/java/com/example/RefreshGridOperation.java",
+        "chunks": [
+          {
+            "module_name": "loadRows",
+            "old_text": "loadRows();"
+          }
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "method_object_target",
+        "chunks"
+      ]
+    },
+    {
+      "id": "dispatch-java-eliminate-dead-code-planonly",
+      "atom": "java-eliminate-dead-code",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "sources": [
+          "src/main/java/com/example/DashboardView.java"
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "files"
+      ]
+    },
+    {
       "id": "dispatch-java-find-usages-planonly",
       "atom": "java-find-usages",
       "args": {
@@ -767,6 +896,22 @@
       "expect_response_fields": [
         "status",
         "class_name"
+      ]
+    },
+    {
+      "id": "dispatch-java-inline-class-planonly",
+      "atom": "java-inline-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ProcessOperation.java",
+        "module_name": "ProcessOperation",
+        "impl_name": "execute",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "plan_path",
+        "files_touched"
       ]
     },
     {

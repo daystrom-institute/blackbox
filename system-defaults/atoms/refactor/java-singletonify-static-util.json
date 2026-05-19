@@ -5,27 +5,31 @@
   "version": 1,
   "subcontract": "refactor/v1",
   "manifest": {
-    "description": "Rewrite callers of `*Util.staticMethod(...)` calls to `*UtilProvider.get().method(...)` for one source file. v1 ships the call-site rewrite half of note-e5439c0a; the Util-class-to-@Singleton conversion + purity classification is v2.",
+    "description": "Rewrite callers of `*Util.staticMethod(...)` calls to `<provider>.get().method(...)` for one source file. Ships the call-site rewrite half of note-e5439c0a with auto-injection of the @Inject Provider field via the shared di_plumbing helper (delegate_type mode); manual pre-staged-field mode remains as an operator override. Util-class-to-@Singleton conversion + purity classification is still a separate workflow.",
     "when_to_use": [
       "redirect callers of a god-Util's static methods toward an injected provider before deleting/converting the Util class itself"
     ],
     "anti_patterns": [
-      "do not use on pure formatter methods that genuinely belong as statics — those should stay as utility methods",
-      "do not use without first staging the @Inject provider field on the caller's enclosing class"
+      "do not use on pure formatter methods that genuinely belong as statics — those should stay as utility methods"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source", "impl_name", "new_text", "item_names"],
+        "required": ["project_dir", "source", "impl_name", "item_names"],
         "properties": {
           "project_dir": { "type": "string" },
           "source": { "type": "string" },
           "impl_name": { "type": "string", "description": "Util class name (e.g. `UIUtils`)." },
-          "new_text": { "type": "string", "description": "Replacement receiver expression (e.g. `uiUtilsProvider.get()`)." },
+          "delegate_type": { "type": "string", "description": "Type to auto-inject as the new receiver (e.g. `UIUtils`). When set, the planner synthesizes or reuses an `@Inject Provider<DelegateType>` field on the caller's enclosing class via the shared di_plumbing helper. Mutually exclusive with `new_text`." },
+          "new_text": { "type": "string", "description": "Manual override: replacement receiver expression (e.g. `uiUtilsProvider.get()`). Use when the provider field is already staged on the enclosing class." },
           "item_names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Static method names to rewrite." }
-        }
+        },
+        "oneOf": [
+          { "required": ["delegate_type"] },
+          { "required": ["new_text"] }
+        ]
       },
-      "prompt_template": "You are java-singletonify-static-util. Charter: Rewrite `<Util>.<staticMethod>(...)` calls to `<provider>.get().<method>(...)`.\n\nProtocol:\n\n1. Ground.\n2. Verify provider field exists; refuse if missing.\n3. Plan with item_kinds=[\"method\"]:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      new_text=\"{{new_text}}\",\n                      item_names={{item_names}},\n                      item_kinds=[\"method\"])\n4. Apply and compile-verify.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{new_text}} {{item_names}}"
+      "prompt_template": "You are java-singletonify-static-util. Charter: Rewrite `<Util>.<staticMethod>(...)` calls to `<provider>.get().<method>(...)`.\n\nProtocol:\n\n1. Ground.\n2. Choose mode:\n   - Auto-injection (default): pass `delegate_type=<UtilType>` and omit `new_text`; the planner synthesizes or reuses the `@Inject Provider<UtilType>` field on the caller's enclosing class via the shared di_plumbing helper.\n   - Manual override: provider field already exists — pass `new_text=\"<provider>.get()\"` and omit `delegate_type`.\n3. Plan with item_kinds=[\"method\"]:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      delegate_type=\"{{delegate_type}}\",   # auto-inject mode; OR\n                      new_text=\"{{new_text}}\",             # manual override\n                      item_names={{item_names}},\n                      item_kinds=[\"method\"])\n4. Apply and compile-verify.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{delegate_type}} {{new_text}} {{item_names}}"
     },
     "outputs": {
       "schema": {

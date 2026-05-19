@@ -536,11 +536,18 @@ pre-configurations:
   drop-accessor mode: pass `delegate_field="UI.getCurrent"` to collapse
   the entire static accessor invocation (note-7d4f0001).
 
-All three v1 atoms require the @Inject provider field to already exist
-on the reader's enclosing class. The conversion of the production-side
-holder/util/Vaadin patterns to actual `@Singleton` services is operator-
-driven; the shared DI-plumbing helper (v2) will eventually automate
-that too.
+All three atoms support an auto-injection mode: pass `delegate_type=<T>`
+(plus optional `toml_entries.enclosing_class` to disambiguate when the
+file has more than one class, and `toml_entries.prefer_provider=false`
+when a direct `@Inject T` is wanted instead of `@Inject Provider<T>`).
+The planner then synthesizes or reuses the `@Inject Provider<T>` field
+on the reader/caller's enclosing class via the shared `di_plumbing`
+helper (`ensure_inject_field`). Manual override mode — `new_text=
+"<provider>.get()"` with the field pre-staged by the operator — remains
+available; use it when you want a custom receiver expression or have
+already wired the injection. The conversion of the production-side
+holder/util/Vaadin patterns to actual `@Singleton` services is still a
+separate operator-driven workflow.
 
 14b8. Split a Provider<Big> across call sites:
 
@@ -561,11 +568,17 @@ bbox_refactor_plan(
 
 The matching atom is `java-split-provider`. Finds
 `<delegate_field>.get().<getter>()` chains and rewrites each to
-`<newProviderField>.get()` per the operator-supplied mapping. v1 only
-handles the call-site rewrite; auto-splitting the `@Inject Provider<T>`
-field on the enclosing class is deferred to the shared DI-plumbing
-helper (v2). Operator splits the field manually first, then runs this
-to drag callers.
+`<newProviderField>.get()` per the operator-supplied mapping. Two modes:
+
+- Auto-injection (default): pass `toml_entries.getter_types =
+  {"<getter>": "<TypeT>", ...}` and the planner synthesizes or reuses
+  the `@Inject Provider<TypeT>` field on the enclosing class via the
+  shared `di_plumbing` helper. When every called getter on
+  `delegate_field` is covered, the planner also deletes the now-unused
+  `@Inject Provider<Big> delegate_field;` declaration.
+- Manual override: pass `toml_entries.getter_mapping = {"<getter>":
+  "<existingProviderFieldName>", ...}` after splitting the fields
+  yourself, and the planner just drags the callers.
 
 14b7. Migrate method receivers after a production move:
 
@@ -588,10 +601,13 @@ field references (`sessionData`) and `Provider<T>.get()` shapes
 (`sessionDataProvider.get()`) — pass whichever text matches the
 existing source.
 
-v1 single-file, manual mode: the new receiver must already exist as
-a field on the enclosing class. Auto `@Inject Provider<T>` insertion
-is v2 follow-up. Method-reference shapes (`oldHolder::foo`) are
-skipped in v1.
+Two modes: pass `delegate_type=<NewHolderType>` to auto-inject an
+`@Inject Provider<NewHolderType>` (or `@Inject NewHolderType` when
+`toml_entries.prefer_provider=false`) field on the enclosing class via
+the shared `di_plumbing` helper, or pass `new_text="<receiver>"` when
+the receiver field is already staged and you want an explicit
+replacement expression. If both are supplied, `new_text` wins.
+Method-reference shapes (`oldHolder::foo`) are not rewritten.
 
 14b6. Collapse verbose getter chains:
 
@@ -660,7 +676,8 @@ declaration.
 body must reference only formal parameters — no `this`, `super`, field
 reads, or calls to other methods. Refuses cleanly on every violation;
 operator can lift state to parameters first or pick a different
-refactor. `inline_java_class` is a separate primitive not yet shipped.
+refactor. For one-shot helper / Method Object classes, use the separate
+`inline_java_class` primitive.
 
 14b3. Method Object — convert a method into a standalone class:
 

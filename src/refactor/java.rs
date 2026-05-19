@@ -3876,6 +3876,7 @@ use cross_file::{MovedStaticItem, compute_cross_file_static_caller_edits};
 pub(crate) use extract_class::plan_extract_java_class;
 pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use extract_methods::plan_extract_java_methods;
+pub(crate) use inline_class::plan_inline_java_class;
 pub(crate) use inline_method::plan_inline_java_method;
 pub(crate) use leaf_plans::{
     plan_add_java_implements, plan_extract_java_interface, plan_java_lsp_organize_imports,
@@ -3891,6 +3892,7 @@ pub(crate) use replace_static_ref::plan_replace_java_static_reference;
 pub(crate) use singletonify::{plan_singletonify_java_holder, plan_singletonify_java_util};
 pub(crate) use split_provider::plan_java_split_provider;
 pub(crate) use test_slice::plan_extract_java_test_slice;
+pub(crate) use vaadin_provider_bindings::plan_java_vaadin_provider_binding_generation;
 
 mod atom_plans;
 mod collapse_chain;
@@ -3899,6 +3901,7 @@ mod extract_class;
 mod extract_code_block;
 mod extract_methods;
 mod find_usages;
+mod inline_class;
 mod inline_method;
 mod leaf_plans;
 mod lombokify;
@@ -3914,11 +3917,18 @@ mod split_provider;
 mod test_slice;
 #[cfg(test)]
 mod tests;
+mod vaadin_provider_bindings;
 pub(crate) use find_usages::plan_find_java_usages;
 mod rename_symbol;
 pub(crate) use rename_symbol::plan_rename_java_symbol;
 mod class_dependency;
 pub(crate) use class_dependency::plan_java_class_dependency_analysis;
+mod cohesive_clusters;
+pub(crate) use cohesive_clusters::plan_extract_java_class_cohesive_clusters;
+mod concurrency_audit;
+pub(crate) use concurrency_audit::plan_java_concurrency_antipattern_audit;
+mod constructor_param_clusters;
+pub(crate) use constructor_param_clusters::plan_cluster_inject_params_java;
 mod imports;
 mod public_api_guard;
 use imports::*;

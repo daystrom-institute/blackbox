@@ -5,27 +5,31 @@
   "version": 1,
   "subcontract": "refactor/v1",
   "manifest": {
-    "description": "Rewrite readers of a public-static-final holder field to use an injected DI provider expression. v1 ships the call-site rewrite half of note-7c819189; holder-class conversion to @Singleton is operator-driven (or v2 with shared DI helper).",
+    "description": "Rewrite readers of a public-static-final holder field to use an injected DI provider expression. Ships the call-site rewrite half of note-7c819189 with auto-injection of the @Inject Provider field via the shared di_plumbing helper (delegate_type mode); manual pre-staged-field mode remains as an operator override. Holder-class conversion to @Singleton is still operator-driven.",
     "when_to_use": [
       "remove `<HolderClass>.<STATIC_FIELD>` escape hatches around the DI graph by routing readers through an injected provider"
     ],
     "anti_patterns": [
-      "do not use without first adding the @Inject provider field on the reader's enclosing class — v1 doesn't auto-inject",
-      "do not use to delete the holder class itself — v1 only rewrites readers; v2 handles the holder-class conversion"
+      "do not use to delete the holder class itself — this atom only rewrites readers; production-side holder conversion is a separate workflow"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source", "impl_name", "new_text", "item_names"],
+        "required": ["project_dir", "source", "impl_name", "item_names"],
         "properties": {
           "project_dir": { "type": "string" },
           "source": { "type": "string" },
           "impl_name": { "type": "string", "description": "Holder class name (e.g. `ProductionDayColumns`)." },
-          "new_text": { "type": "string", "description": "Replacement receiver expression (e.g. `siteAdminProvider.get()`)." },
+          "delegate_type": { "type": "string", "description": "Type to auto-inject as the new receiver (e.g. `SiteAdmin`). When set, the planner synthesizes or reuses an `@Inject Provider<DelegateType>` field on the reader's enclosing class via the shared di_plumbing helper. Mutually exclusive with `new_text` (provide one)." },
+          "new_text": { "type": "string", "description": "Manual override: replacement receiver expression (e.g. `siteAdminProvider.get()`). Use when the provider field is already staged on the enclosing class and auto-injection should be skipped." },
           "item_names": { "type": "array", "items": { "type": "string" }, "minItems": 1, "description": "Static field names to rewrite." }
-        }
+        },
+        "oneOf": [
+          { "required": ["delegate_type"] },
+          { "required": ["new_text"] }
+        ]
       },
-      "prompt_template": "You are java-migrate-static-holder. Charter: Rewrite `<HolderClass>.<STATIC_FIELD>` readers to an injected provider expression.\n\nProtocol:\n\n1. Ground:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n\n2. Verify the reader's enclosing class has the provider field; if missing, refuse.\n\n3. Plan with item_kinds=[\"field\"]:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      new_text=\"{{new_text}}\",\n                      item_names={{item_names}},\n                      item_kinds=[\"field\"])\n\n4. Apply and compile-verify.\n\n5. Emit done note.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{new_text}} {{item_names}}"
+      "prompt_template": "You are java-migrate-static-holder. Charter: Rewrite `<HolderClass>.<STATIC_FIELD>` readers to an injected provider expression.\n\nProtocol:\n\n1. Ground:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n\n2. Choose mode:\n   - Auto-injection (default): pass `delegate_type=<HolderType>` and omit `new_text`. The planner synthesizes or reuses an `@Inject Provider<HolderType>` field on the reader's enclosing class via the shared di_plumbing helper.\n   - Manual override: the operator has already staged the provider field; pass `new_text=\"<provider>.get()\"` and omit `delegate_type`.\n\n3. Plan with item_kinds=[\"field\"]:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      delegate_type=\"{{delegate_type}}\",   # auto-inject mode; OR\n                      new_text=\"{{new_text}}\",             # manual override\n                      item_names={{item_names}},\n                      item_kinds=[\"field\"])\n\n4. Apply and compile-verify.\n\n5. Emit done note.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{delegate_type}} {{new_text}} {{item_names}}"
     },
     "outputs": {
       "schema": {

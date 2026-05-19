@@ -5,26 +5,30 @@
   "version": 1,
   "subcontract": "refactor/v1",
   "manifest": {
-    "description": "Rewrite UI.getCurrent() / VaadinSession.getCurrent() (and similar accessor-style static lookups) to an injected Provider<UI> / Provider<VaadinSession> expression. v1 ships caller rewrites only (note-7d4f0001).",
+    "description": "Rewrite UI.getCurrent() / VaadinSession.getCurrent() (and similar accessor-style static lookups) to an injected Provider<UI> / Provider<VaadinSession> expression. Caller-side rewrite for note-7d4f0001 with auto-injection of the @Inject Provider field via the shared di_plumbing helper (delegate_type mode); manual pre-staged-field mode remains as an operator override.",
     "when_to_use": [
       "remove Vaadin static-context escape hatches in DI-managed view code"
     ],
     "anti_patterns": [
-      "do not use without staging Provider<UI> / Provider<VaadinSession> @Inject fields on the caller's enclosing class — operator must add the injection first",
       "do not use in method-reference contexts (`UI::getCurrent` passed as Supplier) — those need different rewriting"
     ],
     "inputs": {
       "schema": {
         "type": "object",
-        "required": ["project_dir", "source", "impl_name", "new_text"],
+        "required": ["project_dir", "source", "impl_name"],
         "properties": {
           "project_dir": { "type": "string" },
           "source": { "type": "string" },
           "impl_name": { "type": "string", "description": "Class qualifier (e.g. `UI` or `VaadinSession`)." },
-          "new_text": { "type": "string", "description": "Replacement receiver expression (e.g. `uiProvider.get()`)." }
-        }
+          "delegate_type": { "type": "string", "description": "Type to auto-inject as the new receiver (e.g. `UI` or `VaadinSession`). When set, the planner synthesizes or reuses an `@Inject Provider<DelegateType>` field on the caller's enclosing class via the shared di_plumbing helper. Mutually exclusive with `new_text`." },
+          "new_text": { "type": "string", "description": "Manual override: replacement receiver expression (e.g. `uiProvider.get()`). Use when the provider field is already staged on the enclosing class." }
+        },
+        "oneOf": [
+          { "required": ["delegate_type"] },
+          { "required": ["new_text"] }
+        ]
       },
-      "prompt_template": "You are java-replace-vaadin-static-lookup. Charter: Replace `UI.getCurrent()` / `VaadinSession.getCurrent()` with injected provider expressions.\n\nProtocol:\n\n1. Ground.\n2. Verify the provider field is staged.\n3. Plan in drop-accessor mode:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      new_text=\"{{new_text}}\",\n                      item_names=[\"getCurrent\"],\n                      delegate_field=\"{{impl_name}}.getCurrent\")\n4. Apply and compile-verify.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{new_text}}"
+      "prompt_template": "You are java-replace-vaadin-static-lookup. Charter: Replace `UI.getCurrent()` / `VaadinSession.getCurrent()` with injected provider expressions.\n\nProtocol:\n\n1. Ground.\n2. Choose mode:\n   - Auto-injection (default): pass `delegate_type=<UI|VaadinSession>` and omit `new_text`; the planner synthesizes or reuses the `@Inject Provider<DelegateType>` field on the caller's enclosing class via the shared di_plumbing helper.\n   - Manual override: provider field already exists — pass `new_text=\"<provider>.get()\"` and omit `delegate_type`.\n3. Plan in drop-accessor mode:\n   bbox_refactor_plan(kind=\"replace_java_static_reference\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      delegate_type=\"{{delegate_type}}\",   # auto-inject mode; OR\n                      new_text=\"{{new_text}}\",             # manual override\n                      item_names=[\"getCurrent\"],\n                      delegate_field=\"{{impl_name}}.getCurrent\")\n4. Apply and compile-verify.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{delegate_type}} {{new_text}}"
     },
     "outputs": {
       "schema": {

@@ -266,6 +266,109 @@
       "done_note_required": true
     },
     {
+      "atom": "java-cluster-inject-params",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:cluster_inject_params_java",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-extract-class-cohesive-clusters",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_class_cohesive_clusters",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-concurrency-antipattern-audit",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_concurrency_antipattern_audit",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-provider-binding-generation",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_code_symbols",
+        "bbox_refactor_plan:java_vaadin_provider_binding_generation",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-decompose-god-class",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_refactor_plan:extract_java_class_cohesive_clusters",
+        "bbox_note:done",
+        "bbox_refactor_plan:extract_java_class",
+        "bbox_refactor_apply",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_apply",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-introduce-repository-pattern",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_plan:java_class_dependency_analysis",
+        "bbox_refactor_plan:find_java_usages",
+        "bbox_note:done",
+        "bbox_refactor_plan:extract_java_class",
+        "bbox_refactor_apply",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_apply",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-split-god-method",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:convert_method_to_class",
+        "bbox_refactor_apply",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:extract_java_code_block_to_method",
+        "bbox_refactor_apply",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-eliminate-dead-code",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:prune_java_orphans",
+        "bbox_refactor_plan:java_lsp_organize_imports",
+        "bbox_refactor_apply",
+        "bbox_refactor_apply",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
       "atom": "java-find-usages",
       "expected_plan_sequence": [
         "bbox_code_symbols",
@@ -578,6 +681,17 @@
       "expected_plan_sequence": [
         "bbox_refactor_status",
         "bbox_refactor_plan:convert_method_to_class",
+        "bbox_refactor_apply",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-inline-class",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_code_symbols",
+        "bbox_refactor_plan:inline_java_class",
         "bbox_refactor_apply",
         "bbox_note:done"
       ],

@@ -1,0 +1,182 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-cluster-inject-params",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Analyze an oversized Java constructor (preferring @Inject when present, otherwise the largest constructor) and propose cohesive parameter-object groups derived from per-method field/parameter usage. Analysis-only: no file edits.",
+    "when_to_use": [
+      "an @Inject constructor has grown to many parameters and the operator wants to know which subsets co-occur in method bodies",
+      "deciding whether to extract a parameter object or a collaborator from a god-constructor",
+      "audit pass before invoking a future parameter-object extractor"
+    ],
+    "anti_patterns": [
+      "do not use to perform the parameter-object extraction itself — this atom is analysis-only and emits no edits",
+      "do not use on non-Java files",
+      "do not use to rename or visibility-change constructor parameters"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "File containing the target class, relative to project_dir."
+          },
+          "module_name": {
+            "type": "string",
+            "description": "Class name to analyze. Defaults to the first top-level class in the file."
+          },
+          "impl_name": {
+            "type": "string",
+            "description": "Alternate way to name the class — the plan kind accepts either module_name or impl_name."
+          }
+        }
+      },
+      "prompt_template": "You are java-cluster-inject-params. Charter: Analyze a Java class's constructor parameters and propose cohesive groups for parameter-object extraction. Analysis-only.\n\nProtocol (analysis-only — no apply step):\n\n1. Ground the target structurally:\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\",\n                     languages=[\"java\"], item_kinds=[\"class_declaration\"])\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the target class exists in the file. If the @Inject constructor\n   is not obvious from grounding, defer selection to the plan kind which\n   picks @Inject-first, largest-otherwise.\n\n2. Plan the analysis:\n   bbox_refactor_plan(kind=\"cluster_inject_params_java\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\",\n                      impl_name=\"{{impl_name}}\")\n   The response carries: class {name, package, source_path},\n   constructor {signature, line_range, is_inject, param_count},\n   parameters [{name, type, assigned_field}],\n   parameter_method_edges [{parameter, method, via_field, direct}],\n   suggested_groups [{name, naming_hint, parameters, score,\n     internal_methods, spanning_methods}], and spanning_methods\n   [{method, groups, parameters}]. analysis_only=true. plan_status=planned.\n\n3. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: class name, constructor\n     param count, group count, spanning-method count, is_inject flag>).\n   Always read these counts from the plan response — never restate them\n   from memory or paraphrase the constructor signature.\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never attempt apply on this atom — analysis-only.\n- Never derive a parameter-object extraction plan from the suggested\n  groups in this same dispatch; surface the groups and let the operator\n  decide whether to chain a follow-up plan.\n- Surface spanning_methods in the done-note when non-empty: a spanning\n  method is the architectural smell that pins down whether the groups\n  are actually separable.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}} {{impl_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "class": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "package": {
+                "type": "string"
+              },
+              "source_path": {
+                "type": "string"
+              }
+            }
+          },
+          "constructor": {
+            "type": "object",
+            "properties": {
+              "signature": {
+                "type": "string"
+              },
+              "is_inject": {
+                "type": "boolean"
+              },
+              "param_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "parameters": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "parameter_method_edges": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "suggested_groups": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "spanning_methods": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "analysis_only": {
+            "type": "boolean"
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-19T00:00:00Z"
+    }
+  }
+}

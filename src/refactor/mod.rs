@@ -1210,11 +1210,15 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "find_java_usages" => plan_find_java_usages(p),
         "rename_java_symbol" => plan_rename_java_symbol(p),
         "java_class_dependency_analysis" => plan_java_class_dependency_analysis(p),
+        "extract_java_class_cohesive_clusters" => plan_extract_java_class_cohesive_clusters(p),
+        "java_concurrency_antipattern_audit" => plan_java_concurrency_antipattern_audit(p),
+        "cluster_inject_params_java" => plan_cluster_inject_params_java(p),
         "java_public_api_guard" => plan_java_public_api_guard(p),
         "lombokify_java_class" => plan_lombokify_java_class(p),
         "prune_java_orphans" => plan_prune_java_orphans(p),
         "extract_java_code_block_to_method" => plan_extract_java_code_block_to_method(p),
         "convert_method_to_class" => plan_convert_method_to_class(p),
+        "inline_java_class" => plan_inline_java_class(p),
         "inline_java_method" => plan_inline_java_method(p),
         "extract_java_test_slice" => plan_extract_java_test_slice(p),
         "java_collapse_call_chain" => plan_java_collapse_call_chain(p),
@@ -1223,6 +1227,9 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "replace_java_static_reference" => plan_replace_java_static_reference(p),
         "singletonify_java_holder" => plan_singletonify_java_holder(p),
         "singletonify_java_util" => plan_singletonify_java_util(p),
+        "java_vaadin_provider_binding_generation" => {
+            plan_java_vaadin_provider_binding_generation(p)
+        }
         "rewrite_rust_error_type" => rust_error_migrate::plan_rewrite_error_type(p),
         "migrate_rust_string_field_to_enum" => {
             rust_string_enum::plan_migrate_string_field_to_enum(p)
@@ -1291,7 +1298,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_provider_binding_generation, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }

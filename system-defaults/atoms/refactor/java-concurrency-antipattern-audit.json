@@ -1,0 +1,154 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-concurrency-antipattern-audit",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Audit a Java file for unsafe compound operations on Collections.synchronizedMap/synchronizedSet wrappers (computeIfAbsent/compute/merge on maps; removeIf on sets) used outside an explicit synchronized(<collection>) block. Read-only — does not rewrite to concurrent collections.",
+    "when_to_use": [
+      "auditing a file for the JLS gotcha that the synchronized wrapper's intrinsic lock does NOT serialize compound default-method operations",
+      "preparing an operator decision between (a) widening the synchronized region and (b) migrating to a concurrent collection",
+      "smoke-checking a Vaadin/Guice service that mixes synchronized wrappers with lambda-bodied default methods"
+    ],
+    "anti_patterns": [
+      "do not auto-rewrite synchronized wrappers to concurrent collections; that changes locking, iteration, and snapshot semantics",
+      "do not use as a project-wide concurrency lint — the audit is same-file only and does not trace cross-file aliasing",
+      "do not use on non-Java files",
+      "do not extend findings to non-listed operations (replaceAll, forEach, ...) without a follow-up that documents the JLS-level reasoning"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "project_dir",
+          "source"
+        ],
+        "properties": {
+          "project_dir": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string",
+            "description": "Java file to audit, relative to project_dir."
+          }
+        }
+      },
+      "prompt_template": "You are java-concurrency-antipattern-audit. Charter: Surface unsafe compound operations on Collections.synchronizedMap/synchronizedSet wrappers in one Java file. Analysis-only — never propose an apply.\n\nProtocol:\n\n1. Ground the file:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   Confirm the file parses as Java.\n\n2. Plan:\n   bbox_refactor_plan(kind=\"java_concurrency_antipattern_audit\",\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\")\n   The response carries:\n   - source / file (audited path)\n   - declarations: list of {variable, wrapper (\"map\"|\"set\"), scope (\"field\"|\"local\"), line, column}\n     for every Collections.synchronizedMap(...) / synchronizedSet(...) initializer in this file.\n   - findings: list of {line, column, variable, collection_wrapper, operation, confidence, reason}\n     for every map.computeIfAbsent/compute/merge or set.removeIf call on a wrapped collection\n     that is NOT enclosed in an explicit `synchronized (<variable>) { ... }` block keyed on\n     the same variable.\n\n3. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line summary: declaration count, finding count, top one or\n     two operations involved>). When findings is empty, say so explicitly (\"no unsafe\n     synchronized-wrapper compound ops on <source>\"). Mention the audit is same-file only;\n     do NOT silently extrapolate to whole-project safety.\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call bbox_refactor_apply on this atom — analysis-only.\n- Never call any tool outside the refactor persona tool surface.\n- Never propose ConcurrentHashMap migration as part of this atom's output;\n  surface findings and let the operator choose between widening the synchronized\n  region and migrating the collection.\n- Never claim cross-file or aliasing coverage — the audit traces simple\n  local/field declarations in one file.\n\nInputs:\n{{project_dir}} {{source}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "enum": [
+              "planned",
+              "applied",
+              "blocked",
+              "errored"
+            ]
+          },
+          "plan_path": {
+            "type": "string"
+          },
+          "files_touched": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "fixme_count": {
+            "type": "object",
+            "properties": {
+              "plan_only": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "warning": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          },
+          "deep_analysis_summary": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "cargo_result": {
+            "type": "object",
+            "properties": {
+              "command": {
+                "type": "string"
+              },
+              "exit_code": {
+                "type": "integer"
+              },
+              "summary": {
+                "type": "string"
+              },
+              "rolled_back": {
+                "type": "boolean"
+              }
+            }
+          },
+          "block_reason": {
+            "type": "string"
+          },
+          "done_note_id": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "file": {
+            "type": "string"
+          },
+          "declarations": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          },
+          "findings": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": {
+        "kind": "none"
+      }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": {
+      "oracle": "default"
+    },
+    "trace": {
+      "retain": "summary",
+      "portal_focus": "on_attention"
+    },
+    "cost_class": "cheap",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-19T00:00:00Z"
+    }
+  }
+}
