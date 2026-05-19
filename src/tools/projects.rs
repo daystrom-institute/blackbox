@@ -397,7 +397,18 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::projects::ProjectRecord;
+    use crate::server::state::{BlackboxServer, SharedState};
+    use crate::{entity_ref, knowledge, notes, pins, threads};
+    use rmcp::handler::server::wrapper::Parameters;
+    use serde_json::Value;
     use tempfile::tempdir;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
 
     #[test]
     fn project_init_creates_bbox_skeleton() {
@@ -540,5 +551,187 @@ mod tests {
             first[0].content_sha256, second[0].content_sha256,
             "hash must be stable across identical installs"
         );
+    }
+
+    #[test]
+    fn bbox_project_list_round_trips_through_tool_serialization() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let server = test_server(&tmp);
+
+        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
+            path: project.to_string_lossy().into_owned(),
+        }));
+        assert_ne!(register.is_error, Some(true));
+        let register_text = serde_json::to_value(&register).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let register_response: serde_json::Value = serde_json::from_str(&register_text).unwrap();
+        assert_eq!(
+            register_response["indexing"]["status"].as_str(),
+            Some("scheduled")
+        );
+        assert_eq!(
+            register_response["indexing"]["mode"].as_str(),
+            Some("background")
+        );
+
+        let listed = server.bbox_project_list();
+        assert_ne!(listed.is_error, Some(true));
+        let wire = serde_json::to_value(&listed).unwrap();
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        let response: ProjectListResponse = serde_json::from_str(text).unwrap();
+
+        assert_eq!(response.projects.len(), 1);
+        assert_eq!(
+            response.projects[0].project_id,
+            entity_ref::project_id_for_path(&project).unwrap()
+        );
+    }
+
+    #[test]
+    fn bbox_project_rename_migrates_project_scoped_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let old_project = tmp.path().join("old-project");
+        let new_project = tmp.path().join("new-project");
+        std::fs::create_dir_all(&old_project).unwrap();
+        std::fs::create_dir_all(&new_project).unwrap();
+        let old_project = std::fs::canonicalize(&old_project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let new_project = std::fs::canonicalize(&new_project)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let server = test_server(&tmp);
+
+        let register = server.bbox_project_register(Parameters(ProjectRegisterParams {
+            path: old_project.clone(),
+        }));
+        assert_ne!(register.is_error, Some(true));
+        let text = serde_json::to_value(&register).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let registered: ProjectRecord = serde_json::from_value(
+            serde_json::to_value(
+                &serde_json::from_str::<serde_json::Value>(&text).unwrap()["record"],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        server
+            .state
+            .kb
+            .write()
+            .remember(
+                &knowledge::RememberParams {
+                    content: "project fact".into(),
+                    category: None,
+                    title: Some("project fact".into()),
+                    scope: Some("project".into()),
+                    project: Some(old_project.clone()),
+                    decay: None,
+                    review_at: None,
+                    expires_at: None,
+                },
+                false,
+            )
+            .unwrap();
+        server
+            .state
+            .threads
+            .write()
+            .thread(&threads::ThreadParams {
+                action: "open".into(),
+                name: None,
+                id: None,
+                topic: Some("project thread".into()),
+                project: Some(old_project.clone()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: None,
+            })
+            .unwrap();
+        server
+            .state
+            .notes
+            .write()
+            .create(&notes::NoteParams {
+                kind: "learned".into(),
+                body: "project note".into(),
+                task_id: None,
+                session_id: None,
+                project: Some(old_project.clone()),
+                thread_id: None,
+                provider: None,
+                bro: None,
+            })
+            .unwrap();
+        server
+            .state
+            .pins
+            .write()
+            .pin(&pins::PinParams {
+                action: "set".into(),
+                id: None,
+                content: Some("project pin".into()),
+                title: Some("project pin".into()),
+                scope: Some("session".into()),
+                target: Some("sid".into()),
+                project: Some(old_project.clone()),
+                expires_at: None,
+            })
+            .unwrap();
+
+        let renamed = server.bbox_project_rename(Parameters(ProjectRenameParams {
+            project: registered.project_id.clone(),
+            new_path: new_project.clone(),
+            move_on_disk: None,
+            dry_run: None,
+        }));
+        assert_ne!(renamed.is_error, Some(true));
+        let text = serde_json::to_value(&renamed).unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let payload: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            payload["record"]["project_id"].as_str(),
+            Some(registered.project_id.as_str())
+        );
+        assert_eq!(
+            payload["record"]["canonical_path"].as_str(),
+            Some(new_project.as_str())
+        );
+        assert_eq!(payload["migrated_refs"]["knowledge"], 1);
+        assert_eq!(payload["migrated_refs"]["threads"], 1);
+        assert_eq!(payload["migrated_refs"]["notes"], 1);
+        assert_eq!(payload["migrated_refs"]["pins"], 1);
+
+        assert_eq!(
+            server.state.kb.read().all_entries()[0].project.as_deref(),
+            Some(new_project.as_str())
+        );
+        assert_eq!(
+            server.state.threads.read().all()[0].project.as_str(),
+            new_project.as_str()
+        );
+        assert_eq!(
+            server.state.notes.read().all()[0].project.as_deref(),
+            Some(new_project.as_str())
+        );
+        assert_eq!(server.state.pins.read().project_ref_count(&new_project), 1);
     }
 }
