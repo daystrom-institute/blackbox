@@ -73,7 +73,9 @@ the decomposition cleanup that the topology move exposed:
      `engine/hooks.rs` splits. Arc bookkeeping, policy-packet checks, and
      compaction anchors now live in `src/workflow/engine/arc_state.rs`. Sleep
      and signal wait node handling now lives in
-     `src/workflow/engine/wait_nodes.rs`.
+     `src/workflow/engine/wait_nodes.rs`. The node dispatch coordinator
+     (`run_node`, fork dispatch, activity-node mode routing) now lives in
+     `src/workflow/engine/node_dispatch.rs`.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
@@ -639,7 +641,10 @@ Landed:
 36. `src/workflow/engine/wait_nodes.rs` owns sleep node execution and signal
     wait registration/resolution/timeout handling previously embedded in
     `workflow/engine.rs`.
-37. Packet event/gap logging tests moved out of the shared
+37. `src/workflow/engine/node_dispatch.rs` owns node entry fan-in, fork
+    dispatch, and activity-node mode routing previously embedded in
+    `workflow/engine.rs`.
+38. Packet event/gap logging tests moved out of the shared
     `src/packets/tests.rs` island and into the `src/packets/events.rs` test
     module (`src/packets/events_tests.rs`).
 
