@@ -921,3 +921,7 @@ mod tests {
         assert_eq!(m, super::ApplyMode::All);
     }
 }
+
+#[cfg(test)]
+#[path = "apply_compose_tests.rs"]
+mod compose_tests;
