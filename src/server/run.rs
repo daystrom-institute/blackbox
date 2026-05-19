@@ -1,10 +1,10 @@
+use super::restore::restore_runtime_state;
 use super::startup::{
     configure_dispatch_mcp_env, discover_transcript_roots, init_logging, resolve_codex_root,
 };
 use super::*;
 use crate::*;
 use parking_lot::RwLock;
-use std::ffi::OsStr;
 use std::sync::Arc;
 
 pub async fn run() -> anyhow::Result<()> {
@@ -408,148 +408,7 @@ pub async fn run() -> anyhow::Result<()> {
         }
     }
 
-    // Restore webhook + workflow registries from disk so installs
-    // survive daemon restart. Re-run install_check at restore time —
-    // a webhook installed under loopback that's now being restored
-    // under a public bind must NOT silently re-enable.
-    let webhook_dir = shared.store_dir.join("webhooks");
-    for spec in webhooks::load_all(&webhook_dir) {
-        match webhooks::install_check(&spec.signature, shared.bind_is_loopback) {
-            Ok(()) => {
-                tracing::info!("restoring webhook '{}'", spec.name);
-                shared.webhooks.install(spec);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    "skipping restore of webhook '{}': install_check failed: {e}",
-                    spec.name
-                );
-            }
-        }
-    }
-    // Pollers — re-spawn the per-spec tick loop on startup so installs
-    // survive daemon restart. Same store_dir/<name>.json shape as
-    // webhooks; tick loop owns the schedule.
-    let poller_dir = shared.store_dir.join("pollers");
-    for spec in pollers::load_all(&poller_dir) {
-        tracing::info!(
-            "restoring poller '{}' (every {}s)",
-            spec.name,
-            spec.every_seconds
-        );
-        shared.pollers.install(spec.clone());
-        let handle = pollers::spawn_loop(shared.clone(), spec.clone());
-        shared.pollers.track_handle(&spec.name, handle);
-    }
-    // Crons — same restore-on-startup story. Schedule-validation
-    // failures here log + skip rather than crash the daemon, mirroring
-    // the webhook restore semantics (operator-installed specs may have
-    // outlived a syntax change).
-    let cron_dir = shared.store_dir.join("crons");
-    for spec in crons::load_all(&cron_dir) {
-        match crons::validate_schedule(&spec.schedule) {
-            Ok(()) => {
-                tracing::info!(
-                    "restoring cron '{}' (schedule '{}', concurrency {})",
-                    spec.name,
-                    spec.schedule,
-                    spec.concurrency
-                );
-                shared.crons.install(spec.clone());
-                let handle = crons::spawn_loop(shared.clone(), spec.clone());
-                shared.crons.track_handle(&spec.name, handle);
-            }
-            Err(e) => {
-                tracing::warn!("skipping restore of cron '{}': {e}", spec.name);
-            }
-        }
-    }
-    // Whiteboards — restore active boards from disk so phase state +
-    // posts + annotations + votes survive daemon restart. Boards mid-
-    // arc benefit most; archived boards live separately at
-    // <store>/whiteboards/archive/.
-    let whiteboard_dir = shared.store_dir.join("whiteboards");
-    if let Err(e) = shared.whiteboards.set_storage_dir(whiteboard_dir.clone()) {
-        tracing::warn!("whiteboards storage init failed: {e}");
-    } else {
-        let restored = shared.whiteboards.list_ids().len();
-        if restored > 0 {
-            tracing::info!("restored {restored} active whiteboard(s)");
-        }
-    }
-    // Councils — restore session/posts/envelopes from
-    // <store>/councils/<id>/, then respawn drain workers for any
-    // queued envelopes. Envelopes left in `Draining` from a prior
-    // crash are reconciled by `respawn_workers_after_restart`:
-    // marked done if a referencing post landed before the crash,
-    // requeued (with attempt_count++) otherwise, failed once the
-    // attempt budget is exhausted.
-    let council_dir = shared.store_dir.join("councils");
-    if let Err(e) = shared.councils.set_storage_dir(council_dir.clone()) {
-        tracing::warn!("council storage init failed: {e}");
-    } else {
-        let restored = shared.councils.list_ids().len();
-        if restored > 0 {
-            tracing::info!("restored {restored} council(s)");
-        }
-        shared
-            .councils
-            .respawn_workers_after_restart(shared.clone());
-    }
-    let workflow_dir = shared.store_dir.join("workflows");
-    if workflow_dir.exists() {
-        if let Ok(entries) = std::fs::read_dir(&workflow_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension() != Some(OsStr::new("json")) {
-                    continue;
-                }
-                if let Ok(bytes) = std::fs::read(&path) {
-                    if let Ok(spec) = serde_json::from_slice::<workflow::Workflow>(&bytes) {
-                        let id = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or(&spec.name)
-                            .to_string();
-                        tracing::info!("restoring workflow '{id}'");
-                        shared.workflow_registry.write().insert(id, spec);
-                    }
-                }
-            }
-        }
-    }
-    match routes::restore_runtime_artifacts_from_catalog(&shared) {
-        Ok(restored) if restored > 0 => {
-            tracing::info!(
-                "restored {restored} workflow/packet/brofile runtime artifact(s) from active catalog"
-            );
-        }
-        Ok(_) => {}
-        Err(err) => {
-            tracing::warn!(
-                "failed to restore workflow/packet/brofile runtime artifacts from active catalog: {err:#}"
-            );
-        }
-    }
-
-    // Reactions — restore installed reaction specs from disk so they
-    // survive daemon restart. Bad specs are logged and skipped; warnings
-    // are available via reaction_list.
-    let reaction_warnings = shared.system_events.restore_reactions_from_disk().await;
-    if !reaction_warnings.is_empty() {
-        tracing::warn!("reaction restore: {} warning(s)", reaction_warnings.len());
-    }
-
-    // Outbox crash recovery — requeue stale claimed records with
-    // idempotency keys, dead-letter non-idempotent stale claims.
-    let recovery = shared.system_events.outbox_store().recover_stale_claims();
-    if recovery.requeued > 0 || recovery.dead_lettered > 0 {
-        tracing::info!(
-            "outbox recovery: {} requeued, {} dead-lettered",
-            recovery.requeued,
-            recovery.dead_lettered
-        );
-    }
+    restore_runtime_state(&shared).await;
 
     // Startup compaction — drop events older than 7 days / cap at 10k,
     // and drop succeeded outbox records older than 7 days. Failures

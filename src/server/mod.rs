@@ -2,6 +2,7 @@ pub mod dispatch;
 pub mod handler;
 pub mod progress;
 pub mod response;
+mod restore;
 pub mod routes;
 mod run;
 pub mod schema;

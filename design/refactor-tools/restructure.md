@@ -42,8 +42,10 @@ the decomposition cleanup that the topology move exposed:
 2. **Split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root
      resolution, and dispatch MCP env setup.
-   - Remaining candidate modules: `server/restore.rs` for registry restoration
-     and `server/http.rs` or `server/mcp.rs` for router/MCP service assembly.
+   - `server/restore.rs` now owns webhook, poller, cron, whiteboard, council,
+     workflow, catalog-runtime-artifact, reaction, and outbox startup recovery.
+   - Remaining candidate modules: `server/http.rs` or `server/mcp.rs` for
+     router/MCP service assembly.
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
@@ -107,8 +109,9 @@ lines. It is no longer the 17K-line god file described above or even the
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
 | `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
-| `src/server/run.rs` | 882 | Daemon bootstrap glue: state open, registry restoration, router assembly, background tasks, graceful shutdown |
+| `src/server/run.rs` | 741 | Daemon bootstrap glue: state open, router assembly, background tasks, graceful shutdown |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
+| `src/server/restore.rs` | 161 | Registry/runtime restoration and crash recovery helpers called by `server/run.rs` |
 
 The highest-value remaining topology work is no longer in `main.rs`. It is:
 
@@ -528,6 +531,8 @@ Landed:
 12. `src/tools/notes.rs` uses explicit imports instead of the lib-root
     compatibility prelude, and `dispatch_mcp_url` no longer needs a lib-root
     re-export for startup setup.
+13. `src/server/restore.rs` owns registry/runtime restoration previously
+    embedded in `server/run.rs`.
 
 Next useful cuts:
 
@@ -539,10 +544,9 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Split daemon bootstrap by startup concern.**
-   - Candidate boundaries: config/state opening, registry restoration, MCP
-     service construction, background task spawning, and shutdown wiring.
-   - Likely next target files: `server/restore.rs` and `server/http.rs` or
-     `server/mcp.rs`.
+   - Candidate boundaries: config/state opening, MCP service construction,
+     background task spawning, and shutdown wiring.
+   - Likely next target files: `server/http.rs` or `server/mcp.rs`.
    - Keep `server/run.rs` as orchestration glue rather than moving everything
      into another catch-all file.
 
