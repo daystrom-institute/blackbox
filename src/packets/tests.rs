@@ -1,12 +1,6 @@
 use super::*;
+use super::test_support::tmp_packets;
 use serde_json::json;
-use tempfile::TempDir;
-
-fn tmp_packets() -> (TempDir, Packets) {
-    let dir = TempDir::new().unwrap();
-    let packets = Packets::open(dir.path()).unwrap();
-    (dir, packets)
-}
 
 /// Build the E8 authorization matrix packet (the merged Gemini-style
 /// encoding from thread-0b20e854) as a typed Rust value. This is the

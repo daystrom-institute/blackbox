@@ -1,5 +1,6 @@
 use crate::server::*;
 use crate::*;
+use crate::packets::packet_matches_query;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::knowledge_tools()

@@ -14,18 +14,10 @@ use exec_args::{
     CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE, CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE,
 };
 pub use exec_args::{ExecOpts, exec_opts_with_provider_defaults, resolve_bin};
-#[allow(unused_imports)]
-pub use mcp_args::MatchState;
-#[allow(unused_imports)]
-pub use mcp_args::{claude_mcp_config_json, transient_blackbox_name, transient_blackbox_url};
+pub use mcp_args::{transient_blackbox_name, transient_blackbox_url};
 #[cfg(test)]
-use mcp_args::{copilot_format_mcp_tool, format_toml_string_array};
-#[allow(unused_imports)]
-pub use session::{
-    discover_gemini_session, discover_vibe_session, resolve_claude_session_cwd,
-    resolve_codex_session_cwd, resolve_copilot_session_cwd, resolve_gemini_session_cwd,
-    resolve_vibe_session_cwd,
-};
+use mcp_args::{MatchState, copilot_format_mcp_tool, format_toml_string_array};
+pub use session::{discover_gemini_session, discover_vibe_session};
 #[cfg(test)]
 use session::{
     discover_gemini_session_in, resolve_claude_session_cwd_in, resolve_codex_session_cwd_in,
