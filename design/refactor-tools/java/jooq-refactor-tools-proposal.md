@@ -1,7 +1,7 @@
 ---
 title: "jOOQ Refactor Tools Proposal"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -11,12 +11,26 @@ tags:
   - refactor-tools
   - java
   - jooq
-  - proposed-atoms
-status: "proposed; awaiting implementation"
-brief: "Proposed jOOQ-aware Java refactor plan kinds and atoms for query extraction, repository synthesis, transaction hardening, codegen inventory, and typed projection support."
+  - implemented-atoms
+status: "archived as implemented in the jOOQ Java refactor toolsuite"
+brief: "Implemented jOOQ-aware Java refactor plan kinds and atoms for query extraction, repository synthesis, transaction hardening, codegen inventory, and typed projection support."
 ---
 
 # jOOQ Refactor Tools Proposal
+
+## Implementation Status
+
+Archived on 2026-05-19. The implemented surface includes the jOOQ read-only
+analysis/audit/inventory plan kinds, conservative mutating query extraction and
+synthesis plan kinds, transaction boundary normalization, generated-record
+boundary hardening, codegen extension planning, thin wrapper atoms, discovery/
+dispatch/behavior-smoke eval rows, and Java plan-kind atom guard coverage.
+
+This document remains as the design and acceptance record. Current behavior is
+owned by `src/refactor/java/jooq_analysis.rs`,
+`src/refactor/java/jooq_mutations.rs`, atom manifests under
+`system-defaults/atoms/refactor/java-jooq-*.json`, and eval catalog entries
+under `eval/atoms/refactor/`.
 
 ## Motivation
 
