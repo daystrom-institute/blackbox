@@ -125,10 +125,6 @@ use knowledge::KnowledgeListParams;
 use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams};
 use packets::apply_with as apply_packet_with;
-use refactor::{
-    RefactorApplyParams, RefactorPlanParams, RefactorProjectRefsParams, RefactorRunParams,
-    RefactorStatusParams,
-};
 pub(crate) use server::*;
 pub(crate) use tools::bro_helpers::*;
 pub(crate) use tools::bro_params::*;

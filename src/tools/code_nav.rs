@@ -2,8 +2,12 @@ use crate::code_nav::{
     CodeNodeDescribeParams, CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
     code_node_describe, code_query, code_refs, code_symbols,
 };
-use crate::server::*;
-use crate::*;
+use crate::server::BlackboxServer;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::code_nav_tools()
