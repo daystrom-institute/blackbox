@@ -48,6 +48,9 @@ the decomposition cleanup that the topology move exposed:
      service construction.
    - `server/shutdown.rs` now owns signal handling, graceful HTTP shutdown, and
      post-shutdown persistence/flush.
+   - `server/background.rs` now owns post-state startup tasks such as Badgey
+     restore, embed/vector warmup, watchers, event bridges, runtime restore,
+     event compaction, outbox worker, and packet scanner startup.
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
@@ -111,8 +114,9 @@ lines. It is no longer the 17K-line god file described above or even the
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
 | `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
-| `src/server/run.rs` | 523 | Daemon bootstrap glue: state open, background tasks, bind/listen |
+| `src/server/run.rs` | 283 | Daemon bootstrap glue: state open, bind/listen |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
+| `src/server/background.rs` | 243 | Post-state startup tasks, watchers, event bridges, runtime restore, and scanner startup |
 | `src/server/restore.rs` | 161 | Registry/runtime restoration and crash recovery helpers called by `server/run.rs` |
 | `src/server/mcp.rs` | 131 | Axum route assembly plus Streamable HTTP MCP service construction |
 | `src/server/shutdown.rs` | 129 | Signal handling, graceful HTTP shutdown, post-shutdown persistence and vector flush |
@@ -541,6 +545,9 @@ Landed:
     construction previously embedded in `server/run.rs`.
 15. `src/server/shutdown.rs` owns shutdown signal handling, graceful HTTP serve
     termination, task persistence, LSP shutdown, and vector flush.
+16. `src/server/background.rs` owns post-state startup tasks previously embedded
+    in `server/run.rs`; the move also removed three now-unused compatibility
+    prelude exports/imports from `src/lib.rs` and `src/server/mod.rs`.
 
 Next useful cuts:
 
@@ -552,7 +559,7 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Split daemon bootstrap by startup concern.**
-   - Candidate boundaries: config/state opening and background task spawning.
+   - Candidate boundary: config/state opening.
    - Keep `server/run.rs` as orchestration glue rather than moving everything
      into another catch-all file.
 

@@ -119,7 +119,7 @@ use notes::Notes;
 use orchestration::providers::{ExecOpts, Provider};
 use orchestration::tail::TailEvent;
 use orchestration::{self as orch, TaskStore};
-use packets::{Packets, ScannerConfig};
+use packets::Packets;
 use pins::{AmbientPinQuery, PinParams, Pins};
 use projects::{
     ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry,
@@ -163,7 +163,6 @@ use refactor::{
 };
 pub(crate) use server::*;
 use threads::{ThreadListParams, ThreadParams};
-pub(crate) use tools::badgey_adapter::*;
 pub(crate) use tools::bro_helpers::*;
 pub(crate) use tools::bro_params::*;
 pub(crate) use tools::bro_runtime_params::*;

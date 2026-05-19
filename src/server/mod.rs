@@ -1,3 +1,4 @@
+mod background;
 pub mod dispatch;
 pub mod handler;
 mod mcp;
@@ -22,7 +23,6 @@ pub(crate) use progress::*;
 pub(crate) use routes::*;
 pub use run::run;
 pub(crate) use state::*;
-pub(crate) use storage_gc::*;
 pub(crate) use tail::*;
 pub(crate) use workflow_capabilities::*;
 
