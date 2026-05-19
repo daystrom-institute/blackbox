@@ -28,9 +28,7 @@ pub mod code_nav;
 pub mod config;
 mod council;
 mod crons;
-mod dispatch_mcp;
-#[cfg(test)]
-pub(crate) use dispatch_mcp::dispatch_mcp_url;
+pub mod dispatch_mcp;
 mod edge_index;
 mod embed;
 mod embed_queue;

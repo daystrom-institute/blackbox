@@ -130,6 +130,8 @@ large-module and test-locality cleanup that the topology move exposed:
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
      its crate dependencies explicitly; moving it to integration tests remains
      a separate locality cleanup.
+   - Dispatch MCP startup URL tests now live in top-level integration test
+     `tests/dispatch_mcp.rs` and use `blackbox::dispatch_mcp`.
    - The remaining shared packet test island in `src/packets/tests.rs` now uses
      explicit imports instead of `use super::*`; moving those cases into
      per-module test blocks remains opportunistic locality work.
@@ -177,7 +179,7 @@ lines. It is no longer the 17K-line god file described above or even the
 | File | Lines | Content |
 |------|-------|---------|
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
-| `src/lib.rs` | 97 | Lib-owned module declarations plus the agent-query embed cache helper |
+| `src/lib.rs` | 95 | Lib-owned module declarations plus the agent-query embed cache helper |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
 | `src/server/run.rs` | 45 | Daemon bootstrap glue: logging, open state, start background tasks, bind/listen |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
@@ -690,6 +692,8 @@ Landed:
     `use crate::*` dependencies and root compatibility re-exports for
     `SharedState`, `BlackboxServer`, `ArcSnapshot`, and bro parameter types are
     gone.
+44. Dispatch MCP startup URL tests moved from the root unit-test island to
+    `tests/dispatch_mcp.rs`.
 
 Next useful cuts:
 

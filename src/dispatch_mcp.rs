@@ -1,9 +1,9 @@
-pub(crate) fn dispatch_mcp_url(bind_host: &str, port: u16) -> String {
+pub fn dispatch_mcp_url(bind_host: &str, port: u16) -> String {
     let host = dispatch_mcp_host(bind_host);
     format!("http://{host}:{port}/mcp?surface=agent-internal")
 }
 
-pub(crate) fn dispatch_mcp_host(bind_host: &str) -> &str {
+pub fn dispatch_mcp_host(bind_host: &str) -> &str {
     match bind_host.trim() {
         "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1",
         other => other,
