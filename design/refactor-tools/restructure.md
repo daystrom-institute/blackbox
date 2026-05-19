@@ -67,7 +67,8 @@ the decomposition cleanup that the topology move exposed:
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
-     in `src/workflow/ops/worktree.rs`.
+     in `src/workflow/ops/worktree.rs`. System-event hook helpers now live in
+     `src/workflow/ops/system_events.rs`.
    - `src/orchestration/providers.rs`: split catalog, credentials, and provider
      resolution when touching that area.
 
@@ -560,6 +561,9 @@ Landed:
     previously embedded in `workflow/ops.rs`.
 19. `src/workflow/ops/worktree.rs` owns worktree create/remove hook-op helpers
     previously embedded in `workflow/ops.rs`.
+20. `src/workflow/ops/system_events.rs` owns system-event compaction and
+    identity-requirement hook-op helpers previously embedded in
+    `workflow/ops.rs`.
 
 Next useful cuts:
 

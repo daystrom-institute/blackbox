@@ -14,6 +14,7 @@
 //! runs. That stays with the gate packet at the node level. A misuse
 //! that would do that should be refactored into a node + gate.
 
+mod system_events;
 mod vector;
 mod worktree;
 
@@ -31,6 +32,7 @@ use crate::chunker::{EdgeConfidence, EdgeProvenance};
 use crate::entity_ref::EntityRef;
 
 use super::context::{ArcContext, VarsSchema, resolve_arg_value};
+use system_events::{exec_require_identity, exec_system_event_compact};
 use vector::{exec_compact_vector_partitions, exec_read_vector_status, exec_rebuild_hnsw};
 use worktree::{exec_worktree_create, exec_worktree_remove};
 
@@ -319,25 +321,6 @@ pub async fn execute_op_with_hub(
             exec_require_identity(&rendered_args, hook.into_var.as_deref(), hub).await
         }
     }
-}
-
-fn exec_system_event_compact(
-    args: &Value,
-    into_var: Option<&str>,
-    hub: &crate::system_events::SharedEventHub,
-) -> Result<OpEffect> {
-    let now = args
-        .get("now")
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(crate::util::now_iso);
-    let report = hub.compact_with_now(&now)?;
-    Ok(OpEffect::SetVar {
-        key: into_var
-            .unwrap_or("system_event_compaction_result")
-            .to_string(),
-        value: serde_json::to_value(report)?,
-    })
 }
 
 async fn exec_read_session(
@@ -941,76 +924,6 @@ fn resolve_secret_header_value(value: &str) -> Result<String> {
     let prefix = &value[..start];
     let suffix = &rest[end..];
     Ok(format!("{}{}{}", prefix, secret.expose(), suffix))
-}
-
-async fn exec_require_identity(
-    args: &Value,
-    into_var: Option<&str>,
-    hub: &crate::system_events::SharedEventHub,
-) -> Result<OpEffect> {
-    let scope = args
-        .get("scope")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("require_identity requires args.scope"))?;
-    let instance = args
-        .get("instance")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("require_identity requires args.instance"))?;
-    let bro = args
-        .get("bro")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("require_identity requires args.bro"))?;
-    let provider = args
-        .get("provider")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("require_identity requires args.provider"))?;
-    let model = args
-        .get("model")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("require_identity requires args.model"))?;
-    let effort = args
-        .get("effort")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let project = args
-        .get("project")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let owner = args
-        .get("owner")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let repo = args
-        .get("repo")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-
-    let req = crate::system_events::identity::IdentityRequest {
-        scope: scope.to_string(),
-        instance: instance.to_string(),
-        bro: bro.to_string(),
-        provider: provider.to_string(),
-        model: model.to_string(),
-        effort,
-        project,
-        owner,
-        repo,
-    };
-
-    let into = into_var.unwrap_or("identity_result");
-    match hub.require_identity(&req).await? {
-        Some(identity) => Ok(OpEffect::SetVar {
-            key: into.to_string(),
-            value: json!({
-                "status": "ready",
-                "identity": serde_json::to_value(&identity)?
-            }),
-        }),
-        None => Ok(OpEffect::SetVar {
-            key: into.to_string(),
-            value: json!({ "status": "pending", "identity": null }),
-        }),
-    }
 }
 
 // ── Built-in op implementations ──────────────────────────────────
