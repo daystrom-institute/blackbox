@@ -45,7 +45,15 @@ Not for user-stated rules. Those go to durable memory.
 
 ### `done`
 
-Always emit one. This is the orchestrator's fastest acceptance signal.
+Emit one when you are the dispatched executor for a bro/task/workflow/atom. This
+includes work launched through `bro_*` MCP tools, `bro_agent_dispatch`,
+workflow actors, atom invocations, and team broadcasts. The done note is the
+orchestrator's fastest acceptance signal for delegated work.
+
+Do not emit `done` merely because you performed a direct operator-side MCP
+lookup, inbox/status probe, cancellation, note resolution, or timing report.
+Those are controller actions unless they are themselves running inside a
+dispatched executor context.
 
 ## What to keep out
 
@@ -55,6 +63,7 @@ Always emit one. This is the orchestrator's fastest acceptance signal.
 
 ## Hot/cold split
 
-The only always-hot invariant worth rendering is: emit `done`, and keep notes high-signal.
+The only always-hot invariant worth rendering is: dispatched executors emit
+`done`, and all notes stay high-signal.
 
 The rest belongs here.
