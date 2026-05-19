@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use serde_json::json;
 
 use super::super::test_support::tmp_packets;
-use super::super::{CompileParams, apply, apply_all};
+use super::super::{
+    CompileParams, Emit, Packet, Predicate, Rule, Value, apply, apply_all, default_rank_lookup_key,
+    default_threshold_lookup_key, packet_matches_query, packet_summary,
+};
 
 fn compile_params(domain: &str, rules: serde_json::Value) -> CompileParams {
     CompileParams {
@@ -48,6 +51,127 @@ fn compile_tool_happy_path() {
     let packets = store.list_all().unwrap();
     assert_eq!(packets.len(), 1);
     assert_eq!(packets[0].rules.len(), 2);
+}
+
+#[test]
+fn packet_list_helpers_match_and_summarize() {
+    // Exercises the helpers bbox_packet_list / bbox_knowledge share:
+    // packet_matches_query and packet_summary. Covers substring match
+    // across id / domain / rule ids / classifications, the classification
+    // histogram, the rule-id preview, and the latest-per-domain dedup
+    // semantics (consumers rely on list_all being newest-first).
+    fn mk_rule(id: &str, cls: &str) -> Rule {
+        Rule {
+            id: id.to_string(),
+            antecedent: Predicate::AlwaysTrue {},
+            consequent: Value::String(cls.to_uppercase()),
+            classification: cls.to_string(),
+            emit: Emit::Independent,
+            confidence: 1.0,
+            provenance: vec![],
+        }
+    }
+
+    fn mk_packet(id: &str, domain: &str, created_at: &str, rules: Vec<Rule>) -> Packet {
+        Packet {
+            id: id.to_string(),
+            domain: domain.to_string(),
+            scope: "global".to_string(),
+            project: None,
+            rank_table: BTreeMap::new(),
+            threshold_table: BTreeMap::new(),
+            rank_lookup_key: default_rank_lookup_key(),
+            threshold_lookup_key: default_threshold_lookup_key(),
+            classification_lattice: vec![
+                "fail".to_string(),
+                "flag".to_string(),
+                "pass".to_string(),
+            ],
+            prefix_inference: BTreeMap::new(),
+            rules,
+            source_ids: vec![],
+            self_audit_fidelity: None,
+            created_at: created_at.to_string(),
+            updated_at: created_at.to_string(),
+            superseded_by: None,
+            merged_from: vec![],
+        }
+    }
+
+    let pr_triage_old = mk_packet(
+        "packet-11111111",
+        "pr-triage",
+        "2026-01-01T00:00:00Z",
+        vec![
+            mk_rule("breaking_api_change", "fail"),
+            mk_rule("missing_tests", "flag"),
+        ],
+    );
+    let pr_triage_new = mk_packet(
+        "packet-22222222",
+        "pr-triage",
+        "2026-04-19T00:00:00Z",
+        vec![
+            mk_rule("breaking_api_change", "fail"),
+            mk_rule("missing_tests", "flag"),
+            mk_rule("all_clean", "pass"),
+        ],
+    );
+    let auth_matrix = mk_packet(
+        "packet-33333333",
+        "auth-matrix",
+        "2026-02-14T00:00:00Z",
+        vec![
+            mk_rule("deny_reader_team", "fail"),
+            mk_rule("allow_owner_any", "pass"),
+        ],
+    );
+
+    // --- packet_matches_query ---
+    assert!(packet_matches_query(&pr_triage_new, "PR-triage")); // domain hit (case-insensitive)
+    assert!(packet_matches_query(&pr_triage_new, "breaking")); // rule id hit
+    assert!(packet_matches_query(&pr_triage_new, "FAIL")); // classification lattice hit
+    assert!(packet_matches_query(&auth_matrix, "33333333")); // id hit
+    assert!(!packet_matches_query(&auth_matrix, "retry")); // miss
+    // empty query degenerates to false - caller is responsible for
+    // skipping the filter on empty queries; the helper just answers.
+    assert!(!packet_matches_query(&auth_matrix, "zzzzz"));
+
+    // --- packet_summary ---
+    let summary = packet_summary(&pr_triage_new);
+    assert_eq!(summary["id"], "packet-22222222");
+    assert_eq!(summary["domain"], "pr-triage");
+    assert_eq!(summary["rules_count"], 3);
+    // Histogram counts by classification
+    let hist = &summary["classification_histogram"];
+    assert_eq!(hist["fail"], 1);
+    assert_eq!(hist["flag"], 1);
+    assert_eq!(hist["pass"], 1);
+    let preview = summary["rule_ids_preview"].as_array().unwrap();
+    assert_eq!(preview.len(), 3);
+    assert_eq!(preview[0], "breaking_api_change");
+
+    let (_dir, store) = tmp_packets();
+    store.save_packet(&pr_triage_old).unwrap();
+    store.save_packet(&pr_triage_new).unwrap();
+    store.save_packet(&auth_matrix).unwrap();
+
+    // list_all is newest-first across all packets, and callers can do
+    // latest-per-domain by keeping the first domain they see.
+    let listed = store.list_all().unwrap();
+    assert_eq!(listed.len(), 3);
+    assert_eq!(listed[0].id, "packet-22222222");
+    assert_eq!(listed[1].id, "packet-33333333");
+    assert_eq!(listed[2].id, "packet-11111111");
+
+    let mut seen = std::collections::HashSet::new();
+    let deduped: Vec<_> = listed
+        .into_iter()
+        .filter(|pkt| seen.insert(pkt.domain.clone()))
+        .collect();
+    assert_eq!(deduped.len(), 2);
+    assert_eq!(deduped[0].id, "packet-22222222");
+    assert_eq!(deduped[1].id, "packet-33333333");
 }
 
 #[test]
@@ -370,5 +494,33 @@ fn classification_mismatch_error_no_inference_hint_when_explicit() {
     assert!(
         !msg.contains("INFERRED"),
         "explicit classification should not trigger inference hint, got: {msg}"
+    );
+}
+
+#[test]
+fn classification_info_explicitly_preserved_over_prefix_inference() {
+    // The phase-2 bug Codex caught: compile loop upgraded every Info
+    // from the id prefix, so explicit `classification: "info"` was erased.
+    // Post-phase-3: the field is `classification`, and explicit values
+    // still beat id-prefix inference.
+    let (_dir, store) = tmp_packets();
+    let params = compile_params(
+        "classification-preserve",
+        json!([
+            // Prefix says FAIL, but caller EXPLICITLY says Info - must preserve.
+            {"id": "fail_x", "classification": "info", "antecedent": {"op": "True"}, "consequent": "X"},
+            // No classification declared - infer from prefix.
+            {"id": "fail_y", "antecedent": {"op": "True"}, "consequent": "Y"},
+        ]),
+    );
+    store.compile(&params).unwrap();
+    let packet = &store.list_all().unwrap()[0];
+    assert_eq!(
+        packet.rules[0].classification, "info",
+        "explicit info must survive prefix inference"
+    );
+    assert_eq!(
+        packet.rules[1].classification, "fail",
+        "no classification declared -> infer from prefix"
     );
 }
