@@ -1,6 +1,13 @@
-use crate::server::*;
-use crate::*;
+use crate::packets;
+use crate::server::BlackboxServer;
+use crate::server::surface;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
+use serde::Deserialize;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::mcp_surface_tools()
@@ -141,9 +148,9 @@ impl BlackboxServer {
             .map(|r| {
                 let classification = r.classification.as_str();
                 let matching_surface = match &r.antecedent {
-                    crate::packets::Predicate::Eq { field, value } if field == "surface" => {
+                    packets::Predicate::Eq { field, value } if field == "surface" => {
                         match value {
-                            crate::packets::Value::String(s) => s.clone(),
+                            packets::Value::String(s) => s.clone(),
                             other => format!("{:?}", other),
                         }
                     }
