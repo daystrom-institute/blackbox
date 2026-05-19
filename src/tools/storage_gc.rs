@@ -1,6 +1,11 @@
-use crate::server::*;
-use crate::*;
+use crate::server::BlackboxServer;
+use crate::storage_health;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -104,7 +109,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<StorageGcParams>,
     ) -> CallToolResult {
         Self::run("bbox_storage_gc", || {
-            let edges_dir = crate::storage_health::find_edges_dir(&self.state.store_dir, None);
+            let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
 
             let registered: std::collections::HashSet<String> = {
                 let guard = self.state.projects.read();
@@ -121,7 +126,7 @@ impl BlackboxServer {
                 None
             };
 
-            let gc_params = crate::storage_health::GcParams {
+            let gc_params = storage_health::GcParams {
                 dry_run: p.dry_run,
                 project_filter,
                 prune_backups: p.prune_backups,
@@ -132,34 +137,34 @@ impl BlackboxServer {
                 keep_newest_backup_per_source: p.keep_newest_backup_per_source,
             };
 
-            let policy = crate::storage_health::GcPolicy {
-                materialized_snapshots: crate::storage_health::SnapshotRetentionPolicy {
+            let policy = storage_health::GcPolicy {
+                materialized_snapshots: storage_health::SnapshotRetentionPolicy {
                     keep_active: true,
                     keep_recent_per_workspace: p.keep_recent_snapshots_per_workspace,
                     keep_recent_per_repo: p.keep_recent_snapshots_per_repo,
                     branch_switch_grace_minutes: p.branch_switch_grace_minutes,
                     max_age_days: p.max_snapshot_age_days,
                 },
-                backups: crate::storage_health::BackupRetentionPolicy {
+                backups: storage_health::BackupRetentionPolicy {
                     max_total_bytes: p.max_backup_total_bytes,
                 },
-                orphans: crate::storage_health::OrphanRetentionPolicy {
+                orphans: storage_health::OrphanRetentionPolicy {
                     auto_prune_after_days: p.orphan_auto_prune_after_days,
                     prune_explicitly_unregistered: p.prune_explicitly_unregistered,
                 },
-                observed: crate::storage_health::ObservedRetentionPolicy {
+                observed: storage_health::ObservedRetentionPolicy {
                     max_bytes_per_project: p.max_observed_bytes_per_project,
                 },
             };
 
-            let candidates = crate::storage_health::plan_gc_with_policy(
+            let candidates = storage_health::plan_gc_with_policy(
                 &edges_dir,
                 &registered,
                 &gc_params,
                 &policy,
             )?;
 
-            let deletable: Vec<&crate::storage_health::GcCandidate> = candidates
+            let deletable: Vec<&storage_health::GcCandidate> = candidates
                 .iter()
                 .filter(|c| c.deletable && !c.path.is_empty())
                 .collect();
@@ -169,11 +174,11 @@ impl BlackboxServer {
             let (deleted, delete_errors) = if p.dry_run {
                 (None, None)
             } else {
-                let (d, e) = crate::storage_health::apply_gc(&candidates);
+                let (d, e) = storage_health::apply_gc(&candidates);
                 (Some(d), if e.is_empty() { None } else { Some(e) })
             };
 
-            let result = crate::storage_health::GcResult {
+            let result = storage_health::GcResult {
                 applied: !p.dry_run,
                 candidates,
                 deletable_count,

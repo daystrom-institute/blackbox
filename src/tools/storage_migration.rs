@@ -1,6 +1,13 @@
-use crate::server::*;
-use crate::*;
+use std::path::Path;
+
+use crate::server::BlackboxServer;
+use crate::{edge_index, migration, storage_health};
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -33,7 +40,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<StorageMigrationParams>,
     ) -> CallToolResult {
         Self::run("bbox_storage_migrate_legacy_edges", || {
-            let edges_dir = crate::storage_health::find_edges_dir(&self.state.store_dir, None);
+            let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
 
             let registered: std::collections::HashSet<String> = {
                 let guard = self.state.projects.read();
@@ -45,7 +52,7 @@ impl BlackboxServer {
                 let targets =
                     resolve_dry_run_targets(&registered, &edges_dir, p.project.as_deref());
                 for project_id in targets {
-                    match crate::edge_index::plan_legacy_edge_extraction(&edges_dir, &project_id) {
+                    match edge_index::plan_legacy_edge_extraction(&edges_dir, &project_id) {
                         Ok(plan) => {
                             results.push(serde_json::to_value(&plan).unwrap_or_default());
                         }
@@ -84,11 +91,11 @@ impl BlackboxServer {
                     }
                 }
             };
-            let recovery = crate::migration::recover_pending_migrations(&edges_dir)?;
+            let recovery = migration::recover_pending_migrations(&edges_dir)?;
             if !recovery.is_empty() {
                 tracing::info!(?recovery, "recovered pending migrations before apply");
             }
-            let manifest = crate::migration::apply_migration(&edges_dir, &project_id)?;
+            let manifest = migration::apply_migration(&edges_dir, &project_id)?;
 
             Ok(serde_json::to_string_pretty(&serde_json::json!({
                 "mode": "apply",
