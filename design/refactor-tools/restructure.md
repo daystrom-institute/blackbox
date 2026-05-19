@@ -96,7 +96,8 @@ the decomposition cleanup that the topology move exposed:
 
 4. **Improve test locality opportunistically.**
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
-     as packet modules change.
+     as packet modules change. Packet event/gap logging tests now live under
+     `src/packets/events.rs` via `src/packets/events_tests.rs`.
    - Move daemon-startup-shaped tests to integration tests using `blackbox::`
      imports.
    - First locality cut landed outside packets: secret-header helper tests moved
@@ -637,6 +638,9 @@ Landed:
 36. `src/workflow/engine/wait_nodes.rs` owns sleep node execution and signal
     wait registration/resolution/timeout handling previously embedded in
     `workflow/engine.rs`.
+37. Packet event/gap logging tests moved out of the shared
+    `src/packets/tests.rs` island and into the `src/packets/events.rs` test
+    module (`src/packets/events_tests.rs`).
 
 Next useful cuts:
 
@@ -652,8 +656,8 @@ Next useful cuts:
      provider-event waits, hooks, arc bookkeeping, and wait nodes.
 
 3. **Improve test locality.**
-   - Move `packets/tests.rs` cases into per-module test blocks as those modules
-     change.
+   - Continue moving remaining `packets/tests.rs` cases into per-module test
+     blocks as those modules change; event/gap logging tests have moved.
    - Move daemon-startup-shaped tests to top-level integration tests using
      `blackbox::` imports.
 
