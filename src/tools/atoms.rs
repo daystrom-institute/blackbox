@@ -2,11 +2,19 @@ mod composition;
 mod helpers;
 mod invoke;
 mod supervision;
-use crate::server::*;
-use crate::*;
+use crate::orchestration;
+use crate::server::BlackboxServer;
+use crate::tools::bro_params::{
+    AtomDelegateParams, AtomDescribeParams, AtomGetParams, AtomInvokeParams, AtomListParams,
+    AtomResumeParams, AtomSearchParams, AtomStatusParams,
+};
 #[cfg(test)]
 use helpers::atom_ref_allowed;
 use helpers::{default_atom_owner, iso_from_millis, sha256_text};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::atoms_tools()
@@ -887,7 +895,7 @@ mod tests {
                 .state
                 .notes
                 .write()
-                .create(&crate::NoteParams {
+                .create(&crate::notes::NoteParams {
                     kind: "assumption".into(),
                     body: format!("note-{} {}", i, "y".repeat(5000)),
                     task_id: Some("task-primary".into()),
