@@ -35,10 +35,12 @@ the decomposition cleanup that the topology move exposed:
    - Remove root-level imports/re-exports from `src/lib.rs` once no module
      depends on them implicitly.
    - Prefer small compile-checked batches over a whole-crate import rewrite.
-   - First small cuts landed: `src/tools/notes.rs`, `src/tools/atoms.rs`, and
-     `src/tools/packets.rs` now use explicit imports, and `dispatch_mcp_url` is
-     imported directly by `server/startup.rs` instead of being re-exported from
-     the lib root.
+   - First small cuts landed: `src/tools/notes.rs`, `src/tools/atoms.rs`,
+     `src/tools/packets.rs`, `src/tools/config.rs`,
+     `src/tools/orchestrate.rs`, `src/tools/system_events.rs`, and
+     `src/tools/whiteboards.rs` now use explicit imports, and
+     `dispatch_mcp_url` is imported directly by `server/startup.rs` instead of
+     being re-exported from the lib root.
 
 2. **Split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root

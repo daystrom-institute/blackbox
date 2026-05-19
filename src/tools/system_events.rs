@@ -1,6 +1,11 @@
-use crate::server::*;
-use crate::*;
+use crate::server::BlackboxServer;
+use crate::system_events;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
+use serde::{Deserialize, Serialize};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::system_events_tools()
@@ -422,6 +427,8 @@ impl BlackboxServer {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    use serde_json::json;
 
     fn test_hub() -> (Arc<system_events::EventHub>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
