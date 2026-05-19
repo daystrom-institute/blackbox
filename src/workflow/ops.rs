@@ -16,8 +16,10 @@
 
 mod arch_pathology;
 mod auto_digest;
+mod eval_score;
 mod external;
 mod json_ops;
+mod schema_migration;
 mod system_events;
 mod vars;
 mod vector;
@@ -25,7 +27,7 @@ mod worktree;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use super::context::{ArcContext, VarsSchema, resolve_arg_value};
 use arch_pathology::{exec_normalize_arch_pathology_atom_requests, exec_write_arch_pathology_plan};
@@ -34,8 +36,10 @@ use auto_digest::{
     exec_extract_candidate_pairs, exec_log_reject, exec_read_session, exec_surface_to_inbox,
     exec_validate_schema, exec_write_semantic_edge,
 };
+use eval_score::exec_score_eval_output;
 use external::{exec_http_json, exec_mcp_call, exec_shell};
 use json_ops::exec_parse_json;
+use schema_migration::{exec_schema_migration_drop, exec_schema_migration_rebuild};
 use system_events::{exec_require_identity, exec_system_event_compact};
 use vars::{
     exec_append_var, exec_default_var, exec_find_first, exec_inc_var, exec_merge_var,
@@ -331,6 +335,8 @@ pub async fn execute_op_with_hub(
     }
 }
 
+// ── Built-in op implementations ──────────────────────────────────
+
 async fn call_blackbox_tool(tool: &str, arguments: Value, ctx: &ArcContext) -> Result<Value> {
     let arguments = arguments
         .as_object()
@@ -351,107 +357,11 @@ async fn call_blackbox_tool(tool: &str, arguments: Value, ctx: &ArcContext) -> R
     .map_err(|e| anyhow!("McpCall 'blackbox.{tool}': {e}"))
 }
 
-// ── Built-in op implementations ──────────────────────────────────
-
-// ── Schema migration ops ─────────────────────────────────────────────────────
-
-/// Observable marker for the index-drop node. Logs intent and returns None;
-/// the actual document deletion is performed by the following
-/// `SchemaMigrationRebuild` op via a full `bbox_reindex`.
-fn exec_schema_migration_drop(ctx: &ArcContext) -> OpEffect {
-    tracing::info!(
-        arc_id = %ctx.meta.arc_id,
-        project = ?ctx.meta.project_dir,
-        "schema_migration_drop: marking index for full rebuild"
-    );
-    OpEffect::None
-}
-
-/// Full tantivy rebuild via `bbox_reindex(full=true)`. Captures a JSON
-/// summary into `vars[into_var]` when set.
-async fn exec_schema_migration_rebuild(
-    into_var: Option<&str>,
-    ctx: &ArcContext,
-) -> Result<OpEffect> {
-    let result = call_blackbox_tool("bbox_reindex", json!({"full": true}), ctx).await?;
-    tracing::info!(
-        arc_id = %ctx.meta.arc_id,
-        "schema_migration_rebuild: full reindex complete"
-    );
-    match into_var {
-        Some(k) => Ok(OpEffect::SetVar {
-            key: k.to_string(),
-            value: result,
-        }),
-        None => Ok(OpEffect::None),
-    }
-}
-
-// ── Eval score op ────────────────────────────────────────────────────────────
-
-/// Parse captured shell output from a `RunSuite` step and compute `drift_pp`.
-///
-/// Reads `args.from` (or `args.suite_output`) — a `{exit_code, stdout, stderr,
-/// parsed}` blob captured by the preceding Shell op — and extracts:
-///   1. `parsed.drift_pp`   if the script emitted a JSON summary
-///   2. Exit-code heuristic: non-zero exit → assume minor drift (5 pp)
-///   3. Default 0.0          when neither signal is present
-///
-/// Writes `{drift_pp, suite_exit_code, raw_stdout}` into `vars[into_var]`.
-fn exec_score_eval_output(
-    args: &Value,
-    into_var: Option<&str>,
-    ctx: &ArcContext,
-) -> Result<OpEffect> {
-    let into = into_var.unwrap_or("suite_score");
-    let suite_output = args
-        .get("from")
-        .or_else(|| args.get("suite_output"))
-        .or_else(|| ctx.vars.get("suite_output"))
-        .cloned()
-        .unwrap_or(Value::Null);
-
-    let exit_code = suite_output
-        .get("exit_code")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let stdout = suite_output
-        .get("stdout")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-
-    // Extract drift_pp from the parsed JSON block first, then from stdout as
-    // a last-resort inline search for `"drift_pp": N`.
-    let drift_pp: f64 = suite_output
-        .get("parsed")
-        .and_then(|p| p.get("drift_pp"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            // Try to parse stdout directly as JSON
-            serde_json::from_str::<Value>(&stdout)
-                .ok()
-                .and_then(|v| v.get("drift_pp").and_then(Value::as_f64))
-        })
-        .unwrap_or({
-            // Exit-code heuristic: non-zero → minor drift signal
-            if exit_code != 0 { 5.0 } else { 0.0 }
-        });
-
-    Ok(OpEffect::SetVar {
-        key: into.to_string(),
-        value: json!({
-            "drift_pp": drift_pp,
-            "suite_exit_code": exit_code,
-            "raw_stdout": stdout,
-        }),
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::workflow::context::{ArcContext, ArcMeta};
+    use serde_json::json;
 
     #[tokio::test]
     async fn normalize_arch_pathology_atom_requests_parses_nested_survey_json() {
