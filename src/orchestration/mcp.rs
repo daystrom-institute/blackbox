@@ -1245,6 +1245,77 @@ mod tests {
     }
 
     #[test]
+    fn bro_mcp_add_surface_appends_to_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().to_string_lossy().to_string();
+
+        let params = McpToolParams {
+            action: McpAction::Add,
+            name: Some("test-surface".into()),
+            url: Some("http://127.0.0.1:7264/mcp".into()),
+            transport: Some("http".into()),
+            scope: Some("project".into()),
+            project: Some(project.clone()),
+            pattern: None,
+            exclude_tools: None,
+            headers: None,
+            surface: Some("readonly".into()),
+        };
+
+        let result = handle(&params).unwrap();
+        assert!(
+            result.contains("Saved test-surface"),
+            "add should succeed: {result}"
+        );
+
+        let store = McpStore::load(&project_store_path(std::path::Path::new(&project))).unwrap();
+        let cfg = store.servers.get("test-surface").unwrap();
+        match cfg {
+            McpServerConfig::Http { url, .. } => {
+                assert!(
+                    url.contains("?surface=readonly"),
+                    "URL should contain ?surface=readonly, got: {url}"
+                );
+            }
+            _ => panic!("expected HTTP config"),
+        }
+    }
+
+    #[test]
+    fn bro_mcp_add_without_surface_preserves_url() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = dir.path().to_string_lossy().to_string();
+
+        let params = McpToolParams {
+            action: McpAction::Add,
+            name: Some("test-no-surface".into()),
+            url: Some("http://127.0.0.1:7264/mcp".into()),
+            transport: Some("http".into()),
+            scope: Some("project".into()),
+            project: Some(project.clone()),
+            pattern: None,
+            exclude_tools: None,
+            headers: None,
+            surface: None,
+        };
+
+        let result = handle(&params).unwrap();
+        assert!(
+            result.contains("Saved test-no-surface"),
+            "add should succeed: {result}"
+        );
+
+        let store = McpStore::load(&project_store_path(std::path::Path::new(&project))).unwrap();
+        let cfg = store.servers.get("test-no-surface").unwrap();
+        match cfg {
+            McpServerConfig::Http { url, .. } => {
+                assert_eq!(url, "http://127.0.0.1:7264/mcp");
+            }
+            _ => panic!("expected HTTP config"),
+        }
+    }
+
+    #[test]
     #[cfg(unix)]
     fn project_mcp_migrates_bro_path_when_new_missing() {
         let dir = tempdir().unwrap();
