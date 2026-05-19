@@ -70,7 +70,9 @@ the decomposition cleanup that the topology move exposed:
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
      landed `engine/fanout.rs`, `engine/provider_events.rs`, and
      `engine/hooks.rs` splits. Arc bookkeeping, policy-packet checks, and
-     compaction anchors now live in `src/workflow/engine/arc_state.rs`.
+     compaction anchors now live in `src/workflow/engine/arc_state.rs`. Sleep
+     and signal wait node handling now lives in
+     `src/workflow/engine/wait_nodes.rs`.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
@@ -632,6 +634,9 @@ Landed:
 35. `src/workflow/engine/arc_state.rs` owns arc thread opening, live arc
     snapshots, arc note writes, policy-packet checks, and compaction anchors
     previously embedded in `workflow/engine.rs`.
+36. `src/workflow/engine/wait_nodes.rs` owns sleep node execution and signal
+    wait registration/resolution/timeout handling previously embedded in
+    `workflow/engine.rs`.
 
 Next useful cuts:
 
@@ -644,7 +649,7 @@ Next useful cuts:
 
 2. **Keep splitting large domain modules by cohesive internals.**
    - `workflow/engine.rs`: continue with runner subsystems after fanout,
-     provider-event waits, hooks, and arc bookkeeping.
+     provider-event waits, hooks, arc bookkeeping, and wait nodes.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
