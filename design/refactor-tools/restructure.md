@@ -556,7 +556,8 @@ Landed:
     in `server/run.rs`; the move also removed three now-unused compatibility
     prelude exports/imports from `src/lib.rs` and `src/server/mod.rs`.
 17. `src/server/open.rs` owns config/store/index opening and `SharedState`
-    construction previously embedded in `server/run.rs`.
+    construction previously embedded in `server/run.rs`; it now uses explicit
+    imports instead of the lib-root compatibility prelude.
 18. `src/workflow/ops/vector.rs` owns the vector-maintenance hook-op helpers
     previously embedded in `workflow/ops.rs`.
 19. `src/workflow/ops/worktree.rs` owns worktree create/remove hook-op helpers

@@ -1,9 +1,26 @@
 use super::startup::{configure_dispatch_mcp_env, discover_transcript_roots, resolve_codex_root};
 use super::{SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP, is_loopback_bind};
-use crate::*;
 use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use tokio::sync::broadcast;
+
+use crate::index::TranscriptIndex;
+use crate::knowledge::Knowledge;
+use crate::notes::Notes;
+use crate::orchestration::TaskStore;
+use crate::orchestration::tail::TailEvent;
+use crate::packets::Packets;
+use crate::pins::Pins;
+use crate::projects::ProjectRegistry;
+use crate::roadmap::Roadmap;
+use crate::threads::Threads;
+use crate::{
+    artifacts, config, council, crons, edge_index, index, lsp, orchestration, path_cache, pollers,
+    slack_channel_bindings, slack_proposal_links, slack_thread_store, system_events, system_memory,
+    tool_docs, vectors, webhooks, whiteboards,
+};
 
 pub(super) struct OpenedServer {
     pub(super) cfg: config::Config,
