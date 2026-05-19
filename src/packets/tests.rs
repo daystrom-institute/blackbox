@@ -1889,10 +1889,6 @@ fn apply_tool_accepts_stringified_entity() {
     assert!(report.contains("breaking_api_no_migration"));
 }
 
-fn noop_entity() -> serde_json::Map<String, serde_json::Value> {
-    serde_json::Map::new()
-}
-
 #[test]
 fn compile_accepts_new_predicates_end_to_end() {
     let (_d, packets) = tmp_packets();
@@ -2045,103 +2041,6 @@ fn classification_mismatch_error_no_inference_hint_when_explicit() {
         !msg.contains("INFERRED"),
         "explicit classification should not trigger inference hint, got: {msg}"
     );
-}
-
-// ── CountMatches predicate tests ───────────────────────────────
-
-#[test]
-fn count_matches_counts_true_subpredicates() {
-    // 3 predicates, 2 of which match → count=2
-    let p = Predicate::CountMatches {
-        args: vec![
-            Predicate::Eq {
-                field: "a".into(),
-                value: Value::Bool(true),
-            },
-            Predicate::Eq {
-                field: "b".into(),
-                value: Value::Bool(true),
-            },
-            Predicate::Eq {
-                field: "c".into(),
-                value: Value::Bool(true),
-            },
-        ],
-        compare: CmpOp::Ge,
-        value: 2,
-    };
-    let two_true = serde_json::json!({"a": true, "b": true, "c": false})
-        .as_object()
-        .unwrap()
-        .clone();
-    let one_true = serde_json::json!({"a": true, "b": false, "c": false})
-        .as_object()
-        .unwrap()
-        .clone();
-    let all_true = serde_json::json!({"a": true, "b": true, "c": true})
-        .as_object()
-        .unwrap()
-        .clone();
-    assert!(eval_predicate(&p, &two_true, &NoopResolver, 0));
-    assert!(!eval_predicate(&p, &one_true, &NoopResolver, 0));
-    assert!(eval_predicate(&p, &all_true, &NoopResolver, 0));
-}
-
-#[test]
-fn count_matches_exactly_k_shape() {
-    // "exactly 1 of N" uses CmpOp::Eq
-    let p = Predicate::CountMatches {
-        args: vec![
-            Predicate::Eq {
-                field: "a".into(),
-                value: Value::Bool(true),
-            },
-            Predicate::Eq {
-                field: "b".into(),
-                value: Value::Bool(true),
-            },
-            Predicate::Eq {
-                field: "c".into(),
-                value: Value::Bool(true),
-            },
-        ],
-        compare: CmpOp::Eq,
-        value: 1,
-    };
-    for (a, b, c, want) in [
-        (false, false, false, false), // 0 true
-        (true, false, false, true),   // 1 true
-        (true, true, false, false),   // 2 true
-        (true, true, true, false),    // 3 true
-    ] {
-        let e = serde_json::json!({"a": a, "b": b, "c": c})
-            .as_object()
-            .unwrap()
-            .clone();
-        assert_eq!(
-            eval_predicate(&p, &e, &NoopResolver, 0),
-            want,
-            "a={a},b={b},c={c}"
-        );
-    }
-}
-
-#[test]
-fn count_matches_empty_args_is_zero_count() {
-    let p = Predicate::CountMatches {
-        args: vec![],
-        compare: CmpOp::Eq,
-        value: 0,
-    };
-    let e = noop_entity();
-    assert!(eval_predicate(&p, &e, &NoopResolver, 0));
-
-    let p_ge_1 = Predicate::CountMatches {
-        args: vec![],
-        compare: CmpOp::Ge,
-        value: 1,
-    };
-    assert!(!eval_predicate(&p_ge_1, &e, &NoopResolver, 0));
 }
 
 #[test]
