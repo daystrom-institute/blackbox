@@ -11,7 +11,7 @@
     }
   ],
   "expected_entity_refs": [
-    "transcript:claude:0142cece-dfc1-4e7d-8cce-7b6079454ef0:1954884:0"
+    "transcript:account3:67d0fa8f-11fb-40fb-a016-376a13dac3f0:248014:0"
   ],
   "required_evidence": {
     "kind": "edge_family",
