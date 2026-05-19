@@ -25,6 +25,7 @@ use anyhow::{Result, bail};
 
 use crate::edge_index::Edge;
 use crate::entity_ref::{EntityRef, EntityType};
+use crate::server::state::SharedState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityView {
@@ -63,11 +64,11 @@ pub struct EdgeFamilyExpectation {
 }
 
 pub(crate) struct ProviderContext<'a> {
-    state: Option<&'a crate::SharedState>,
+    state: Option<&'a SharedState>,
 }
 
 impl<'a> ProviderContext<'a> {
-    pub(crate) fn new(state: &'a crate::SharedState) -> Self {
+    pub(crate) fn new(state: &'a SharedState) -> Self {
         Self { state: Some(state) }
     }
 
@@ -76,7 +77,7 @@ impl<'a> ProviderContext<'a> {
         Self { state: None }
     }
 
-    pub(crate) fn state(&self) -> Option<&'a crate::SharedState> {
+    pub(crate) fn state(&self) -> Option<&'a SharedState> {
         self.state
     }
 }

@@ -1,5 +1,6 @@
+use crate::orchestration;
+use crate::server::state::BlackboxServer;
 use crate::tools::bro_params::{AtomInvokeParams, AtomResumeParams, AtomStatusParams};
-use crate::{BlackboxServer, orchestration};
 
 impl BlackboxServer {
     fn supervision_plan_defaults() -> orchestration::atoms::types::SupervisionPlanDefaults {

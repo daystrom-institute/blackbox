@@ -5,7 +5,6 @@ use parking_lot::RwLock;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::embed::queue::{EmbedQueueHandle, EmbedRequest, EmbedStatusResponse};
 use crate::embed::{Bucket, queue};
@@ -17,6 +16,8 @@ use crate::orchestration::agents::types::{
     AgentEmbedding, AgentEmbeddingComponents, AgentManifest, AgentRef,
 };
 use crate::routing::RoutingVerdict;
+use crate::server::dispatch::dispatch_routing_verdict_direct;
+use crate::server::state::SharedState;
 use crate::threads::Thread;
 
 static GLOBAL_QUEUE: OnceLock<RwLock<Option<EmbedQueueHandle>>> = OnceLock::new();
@@ -666,7 +667,7 @@ pub(crate) fn maybe_detect_knowledge_contradiction(
         initial_vars.insert("entry_b".into(), json!(format!("knowledge:{}", entry_b.id)));
         initial_vars.insert("cosine".into(), json!(cosine));
         tokio::spawn(async move {
-            let _ = crate::dispatch_routing_verdict_direct(
+            let _ = dispatch_routing_verdict_direct(
                 state_for_task,
                 "contradiction-detected",
                 RoutingVerdict::StartArc {

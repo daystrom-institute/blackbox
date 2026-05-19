@@ -1,5 +1,5 @@
-use crate::BlackboxServer;
 use crate::orchestration;
+use crate::server::state::BlackboxServer;
 use crate::tools::bro_params::AtomInvokeParams;
 use crate::workflow;
 

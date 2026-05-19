@@ -26,9 +26,9 @@ use crate::server::dispatch::try_slack_proposal_signal_hook;
 use crate::server::state::{
     ArcSnapshot, BlackboxServer, SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP,
 };
+use crate::server::workflow_capabilities::validate_workflow_capabilities;
 use crate::server::{
     install_artifact_value, read_artifact_source, restore_runtime_artifacts_from_catalog,
-    validate_workflow_capabilities,
 };
 use crate::threads::Threads;
 use crate::tools::badgey_adapter::{

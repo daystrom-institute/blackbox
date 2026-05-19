@@ -38,6 +38,7 @@ use tokio::sync::{Notify, broadcast};
 use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::team::{Team, load_all_teams};
+use crate::server::state::SharedState;
 
 const COUNCIL_EVENT_BUFFER: usize = 256;
 
@@ -234,7 +235,7 @@ impl CouncilRegistry {
     /// Walk all restored councils and respawn drain workers for any
     /// `Queued` envelopes. Drain envelopes that were left in `Draining`
     /// at restart are reconciled by `reconcile_draining_at_restart`.
-    pub fn respawn_workers_after_restart(self: &Arc<Self>, shared: Arc<crate::SharedState>) {
+    pub fn respawn_workers_after_restart(self: &Arc<Self>, shared: Arc<SharedState>) {
         let ids: Vec<String> = self.councils.read().keys().cloned().collect();
         for id in ids {
             let Some(state) = self.get(&id) else { continue };
@@ -413,7 +414,7 @@ impl CouncilState {
     /// authoritative liveness check.
     pub fn ensure_worker(
         self: &Arc<Self>,
-        shared: Arc<crate::SharedState>,
+        shared: Arc<SharedState>,
         registry: SharedRegistry,
         bro_id: String,
     ) {
@@ -503,7 +504,7 @@ fn restore_council(dir: &Path) -> Result<CouncilState> {
 /// Append a user turn to the council, fan out one envelope per team
 /// member, and notify (or spawn) their drain workers.
 pub async fn post_user_turn(
-    shared: Arc<crate::SharedState>,
+    shared: Arc<SharedState>,
     registry: SharedRegistry,
     council_id: &str,
     sender: &str,

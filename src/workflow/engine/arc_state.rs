@@ -1,6 +1,8 @@
 use anyhow::{Result, bail};
 use serde_json::json;
 
+use crate::server::state::ArcSnapshot;
+
 use super::WorkflowRunner;
 
 impl WorkflowRunner<'_> {
@@ -78,7 +80,7 @@ impl WorkflowRunner<'_> {
             .collect();
         let mut map = self.server.state.running_arcs.write();
         let existing_started = map.get(thread_id).map(|s| s.started_at.clone());
-        let snapshot = crate::ArcSnapshot {
+        let snapshot = ArcSnapshot {
             arc_id: self.ctx.meta.arc_id.clone(),
             arc_thread_id: thread_id.to_string(),
             workflow_name: self.compiled.spec.name.clone(),

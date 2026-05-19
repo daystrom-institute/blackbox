@@ -1,5 +1,5 @@
 //! Cron primitive — calendar-driven event inlet, sibling of webhooks
-//! and pollers. All three converge on `crate::dispatch_routed_event`,
+//! and pollers. All three converge on `server::dispatch_routed_event`,
 //! so a cron is operationally "a webhook whose source is wall-clock
 //! time and whose payload is whatever the operator stuffs into the
 //! spec."
@@ -35,6 +35,9 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio::task::JoinHandle;
+
+use crate::server::dispatch::dispatch_routed_event;
+use crate::server::state::SharedState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronSpec {
@@ -278,7 +281,7 @@ fn build_entity(spec: &CronSpec) -> Value {
 /// shared routing pipeline. Returns Ok(true) if a tick fired (whether
 /// the arc spawned or skipped due to concurrency cap), Ok(false) if
 /// the routing packet returned no_match.
-pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> Result<bool> {
+pub async fn run_one_tick(state: &Arc<SharedState>, spec: &CronSpec) -> Result<bool> {
     // Concurrency check — claim a slot before dispatching, refund if
     // dispatch fails.
     if !state.crons.try_claim(&spec.name, spec.concurrency) {
@@ -294,7 +297,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> R
     let inlet_label = format!("cron:{}", spec.name);
     let cron_name = spec.name.clone();
     let crons_for_done = state.crons.clone();
-    let result = crate::dispatch_routed_event(
+    let result = dispatch_routed_event(
         state.clone(),
         &inlet_label,
         &spec.routing_packet,
@@ -332,7 +335,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &CronSpec) -> R
 /// the handle (registry.track_handle) so the task can be aborted on
 /// uninstall or replaced on reinstall. The loop sleeps until the next
 /// scheduled time (computed via `cron::Schedule`) and fires one tick.
-pub fn spawn_loop(state: Arc<crate::SharedState>, spec: CronSpec) -> JoinHandle<()> {
+pub fn spawn_loop(state: Arc<SharedState>, spec: CronSpec) -> JoinHandle<()> {
     tokio::spawn(async move {
         let schedule = match Schedule::from_str(&normalize_unix_dow(&spec.schedule)) {
             Ok(s) => s,
