@@ -41,8 +41,9 @@ the decomposition cleanup that the topology move exposed:
      `src/tools/roadmap.rs`, `src/tools/roster.rs`,
      `src/tools/system_events.rs`, `src/tools/whiteboards.rs`,
      `src/tools/workspace.rs`, `src/tools/agents.rs`, and
-     `src/tools/badgey.rs` / `src/tools/badgey_adapter.rs` now use explicit
-     imports, and
+     `src/tools/badgey.rs` / `src/tools/badgey_adapter.rs` and packet
+     implementation modules `apply`, `audit`, `compile`, and `scanner` now
+     use explicit imports, and
      `dispatch_mcp_url` is imported directly by `server/startup.rs` instead of
      being re-exported from the lib root.
 
@@ -106,7 +107,8 @@ the decomposition cleanup that the topology move exposed:
 4. **Improve test locality opportunistically.**
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
      as packet modules change. Packet event/gap logging tests now live under
-     `src/packets/events.rs` via `src/packets/events_tests.rs`.
+     `src/packets/events.rs` via `src/packets/events_tests.rs`, and
+     self-heal scanner tests now live under `src/packets/scanner.rs`.
    - Move daemon-startup-shaped tests to integration tests using `blackbox::`
      imports.
    - First locality cut landed outside packets: secret-header helper tests moved

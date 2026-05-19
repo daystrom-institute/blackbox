@@ -1,5 +1,8 @@
-use super::*;
+use std::collections::BTreeMap;
+
+use super::Packet;
 use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 
 /// Case-insensitive substring match across the fields an agent is likely to
 /// search for: packet id, domain, rule ids, rule classifications, and the

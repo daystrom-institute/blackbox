@@ -1,4 +1,7 @@
-use super::*;
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use super::events::PacketEvent;
 
 // ── Self-heal scanner ─────────────────────────────────────────────
 //
@@ -267,4 +270,154 @@ pub fn find_repair_candidates(
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::packets::test_support::tmp_packets;
+
+    #[test]
+    fn self_heal_scanner_flags_and_dedups() {
+        // Synthetic event stream covering the cases the scanner cares about.
+        fn ev(
+            op: &str,
+            outcome: &str,
+            pid: &str,
+            ts: &str,
+            details: serde_json::Value,
+        ) -> PacketEvent {
+            let mut e = PacketEvent::now(op, outcome);
+            e.timestamp = ts.to_string();
+            e.packet_id = Some(pid.to_string());
+            e.domain = Some(format!("dom-{pid}"));
+            e.details = details;
+            e
+        }
+
+        let now = "2026-04-20T12:00:00Z";
+        let in_window = "2026-04-20T06:00:00Z";
+        let out_of_window = "2026-04-18T00:00:00Z";
+
+        let mut events: Vec<PacketEvent> = Vec::new();
+
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "no_match",
+                "packet-aaaaaaaa",
+                &format!("2026-04-20T0{}:30:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "ok",
+                "packet-aaaaaaaa",
+                &format!("2026-04-20T0{}:45:00Z", i + 1),
+                serde_json::json!({"mode": "first"}),
+            ));
+        }
+
+        for i in 0..6 {
+            events.push(ev(
+                "apply",
+                "ok",
+                "packet-bbbbbbbb",
+                &format!("2026-04-20T0{}:00:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        events.push(ev(
+            "audit",
+            "low_fidelity",
+            "packet-bbbbbbbb",
+            in_window,
+            serde_json::json!({"fidelity": 0.7, "total": 10, "correct": 7}),
+        ));
+
+        for i in 0..2 {
+            events.push(ev(
+                "apply",
+                "no_match",
+                "packet-cccccccc",
+                &format!("2026-04-20T0{}:00:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "no_match",
+                "packet-dddddddd",
+                &format!("2026-04-20T0{}:00:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        for i in 0..4 {
+            events.push(ev(
+                "apply",
+                "ok",
+                "packet-dddddddd",
+                &format!("2026-04-20T0{}:30:00Z", i + 1),
+                serde_json::json!({}),
+            ));
+        }
+        events.push(ev(
+            "repair_candidate",
+            "flagged",
+            "packet-dddddddd",
+            "2026-04-20T10:00:00Z",
+            serde_json::json!({"reasons": ["high_no_match_rate"]}),
+        ));
+
+        events.push(ev(
+            "apply",
+            "no_match",
+            "packet-aaaaaaaa",
+            out_of_window,
+            serde_json::json!({}),
+        ));
+
+        events.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        let config = ScannerConfig::default();
+        let candidates = find_repair_candidates(&events, &config, now);
+
+        assert_eq!(
+            candidates.len(),
+            2,
+            "expected A and B, got: {:?}",
+            candidates.iter().map(|c| &c.packet_id).collect::<Vec<_>>()
+        );
+
+        let a = candidates
+            .iter()
+            .find(|c| c.packet_id == "packet-aaaaaaaa")
+            .expect("packet-aaaaaaaa flagged");
+        assert!(a.reasons.contains(&"high_no_match_rate".to_string()));
+        assert_eq!(a.apply_count, 8);
+        assert_eq!(a.no_match_count, 4);
+        assert_eq!(a.no_match_rate, Some(0.5));
+
+        let b = candidates
+            .iter()
+            .find(|c| c.packet_id == "packet-bbbbbbbb")
+            .expect("packet-bbbbbbbb flagged");
+        assert!(b.reasons.contains(&"low_fidelity".to_string()));
+        assert_eq!(b.fidelity, Some(0.7));
+
+        let (_dir, store) = tmp_packets();
+        for e in &events {
+            store.append_event(e);
+        }
+        let written = store.scanner_step_at(&config, now).unwrap();
+        assert_eq!(written.len(), 2);
+        let log = store
+            .list_events(Some("repair_candidate"), None, None, None, 50)
+            .unwrap();
+        assert_eq!(log.len(), 3);
+    }
 }
