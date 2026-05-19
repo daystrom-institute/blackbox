@@ -510,3 +510,134 @@ pub fn apply_all_with(
         verdict,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::super::{Predicate, Value};
+    use super::{NoopResolver, eval_predicate};
+
+    fn eval_simple(pred: &Predicate, entity: &serde_json::Value) -> bool {
+        let map = entity.as_object().expect("entity must be a JSON object");
+        eval_predicate(pred, map, &NoopResolver, 0)
+    }
+
+    #[test]
+    fn dotted_path_eq_resolves() {
+        let entity = json!({
+            "vars": {"issue": 42, "labels": ["bug", "urgent"]},
+            "outputs": {"Plan": {"branch": "fix/issue-42"}}
+        });
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "vars.issue".into(),
+                value: Value::Int(42),
+            },
+            &entity
+        ));
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "outputs.Plan.branch".into(),
+                value: Value::String("fix/issue-42".into()),
+            },
+            &entity
+        ));
+        assert!(!eval_simple(
+            &Predicate::Eq {
+                field: "vars.does_not_exist".into(),
+                value: Value::Int(0),
+            },
+            &entity
+        ));
+    }
+
+    #[test]
+    fn dotted_path_array_index() {
+        let entity = json!({"vars": {"labels": ["bug", "urgent"]}});
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "vars.labels.0".into(),
+                value: Value::String("bug".into()),
+            },
+            &entity
+        ));
+        assert!(eval_simple(
+            &Predicate::Eq {
+                field: "vars.labels.1".into(),
+                value: Value::String("urgent".into()),
+            },
+            &entity
+        ));
+    }
+
+    #[test]
+    fn in_predicate_set_membership() {
+        let entity = json!({"last_signal": {"name": "pr-merged"}});
+        let pred = Predicate::In {
+            field: "last_signal.name".into(),
+            values: vec![
+                Value::String("pr-merged".into()),
+                Value::String("pr-feedback".into()),
+            ],
+        };
+        assert!(eval_simple(&pred, &entity));
+
+        let entity2 = json!({"last_signal": {"name": "pr-other"}});
+        assert!(!eval_simple(&pred, &entity2));
+
+        let entity3 = json!({});
+        assert!(!eval_simple(&pred, &entity3));
+    }
+
+    #[test]
+    fn string_matches_regex() {
+        let entity = json!({"event": "pull_request.synchronize"});
+        let pred = Predicate::StringMatches {
+            field: "event".into(),
+            pattern: r"^pull_request\..*$".into(),
+            case_insensitive: false,
+        };
+        assert!(eval_simple(&pred, &entity));
+
+        let entity2 = json!({"event": "issue.opened"});
+        assert!(!eval_simple(&pred, &entity2));
+    }
+
+    #[test]
+    fn string_matches_case_insensitive() {
+        let entity = json!({"branch": "Fix/Issue-42"});
+        let pred = Predicate::StringMatches {
+            field: "branch".into(),
+            pattern: r"^fix/issue-".into(),
+            case_insensitive: true,
+        };
+        assert!(eval_simple(&pred, &entity));
+    }
+
+    #[test]
+    fn string_matches_invalid_regex_returns_false() {
+        let entity = json!({"x": "anything"});
+        let pred = Predicate::StringMatches {
+            field: "x".into(),
+            pattern: r"(unclosed".into(),
+            case_insensitive: false,
+        };
+        assert!(!eval_simple(&pred, &entity));
+    }
+
+    #[test]
+    fn dotted_path_in_quantified_path() {
+        // Exists over `vars.labels[*]` — the core "labels contains
+        // `bug`" idiom.
+        let entity = json!({"vars": {"labels": ["bug", "urgent"]}});
+        let pred = Predicate::Exists {
+            path: "vars.labels[*]".into(),
+            pred: Box::new(Predicate::Eq {
+                field: "$".into(),
+                value: Value::String("bug".into()),
+            }),
+        };
+        assert!(eval_simple(&pred, &entity));
+    }
+}
