@@ -63,7 +63,7 @@ the decomposition cleanup that the topology move exposed:
      cluster now lives in `src/tools/atoms/helpers.rs`; the large
      `impl BlackboxServer` remains the main follow-up.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
-     landed `engine/fanout.rs` split.
+     landed `engine/fanout.rs` and `engine/provider_events.rs` splits.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
@@ -605,6 +605,9 @@ Landed:
     and resolution, `ExecOpts`, provider-default suppression config, and
     exec/resume argument construction previously embedded in
     `orchestration/providers.rs`.
+30. `src/workflow/engine/provider_events.rs` owns provider-event wait polling,
+    transcript adapter reads, provider-event matching, payload construction, and
+    retry delay logic previously embedded in `workflow/engine.rs`.
 
 Next useful cuts:
 
@@ -616,7 +619,8 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Keep splitting large domain modules by cohesive internals.**
-   - `workflow/engine.rs`: continue with runner subsystems after fanout.
+   - `workflow/engine.rs`: continue with runner subsystems after fanout and
+     provider-event waits.
    - `tools/atoms.rs`: keep the public tool facade and move implementation
      clusters into child modules; the helper tail has already moved to
      `tools/atoms/helpers.rs`.
