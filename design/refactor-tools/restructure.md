@@ -44,8 +44,8 @@ the decomposition cleanup that the topology move exposed:
      resolution, and dispatch MCP env setup.
    - `server/restore.rs` now owns webhook, poller, cron, whiteboard, council,
      workflow, catalog-runtime-artifact, reaction, and outbox startup recovery.
-   - Remaining candidate modules: `server/http.rs` or `server/mcp.rs` for
-     router/MCP service assembly.
+   - `server/mcp.rs` now owns Axum route assembly and Streamable HTTP MCP
+     service construction.
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
@@ -109,9 +109,10 @@ lines. It is no longer the 17K-line god file described above or even the
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
 | `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
-| `src/server/run.rs` | 741 | Daemon bootstrap glue: state open, router assembly, background tasks, graceful shutdown |
+| `src/server/run.rs` | 626 | Daemon bootstrap glue: state open, background tasks, bind/listen, graceful shutdown |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
 | `src/server/restore.rs` | 161 | Registry/runtime restoration and crash recovery helpers called by `server/run.rs` |
+| `src/server/mcp.rs` | 131 | Axum route assembly plus Streamable HTTP MCP service construction |
 
 The highest-value remaining topology work is no longer in `main.rs`. It is:
 
@@ -533,6 +534,8 @@ Landed:
     re-export for startup setup.
 13. `src/server/restore.rs` owns registry/runtime restoration previously
     embedded in `server/run.rs`.
+14. `src/server/mcp.rs` owns HTTP route assembly and Streamable HTTP MCP service
+    construction previously embedded in `server/run.rs`.
 
 Next useful cuts:
 
@@ -544,9 +547,8 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Split daemon bootstrap by startup concern.**
-   - Candidate boundaries: config/state opening, MCP service construction,
-     background task spawning, and shutdown wiring.
-   - Likely next target files: `server/http.rs` or `server/mcp.rs`.
+   - Candidate boundaries: config/state opening, background task spawning, and
+     shutdown wiring.
    - Keep `server/run.rs` as orchestration glue rather than moving everything
      into another catch-all file.
 

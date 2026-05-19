@@ -1,5 +1,6 @@
 pub mod dispatch;
 pub mod handler;
+mod mcp;
 pub mod progress;
 pub mod response;
 mod restore;

@@ -107,9 +107,6 @@ use rmcp::model::{
     IntoContents, ListToolsResult, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
-use rmcp::transport::streamable_http_server::{
-    StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
-};
 use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
