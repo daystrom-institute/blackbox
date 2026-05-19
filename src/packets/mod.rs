@@ -949,6 +949,8 @@ mod ast;
 mod audit;
 mod coerce;
 mod compile;
+#[cfg(test)]
+mod e8_tests;
 mod events;
 mod scanner;
 #[cfg(test)]
