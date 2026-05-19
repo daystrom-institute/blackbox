@@ -1,6 +1,7 @@
-use super::*;
-use crate::storage_health;
 use std::sync::Arc;
+
+use crate::server::SharedState;
+use crate::storage_health;
 
 const DEFAULT_STORAGE_GC_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
