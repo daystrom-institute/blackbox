@@ -453,6 +453,190 @@
       "done_note_required": true
     },
     {
+      "atom": "java-jooq-codegen-inventory",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_codegen_config_inventory",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-query-structure-analysis",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_query_structure_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-dsl-context-audit",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_dsl_context_audit",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-projection-mapping-analysis",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_projection_mapping_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-raw-sql-fragment-audit",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_raw_sql_fragment_audit",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-raw-sql-fragment-rewrite",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_raw_sql_fragment_audit",
+        "bbox_refactor_plan:java_jooq_raw_sql_fragment_rewrite",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-extract-query-method",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_query_structure_analysis",
+        "bbox_refactor_plan:java_jooq_extract_query_method",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-extract-query-object",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_query_structure_analysis",
+        "bbox_refactor_plan:java_jooq_extract_query_object",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-extract-repository",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_dsl_context_audit",
+        "bbox_refactor_plan:java_jooq_extract_repository",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-synthesize-repository",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_jooq_codegen_config_inventory",
+        "bbox_refactor_plan:java_jooq_synthesize_repository",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-synthesize-query-method",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_synthesize_query_method",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-synthesize-dto-projection",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_projection_mapping_analysis",
+        "bbox_refactor_plan:java_jooq_synthesize_dto_projection",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-condition-builder-extract",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_condition_builder_extract",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-transaction-boundary-normalize",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_dsl_context_audit",
+        "bbox_refactor_plan:java_jooq_transaction_boundary_normalize",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-generated-record-boundary-analysis",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_generated_record_boundary_analysis",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-generated-record-boundary-rewrite",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_generated_record_boundary_analysis",
+        "bbox_refactor_plan:java_jooq_synthesize_dto_projection",
+        "bbox_refactor_plan:java_jooq_generated_record_boundary_rewrite",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-jooq-codegen-extension-apply",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_jooq_codegen_config_inventory",
+        "bbox_refactor_plan:java_jooq_codegen_extension_apply",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
       "atom": "java-decompose-god-class",
       "expected_plan_sequence": [
         "bbox_code_symbols",

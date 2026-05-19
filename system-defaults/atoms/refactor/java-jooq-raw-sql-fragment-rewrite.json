@@ -1,0 +1,85 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-raw-sql-fragment-rewrite",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating rewrite of audited raw SQL fragments to safer jOOQ expressions — replaces raw field/table strings with generated jOOQ references, DSL.name(...) expressions, or typed alias fields, driven by an operator-approved audit result plus a per-fragment mapping. Refuses dynamic SQL, ambiguous CTE fields, or any rewrite whose target cannot be expressed from the approved mapping.",
+    "when_to_use": [
+      "operator has reviewed a java-jooq-raw-sql-fragment-audit result and supplied concrete mappings for each fragment to rewrite",
+      "hardening stringly typed jOOQ usage in selected files where every target is unambiguous",
+      "replacing string aliases with DSL.name(...) based expressions on operator approval"
+    ],
+    "anti_patterns": [
+      "do not rewrite fragments whose mapping is not supplied by the operator — the atom must refuse",
+      "do not rewrite dynamic SQL or ambiguous CTE fields — those classifications must remain explicit",
+      "do not invent generated table or field references not present in the operator mapping",
+      "do not apply without a prior approved audit result; do not default apply=true",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "sources", "fragment_mappings"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "sources": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Java files containing fragments to rewrite, relative to project_dir."
+          },
+          "audit_plan_path": {
+            "type": "string",
+            "description": "Path to the approved java_jooq_raw_sql_fragment_audit plan whose findings are being rewritten."
+          },
+          "fragment_mappings": {
+            "type": "array",
+            "items": { "type": "object" },
+            "description": "Operator-supplied per-fragment mapping. Each entry identifies the source fragment (file/line/byte range) and the replacement target (generated reference, DSL.name expression, or typed alias). Fragments without a mapping are skipped."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-raw-sql-fragment-rewrite. Charter: replace operator-mapped stringly typed jOOQ fragments with safer expressions; refuse anything the mapping does not authorize.\n\nProtocol:\n\n1. Ground each source structurally:\n   For each F in {{sources}}:\n     bbox_refactor_status(file=F, project_dir=\"{{project_dir}}\")\n   Confirm fragments in {{fragment_mappings}} still resolve at their declared positions before planning.\n\n2. Plan the rewrite — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_raw_sql_fragment_rewrite\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      sources={{sources}},\n                      toml_entries={\"audit_plan_path\": \"{{audit_plan_path}}\",\n                                    \"fragment_mappings\": {{fragment_mappings}}})\n\n   The planner refuses dynamic SQL, ambiguous CTE fields, and any rewrite whose target is not expressible from the supplied mapping; those fragments come back as planner-rejected items.\n\n3. Decide:\n   - If the planner rejects any required fragment or reports block_reason, emit bbox_note(kind=\"blocked\") with the diagnostic and return status=\"blocked\". Do not apply.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_raw_sql_fragment_rewrite step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: fragments rewritten, fragments skipped, refusal count, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never rewrite a fragment whose mapping was not supplied by the operator.\n- Never rewrite dynamic SQL or ambiguous CTE fields.\n- Never default apply=true on the operator's behalf.\n- Never invent generated references not present in {{fragment_mappings}}.\n\nInputs:\n{{project_dir}} {{sources}} {{audit_plan_path}} {{fragment_mappings}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "fragments_rewritten": { "type": "integer", "minimum": 0 },
+          "fragments_skipped": { "type": "integer", "minimum": 0 },
+          "refusals": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

@@ -1,0 +1,78 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-extract-query-method",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating extraction of a selected jOOQ fluent chain into a named method in the same class — preserving the existing DSLContext source, fetch shape, mapping target, imports, comments attached to the query, and transaction context. The plan parameterizes captured local values and refuses extraction when the selected range crosses unrelated side effects or transaction boundaries.",
+    "when_to_use": [
+      "a large method contains a self-contained jOOQ chain that should become a named private helper",
+      "the chain has a clear fetch shape and the operator wants to give it a name without changing class structure",
+      "preparing follow-up java-jooq-extract-query-object or java-jooq-extract-repository by first naming the query"
+    ],
+    "anti_patterns": [
+      "do not extract a range that crosses transaction boundaries or unrelated side effects — the plan must refuse",
+      "do not change DSLContext source, qualifier, or transaction callback ownership during extraction",
+      "do not invent method names, parameter names, or fetch shape from the user prompt — re-derive from the plan response",
+      "do not apply when status=blocked or when apply is not explicitly true",
+      "do not use on non-Java files"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "module_name", "selection"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file containing the target query chain, relative to project_dir." },
+          "module_name": { "type": "string", "description": "Name of the new extracted method." },
+          "impl_name": { "type": "string", "description": "Optional containing class name when source has multiple classes." },
+          "selection": {
+            "type": "object",
+            "description": "Selection of the jOOQ chain to extract — byte range, line range, or an item_name + statement index identifying the chain.",
+            "additionalProperties": true
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-extract-query-method. Charter: extract a selected jOOQ chain into a named method in the same class, preserving context and refusing unsafe ranges.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\", languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\"])\n   Confirm the selection resolves inside a single jOOQ chain in the target class.\n\n2. Plan the extraction — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_extract_query_method\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\",\n                      impl_name=\"{{impl_name}}\",\n                      toml_entries={\"selection\": {{selection}}})\n\n   The planner refuses ranges that cross transaction boundaries, mix DSLContext sources, or include unrelated side effects. It parameterizes captured locals and preserves fetch shape, mapping target, imports, and comments attached to the chain.\n\n3. Decide:\n   - If status=blocked, emit bbox_note(kind=\"blocked\") with block_reason and return.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_extract_query_method step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: method name, parameters captured, fetch shape, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never extract across transaction boundaries or DSLContext source changes.\n- Never default apply=true on the operator's behalf.\n- Never invent method names or fetch shape from the user prompt — re-derive from the plan response.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}} {{impl_name}} {{selection}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "extracted_method": { "type": "string" },
+          "captured_parameters": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

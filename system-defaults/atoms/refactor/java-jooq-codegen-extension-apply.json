@@ -1,0 +1,78 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-codegen-extension-apply",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating apply plan for jOOQ codegen extension configuration — adds or updates forced types, converters, bindings, or generator strategy rules when the operator supplies the exact database type pattern, Java type, converter/binding class, target schemas, and validation command. Refuses to infer broad forced-type rules from a single usage site.",
+    "when_to_use": [
+      "operator has supplied the exact forced-type, converter, binding, or generator-strategy rule, including pattern, Java type, target schemas, and validator",
+      "extending codegen configuration in a controlled way after a java-jooq-codegen-inventory result",
+      "wiring a converter or binding that resolves a domain type previously handled by ad hoc field conversion"
+    ],
+    "anti_patterns": [
+      "do not infer broad forced-type rules from a single usage site — pattern, java_type, and target schemas are operator-supplied",
+      "do not edit generated jOOQ source files; this atom edits codegen configuration only",
+      "do not invent converter/binding class names from the user prompt — they must reference real classes",
+      "do not apply when status=blocked or when apply is not explicitly true",
+      "do not use on non-jOOQ projects"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "config_target", "extensions"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "config_target": {
+            "type": "string",
+            "description": "Path to the codegen configuration file to edit (e.g. pom.xml jOOQ plugin config, build.gradle codegen block, jooq-codegen.xml)."
+          },
+          "extensions": {
+            "type": "array",
+            "items": { "type": "object" },
+            "description": "Operator-supplied codegen extensions. Each entry is one of {kind: 'forced_type', includes_pattern, java_type, converter?, binding?, schemas}, {kind: 'converter', t_jdbc, t_java, converter_class, schemas}, {kind: 'binding', t_jdbc, binding_class, schemas}, or {kind: 'strategy', strategy_class}."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply — typically a codegen + compile, e.g. [\"mvn\", \"-pl\", \"<module>\", \"verify\"]. Defaults to [\"mvn\", \"compile\"]; the operator should supply the codegen-aware command when needed."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-codegen-extension-apply. Charter: edit codegen configuration to add operator-supplied forced types / converters / bindings / generator strategy rules; refuse to invent broad rules.\n\nProtocol:\n\n1. Ground the codegen configuration:\n   bbox_refactor_status(file=\"{{config_target}}\", project_dir=\"{{project_dir}}\")\n   Optionally consult a recent java-jooq-codegen-inventory result to confirm existing forced types / converters / bindings before adding new entries.\n\n2. Plan the extension — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_codegen_extension_apply\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{config_target}}\",\n                      toml_entries={\"extensions\": {{extensions}}})\n\n   The planner refuses extension entries missing required operator fields (includes_pattern, java_type, schemas, converter/binding class), and refuses to broaden a forced type beyond the supplied schemas.\n\n3. Decide:\n   - If status=blocked, emit bbox_note(kind=\"blocked\") with block_reason and return.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_codegen_extension_apply step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"]. The operator should supply a codegen-aware command (e.g. mvn verify on the module) when forced types or converters are added.\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: config target, extensions added by kind, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never infer broad forced-type rules from usage sites.\n- Never edit generated jOOQ source files; only codegen configuration.\n- Never invent converter/binding class names.\n- Never default apply=true on the operator's behalf.\n\nInputs:\n{{project_dir}} {{config_target}} {{extensions}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "extensions_added": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

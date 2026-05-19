@@ -1,0 +1,65 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-query-structure-analysis",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Read-only structural analysis of jOOQ query blocks in selected Java files — DSLContext origin and qualifier, tables / aliases / joins / CTEs / nested multisets / raw fragments, projection fields and mapping target, fetch shape, nullability hazards, captured parameters, transaction scope, and boundary crossings such as generated records returned from UI/API methods.",
+    "when_to_use": [
+      "preparing to extract jOOQ query methods or query objects from a large class and need a structural inventory of query blocks first",
+      "auditing a file for context mixing, raw SQL fragments, and projection mapping hazards before any mutation",
+      "feeding extract / synthesize plan kinds with a stable list of query blocks and their captured locals"
+    ],
+    "anti_patterns": [
+      "do not use as a mutation step — this atom is analysis-only and emits no edits",
+      "do not infer DSLContext read/write safety from method names or table names — qualifier policy is operator-supplied",
+      "do not claim transaction safety beyond what is visible in the surrounding scope; nested-transaction semantics are operator-owned",
+      "do not use on non-Java files or files with no jOOQ usage",
+      "do not invent table aliases, projection arities, or mapping targets from the user prompt — re-derive from the plan response"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file containing target jOOQ query blocks, relative to project_dir." },
+          "module_name": { "type": "string", "description": "Optional class name; defaults to the first top-level class in source." }
+        }
+      },
+      "prompt_template": "You are java-jooq-query-structure-analysis. Charter: produce a read-only structural report of jOOQ query blocks in one Java file so the operator can choose a safe extraction shape.\n\nProtocol (analysis-only — no apply step exists):\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\", languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\"])\n   Confirm the target class exists in the file before planning.\n\n2. Plan the structural analysis:\n   bbox_refactor_plan(kind=\"java_jooq_query_structure_analysis\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\")\n\n   The planner is read-only. It refuses non-Java files and files without visible jOOQ usage. The response carries query_blocks with DSLContext origin and visible qualifier, tables/aliases/joins/CTEs, nested multiset queries, raw SQL fragments, projection fields, mapping target, fetch shape, nullability hazards, captured parameters, locally computed conditions, transaction scope, callback-context usage, and boundary_crossings such as generated records returned from UI/API-facing methods.\n\n3. Surface findings; do NOT mutate. If the file is not jOOQ-using, report status=blocked with the planner's block_reason.\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: class name, query block count, raw-fragment count, boundary-crossing count>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never propose edits, organize imports, or trigger any apply step — this atom is analysis-only.\n- Never infer DSLContext qualifier (read-only vs write, schema-specific) — report observed annotations only.\n- Never claim transaction safety beyond visible scope; nested-transaction semantics are operator-owned.\n- Never invent table aliases, projection arities, or mapping targets from the user prompt — re-derive from the plan response.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "class": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "package": { "type": "string" },
+              "source_path": { "type": "string" }
+            }
+          },
+          "query_blocks": { "type": "array", "items": { "type": "object" } },
+          "boundary_crossings": { "type": "array", "items": { "type": "object" } },
+          "raw_fragment_findings": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

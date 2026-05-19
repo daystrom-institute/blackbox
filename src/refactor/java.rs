@@ -3878,6 +3878,19 @@ pub(crate) use extract_code_block::plan_extract_java_code_block_to_method;
 pub(crate) use extract_methods::plan_extract_java_methods;
 pub(crate) use inline_class::plan_inline_java_class;
 pub(crate) use inline_method::plan_inline_java_method;
+pub(crate) use jooq_analysis::{
+    plan_java_jooq_codegen_config_inventory, plan_java_jooq_dsl_context_audit,
+    plan_java_jooq_generated_record_boundary_analysis, plan_java_jooq_projection_mapping_analysis,
+    plan_java_jooq_query_structure_analysis, plan_java_jooq_raw_sql_fragment_audit,
+};
+pub(crate) use jooq_mutations::{
+    plan_java_jooq_codegen_extension_apply, plan_java_jooq_condition_builder_extract,
+    plan_java_jooq_extract_query_method, plan_java_jooq_extract_query_object,
+    plan_java_jooq_extract_repository, plan_java_jooq_generated_record_boundary_rewrite,
+    plan_java_jooq_raw_sql_fragment_rewrite, plan_java_jooq_synthesize_dto_projection,
+    plan_java_jooq_synthesize_query_method, plan_java_jooq_synthesize_repository,
+    plan_java_jooq_transaction_boundary_normalize,
+};
 pub(crate) use leaf_plans::{
     plan_add_java_implements, plan_extract_java_interface, plan_java_lsp_organize_imports,
     plan_migrate_java_type_usages,
@@ -3912,6 +3925,8 @@ mod extract_methods;
 mod find_usages;
 mod inline_class;
 mod inline_method;
+mod jooq_analysis;
+mod jooq_mutations;
 mod leaf_plans;
 mod lombokify;
 mod method_object;

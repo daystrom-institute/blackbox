@@ -1,0 +1,64 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-generated-record-boundary-analysis",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Read-only analysis of generated jOOQ records crossing UI, API, or domain boundaries — reports boundary crossings and suggests DTO or mapper targets. Does not change return types.",
+    "when_to_use": [
+      "preparing java-jooq-generated-record-boundary-rewrite and need a stable list of generated-record leaks first",
+      "auditing UI/API/domain surfaces for generated jOOQ record leakage before any return-type hardening",
+      "feeding DTO synthesis decisions with candidate boundary methods"
+    ],
+    "anti_patterns": [
+      "do not use as a mutation step — this atom is analysis-only and emits no edits",
+      "do not change return types here; that is the rewrite atom",
+      "do not infer which boundaries are UI/API/domain from class names alone — report visible evidence (annotations, package layout, callers)",
+      "do not invent DTO names or method targets from the user prompt — re-derive from the plan response",
+      "do not use on projects without jOOQ generated sources"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "sources"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "sources": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Java files (or boundary packages) to audit, relative to project_dir."
+          },
+          "boundary_classification": {
+            "type": "object",
+            "description": "Optional operator-supplied mapping of package or annotation -> boundary kind {ui, api, domain}.",
+            "additionalProperties": true
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-generated-record-boundary-analysis. Charter: identify generated jOOQ records crossing UI/API/domain boundaries and propose DTO/mapper targets without mutating anything.\n\nProtocol (analysis-only — no apply step exists):\n\n1. Ground each source structurally:\n   For each F in {{sources}}:\n     bbox_refactor_status(file=F, project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"Record\", languages=[\"java\"])\n   Confirm at least one generated jOOQ record reference is visible in scope.\n\n2. Plan the analysis:\n   bbox_refactor_plan(kind=\"java_jooq_generated_record_boundary_analysis\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      sources={{sources}},\n                      toml_entries={\"boundary_classification\": {{boundary_classification}}})\n\n   The planner is read-only. The response carries boundary_crossings (method, return_type, boundary_kind, evidence) and dto_targets with suggested DTO/mapper shape.\n\n3. Surface findings; do NOT mutate. If no generated records or no boundary evidence is visible, report status=blocked with the planner's block_reason.\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: source count, boundary crossing count, dto target count>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never propose edits or trigger any apply step — this atom is analysis-only.\n- Never infer boundary kind from class names alone; require annotation/package/caller evidence or operator-supplied classification.\n- Never invent DTO names from the user prompt — re-derive from the plan response.\n\nInputs:\n{{project_dir}} {{sources}} {{boundary_classification}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "boundary_crossings": { "type": "array", "items": { "type": "object" } },
+          "dto_targets": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

@@ -341,6 +341,142 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-java-jooq-codegen-inventory",
+      "query": "inventory jooq codegen tasks generated source roots schema package mappings forced types converters bindings",
+      "expected_atoms": [
+        "java-jooq-codegen-inventory"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-query-structure-analysis",
+      "query": "analyze jooq query block dslcontext tables joins multiset projections fetch shape in a java file",
+      "expected_atoms": [
+        "java-jooq-query-structure-analysis"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-dsl-context-audit",
+      "query": "audit jooq dslcontext ownership qualified provider transaction callback scope in java",
+      "expected_atoms": [
+        "java-jooq-dsl-context-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-projection-mapping-analysis",
+      "query": "analyze jooq records mapping projection arity nullability generated record boundary leakage",
+      "expected_atoms": [
+        "java-jooq-projection-mapping-analysis"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-raw-sql-fragment-audit",
+      "query": "audit jooq dsl.field dsl.table dsl.condition string aliases stringly typed sql fragments",
+      "expected_atoms": [
+        "java-jooq-raw-sql-fragment-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-raw-sql-fragment-rewrite",
+      "query": "rewrite audited jooq raw sql fragments to generated references or dsl.name expressions",
+      "expected_atoms": [
+        "java-jooq-raw-sql-fragment-rewrite"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-extract-query-method",
+      "query": "extract a selected jooq fluent chain into a named private query method in the same class",
+      "expected_atoms": [
+        "java-jooq-extract-query-method"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-extract-query-object",
+      "query": "extract a complex jooq cte multiset query block into a query object or query factory class",
+      "expected_atoms": [
+        "java-jooq-extract-query-object"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-extract-repository",
+      "query": "extract cohesive jooq query and persistence methods into a repository or data service",
+      "expected_atoms": [
+        "java-jooq-extract-repository"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-synthesize-repository",
+      "query": "synthesize a new jooq repository with crud list exists from operator supplied schema slice",
+      "expected_atoms": [
+        "java-jooq-synthesize-repository"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-synthesize-query-method",
+      "query": "synthesize one typed jooq query method from operator supplied query shape with mapping target",
+      "expected_atoms": [
+        "java-jooq-synthesize-query-method"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-synthesize-dto-projection",
+      "query": "synthesize jooq dto or java record projection and rewrite records mapping at selected site",
+      "expected_atoms": [
+        "java-jooq-synthesize-dto-projection"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-condition-builder-extract",
+      "query": "extract repeated jooq condition construction into a named helper specification or repository private method",
+      "expected_atoms": [
+        "java-jooq-condition-builder-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-transaction-boundary-normalize",
+      "query": "normalize jooq transaction callback to use config.dsl instead of provider lookups or mixed contexts",
+      "expected_atoms": [
+        "java-jooq-transaction-boundary-normalize"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-generated-record-boundary-analysis",
+      "query": "audit generated jooq records crossing ui api or domain boundaries with suggested dto mapper targets",
+      "expected_atoms": [
+        "java-jooq-generated-record-boundary-analysis"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-generated-record-boundary-rewrite",
+      "query": "rewrite jooq generated record return types into dto and mapper at selected method boundaries",
+      "expected_atoms": [
+        "java-jooq-generated-record-boundary-rewrite"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-jooq-codegen-extension-apply",
+      "query": "apply jooq codegen extension forced types converters bindings or generator strategy rules",
+      "expected_atoms": [
+        "java-jooq-codegen-extension-apply"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-find-usages",
       "query": "find every project wide caller of a java method or field",
       "expected_atoms": [

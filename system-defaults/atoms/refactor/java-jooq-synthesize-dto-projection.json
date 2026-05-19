@@ -1,0 +1,84 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-synthesize-dto-projection",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating synthesis of a DTO or Java record plus matching jOOQ projection — creates a named projection type and rewrites a selected Records.mapping(...) or lambda mapping to use it, preserving field order, aliases, nested multiset result types, nullability-visible types, and imports. Supports local nested DTOs only when that matches surrounding code style; otherwise creates a package-level type.",
+    "when_to_use": [
+      "java-jooq-projection-mapping-analysis identified a DTO candidate and the operator approves materializing it",
+      "a Records.mapping(...) site mixes generated record leakage with hand-built constructor args and should bind to a named DTO",
+      "hardening a UI/API-facing query so its projection mapping points at a named DTO instead of a generated record"
+    ],
+    "anti_patterns": [
+      "do not change field order, aliases, multiset nesting, nullability-visible types, or imports beyond what the new DTO requires",
+      "do not synthesize a local nested DTO when surrounding style is package-level (or vice versa) — follow the visible code style",
+      "do not invent fields not present in the selected projection — DTO shape mirrors the projection",
+      "do not change return types of unrelated callers; this atom only rewrites the selected mapping site",
+      "do not apply when status=blocked or when apply is not explicitly true"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name", "mapping_site"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file containing the projection mapping to rewrite, relative to project_dir." },
+          "target": { "type": "string", "description": "Path for the new DTO/Record .java file (package-level) — omit when style=local_nested." },
+          "module_name": { "type": "string", "description": "DTO / Java record name." },
+          "style": {
+            "type": "string",
+            "enum": ["local_nested", "package_level"],
+            "description": "Operator choice of DTO placement style. Must match surrounding code style."
+          },
+          "mapping_site": {
+            "type": "object",
+            "description": "Identifies the Records.mapping(...) / lambda mapping to rewrite — file/line/byte range or item_name + projection index.",
+            "additionalProperties": true
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-synthesize-dto-projection. Charter: materialize a named DTO/record for a selected projection mapping and rewrite the mapping site, preserving order/aliases/nullability/nested-multiset shape.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\", languages=[\"java\"], item_kinds=[\"class_declaration\", \"record_declaration\"])\n   Confirm the mapping site resolves and the chosen DTO name does not collide.\n\n2. Plan the synthesis — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_synthesize_dto_projection\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      target=\"{{target}}\",\n                      module_name=\"{{module_name}}\",\n                      toml_entries={\"style\": \"{{style}}\",\n                                    \"mapping_site\": {{mapping_site}}})\n\n   The planner refuses arity mismatches between the projection and the synthesized DTO, refuses placement style that conflicts with surrounding code style, and refuses to lose nested multiset typing.\n\n3. Decide:\n   - If status=blocked, emit bbox_note(kind=\"blocked\") with block_reason and return.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_synthesize_dto_projection step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: DTO name, style, fields, mapping site rewritten, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never invent fields not present in the selected projection.\n- Never change unrelated caller return types.\n- Never override the operator's placement style.\n- Never default apply=true on the operator's behalf.\n\nInputs:\n{{project_dir}} {{source}} {{target}} {{module_name}} {{style}} {{mapping_site}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "dto_file": { "type": "string" },
+          "dto_style": { "enum": ["local_nested", "package_level"] },
+          "fields": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

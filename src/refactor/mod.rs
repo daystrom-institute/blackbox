@@ -1326,6 +1326,29 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "java_vaadin_route_inventory" => plan_java_vaadin_route_inventory(p),
         "java_vaadin_static_ui_context_audit" => plan_java_vaadin_static_ui_context_audit(p),
         "java_vaadin_view_structure_analysis" => plan_java_vaadin_view_structure_analysis(p),
+        "java_jooq_codegen_config_inventory" => plan_java_jooq_codegen_config_inventory(p),
+        "java_jooq_query_structure_analysis" => plan_java_jooq_query_structure_analysis(p),
+        "java_jooq_dsl_context_audit" => plan_java_jooq_dsl_context_audit(p),
+        "java_jooq_projection_mapping_analysis" => plan_java_jooq_projection_mapping_analysis(p),
+        "java_jooq_raw_sql_fragment_audit" => plan_java_jooq_raw_sql_fragment_audit(p),
+        "java_jooq_raw_sql_fragment_rewrite" => plan_java_jooq_raw_sql_fragment_rewrite(p),
+        "java_jooq_extract_query_method" => plan_java_jooq_extract_query_method(p),
+        "java_jooq_extract_query_object" => plan_java_jooq_extract_query_object(p),
+        "java_jooq_extract_repository" => plan_java_jooq_extract_repository(p),
+        "java_jooq_synthesize_repository" => plan_java_jooq_synthesize_repository(p),
+        "java_jooq_synthesize_query_method" => plan_java_jooq_synthesize_query_method(p),
+        "java_jooq_synthesize_dto_projection" => plan_java_jooq_synthesize_dto_projection(p),
+        "java_jooq_condition_builder_extract" => plan_java_jooq_condition_builder_extract(p),
+        "java_jooq_transaction_boundary_normalize" => {
+            plan_java_jooq_transaction_boundary_normalize(p)
+        }
+        "java_jooq_generated_record_boundary_analysis" => {
+            plan_java_jooq_generated_record_boundary_analysis(p)
+        }
+        "java_jooq_generated_record_boundary_rewrite" => {
+            plan_java_jooq_generated_record_boundary_rewrite(p)
+        }
+        "java_jooq_codegen_extension_apply" => plan_java_jooq_codegen_extension_apply(p),
         "rewrite_rust_error_type" => rust_error_migrate::plan_rewrite_error_type(p),
         "migrate_rust_string_field_to_enum" => {
             rust_string_enum::plan_migrate_string_field_to_enum(p)

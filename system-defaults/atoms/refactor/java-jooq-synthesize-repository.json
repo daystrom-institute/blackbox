@@ -1,0 +1,98 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-synthesize-repository",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating synthesis of a new jOOQ repository or data service from an operator-defined schema slice. Generates conservative, compile-oriented code for operator-specified methods (findById, list, exists, insert, update, count, paged search, explicit delete variants) using supplied package, injection style, DSLContext policy, tables, return shapes, and transaction policy. Delete methods require exact operator policy.",
+    "when_to_use": [
+      "operator has supplied a complete schema model slice (tables, generated record types, method list, return shapes, context/transaction/injection policy) and wants a new repository scaffold",
+      "synthesizing straightforward CRUD/list/exists/typed-projection repositories before complex CTE/window/multiset queries are needed",
+      "kick-starting a new module's data layer with conservative, compile-oriented code"
+    ],
+    "anti_patterns": [
+      "do not infer DSLContext qualifier, read-only vs read/write policy, soft-delete column/predicate/values, hard-delete scope, or authorization filters — these are operator-supplied",
+      "do not synthesize hard-delete or soft-delete methods without explicit operator scope and exact deletion policy",
+      "do not invent business rules, security filters, tenant filters, auditing fields, or sequence usage",
+      "do not synthesize complex CTE/window/multiset queries in v1 — prefer extract-query-object plus human review",
+      "do not apply when status=blocked or when apply is not explicitly true",
+      "do not invent table names or package targets from the user prompt — re-derive from operator inputs"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "target", "module_name", "context_policy", "tables", "methods", "transaction_policy", "injection_style"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "target": { "type": "string", "description": "Path for the new repository .java file." },
+          "module_name": { "type": "string", "description": "New repository / data service class name." },
+          "context_policy": {
+            "type": "object",
+            "description": "Operator-supplied DSLContext policy: {style, qualifier, read_only}.",
+            "additionalProperties": true
+          },
+          "tables": {
+            "type": "array",
+            "items": { "type": "object" },
+            "description": "Operator-supplied tables + generated record types in scope."
+          },
+          "methods": {
+            "type": "array",
+            "items": { "type": "object" },
+            "description": "Operator-supplied method specs: kind (findById, list, exists, insert, update, count, paged_search, hard_delete, soft_delete), return_shape (generated_record | dto | java_record | mapper_method), parameters, soft-delete column/predicate/update values, hard-delete scope, etc."
+          },
+          "transaction_policy": {
+            "type": "object",
+            "description": "Operator-supplied transaction policy for writes and multi-step operations.",
+            "additionalProperties": true
+          },
+          "injection_style": {
+            "type": "string",
+            "description": "DI style for the new class — operator-supplied."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-synthesize-repository. Charter: synthesize a conservative compile-oriented repository scaffold from operator-supplied schema model slice and policies; refuse to invent semantics.\n\nProtocol:\n\n1. Ground codegen state:\n   bbox_refactor_status(file=\"{{target}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"DSLContext\", languages=[\"java\"])\n   Confirm the generated jOOQ package(s) referenced by {{tables}} exist before planning. Optionally consult a recent java-jooq-codegen-inventory result.\n\n2. Plan the synthesis — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_synthesize_repository\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      target=\"{{target}}\",\n                      module_name=\"{{module_name}}\",\n                      toml_entries={\"context_policy\": {{context_policy}},\n                                    \"tables\": {{tables}},\n                                    \"methods\": {{methods}},\n                                    \"transaction_policy\": {{transaction_policy}},\n                                    \"injection_style\": \"{{injection_style}}\"})\n\n   The planner refuses any method spec missing required operator inputs: soft_delete without column/predicate/update values, hard_delete without explicit scope, methods that would require authorization/tenant/audit semantics not present in inputs. Soft-delete and hard-delete only synthesize when the operator's method entry explicitly supplies the exact policy.\n\n3. Decide:\n   - If status=blocked, emit bbox_note(kind=\"blocked\") with block_reason and return.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_synthesize_repository step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: repository class, method kinds synthesized, soft/hard delete present?, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never infer context qualifier, read/write policy, soft-delete predicates/values, hard-delete scope, authorization, tenant, or audit semantics.\n- Never synthesize hard-delete or soft-delete methods without explicit operator scope.\n- Never default apply=true on the operator's behalf.\n- Never invent table names or package targets from the user prompt.\n\nInputs:\n{{project_dir}} {{target}} {{module_name}} {{context_policy}} {{tables}} {{methods}} {{transaction_policy}} {{injection_style}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "repository_file": { "type": "string" },
+          "methods_synthesized": { "type": "array", "items": { "type": "object" } },
+          "operator_policy_inputs_used": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

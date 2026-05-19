@@ -1381,6 +1381,23 @@ mod tests {
             "java_vaadin_route_inventory",
             "java_vaadin_static_ui_context_audit",
             "java_vaadin_view_structure_analysis",
+            "java_jooq_codegen_config_inventory",
+            "java_jooq_query_structure_analysis",
+            "java_jooq_dsl_context_audit",
+            "java_jooq_projection_mapping_analysis",
+            "java_jooq_raw_sql_fragment_audit",
+            "java_jooq_raw_sql_fragment_rewrite",
+            "java_jooq_extract_query_method",
+            "java_jooq_extract_query_object",
+            "java_jooq_extract_repository",
+            "java_jooq_synthesize_repository",
+            "java_jooq_synthesize_query_method",
+            "java_jooq_synthesize_dto_projection",
+            "java_jooq_condition_builder_extract",
+            "java_jooq_transaction_boundary_normalize",
+            "java_jooq_generated_record_boundary_analysis",
+            "java_jooq_generated_record_boundary_rewrite",
+            "java_jooq_codegen_extension_apply",
         ];
 
         for kind in java_plan_kinds {

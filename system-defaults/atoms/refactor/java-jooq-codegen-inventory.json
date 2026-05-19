@@ -1,0 +1,60 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-codegen-inventory",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Read-only inventory of jOOQ generation configuration for a project — generation tasks, generated source roots, schema-to-package mappings, forced types, converters, bindings, custom generator strategy hooks, and generated-source ownership.",
+    "when_to_use": [
+      "preparing to synthesize or refactor jOOQ repositories and need to learn the generated package layout and codegen ownership",
+      "before java-jooq-codegen-extension-apply to ground forced-type / converter / binding decisions in current configuration",
+      "auditing which schemas, generators, and generated source roots a Java module owns"
+    ],
+    "anti_patterns": [
+      "do not use as a mutation step — this atom is analysis-only and emits no edits",
+      "do not infer broad forced-type, converter, or binding rules from a single usage site — that is operator-supplied policy in java-jooq-codegen-extension-apply",
+      "do not claim semantic correctness of generator strategies beyond what the configuration declares",
+      "do not use on non-Java / non-jOOQ projects",
+      "do not invent generated package names, schemas, or forced-type targets from the user prompt — re-derive from the plan response"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "module_name": { "type": "string", "description": "Optional Maven/Gradle module to scope the inventory; defaults to all jOOQ-using modules." }
+        }
+      },
+      "prompt_template": "You are java-jooq-codegen-inventory. Charter: produce a read-only inventory of jOOQ codegen configuration so the operator can ground repository synthesis and codegen-extension decisions.\n\nProtocol (analysis-only — no apply step exists):\n\n1. Ground the project structurally:\n   bbox_refactor_status(file=\"pom.xml\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"jooq\", languages=[\"java\"])\n   Confirm the project actually uses jOOQ before planning. Use a Gradle equivalent when the project is Gradle-shaped.\n\n2. Plan the inventory:\n   bbox_refactor_plan(kind=\"java_jooq_codegen_config_inventory\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      module_name=\"{{module_name}}\")\n\n   The planner is read-only. The response carries generation_tasks, generated_source_roots, schema_to_package mappings, forced_types, converters, bindings, generator_strategy_hooks, and generated_source_ownership.\n\n3. Surface findings; do NOT mutate. If the project is not jOOQ-using, report status=blocked with the planner's block_reason.\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: generation task count, generated source root count, forced-type count, converter/binding count>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never propose edits, organize imports, or trigger any apply step — this atom is analysis-only.\n- Never infer forced-type, converter, or binding rules from usage sites — that is operator-supplied policy elsewhere.\n- Never invent generated package names, schemas, or forced-type targets from the user prompt — re-derive from the plan response.\n\nInputs:\n{{project_dir}} {{module_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "generation_tasks": { "type": "array", "items": { "type": "object" } },
+          "generated_source_roots": { "type": "array", "items": { "type": "string" } },
+          "schema_to_package": { "type": "array", "items": { "type": "object" } },
+          "forced_types": { "type": "array", "items": { "type": "object" } },
+          "converters": { "type": "array", "items": { "type": "object" } },
+          "bindings": { "type": "array", "items": { "type": "object" } },
+          "generator_strategy_hooks": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

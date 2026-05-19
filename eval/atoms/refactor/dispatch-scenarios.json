@@ -617,6 +617,323 @@
       "expect_response_fields": ["status", "findings", "highest_risk"]
     },
     {
+      "id": "dispatch-java-jooq-codegen-inventory-planonly",
+      "atom": "java-jooq-codegen-inventory",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status",
+        "generation_tasks",
+        "generated_source_roots",
+        "schema_package_mappings"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-query-structure-analysis-planonly",
+      "atom": "java-jooq-query-structure-analysis",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "query_blocks",
+        "boundary_crossings"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-dsl-context-audit-planonly",
+      "atom": "java-jooq-dsl-context-audit",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "provider_fields",
+        "transaction_scopes",
+        "findings"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-projection-mapping-analysis-planonly",
+      "atom": "java-jooq-projection-mapping-analysis",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "projections",
+        "arity_risks",
+        "boundary_leaks"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-raw-sql-fragment-audit-planonly",
+      "atom": "java-jooq-raw-sql-fragment-audit",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "fragments",
+        "classifications"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-raw-sql-fragment-rewrite-planonly",
+      "atom": "java-jooq-raw-sql-fragment-rewrite",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java",
+        "fragment_mappings": [
+          {
+            "fragment_id": "fragment-1",
+            "replacement_kind": "generated_field",
+            "replacement": "com.example.jooq.tables.Users.USERS.NAME"
+          }
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "fragments_rewritten",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-extract-query-method-planonly",
+      "atom": "java-jooq-extract-query-method",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java",
+        "module_name": "findActiveUsersForReport",
+        "old_text": "dsl.selectFrom(USERS).where(USERS.ACTIVE.isTrue()).fetch()",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "method_name",
+        "captured_parameters",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-extract-query-object-planonly",
+      "atom": "java-jooq-extract-query-object",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java",
+        "target": "src/main/java/com/example/ReportRollupQuery.java",
+        "module_name": "ReportRollupQuery",
+        "old_text": "dsl.with(\"daily\").as(...).select(...).from(...).fetch()",
+        "context_policy": "provider",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "query_object_class",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-extract-repository-planonly",
+      "atom": "java-jooq-extract-repository",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/AdminUserView.java",
+        "target": "src/main/java/com/example/UserRepository.java",
+        "module_name": "UserRepository",
+        "item_names": [
+          "findUserById",
+          "listActiveUsers",
+          "countByTenant"
+        ],
+        "context_qualifier_policy": "primary",
+        "transaction_boundary_policy": "caller_owned",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "repository_class",
+        "methods_moved",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-synthesize-repository-planonly",
+      "atom": "java-jooq-synthesize-repository",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "target": "src/main/java/com/example/UserRepository.java",
+        "module_name": "UserRepository",
+        "package_name": "com.example.repo",
+        "injection_style": "guice_provider",
+        "context_qualifier_policy": "primary",
+        "read_write_policy": "read_write",
+        "tables": [
+          "com.example.jooq.tables.Users"
+        ],
+        "methods": [
+          "findById",
+          "list",
+          "exists",
+          "insert",
+          "update"
+        ],
+        "return_shape": "record",
+        "transaction_policy": "caller_owned",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "repository_class",
+        "methods_synthesized",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-synthesize-query-method-planonly",
+      "atom": "java-jooq-synthesize-query-method",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "target": "src/main/java/com/example/UserRepository.java",
+        "module_name": "findActiveUsersByTenant",
+        "query_shape": {
+          "tables": ["com.example.jooq.tables.Users"],
+          "selected_fields": ["USERS.ID", "USERS.NAME"],
+          "conditions": ["USERS.TENANT_ID.eq(tenantId)", "USERS.ACTIVE.isTrue()"],
+          "parameters": [{"name": "tenantId", "type": "java.util.UUID"}],
+          "ordering": ["USERS.NAME.asc()"],
+          "fetch_shape": "fetch"
+        },
+        "mapping_target": "com.example.dto.UserSummary",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "method_name",
+        "mapping_target",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-synthesize-dto-projection-planonly",
+      "atom": "java-jooq-synthesize-dto-projection",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/ReportService.java",
+        "target": "src/main/java/com/example/dto/UserSummary.java",
+        "module_name": "UserSummary",
+        "old_text": "Records.mapping(UserSummary::new)",
+        "fields": [
+          {"name": "id", "type": "java.util.UUID"},
+          {"name": "name", "type": "java.lang.String"}
+        ],
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "dto_class",
+        "fields",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-condition-builder-extract-planonly",
+      "atom": "java-jooq-condition-builder-extract",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UserRepository.java",
+        "target": "src/main/java/com/example/UserConditions.java",
+        "module_name": "activeUserCondition",
+        "old_text": "USERS.ACTIVE.isTrue().and(USERS.DELETED_AT.isNull())",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "helper_name",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-transaction-boundary-normalize-planonly",
+      "atom": "java-jooq-transaction-boundary-normalize",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UserRepository.java",
+        "item_names": [
+          "registerUser"
+        ],
+        "context_qualifier_policy": "callback_owned",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "methods_normalized",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-generated-record-boundary-analysis-planonly",
+      "atom": "java-jooq-generated-record-boundary-analysis",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/AdminUserView.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "boundary_crossings",
+        "suggested_dto_targets"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-generated-record-boundary-rewrite-planonly",
+      "atom": "java-jooq-generated-record-boundary-rewrite",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/UserRepository.java",
+        "item_names": [
+          "findUserById"
+        ],
+        "dto_target": "com.example.dto.UserSummary",
+        "acknowledge_public_api_change": true,
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "methods_rewritten",
+        "dto_target",
+        "plan_path"
+      ]
+    },
+    {
+      "id": "dispatch-java-jooq-codegen-extension-apply-planonly",
+      "atom": "java-jooq-codegen-extension-apply",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "target": "jooq-codegen.xml",
+        "forced_types": [
+          {
+            "database_type_pattern": "JSONB",
+            "java_type": "com.fasterxml.jackson.databind.JsonNode",
+            "converter": "com.example.jooq.JsonbConverter",
+            "target_schemas": ["public"]
+          }
+        ],
+        "validation_command": "mvn -pl codegen jooq-codegen:generate",
+        "apply": false
+      },
+      "expect_response_fields": [
+        "status",
+        "forced_types_added",
+        "plan_path"
+      ]
+    },
+    {
       "id": "dispatch-java-decompose-god-class-planonly",
       "atom": "java-decompose-god-class",
       "args": {

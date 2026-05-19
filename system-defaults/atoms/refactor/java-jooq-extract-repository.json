@@ -1,0 +1,99 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-extract-repository",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating extraction of a cohesive group of query and persistence methods into a repository or data service. The plan preserves method signatures unless the operator explicitly requests DTO boundary changes, and refuses to merge methods using incompatible DSLContexts or transaction ownership without explicit mapping.",
+    "when_to_use": [
+      "a class has accumulated a cohesive cluster of query/persistence methods that should live in a repository or data service",
+      "operator has chosen target package, class name, injection style, context qualifier policy, transaction policy, and method list",
+      "the selected methods share compatible DSLContext qualifiers and transaction ownership (or the operator has supplied a mapping)"
+    ],
+    "anti_patterns": [
+      "do not infer DSLContext qualifier, injection style, or transaction policy — these are operator-supplied",
+      "do not change method signatures or public API without explicit operator approval (acknowledge_public_api_change must be operator-explicit)",
+      "do not merge methods with incompatible contexts/transaction ownership without an explicit mapping; the plan must refuse",
+      "do not apply when status=blocked or when apply is not explicitly true",
+      "do not invent target package or class names from the user prompt — re-derive from the operator inputs"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name", "item_names", "context_policy", "transaction_policy", "injection_style"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file containing the methods to extract, relative to project_dir." },
+          "target": { "type": "string", "description": "Path for the new repository .java file." },
+          "module_name": { "type": "string", "description": "New repository / data service class name." },
+          "impl_name": { "type": "string", "description": "Optional source class name when source has multiple classes." },
+          "item_names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Method names to lift into the new repository."
+          },
+          "context_policy": {
+            "type": "object",
+            "description": "Operator-supplied DSLContext policy: {style, qualifier, read_only}.",
+            "additionalProperties": true
+          },
+          "transaction_policy": {
+            "type": "object",
+            "description": "Operator-supplied transaction boundary policy for the new repository.",
+            "additionalProperties": true
+          },
+          "injection_style": {
+            "type": "string",
+            "description": "DI style for the new class, e.g. constructor / field / Guice / Spring — operator-supplied."
+          },
+          "acknowledge_public_api_change": {
+            "type": "boolean",
+            "description": "Operator-authority opt-out (RX-V1 style). Required when the plan would change call-site signatures or public surface. MUST be operator-explicit; the atom MUST NOT default this flag."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-extract-repository. Charter: lift a cohesive cluster of jOOQ-using methods into a new repository under operator-supplied context/transaction/injection policy, with an explicit public-API opt-out.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\", languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\"])\n   Confirm every method in {{item_names}} resolves on the source class.\n\n2. Plan the extraction — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_extract_repository\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      target=\"{{target}}\",\n                      module_name=\"{{module_name}}\",\n                      impl_name=\"{{impl_name}}\",\n                      item_names={{item_names}},\n                      toml_entries={\"context_policy\": {{context_policy}},\n                                    \"transaction_policy\": {{transaction_policy}},\n                                    \"injection_style\": \"{{injection_style}}\"})\n\n   The planner requires {{context_policy}}, {{transaction_policy}}, and {{injection_style}} to be supplied explicitly. It refuses merging methods with incompatible contexts or transaction ownership unless the operator has supplied a mapping. The response carries a public_api_delta summary.\n\n3. Decide:\n   - STRUCTURED REFUSAL: IF the planner reports public_api_delta.severity == \"breaking\" AND {{acknowledge_public_api_change}} != true: emit bbox_note(kind=\"blocked\", body=<diagnostic with public_items_touched and plan_path>) and return status=\"blocked\". The atom MUST NOT default acknowledge_public_api_change.\n   - If status=blocked for any other reason, surface the block_reason.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true and not blocked):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_extract_repository step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: repository class, methods lifted, public-API delta, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never infer context qualifier, transaction policy, or injection style.\n- Never default acknowledge_public_api_change — operator-authority is explicit (RX-V1).\n- Never merge methods with incompatible contexts/transaction ownership without an explicit mapping.\n- Never default apply=true on the operator's behalf.\n\nInputs:\n{{project_dir}} {{source}} {{target}} {{module_name}} {{impl_name}} {{item_names}} {{context_policy}} {{transaction_policy}} {{injection_style}} {{acknowledge_public_api_change}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "repository_file": { "type": "string" },
+          "methods_lifted": { "type": "array", "items": { "type": "string" } },
+          "public_api_delta": { "type": "object", "additionalProperties": true },
+          "operator_opt_outs_used": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

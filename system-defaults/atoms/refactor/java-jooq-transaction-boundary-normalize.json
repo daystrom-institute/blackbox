@@ -1,0 +1,87 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-jooq-transaction-boundary-normalize",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Mutating rewrite that normalizes a method to use the correct callback-owned DSLContext — replacing provider lookups inside a transaction callback with config.dsl(), passing the transaction context into helper methods, and removing accidental mixed-context calls. Preserves nesting semantics unless the operator explicitly asks to flatten nested transactions.",
+    "when_to_use": [
+      "java-jooq-dsl-context-audit identified mixed-context callbacks or provider lookups inside a transaction callback and the operator approves normalization",
+      "hardening a write path so the callback context is threaded through helper methods consistently",
+      "removing accidental Provider<DSLContext>.get() calls inside a transactionResult callback"
+    ],
+    "anti_patterns": [
+      "do not flatten nested transactions without explicit operator request — nesting semantics are operator-owned",
+      "do not change DSLContext qualifier across the rewrite — qualifier is fixed by the existing callback owner",
+      "do not infer read/write safety from method names or table names — policy is operator-supplied via the prior audit",
+      "do not apply when status=blocked or when apply is not explicitly true",
+      "do not invent helper method signatures from the user prompt — re-derive from the plan response"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "item_names"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file containing the methods to normalize, relative to project_dir." },
+          "impl_name": { "type": "string", "description": "Optional containing class name when source has multiple classes." },
+          "item_names": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Method names to normalize."
+          },
+          "flatten_nested_transactions": {
+            "type": "boolean",
+            "description": "Operator-supplied flag; only true when the operator explicitly approves flattening nested callbacks. MUST NOT be defaulted by the atom."
+          },
+          "audit_plan_path": {
+            "type": "string",
+            "description": "Optional path to the approved java_jooq_dsl_context_audit plan whose findings are being acted on."
+          },
+          "apply": { "type": "boolean" },
+          "validation_cmd": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "Validation command after apply. Defaults to [\"mvn\", \"compile\"]."
+          }
+        }
+      },
+      "prompt_template": "You are java-jooq-transaction-boundary-normalize. Charter: rewrite selected methods to use the callback-owned DSLContext consistently; never flatten nested transactions unless explicitly authorized.\n\nProtocol:\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{impl_name}}\", languages=[\"java\"], item_kinds=[\"class_declaration\", \"method_declaration\"])\n   Confirm every method in {{item_names}} resolves and contains a transaction callback.\n\n2. Plan the normalization — PREVIEW only:\n   bbox_refactor_plan(kind=\"java_jooq_transaction_boundary_normalize\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      impl_name=\"{{impl_name}}\",\n                      item_names={{item_names}},\n                      toml_entries={\"flatten_nested_transactions\": {{flatten_nested_transactions}},\n                                    \"audit_plan_path\": \"{{audit_plan_path}}\"})\n\n   The planner refuses to flatten nested transactions when flatten_nested_transactions is not true. It preserves DSLContext qualifier and rewrites provider lookups, helper signatures, and mixed-context calls only where the callback owner is unambiguous.\n\n3. Decide:\n   - If status=blocked, emit bbox_note(kind=\"blocked\") with block_reason and return.\n   - If apply is not true, return status=\"planned\".\n\n4. Apply (only when inputs.apply == true):\n   bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[\n     <java_jooq_transaction_boundary_normalize step from the plan>,\n     {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}\n   ])\n   Default validation_cmd is [\"mvn\", \"compile\"].\n\n5. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: methods normalized, provider lookups replaced, helper signatures updated, nested flatten applied?, validation result>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never default flatten_nested_transactions — operator-authority is explicit.\n- Never change DSLContext qualifier across the rewrite.\n- Never infer read/write safety from method names or table names.\n- Never default apply=true on the operator's behalf.\n\nInputs:\n{{project_dir}} {{source}} {{impl_name}} {{item_names}} {{flatten_nested_transactions}} {{audit_plan_path}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "methods_normalized": { "type": "array", "items": { "type": "string" } },
+          "provider_lookups_replaced": { "type": "integer", "minimum": 0 },
+          "helper_signatures_updated": { "type": "integer", "minimum": 0 },
+          "operator_opt_outs_used": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "mvn_result": {
+            "type": "object",
+            "properties": {
+              "command": { "type": "string" },
+              "exit_code": { "type": "integer" },
+              "summary": { "type": "string" },
+              "rolled_back": { "type": "boolean" }
+            }
+          }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}
