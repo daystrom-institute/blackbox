@@ -79,7 +79,9 @@ the decomposition cleanup that the topology move exposed:
      `src/orchestration/providers/catalog.rs`; session discovery and session-cwd
      resolution helpers now live in `src/orchestration/providers/session.rs`;
      provider event parsing now lives in
-     `src/orchestration/providers/events.rs`.
+     `src/orchestration/providers/events.rs`; provider MCP registration and
+     dispatch-filter argument builders now live in
+     `src/orchestration/providers/mcp_args.rs`.
 
 4. **Improve test locality opportunistically.**
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
@@ -593,6 +595,10 @@ Landed:
 27. `src/orchestration/providers/events.rs` owns provider event parsing,
     `EventSink`, `Usage`, and OpenCode export parsing previously embedded in
     `orchestration/providers.rs`.
+28. `src/orchestration/providers/mcp_args.rs` owns provider MCP registration,
+    removal/listing, dispatch-filter argument construction, transient blackbox
+    MCP injection helpers, and MCP-list matching previously embedded in
+    `orchestration/providers.rs`.
 
 Next useful cuts:
 
@@ -608,9 +614,8 @@ Next useful cuts:
    - `tools/atoms.rs`: keep the public tool facade and move implementation
      clusters into child modules; the helper tail has already moved to
      `tools/atoms/helpers.rs`.
-   - `orchestration/providers.rs`: continue after the catalog/session/events
-     splits with provider MCP/filter handling and credentials/bin resolution
-     when touching nearby code.
+   - `orchestration/providers.rs`: continue after the catalog/session/events/MCP
+     splits with credentials/bin resolution when touching nearby code.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
