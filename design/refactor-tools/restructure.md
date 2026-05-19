@@ -130,7 +130,8 @@ large-module and test-locality cleanup that the topology move exposed:
      `src/packets/apply.rs`; string-contains and in-range evaluator tests live
      there as well.
      Simple `CountMatches` predicate evaluator tests now live under
-     `src/packets/apply.rs`.
+     `src/packets/apply.rs`. All-mode audit verifier tests now live under
+     `src/packets/audit.rs`.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
@@ -708,6 +709,8 @@ Landed:
     shared packet test island to `src/packets/apply.rs`.
 48. Simple `CountMatches` predicate evaluator tests moved from the shared
     packet test island to `src/packets/apply.rs`.
+49. All-mode audit verifier tests moved from the shared packet test island to
+    `src/packets/audit.rs`.
 
 Next useful cuts:
 
@@ -720,7 +723,8 @@ Next useful cuts:
    - Continue moving remaining `packets/tests.rs` cases into per-module test
      blocks; event/gap logging, scanner, JSON coercion, and dotted-path
      predicate evaluator tests have moved, along with string-contains and
-     in-range evaluator tests and simple `CountMatches` evaluator tests.
+     in-range evaluator tests, simple `CountMatches` evaluator tests, and
+     all-mode audit verifier tests.
    - Move daemon-startup-shaped tests to top-level integration tests using
      `blackbox::` imports.
 

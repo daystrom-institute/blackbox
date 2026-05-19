@@ -5,7 +5,7 @@ use super::{
     ApplyMode, ApplyParams, AuditParams, CmpOp, CompileParams, Emit, MAX_COMPOSITION_DEPTH,
     NoopResolver, Packet, Packets, Predicate, Rule, RuleInput, Value, apply, apply_all, apply_with,
     default_rank_lookup_key, default_threshold_lookup_key, eval_predicate, infer_classification,
-    packet_matches_query, packet_summary, review_lattice, review_prefix_inference, verify_all,
+    packet_matches_query, packet_summary, review_lattice, review_prefix_inference,
 };
 use serde_json::json;
 
@@ -1697,133 +1697,6 @@ fn emit_default_is_independent() {
         .materialize(&review_lattice(), &review_prefix_inference())
         .unwrap();
     assert_eq!(r.emit, Emit::Independent);
-}
-
-// ── Phase 4B: multi-finding audit ──
-
-fn multi_find_packet() -> Packet {
-    bare_packet(vec![
-        rule("fail_always", Predicate::AlwaysTrue {}, "FAIL", "fail"),
-        rule(
-            "flag_on_x",
-            Predicate::Eq {
-                field: "x".into(),
-                value: Value::Int(1),
-            },
-            "FLAG_X",
-            "flag",
-        ),
-        fallback_rule("pass_catchall", Predicate::AlwaysTrue {}, "PASS", "pass"),
-    ])
-}
-
-#[test]
-fn verify_all_matches_verdict_and_rule_ids() {
-    let p = multi_find_packet();
-    // Entity with x=1: both fail_always and flag_on_x fire; verdict = fail.
-    let dataset = json!([{
-        "entity": {"x": 1},
-        "expected_verdict": "fail",
-        "expected_rule_ids": ["fail_always", "flag_on_x"]
-    }]);
-    let report = verify_all(&p, &dataset).unwrap();
-    assert_eq!(report.total, 1);
-    assert_eq!(report.correct, 1);
-    assert!(report.mismatches.is_empty());
-}
-
-#[test]
-fn verify_all_flags_verdict_mismatch() {
-    let p = multi_find_packet();
-    let dataset = json!([{
-        "entity": {"x": 1},
-        "expected_verdict": "flag",  // wrong — actual is "fail"
-        "expected_rule_ids": ["fail_always", "flag_on_x"]
-    }]);
-    let report = verify_all(&p, &dataset).unwrap();
-    assert_eq!(report.total, 1);
-    assert_eq!(report.correct, 0);
-    assert_eq!(report.mismatches.len(), 1);
-    assert_eq!(report.mismatches[0].check, "verdict");
-    assert_eq!(
-        report.mismatches[0].expected_verdict.as_deref(),
-        Some("flag")
-    );
-    assert_eq!(report.mismatches[0].actual_verdict.as_deref(), Some("fail"));
-}
-
-#[test]
-fn verify_all_flags_rule_ids_mismatch() {
-    let p = multi_find_packet();
-    let dataset = json!([{
-        "entity": {"x": 1},
-        "expected_verdict": "fail",
-        "expected_rule_ids": ["fail_always"]  // missing flag_on_x
-    }]);
-    let report = verify_all(&p, &dataset).unwrap();
-    assert_eq!(report.correct, 0);
-    assert_eq!(report.mismatches[0].check, "rule_ids");
-}
-
-#[test]
-fn verify_all_flags_both_mismatches() {
-    let p = multi_find_packet();
-    let dataset = json!([{
-        "entity": {"x": 1},
-        "expected_verdict": "pass",
-        "expected_rule_ids": ["nonexistent_rule"]
-    }]);
-    let report = verify_all(&p, &dataset).unwrap();
-    assert_eq!(report.mismatches[0].check, "both");
-}
-
-#[test]
-fn verify_all_rule_ids_order_invariant() {
-    let p = multi_find_packet();
-    // Order of expected_rule_ids differs from firing order — still matches.
-    let dataset = json!([{
-        "entity": {"x": 1},
-        "expected_rule_ids": ["flag_on_x", "fail_always"]  // reversed
-    }]);
-    let report = verify_all(&p, &dataset).unwrap();
-    assert_eq!(
-        report.correct, 1,
-        "rule_ids comparison is a set, not a list"
-    );
-}
-
-#[test]
-fn verify_all_partial_expectations_ok() {
-    let p = multi_find_packet();
-    // Only expected_verdict set → only verdict checked.
-    let dataset = json!([
-        {"entity": {"x": 1}, "expected_verdict": "fail"},
-        {"entity": {"x": 99}, "expected_verdict": "fail"}  // fail_always still fires
-    ]);
-    let report = verify_all(&p, &dataset).unwrap();
-    assert_eq!(report.correct, 2);
-}
-
-#[test]
-fn audit_tool_all_mode_via_mcp_surface() {
-    let (_dir, store) = tmp_packets();
-    store.save_packet(&multi_find_packet()).unwrap();
-    let packet_id = multi_find_packet().id;
-
-    let report = store
-        .audit_tool(&AuditParams {
-            packet_id: packet_id.clone(),
-            dataset: json!([{
-                "entity": {"x": 1},
-                "expected_verdict": "fail",
-                "expected_rule_ids": ["fail_always", "flag_on_x"]
-            }]),
-            mode: Some(ApplyMode::All),
-        })
-        .unwrap();
-    assert!(report.contains("\"mode\": \"all\""));
-    assert!(report.contains("\"correct\": 1"));
-    assert!(report.contains("\"fidelity\": 1.0"));
 }
 
 #[test]
