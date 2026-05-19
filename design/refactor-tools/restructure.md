@@ -132,8 +132,8 @@ large-module and test-locality cleanup that the topology move exposed:
      Simple `CountMatches` predicate evaluator tests now live under
      `src/packets/apply.rs`. All-mode audit verifier tests now live under
      `src/packets/audit.rs`. Predicate serde and value equality tests now live
-     under `src/packets/ast.rs`. Shared packet test builders now live in
-     `src/packets/test_support.rs`.
+     under `src/packets/ast.rs`. Shared packet test builders and composition
+     helpers now live in `src/packets/test_support.rs`.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
@@ -715,8 +715,8 @@ Landed:
     `src/packets/audit.rs`.
 50. Predicate serde and value equality tests moved from the shared packet test
     island to `src/packets/ast.rs`.
-51. Shared packet test builders moved from the packet test island to
-    `src/packets/test_support.rs`.
+51. Shared packet test builders and composition helpers moved from the packet
+    test island to `src/packets/test_support.rs`.
 
 Next useful cuts:
 
