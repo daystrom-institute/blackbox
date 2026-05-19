@@ -1,4 +1,9 @@
-use super::{CompileParams, Packets};
+use std::collections::BTreeMap;
+
+use super::{
+    CompileParams, Emit, Packet, Packets, Predicate, Rule, Value, review_lattice,
+    review_prefix_inference,
+};
 
 use serde_json::json;
 use tempfile::TempDir;
@@ -7,6 +12,58 @@ pub(super) fn tmp_packets() -> (TempDir, Packets) {
     let dir = TempDir::new().unwrap();
     let packets = Packets::open(dir.path()).unwrap();
     (dir, packets)
+}
+
+pub(super) fn bare_packet(rules: Vec<Rule>) -> Packet {
+    let now = Packets::now_iso();
+    Packet {
+        id: "packet-phase2t".into(),
+        domain: "phase2-test".into(),
+        scope: "global".into(),
+        project: None,
+        rank_table: BTreeMap::new(),
+        threshold_table: BTreeMap::new(),
+        rank_lookup_key: "role".into(),
+        threshold_lookup_key: "resource".into(),
+        classification_lattice: review_lattice(),
+        prefix_inference: review_prefix_inference(),
+        rules,
+        source_ids: vec![],
+        self_audit_fidelity: None,
+        created_at: now.clone(),
+        updated_at: now,
+        superseded_by: None,
+        merged_from: vec![],
+    }
+}
+
+pub(super) fn rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
+    Rule {
+        id: id.into(),
+        antecedent,
+        consequent: Value::String(consequent.into()),
+        classification: class.into(),
+        emit: Emit::Independent,
+        confidence: 1.0,
+        provenance: vec![],
+    }
+}
+
+pub(super) fn fallback_rule(
+    id: &str,
+    antecedent: Predicate,
+    consequent: &str,
+    class: &str,
+) -> Rule {
+    Rule {
+        id: id.into(),
+        antecedent,
+        consequent: Value::String(consequent.into()),
+        classification: class.into(),
+        emit: Emit::Fallback,
+        confidence: 1.0,
+        provenance: vec![],
+    }
 }
 
 /// Compile a minimal "is_breaking" sub-packet: breaks if api_surface

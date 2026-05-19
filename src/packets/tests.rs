@@ -1,4 +1,4 @@
-use super::test_support::tmp_packets;
+use super::test_support::{bare_packet, fallback_rule, rule, tmp_packets};
 use std::collections::BTreeMap;
 
 use super::{
@@ -631,53 +631,6 @@ fn missing_packet_errors_clearly() {
 }
 
 // ── Phase 2 tests: applicability, field-vs-field, float, severity, evaluate-all ──
-
-fn bare_packet(rules: Vec<Rule>) -> Packet {
-    let now = Packets::now_iso();
-    Packet {
-        id: "packet-phase2t".into(),
-        domain: "phase2-test".into(),
-        scope: "global".into(),
-        project: None,
-        rank_table: BTreeMap::new(),
-        threshold_table: BTreeMap::new(),
-        rank_lookup_key: "role".into(),
-        threshold_lookup_key: "resource".into(),
-        classification_lattice: review_lattice(),
-        prefix_inference: review_prefix_inference(),
-        rules,
-        source_ids: vec![],
-        self_audit_fidelity: None,
-        created_at: now.clone(),
-        updated_at: now,
-        superseded_by: None,
-        merged_from: vec![],
-    }
-}
-
-fn rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
-    Rule {
-        id: id.into(),
-        antecedent,
-        consequent: Value::String(consequent.into()),
-        classification: class.into(),
-        emit: Emit::Independent,
-        confidence: 1.0,
-        provenance: vec![],
-    }
-}
-
-fn fallback_rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
-    Rule {
-        id: id.into(),
-        antecedent,
-        consequent: Value::String(consequent.into()),
-        classification: class.into(),
-        emit: Emit::Fallback,
-        confidence: 1.0,
-        provenance: vec![],
-    }
-}
 
 #[test]
 fn applicability_gate_discriminates_from_zero() {

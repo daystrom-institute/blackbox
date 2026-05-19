@@ -249,63 +249,11 @@ pub fn verify_with(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use serde_json::json;
 
-    use super::super::test_support::tmp_packets;
-    use super::super::{
-        ApplyMode, Emit, Packet, Packets, Predicate, Rule, Value, review_lattice,
-        review_prefix_inference,
-    };
+    use super::super::test_support::{bare_packet, fallback_rule, rule, tmp_packets};
+    use super::super::{ApplyMode, Packet, Predicate, Value};
     use super::{AuditParams, verify_all};
-
-    fn bare_packet(rules: Vec<Rule>) -> Packet {
-        let now = Packets::now_iso();
-        Packet {
-            id: "packet-phase2t".into(),
-            domain: "phase2-test".into(),
-            scope: "global".into(),
-            project: None,
-            rank_table: BTreeMap::new(),
-            threshold_table: BTreeMap::new(),
-            rank_lookup_key: "role".into(),
-            threshold_lookup_key: "resource".into(),
-            classification_lattice: review_lattice(),
-            prefix_inference: review_prefix_inference(),
-            rules,
-            source_ids: vec![],
-            self_audit_fidelity: None,
-            created_at: now.clone(),
-            updated_at: now,
-            superseded_by: None,
-            merged_from: vec![],
-        }
-    }
-
-    fn rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
-        Rule {
-            id: id.into(),
-            antecedent,
-            consequent: Value::String(consequent.into()),
-            classification: class.into(),
-            emit: Emit::Independent,
-            confidence: 1.0,
-            provenance: vec![],
-        }
-    }
-
-    fn fallback_rule(id: &str, antecedent: Predicate, consequent: &str, class: &str) -> Rule {
-        Rule {
-            id: id.into(),
-            antecedent,
-            consequent: Value::String(consequent.into()),
-            classification: class.into(),
-            emit: Emit::Fallback,
-            confidence: 1.0,
-            provenance: vec![],
-        }
-    }
 
     fn multi_find_packet() -> Packet {
         bare_packet(vec![
