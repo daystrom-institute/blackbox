@@ -1637,7 +1637,10 @@ mod tests {
         assert_eq!(plan.semantic_status, SemanticStatus::SyntaxOnly);
         assert!(plan.dry_run);
         assert_eq!(plan.plan_status, PlanStatus::Blocked);
-        assert!(plan.edits.is_empty(), "Blocked plan must emit no file edits");
+        assert!(
+            plan.edits.is_empty(),
+            "Blocked plan must emit no file edits"
+        );
         assert!(
             plan.file_moves.is_empty(),
             "Blocked plan must emit no file moves"
@@ -1652,9 +1655,7 @@ mod tests {
     #[test]
     fn synthesize_repository_records_soft_delete_predicate_consumption() {
         let dir = tempfile::tempdir().unwrap();
-        let target = dir
-            .path()
-            .join("src/main/java/com/example/UserRepo.java");
+        let target = dir.path().join("src/main/java/com/example/UserRepo.java");
         let mut toml_entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         toml_entries.insert(
             "delete_policy".to_string(),
@@ -1713,9 +1714,7 @@ mod tests {
         // delete_policy=hard never reads soft_delete_predicate even if supplied;
         // the audit line must not appear.
         let dir = tempfile::tempdir().unwrap();
-        let target = dir
-            .path()
-            .join("src/main/java/com/example/UserRepo.java");
+        let target = dir.path().join("src/main/java/com/example/UserRepo.java");
         let mut toml_entries: BTreeMap<String, serde_json::Value> = BTreeMap::new();
         toml_entries.insert(
             "delete_policy".to_string(),
@@ -1830,9 +1829,7 @@ mod tests {
             kind: KIND_TX_NORMALIZE.to_string(),
             source: src.to_string_lossy().into_owned(),
             project_dir: Some(dir.path().to_string_lossy().into_owned()),
-            old_text: Some(
-                "dsl.transaction(cfg -> { cfg.dsl().fetch(\"x\"); });".to_string(),
-            ),
+            old_text: Some("dsl.transaction(cfg -> { cfg.dsl().fetch(\"x\"); });".to_string()),
             new_text: Some(
                 "dsl.transactionResult(cfg -> { return cfg.dsl().fetch(\"x\"); });".to_string(),
             ),
