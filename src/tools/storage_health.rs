@@ -1,6 +1,11 @@
-use crate::server::*;
-use crate::*;
+use crate::server::BlackboxServer;
+use crate::storage_health;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -31,7 +36,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<StorageHealthParams>,
     ) -> CallToolResult {
         Self::run("bbox_storage_health", || {
-            let edges_dir = crate::storage_health::find_edges_dir(&self.state.store_dir, None);
+            let edges_dir = storage_health::find_edges_dir(&self.state.store_dir, None);
 
             let registered: std::collections::HashSet<String> = {
                 let guard = self.state.projects.read();
@@ -49,7 +54,7 @@ impl BlackboxServer {
             };
 
             let include_files = p.include_files.unwrap_or(false);
-            let report = crate::storage_health::scan_storage_health(
+            let report = storage_health::scan_storage_health(
                 &edges_dir,
                 &registered,
                 project_filter.as_deref(),
