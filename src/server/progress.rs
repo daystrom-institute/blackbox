@@ -1,4 +1,13 @@
-use crate::*;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use crate::orchestration;
+use crate::orchestration as orch;
+use crate::orchestration::TaskStore;
+use crate::orchestration::providers::Provider;
+use crate::packets::Packets;
 
 // ---------------------------------------------------------------------------
 // Progress notifications — MCP progressToken plumbing for blocking waits
@@ -132,7 +141,7 @@ pub(crate) fn combine_dispatch_filters(
 fn surface_to_filters(
     surface: Option<&str>,
     project_dir: Option<&str>,
-    packets: &crate::packets::Packets,
+    packets: &Packets,
 ) -> Result<Option<orchestration::mcp::McpFilters>, String> {
     let Some(surface_name) = surface else {
         return Ok(None);
