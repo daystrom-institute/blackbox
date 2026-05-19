@@ -105,3 +105,7 @@ pub struct CompileParams {
     #[serde(default)]
     pub project: Option<String>,
 }
+
+#[cfg(test)]
+#[path = "compile_tests.rs"]
+mod tests;
