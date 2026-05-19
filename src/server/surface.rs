@@ -243,6 +243,7 @@ pub fn extract_surface_from_uri(query: Option<&str>) -> &str {
 mod tests {
     use super::*;
     use crate::packets::{CompileParams, Packets, Value as AstValue};
+    use crate::server::state::SharedState;
 
     fn tmp_packets() -> (tempfile::TempDir, Packets) {
         let dir = tempfile::TempDir::new().unwrap();
@@ -307,6 +308,142 @@ mod tests {
             "consequent": serde_json::to_string(&consequent).unwrap(),
             "classification": "deny",
         })
+    }
+
+    #[test]
+    fn example_surface_packet_parses_and_compiles() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("system-defaults/mcp-surfaces/routing.json");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("example packet not found at {:?}: {e}", path));
+        let value: serde_json::Value =
+            serde_json::from_str(&raw).expect("example packet JSON parse");
+        let domain = value["domain"].as_str().expect("domain field");
+        assert_eq!(domain, "mcp-surface/routing");
+        let rules = value["rules"].as_array().expect("rules array");
+        assert_eq!(
+            rules.len(),
+            5,
+            "expected 5 rules (readonly, agent-internal, ops, default, deny)"
+        );
+        let tmp = tempfile::TempDir::new().unwrap();
+        let packets = Packets::open(tmp.path()).unwrap();
+        let _packet_id = packets
+            .compile(&CompileParams {
+                domain: domain.to_string(),
+                rules: value["rules"].clone(),
+                classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
+                prefix_inference: Some(Default::default()),
+                scope: Some("global".into()),
+                project: None,
+                source_ids: None,
+                rank_lookup_key: None,
+                rank_table: None,
+                threshold_lookup_key: None,
+                threshold_table: None,
+            })
+            .expect("example packet compiles");
+    }
+
+    #[test]
+    fn example_surface_packet_system_event_tool_visibility() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("system-defaults/mcp-surfaces/routing.json");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let domain = value["domain"].as_str().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let packets = Packets::open(tmp.path()).unwrap();
+        packets
+            .compile(&CompileParams {
+                domain: domain.to_string(),
+                rules: value["rules"].clone(),
+                classification_lattice: Some(vec!["tool_surface".into(), "deny".into()]),
+                prefix_inference: Some(Default::default()),
+                scope: Some("global".into()),
+                project: None,
+                source_ids: None,
+                rank_lookup_key: None,
+                rank_table: None,
+                threshold_lookup_key: None,
+                threshold_table: None,
+            })
+            .expect("packet compiles");
+        drop(packets);
+
+        let state = SharedState::for_test(tmp.path());
+        let packets = state.packets.read();
+        let emit = "mcp__blackbox__system_event_emit";
+        let compact = "mcp__blackbox__system_event_compact";
+        let list = "mcp__blackbox__system_event_list";
+        let open = "mcp__blackbox__system_event_open";
+        let r_install = "mcp__blackbox__reaction_install";
+        let r_list = "mcp__blackbox__reaction_list";
+        let r_replay = "mcp__blackbox__reaction_replay";
+        let r_execute = "mcp__blackbox__reaction_execute";
+        let r_deliveries = "mcp__blackbox__reaction_deliveries";
+        let r_retry = "mcp__blackbox__reaction_retry";
+        let universe: Vec<String> = vec![
+            emit.into(),
+            compact.into(),
+            list.into(),
+            open.into(),
+            r_install.into(),
+            r_list.into(),
+            r_replay.into(),
+            r_execute.into(),
+            r_deliveries.into(),
+            r_retry.into(),
+        ];
+
+        let check = |surface: &str, expect_visible: &[&str], expect_hidden: &[&str]| {
+            let entity = build_surface_entity(surface, None);
+            let decision = evaluate_tool_surface(&packets, entity, None);
+            for tool in expect_visible {
+                assert!(
+                    tool_visible(tool, &decision, &universe),
+                    "{surface}: {tool} should be visible",
+                );
+            }
+            for tool in expect_hidden {
+                assert!(
+                    !tool_visible(tool, &decision, &universe),
+                    "{surface}: {tool} should be hidden",
+                );
+            }
+        };
+
+        check(
+            "readonly",
+            &[list, open, r_list, r_replay, r_deliveries],
+            &[emit, compact, r_install, r_execute, r_retry],
+        );
+        check(
+            "default",
+            &[list, open, r_list, r_replay, r_deliveries],
+            &[emit, compact, r_install, r_execute, r_retry],
+        );
+        check(
+            "agent-internal",
+            &[list, open, r_list, r_replay, r_deliveries],
+            &[emit, compact, r_install, r_execute, r_retry],
+        );
+        check(
+            "ops",
+            &[
+                emit,
+                compact,
+                list,
+                open,
+                r_install,
+                r_list,
+                r_replay,
+                r_execute,
+                r_deliveries,
+                r_retry,
+            ],
+            &[],
+        );
     }
 
     #[test]
