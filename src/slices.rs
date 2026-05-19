@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::schemars;
+use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -19,6 +20,8 @@ pub struct SliceReadParams {
     pub file: String,
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// Selector as a JSON object or MCP-friendly JSON string, e.g. {"type":"lines","start_line":10,"end_line":20}.
+    #[serde(deserialize_with = "deserialize_slice_range_selector")]
     pub range: SliceRangeSelector,
     /// Number of surrounding whole lines to return before and after the selected text. Defaults to 3.
     #[serde(default)]
@@ -30,8 +33,12 @@ pub struct SliceMoveParams {
     #[serde(default)]
     pub project_dir: Option<String>,
     pub source: String,
+    /// Selector as a JSON object or MCP-friendly JSON string.
+    #[serde(deserialize_with = "deserialize_slice_range_selector")]
     pub source_range: SliceRangeSelector,
     pub target: String,
+    /// Insert selector as a JSON object or MCP-friendly JSON string, e.g. {"type":"append"}.
+    #[serde(deserialize_with = "deserialize_insert_selector")]
     pub insert: InsertSelector,
     #[serde(flatten)]
     pub apply: SliceApplyOptions,
@@ -42,8 +49,12 @@ pub struct SliceCopyParams {
     #[serde(default)]
     pub project_dir: Option<String>,
     pub source: String,
+    /// Selector as a JSON object or MCP-friendly JSON string.
+    #[serde(deserialize_with = "deserialize_slice_range_selector")]
     pub source_range: SliceRangeSelector,
     pub target: String,
+    /// Insert selector as a JSON object or MCP-friendly JSON string.
+    #[serde(deserialize_with = "deserialize_insert_selector")]
     pub insert: InsertSelector,
     #[serde(flatten)]
     pub apply: SliceApplyOptions,
@@ -54,6 +65,8 @@ pub struct SliceDeleteParams {
     #[serde(default)]
     pub project_dir: Option<String>,
     pub source: String,
+    /// Selector as a JSON object or MCP-friendly JSON string.
+    #[serde(deserialize_with = "deserialize_slice_range_selector")]
     pub source_range: SliceRangeSelector,
     #[serde(flatten)]
     pub apply: SliceApplyOptions,
@@ -64,6 +77,8 @@ pub struct SliceInsertTextParams {
     #[serde(default)]
     pub project_dir: Option<String>,
     pub target: String,
+    /// Insert selector as a JSON object or MCP-friendly JSON string.
+    #[serde(deserialize_with = "deserialize_insert_selector")]
     pub insert: InsertSelector,
     pub text: String,
     #[serde(flatten)]
@@ -75,12 +90,18 @@ pub struct SliceReplaceParams {
     #[serde(default)]
     pub project_dir: Option<String>,
     pub target: String,
+    /// Selector as a JSON object or MCP-friendly JSON string.
+    #[serde(deserialize_with = "deserialize_slice_range_selector")]
     pub target_range: SliceRangeSelector,
     #[serde(default, alias = "text")]
     pub new_text: Option<String>,
     #[serde(default)]
     pub source: Option<String>,
-    #[serde(default)]
+    /// Selector as a JSON object or MCP-friendly JSON string.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_slice_range_selector"
+    )]
     pub source_range: Option<SliceRangeSelector>,
     #[serde(flatten)]
     pub apply: SliceApplyOptions,
@@ -156,6 +177,58 @@ pub enum InsertSelector {
 pub enum LinePlacement {
     Before,
     After,
+}
+
+fn deserialize_slice_range_selector<'de, D>(
+    deserializer: D,
+) -> std::result::Result<SliceRangeSelector, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    slice_range_selector_from_value(value).map_err(D::Error::custom)
+}
+
+fn deserialize_optional_slice_range_selector<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<SliceRangeSelector>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let Some(value) = Option::<Value>::deserialize(deserializer)? else {
+        return Ok(None);
+    };
+    slice_range_selector_from_value(value)
+        .map(Some)
+        .map_err(D::Error::custom)
+}
+
+fn deserialize_insert_selector<'de, D>(
+    deserializer: D,
+) -> std::result::Result<InsertSelector, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Value::deserialize(deserializer)?;
+    insert_selector_from_value(value).map_err(D::Error::custom)
+}
+
+fn slice_range_selector_from_value(
+    value: Value,
+) -> std::result::Result<SliceRangeSelector, serde_json::Error> {
+    match value {
+        Value::String(raw) => serde_json::from_str(&raw),
+        other => serde_json::from_value(other),
+    }
+}
+
+fn insert_selector_from_value(
+    value: Value,
+) -> std::result::Result<InsertSelector, serde_json::Error> {
+    match value {
+        Value::String(raw) => serde_json::from_str(&raw),
+        other => serde_json::from_value(other),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
@@ -941,6 +1014,35 @@ mod tests {
             response["hashes"]["slice_sha256"],
             sha256_hex(b"fn b() {}\n")
         );
+    }
+
+    #[test]
+    fn params_accept_mcp_advertised_json_string_selectors() {
+        let read: SliceReadParams = serde_json::from_value(serde_json::json!({
+            "file": "lib.rs",
+            "range": "{\"type\":\"lines\",\"start_line\":1,\"end_line\":2}"
+        }))
+        .unwrap();
+        assert!(matches!(
+            read.range,
+            SliceRangeSelector::Lines {
+                start_line: 1,
+                end_line: 2
+            }
+        ));
+
+        let mv: SliceMoveParams = serde_json::from_value(serde_json::json!({
+            "source": "a.rs",
+            "source_range": "{\"type\":\"exact_text\",\"text\":\"fn a() {}\"}",
+            "target": "b.rs",
+            "insert": "{\"type\":\"append\"}"
+        }))
+        .unwrap();
+        assert!(matches!(mv.insert, InsertSelector::Append));
+        assert!(matches!(
+            mv.source_range,
+            SliceRangeSelector::ExactText { ref text, occurrence: None } if text == "fn a() {}"
+        ));
     }
 
     #[test]

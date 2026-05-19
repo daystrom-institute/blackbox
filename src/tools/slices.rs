@@ -17,7 +17,7 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 impl BlackboxServer {
     #[tool(
         name = "bbox_slice_read",
-        description = "Read an exact text slice from a file by line range, markers, exact text, or byte range."
+        description = "Read an exact text slice from a file. Pass range as JSON string in MCP, e.g. {\"type\":\"lines\",\"start_line\":10,\"end_line\":20}; object form is also accepted by direct clients."
     )]
     pub(crate) fn bbox_slice_read(
         &self,
@@ -28,7 +28,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_slice_move",
-        description = "Move an exact text slice from one file/location to another with a dry-run plan by default and confirmed writes via the refactor apply safety path."
+        description = "Move an exact text slice. In MCP, pass source_range and insert as JSON strings, e.g. source_range={\"type\":\"lines\",\"start_line\":10,\"end_line\":20}, insert={\"type\":\"append\"}. Dry-run by default; confirmed writes use refactor apply safety."
     )]
     pub(crate) fn bbox_slice_move(
         &self,
@@ -42,7 +42,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_slice_copy",
-        description = "Copy an exact text slice into another file/location with a dry-run plan by default and confirmed writes via the refactor apply safety path."
+        description = "Copy an exact text slice. In MCP, pass source_range and insert as JSON strings, e.g. source_range={\"type\":\"exact_text\",\"text\":\"...\"}, insert={\"type\":\"append\"}. Dry-run by default; confirmed writes use refactor apply safety."
     )]
     pub(crate) fn bbox_slice_copy(
         &self,
@@ -56,7 +56,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_slice_delete",
-        description = "Delete an exact text slice with a dry-run plan by default and confirmed writes via the refactor apply safety path."
+        description = "Delete an exact text slice. In MCP, pass source_range as a JSON string, e.g. {\"type\":\"lines\",\"start_line\":10,\"end_line\":20}. Dry-run by default; confirmed writes use refactor apply safety."
     )]
     pub(crate) fn bbox_slice_delete(
         &self,
@@ -70,7 +70,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_slice_insert_text",
-        description = "Insert literal text at a file location with a dry-run plan by default and confirmed writes via the refactor apply safety path."
+        description = "Insert literal text. In MCP, pass insert as a JSON string, e.g. {\"type\":\"line\",\"line\":12,\"placement\":\"before\"} or {\"type\":\"append\"}. Dry-run by default; confirmed writes use refactor apply safety."
     )]
     pub(crate) fn bbox_slice_insert_text(
         &self,
@@ -84,7 +84,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_slice_replace",
-        description = "Replace an exact text slice with literal text or another selected slice, dry-run by default and confirmed through the refactor apply safety path."
+        description = "Replace an exact text slice. In MCP, pass target_range and optional source_range as JSON strings. Use new_text for literal replacement or source+source_range for slice replacement. Dry-run by default; confirmed writes use refactor apply safety."
     )]
     pub(crate) fn bbox_slice_replace(
         &self,
