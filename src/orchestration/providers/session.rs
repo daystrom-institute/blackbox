@@ -2,6 +2,8 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use super::Provider;
+
 pub fn discover_vibe_session(start_ms: u64, project_dir: &str) -> Option<String> {
     let session_dir = std::env::var("VIBE_SESSION_DIR").unwrap_or_else(|_| {
         let home = dirs::home_dir().unwrap_or_default();
@@ -438,4 +440,24 @@ fn extract_gemini_session_id(raw: &str) -> Option<String> {
     data.get("sessionId")
         .and_then(Value::as_str)
         .map(str::to_owned)
+}
+
+impl Provider {
+    /// Locate the cwd a prior session was recorded in. Enables agents to resume
+    /// across repo boundaries without hand-passing project_dir. Returns None
+    /// when the provider has no cwd-aware session store or when the session
+    /// can't be found locally.
+    pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
+        match self {
+            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+                resolve_claude_session_cwd(session_id)
+            }
+            Provider::Inception => None,
+            Provider::Codex => resolve_codex_session_cwd(session_id),
+            Provider::Gemini => resolve_gemini_session_cwd(session_id),
+            Provider::Copilot => resolve_copilot_session_cwd(session_id),
+            Provider::Vibe => resolve_vibe_session_cwd(session_id),
+            Provider::Workflow => None,
+        }
+    }
 }
