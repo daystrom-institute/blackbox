@@ -706,9 +706,16 @@ fn supersession_related(a: &KnowledgeEntry, b: &KnowledgeEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::embed::{Bucket, EmbeddingRouter};
+    use crate::entity_ref::EntityRef;
+    use crate::server::state::SharedState;
     use crate::threads::{
-        EdgeKind, EdgeTarget, SessionLink, Thread, ThreadEdge, ThreadKind, ThreadStatus,
+        EdgeKind, EdgeTarget, SessionLink, Thread, ThreadEdge, ThreadKind, ThreadParams,
+        ThreadStatus,
     };
+    use crate::vectors::{VectorStore, install_test_global};
 
     fn sample_thread() -> Thread {
         Thread {
@@ -766,5 +773,67 @@ mod tests {
         assert!(text.contains("thread_id: thread-1234abcd"));
         assert!(text.contains("thread text truncated"));
         assert!(text.contains("tail marker"));
+    }
+    #[test]
+    fn embed_status_reports_thread_coverage_from_vector_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = SharedState::for_test(tmp.path());
+        let vector_tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(VectorStore::open(vector_tmp.path()).unwrap());
+        let _guard = install_test_global(store.clone());
+        let created = state
+            .threads
+            .write()
+            .thread(&ThreadParams {
+                action: "open".into(),
+                name: Some("coverage-thread".into()),
+                id: None,
+                topic: Some("status coverage thread".into()),
+                project: Some("/repo".into()),
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: Some("handoff marker".into()),
+                note: Some("note marker".into()),
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("investigation".into()),
+            })
+            .unwrap();
+        let thread_id = regex::Regex::new(r"thread-[0-9a-f]{8}")
+            .unwrap()
+            .find(&created)
+            .unwrap()
+            .as_str()
+            .to_string();
+        let thread = state
+            .threads
+            .read()
+            .all()
+            .iter()
+            .find(|thread| thread.id == thread_id)
+            .unwrap()
+            .clone();
+        let route = EmbeddingRouter::default()
+            .route(Bucket::Threads, None)
+            .unwrap()
+            .vector_route_id();
+        let entity_id = EntityRef::Thread { thread_id }.to_string();
+        store
+            .upsert(
+                &route,
+                &entity_id,
+                &thread_chunk_hash(&thread),
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+
+        let status = status_response_for_buckets(&state, &[Bucket::Threads]).unwrap();
+        let threads = status.routes.get("threads").unwrap();
+        assert_eq!(threads.source_count, Some(1));
+        assert_eq!(threads.indexed_count, 1);
+        assert_eq!(threads.coverage_ratio, Some(1.0));
     }
 }
