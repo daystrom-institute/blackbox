@@ -5,7 +5,10 @@ use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
 use crate::packets::{CompileParams, Packets};
 use crate::pins::Pins;
-use crate::projects::ProjectRegistry;
+use crate::projects::{
+    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry,
+    ProjectRenameParams,
+};
 use crate::roadmap::Roadmap;
 use crate::threads::Threads;
 use crate::tools::badgey_adapter::{

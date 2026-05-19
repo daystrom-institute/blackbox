@@ -109,10 +109,7 @@ use index::TranscriptIndex;
 use orchestration::providers::{ExecOpts, Provider};
 use orchestration::{self as orch};
 use pins::PinParams;
-use projects::{
-    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRenameParams,
-    ProjectUnregisterParams,
-};
+use projects::ProjectRecord;
 
 static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();
 
@@ -120,9 +117,7 @@ use artifacts::{
     ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
 use inbox::InboxParams;
-use index::ReindexParams;
 use knowledge::KnowledgeListParams;
-use mcp_tools::provenance::ProvenanceParams;
 use notes::{NoteListParams, NoteParams};
 use packets::apply_with as apply_packet_with;
 pub(crate) use server::*;
