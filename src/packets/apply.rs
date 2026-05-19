@@ -1,5 +1,13 @@
-use super::*;
+use std::collections::BTreeMap;
+
+use super::ast::{Emit, Predicate, Value};
+use super::coerce::{
+    entity_f64, entity_get, entity_get_raw, entity_has, entity_int, entity_is_null,
+    entity_key_exists, resolve_collection, resolve_entity,
+};
+use super::{Packet, Packets};
 use rmcp::schemars;
+use serde::{Deserialize, Serialize};
 
 /// Apply modes. `First` returns the first matching rule (classification
 /// use case); `All` returns all findings + aggregate verdict (review use
