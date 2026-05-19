@@ -124,7 +124,8 @@ large-module and test-locality cleanup that the topology move exposed:
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
      as packet modules change. Packet event/gap logging tests now live under
      `src/packets/events.rs` via `src/packets/events_tests.rs`, and
-   self-heal scanner tests now live under `src/packets/scanner.rs`.
+   self-heal scanner tests now live under `src/packets/scanner.rs`. JSON
+     coercion helper tests now live under `src/packets/coerce.rs`.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
@@ -694,6 +695,8 @@ Landed:
     gone.
 44. Dispatch MCP startup URL tests moved from the root unit-test island to
     `tests/dispatch_mcp.rs`.
+45. JSON coercion helper tests moved from the shared packet test island to
+    `src/packets/coerce.rs`.
 
 Next useful cuts:
 
@@ -704,7 +707,7 @@ Next useful cuts:
 
 2. **Improve test locality.**
    - Continue moving remaining `packets/tests.rs` cases into per-module test
-     blocks; event/gap logging and scanner tests have moved.
+     blocks; event/gap logging, scanner, and JSON coercion tests have moved.
    - Move daemon-startup-shaped tests to top-level integration tests using
      `blackbox::` imports.
 

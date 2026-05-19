@@ -5,8 +5,7 @@ use super::{
     ApplyMode, ApplyParams, AuditParams, CmpOp, CompileParams, Emit, MAX_COMPOSITION_DEPTH,
     NoopResolver, Packet, Packets, Predicate, Rule, RuleInput, Value, apply, apply_all, apply_with,
     default_rank_lookup_key, default_threshold_lookup_key, eval_predicate, infer_classification,
-    packet_matches_query, packet_summary, review_lattice, review_prefix_inference, unwrap_jsonish,
-    verify_all,
+    packet_matches_query, packet_summary, review_lattice, review_prefix_inference, verify_all,
 };
 use serde_json::json;
 
@@ -1843,49 +1842,6 @@ fn emit_fallback_deserializes() {
 }
 
 // ── E12-refinement: permissive JSON on tool params ─────────────
-
-#[test]
-fn unwrap_jsonish_parses_stringified_array() {
-    let mut v = serde_json::Value::String(r#"[{"a": 1}, {"a": 2}]"#.into());
-    unwrap_jsonish(&mut v);
-    assert!(v.is_array());
-    assert_eq!(v.as_array().unwrap().len(), 2);
-}
-
-#[test]
-fn unwrap_jsonish_parses_stringified_object() {
-    let mut v = serde_json::Value::String(r#"{"role": "admin"}"#.into());
-    unwrap_jsonish(&mut v);
-    assert!(v.is_object());
-    assert_eq!(v.get("role").unwrap().as_str().unwrap(), "admin");
-}
-
-#[test]
-fn unwrap_jsonish_noop_on_structured_value() {
-    let mut v = serde_json::json!({"already": "structured"});
-    let before = v.clone();
-    unwrap_jsonish(&mut v);
-    assert_eq!(v, before);
-}
-
-#[test]
-fn unwrap_jsonish_noop_on_plain_string() {
-    // A genuinely string param (not a JSON literal) should not be
-    // coerced. The `{`/`[` prefix check prevents false positives.
-    let mut v = serde_json::Value::String("hello world".into());
-    let before = v.clone();
-    unwrap_jsonish(&mut v);
-    assert_eq!(v, before);
-}
-
-#[test]
-fn unwrap_jsonish_leaves_invalid_json_string_untouched() {
-    // String that starts with `{` but isn't valid JSON — leave it.
-    let mut v = serde_json::Value::String("{ not json }".into());
-    let before = v.clone();
-    unwrap_jsonish(&mut v);
-    assert_eq!(v, before);
-}
 
 #[test]
 fn compile_accepts_stringified_rules_array() {
