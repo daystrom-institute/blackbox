@@ -68,7 +68,8 @@ the decomposition cleanup that the topology move exposed:
      validation, and profile/workflow/runner invocation backends now live in
      `src/tools/atoms/invoke.rs`.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
-     landed `engine/fanout.rs` and `engine/provider_events.rs` splits.
+     landed `engine/fanout.rs`, `engine/provider_events.rs`, and
+     `engine/hooks.rs` splits.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
@@ -623,6 +624,10 @@ Landed:
 33. `src/tools/atoms/invoke.rs` owns active atom manifest resolution, input
     schema validation, `atom_invoke_value`, and the profile/workflow/runner atom
     invocation backends previously embedded in `tools/atoms.rs`.
+34. `src/workflow/engine/hooks.rs` owns hook op effect application, special
+    supervision hook ops, hook gating/failure policy handling, arc-exit hook
+    execution, and hook allow-verdict normalization previously embedded in
+    `workflow/engine.rs`.
 
 Next useful cuts:
 
@@ -634,8 +639,8 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Keep splitting large domain modules by cohesive internals.**
-   - `workflow/engine.rs`: continue with runner subsystems after fanout and
-     provider-event waits.
+   - `workflow/engine.rs`: continue with runner subsystems after fanout,
+     provider-event waits, and hooks.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
