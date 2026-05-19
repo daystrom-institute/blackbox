@@ -127,7 +127,8 @@ large-module and test-locality cleanup that the topology move exposed:
    self-heal scanner tests now live under `src/packets/scanner.rs`. JSON
      coercion helper tests now live under `src/packets/coerce.rs`. Dotted-path,
      `In`, and regex predicate evaluator tests now live under
-     `src/packets/apply.rs`.
+     `src/packets/apply.rs`; string-contains and in-range evaluator tests live
+     there as well.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
@@ -701,6 +702,8 @@ Landed:
     `src/packets/coerce.rs`.
 46. Dotted-path, `In`, and regex predicate evaluator tests moved from the
     shared packet test island to `src/packets/apply.rs`.
+47. String-contains and in-range predicate evaluator tests moved from the
+    shared packet test island to `src/packets/apply.rs`.
 
 Next useful cuts:
 
@@ -712,7 +715,8 @@ Next useful cuts:
 2. **Improve test locality.**
    - Continue moving remaining `packets/tests.rs` cases into per-module test
      blocks; event/gap logging, scanner, JSON coercion, and dotted-path
-     predicate evaluator tests have moved.
+     predicate evaluator tests have moved, along with string-contains and
+     in-range evaluator tests.
    - Move daemon-startup-shaped tests to top-level integration tests using
      `blackbox::` imports.
 

@@ -626,6 +626,168 @@ mod tests {
         assert!(!eval_simple(&pred, &entity));
     }
 
+    fn noop_entity() -> serde_json::Map<String, serde_json::Value> {
+        serde_json::Map::new()
+    }
+
+    #[test]
+    fn string_contains_matches_case_sensitive() {
+        let p = Predicate::StringContains {
+            field: "message".into(),
+            needle: "OOM".into(),
+            case_insensitive: false,
+        };
+        let yes = json!({"message": "worker OOMKilled"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mixed = json!({"message": "worker oom event"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let no_field = noop_entity();
+        let non_string = json!({"message": 42}).as_object().unwrap().clone();
+        assert!(eval_predicate(&p, &yes, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &mixed, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &no_field, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &non_string, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn string_contains_matches_case_insensitive() {
+        let p = Predicate::StringContains {
+            field: "message".into(),
+            needle: "out of memory".into(),
+            case_insensitive: true,
+        };
+        let yes1 = json!({"message": "Out Of Memory allocating"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let yes2 = json!({"message": "OUT OF MEMORY"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let no = json!({"message": "disk full"}).as_object().unwrap().clone();
+        assert!(eval_predicate(&p, &yes1, &NoopResolver, 0));
+        assert!(eval_predicate(&p, &yes2, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &no, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn string_contains_supports_dotted_fields() {
+        let p = Predicate::StringContains {
+            field: "vars.cheap_output.result".into(),
+            needle: "confidence-low".into(),
+            case_insensitive: true,
+        };
+        let yes = json!({
+            "vars": {
+                "cheap_output": {
+                    "result": "Confidence-Low: needs a reviewer"
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let no = json!({
+            "vars": {
+                "cheap_output": {
+                    "result": "looks sufficient"
+                }
+            }
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(eval_predicate(&p, &yes, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &no, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn string_contains_composes_via_any_for_multi_needle() {
+        // The regex-alternation idiom: Any[Contains{a}, Contains{b}].
+        let p = Predicate::Any {
+            args: vec![
+                Predicate::StringContains {
+                    field: "message".into(),
+                    needle: "OOM".into(),
+                    case_insensitive: true,
+                },
+                Predicate::StringContains {
+                    field: "message".into(),
+                    needle: "out of memory".into(),
+                    case_insensitive: true,
+                },
+            ],
+        };
+        let oom = json!({"message": "ooMkilled"}).as_object().unwrap().clone();
+        let prose = json!({"message": "Process Ran Out Of Memory"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let neither = json!({"message": "disk full"}).as_object().unwrap().clone();
+        assert!(eval_predicate(&p, &oom, &NoopResolver, 0));
+        assert!(eval_predicate(&p, &prose, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &neither, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn in_range_inclusive_both_ends() {
+        let p = Predicate::InRange {
+            field: "perf_delta_ms".into(),
+            min: 1,
+            max: 5,
+        };
+        for (v, want) in [(0, false), (1, true), (3, true), (5, true), (6, false)] {
+            let e = json!({"perf_delta_ms": v}).as_object().unwrap().clone();
+            assert_eq!(
+                eval_predicate(&p, &e, &NoopResolver, 0),
+                want,
+                "v={v} expected {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_range_missing_or_non_int_is_false() {
+        let p = Predicate::InRange {
+            field: "x".into(),
+            min: 0,
+            max: 10,
+        };
+        let missing = noop_entity();
+        let str_field = json!({"x": "five"}).as_object().unwrap().clone();
+        assert!(!eval_predicate(&p, &missing, &NoopResolver, 0));
+        assert!(!eval_predicate(&p, &str_field, &NoopResolver, 0));
+    }
+
+    #[test]
+    fn in_range_f_inclusive_and_rejects_non_numeric() {
+        let p = Predicate::InRangeF {
+            field: "coverage".into(),
+            min: 0.8,
+            max: 0.95,
+        };
+        for (v, want) in [
+            (0.79, false),
+            (0.80, true),
+            (0.90, true),
+            (0.95, true),
+            (0.96, false),
+        ] {
+            let e = json!({"coverage": v}).as_object().unwrap().clone();
+            assert_eq!(
+                eval_predicate(&p, &e, &NoopResolver, 0),
+                want,
+                "v={v} expected {want}"
+            );
+        }
+        let str_field = json!({"coverage": "high"}).as_object().unwrap().clone();
+        assert!(!eval_predicate(&p, &str_field, &NoopResolver, 0));
+    }
+
     #[test]
     fn dotted_path_in_quantified_path() {
         // Exists over `vars.labels[*]` — the core "labels contains
