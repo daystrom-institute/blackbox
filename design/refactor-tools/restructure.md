@@ -69,7 +69,8 @@ the decomposition cleanup that the topology move exposed:
      `src/tools/atoms/invoke.rs`.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
      landed `engine/fanout.rs`, `engine/provider_events.rs`, and
-     `engine/hooks.rs` splits.
+     `engine/hooks.rs` splits. Arc bookkeeping, policy-packet checks, and
+     compaction anchors now live in `src/workflow/engine/arc_state.rs`.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
@@ -628,6 +629,9 @@ Landed:
     supervision hook ops, hook gating/failure policy handling, arc-exit hook
     execution, and hook allow-verdict normalization previously embedded in
     `workflow/engine.rs`.
+35. `src/workflow/engine/arc_state.rs` owns arc thread opening, live arc
+    snapshots, arc note writes, policy-packet checks, and compaction anchors
+    previously embedded in `workflow/engine.rs`.
 
 Next useful cuts:
 
@@ -640,7 +644,7 @@ Next useful cuts:
 
 2. **Keep splitting large domain modules by cohesive internals.**
    - `workflow/engine.rs`: continue with runner subsystems after fanout,
-     provider-event waits, and hooks.
+     provider-event waits, hooks, and arc bookkeeping.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
