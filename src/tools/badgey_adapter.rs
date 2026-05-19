@@ -1,4 +1,10 @@
-use crate::*;
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use crate::notes;
+use crate::orchestration::{self, providers::Provider};
+use crate::server::state::{BlackboxServer, SharedState};
+use serde_json::{Value, json};
 
 pub(crate) struct BadgeyAgentAdapter {
     pub(crate) state: Arc<SharedState>,
@@ -132,7 +138,7 @@ pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
                 ActionJournalState::Dispatching { task_id } => {
                     let terminal = state.task_store.read().get(&task_id).map(|task| {
                         let inner = task.inner.lock();
-                        if inner.status == orch::TaskStatus::Completed {
+                        if inner.status == orchestration::TaskStatus::Completed {
                             ActionJournalState::Completed {
                                 result_ref: format!("task:{task_id}"),
                             }
@@ -173,7 +179,7 @@ pub(crate) fn recover_badgey_non_terminal_state(state: &Arc<SharedState>) {
                     || ProposalState::Failed,
                     |task| {
                         let status = task.inner.lock().status;
-                        if status == orch::TaskStatus::Completed {
+                        if status == orchestration::TaskStatus::Completed {
                             ProposalState::Applied
                         } else if status.is_terminal() {
                             ProposalState::Failed
