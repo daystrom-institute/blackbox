@@ -157,12 +157,8 @@ impl BlackboxServer {
                 },
             };
 
-            let candidates = storage_health::plan_gc_with_policy(
-                &edges_dir,
-                &registered,
-                &gc_params,
-                &policy,
-            )?;
+            let candidates =
+                storage_health::plan_gc_with_policy(&edges_dir, &registered, &gc_params, &policy)?;
 
             let deletable: Vec<&storage_health::GcCandidate> = candidates
                 .iter()

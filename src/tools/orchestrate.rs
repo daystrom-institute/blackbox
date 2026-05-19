@@ -6,7 +6,7 @@ use crate::orchestration::providers::Provider;
 use crate::pollers;
 use crate::server::BlackboxServer;
 use crate::server::routes::{signal_arc_dispatch, webhook_replay_inner};
-use crate::server::state::{SignalEvent, WebhookDelivery, SIGNAL_LOG_CAP, WEBHOOK_LOG_CAP};
+use crate::server::state::{SIGNAL_LOG_CAP, SignalEvent, WEBHOOK_LOG_CAP, WebhookDelivery};
 use crate::server::workflow_capabilities::validate_workflow_capabilities;
 use crate::system_memory;
 use crate::tools::bro_helpers::extract_and_compile_workflow;

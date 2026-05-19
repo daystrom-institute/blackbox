@@ -1,5 +1,5 @@
-use crate::packets::*;
 use crate::packets::test_support::{compile_breaking_packet, tmp_packets};
+use crate::packets::*;
 use serde_json::json;
 use tempfile::TempDir;
 

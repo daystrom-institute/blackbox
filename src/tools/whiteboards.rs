@@ -3,9 +3,8 @@ use crate::server::BlackboxServer;
 use crate::server::dispatch::dispatch_routing_verdict_direct;
 use crate::tools::bro_runtime_params::{
     WhiteboardAnnotateParams, WhiteboardArchiveParams, WhiteboardConflictsParams,
-    WhiteboardOpenParams, WhiteboardPostParams, WhiteboardRegisterParams,
-    WhiteboardStateParams, WhiteboardSummarizeParams, WhiteboardTransitionParams,
-    WhiteboardVoteParams,
+    WhiteboardOpenParams, WhiteboardPostParams, WhiteboardRegisterParams, WhiteboardStateParams,
+    WhiteboardSummarizeParams, WhiteboardTransitionParams, WhiteboardVoteParams,
 };
 use crate::whiteboards;
 use rmcp::handler::server::router::tool::ToolRouter;

@@ -1,7 +1,7 @@
+use crate::embed_queue;
 use crate::packets::apply_with as apply_packet_with;
 use crate::server::BlackboxServer;
 use crate::server::routes::rebuild_edge_index_from_shared;
-use crate::embed_queue;
 
 impl BlackboxServer {
     pub(crate) fn sync_knowledge_entry_to_index(&self, entry_id: &str) -> anyhow::Result<()> {

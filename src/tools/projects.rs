@@ -148,9 +148,7 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("bbox_project_register", || {
             let record = self.state.projects.write().register_path(&p.path)?;
-            orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(
-                &record.canonical_path,
-            ))?;
+            orchestration::mcp::migrate_project_mcp_path(&PathBuf::from(&record.canonical_path))?;
             let project_config = config::load_project(Path::new(&record.canonical_path))?;
             let project_config_loaded = true;
             if project_config.mcp.enabled == Some(false) {
@@ -488,12 +486,9 @@ mod tests {
         let catalog_dir = dir.path().join("catalog");
         let catalog = artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
 
-        let installed = artifacts::discover_and_install_project_artifacts(
-            &project_dir,
-            "proj-abc",
-            &catalog,
-        )
-        .unwrap();
+        let installed =
+            artifacts::discover_and_install_project_artifacts(&project_dir, "proj-abc", &catalog)
+                .unwrap();
 
         assert_eq!(installed.len(), 1);
         let meta = &installed[0];
@@ -530,18 +525,12 @@ mod tests {
         let catalog_dir = dir.path().join("catalog");
         let catalog = artifacts::ArtifactCatalog::open(&catalog_dir).unwrap();
 
-        let first = artifacts::discover_and_install_project_artifacts(
-            &project_dir,
-            "proj-xyz",
-            &catalog,
-        )
-        .unwrap();
-        let second = artifacts::discover_and_install_project_artifacts(
-            &project_dir,
-            "proj-xyz",
-            &catalog,
-        )
-        .unwrap();
+        let first =
+            artifacts::discover_and_install_project_artifacts(&project_dir, "proj-xyz", &catalog)
+                .unwrap();
+        let second =
+            artifacts::discover_and_install_project_artifacts(&project_dir, "proj-xyz", &catalog)
+                .unwrap();
 
         // Both calls succeed and return the same version — second install is a hash-match noop.
         assert_eq!(first.len(), 1);

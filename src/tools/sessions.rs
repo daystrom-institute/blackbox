@@ -1,9 +1,9 @@
-use crate::server::BlackboxServer;
-use crate::{embed, embed_queue};
 use crate::embed::ReembedParams;
 use crate::index::{
     MessagesParams, ReindexParams, SessionParams, SessionsListParams, TopicsParams,
 };
+use crate::server::BlackboxServer;
+use crate::{embed, embed_queue};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;

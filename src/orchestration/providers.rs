@@ -14,9 +14,9 @@ use exec_args::{
     CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE, CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE,
 };
 pub use exec_args::{ExecOpts, exec_opts_with_provider_defaults, resolve_bin};
-pub use mcp_args::{transient_blackbox_name, transient_blackbox_url};
 #[cfg(test)]
 use mcp_args::{MatchState, copilot_format_mcp_tool, format_toml_string_array};
+pub use mcp_args::{transient_blackbox_name, transient_blackbox_url};
 pub use session::{discover_gemini_session, discover_vibe_session};
 #[cfg(test)]
 use session::{
