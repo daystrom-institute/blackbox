@@ -94,7 +94,10 @@ the decomposition cleanup that the topology move exposed:
      `src/workflow/engine/node_dispatch.rs`. Executor and atom node execution
      now lives in `src/workflow/engine/actor_nodes.rs`. Fire-and-forget fork
      dispatch plus late-inject / explicit in-flight joins now live in
-     `src/workflow/engine/async_join.rs`.
+     `src/workflow/engine/async_join.rs`. Ensemble member dispatch/join
+     handling now lives in `src/workflow/engine/ensemble_nodes.rs`, and
+     embedded subworkflow execution now lives in
+     `src/workflow/engine/subworkflow_nodes.rs`.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
