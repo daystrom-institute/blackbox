@@ -2,6 +2,7 @@ use super::*;
 use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
 use crate::notes::{NoteParams, Notes};
+use crate::orchestration as orch;
 use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
 use crate::packets::{CompileParams, Packets};

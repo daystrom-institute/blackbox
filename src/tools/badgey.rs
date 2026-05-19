@@ -3,8 +3,30 @@
 mod lifecycle;
 mod proposals;
 mod reports;
-use crate::server::*;
-use crate::*;
+use std::sync::Arc;
+
+use crate::artifacts::{self, ArtifactInstallParams};
+use crate::knowledge;
+use crate::notes;
+use crate::orchestration;
+use crate::orchestration as orch;
+use crate::orchestration::providers::Provider;
+use crate::server::progress::{cleanup_policy_file_when_done, resolve_dispatch_filters};
+use crate::server::routes::install_artifact_from_params;
+use crate::server::state::BlackboxServer;
+use crate::threads;
+use crate::tools::bro_params::{
+    BadgeyApplyProposalParams, BadgeyAskParams, BadgeyCloseLoopsParams, BadgeyCollectParams,
+    BadgeyDismissParams, BadgeyExecParams, BadgeyListParams, BadgeyProposalBeginApplyParams,
+    BadgeyProposalCompleteApplyParams, BadgeyProposalsListParams, BadgeyResumeParams,
+    BadgeyScoutParams, BadgeyStatusParams, BadgeyTriageInboxParams, EnsureBadgeyForChannelParams,
+};
+use crate::util;
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
+use serde_json::{Map, Value, json};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::badgey_tools()
