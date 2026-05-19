@@ -1372,6 +1372,9 @@ mod tests {
             "java_split_provider",
             "replace_java_static_reference",
             "java_vaadin_provider_binding_generation",
+            "java_vaadin_route_inventory",
+            "java_vaadin_static_ui_context_audit",
+            "java_vaadin_view_structure_analysis",
         ];
 
         for kind in java_plan_kinds {

@@ -1,0 +1,81 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-vaadin-view-structure-analysis",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Read-only structural analysis of one Vaadin view/component class — route metadata, scope/access annotations, injected dependencies, fields by category, UI composition methods, listener registrations, UI/session static access, navigation sites, async/UI access patterns, and candidate extraction groups for downstream Vaadin extraction atoms.",
+    "when_to_use": [
+      "preparing to decompose a large Vaadin Flow view and need a structural inventory before choosing an extraction shape (component, grid, dialog, widget host)",
+      "operator wants a stable candidate list with line/byte ranges to feed java_vaadin_extract_component / java_vaadin_extract_grid_component / java_vaadin_extract_dialog_class",
+      "auditing a view for route surfaces, lifecycle findings, and UI access patterns before any mutation"
+    ],
+    "anti_patterns": [
+      "do not use as a mutation step — this atom is analysis-only and emits no edits",
+      "do not use to make authorization or scope decisions — route access and scope policy remain operator-owned and belong to separate plan kinds",
+      "do not claim semantic certainty beyond tree-sitter syntax plus textual Vaadin conventions — v1 is SemanticStatus::SyntaxOnly and does not require JDTLS",
+      "do not use on non-Java files; do not use on non-Vaadin classes",
+      "do not invent candidate ids, route paths, or annotations from the user prompt — re-derive from the plan response"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string", "description": "Java file containing the target Vaadin view/component, relative to project_dir." },
+          "module_name": { "type": "string", "description": "Optional class name; defaults to the first top-level class in source." }
+        }
+      },
+      "prompt_template": "You are java-vaadin-view-structure-analysis. Charter: produce a read-only structural report for one Vaadin view/component class so the operator can choose a safe extraction shape.\n\nProtocol (analysis-only — no apply step exists):\n\n1. Ground the target structurally:\n   bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\")\n   bbox_code_symbols(project_dir=\"{{project_dir}}\", query=\"{{module_name}}\", languages=[\"java\"], item_kinds=[\"class_declaration\"])\n   Confirm the target class exists in the file before planning.\n\n2. Plan the structural analysis:\n   bbox_refactor_plan(kind=\"java_vaadin_view_structure_analysis\",\n                      deep_analysis=true,\n                      project_dir=\"{{project_dir}}\",\n                      source=\"{{source}}\",\n                      module_name=\"{{module_name}}\")\n\n   The planner is read-only. It refuses non-Java files and refuses classes that do not look like Vaadin Flow views/components. The response carries route_surfaces, access_annotations, scope_annotations, lifecycle_interfaces, fields grouped by category (Vaadin component, grid/table, data provider, dialog provider, backend/admin service, event bus, state), constructor_parameters grouped on the same axes, UI.getCurrent() / VaadinSession.getCurrent() sites, navigation sites, async/UI-access findings, and candidate_components with reasons and field lists.\n\n3. Surface findings; do NOT mutate. If the file is not a Vaadin class, report status=blocked with the planner's block_reason.\n\n4. Emit done note:\n   bbox_note(kind=\"done\", body=<one-line: class name, candidate component count, route surface summary, ui_access finding count>).\n\nStrict refusal rules (prompt-discipline; not enforced at dispatch):\n- Never call any tool outside the refactor persona tool surface.\n- Never propose edits, organize imports, or trigger any apply step — this atom is analysis-only.\n- Never make authorization decisions (route access, role policy) on the operator's behalf; report observed annotations only.\n- Never claim semantic certainty beyond syntax+textual analysis; v1 is SyntaxOnly and does not require JDTLS.\n- Never invent candidate ids, route paths, or annotations from the user prompt — re-derive from the plan response.\n\nInputs:\n{{project_dir}} {{source}} {{module_name}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "class": {
+            "type": "object",
+            "properties": {
+              "name": { "type": "string" },
+              "package": { "type": "string" },
+              "source_path": { "type": "string" }
+            }
+          },
+          "route_surfaces": { "type": "object", "additionalProperties": true },
+          "lifecycle_findings": { "type": "array", "items": { "type": "object" } },
+          "ui_access_findings": { "type": "array", "items": { "type": "object" } },
+          "candidate_components": { "type": "array", "items": { "type": "object" } }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": {
+      "writes_files": false,
+      "dispatches_runs": 1,
+      "max_depth": 0,
+      "uses_network": false
+    },
+    "composition": {
+      "may_invoke_atoms": { "kind": "none" }
+    },
+    "implementation": {
+      "kind": "profile",
+      "brofile_ref": "brofile:java-refactor-persona@v1"
+    },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": {
+      "kind": "hand_authored",
+      "author": "blackbox-refactor-agents",
+      "created_at": "2026-05-19T00:00:00Z"
+    }
+  }
+}

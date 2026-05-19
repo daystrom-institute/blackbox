@@ -421,6 +421,47 @@
       ]
     },
     {
+      "id": "dispatch-java-vaadin-view-structure-analysis-planonly",
+      "atom": "java-vaadin-view-structure-analysis",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "DashboardView"
+      },
+      "expect_response_fields": [
+        "status",
+        "class",
+        "fields",
+        "candidate_components"
+      ]
+    },
+    {
+      "id": "dispatch-java-vaadin-static-ui-context-audit-planonly",
+      "atom": "java-vaadin-static-ui-context-audit",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java"
+      },
+      "expect_response_fields": [
+        "status",
+        "source",
+        "findings"
+      ]
+    },
+    {
+      "id": "dispatch-java-vaadin-route-inventory-planonly",
+      "atom": "java-vaadin-route-inventory",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}"
+      },
+      "expect_response_fields": [
+        "status",
+        "project_dir",
+        "routes",
+        "duplicate_routes"
+      ]
+    },
+    {
       "id": "dispatch-java-decompose-god-class-planonly",
       "atom": "java-decompose-god-class",
       "args": {

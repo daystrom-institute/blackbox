@@ -3893,6 +3893,9 @@ pub(crate) use singletonify::{plan_singletonify_java_holder, plan_singletonify_j
 pub(crate) use split_provider::plan_java_split_provider;
 pub(crate) use test_slice::plan_extract_java_test_slice;
 pub(crate) use vaadin_provider_bindings::plan_java_vaadin_provider_binding_generation;
+pub(crate) use vaadin_route_inventory::plan_java_vaadin_route_inventory;
+pub(crate) use vaadin_static_ui_audit::plan_java_vaadin_static_ui_context_audit;
+pub(crate) use vaadin_view_structure::plan_java_vaadin_view_structure_analysis;
 
 mod atom_plans;
 mod collapse_chain;
@@ -3918,6 +3921,9 @@ mod test_slice;
 #[cfg(test)]
 mod tests;
 mod vaadin_provider_bindings;
+mod vaadin_route_inventory;
+mod vaadin_static_ui_audit;
+mod vaadin_view_structure;
 pub(crate) use find_usages::plan_find_java_usages;
 mod rename_symbol;
 pub(crate) use rename_symbol::plan_rename_java_symbol;

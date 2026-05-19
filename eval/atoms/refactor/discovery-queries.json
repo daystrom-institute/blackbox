@@ -221,6 +221,30 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-java-vaadin-view-structure-analysis",
+      "query": "inventory route metadata fields grids dialogs data providers and services before decomposing a Vaadin view",
+      "expected_atoms": [
+        "java-vaadin-view-structure-analysis"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-static-ui-context-audit",
+      "query": "audit Vaadin UI.getCurrent VaadinSession.getCurrent async ui access and missing detach cleanup",
+      "expected_atoms": [
+        "java-vaadin-static-ui-context-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-route-inventory",
+      "query": "inventory Vaadin Route classes duplicate route paths authorization annotations and navigation menu coverage",
+      "expected_atoms": [
+        "java-vaadin-route-inventory"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-find-usages",
       "query": "find every project wide caller of a java method or field",
       "expected_atoms": [
