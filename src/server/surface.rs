@@ -242,13 +242,20 @@ pub fn extract_surface_from_uri(query: Option<&str>) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::packets::{CompileParams, Packets, Value as AstValue};
-    use crate::server::state::SharedState;
+    use crate::server::state::{BlackboxServer, SharedState};
+    use rmcp::ServerHandler;
 
     fn tmp_packets() -> (tempfile::TempDir, Packets) {
         let dir = tempfile::TempDir::new().unwrap();
         let p = Packets::open(dir.path()).unwrap();
         (dir, p)
+    }
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
     }
 
     fn compile_surface_packet(
@@ -778,5 +785,161 @@ mod tests {
     #[test]
     fn extract_surface_no_match() {
         assert_eq!(extract_surface_from_uri(Some("foo=bar&baz=qux")), "default");
+    }
+    #[test]
+    fn surface_get_tool_no_packet_returns_full_catalog() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = test_server(&tmp);
+        assert!(
+            srv.get_tool("bbox_search").is_some(),
+            "bbox_search should be visible with no surface packet"
+        );
+        assert!(
+            srv.get_tool("bro_exec").is_some(),
+            "bro_exec should be visible with no surface packet"
+        );
+    }
+
+    #[test]
+    fn surface_get_tool_with_packet_restricts_visibility() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = test_server(&tmp);
+
+        let consequent = serde_json::json!({
+            "route": "tool_surface",
+            "allow": ["bbox_search", "bbox_stats"],
+            "disallow": [],
+        });
+        let deny_consequent = serde_json::json!({"route": "deny", "reason": "unknown surface"});
+        compile_surface_packet(
+            &srv.state.packets.read(),
+            vec![
+                serde_json::json!({
+                    "id": "readonly",
+                    "antecedent": {"op": "Eq", "field": "surface", "value": "default"},
+                    "consequent": serde_json::to_string(&consequent).unwrap(),
+                    "classification": "tool_surface",
+                }),
+                serde_json::json!({
+                    "id": "deny_rest",
+                    "antecedent": {"op": "True"},
+                    "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+                    "classification": "deny",
+                }),
+            ],
+            "global",
+            None,
+        );
+
+        assert!(
+            srv.get_tool("bbox_search").is_some(),
+            "bbox_search should be visible on default surface"
+        );
+        assert!(
+            srv.get_tool("bbox_stats").is_some(),
+            "bbox_stats should be visible on default surface"
+        );
+        assert!(
+            srv.get_tool("bbox_forget").is_none(),
+            "bbox_forget should be hidden on default surface"
+        );
+        assert!(
+            srv.get_tool("bro_exec").is_none(),
+            "bro_exec should be hidden on default surface"
+        );
+    }
+
+    #[test]
+    fn surface_get_tool_deny_verdict_hides_all() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = test_server(&tmp);
+
+        let deny_consequent = serde_json::json!({"route": "deny", "reason": "locked"});
+        compile_surface_packet(
+            &srv.state.packets.read(),
+            vec![serde_json::json!({
+                "id": "deny_all",
+                "antecedent": {"op": "True"},
+                "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+                "classification": "deny",
+            })],
+            "global",
+            None,
+        );
+
+        assert!(
+            srv.get_tool("bbox_search").is_none(),
+            "all tools should be hidden under deny verdict"
+        );
+    }
+
+    // ── Phase 2b: initialize + surface binding tests ───────────────────
+
+    #[test]
+    fn surface_once_lock_set_prevents_second_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = test_server(&tmp);
+
+        let lock = &srv.surface;
+        assert!(lock.get().is_none(), "surface should start unset");
+        assert!(
+            lock.set(Arc::from("readonly")).is_ok(),
+            "first set should succeed"
+        );
+        assert_eq!(lock.get().unwrap().as_ref(), "readonly");
+        assert!(
+            lock.set(Arc::from("admin")).is_err(),
+            "second set should fail (OnceLock)"
+        );
+        assert_eq!(
+            lock.get().unwrap().as_ref(),
+            "readonly",
+            "value should remain unchanged"
+        );
+    }
+
+    #[test]
+    fn surface_evaluate_deny_produces_correct_error_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let srv = test_server(&tmp);
+
+        let deny_consequent = serde_json::json!({"route": "deny", "reason": "locked out"});
+        compile_surface_packet(
+            &srv.state.packets.read(),
+            vec![
+                serde_json::json!({
+                    "id": "deny_locked",
+                    "antecedent": {
+                        "op": "Eq",
+                        "field": "surface",
+                        "value": "locked"
+                    },
+                    "consequent": serde_json::to_string(&deny_consequent).unwrap(),
+                    "classification": "deny",
+                }),
+                serde_json::json!({
+                    "id": "allow_rest",
+                    "antecedent": {"op": "True"},
+                    "consequent": serde_json::json!({
+                        "route": "tool_surface",
+                        "allow": ["bbox_search"],
+                        "disallow": [],
+                    }).to_string(),
+                    "classification": "tool_surface",
+                }),
+            ],
+            "global",
+            None,
+        );
+
+        let entity_locked = serde_json::json!({"surface": "locked"});
+        let decision =
+            evaluate_tool_surface(&srv.state.packets.read(), entity_locked, None::<&str>);
+        assert!(decision.is_deny(), "locked surface should deny");
+        if let ToolSurfaceVerdict::Deny { reason } = &decision.verdict {
+            assert_eq!(reason.as_deref(), Some("locked out"));
+        } else {
+            panic!("expected Deny variant");
+        }
     }
 }
