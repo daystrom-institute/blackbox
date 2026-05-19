@@ -66,7 +66,8 @@ the decomposition cleanup that the topology move exposed:
      landed `engine/fanout.rs` split.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
      code. The vector-maintenance hook family now lives in
-     `src/workflow/ops/vector.rs`.
+     `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
+     in `src/workflow/ops/worktree.rs`.
    - `src/orchestration/providers.rs`: split catalog, credentials, and provider
      resolution when touching that area.
 
@@ -556,6 +557,8 @@ Landed:
 17. `src/server/open.rs` owns config/store/index opening and `SharedState`
     construction previously embedded in `server/run.rs`.
 18. `src/workflow/ops/vector.rs` owns the vector-maintenance hook-op helpers
+    previously embedded in `workflow/ops.rs`.
+19. `src/workflow/ops/worktree.rs` owns worktree create/remove hook-op helpers
     previously embedded in `workflow/ops.rs`.
 
 Next useful cuts:

@@ -15,10 +15,11 @@
 //! that would do that should be refactored into a node + gate.
 
 mod vector;
+mod worktree;
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Result, anyhow, bail};
@@ -31,6 +32,7 @@ use crate::entity_ref::EntityRef;
 
 use super::context::{ArcContext, VarsSchema, resolve_arg_value};
 use vector::{exec_compact_vector_partitions, exec_read_vector_status, exec_rebuild_hnsw};
+use worktree::{exec_worktree_create, exec_worktree_remove};
 
 /// Side-effect declaration. Lives in `NodeSpec.on_enter`,
 /// `NodeSpec.on_exit`, `Workflow.on_arc_exit`, `Workflow.on_arc_cancel`.
@@ -1743,207 +1745,6 @@ fn arch_pathology_dispatch_payload(
         "```json\n{}\n```",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     )
-}
-
-async fn exec_worktree_create(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("WorktreeCreate requires args.path"))?
-        .to_string();
-    let branch = args
-        .get("branch")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("WorktreeCreate requires args.branch"))?
-        .to_string();
-    let base = args
-        .get("base")
-        .and_then(|v| v.as_str())
-        .unwrap_or("main")
-        .to_string();
-    let repo_root = ctx
-        .meta
-        .project_dir
-        .clone()
-        .ok_or_else(|| anyhow!("WorktreeCreate: meta.project_dir not set"))?;
-
-    // Refuse to clobber an existing path. Different issue from the
-    // existing-branch case below — a path collision means another arc
-    // is concurrently using this exact path or a previous one wasn't
-    // cleaned up. Either way, don't silently mutate.
-    if Path::new(&path).exists() {
-        bail!("WorktreeCreate: path {path} already exists");
-    }
-
-    // Branch existence check. Failed/killed arcs leave their branch
-    // behind (intentional under `keep-on-fail` cleanup policy), so
-    // creating a fresh branch with the same name (`-b`) on the next
-    // attempt blows up with `fatal: a branch named '<x>' already
-    // exists`. Two real cases:
-    //   (a) branch exists AND is checked out in another worktree → real
-    //       conflict (concurrent arc on same issue), fail loudly
-    //   (b) branch exists but no worktree references it → reuse it
-    //       (`git worktree add <path> <branch>` without `-b`)
-    //   (c) branch doesn't exist → fresh create (`-b <branch>` against
-    //       <base>)
-    let branch_status = branch_state(&repo_root, &branch).await?;
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C").arg(&repo_root).arg("worktree").arg("add");
-    match branch_status {
-        BranchState::AbsentLocal => {
-            // Case (c): create fresh.
-            cmd.arg("-b").arg(&branch).arg(&path).arg(&base);
-        }
-        BranchState::PresentFree => {
-            // Case (b): reuse existing branch — no `-b`.
-            cmd.arg(&path).arg(&branch);
-        }
-        BranchState::PresentInUse(other_path) => {
-            // Case (a): real conflict.
-            bail!(
-                "WorktreeCreate: branch '{branch}' is already checked out at {other_path} \
-                 (concurrent arc on same issue?). Either let the other arc finish, or \
-                 retire its worktree, or use a unique branch name (e.g. include \
-                 ${{meta.arc_id}} in the name)."
-            );
-        }
-    }
-    let output = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| anyhow!("git worktree add spawn: {e}"))?;
-    if !output.status.success() {
-        bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(OpEffect::SetWorktree(Some(path)))
-}
-
-/// State of a local branch with respect to worktree usage.
-enum BranchState {
-    /// Branch does not exist locally.
-    AbsentLocal,
-    /// Branch exists but is not checked out by any worktree.
-    PresentFree,
-    /// Branch exists AND another worktree has it checked out (path).
-    PresentInUse(String),
-}
-
-/// Inspect a branch's worktree-occupancy in `repo_root`.
-async fn branch_state(repo_root: &str, branch: &str) -> Result<BranchState> {
-    // First: does the branch ref exist at all?
-    let exists = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("show-ref")
-        .arg("--verify")
-        .arg("--quiet")
-        .arg(format!("refs/heads/{branch}"))
-        .status()
-        .await
-        .map_err(|e| anyhow!("git show-ref spawn: {e}"))?
-        .success();
-    if !exists {
-        return Ok(BranchState::AbsentLocal);
-    }
-    // Second: is some worktree currently checked out on it?
-    let porcelain = tokio::process::Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .arg("worktree")
-        .arg("list")
-        .arg("--porcelain")
-        .output()
-        .await
-        .map_err(|e| anyhow!("git worktree list spawn: {e}"))?;
-    if !porcelain.status.success() {
-        bail!(
-            "git worktree list failed: {}",
-            String::from_utf8_lossy(&porcelain.stderr)
-        );
-    }
-    let text = String::from_utf8_lossy(&porcelain.stdout).into_owned();
-    // Records are separated by blank lines; each starts with `worktree
-    // <path>` and may include `branch refs/heads/<name>`.
-    let needle = format!("branch refs/heads/{branch}");
-    let mut current_path: Option<String> = None;
-    for line in text.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            current_path = Some(p.to_string());
-            continue;
-        }
-        if line.trim() == needle {
-            if let Some(p) = current_path.take() {
-                return Ok(BranchState::PresentInUse(p));
-            }
-        }
-        if line.trim().is_empty() {
-            current_path = None;
-        }
-    }
-    Ok(BranchState::PresentFree)
-}
-
-async fn exec_worktree_remove(args: &Value, ctx: &ArcContext) -> Result<OpEffect> {
-    let path = args
-        .get("path")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("WorktreeRemove requires args.path"))?
-        .to_string();
-    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-
-    if !Path::new(&path).exists() {
-        // Treat as no-op — repeated cleanups must be idempotent.
-        return Ok(OpEffect::SetWorktree(None));
-    }
-
-    // `git worktree remove` is a porcelain that needs to run inside
-    // the *parent* repo (the one that owns the worktree), not inside
-    // the worktree itself. Default to meta.project_dir; allow the
-    // workflow to override via args.repo_root if it knows better.
-    let repo_root = args
-        .get("repo_root")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .or_else(|| ctx.meta.project_dir.clone())
-        .ok_or_else(|| {
-            anyhow!(
-                "WorktreeRemove: no repo_root resolvable (set args.repo_root or meta.project_dir)"
-            )
-        })?;
-
-    let mut cmd = tokio::process::Command::new("git");
-    cmd.arg("-C")
-        .arg(&repo_root)
-        .arg("worktree")
-        .arg("remove")
-        .arg(&path);
-    if force {
-        cmd.arg("--force");
-    }
-    let output = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| anyhow!("git worktree remove spawn: {e}"))?;
-    if !output.status.success() {
-        // No `rm -rf` fallback — that would erase whatever path the
-        // workflow author templated, with no containment guarantee.
-        // Operator can clean a non-git-tracked path manually; engine
-        // surfaces the git error verbatim so the cause is visible.
-        bail!(
-            "git worktree remove failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    Ok(OpEffect::SetWorktree(None))
 }
 
 fn exec_set_meta(args: &Value) -> Result<OpEffect> {
