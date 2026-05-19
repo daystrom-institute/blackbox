@@ -1,9 +1,18 @@
 use super::*;
+use crate::knowledge::Knowledge;
+use crate::notes::Notes;
+use crate::orchestration::TaskStore;
+use crate::orchestration::tail::TailEvent;
+use crate::packets::{CompileParams, Packets};
+use crate::pins::Pins;
+use crate::projects::ProjectRegistry;
+use crate::roadmap::Roadmap;
+use crate::threads::Threads;
 use crate::tools::badgey_adapter::{
     BadgeyAgentAdapter, recover_badgey_non_terminal_state, restore_badgey_registry_from_notes,
 };
-use crate::packets::CompileParams;
 use rmcp::ServerHandler;
+use tokio::sync::broadcast;
 
 fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let index = TranscriptIndex::open_or_create(
