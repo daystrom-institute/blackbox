@@ -923,5 +923,9 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "apply_eval_tests.rs"]
+mod eval_tests;
+
+#[cfg(test)]
 #[path = "apply_compose_tests.rs"]
 mod compose_tests;
