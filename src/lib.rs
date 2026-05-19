@@ -105,7 +105,7 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use orchestration::providers::{ExecOpts, Provider};
+use orchestration::providers::Provider;
 use orchestration::{self as orch};
 use pins::PinParams;
 use projects::ProjectRecord;
