@@ -4,8 +4,8 @@ use std::collections::BTreeMap;
 use super::{
     ApplyMode, ApplyParams, AuditParams, CmpOp, CompileParams, Emit, MAX_COMPOSITION_DEPTH,
     NoopResolver, Packet, Packets, Predicate, Rule, Value, apply, apply_all, apply_with,
-    default_rank_lookup_key, default_threshold_lookup_key, eval_predicate, infer_classification,
-    packet_matches_query, packet_summary, review_lattice, review_prefix_inference,
+    default_rank_lookup_key, default_threshold_lookup_key, eval_predicate, packet_matches_query,
+    packet_summary, review_lattice, review_prefix_inference,
 };
 use serde_json::json;
 
@@ -807,32 +807,6 @@ fn float_comparisons_work() {
 }
 
 #[test]
-fn classification_infers_from_id_prefix() {
-    let map = review_prefix_inference();
-    assert_eq!(
-        infer_classification("fail_warnings", &map).as_deref(),
-        Some("fail")
-    );
-    assert_eq!(
-        infer_classification("flag_readonly_fs", &map).as_deref(),
-        Some("flag")
-    );
-    assert_eq!(
-        infer_classification("manual_review_security", &map).as_deref(),
-        Some("manual")
-    );
-    assert_eq!(
-        infer_classification("review_contract", &map).as_deref(),
-        Some("manual")
-    );
-    assert_eq!(
-        infer_classification("pass_all_clean", &map).as_deref(),
-        Some("pass")
-    );
-    assert_eq!(infer_classification("miscellaneous", &map).as_deref(), None);
-}
-
-#[test]
 fn compile_infers_classification_from_id_prefix() {
     let (_dir, store) = tmp_packets();
     let params = CompileParams {
@@ -896,36 +870,6 @@ fn compile_rejects_classification_not_in_lattice() {
     };
     let err = store.compile(&params).unwrap_err().to_string();
     assert!(err.contains("not in packet lattice"), "got: {err}");
-}
-
-#[test]
-fn prefix_inference_uses_longest_match() {
-    // Overlapping prefixes — longer one wins (not BTreeMap iteration order).
-    let mut map = BTreeMap::new();
-    map.insert("fail_".into(), "fail".into());
-    map.insert("fail_critical_".into(), "blocker".into());
-    map.insert("flag_".into(), "flag".into());
-
-    assert_eq!(
-        infer_classification("fail_critical_foo", &map).as_deref(),
-        Some("blocker"),
-        "longer prefix `fail_critical_` beats shorter `fail_`"
-    );
-    assert_eq!(
-        infer_classification("fail_normal", &map).as_deref(),
-        Some("fail"),
-        "only `fail_` matches — picks that"
-    );
-    assert_eq!(
-        infer_classification("flag_readonly", &map).as_deref(),
-        Some("flag"),
-        "different prefix — picks the matching one"
-    );
-    assert_eq!(
-        infer_classification("unknown_rule", &map).as_deref(),
-        None,
-        "no prefix match returns None"
-    );
 }
 
 // ── Phase 4A: quantified collection predicates ──

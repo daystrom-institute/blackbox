@@ -770,10 +770,12 @@ pub(super) fn default_confidence() -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::super::{review_lattice, review_prefix_inference};
-    use super::{Emit, Predicate, RuleInput, Value};
+    use super::{Emit, Predicate, RuleInput, Value, infer_classification};
 
     #[test]
     fn predicate_serde_matches_e11_format() {
@@ -854,5 +856,61 @@ mod tests {
             .materialize(&review_lattice(), &review_prefix_inference())
             .unwrap();
         assert_eq!(r.emit, Emit::Fallback);
+    }
+
+    #[test]
+    fn classification_infers_from_id_prefix() {
+        let map = review_prefix_inference();
+        assert_eq!(
+            infer_classification("fail_warnings", &map).as_deref(),
+            Some("fail")
+        );
+        assert_eq!(
+            infer_classification("flag_readonly_fs", &map).as_deref(),
+            Some("flag")
+        );
+        assert_eq!(
+            infer_classification("manual_review_security", &map).as_deref(),
+            Some("manual")
+        );
+        assert_eq!(
+            infer_classification("review_contract", &map).as_deref(),
+            Some("manual")
+        );
+        assert_eq!(
+            infer_classification("pass_all_clean", &map).as_deref(),
+            Some("pass")
+        );
+        assert_eq!(infer_classification("miscellaneous", &map).as_deref(), None);
+    }
+
+    #[test]
+    fn prefix_inference_uses_longest_match() {
+        // Overlapping prefixes — longer one wins (not BTreeMap iteration order).
+        let mut map = BTreeMap::new();
+        map.insert("fail_".into(), "fail".into());
+        map.insert("fail_critical_".into(), "blocker".into());
+        map.insert("flag_".into(), "flag".into());
+
+        assert_eq!(
+            infer_classification("fail_critical_foo", &map).as_deref(),
+            Some("blocker"),
+            "longer prefix `fail_critical_` beats shorter `fail_`"
+        );
+        assert_eq!(
+            infer_classification("fail_normal", &map).as_deref(),
+            Some("fail"),
+            "only `fail_` matches — picks that"
+        );
+        assert_eq!(
+            infer_classification("flag_readonly", &map).as_deref(),
+            Some("flag"),
+            "different prefix — picks the matching one"
+        );
+        assert_eq!(
+            infer_classification("unknown_rule", &map).as_deref(),
+            None,
+            "no prefix match returns None"
+        );
     }
 }
