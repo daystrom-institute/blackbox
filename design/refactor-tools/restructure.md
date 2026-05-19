@@ -50,7 +50,8 @@ the decomposition cleanup that the topology move exposed:
      wholesale, and several now-unused root compatibility imports/re-exports
      have been removed from `src/lib.rs`. `dispatch_mcp_url` is imported
      directly by `server/startup.rs` instead of being re-exported from the lib
-     root.
+     root. The remaining shared packet test island no longer imports the packet
+     parent prelude wholesale.
 
 2. **Split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root
@@ -119,6 +120,9 @@ the decomposition cleanup that the topology move exposed:
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
      its crate dependencies explicitly; moving it to integration tests remains
      a separate locality cleanup.
+   - The remaining shared packet test island in `src/packets/tests.rs` now uses
+     explicit imports instead of `use super::*`; moving those cases into
+     per-module test blocks remains opportunistic locality work.
    - Move daemon-startup-shaped tests to integration tests using `blackbox::`
      imports.
    - First locality cut landed outside packets: secret-header helper tests moved
