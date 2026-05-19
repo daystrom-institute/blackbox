@@ -529,6 +529,7 @@ mod tests {
             callback_externals: None,
             project_dir: None,
             output_path: None,
+            ..Default::default()
         }
     }
 

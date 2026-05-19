@@ -858,6 +858,7 @@ mod tests {
             wiring_mode: None,
             callback_externals: None,
             output_path: None,
+            ..Default::default()
         })
         .unwrap();
         parse_response(&response)
@@ -979,6 +980,7 @@ fn consume(input: OldService, output: Vec<OldService>) -> OldService {
             wiring_mode: None,
             callback_externals: None,
             output_path: None,
+            ..Default::default()
         });
         let msg = err.expect_err("impl trait should fail").to_string();
         assert!(
@@ -1065,6 +1067,7 @@ fn consume<T>(value: OldService, list: Vec<OldService>) {
             wiring_mode: None,
             callback_externals: None,
             output_path: None,
+            ..Default::default()
         });
         let msg = err.expect_err("expected conflict").to_string();
         assert!(
@@ -1152,6 +1155,7 @@ struct Holder {
             wiring_mode: None,
             callback_externals: None,
             output_path: None,
+            ..Default::default()
         });
         let msg = err
             .expect_err("impl trait should refuse struct field")

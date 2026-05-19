@@ -396,6 +396,7 @@ impl MyStruct {
             wiring_mode: None,
             callback_externals: None,
             output_path: None,
+            ..Default::default()
         };
 
         let result = plan_lift_to_free(&params);

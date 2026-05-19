@@ -659,6 +659,7 @@ mod tests {
             wiring_mode: None,
             callback_externals: None,
             output_path: None,
+            ..Default::default()
         }
     }
 

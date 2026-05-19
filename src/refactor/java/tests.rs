@@ -50,6 +50,7 @@ fn java_plan_params(kind: &str, source: &Path) -> RefactorPlanParams {
         wiring_mode: None,
         callback_externals: None,
         output_path: None,
+        ..Default::default()
     }
 }
 

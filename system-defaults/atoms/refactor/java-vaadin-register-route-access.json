@@ -1,0 +1,59 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-vaadin-register-route-access",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Register a Vaadin view route in detected project route/access or navigation registries without synthesizing the view itself.",
+    "when_to_use": [
+      "after synthesizing or moving a Vaadin view when registry-based route access must be updated",
+      "adding one explicit route/view entry to a detectable access or navigation surface"
+    ],
+    "anti_patterns": [
+      "do not use when multiple authorization systems are active and the operator has not chosen authority of record",
+      "do not invent role mappings or nav groups from context"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "view_source": { "type": "string" },
+          "view_class": { "type": "string" },
+          "route_path": { "type": "string" },
+          "role_policy": { "type": "string" },
+          "nav_group": { "type": "string" },
+          "route_access_policy": { "type": "string" },
+          "apply": { "type": "boolean" },
+          "validation_cmd": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "prompt_template": "You are java-vaadin-register-route-access. Charter: update one explicit route/access or navigation registry entry after operator review.\n\nProtocol:\n1. Ground the route surface: bbox_refactor_plan(kind=\"java_vaadin_route_inventory\", deep_analysis=true, project_dir=\"{{project_dir}}\").\n2. Plan registration: bbox_refactor_plan(kind=\"java_vaadin_register_route_access\", deep_analysis=true, project_dir=\"{{project_dir}}\", view_source=\"{{view_source}}\", view_class=\"{{view_class}}\", route_path=\"{{route_path}}\", role_policy=\"{{role_policy}}\", nav_group=\"{{nav_group}}\", route_access_policy=\"{{route_access_policy}}\").\n3. Block if no registry is detected, the route/view already exists, multiple auth systems are active without explicit policy, or role mapping is ambiguous.\n4. Apply only when inputs.apply is true via bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[<java_vaadin_register_route_access plan step>, <validation command from validation_cmd>]).\n5. Emit bbox_note(kind=\"done\", body=<one-line registry file, route/view, role/nav policy, applied/planned>).\n\nInputs: {{project_dir}} {{view_source}} {{view_class}} {{route_path}} {{role_policy}} {{nav_group}} {{route_access_policy}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "route_path": { "type": "string" },
+          "registry_files": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

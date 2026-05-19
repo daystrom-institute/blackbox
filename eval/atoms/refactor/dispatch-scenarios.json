@@ -462,6 +462,161 @@
       ]
     },
     {
+      "id": "dispatch-java-vaadin-extract-component-planonly",
+      "atom": "java-vaadin-extract-component",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/DashboardWidget.java",
+        "module_name": "DashboardWidget",
+        "item_names": ["buildWidget"],
+        "move_fields": ["widgetLayout"],
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "component_class"]
+    },
+    {
+      "id": "dispatch-java-vaadin-extract-grid-component-planonly",
+      "atom": "java-vaadin-extract-grid-component",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/UserGridComponent.java",
+        "module_name": "UserGridComponent",
+        "grid_field": "userGrid",
+        "item_names": ["configureUserGrid"],
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "grid_field"]
+    },
+    {
+      "id": "dispatch-java-vaadin-extract-dialog-class-planonly",
+      "atom": "java-vaadin-extract-dialog-class",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/EditUserDialog.java",
+        "module_name": "EditUserDialog",
+        "item_names": ["openEditDialog"],
+        "provider_field": "editUserDialogProvider",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "dialog_class"]
+    },
+    {
+      "id": "dispatch-java-vaadin-synthesize-view-planonly",
+      "atom": "java-vaadin-synthesize-view",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "target": "src/main/java/com/example/ReportsView.java",
+        "module_name": "ReportsView",
+        "route_path": "reports",
+        "page_title": "Reports",
+        "route_access_policy": "permit_all",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "view_class"]
+    },
+    {
+      "id": "dispatch-java-vaadin-register-route-access-planonly",
+      "atom": "java-vaadin-register-route-access",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "view_class": "ReportsView",
+        "route_path": "reports",
+        "role_policy": "ADMIN",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "route_path"]
+    },
+    {
+      "id": "dispatch-java-vaadin-navigation-helper-extract-planonly",
+      "atom": "java-vaadin-navigation-helper-extract",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/DashboardNavigation.java",
+        "module_name": "DashboardNavigation",
+        "old_text": "UI.getCurrent().navigate(\"reports\")",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "helper_class"]
+    },
+    {
+      "id": "dispatch-java-vaadin-decompose-view-planonly",
+      "atom": "java-vaadin-decompose-view",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "module_name": "DashboardView",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "candidate_id", "next_candidates"]
+    },
+    {
+      "id": "dispatch-java-vaadin-dashboard-widget-extract-planonly",
+      "atom": "java-vaadin-dashboard-widget-extract",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "candidate_id": "component-section:summaryCard",
+        "target": "src/main/java/com/example/SummaryCardWidget.java",
+        "module_name": "SummaryCardWidget",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "plan_path", "target_shape"]
+    },
+    {
+      "id": "dispatch-java-vaadin-create-view-with-access-planonly",
+      "atom": "java-vaadin-create-view-with-access",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "target": "src/main/java/com/example/ReportsView.java",
+        "module_name": "ReportsView",
+        "route_path": "reports",
+        "page_title": "Reports",
+        "route_access_policy": "permit_all",
+        "role_policy": "ADMIN",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "access_phase"]
+    },
+    {
+      "id": "dispatch-java-vaadin-dialog-extract-workflow-planonly",
+      "atom": "java-vaadin-dialog-extract-workflow",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/EditUserDialog.java",
+        "module_name": "EditUserDialog",
+        "item_names": ["openEditDialog"],
+        "apply": false
+      },
+      "expect_response_fields": ["status", "cleanup_status"]
+    },
+    {
+      "id": "dispatch-java-vaadin-grid-component-extract-workflow-planonly",
+      "atom": "java-vaadin-grid-component-extract-workflow",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java",
+        "target": "src/main/java/com/example/UserGridComponent.java",
+        "module_name": "UserGridComponent",
+        "grid_field": "userGrid",
+        "apply": false
+      },
+      "expect_response_fields": ["status", "remaining_grid_references"]
+    },
+    {
+      "id": "dispatch-java-vaadin-ui-lifecycle-audit-planonly",
+      "atom": "java-vaadin-ui-lifecycle-audit",
+      "args": {
+        "project_dir": "${FIXTURE_JAVA_PROJECT}",
+        "source": "src/main/java/com/example/DashboardView.java"
+      },
+      "expect_response_fields": ["status", "findings", "highest_risk"]
+    },
+    {
       "id": "dispatch-java-decompose-god-class-planonly",
       "atom": "java-decompose-god-class",
       "args": {

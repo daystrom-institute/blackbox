@@ -334,6 +334,125 @@
       "done_note_required": true
     },
     {
+      "atom": "java-vaadin-extract-component",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_vaadin_view_structure_analysis",
+        "bbox_refactor_plan:java_vaadin_extract_component",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-extract-grid-component",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_vaadin_extract_grid_component",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-extract-dialog-class",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_vaadin_extract_dialog_class",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-synthesize-view",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_route_inventory",
+        "bbox_refactor_plan:java_vaadin_synthesize_view",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-register-route-access",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_route_inventory",
+        "bbox_refactor_plan:java_vaadin_register_route_access",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-navigation-helper-extract",
+      "expected_plan_sequence": [
+        "bbox_refactor_status",
+        "bbox_refactor_plan:java_vaadin_navigation_helper_extract",
+        "bbox_refactor_run",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-decompose-view",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_route_inventory",
+        "bbox_refactor_plan:java_vaadin_view_structure_analysis",
+        "bbox_refactor_plan:cluster_inject_params_java",
+        "bbox_refactor_plan:java_vaadin_extract_component",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-dashboard-widget-extract",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_view_structure_analysis",
+        "bbox_refactor_plan:java_vaadin_extract_component",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-create-view-with-access",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_route_inventory",
+        "bbox_refactor_plan:java_vaadin_synthesize_view",
+        "bbox_refactor_plan:java_vaadin_register_route_access",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-dialog-extract-workflow",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_view_structure_analysis",
+        "bbox_refactor_plan:java_vaadin_extract_dialog_class",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-grid-component-extract-workflow",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_view_structure_analysis",
+        "bbox_refactor_plan:java_vaadin_extract_grid_component",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "java-vaadin-ui-lifecycle-audit",
+      "expected_plan_sequence": [
+        "bbox_refactor_plan:java_vaadin_static_ui_context_audit",
+        "bbox_refactor_plan:java_concurrency_antipattern_audit",
+        "bbox_refactor_plan:find_java_usages",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
       "atom": "java-decompose-god-class",
       "expected_plan_sequence": [
         "bbox_code_symbols",

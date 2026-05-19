@@ -1,0 +1,64 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-vaadin-extract-component",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Extract a selected Vaadin view widget/component section into a dedicated component class with source-side delegate field wiring.",
+    "when_to_use": [
+      "moving a coherent Vaadin widget or component-owned field/method group out of a large Flow view",
+      "following java-vaadin-view-structure-analysis when the operator selected one component candidate"
+    ],
+    "anti_patterns": [
+      "do not use for @Route classes or route lifecycle methods; synthesize or migrate a view instead",
+      "do not apply when listener cleanup, source state mutation, or UI/session scope cannot be preserved"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "module_name": { "type": "string" },
+          "item_names": { "type": "array", "items": { "type": "string" } },
+          "move_fields": { "type": "array", "items": { "type": "string" } },
+          "candidate_id": { "type": "string" },
+          "component_base": { "type": "string" },
+          "parameters_type_name": { "type": "string" },
+          "public_methods": { "type": "array", "items": { "type": "string" } },
+          "target_scope": { "type": "string" },
+          "target_access_policy": { "type": "string" },
+          "apply": { "type": "boolean" },
+          "validation_cmd": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "prompt_template": "You are java-vaadin-extract-component. Charter: extract exactly one operator-selected Vaadin component/widget section into a dedicated component class.\n\nProtocol:\n1. Ground the source: bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\"). If candidate_id is supplied, first re-run bbox_refactor_plan(kind=\"java_vaadin_view_structure_analysis\", project_dir=\"{{project_dir}}\", source=\"{{source}}\") and verify the candidate still exists.\n2. Plan: bbox_refactor_plan(kind=\"java_vaadin_extract_component\", deep_analysis=true, project_dir=\"{{project_dir}}\", source=\"{{source}}\", target=\"{{target}}\", module_name=\"{{module_name}}\", item_names={{item_names}}, move_fields={{move_fields}}, candidate_id=\"{{candidate_id}}\", component_base=\"{{component_base}}\", parameters_type_name=\"{{parameters_type_name}}\", public_methods={{public_methods}}, target_scope=\"{{target_scope}}\", target_access_policy=\"{{target_access_policy}}\").\n3. Inspect refusal risks: route annotations, lifecycle methods, listener cleanup, unrelated source state mutation, and UI/session scoped dependencies. If blocked, emit bbox_note(kind=\"blocked\", body=<specific reason + plan_path if present>).\n4. Apply only when inputs.apply is true: bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[<java_vaadin_extract_component plan step>, {\"op\":\"command\",\"command\":\"<validation_cmd[0]>\",\"args\":<validation_cmd[1..]>,\"required\":true}]).\n5. Emit bbox_note(kind=\"done\", body=<one-line source, target, members moved, applied/planned, validation result>).\n\nInputs: {{project_dir}} {{source}} {{target}} {{module_name}} {{item_names}} {{move_fields}} {{candidate_id}} {{component_base}} {{parameters_type_name}} {{public_methods}} {{target_scope}} {{target_access_policy}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "component_class": { "type": "string" },
+          "members_moved": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

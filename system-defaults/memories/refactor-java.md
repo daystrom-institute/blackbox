@@ -549,6 +549,13 @@ already wired the injection. The conversion of the production-side
 holder/util/Vaadin patterns to actual `@Singleton` services is still a
 separate operator-driven workflow.
 
+For Vaadin Flow view decomposition, route/view synthesis, route-access
+registration, dialog/grid/component extraction, and UI/session lifecycle audit
+patterns, prefer discovering the current Vaadin refactor atom surface with
+`atom_search(query="vaadin flow view component route lifecycle", subcontract="refactor/v1")`;
+the archived design record is
+`design/refactor-tools/java/vaadin-refactor-tools-proposal.md`.
+
 14b8. Split a Provider<Big> across call sites:
 
 ```text

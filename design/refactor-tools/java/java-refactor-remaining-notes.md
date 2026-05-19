@@ -75,6 +75,7 @@ is found:
 | `note-1ee49c59` `migrate_java_method_receiver` | Landed | auto-injection and project-wide caller walk exist |
 | `note-4ec8ff30` `java_split_provider` | Landed | call-site rewrite, provider auto-injection, and full-coverage old-field deletion exist |
 | `note-7d4f0001` Vaadin static lookup caller rewrite | Landed for callers | `replace_java_static_reference` drop-accessor mode and `java-replace-vaadin-static-lookup` atom exist |
+| Vaadin Flow view decomposition/synthesis toolsuite | Landed | `java_vaadin_view_structure_analysis`, component/grid/dialog extraction, static UI audit, route inventory, view synthesis, route access, navigation helper extraction, and Vaadin workflow atoms |
 | `note-7c819189` static holder caller rewrite | Landed for callers | `replace_java_static_reference` field mode and `java-migrate-static-holder` atom exist |
 | `note-e5439c0a` static util caller rewrite | Landed for callers | `replace_java_static_reference` method mode and `java-singletonify-static-util` atom exist |
 | `note-4257caaa` production-side holder/util conversion | Landed in worktree | `singletonify_java_holder`, `singletonify_java_util`, and Guice-only `java_vaadin_provider_binding_generation` exist |

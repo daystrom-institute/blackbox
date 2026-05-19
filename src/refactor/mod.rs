@@ -336,6 +336,50 @@ pub struct RefactorPlanParams {
     /// Java field names to move with extract_java_class.
     #[serde(default)]
     pub move_fields: Option<Vec<String>>,
+    /// Vaadin extraction: stable candidate id from
+    /// `java_vaadin_view_structure_analysis`.
+    #[serde(default)]
+    pub candidate_id: Option<String>,
+    /// Vaadin view-structure analysis: explicitly allow analyzing a plain
+    /// Java component/class that does not yet carry Vaadin imports/routes.
+    #[serde(default)]
+    pub allow_plain_component: Option<bool>,
+    /// Vaadin component extraction: generated component superclass/base,
+    /// e.g. `Composite<Div>`, `VerticalLayout`, or an explicit FQCN.
+    #[serde(default)]
+    pub component_base: Option<String>,
+    /// Vaadin component extraction: optional generated parameter/context
+    /// type name for operator-managed state threading.
+    #[serde(default)]
+    pub parameters_type_name: Option<String>,
+    /// Vaadin component/dialog/grid extraction: source-visible public API
+    /// methods that the generated target should expose.
+    #[serde(default)]
+    pub public_methods: Option<Vec<String>>,
+    /// Vaadin extraction: explicit scope annotation/policy for generated
+    /// target classes when source scope cannot be safely propagated.
+    #[serde(default)]
+    pub target_scope: Option<String>,
+    /// Vaadin extraction: explicit access policy for generated route-like
+    /// targets. Mutating planners must not infer this.
+    #[serde(default)]
+    pub target_access_policy: Option<String>,
+    /// Vaadin grid extraction: source grid field to move/analyze.
+    #[serde(default)]
+    pub grid_field: Option<String>,
+    /// Vaadin grid extraction: source factory method to move/analyze.
+    #[serde(default)]
+    pub factory_method: Option<String>,
+    /// Vaadin grid extraction: optional row type override.
+    #[serde(default)]
+    pub row_type: Option<String>,
+    /// Vaadin grid extraction: data provider fields that travel with the grid.
+    #[serde(default)]
+    pub data_provider_fields: Option<Vec<String>>,
+    /// Vaadin dialog extraction: optional provider field name to inject/use
+    /// at the caller.
+    #[serde(default)]
+    pub provider_field: Option<String>,
     /// Java delegate field name for caller rewrites or source-side delegate wiring.
     #[serde(default)]
     pub delegate_field: Option<String>,
@@ -371,6 +415,49 @@ pub struct RefactorPlanParams {
     /// Optional project root used to resolve relative paths.
     #[serde(default)]
     pub project_dir: Option<String>,
+    /// Plan-specific multi-source input for read-only audits.
+    #[serde(default)]
+    pub sources: Option<Vec<String>>,
+    /// Vaadin view synthesis/registration: route path for a generated or
+    /// registered view.
+    #[serde(default)]
+    pub route_path: Option<String>,
+    /// Vaadin view synthesis: page title for `@PageTitle`.
+    #[serde(default)]
+    pub page_title: Option<String>,
+    /// Vaadin view synthesis: layout class for `@Route(..., layout=...)`.
+    #[serde(default)]
+    pub layout_class: Option<String>,
+    /// Vaadin view synthesis: base class/superclass for the generated view.
+    #[serde(default)]
+    pub base_class: Option<String>,
+    /// Vaadin view synthesis: optional skeleton selector such as `empty`,
+    /// `grid_crud`, `tabs`, `dashboard`, or `form`.
+    #[serde(default)]
+    pub content_skeleton: Option<String>,
+    /// Vaadin view synthesis: optional explicit constructor dependencies.
+    #[serde(default)]
+    pub constructor_dependencies: Option<Vec<JavaParameterSpec>>,
+    /// Vaadin view synthesis/registration: operator-supplied route access
+    /// policy. Planners must not invent authorization policy.
+    #[serde(default)]
+    pub route_access_policy: Option<String>,
+    /// Vaadin view synthesis: explicitly allow merging into an existing target.
+    #[serde(default)]
+    pub merge_existing: Option<bool>,
+    /// Vaadin route registration: source file containing the view class.
+    #[serde(default)]
+    pub view_source: Option<String>,
+    /// Vaadin route registration: view class simple/FQCN.
+    #[serde(default)]
+    pub view_class: Option<String>,
+    /// Vaadin route registration: operator-supplied role policy for registry
+    /// based access systems.
+    #[serde(default)]
+    pub role_policy: Option<String>,
+    /// Vaadin route registration: navigation group/menu bucket.
+    #[serde(default)]
+    pub nav_group: Option<String>,
     /// Optional filename for writing the full RefactorPlan JSON to disk.
     /// When set, the planner writes the plan and returns a compact
     /// `RefactorPlanSummary` instead of the full plan body. Use this for
@@ -1230,6 +1317,12 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "java_vaadin_provider_binding_generation" => {
             plan_java_vaadin_provider_binding_generation(p)
         }
+        "java_vaadin_extract_component" => plan_java_vaadin_extract_component(p),
+        "java_vaadin_extract_grid_component" => plan_java_vaadin_extract_grid_component(p),
+        "java_vaadin_extract_dialog_class" => plan_java_vaadin_extract_dialog_class(p),
+        "java_vaadin_synthesize_view" => plan_java_vaadin_synthesize_view(p),
+        "java_vaadin_register_route_access" => plan_java_vaadin_register_route_access(p),
+        "java_vaadin_navigation_helper_extract" => plan_java_vaadin_navigation_helper_extract(p),
         "java_vaadin_route_inventory" => plan_java_vaadin_route_inventory(p),
         "java_vaadin_static_ui_context_audit" => plan_java_vaadin_static_ui_context_audit(p),
         "java_vaadin_view_structure_analysis" => plan_java_vaadin_view_structure_analysis(p),
@@ -1301,7 +1394,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_provider_binding_generation, java_vaadin_route_inventory, java_vaadin_static_ui_context_audit, java_vaadin_view_structure_analysis, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_provider_binding_generation, java_vaadin_extract_component, java_vaadin_extract_grid_component, java_vaadin_extract_dialog_class, java_vaadin_synthesize_view, java_vaadin_register_route_access, java_vaadin_navigation_helper_extract, java_vaadin_route_inventory, java_vaadin_static_ui_context_audit, java_vaadin_view_structure_analysis, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }

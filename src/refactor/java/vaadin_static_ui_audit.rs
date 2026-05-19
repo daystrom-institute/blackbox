@@ -26,7 +26,62 @@
 use super::*;
 
 pub(crate) fn plan_java_vaadin_static_ui_context_audit(p: &RefactorPlanParams) -> Result<String> {
-    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    if let Some(sources) = p.sources.as_deref().filter(|sources| !sources.is_empty()) {
+        let mut files = Vec::new();
+        let mut all_findings = Vec::new();
+        for source in sources {
+            let report = audit_one_source(p.project_dir.as_deref(), source)?;
+            for finding in &report.findings {
+                all_findings.push(serde_json::json!({
+                    "source": report.source,
+                    "finding": finding,
+                }));
+            }
+            files.push(serde_json::json!({
+                "source": report.source,
+                "findings": report.findings,
+            }));
+        }
+        let body = serde_json::json!({
+            "status": "planned",
+            "kind": "java_vaadin_static_ui_context_audit",
+            "title": "Java Vaadin static UI/session audit on multiple files",
+            "semantic_status": "syntax_only",
+            "dry_run": true,
+            "sources": files,
+            "findings": all_findings,
+        });
+        return Ok(serde_json::to_string_pretty(&body)?);
+    }
+
+    let report = audit_one_source(p.project_dir.as_deref(), &p.source)?;
+    let source_path = report.source.clone();
+    let findings = report.findings;
+
+    let body = serde_json::json!({
+        "status": "planned",
+        "kind": "java_vaadin_static_ui_context_audit",
+        "title": format!(
+            "Java Vaadin static UI/session audit on {}",
+            source_path
+        ),
+        "semantic_status": "syntax_only",
+        "dry_run": true,
+        "source": source_path,
+        "file": source_path,
+        "findings": findings,
+    });
+    Ok(serde_json::to_string_pretty(&body)?)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SourceAudit {
+    source: String,
+    findings: Vec<Finding>,
+}
+
+fn audit_one_source(project_dir: Option<&str>, source: &str) -> Result<SourceAudit> {
+    let source_path = resolve_path(project_dir, source)?;
     let parsed = parse_source_file(&source_path)?;
     if parsed.language != "java" {
         bail!("java_vaadin_static_ui_context_audit only supports java files");
@@ -41,20 +96,10 @@ pub(crate) fn plan_java_vaadin_static_ui_context_audit(p: &RefactorPlanParams) -
 
     findings.sort_by_key(|f| (f.line, f.column));
 
-    let body = serde_json::json!({
-        "status": "planned",
-        "kind": "java_vaadin_static_ui_context_audit",
-        "title": format!(
-            "Java Vaadin static UI/session audit on {}",
-            path_string(&source_path)
-        ),
-        "semantic_status": "syntax_only",
-        "dry_run": true,
-        "source": path_string(&source_path),
-        "file": path_string(&source_path),
-        "findings": findings,
-    });
-    Ok(serde_json::to_string_pretty(&body)?)
+    Ok(SourceAudit {
+        source: path_string(&source_path),
+        findings,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

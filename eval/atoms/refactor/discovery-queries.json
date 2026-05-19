@@ -245,6 +245,102 @@
       "forbidden_atoms": []
     },
     {
+      "id": "find-java-vaadin-extract-component",
+      "query": "extract one vaadin widget component section from a flow view into component class",
+      "expected_atoms": [
+        "java-vaadin-extract-component"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-extract-grid-component",
+      "query": "extract vaadin grid setup renderers data provider and selection listeners into component",
+      "expected_atoms": [
+        "java-vaadin-extract-grid-component"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-extract-dialog-class",
+      "query": "extract inline vaadin dialog creation binder save cancel handlers into dialog class",
+      "expected_atoms": [
+        "java-vaadin-extract-dialog-class"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-synthesize-view",
+      "query": "synthesize a new vaadin flow route view with page title layout and explicit access policy",
+      "expected_atoms": [
+        "java-vaadin-synthesize-view"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-register-route-access",
+      "query": "register vaadin route access navigation registry for a new view with role policy",
+      "expected_atoms": [
+        "java-vaadin-register-route-access"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-navigation-helper-extract",
+      "query": "extract repeated UI getCurrent navigate calls into typed vaadin navigation helper",
+      "expected_atoms": [
+        "java-vaadin-navigation-helper-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-decompose-view",
+      "query": "decompose a large vaadin flow view one widget grid dialog candidate at a time",
+      "expected_atoms": [
+        "java-vaadin-decompose-view"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-dashboard-widget-extract",
+      "query": "extract one dashboard widget card or widget host from a vaadin dashboard view",
+      "expected_atoms": [
+        "java-vaadin-dashboard-widget-extract"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-create-view-with-access",
+      "query": "create a vaadin view then register route access after operator authorization review",
+      "expected_atoms": [
+        "java-vaadin-create-view-with-access"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-dialog-extract-workflow",
+      "query": "workflow extract vaadin dialog class provider injection call site cleanup",
+      "expected_atoms": [
+        "java-vaadin-dialog-extract-workflow"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-grid-component-extract-workflow",
+      "query": "workflow extract vaadin grid component then cleanup imports and minimize API",
+      "expected_atoms": [
+        "java-vaadin-grid-component-extract-workflow"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-java-vaadin-ui-lifecycle-audit",
+      "query": "risk ranked audit vaadin ui lifecycle static UI session async detach listener cleanup",
+      "expected_atoms": [
+        "java-vaadin-ui-lifecycle-audit"
+      ],
+      "forbidden_atoms": []
+    },
+    {
       "id": "find-java-find-usages",
       "query": "find every project wide caller of a java method or field",
       "expected_atoms": [

@@ -371,6 +371,7 @@ mod tests {
             propagate_class_annotations: None,
             source_delegate_wrappers: None,
             wiring_mode: None,
+            ..Default::default()
         }
     }
 

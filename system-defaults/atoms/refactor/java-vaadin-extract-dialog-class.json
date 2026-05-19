@@ -1,0 +1,62 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "java-vaadin-extract-dialog-class",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Extract inline Vaadin dialog creation/opening logic into a dedicated Dialog subclass with optional provider wiring.",
+    "when_to_use": [
+      "a Vaadin view builds dialogs inline or keeps dialog fields only for open and close coordination",
+      "dialog-owned binder, save, cancel, or listener setup should live in a typed Dialog class"
+    ],
+    "anti_patterns": [
+      "do not move dialog save/cancel code that mutates caller state without explicit callbacks/public API",
+      "do not create singleton dialogs for UI/session scoped state"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "source", "target", "module_name"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "source": { "type": "string" },
+          "target": { "type": "string" },
+          "module_name": { "type": "string" },
+          "item_names": { "type": "array", "items": { "type": "string" } },
+          "old_text": { "type": "string" },
+          "move_fields": { "type": "array", "items": { "type": "string" } },
+          "provider_field": { "type": "string" },
+          "base_class": { "type": "string" },
+          "public_methods": { "type": "array", "items": { "type": "string" } },
+          "apply": { "type": "boolean" },
+          "validation_cmd": { "type": "array", "items": { "type": "string" } }
+        }
+      },
+      "prompt_template": "You are java-vaadin-extract-dialog-class. Charter: move one dialog-owned creation/opening surface into a dedicated Dialog class.\n\nProtocol:\n1. Ground: bbox_refactor_status(file=\"{{source}}\", project_dir=\"{{project_dir}}\").\n2. Plan: bbox_refactor_plan(kind=\"java_vaadin_extract_dialog_class\", deep_analysis=true, project_dir=\"{{project_dir}}\", source=\"{{source}}\", target=\"{{target}}\", module_name=\"{{module_name}}\", item_names={{item_names}}, old_text=\"{{old_text}}\", move_fields={{move_fields}}, provider_field=\"{{provider_field}}\", base_class=\"{{base_class}}\", public_methods={{public_methods}}).\n3. Block if caller state mutation lacks public_methods/callback acknowledgement, listener cleanup is lost, or dialog dependencies have unmodeled UI/session scope.\n4. Apply only when inputs.apply is true via bbox_refactor_run(dispatch_origin=\"agent\", confirm=true, steps=[<java_vaadin_extract_dialog_class plan step>, <validation command from validation_cmd>]).\n5. Emit bbox_note(kind=\"done\", body=<one-line dialog class, provider/direct wiring, moved members, applied/planned>).\n\nInputs: {{project_dir}} {{source}} {{target}} {{module_name}} {{item_names}} {{old_text}} {{move_fields}} {{provider_field}} {{base_class}} {{public_methods}} {{apply}} {{validation_cmd}}"
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status"],
+        "properties": {
+          "status": { "enum": ["planned", "applied", "blocked", "errored"] },
+          "plan_path": { "type": "string" },
+          "files_touched": { "type": "array", "items": { "type": "string" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" },
+          "dialog_class": { "type": "string" },
+          "provider_field": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": true, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:java-refactor-persona@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-refactor-agents", "created_at": "2026-05-19T00:00:00Z" }
+  }
+}

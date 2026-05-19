@@ -10,6 +10,11 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Vaadin Java refactor toolsuite. Adds read-only view structure, static
+  UI/session audit, and route inventory analysis; conservative component,
+  grid, dialog, navigation-helper, view-synthesis, and route-access plan
+  kinds; plus Vaadin wrapper/workflow atom manifests and refactor eval catalog
+  coverage.
 - Elixir refactor toolsuite (EX-G1..EX-G19, EX-V1..EX-V6). 19 plan kinds
   dispatchable through `bbox_refactor_plan(kind=...)` covering the BEAM-
   specific shapes that the existing Rust/Java surfaces don't translate:

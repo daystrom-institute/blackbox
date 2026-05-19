@@ -1,7 +1,7 @@
 ---
 title: "Vaadin Refactor Tools Proposal"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -11,14 +11,14 @@ tags:
   - refactor-tools
   - java
   - vaadin
-  - proposed-atoms
-status: "proposed; awaiting implementation"
-brief: "Proposed Vaadin-aware Java refactor plan kinds and atoms for decomposing large server-side Flow views, synthesizing new views/components, and hardening UI/session lifecycle usage."
+  - implemented-atoms
+status: "archived as implemented in the Vaadin Java refactor toolsuite"
+brief: "Implemented Vaadin-aware Java refactor plan kinds and atoms for decomposing large server-side Flow views, synthesizing new views/components, and hardening UI/session lifecycle usage."
 ---
 
 # Vaadin Refactor Tools Proposal
 
-This proposal adds a Vaadin-specific refactor layer on top of the existing Java
+This proposal added a Vaadin-specific refactor layer on top of the existing Java
 plan kinds. The target shape is a server-side Flow application where large
 views often accumulate constructor injection, grids/tabs/widgets,
 route/navigation logic, dialogs, event handlers, and background/UI access
@@ -36,6 +36,19 @@ needs more domain rules:
   an arbitrary method cluster.
 - Synthesizing a new view must update route, privilege, and navigation surfaces
   together.
+
+## Implementation Status
+
+Archived on 2026-05-19. The implemented surface includes the Vaadin
+read-only analysis/audit/inventory plan kinds, the component/grid/dialog
+extraction plan kinds, view synthesis, route/access registration, navigation
+helper extraction, thin wrapper atoms, workflow atoms, discovery/dispatch/
+behavior-smoke eval rows, and Java plan-kind atom guard coverage.
+
+This document remains as the design and acceptance record. Current behavior is
+owned by the Rust modules under `src/refactor/java/`, atom manifests under
+`system-defaults/atoms/refactor/java-vaadin-*.json`, and eval catalog entries
+under `eval/atoms/refactor/`.
 
 ## Current Useful Building Blocks
 
@@ -55,8 +68,7 @@ pretend that generic Java cohesion equals Vaadin component cohesion.
 
 ## Global Implementation Contract
 
-All proposed plan kinds are design-level names until implemented. Each shipped
-plan kind needs:
+Each shipped plan kind has:
 
 - a formal input shape in `RefactorPlanParams` or a typed Java-specific
   parameter object translated from `RefactorPlanParams`
@@ -76,7 +88,7 @@ and `@AnonymousAllowed`. When the target class cannot preserve those semantics,
 the plan must refuse or require an explicit operator-supplied scope/access
 policy.
 
-## Proposed Plan Kinds
+## Implemented Plan Kinds
 
 ### `java_vaadin_view_structure_analysis`
 
@@ -350,7 +362,7 @@ Acceptance:
   reroute/forward callbacks and the helper API does not model those effects.
 - Report all remaining direct `UI.getCurrent().navigate` calls in the source.
 
-## Proposed Atoms
+## Implemented Atoms
 
 Every new plan kind below should ship with a thin wrapper atom of the same
 surface name using kebab case, for example
