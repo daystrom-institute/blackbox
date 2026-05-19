@@ -113,7 +113,6 @@ use projects::{
     ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRenameParams,
     ProjectUnregisterParams,
 };
-use providers::ProviderContext;
 
 static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();
 
@@ -123,12 +122,7 @@ use artifacts::{
 use inbox::InboxParams;
 use index::ReindexParams;
 use knowledge::KnowledgeListParams;
-use mcp_tools::blame::BlameParams;
-use mcp_tools::bundle_evidence::BundleEvidenceParams;
-use mcp_tools::find_paths::FindPathsParams;
-use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
-use mcp_tools::ref_size::RefSizeParams;
 use notes::{NoteListParams, NoteParams};
 use packets::apply_with as apply_packet_with;
 use refactor::{

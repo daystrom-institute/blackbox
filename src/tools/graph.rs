@@ -1,7 +1,21 @@
-use crate::server::*;
-use crate::*;
+use crate::mcp_tools;
+use crate::mcp_tools::blame::BlameParams;
+use crate::mcp_tools::bundle_evidence::BundleEvidenceParams;
+use crate::mcp_tools::find_paths::FindPathsParams;
+use crate::mcp_tools::inspect::InspectEntityParams;
+use crate::mcp_tools::provenance::ProvenanceParams;
+use crate::mcp_tools::ref_size::RefSizeParams;
+use crate::providers::ProviderContext;
+use crate::server::BlackboxServer;
+use crate::{edge_index, entity_ref, git};
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::graph_tools()
@@ -31,7 +45,7 @@ impl BlackboxServer {
         Parameters(p): Parameters<InspectEntityParams>,
     ) -> CallToolResult {
         Self::run("bbox_inspect_entity", || {
-            let entity_ref = match crate::entity_ref::EntityRef::parse(&p.entity_ref) {
+            let entity_ref = match entity_ref::EntityRef::parse(&p.entity_ref) {
                 Ok(entity_ref) => entity_ref,
                 Err(err) => {
                     return Ok(mcp_tools::inspect::bad_input(
@@ -177,7 +191,7 @@ impl BlackboxServer {
             Ok(serde_json::to_string_pretty(&json!({
                 "status": "ok",
                 "edges_imported": edges_imported,
-                "notes_ref": crate::git::notes_ref("provenance"),
+                "notes_ref": git::notes_ref("provenance"),
             }))?)
         })
     }
