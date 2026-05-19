@@ -60,8 +60,10 @@ the decomposition cleanup that the topology move exposed:
 3. **Continue large-module decomposition where there is a cohesive boundary.**
    - `src/tools/atoms.rs`: keep public tool wrappers in the facade and move
      private implementation clusters into child modules. The first helper
-     cluster now lives in `src/tools/atoms/helpers.rs`; the large
-     `impl BlackboxServer` remains the main follow-up.
+     cluster now lives in `src/tools/atoms/helpers.rs`; invocation composition
+     policy and dispatch-budget accounting now live in
+     `src/tools/atoms/composition.rs`; the large `impl BlackboxServer` remains
+     the main follow-up.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
      landed `engine/fanout.rs` and `engine/provider_events.rs` splits.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
@@ -608,6 +610,9 @@ Landed:
 30. `src/workflow/engine/provider_events.rs` owns provider-event wait polling,
     transcript adapter reads, provider-event matching, payload construction, and
     retry delay logic previously embedded in `workflow/engine.rs`.
+31. `src/tools/atoms/composition.rs` owns atom child-invocation policy,
+    dispatch-budget estimation for workflow atoms, invocation ancestor walking,
+    and child dispatch-cost recording previously embedded in `tools/atoms.rs`.
 
 Next useful cuts:
 
@@ -622,8 +627,8 @@ Next useful cuts:
    - `workflow/engine.rs`: continue with runner subsystems after fanout and
      provider-event waits.
    - `tools/atoms.rs`: keep the public tool facade and move implementation
-     clusters into child modules; the helper tail has already moved to
-     `tools/atoms/helpers.rs`.
+     clusters into child modules; the helper tail and composition/budget
+     policy have already moved.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
