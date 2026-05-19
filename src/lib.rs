@@ -69,6 +69,7 @@ pub mod server;
 pub mod slack_channel_bindings;
 pub mod slack_proposal_links;
 mod slack_thread_store;
+mod slices;
 mod snapshot;
 mod storage_health;
 mod system_events;

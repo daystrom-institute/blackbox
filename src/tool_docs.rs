@@ -412,6 +412,60 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "bbox_slice_read",
+        category: ToolCategory::Refactor,
+        summary: "Read an exact text slice from a file by line range, markers, exact text, or byte range.",
+        when_to_use: "Use when you need a context-clipboard slice before moving, copying, deleting, or replacing text. Selectors are structured: `range={type:\"lines\",start_line:10,end_line:20}`, `type:\"markers\"`, `type:\"exact_text\"`, or `type:\"bytes\"`. The response includes slice/file hashes, before/after context lines, parse_status, and warnings so agents can verify they grabbed the intended block. Prefer this over grepping/sedding when the next step needs an exact range that can be passed to a slice mutation tool.",
+        example: Some(
+            r#"bbox_slice_read(file="src/foo.rs", project_dir="/repo/x", range={"type":"lines","start_line":10,"end_line":20})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_slice_move",
+        category: ToolCategory::Refactor,
+        summary: "Move an exact text slice from one file/location to another with a dry-run plan by default and confirmed writes via the refactor apply safety path.",
+        when_to_use: "Use as the simple context-clipboard move primitive: source file + structured source_range + destination file + insertion point. It returns a reviewable RefactorPlan with file hashes and parse validations; pass `confirm=true` to write through the same stale-hash, registered-project, dirty-worktree, validation, and rollback path as `bbox_refactor_apply`. Prefer this over manual sed/perl/apply_patch for moving tests, docs blocks, helper functions, or other exact text regions.",
+        example: Some(
+            r#"bbox_slice_move(project_dir="/repo/x", source="tests/a.rs", source_range={"type":"lines","start_line":40,"end_line":75}, target="tests/b.rs", insert={"type":"append"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_slice_copy",
+        category: ToolCategory::Refactor,
+        summary: "Copy an exact text slice into another file/location with a dry-run plan by default and confirmed writes via the refactor apply safety path.",
+        when_to_use: "Use when a selected text range should be duplicated without deleting the source. Select source by lines, markers, exact text, or byte range; choose insertion by line placement, marker, prepend, or append. Confirmed writes require `confirm=true` and honor the same apply safety flags as refactor plans.",
+        example: Some(
+            r#"bbox_slice_copy(project_dir="/repo/x", source="src/a.rs", source_range={"type":"markers","start_marker":"// start","end_marker":"// end"}, target="src/b.rs", insert={"type":"line","line":12,"placement":"before"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_slice_delete",
+        category: ToolCategory::Refactor,
+        summary: "Delete an exact text slice with a dry-run plan by default and confirmed writes via the refactor apply safety path.",
+        when_to_use: "Use for exact text removal when a structured range is safer than ad hoc shell editing. It stages a single delete edit in a RefactorPlan and validates supported source files before confirmed writes.",
+        example: Some(
+            r#"bbox_slice_delete(project_dir="/repo/x", source="src/foo.rs", source_range={"type":"exact_text","text":"obsolete();\n","occurrence":1})"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_slice_insert_text",
+        category: ToolCategory::Refactor,
+        summary: "Insert literal text at a file location with a dry-run plan by default and confirmed writes via the refactor apply safety path.",
+        when_to_use: "Use for controlled insertion at a line, marker, prepend, or append point. This is the write half of the context clipboard when the replacement text is already known rather than selected from another source file.",
+        example: Some(
+            r#"bbox_slice_insert_text(project_dir="/repo/x", target="src/foo.rs", insert={"type":"append"}, text="\nmod new_tests;\n")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_slice_replace",
+        category: ToolCategory::Refactor,
+        summary: "Replace an exact text slice with literal text or another selected slice, dry-run by default and confirmed through the refactor apply safety path.",
+        when_to_use: "Use when the destination range is exact and the replacement is either literal `new_text` or a selected `source` + `source_range`. Pass exactly one replacement source. Confirmed writes run through refactor apply hash checks, registered-project checks, dirty-worktree gates, parse validation, and rollback.",
+        example: Some(
+            r#"bbox_slice_replace(project_dir="/repo/x", target="src/foo.rs", target_range={"type":"lines","start_line":5,"end_line":8}, source="src/bar.rs", source_range={"type":"lines","start_line":20,"end_line":23})"#,
+        ),
+    },
+    ToolDoc {
         name: "bbox_refactor_plan",
         category: ToolCategory::Refactor,
         summary: "Create a dry-run structural refactor plan using a supported generic or language-scoped plan kind.",

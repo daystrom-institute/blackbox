@@ -44,6 +44,7 @@ impl BlackboxServer {
                 + crate::tools::knowledge::router()
                 + crate::tools::render::router()
                 + crate::tools::roadmap::router()
+                + crate::tools::slices::router()
                 + crate::tools::whiteboards::router()
                 + crate::tools::badgey::router()
                 + crate::tools::agents::router()

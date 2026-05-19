@@ -4185,7 +4185,7 @@ fn select_items<'a>(
     Ok(selected)
 }
 
-fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
+pub(crate) fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
     if plan.edits.is_empty() && plan.file_moves.is_empty() {
         bail!("plan has no edits or file moves");
     }
@@ -4211,7 +4211,7 @@ fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
     Ok(())
 }
 
-fn parse_validation_step_for_path(path: &Path) -> Vec<ValidationStep> {
+pub(crate) fn parse_validation_step_for_path(path: &Path) -> Vec<ValidationStep> {
     if language_for_path(path).is_some() {
         vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(path),
@@ -4717,12 +4717,12 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     hex::encode(hasher.finalize())
 }
 
-fn path_string(path: &Path) -> String {
+pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
 }

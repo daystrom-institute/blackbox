@@ -23,6 +23,7 @@ pub mod render;
 pub mod roadmap;
 pub mod roster;
 pub mod sessions;
+pub mod slices;
 pub mod storage_gc;
 pub mod storage_health;
 pub mod storage_migration;
