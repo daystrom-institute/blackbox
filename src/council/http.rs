@@ -23,6 +23,8 @@ use axum::response::sse::{Event, Sse};
 use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 
+use crate::server::state::SharedState;
+
 use super::{
     CouncilEvent, CouncilPost, CouncilStatus, CouncilSummary, InboxEnvelope, post_user_turn,
 };
@@ -80,7 +82,7 @@ pub struct PostResponse {
 // ── Handlers ──────────────────────────────────────────────────────────
 
 pub async fn create(
-    AxumState(state): AxumState<Arc<crate::SharedState>>,
+    AxumState(state): AxumState<Arc<SharedState>>,
     Json(req): Json<CreateCouncilRequest>,
 ) -> impl IntoResponse {
     let store_dir = state.store_dir.clone();
@@ -110,7 +112,7 @@ pub async fn create(
 }
 
 pub async fn list(
-    AxumState(state): AxumState<Arc<crate::SharedState>>,
+    AxumState(state): AxumState<Arc<SharedState>>,
     Query(q): Query<ListQuery>,
 ) -> impl IntoResponse {
     let summaries = state.councils.list_summaries(q.project.as_deref());
@@ -118,7 +120,7 @@ pub async fn list(
 }
 
 pub async fn open(
-    AxumState(state): AxumState<Arc<crate::SharedState>>,
+    AxumState(state): AxumState<Arc<SharedState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     let Some(council) = state.councils.get(&id) else {
@@ -148,7 +150,7 @@ pub async fn open(
 }
 
 pub async fn close(
-    AxumState(state): AxumState<Arc<crate::SharedState>>,
+    AxumState(state): AxumState<Arc<SharedState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.councils.close(&id) {
@@ -158,7 +160,7 @@ pub async fn close(
 }
 
 pub async fn post(
-    AxumState(state): AxumState<Arc<crate::SharedState>>,
+    AxumState(state): AxumState<Arc<SharedState>>,
     Path(id): Path<String>,
     Json(req): Json<PostRequest>,
 ) -> impl IntoResponse {
@@ -170,7 +172,7 @@ pub async fn post(
 }
 
 pub async fn tail(
-    AxumState(state): AxumState<Arc<crate::SharedState>>,
+    AxumState(state): AxumState<Arc<SharedState>>,
     Path(id): Path<String>,
 ) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
     use async_stream::stream;

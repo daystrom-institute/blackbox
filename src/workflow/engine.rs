@@ -26,8 +26,10 @@ use super::{
     ActorFailureMode, ActorKind, ActorSpec, AtomBinding, CompiledWorkflow, ForeachSpec, GateMode,
     ItemFailurePolicy, MatrixSpec, NodeSpec, NodeTransition, Workflow,
 };
-use crate::BlackboxServer;
 use crate::orchestration as orch;
+use crate::server::state::BlackboxServer;
+use crate::server::workflow_capabilities::validate_workflow_capabilities;
+use crate::tools::bro_params::{AtomInvokeParams, AtomResumeParams, AtomStatusParams};
 /// Sentinel value returned by `next_node` when the arc has reached a
 /// `Terminal` transition. The main run loop exits on this value.
 const TERMINAL_SENTINEL: &str = "__terminal__";
@@ -1036,7 +1038,7 @@ impl<'a> WorkflowRunner<'a> {
                 .unwrap_or_else(|| serde_json::to_string_pretty(&args).unwrap_or_default());
             match self
                 .server
-                .atom_resume_value(crate::AtomResumeParams {
+                .atom_resume_value(AtomResumeParams {
                     invocation_id: invocation_id.clone(),
                     prompt: resume_prompt,
                     owner: Some(owner.clone()),
@@ -1056,7 +1058,7 @@ impl<'a> WorkflowRunner<'a> {
                     );
                     self.server
                         .atom_invoke_value(
-                            crate::AtomInvokeParams {
+                            AtomInvokeParams {
                                 atom: binding.atom_ref.clone(),
                                 args: args.clone(),
                                 project_dir: self.effective_project_dir(),
@@ -1076,7 +1078,7 @@ impl<'a> WorkflowRunner<'a> {
         } else {
             self.server
                 .atom_invoke_value(
-                    crate::AtomInvokeParams {
+                    AtomInvokeParams {
                         atom: binding.atom_ref.clone(),
                         args,
                         project_dir: self.effective_project_dir(),
@@ -1136,7 +1138,7 @@ impl<'a> WorkflowRunner<'a> {
 
         let status_value = self
             .server
-            .atom_status_value(crate::AtomStatusParams {
+            .atom_status_value(AtomStatusParams {
                 invocation_id: invocation_id.clone(),
                 owner: Some(owner),
             })
@@ -1614,7 +1616,7 @@ impl<'a> WorkflowRunner<'a> {
         // subworkflow silently dispatches against a now-incapable
         // provider. Ref-resolution is dispatch-time, so this check
         // must happen here, not at parent compile.
-        crate::validate_workflow_capabilities(&compiled, &self.server.state)
+        validate_workflow_capabilities(&compiled, &self.server.state)
             .map_err(|e| anyhow!("subworkflow on node '{node_id}' capability validation: {e}"))?;
         let project_dir = self.project_dir.clone();
         // Seed the sub-runner with the parent's node_outputs so sub

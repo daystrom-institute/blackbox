@@ -1,5 +1,5 @@
 //! Poller primitive — scheduled HTTP-source event inlet, parallel to
-//! webhook ingress. Both converge on `crate::dispatch_routed_event`,
+//! webhook ingress. Both converge on `server::dispatch_routed_event`,
 //! so a poller is operationally just "a webhook whose source is a
 //! tokio interval pulling from a URL instead of an inbound POST."
 //!
@@ -35,6 +35,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 
 use crate::orchestration::http_fetch::HttpFetchSpec;
+use crate::server::dispatch::dispatch_routed_event;
+use crate::server::state::SharedState;
 use crate::workflow::extractor::{Extractor, Selector};
 
 const DEDUP_RING_CAP: usize = 1024;
@@ -170,7 +172,7 @@ pub fn load_all(dir: &std::path::Path) -> Vec<PollerSpec> {
 /// extract → dedup → dispatch via the shared routing pipeline.
 /// Errors per-item are logged but do NOT abort the loop — a transient
 /// upstream failure shouldn't kill a long-lived poller.
-pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &PollerSpec) -> Result<usize> {
+pub async fn run_one_tick(state: &Arc<SharedState>, spec: &PollerSpec) -> Result<usize> {
     // Resolve `${env.X}` references in the source URL + headers
     // per-tick so secrets stay in the daemon's env (not persisted
     // on disk in the spec) and operators can rotate tokens without
@@ -227,7 +229,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &PollerSpec) ->
             );
             continue;
         }
-        match crate::dispatch_routed_event(
+        match dispatch_routed_event(
             state.clone(),
             &inlet_label,
             &spec.routing_packet,
@@ -246,7 +248,7 @@ pub async fn run_one_tick(state: &Arc<crate::SharedState>, spec: &PollerSpec) ->
 /// Spawn the long-running tick loop for a single poller. Caller is
 /// responsible for storing the handle (registry.track_handle) so the
 /// task can be aborted on uninstall or replaced on reinstall.
-pub fn spawn_loop(state: Arc<crate::SharedState>, spec: PollerSpec) -> JoinHandle<()> {
+pub fn spawn_loop(state: Arc<SharedState>, spec: PollerSpec) -> JoinHandle<()> {
     let min_secs = if let Ok(cfg) = blackbox::config::load() {
         cfg.daemon.poller_min_interval_secs
     } else {

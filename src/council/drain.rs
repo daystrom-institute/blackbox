@@ -27,7 +27,6 @@ use chrono::Utc;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::SharedState;
 use crate::orchestration::{
     self as orch, AmbientContext,
     brofile::{enforce_provider_defaults, resolve_brofile, resolve_provider_env},
@@ -38,6 +37,8 @@ use crate::orchestration::{
     providers::{ExecOpts, Provider},
     team::{Team, TeamMember, load_all_teams},
 };
+use crate::server::progress::cleanup_policy_file_when_done;
+use crate::server::state::SharedState;
 
 use super::{
     CouncilEvent, CouncilState, CouncilStatus, SharedRegistry,
@@ -276,7 +277,7 @@ async fn process_envelope(
         Some(shared.system_events.clone()),
     );
     task.inner.lock().bro_label = Some(format!("{}::{}", council_id, bro_id));
-    crate::cleanup_policy_file_when_done(task.clone(), dispatch._policy_file);
+    cleanup_policy_file_when_done(task.clone(), dispatch._policy_file);
 
     let completed = orch::wait_for_task_with_timeout(&task, Some(TURN_TIMEOUT_SECS)).await;
 

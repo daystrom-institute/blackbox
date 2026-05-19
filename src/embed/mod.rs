@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::SharedState;
 use crate::chunker::Chunk;
 use crate::entity_ref::EntityRef;
 use crate::index::EmbeddingSourceDoc;
+use crate::server::state::SharedState;
 
 pub const VOYAGE_PROVIDER_ID: &str = "voyage";
 pub const OLLAMA_PROVIDER_ID: &str = "ollama";

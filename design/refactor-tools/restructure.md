@@ -51,7 +51,10 @@ the decomposition cleanup that the topology move exposed:
      have been removed from `src/lib.rs`. `dispatch_mcp_url` is imported
      directly by `server/startup.rs` instead of being re-exported from the lib
      root. The remaining shared packet test island no longer imports the packet
-     parent prelude wholesale.
+     parent prelude wholesale. The root `SharedState` / `BlackboxServer` /
+     `ArcSnapshot` / bro-param compatibility reexports have been removed;
+     callers now import those symbols from `server::state` or
+     `tools::bro_params`.
 
 2. **Split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root

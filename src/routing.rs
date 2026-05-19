@@ -13,9 +13,9 @@
 //!
 //! Inlets are responsible for steps 1–2 (they each have their own
 //! signature/scheduling concerns). The shared primitives below cover
-//! 3–4. Step 5 is `crate::dispatch_routed_event` in `main.rs` so it
-//! can reach `BlackboxServer` + `workflow_registry` without dragging
-//! the whole orchestration surface into this module.
+//! 3–4. Step 5 lives in `server::dispatch` so it can reach
+//! `BlackboxServer` + `workflow_registry` without dragging the whole
+//! orchestration surface into this module.
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
