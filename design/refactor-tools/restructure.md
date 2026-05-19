@@ -64,8 +64,9 @@ the decomposition cleanup that the topology move exposed:
      policy and dispatch-budget accounting now live in
      `src/tools/atoms/composition.rs`; atom supervision plan startup,
      attachment polling, and action execution now live in
-     `src/tools/atoms/supervision.rs`; the large `impl BlackboxServer` remains
-     the main follow-up.
+     `src/tools/atoms/supervision.rs`; atom manifest resolution, input schema
+     validation, and profile/workflow/runner invocation backends now live in
+     `src/tools/atoms/invoke.rs`.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
      landed `engine/fanout.rs` and `engine/provider_events.rs` splits.
    - `src/workflow/ops.rs`: split hook/action families when changing nearby
@@ -619,6 +620,9 @@ Landed:
     normalization, classifier/advisor attachment startup, attached supervision
     polling snapshots, supervision action execution, and replacement-attempt
     linking previously embedded in `tools/atoms.rs`.
+33. `src/tools/atoms/invoke.rs` owns active atom manifest resolution, input
+    schema validation, `atom_invoke_value`, and the profile/workflow/runner atom
+    invocation backends previously embedded in `tools/atoms.rs`.
 
 Next useful cuts:
 
@@ -632,9 +636,6 @@ Next useful cuts:
 2. **Keep splitting large domain modules by cohesive internals.**
    - `workflow/engine.rs`: continue with runner subsystems after fanout and
      provider-event waits.
-   - `tools/atoms.rs`: keep the public tool facade and move remaining
-     implementation clusters into child modules; helpers, composition/budget
-     policy, and supervision internals have already moved.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
