@@ -1,5 +1,6 @@
 use super::mcp::build_http_app;
 use super::restore::restore_runtime_state;
+use super::shutdown::serve_until_shutdown;
 use super::startup::{
     configure_dispatch_mcp_env, discover_transcript_roots, init_logging, resolve_codex_root,
 };
@@ -510,117 +511,13 @@ pub async fn run() -> anyhow::Result<()> {
         "blackboxd listening on http://{bind_host}:{port}/mcp (loopback={bind_is_loopback})"
     );
 
-    let shutdown_grace = std::time::Duration::from_secs(cfg.daemon.shutdown_grace_secs);
-    let signal_ct = ct.clone();
-    #[cfg(unix)]
-    {
-        let shared_for_hup = shared.clone();
-        tokio::spawn(async move {
-            let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-                .expect("install SIGHUP handler");
-            loop {
-                let _ = sighup.recv().await;
-                match config::load() {
-                    Ok(new_cfg) => {
-                        let old_cfg = shared_for_hup.config.read();
-                        if old_cfg.daemon.port != new_cfg.daemon.port
-                            || old_cfg.daemon.bind != new_cfg.daemon.bind
-                        {
-                            tracing::warn!(
-                                "SIGHUP reload changed bind/port; requires daemon restart"
-                            );
-                        }
-                        drop(old_cfg);
-                        *shared_for_hup.config.write() = new_cfg;
-                    }
-                    Err(e) => {
-                        tracing::warn!("SIGHUP reload failed: {e}");
-                    }
-                }
-            }
-        });
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::spawn(async {});
-    }
-
-    tokio::spawn(async move {
-        // Wait for either Ctrl-C (interactive) or SIGTERM (systemd
-        // stop). Without the SIGTERM branch, `systemctl stop` would
-        // not signal graceful shutdown and would rely on the
-        // TimeoutStopSec SIGKILL.
-        #[cfg(unix)]
-        {
-            let mut sigterm =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-                    .expect("install SIGTERM handler");
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {}
-                _ = sigterm.recv() => {}
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::signal::ctrl_c().await.ok();
-        }
-        signal_ct.cancel();
-    });
-
-    let graceful_ct = ct.clone();
-    let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-        graceful_ct.cancelled().await;
-    });
-    tokio::select! {
-        result = server => result?,
-        _ = async {
-            ct.cancelled().await;
-            tokio::time::sleep(shutdown_grace).await;
-        } => {
-            tracing::warn!(
-                grace_secs = shutdown_grace.as_secs(),
-                "HTTP graceful shutdown timed out; forcing daemon shutdown path"
-            );
-        }
-    }
-
-    // Persist tasks on shutdown
-    embed_queue::shutdown();
-    // Tear down long-lived LSP sessions before persistence so JDTLS
-    // and friends get a chance to write their workspace caches and
-    // exit cleanly. shutdown_all is best-effort and bounded.
-    shared.lsp_sessions.shutdown_all();
-    shared.task_store.read().persist(&store_dir);
-    // Best-effort vector-partition force-flush with a short timeout.
-    // The earlier unconditional `vectors::global().flush_all()` could
-    // block here for tens of seconds if any embed worker was holding a
-    // partition write lock for a mid-flight voyage batch — long enough
-    // to push systemd past TimeoutStopSec=90 and trigger SIGKILL,
-    // which is worse than just leaving the WAL to replay on next start.
-    // Spawn it on a thread + join with a short cap; if it doesn't
-    // finish in time, drop on the floor and exit cleanly. The next
-    // daemon start restores from any matching vector snapshot and replays
-    // the WAL tail, or falls back to a full WAL rebuild if no usable
-    // snapshot exists.
-    let flush_handle = std::thread::spawn(|| vectors::global().flush_all());
-    let flush_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while std::time::Instant::now() < flush_deadline {
-        if flush_handle.is_finished() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    if flush_handle.is_finished() {
-        if let Err(err) = flush_handle.join().expect("flush thread panic") {
-            tracing::warn!(error = %err, "vector partition force-flush on shutdown failed");
-        }
-    } else {
-        tracing::warn!(
-            "vector partition force-flush on shutdown timed out after 5s; \
-             next start will rebuild derived files from WAL"
-        );
-        // Detach; the OS reaps it when the process exits.
-    }
-    tracing::info!("blackboxd shut down");
-    Ok(())
+    serve_until_shutdown(
+        listener,
+        app,
+        shared,
+        store_dir,
+        ct,
+        cfg.daemon.shutdown_grace_secs,
+    )
+    .await
 }

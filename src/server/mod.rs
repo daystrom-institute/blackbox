@@ -7,6 +7,7 @@ mod restore;
 pub mod routes;
 mod run;
 pub mod schema;
+mod shutdown;
 mod startup;
 pub mod state;
 pub mod storage_gc;

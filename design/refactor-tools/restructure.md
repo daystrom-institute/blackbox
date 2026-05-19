@@ -46,6 +46,8 @@ the decomposition cleanup that the topology move exposed:
      workflow, catalog-runtime-artifact, reaction, and outbox startup recovery.
    - `server/mcp.rs` now owns Axum route assembly and Streamable HTTP MCP
      service construction.
+   - `server/shutdown.rs` now owns signal handling, graceful HTTP shutdown, and
+     post-shutdown persistence/flush.
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
@@ -109,10 +111,11 @@ lines. It is no longer the 17K-line god file described above or even the
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
 | `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
-| `src/server/run.rs` | 626 | Daemon bootstrap glue: state open, background tasks, bind/listen, graceful shutdown |
+| `src/server/run.rs` | 523 | Daemon bootstrap glue: state open, background tasks, bind/listen |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
 | `src/server/restore.rs` | 161 | Registry/runtime restoration and crash recovery helpers called by `server/run.rs` |
 | `src/server/mcp.rs` | 131 | Axum route assembly plus Streamable HTTP MCP service construction |
+| `src/server/shutdown.rs` | 129 | Signal handling, graceful HTTP shutdown, post-shutdown persistence and vector flush |
 
 The highest-value remaining topology work is no longer in `main.rs`. It is:
 
@@ -536,6 +539,8 @@ Landed:
     embedded in `server/run.rs`.
 14. `src/server/mcp.rs` owns HTTP route assembly and Streamable HTTP MCP service
     construction previously embedded in `server/run.rs`.
+15. `src/server/shutdown.rs` owns shutdown signal handling, graceful HTTP serve
+    termination, task persistence, LSP shutdown, and vector flush.
 
 Next useful cuts:
 
@@ -547,8 +552,7 @@ Next useful cuts:
    - Keep each batch `cargo check --bin blackboxd` verified.
 
 2. **Split daemon bootstrap by startup concern.**
-   - Candidate boundaries: config/state opening, background task spawning, and
-     shutdown wiring.
+   - Candidate boundaries: config/state opening and background task spawning.
    - Keep `server/run.rs` as orchestration glue rather than moving everything
      into another catch-all file.
 
