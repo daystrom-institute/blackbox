@@ -12,10 +12,17 @@ use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, TermQuery};
 use tantivy::schema::IndexRecordOption;
 
+use crate::index::TranscriptIndex;
+use crate::knowledge::KnowledgeListParams;
+use crate::notes::{NoteListParams, NoteParams};
+use crate::server::state::{BlackboxServer, SharedState};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
 use rmcp::schemars;
-
-use crate::server::*;
-use crate::*;
+use rmcp::{tool, tool_router};
+use serde::Deserialize;
+use serde_json::{Value, json};
 
 // ── Public router ─────────────────────────────────────────────────────
 

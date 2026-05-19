@@ -39,8 +39,9 @@ the decomposition cleanup that the topology move exposed:
      `src/tools/packets.rs`, `src/tools/config.rs`,
      `src/tools/orchestrate.rs`, `src/tools/projects.rs`,
      `src/tools/roadmap.rs`, `src/tools/roster.rs`,
-     `src/tools/system_events.rs`, `src/tools/whiteboards.rs`, and
-     `src/tools/badgey_adapter.rs` now use explicit imports, and
+     `src/tools/system_events.rs`, `src/tools/whiteboards.rs`,
+     `src/tools/workspace.rs`, and `src/tools/badgey_adapter.rs` now use
+     explicit imports, and
      `dispatch_mcp_url` is imported directly by `server/startup.rs` instead of
      being re-exported from the lib root.
 

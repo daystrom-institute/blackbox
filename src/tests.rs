@@ -1,6 +1,7 @@
 use super::*;
+use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
-use crate::notes::Notes;
+use crate::notes::{NoteParams, Notes};
 use crate::orchestration::TaskStore;
 use crate::orchestration::tail::TailEvent;
 use crate::packets::{CompileParams, Packets};

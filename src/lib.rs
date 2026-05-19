@@ -105,7 +105,6 @@ use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use index::TranscriptIndex;
 use orchestration::providers::{ExecOpts, Provider};
 use orchestration::{self as orch};
 use pins::PinParams;
@@ -117,8 +116,6 @@ use artifacts::{
     ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
 use inbox::InboxParams;
-use knowledge::KnowledgeListParams;
-use notes::{NoteListParams, NoteParams};
 use packets::apply_with as apply_packet_with;
 pub(crate) use server::*;
 pub(crate) use tools::bro_helpers::*;
