@@ -120,21 +120,15 @@ static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = O
 use artifacts::{
     ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
 };
-use embed::ReembedParams;
 use inbox::InboxParams;
-use index::{
-    CiteParams, ContextParams, MessagesParams, ReindexParams, SearchParams, SessionParams,
-    SessionsListParams, TopicsParams,
-};
+use index::ReindexParams;
 use knowledge::{
     DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
     RememberParams, ResponseFormat,
 };
 use mcp_tools::blame::BlameParams;
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
-use mcp_tools::discover_seed::DiscoverSeedParams;
 use mcp_tools::find_paths::FindPathsParams;
-use mcp_tools::hybrid_search::HybridSearchParams;
 use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
 use mcp_tools::ref_size::RefSizeParams;
@@ -145,7 +139,6 @@ use refactor::{
     RefactorStatusParams,
 };
 pub(crate) use server::*;
-use threads::{ThreadListParams, ThreadParams};
 pub(crate) use tools::bro_helpers::*;
 pub(crate) use tools::bro_params::*;
 pub(crate) use tools::bro_runtime_params::*;

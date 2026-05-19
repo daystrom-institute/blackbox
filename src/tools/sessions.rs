@@ -1,5 +1,14 @@
-use crate::server::*;
-use crate::*;
+use crate::server::BlackboxServer;
+use crate::{embed, embed_queue};
+use crate::embed::ReembedParams;
+use crate::index::{
+    MessagesParams, ReindexParams, SessionParams, SessionsListParams, TopicsParams,
+};
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::sessions_tools()
