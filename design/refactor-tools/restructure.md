@@ -26,10 +26,11 @@ unfinished work to roadmap entries.
 
 ## Remaining Work Before Archive
 
-The original crate-topology goal is implemented. The doc remains live only for
-the decomposition cleanup that the topology move exposed:
+The original crate-topology goal is implemented. The completed entries below
+are retained as implementation context; the doc remains live only for the open
+large-module and test-locality cleanup that the topology move exposed:
 
-1. **Pay down the `src/lib.rs` compatibility prelude.**
+1. **Completed: pay down the `src/lib.rs` compatibility prelude.**
    - Replace broad `use crate::*` dependencies with explicit imports when
      editing touched modules.
    - Remove root-level imports/re-exports from `src/lib.rs` once no module
@@ -56,7 +57,7 @@ the decomposition cleanup that the topology move exposed:
      callers now import those symbols from `server::state` or
      `tools::bro_params`.
 
-2. **Split `src/server/run.rs` by startup concern.**
+2. **Completed: split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root
      resolution, and dispatch MCP env setup.
    - `server/restore.rs` now owns webhook, poller, cron, whiteboard, council,
@@ -155,18 +156,17 @@ The crate originally had two god files and no library target:
 
 That is no longer the current tree: the `[lib]` target exists and `packets`,
 `server`, and `tools` have been split. The remaining issue is not "no lib" or
-"binary owns daemon modules"; it is reducing the broad compatibility imports
-needed by the lib-owned modules and continuing to split large domain modules
-into smaller implementation files.
+"binary owns daemon modules"; the remaining issue is continuing to split large
+domain modules into smaller implementation files and improving test locality.
 
 Routing-related concerns are now mostly split: `src/routing.rs`,
 `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, `src/workflow/wait.rs`,
 `src/server/routes.rs`, and `src/server/tail.rs` exist as separate files.
 `src/mcp_tools/` contains the agentic graph helper set. The remaining
 concentration has shifted away from `main.rs` and into a few large but more
-domain-specific modules, especially `src/server/run.rs`,
-`src/workflow/engine.rs`, `src/workflow/ops.rs`, `src/tools/atoms.rs`, and
-`src/orchestration/providers.rs`.
+domain-specific modules, especially `src/workflow/ops.rs`,
+`src/tools/atoms.rs`, `src/orchestration/providers.rs`, and route/test islands
+that still benefit from locality cleanup.
 
 ## Current Topology Breakdown
 
@@ -177,7 +177,7 @@ lines. It is no longer the 17K-line god file described above or even the
 | File | Lines | Content |
 |------|-------|---------|
 | `src/main.rs` | 4 | `#[tokio::main]` entry point calling `blackbox::server::run()` |
-| `src/lib.rs` | 170 | Lib-owned module declarations plus temporary root-level compatibility imports/re-exports for modules that still use `crate::*` |
+| `src/lib.rs` | 97 | Lib-owned module declarations plus the agent-query embed cache helper |
 | `src/server/mod.rs` | 64 | Server module wiring, `BlackboxServer::new`, router sum, response cap constant |
 | `src/server/run.rs` | 45 | Daemon bootstrap glue: logging, open state, start background tasks, bind/listen |
 | `src/server/startup.rs` | 139 | Logging, transcript-root discovery, Codex root resolution, dispatch MCP env setup |
@@ -189,10 +189,10 @@ lines. It is no longer the 17K-line god file described above or even the
 
 The highest-value remaining topology work is no longer in `main.rs`. It is:
 
-1. Reduce the temporary lib-root prelude by replacing broad `use crate::*`
-   dependencies with explicit imports in touched modules.
-2. Continue splitting `server/run.rs` by startup concern.
-3. Continue domain-local decomposition in the remaining large modules.
+1. Continue domain-local decomposition in the remaining large modules where a
+   cohesive boundary exists.
+2. Improve test locality so large shared unit-test islands move closer to the
+   modules they cover.
 
 ## Current Packets Breakdown
 
@@ -228,9 +228,8 @@ Already landed additions: `src/lib.rs`, `src/server/`, `src/tools/`,
 Cargo.toml                      # [lib] exists; all [[bin]] targets depend on it
 
 src/
-  lib.rs                        # Owns daemon module declarations. Still carries
-                                # temporary compatibility imports/re-exports
-                                # while older modules use `crate::*`.
+  lib.rs                        # Owns daemon module declarations and the
+                                # agent-query embed cache helper.
 
   main.rs                       # Tiny blackboxd entry point calling
                                 # blackbox::server::run().
@@ -264,8 +263,8 @@ src/
                                 # validate_workflow_capabilities, related
                                 # helpers. Referenced by sibling files
                                 # (crons.rs, pollers.rs, workflow/engine.rs,
-                                # council/*) via crate::* — re-exported
-                                # from lib.rs for ergonomics.
+                                # council/*) through explicit
+                                # crate::server::dispatch imports.
     routes.rs                   # Axum HTTP route handlers (Bro roster
                                 # endpoint, IRC/admin/orchestrate/webhook
                                 # helpers).
@@ -678,23 +677,30 @@ Landed:
 38. Packet event/gap logging tests moved out of the shared
     `src/packets/tests.rs` island and into the `src/packets/events.rs` test
     module (`src/packets/events_tests.rs`).
+39. `src/workflow/engine/actor_nodes.rs` owns executor and atom node execution
+    previously embedded in `workflow/engine.rs`.
+40. `src/workflow/engine/async_join.rs` owns fire-and-forget fork dispatch,
+    late-inject joins, and explicit in-flight joins previously embedded in
+    `workflow/engine.rs`.
+41. `src/workflow/engine/ensemble_nodes.rs` owns ensemble member dispatch and
+    join handling previously embedded in `workflow/engine.rs`.
+42. `src/workflow/engine/subworkflow_nodes.rs` owns embedded subworkflow
+    execution previously embedded in `workflow/engine.rs`.
+43. The lib-root compatibility prelude has been paid down: broad module-level
+    `use crate::*` dependencies and root compatibility re-exports for
+    `SharedState`, `BlackboxServer`, `ArcSnapshot`, and bro parameter types are
+    gone.
 
 Next useful cuts:
 
-1. **Pay down the lib-root compatibility prelude.**
-   - Prefer `rust_minimize_imports` or explicit hand fixes in touched modules
-     over broad mechanical churn across the whole crate.
-   - Replace `use crate::*` with local explicit imports when editing a module
-     anyway, then remove the corresponding root import/re-export from `lib.rs`.
-   - Keep each batch `cargo check --bin blackboxd` verified.
+1. **Keep splitting large domain modules by cohesive internals.**
+   - `workflow/ops.rs`, `tools/atoms.rs`, and `orchestration/providers.rs`
+     should only be split further where the next boundary is as clear as the
+     child modules already landed.
 
-2. **Keep splitting large domain modules by cohesive internals.**
-   - `workflow/engine.rs`: continue with runner subsystems after fanout,
-     provider-event waits, hooks, arc bookkeeping, and wait nodes.
-
-3. **Improve test locality.**
+2. **Improve test locality.**
    - Continue moving remaining `packets/tests.rs` cases into per-module test
-     blocks as those modules change; event/gap logging tests have moved.
+     blocks; event/gap logging and scanner tests have moved.
    - Move daemon-startup-shaped tests to top-level integration tests using
      `blackbox::` imports.
 
