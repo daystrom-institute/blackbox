@@ -1,5 +1,22 @@
-use crate::server::*;
-use crate::*;
+use std::collections::BTreeMap;
+
+use parking_lot::RwLock;
+
+use crate::AGENT_QUERY_EMBED_CACHE;
+use crate::artifacts;
+use crate::embed;
+use crate::orchestration;
+use crate::orchestration::providers::ExecOpts;
+use crate::server::state::BlackboxServer;
+use crate::server::tail::resolve_agent_vector_search;
+use crate::tools::bro_params::{
+    AgentDescribeParams, AgentDispatchParams, AgentGetParams, AgentListParams, AgentSearchParams,
+    AgentVectorPlan,
+};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::agents_tools()

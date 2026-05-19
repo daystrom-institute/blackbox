@@ -24,7 +24,6 @@ pub(crate) use progress::*;
 pub(crate) use routes::*;
 pub use run::run;
 pub(crate) use state::*;
-pub(crate) use tail::*;
 pub(crate) use workflow_capabilities::*;
 
 impl BlackboxServer {
