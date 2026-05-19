@@ -62,7 +62,9 @@ the decomposition cleanup that the topology move exposed:
      private implementation clusters into child modules. The first helper
      cluster now lives in `src/tools/atoms/helpers.rs`; invocation composition
      policy and dispatch-budget accounting now live in
-     `src/tools/atoms/composition.rs`; the large `impl BlackboxServer` remains
+     `src/tools/atoms/composition.rs`; atom supervision plan startup,
+     attachment polling, and action execution now live in
+     `src/tools/atoms/supervision.rs`; the large `impl BlackboxServer` remains
      the main follow-up.
    - `src/workflow/engine.rs`: continue extracting runner subsystems after the
      landed `engine/fanout.rs` and `engine/provider_events.rs` splits.
@@ -613,6 +615,10 @@ Landed:
 31. `src/tools/atoms/composition.rs` owns atom child-invocation policy,
     dispatch-budget estimation for workflow atoms, invocation ancestor walking,
     and child dispatch-cost recording previously embedded in `tools/atoms.rs`.
+32. `src/tools/atoms/supervision.rs` owns atom supervision plan defaults and
+    normalization, classifier/advisor attachment startup, attached supervision
+    polling snapshots, supervision action execution, and replacement-attempt
+    linking previously embedded in `tools/atoms.rs`.
 
 Next useful cuts:
 
@@ -626,9 +632,9 @@ Next useful cuts:
 2. **Keep splitting large domain modules by cohesive internals.**
    - `workflow/engine.rs`: continue with runner subsystems after fanout and
      provider-event waits.
-   - `tools/atoms.rs`: keep the public tool facade and move implementation
-     clusters into child modules; the helper tail and composition/budget
-     policy have already moved.
+   - `tools/atoms.rs`: keep the public tool facade and move remaining
+     implementation clusters into child modules; helpers, composition/budget
+     policy, and supervision internals have already moved.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
