@@ -135,8 +135,8 @@ use index::{
     SessionsListParams, TopicsParams,
 };
 use knowledge::{
-    AbsorbParams, BootstrapParams, DecideParams, ForgetParams, KnowledgeLinkParams,
-    KnowledgeListParams, LearnParams, RememberParams, RenderParams, ResponseFormat, ReviewParams,
+    DecideParams, ForgetParams, KnowledgeLinkParams, KnowledgeListParams, LearnParams,
+    RememberParams, ResponseFormat,
 };
 use mcp_tools::blame::BlameParams;
 use mcp_tools::bundle_evidence::BundleEvidenceParams;
