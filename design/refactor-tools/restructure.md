@@ -75,7 +75,8 @@ the decomposition cleanup that the topology move exposed:
      `src/workflow/ops/arch_pathology.rs`. MCP/HTTP/shell side-effect helpers
      now live in `src/workflow/ops/external.rs`.
    - `src/orchestration/providers.rs`: split catalog, credentials, and provider
-     resolution when touching that area.
+     resolution when touching that area. The model/effort catalog now lives in
+     `src/orchestration/providers/catalog.rs`.
 
 4. **Improve test locality opportunistically.**
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
@@ -581,6 +582,8 @@ Landed:
     embedded in `workflow/ops.rs`.
 24. `src/workflow/ops/external.rs` owns MCP, HTTP JSON, and shell side-effect
     hook-op helpers previously embedded in `workflow/ops.rs`.
+25. `src/orchestration/providers/catalog.rs` owns provider model and effort
+    catalog tables previously embedded in `orchestration/providers.rs`.
 
 Next useful cuts:
 
