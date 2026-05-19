@@ -1,6 +1,6 @@
 use crate::server::BlackboxServer;
-use crate::{gap_spool, inbox};
 use crate::{InboxParams, PinParams};
+use crate::{gap_spool, inbox};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;

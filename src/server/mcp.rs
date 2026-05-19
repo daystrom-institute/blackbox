@@ -1,7 +1,7 @@
-use crate::{config, council};
 use crate::server::routes::*;
 use crate::server::tail::tail_handler;
 use crate::server::{BlackboxServer, SharedState};
+use crate::{config, council};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };

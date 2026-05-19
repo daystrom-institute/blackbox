@@ -148,12 +148,10 @@ impl BlackboxServer {
             .map(|r| {
                 let classification = r.classification.as_str();
                 let matching_surface = match &r.antecedent {
-                    packets::Predicate::Eq { field, value } if field == "surface" => {
-                        match value {
-                            packets::Value::String(s) => s.clone(),
-                            other => format!("{:?}", other),
-                        }
-                    }
+                    packets::Predicate::Eq { field, value } if field == "surface" => match value {
+                        packets::Value::String(s) => s.clone(),
+                        other => format!("{:?}", other),
+                    },
                     _ => "*".to_string(),
                 };
                 serde_json::json!({

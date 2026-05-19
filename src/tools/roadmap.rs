@@ -267,9 +267,9 @@ impl BlackboxServer {
             .iter()
             .map(|tid| {
                 let raw = tid.strip_prefix("thread:").unwrap_or(tid);
-                th.all().iter().any(|t| {
-                    t.id == raw && matches!(t.status, ThreadStatus::Resolved)
-                })
+                th.all()
+                    .iter()
+                    .any(|t| t.id == raw && matches!(t.status, ThreadStatus::Resolved))
             })
             .collect();
         drop(th);
@@ -324,10 +324,9 @@ impl BlackboxServer {
                     .iter()
                     .map(|tid| {
                         let raw = tid.strip_prefix("thread:").unwrap_or(tid);
-                        th.all().iter().any(|t| {
-                            t.id == raw
-                                && matches!(t.status, ThreadStatus::Resolved)
-                        })
+                        th.all()
+                            .iter()
+                            .any(|t| t.id == raw && matches!(t.status, ThreadStatus::Resolved))
                     })
                     .collect();
                 let (status_label, _) = rm.computed_status(item, &resolved);
@@ -816,9 +815,10 @@ impl BlackboxServer {
                 let mut resolved = Vec::new();
                 for tid in &thread_ids {
                     let raw = tid.strip_prefix("thread:").unwrap_or(tid);
-                    let is_resolved = th.all().iter().any(|t| {
-                        t.id == raw && matches!(t.status, ThreadStatus::Resolved)
-                    });
+                    let is_resolved = th
+                        .all()
+                        .iter()
+                        .any(|t| t.id == raw && matches!(t.status, ThreadStatus::Resolved));
                     resolved.push((tid.clone(), is_resolved));
                 }
                 (item.id.clone(), resolved)

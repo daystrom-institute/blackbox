@@ -1,5 +1,5 @@
-use super::*;
 use super::test_support::tmp_packets;
+use super::*;
 use serde_json::json;
 
 /// Build the E8 authorization matrix packet (the merged Gemini-style
