@@ -91,3 +91,7 @@ impl PacketEvent {
         self
     }
 }
+
+#[cfg(test)]
+#[path = "events_tests.rs"]
+mod tests;
