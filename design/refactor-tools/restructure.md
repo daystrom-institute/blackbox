@@ -72,7 +72,8 @@ the decomposition cleanup that the topology move exposed:
      now live in `src/workflow/ops/json_ops.rs`. Auto-digest and semantic-edge
      hook helpers now live in `src/workflow/ops/auto_digest.rs`, and
      architecture-pathology request/plan helpers now live in
-     `src/workflow/ops/arch_pathology.rs`.
+     `src/workflow/ops/arch_pathology.rs`. MCP/HTTP/shell side-effect helpers
+     now live in `src/workflow/ops/external.rs`.
    - `src/orchestration/providers.rs`: split catalog, credentials, and provider
      resolution when touching that area.
 
@@ -81,6 +82,8 @@ the decomposition cleanup that the topology move exposed:
      as packet modules change.
    - Move daemon-startup-shaped tests to integration tests using `blackbox::`
      imports.
+   - First locality cut landed outside packets: secret-header helper tests moved
+     with the external workflow hook helpers in `src/workflow/ops/external.rs`.
 
 Archive criteria: this doc can become `lifecycle: archived` once these
 follow-ups are either complete or represented as accepted roadmap/thread items
@@ -576,6 +579,8 @@ Landed:
 23. `src/workflow/ops/arch_pathology.rs` owns architecture-pathology
     atom-request normalization and correction-plan writing helpers previously
     embedded in `workflow/ops.rs`.
+24. `src/workflow/ops/external.rs` owns MCP, HTTP JSON, and shell side-effect
+    hook-op helpers previously embedded in `workflow/ops.rs`.
 
 Next useful cuts:
 
