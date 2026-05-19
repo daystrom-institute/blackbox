@@ -1,5 +1,13 @@
-use crate::server::*;
-use crate::*;
+use crate::artifacts::{
+    ArtifactInstallParams, ArtifactListParams, ArtifactRemoveParams, ArtifactSupersedeParams,
+};
+use crate::server::BlackboxServer;
+use crate::server::routes::{deactivate_artifact, install_artifact_from_params};
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::artifacts_tools()
