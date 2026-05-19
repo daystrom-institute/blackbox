@@ -1,7 +1,7 @@
 ---
 title: Restructure Proposal - Crate Topology
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - restructure
@@ -12,22 +12,27 @@ brief: Live topology cleanup record for the crate restructure that drove the ref
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; refreshed 2026-05-17
+Status: topology implemented and archived; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; archived on 2026-05-19
 Related: `design/refactor-tools/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
 target, `src/packets/`, `src/server/`, `src/tools/`, and first-pass child
 splits under `src/tools/badgey/` and `src/workflow/engine/`. `src/main.rs` is
 now only the binary entry point, module declarations are owned by `src/lib.rs`,
-and daemon bootstrap has moved to `src/server/run.rs`. Keep this document
-`lifecycle: partial` until the remaining live work below is either implemented
-or moved to roadmap/thread entries; then archive it as the completed topology
-design.
+and daemon bootstrap has moved out of `src/main.rs` and through focused
+`src/server/` modules. This document is now archived as the completed topology
+design; remaining broad cleanup lives in accepted roadmap item
+`roadmap-d5b47b51`.
 
-## Remaining Work Before Archive
+## Archive State
 
-The original crate-topology goal is implemented. The doc remains live only for
-the decomposition cleanup that the topology move exposed:
+The original crate-topology goal is implemented. The decomposition cleanup that
+the topology move exposed is no longer tracked by this historical proposal.
+Concrete follow-up slices landed here through 2026-05-19, and the remaining
+broader cleanup is represented by accepted roadmap item `roadmap-d5b47b51`
+("Complete post-topology decomposition cleanup").
+
+Archived follow-up state:
 
 1. **Pay down the `src/lib.rs` compatibility prelude.**
    - Replace broad `use crate::*` dependencies with explicit imports when
@@ -86,9 +91,10 @@ the decomposition cleanup that the topology move exposed:
    - First locality cut landed outside packets: secret-header helper tests moved
      with the external workflow hook helpers in `src/workflow/ops/external.rs`.
 
-Archive criteria: this doc can become `lifecycle: archived` once these
-follow-ups are either complete or represented as accepted roadmap/thread items
-with enough detail that agents do not need this historical proposal to proceed.
+Archive criteria satisfied on 2026-05-19: the topology work is complete, several
+high-value decomposition follow-ups have landed, and the remaining broad work is
+covered by accepted roadmap item `roadmap-d5b47b51` with enough detail that
+agents do not need this historical proposal to proceed.
 The companion AST execution plan was a checkpoint artifact for the old
 mechanized sequence and now lives at
 `design/refactor-tools/restructure-ast.md`.
@@ -585,28 +591,6 @@ Landed:
 25. `src/orchestration/providers/catalog.rs` owns provider model and effort
     catalog tables previously embedded in `orchestration/providers.rs`.
 
-Next useful cuts:
-
-1. **Pay down the lib-root compatibility prelude.**
-   - Prefer `rust_minimize_imports` or explicit hand fixes in touched modules
-     over broad mechanical churn across the whole crate.
-   - Replace `use crate::*` with local explicit imports when editing a module
-     anyway, then remove the corresponding root import/re-export from `lib.rs`.
-   - Keep each batch `cargo check --bin blackboxd` verified.
-
-2. **Keep splitting large domain modules by cohesive internals.**
-   - `workflow/engine.rs`: continue with runner subsystems after fanout.
-   - `workflow/ops.rs`: split hook/action families if they continue to grow.
-   - `tools/atoms.rs`: keep the public tool facade and move implementation
-     clusters into child modules; the helper tail has already moved to
-     `tools/atoms/helpers.rs`.
-   - `orchestration/providers.rs`: split catalog, credentials, and provider
-   resolution when touching nearby code.
-
-3. **Improve test locality.**
-   - Move `packets/tests.rs` cases into per-module test blocks as those modules
-     change.
-   - Move daemon-startup-shaped tests to top-level integration tests using
-     `blackbox::` imports.
-
-Each cut should remain a small `cargo check` / targeted-test verified commit.
+Next useful cuts moved to accepted roadmap item `roadmap-d5b47b51`. Each future
+cut should remain a small `cargo check --bin blackboxd` plus targeted-test
+verified commit.
