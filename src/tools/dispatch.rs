@@ -1,5 +1,6 @@
 use crate::server::*;
 use crate::*;
+use crate::orchestration::tail::TailEvent;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::dispatch_tools()

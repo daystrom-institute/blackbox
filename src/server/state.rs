@@ -1,4 +1,28 @@
-use crate::*;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
+
+use parking_lot::RwLock;
+use rmcp::handler::server::router::tool::ToolRouter;
+use serde::Serialize;
+use serde_json::Value;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
+
+use crate::index::TranscriptIndex;
+use crate::knowledge::Knowledge;
+use crate::notes::Notes;
+use crate::orchestration::tail::TailEvent;
+use crate::orchestration::{self, TaskStore};
+use crate::packets::Packets;
+use crate::pins::Pins;
+use crate::projects::ProjectRegistry;
+use crate::roadmap::Roadmap;
+use crate::threads::Threads;
+use crate::{
+    artifacts, council, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
+    slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
+};
 
 // ---------------------------------------------------------------------------
 // Shared state
@@ -354,8 +378,6 @@ pub(crate) struct ArcSnapshot {
 // ---------------------------------------------------------------------------
 // MCP Server Handler
 // ---------------------------------------------------------------------------
-
-use std::sync::OnceLock;
 
 #[derive(Clone)]
 pub(crate) struct BlackboxServer {

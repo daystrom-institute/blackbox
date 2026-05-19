@@ -90,7 +90,7 @@ mod whiteboards;
 mod workflow;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::RwLock;
@@ -104,24 +104,16 @@ use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use index::TranscriptIndex;
-use knowledge::Knowledge;
-use notes::Notes;
 use orchestration::providers::{ExecOpts, Provider};
-use orchestration::tail::TailEvent;
-use orchestration::{self as orch, TaskStore};
-use packets::Packets;
-use pins::{PinParams, Pins};
+use orchestration::{self as orch};
+use pins::PinParams;
 use projects::{
-    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRegistry,
-    ProjectRenameParams, ProjectUnregisterParams,
+    ProjectListResponse, ProjectRecord, ProjectRegisterParams, ProjectRenameParams,
+    ProjectUnregisterParams,
 };
 use providers::ProviderContext;
-use roadmap::Roadmap;
-use threads::Threads;
 
 static AGENT_QUERY_EMBED_CACHE: OnceLock<RwLock<BTreeMap<String, Vec<f32>>>> = OnceLock::new();
 
