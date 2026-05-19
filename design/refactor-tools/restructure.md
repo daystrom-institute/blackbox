@@ -124,14 +124,15 @@ large-module and test-locality cleanup that the topology move exposed:
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
      as packet modules change. Packet event/gap logging tests now live under
      `src/packets/events.rs` via `src/packets/events_tests.rs`, and
-   self-heal scanner tests now live under `src/packets/scanner.rs`. JSON
+     self-heal scanner tests now live under `src/packets/scanner.rs`. JSON
      coercion helper tests now live under `src/packets/coerce.rs`. Dotted-path,
      `In`, and regex predicate evaluator tests now live under
      `src/packets/apply.rs`; string-contains and in-range evaluator tests live
      there as well.
      Simple `CountMatches` predicate evaluator tests now live under
      `src/packets/apply.rs`. All-mode audit verifier tests now live under
-     `src/packets/audit.rs`.
+     `src/packets/audit.rs`. Predicate serde and value equality tests now live
+     under `src/packets/ast.rs`.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
@@ -711,6 +712,8 @@ Landed:
     packet test island to `src/packets/apply.rs`.
 49. All-mode audit verifier tests moved from the shared packet test island to
     `src/packets/audit.rs`.
+50. Predicate serde and value equality tests moved from the shared packet test
+    island to `src/packets/ast.rs`.
 
 Next useful cuts:
 
@@ -724,7 +727,8 @@ Next useful cuts:
      blocks; event/gap logging, scanner, JSON coercion, and dotted-path
      predicate evaluator tests have moved, along with string-contains and
      in-range evaluator tests, simple `CountMatches` evaluator tests, and
-     all-mode audit verifier tests.
+     all-mode audit verifier tests. Predicate serde and value equality tests
+     have also moved.
    - Move daemon-startup-shaped tests to top-level integration tests using
      `blackbox::` imports.
 

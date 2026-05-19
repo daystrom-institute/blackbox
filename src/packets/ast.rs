@@ -767,3 +767,61 @@ impl RuleInput {
 pub(super) fn default_confidence() -> f32 {
     1.0
 }
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{Predicate, Value};
+
+    #[test]
+    fn predicate_serde_matches_e11_format() {
+        // The E11 experiment output rules in this exact JSON shape.
+        // If this round-trips, our AST is compatible with what LLMs
+        // actually produce.
+        let json_rule = json!({
+            "op": "All",
+            "args": [
+                {"op": "Eq", "field": "role", "value": "admin"},
+                {"op": "Eq", "field": "method", "value": "DELETE"},
+                {"op": "Eq", "field": "resource", "value": "billing"}
+            ]
+        });
+        let p: Predicate = serde_json::from_value(json_rule.clone()).unwrap();
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back, json_rule);
+    }
+
+    #[test]
+    fn quantified_predicate_serde_round_trips() {
+        // Canonical JSON shape for ForAll.
+        let forall_json = json!({
+            "op": "ForAll",
+            "path": "tools[*]",
+            "pred": {"op": "IsNonNull", "field": "description"}
+        });
+        let p: Predicate = serde_json::from_value(forall_json.clone()).unwrap();
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back, forall_json);
+
+        let count_json = json!({
+            "op": "CountCmp",
+            "path": "tools[*]",
+            "compare": "ge",
+            "value": 1
+        });
+        let p: Predicate = serde_json::from_value(count_json.clone()).unwrap();
+        let back = serde_json::to_value(&p).unwrap();
+        assert_eq!(back, count_json);
+    }
+
+    #[test]
+    fn value_eq_across_int_and_float() {
+        // JSON serde can widen ints to floats on round-trip. Rules
+        // authored as `Eq{value: 5}` must still match `entity.x = 5.0`.
+        assert_eq!(Value::Int(5), Value::Float(5.0));
+        assert_eq!(Value::Float(5.0), Value::Int(5));
+        assert_ne!(Value::Int(5), Value::Int(6));
+        assert_ne!(Value::Float(5.0), Value::Float(6.0));
+    }
+}
