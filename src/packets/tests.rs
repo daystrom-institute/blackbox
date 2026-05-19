@@ -1,5 +1,13 @@
 use super::test_support::tmp_packets;
-use super::*;
+use std::collections::BTreeMap;
+
+use super::{
+    ApplyMode, ApplyParams, AuditParams, CmpOp, CompileParams, Emit, MAX_COMPOSITION_DEPTH,
+    NoopResolver, Packet, Packets, Predicate, Rule, RuleInput, Value, apply, apply_all, apply_with,
+    default_rank_lookup_key, default_threshold_lookup_key, eval_predicate, infer_classification,
+    packet_matches_query, packet_summary, review_lattice, review_prefix_inference, unwrap_jsonish,
+    verify_all,
+};
 use serde_json::json;
 
 /// Build the E8 authorization matrix packet (the merged Gemini-style
