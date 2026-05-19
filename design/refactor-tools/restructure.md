@@ -81,7 +81,9 @@ the decomposition cleanup that the topology move exposed:
      provider event parsing now lives in
      `src/orchestration/providers/events.rs`; provider MCP registration and
      dispatch-filter argument builders now live in
-     `src/orchestration/providers/mcp_args.rs`.
+     `src/orchestration/providers/mcp_args.rs`; provider binary resolution,
+     `ExecOpts`, provider-default suppression, and exec/resume argument builders
+     now live in `src/orchestration/providers/exec_args.rs`.
 
 4. **Improve test locality opportunistically.**
    - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
@@ -599,6 +601,10 @@ Landed:
     removal/listing, dispatch-filter argument construction, transient blackbox
     MCP injection helpers, and MCP-list matching previously embedded in
     `orchestration/providers.rs`.
+29. `src/orchestration/providers/exec_args.rs` owns provider binary selection
+    and resolution, `ExecOpts`, provider-default suppression config, and
+    exec/resume argument construction previously embedded in
+    `orchestration/providers.rs`.
 
 Next useful cuts:
 
@@ -614,8 +620,6 @@ Next useful cuts:
    - `tools/atoms.rs`: keep the public tool facade and move implementation
      clusters into child modules; the helper tail has already moved to
      `tools/atoms/helpers.rs`.
-   - `orchestration/providers.rs`: continue after the catalog/session/events/MCP
-     splits with credentials/bin resolution when touching nearby code.
 
 3. **Improve test locality.**
    - Move `packets/tests.rs` cases into per-module test blocks as those modules
