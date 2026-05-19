@@ -147,11 +147,7 @@ use mcp_tools::inspect::InspectEntityParams;
 use mcp_tools::provenance::ProvenanceParams;
 use mcp_tools::ref_size::RefSizeParams;
 use notes::{NoteListParams, NoteParams};
-#[allow(unused_imports)]
-use packets::{
-    ApplyParams as PacketApplyParams, AuditParams, CompileParams, EventsParams, GapParams,
-    PacketListParams, apply_with as apply_packet_with, packet_matches_query, packet_summary,
-};
+use packets::apply_with as apply_packet_with;
 use refactor::{
     RefactorApplyParams, RefactorPlanParams, RefactorProjectRefsParams, RefactorRunParams,
     RefactorStatusParams,
