@@ -1,5 +1,14 @@
-use crate::server::*;
-use crate::*;
+use crate::index::{CiteParams, ContextParams, SearchParams};
+use crate::mcp_tools::discover_seed::DiscoverSeedParams;
+use crate::mcp_tools::hybrid_search::HybridSearchParams;
+use crate::providers::ProviderContext;
+use crate::server::BlackboxServer;
+use crate::mcp_tools;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::transcripts_tools()
