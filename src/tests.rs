@@ -2,6 +2,7 @@ use super::*;
 use crate::tools::badgey_adapter::{
     BadgeyAgentAdapter, recover_badgey_non_terminal_state, restore_badgey_registry_from_notes,
 };
+use rmcp::ServerHandler;
 
 fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let index = TranscriptIndex::open_or_create(

@@ -97,17 +97,11 @@ use parking_lot::RwLock;
 
 use axum::extract::{Query, State as AxumState};
 use axum::response::IntoResponse;
-use axum::response::sse::{Event, Sse};
-use futures::{StreamExt, stream::Stream};
+use futures::StreamExt;
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{
-    CallToolRequestParams, CallToolResult, ErrorCode, InitializeRequestParams, InitializeResult,
-    IntoContents, ListToolsResult, ServerCapabilities, ServerInfo,
-};
-use rmcp::service::RequestContext;
-use rmcp::{ErrorData, RoleServer, ServerHandler, tool, tool_handler, tool_router};
+use rmcp::model::CallToolResult;
+use rmcp::{tool, tool_router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use tokio::sync::broadcast;

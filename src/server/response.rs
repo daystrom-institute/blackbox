@@ -1,4 +1,7 @@
-use crate::*;
+use crate::server::BlackboxServer;
+
+use rmcp::model::{CallToolResult, IntoContents};
+use serde_json::Value;
 
 impl BlackboxServer {
     pub(crate) fn ok_text(text: &str) -> CallToolResult {
