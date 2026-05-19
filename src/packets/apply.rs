@@ -894,4 +894,30 @@ mod tests {
         };
         assert!(!eval_predicate(&p_ge_1, &e, &NoopResolver, 0));
     }
+
+    #[test]
+    fn apply_mode_deserializes_invalid_string_as_error() {
+        // Phase-2.5: mode is now a typed enum, so invalid mode strings
+        // fail at JSON deserialization rather than reaching apply_tool.
+        let bad = json!({"packet_id": "packet-deadbeef", "entity": {}, "mode": "nonsense"});
+        let res: std::result::Result<super::ApplyParams, _> = serde_json::from_value(bad);
+        assert!(
+            res.is_err(),
+            "invalid mode string should fail deserialization"
+        );
+    }
+
+    #[test]
+    fn apply_mode_enum_serde_lowercase() {
+        assert_eq!(
+            serde_json::to_value(super::ApplyMode::First).unwrap(),
+            json!("first")
+        );
+        assert_eq!(
+            serde_json::to_value(super::ApplyMode::All).unwrap(),
+            json!("all")
+        );
+        let m: super::ApplyMode = serde_json::from_value(json!("all")).unwrap();
+        assert_eq!(m, super::ApplyMode::All);
+    }
 }

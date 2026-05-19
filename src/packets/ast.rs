@@ -772,7 +772,8 @@ pub(super) fn default_confidence() -> f32 {
 mod tests {
     use serde_json::json;
 
-    use super::{Predicate, Value};
+    use super::super::{review_lattice, review_prefix_inference};
+    use super::{Emit, Predicate, RuleInput, Value};
 
     #[test]
     fn predicate_serde_matches_e11_format() {
@@ -823,5 +824,35 @@ mod tests {
         assert_eq!(Value::Float(5.0), Value::Int(5));
         assert_ne!(Value::Int(5), Value::Int(6));
         assert_ne!(Value::Float(5.0), Value::Float(6.0));
+    }
+
+    #[test]
+    fn emit_default_is_independent() {
+        // Rule authored without `emit:` field gets Independent.
+        let rule_json = json!({
+            "id": "fail_x",
+            "antecedent": {"op": "True"},
+            "consequent": "X",
+        });
+        let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
+        let r = ri
+            .materialize(&review_lattice(), &review_prefix_inference())
+            .unwrap();
+        assert_eq!(r.emit, Emit::Independent);
+    }
+
+    #[test]
+    fn emit_fallback_deserializes() {
+        let rule_json = json!({
+            "id": "pass_clean",
+            "antecedent": {"op": "True"},
+            "consequent": "PASS",
+            "emit": "fallback",
+        });
+        let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
+        let r = ri
+            .materialize(&review_lattice(), &review_prefix_inference())
+            .unwrap();
+        assert_eq!(r.emit, Emit::Fallback);
     }
 }

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use super::{
     ApplyMode, ApplyParams, AuditParams, CmpOp, CompileParams, Emit, MAX_COMPOSITION_DEPTH,
-    NoopResolver, Packet, Packets, Predicate, Rule, RuleInput, Value, apply, apply_all, apply_with,
+    NoopResolver, Packet, Packets, Predicate, Rule, Value, apply, apply_all, apply_with,
     default_rank_lookup_key, default_threshold_lookup_key, eval_predicate, infer_classification,
     packet_matches_query, packet_summary, review_lattice, review_prefix_inference,
 };
@@ -1406,18 +1406,6 @@ fn apply_tool_all_mode_returns_aggregate() {
     assert!(out.contains("pass_c"));
 }
 
-#[test]
-fn apply_mode_deserializes_invalid_string_as_error() {
-    // Phase-2.5: mode is now a typed enum, so invalid mode strings
-    // fail at JSON deserialization rather than reaching apply_tool.
-    let bad = json!({"packet_id": "packet-deadbeef", "entity": {}, "mode": "nonsense"});
-    let res: std::result::Result<ApplyParams, _> = serde_json::from_value(bad);
-    assert!(
-        res.is_err(),
-        "invalid mode string should fail deserialization"
-    );
-}
-
 // ── Phase 2.5 tests (convergent adversarial-review fixes) ──
 
 #[test]
@@ -1573,47 +1561,6 @@ fn fallback_ignored_in_first_mode() {
     // still walk the rule list top-to-bottom.
     let pred = apply(&p, &json!({"a": 99})).unwrap();
     assert_eq!(pred.rule_id, "pass_catchall");
-}
-
-#[test]
-fn apply_mode_enum_serde_lowercase() {
-    assert_eq!(
-        serde_json::to_value(ApplyMode::First).unwrap(),
-        json!("first")
-    );
-    assert_eq!(serde_json::to_value(ApplyMode::All).unwrap(), json!("all"));
-    let m: ApplyMode = serde_json::from_value(json!("all")).unwrap();
-    assert_eq!(m, ApplyMode::All);
-}
-
-#[test]
-fn emit_default_is_independent() {
-    // Rule authored without `emit:` field gets Independent.
-    let rule_json = json!({
-        "id": "fail_x",
-        "antecedent": {"op": "True"},
-        "consequent": "X",
-    });
-    let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-    let r = ri
-        .materialize(&review_lattice(), &review_prefix_inference())
-        .unwrap();
-    assert_eq!(r.emit, Emit::Independent);
-}
-
-#[test]
-fn emit_fallback_deserializes() {
-    let rule_json = json!({
-        "id": "pass_clean",
-        "antecedent": {"op": "True"},
-        "consequent": "PASS",
-        "emit": "fallback",
-    });
-    let ri: RuleInput = serde_json::from_value(rule_json).unwrap();
-    let r = ri
-        .materialize(&review_lattice(), &review_prefix_inference())
-        .unwrap();
-    assert_eq!(r.emit, Emit::Fallback);
 }
 
 // ── E12-refinement: permissive JSON on tool params ─────────────

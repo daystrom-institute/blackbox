@@ -134,7 +134,9 @@ large-module and test-locality cleanup that the topology move exposed:
      `src/packets/audit.rs`. Predicate serde and value equality tests now live
      under `src/packets/ast.rs`. Shared packet test builders and composition
      helpers now live in `src/packets/test_support.rs`. Packet store
-     domain-resolution tests now live under `src/packets/mod.rs`.
+     domain-resolution tests now live under `src/packets/mod.rs`. `ApplyMode`
+     serde tests now live under `src/packets/apply.rs`, and `Emit` serde tests
+     now live under `src/packets/ast.rs`.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
    - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
@@ -720,6 +722,8 @@ Landed:
     test island to `src/packets/test_support.rs`.
 52. Packet store domain-resolution tests moved from the packet test island to
     `src/packets/mod.rs`.
+53. `ApplyMode` and `Emit` serde tests moved from the packet test island to
+    `src/packets/apply.rs` and `src/packets/ast.rs`.
 
 Next useful cuts:
 
