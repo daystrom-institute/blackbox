@@ -1,8 +1,20 @@
-use crate::server::*;
-use crate::*;
-use rmcp::schemars;
+use std::collections::HashMap;
+use std::path::Path;
 
-use blackbox::config;
+use crate::config;
+use crate::embed_queue;
+use crate::entity_ref::EntityRef;
+use crate::index::{roadmap_chunk_hash, roadmap_entity_id};
+use crate::roadmap::{self, RoadmapEdge};
+use crate::server::state::{BlackboxServer, SharedState};
+use crate::template;
+use crate::threads::{self, ThreadStatus};
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::CallToolResult;
+use rmcp::schemars;
+use rmcp::{tool, tool_router};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct RoadmapParams {
@@ -226,8 +238,8 @@ impl BlackboxServer {
         )?;
 
         // Sync to index + embed
-        let entity_id = crate::index::roadmap_entity_id(&item.id);
-        let chunk_hash = crate::index::roadmap_chunk_hash(item);
+        let entity_id = roadmap_entity_id(&item.id);
+        let chunk_hash = roadmap_chunk_hash(item);
         if let Err(err) = self.state.idx.write().index_roadmap_item(item) {
             tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
         }
@@ -256,7 +268,7 @@ impl BlackboxServer {
             .map(|tid| {
                 let raw = tid.strip_prefix("thread:").unwrap_or(tid);
                 th.all().iter().any(|t| {
-                    t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved)
+                    t.id == raw && matches!(t.status, ThreadStatus::Resolved)
                 })
             })
             .collect();
@@ -314,7 +326,7 @@ impl BlackboxServer {
                         let raw = tid.strip_prefix("thread:").unwrap_or(tid);
                         th.all().iter().any(|t| {
                             t.id == raw
-                                && matches!(t.status, crate::threads::ThreadStatus::Resolved)
+                                && matches!(t.status, ThreadStatus::Resolved)
                         })
                     })
                     .collect();
@@ -418,8 +430,8 @@ impl BlackboxServer {
         )?;
 
         // Sync to index
-        let entity_id = crate::index::roadmap_entity_id(&item.id);
-        let chunk_hash = crate::index::roadmap_chunk_hash(&item);
+        let entity_id = roadmap_entity_id(&item.id);
+        let chunk_hash = roadmap_chunk_hash(&item);
         if let Err(err) = self.state.idx.write().index_roadmap_item(&item) {
             tracing::warn!(error = %err, item = %item.id, "roadmap index sync failed");
         }
@@ -438,7 +450,7 @@ impl BlackboxServer {
 
     fn roadmap_delete(&self, p: RoadmapDeleteParams) -> anyhow::Result<String> {
         let mut rm = self.state.roadmap.write();
-        let entity_id = crate::index::roadmap_entity_id(&p.id);
+        let entity_id = roadmap_entity_id(&p.id);
         rm.delete(&p.id)?;
 
         // Tombstone in index
@@ -565,20 +577,19 @@ impl BlackboxServer {
             roadmap::RoadmapEdgeKind::parse(&p.link_type).map_err(|e| anyhow::anyhow!("{e}"))?;
 
         // Domain validation using EntityRef::parse
-        let target_ref = crate::entity_ref::EntityRef::parse(&p.link_target)
+        let target_ref = EntityRef::parse(&p.link_target)
             .map_err(|e| anyhow::anyhow!("invalid link_target '{}': {e}", p.link_target))?;
 
         match edge_kind {
             roadmap::RoadmapEdgeKind::Spawns => {
-                if !matches!(target_ref, crate::entity_ref::EntityRef::Thread { .. }) {
+                if !matches!(target_ref, EntityRef::Thread { .. }) {
                     anyhow::bail!("spawns link target must be a thread entity ref (thread:<id>)");
                 }
             }
             roadmap::RoadmapEdgeKind::DeferredFrom => {
                 if !matches!(
                     target_ref,
-                    crate::entity_ref::EntityRef::Thread { .. }
-                        | crate::entity_ref::EntityRef::Knowledge { .. }
+                    EntityRef::Thread { .. } | EntityRef::Knowledge { .. }
                 ) {
                     anyhow::bail!(
                         "deferred_from link target must be a thread or knowledge entity ref"
@@ -588,8 +599,7 @@ impl BlackboxServer {
             roadmap::RoadmapEdgeKind::DesignedIn => {
                 if !matches!(
                     target_ref,
-                    crate::entity_ref::EntityRef::ProjectFile { .. }
-                        | crate::entity_ref::EntityRef::ProjectFileV2 { .. }
+                    EntityRef::ProjectFile { .. } | EntityRef::ProjectFileV2 { .. }
                 ) {
                     anyhow::bail!("designed_in link target must be a project_file entity ref");
                 }
@@ -599,7 +609,7 @@ impl BlackboxServer {
             | roadmap::RoadmapEdgeKind::Supersedes
             | roadmap::RoadmapEdgeKind::Subsumes
             | roadmap::RoadmapEdgeKind::RelatedTo => {
-                if !matches!(target_ref, crate::entity_ref::EntityRef::RoadmapItem { .. }) {
+                if !matches!(target_ref, EntityRef::RoadmapItem { .. }) {
                     anyhow::bail!(
                         "{} link target must be a roadmap_item entity ref (roadmap_item:<id>)",
                         p.link_type
@@ -659,7 +669,7 @@ impl BlackboxServer {
 
     fn roadmap_repair_links(&self, p: RoadmapRepairLinksParams) -> anyhow::Result<String> {
         let rm = self.state.roadmap.read();
-        let edges: Vec<crate::roadmap::RoadmapEdge> = rm
+        let edges: Vec<RoadmapEdge> = rm
             .designed_in_edges(p.id.as_deref())
             .into_iter()
             .cloned()
@@ -751,7 +761,7 @@ impl BlackboxServer {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .or_else(|| {
                 project.and_then(|project_root| {
-                    config::load_project(std::path::Path::new(project_root))
+                    config::load_project(Path::new(project_root))
                         .ok()
                         .and_then(|c| {
                             c.roadmap
@@ -773,7 +783,7 @@ impl BlackboxServer {
             .and_then(|v| v.as_str().map(|s| s.to_string()))
             .or_else(|| {
                 project.and_then(|project_root| {
-                    config::load_project(std::path::Path::new(project_root))
+                    config::load_project(Path::new(project_root))
                         .ok()
                         .and_then(|c| {
                             c.roadmap
@@ -795,7 +805,7 @@ impl BlackboxServer {
         let th = self.state.threads.read();
 
         // Pre-compute spawn status for all items
-        let spawn_data: std::collections::HashMap<String, Vec<(String, bool)>> = rm
+        let spawn_data: HashMap<String, Vec<(String, bool)>> = rm
             .all_items()
             .iter()
             .map(|item| {
@@ -807,7 +817,7 @@ impl BlackboxServer {
                 for tid in &thread_ids {
                     let raw = tid.strip_prefix("thread:").unwrap_or(tid);
                     let is_resolved = th.all().iter().any(|t| {
-                        t.id == raw && matches!(t.status, crate::threads::ThreadStatus::Resolved)
+                        t.id == raw && matches!(t.status, ThreadStatus::Resolved)
                     });
                     resolved.push((tid.clone(), is_resolved));
                 }
@@ -826,10 +836,10 @@ impl BlackboxServer {
 
         let md = if let Some(src) = inline_template {
             let ctx = rm.to_template_context(project, &spawn);
-            crate::template::render(src, &ctx)?
+            template::render(src, &ctx)?
         } else if let Some(ref path) = template_path {
             let ctx = rm.to_template_context(project, &spawn);
-            crate::template::render_file(std::path::Path::new(path), &ctx)?
+            template::render_file(Path::new(path), &ctx)?
         } else {
             rm.render_markdown(project, &spawn)
         };
@@ -850,7 +860,7 @@ impl BlackboxServer {
 
 /// Resolve a project_file entity ref to its file path by querying the tantivy index.
 fn resolve_project_file_path(
-    state: &crate::SharedState,
+    state: &SharedState,
     entity_ref: &str,
 ) -> anyhow::Result<Option<String>> {
     if let Ok(results) = state
