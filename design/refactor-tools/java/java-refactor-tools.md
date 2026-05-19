@@ -19,6 +19,7 @@ atomized refactor workflows.
 ## Docs
 
 - [Java Refactor Gap Inventory](java-refactor-gaps.md)
+- [Java Refactor Remaining Notes](java-refactor-remaining-notes.md)
 
 ## Crosscuts
 
