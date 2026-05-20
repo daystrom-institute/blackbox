@@ -196,3 +196,104 @@ impl BlackboxServer {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::artifacts;
+    use crate::server::state::SharedState;
+    use std::sync::Arc;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
+
+    fn extract_text(result: &CallToolResult) -> String {
+        let wire = serde_json::to_value(result).unwrap();
+        wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
+    #[test]
+    fn bbox_describe_schema_includes_installed_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "schema-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "schema-tester",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for schema test.",
+                    "when_to_use": ["use when testing schema"],
+                    "anti_patterns": ["do not use in prod"],
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "normal",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "badgey-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "badgey-agent",
+                "version": 3,
+                "manifest": {
+                    "description": "Badgey-backed agent.",
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "cheap",
+                    "dispatch_adapter": "badgey",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        drop(cat);
+
+        let result = server.bbox_describe_schema();
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let agents = body["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 2);
+        let schema_tester = agents
+            .iter()
+            .find(|a| a["name"] == "schema-tester")
+            .unwrap();
+        assert_eq!(schema_tester["version"].as_str(), Some("1"));
+        assert_eq!(schema_tester["cost_class"].as_str(), Some("normal"));
+        assert_eq!(schema_tester["when_to_use"].as_array().unwrap().len(), 1);
+        assert_eq!(schema_tester["anti_patterns"].as_array().unwrap().len(), 1);
+        assert!(schema_tester["dispatch_adapter"].is_null());
+
+        let badgey = agents.iter().find(|a| a["name"] == "badgey-agent").unwrap();
+        assert_eq!(badgey["dispatch_adapter"].as_str(), Some("badgey"));
+        assert_eq!(
+            badgey["when_to_use"]
+                .as_array()
+                .expect("when_to_use always present"),
+            &Vec::<serde_json::Value>::new(),
+            "badgey-agent has empty when_to_use but field must be present"
+        );
+        assert_eq!(
+            badgey["anti_patterns"]
+                .as_array()
+                .expect("anti_patterns always present"),
+            &Vec::<serde_json::Value>::new(),
+            "badgey-agent has empty anti_patterns but field must be present"
+        );
+
+        let by_adapter = body["agents_by_dispatch_adapter"]
+            .as_object()
+            .expect("agents_by_dispatch_adapter object");
+        assert_eq!(by_adapter["direct"].as_array().unwrap().len(), 1);
+        assert_eq!(by_adapter["badgey"].as_array().unwrap().len(), 1);
+    }
+}

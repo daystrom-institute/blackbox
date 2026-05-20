@@ -1302,12 +1302,19 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::artifacts;
     use crate::notes::NoteParams;
     use crate::packets::CompileParams;
     use crate::server::state::SharedState;
+    use crate::tools::bro_params::{AgentDispatchParams, StatusParams};
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    fn extract_text(result: &CallToolResult) -> String {
+        let wire = serde_json::to_value(result).unwrap();
+        wire["content"][0]["text"].as_str().unwrap().to_string()
     }
 
     #[test]
@@ -1594,5 +1601,160 @@ mod tests {
         assert_eq!(checkpoint.dispute_count, 1);
         assert_eq!(checkpoint.notes.blocked_count, 1);
         assert_eq!(checkpoint.notes.dispute_count, 1);
+    }
+    #[test]
+    fn bro_dashboard_emits_agent_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "dash-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "dash-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for dashboard test.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "dash-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+            runtime: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap();
+
+        let dash = server.bro_dashboard(Parameters(DashboardParams {
+            limit: Some(20),
+            provider: None,
+            status: None,
+            team: None,
+        }));
+        let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+        let tasks = dash_body["tasks"].as_array().unwrap();
+        let found = tasks.iter().find(|t| t["taskId"].as_str() == Some(task_id));
+        assert!(found.is_some(), "task should appear in dashboard");
+        let entry = found.unwrap();
+        assert_eq!(
+            entry["agentLabel"].as_str(),
+            Some("agent:dash-agent@v1"),
+            "dashboard entry should carry agentLabel: {entry}"
+        );
+        assert_eq!(
+            entry["broLabel"].as_str(),
+            Some("agent:dash-agent@v1"),
+            "dashboard entry should carry broLabel: {entry}"
+        );
+        let agent_metrics = &dash_body["agents"]["agent:dash-agent@v1"];
+        assert_eq!(agent_metrics["dispatch_count"].as_u64(), Some(1));
+        assert_eq!(agent_metrics["success_count"].as_u64(), Some(0));
+        assert_eq!(agent_metrics["failure_count"].as_u64(), Some(0));
+    }
+
+    #[test]
+    fn bro_report_surfaces_latest_task_report() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "report-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "report-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for report test.",
+                    "brofile_inline": {"provider": "claude"},
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(server.bro_agent_dispatch(Parameters(AgentDispatchParams {
+            agent: "report-agent".into(),
+            args: serde_json::Value::Null,
+            project_dir: Some(tmp.path().to_str().unwrap().to_string()),
+            bro: None,
+            ambient: None,
+            caller_provider: None,
+            caller_session_id: None,
+            runtime: None,
+        })));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap().to_string();
+
+        let report = server.bro_report(Parameters(ReportParams {
+            task_id: task_id.clone(),
+            message: "writing focused tests".into(),
+            needs: Some("review API naming".into()),
+            data: Some(serde_json::json!({"phase": "test"})),
+        }));
+        assert_ne!(report.is_error, Some(true));
+        let report_body: serde_json::Value = serde_json::from_str(&extract_text(&report)).unwrap();
+        assert_eq!(
+            report_body["report"]["message"].as_str(),
+            Some("writing focused tests")
+        );
+        assert_eq!(
+            report_body["report"]["needs"].as_str(),
+            Some("review API naming")
+        );
+        assert_eq!(
+            report_body["report"]["data"]["phase"].as_str(),
+            Some("test")
+        );
+        assert!(report_body["report"]["reportedAt"].as_u64().is_some());
+        assert!(report_body["report"]["reportedAgo"].as_str().is_some());
+
+        let dash = server.bro_dashboard(Parameters(DashboardParams {
+            limit: Some(20),
+            provider: None,
+            status: None,
+            team: None,
+        }));
+        let dash_body: serde_json::Value = serde_json::from_str(&extract_text(&dash)).unwrap();
+        let entry = dash_body["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["taskId"].as_str() == Some(task_id.as_str()))
+            .expect("task should appear in dashboard");
+        assert_eq!(
+            entry["report"]["message"].as_str(),
+            Some("writing focused tests")
+        );
+        assert_eq!(entry["report"]["needs"].as_str(), Some("review API naming"));
+
+        let status = server.bro_status(Parameters(StatusParams {
+            task_id: task_id.clone(),
+            tail: None,
+        }));
+        let status_body: serde_json::Value = serde_json::from_str(&extract_text(&status)).unwrap();
+        assert_eq!(
+            status_body["report"]["message"].as_str(),
+            Some("writing focused tests")
+        );
     }
 }
