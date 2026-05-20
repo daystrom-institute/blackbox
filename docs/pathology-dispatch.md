@@ -1,28 +1,34 @@
 # Architecture Pathology Dispatch
 
-Architecture pathology is the workflow lane for turning Java architecture
-smells into a reviewed correction plan. It is diagnostic only while it runs: it
-does not edit source during diagnosis. Its output is meant to be automation
-ready for PD-dispatch once the operator chooses to launch implementation.
+Architecture pathology is the workflow lane for turning language-specific
+architecture pressure into a reviewed correction plan. It is diagnostic only
+while it runs: it does not edit source during diagnosis. Its output is meant to
+be automation ready for PD-dispatch once the operator chooses to launch
+implementation.
 
-The workflow currently ships one language-specific lane:
+The workflow currently ships two language-specific lanes:
 
 - `arch-pathology-java` surveys a Java project, dispatches the justified subset
   of Java architecture pathology atoms, reviews their claims on a whiteboard,
   and writes a correction plan under `design/refactor/plans/`.
+- `arch-pathology-rust` surveys a Rust crate/workspace, dispatches the
+  justified subset of Rust architecture pathology atoms, reviews their claims on
+  a whiteboard, and writes a correction plan under `design/refactor/plans/`.
 
 Do not use pathology as a larger lint run. If SAST, ArchUnit, a clone detector,
 or a metric threshold can make the diagnosis by itself, encode that static rule
 directly. Pathology is for semantic architecture judgments: role mismatch,
-responsibility ownership, framework lifecycle contract, context capture, and
-history-backed pressure.
+responsibility ownership, lifecycle contract, context capture, public API or
+error-contract drift, and history-backed pressure.
 
 ## Install Artifacts
 
-Install or refresh the Java pathology artifacts before dispatching by workflow
-id:
+Install or refresh the Java pathology artifacts before dispatching
+`arch-pathology-java`:
 
 ```text
+bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-architecture-pathologist.json")
+
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-role-behavior-coherence.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-responsibility-bleed.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-conceptual-duplicate-discovery.json")
@@ -32,9 +38,29 @@ bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-a
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-test-implied-architecture.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-transcript-anchored-pressure.json")
 
-bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-architecture-pathologist.json")
-
 bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/arch-pathology-java.json")
+```
+
+Install or refresh the Rust pathology artifacts before dispatching
+`arch-pathology-rust`:
+
+```text
+bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-architecture-pathologist.json")
+
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-impl-role-coherence.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-state-ownership-collapse.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-construction-boundary-collapse.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-trait-boundary-mismatch.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-module-topology-drift.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-error-contract-drift.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-feature-cfg-matrix.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-async-runtime-lifecycle.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-test-implied-architecture.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-unsafe-contract-opacity.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-macro-generated-contract-opacity.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-transcript-anchored-pressure.json")
+
+bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/arch-pathology-rust.json")
 ```
 
 If a dispatch reports an unknown atom, brofile, or workflow, install the named
@@ -45,9 +71,10 @@ for atom-request normalization and plan writing.
 ## Invocation
 
 Use `/orchestrate/by-id` or MCP `bro_orchestrate_run` with `workflow_id =
-"arch-pathology-java"`. `bro orchestrate run <file>` is useful for dry-run
-validation, but real runs should use the installed workflow id so atom and
-brofile references resolve through the production artifact catalog.
+"arch-pathology-java"` or `"arch-pathology-rust"`. `bro orchestrate run
+<file>` is useful for dry-run validation, but real runs should use the
+installed workflow id so atom and brofile references resolve through the
+production artifact catalog.
 
 Required initial vars:
 
@@ -103,6 +130,36 @@ curl -sS -H 'content-type: application/json' \
   -d @- "http://127.0.0.1:${PORT}/orchestrate/by-id" | jq .
 ```
 
+Rust example:
+
+```bash
+PORT="${BBOX_PORT:-7264}"
+PROJECT="/repo"
+
+jq -n \
+  --arg project_dir "$PROJECT" \
+  '{
+    workflow_id: "arch-pathology-rust",
+    project_dir: $project_dir,
+    max_steps: 80,
+    await_completion: false,
+    initial_vars: {
+      project_dir: $project_dir,
+      scope_filter: ".",
+      target_context_window: 10000,
+      operator_hints: [
+        "whole-project Rust architecture pathology pass",
+        "look for god impls, state ownership collapse, trait boundary drift, and feature/cfg matrix pressure"
+      ],
+      target_loci: [],
+      layer_model_path: "",
+      whole_project_mode: true
+    }
+  }' |
+curl -sS -H 'content-type: application/json' \
+  -d @- "http://127.0.0.1:${PORT}/orchestrate/by-id" | jq .
+```
+
 Poll with the returned ids:
 
 ```bash
@@ -116,10 +173,12 @@ bro_arc_status(arc_id="<arcId>")
 
 1. `Setup` records the baseline commit, opens a whiteboard, and registers
    `pathologist` as facilitator.
-2. `Survey` does cheap grounding first: code symbols, refs, refactor status,
-   dependency analysis for candidate classes, transcript search, and notes. It
+2. `Survey` does cheap grounding first. Java uses code symbols, refs, refactor
+   status, dependency analysis for candidate classes, transcript search, and
+   notes. Rust uses symbols, refactor status, impl partition analysis, public
+   API guard, Cargo/cfg/macro/test evidence, transcript search, and notes. It
    selects only the atom requests justified by evidence.
-3. `FocusedAtoms` dispatches the selected Java architecture atoms in parallel
+3. `FocusedAtoms` dispatches the selected architecture atoms in parallel
    and collects their structured diagnosis results. A broad run may still
    dispatch fewer than all atoms; that is expected.
 4. `Review` merges overlapping claims, rejects SAST-shaped or weak findings,
@@ -127,7 +186,7 @@ bro_arc_status(arc_id="<arcId>")
    architecture-level diagnoses.
 5. `SynthesizePlan` writes strict JSON for a correction plan: diagnosis summary,
    evidence, remediation slices, acceptance criteria, and deferred/rejected
-   candidates.
+   candidates. Rust plans also retain authority grades and atom mapping.
 6. `WritePlan` writes markdown to
    `<project>/design/refactor/plans/<slug>.md`.
 
@@ -156,6 +215,35 @@ The survey may choose from these atoms:
 - `java-architecture-transcript-anchored-pressure`: prior operator/agent
   history corroborating current code pressure.
 
+## Rust Pathology Atoms
+
+The Rust survey may choose from these atoms:
+
+- `rust-architecture-impl-role-coherence`: impl/module role versus actual
+  behavior.
+- `rust-architecture-state-ownership-collapse`: unrelated responsibilities
+  coupled through one struct or receiver.
+- `rust-architecture-construction-boundary-collapse`: constructors/builders
+  crossing domain boundaries without owning that integration seam.
+- `rust-architecture-trait-boundary-mismatch`: missing, too-broad, too-narrow,
+  or service-locator-style trait boundaries.
+- `rust-architecture-module-topology-drift`: module tree, re-export, or
+  bin/lib ownership drift.
+- `rust-architecture-error-contract-drift`: error types and Result contracts as
+  accidental architecture boundaries.
+- `rust-architecture-feature-cfg-matrix`: feature flags, cfg attributes,
+  optional dependencies, and target matrix entanglement.
+- `rust-architecture-async-runtime-lifecycle`: runtime/task/channel/lifecycle
+  capture that the borrow checker does not express.
+- `rust-architecture-test-implied-architecture`: Rust test pain revealing
+  missing production seams.
+- `rust-architecture-unsafe-contract-opacity`: unsafe boundaries hiding caller
+  obligations or invariants.
+- `rust-architecture-macro-generated-contract-opacity`: macro-generated
+  contracts hiding ownership, lifecycle, or public API.
+- `rust-architecture-transcript-anchored-pressure`: prior Blackbox/operator
+  history corroborating current Rust architectural pressure.
+
 ## Output
 
 Successful runs write a plan with frontmatter like:
@@ -168,10 +256,15 @@ generated_by: arch-pathology
 baseline_commit: <sha>
 ```
 
+Rust runs use `generated_by: rust-arch-pathology` and include `Authority Grades`
+and `Atom Mapping` sections when the pathologist retained that evidence.
+
 The body contains:
 
 - `Diagnosis Summary`
 - `Evidence`
+- `Authority Grades` (Rust)
+- `Atom Mapping` (Rust)
 - `Remediation Plan`
 - `Acceptance Criteria`
 - `Deferred`
@@ -237,10 +330,16 @@ A broad run should produce architecture-level findings such as:
 
 - Role-boundary findings where presentation classes own transport, scheduler,
   persistence, or cross-domain event handling concerns.
+- Rust role-boundary findings where one impl owns provider data, driver
+  behavior, runtime lifecycle, and error policy.
 - Responsibility-bleed findings where one dispatcher or coordinator owns too
   many unrelated domain decisions.
+- Rust state-ownership findings where one struct is the only path to unrelated
+  stores, runtime handles, caches, and request/session state.
 - DI-seam findings where scoped objects acquire dependencies through service
   locators, static containers, or lifecycle-unsafe APIs.
+- Rust trait/error/cfg findings where public surfaces, `Result` contracts, or
+  feature gates encode accidental architecture boundaries.
 - Conceptual-duplicate findings where sibling classes are thin variants of the
   same architectural behavior.
 

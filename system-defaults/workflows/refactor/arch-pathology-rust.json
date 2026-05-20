@@ -1,0 +1,308 @@
+{
+  "name": "arch-pathology-rust",
+  "version": 1,
+  "vars_schema": {
+    "project_dir": { "kind": "string", "required": true },
+    "scope_filter": { "kind": "string", "required": true },
+    "target_context_window": { "kind": "int", "required": true },
+    "operator_hints": { "kind": "array" },
+    "target_loci": { "kind": "array" },
+    "layer_model_path": { "kind": "string" },
+    "whole_project_mode": { "kind": "bool" },
+    "baseline_result": { "kind": "object" },
+    "survey_json": { "kind": "object" },
+    "atom_requests": { "kind": "array" },
+    "atom_results": { "kind": "array" },
+    "whiteboard_id": { "kind": "string" },
+    "whiteboard_open": { "kind": "object" },
+    "review_json": { "kind": "object" },
+    "plan_json": { "kind": "object" },
+    "write_result": { "kind": "object" }
+  },
+  "actors": {
+    "pathologist": {
+      "kind": "executor",
+      "brofile": "rust-architecture-pathologist",
+      "durable": true,
+      "compaction_anchor": true
+    }
+  },
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        { "op": "default_var", "args": { "key": "operator_hints", "value": [] } },
+        { "op": "default_var", "args": { "key": "target_loci", "value": [] } },
+        { "op": "default_var", "args": { "key": "layer_model_path", "value": "" } },
+        { "op": "default_var", "args": { "key": "whole_project_mode", "value": false } },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "whiteboard_id",
+            "value": "arch-pathology-rust:${meta.arc_id}"
+          }
+        },
+        {
+          "op": "shell",
+          "args": {
+            "argv": ["git", "rev-parse", "HEAD"],
+            "cwd": "${vars.project_dir}"
+          },
+          "into_var": "baseline_result",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_open",
+            "arguments": {
+              "board_id": "${vars.whiteboard_id}",
+              "opened_by": "pathologist",
+              "project": "${vars.project_dir}",
+              "topic": "Rust architecture pathology review for ${vars.scope_filter}",
+              "domain": "rust-architecture-pathology"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "whiteboard_open",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Survey" }
+    },
+    "Survey": {
+      "actor": "pathologist",
+      "prompt": "Run the cheap survey for Rust architecture pathology.\n\nProject: ${vars.project_dir}\nScope filter: ${vars.scope_filter}\nWhole-project mode: ${vars.whole_project_mode}\nTarget loci: ${vars.target_loci}\nOperator hints: ${vars.operator_hints}\nLayer model path: ${vars.layer_model_path}\nTarget context window: ${vars.target_context_window}\nWhiteboard id: ${vars.whiteboard_id}\n\nUse cheap measurement before LLM judgment: bbox_code_symbols, bbox_refactor_status, bbox_refactor_plan(kind=\"rust_impl_partition_analysis\") for concrete candidate impls, rust_public_api_guard when public surfaces may be touched, Cargo.toml/cargo metadata observations where available from files, cfg/macro density, tests, and bbox_hybrid_search/bbox_notes/bbox_search for transcript pressure when hints or history point there. Do not run every atom. Select a bounded top set of atom requests whose diagnostic question is justified by the survey.\n\nReturn strict JSON only with keys: survey_summary, pressure_map, target_loci, atom_requests, deferred_hotspots, limits. atom_requests must be an array of objects shaped {\"atom_ref\":\"atom:rust-architecture-impl-role-coherence@v1\",\"args\":{...}}. Each args object must include project_dir, scope_filter, target_loci, operator_hints, layer_model_path, survey_json, target_context_window, whole_project_mode, and whiteboard_id. Use only these atom refs: atom:rust-architecture-impl-role-coherence@v1, atom:rust-architecture-state-ownership-collapse@v1, atom:rust-architecture-construction-boundary-collapse@v1, atom:rust-architecture-trait-boundary-mismatch@v1, atom:rust-architecture-module-topology-drift@v1, atom:rust-architecture-error-contract-drift@v1, atom:rust-architecture-feature-cfg-matrix@v1, atom:rust-architecture-async-runtime-lifecycle@v1, atom:rust-architecture-test-implied-architecture@v1, atom:rust-architecture-unsafe-contract-opacity@v1, atom:rust-architecture-macro-generated-contract-opacity@v1, atom:rust-architecture-transcript-anchored-pressure@v1. If evidence is weak, return fewer atom_requests and explain the limit. First byte {, final byte }.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Survey.output}" },
+          "into_var": "survey_json",
+          "on_failure": "halt"
+        },
+        {
+          "op": "normalize_arch_pathology_atom_requests",
+          "args": {
+            "requests": "${vars.survey_json.atom_requests}",
+            "allowed_atoms": [
+              "atom:rust-architecture-impl-role-coherence@v1",
+              "atom:rust-architecture-state-ownership-collapse@v1",
+              "atom:rust-architecture-construction-boundary-collapse@v1",
+              "atom:rust-architecture-trait-boundary-mismatch@v1",
+              "atom:rust-architecture-module-topology-drift@v1",
+              "atom:rust-architecture-error-contract-drift@v1",
+              "atom:rust-architecture-feature-cfg-matrix@v1",
+              "atom:rust-architecture-async-runtime-lifecycle@v1",
+              "atom:rust-architecture-test-implied-architecture@v1",
+              "atom:rust-architecture-unsafe-contract-opacity@v1",
+              "atom:rust-architecture-macro-generated-contract-opacity@v1",
+              "atom:rust-architecture-transcript-anchored-pressure@v1"
+            ],
+            "defaults": {
+              "project_dir": "${vars.project_dir}",
+              "scope_filter": "${vars.scope_filter}",
+              "target_loci": "${vars.target_loci}",
+              "operator_hints": "${vars.operator_hints}",
+              "layer_model_path": "${vars.layer_model_path}",
+              "survey_json": "${vars.survey_json}",
+              "target_context_window": "${vars.target_context_window}",
+              "whole_project_mode": "${vars.whole_project_mode}",
+              "whiteboard_id": "${vars.whiteboard_id}"
+            }
+          },
+          "into_var": "atom_requests",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "FocusedAtoms" }
+    },
+    "FocusedAtoms": {
+      "actor": "",
+      "foreach": {
+        "items": "${vars.atom_requests}",
+        "as_var": "atom_request",
+        "index_as": "atom_index",
+        "key": "atom-${vars.atom_index}",
+        "imports": ["project_dir"],
+        "exports": ["atom_result"],
+        "parallelism": 3,
+        "on_item_failure": "collect_then_halt",
+        "collect": { "into_var": "atom_results" },
+        "subworkflow": {
+          "name": "arch-pathology-rust-atom-child",
+          "version": 1,
+          "vars_schema": {
+            "project_dir": { "kind": "string", "required": true },
+            "atom_request": { "kind": "object", "required": true },
+            "atom_handle": { "kind": "object" },
+            "atom_wait": { "kind": "object" },
+            "atom_status": { "kind": "object" },
+            "atom_result": { "kind": "object" }
+          },
+          "actors": {},
+          "start": "InvokeAtom",
+          "nodes": {
+            "InvokeAtom": {
+              "actor": "",
+              "on_enter": [
+                {
+                  "op": "mcp_call",
+                  "args": {
+                    "server": "blackbox",
+                    "tool": "atom_invoke",
+                    "arguments": {
+                      "atom": "${vars.atom_request.atom_ref}",
+                      "args": "${vars.atom_request.args}",
+                      "project_dir": "${vars.project_dir}",
+                      "owner": "workflow:${meta.arc_id}"
+                    },
+                    "timeout_secs": 120
+                  },
+                  "into_var": "atom_handle",
+                  "on_failure": "halt"
+                }
+              ],
+              "next": { "type": "goto", "to": "WaitAtom" }
+            },
+            "WaitAtom": {
+              "actor": "",
+              "on_enter": [
+                {
+                  "op": "mcp_call",
+                  "args": {
+                    "server": "blackbox",
+                    "tool": "bro_wait",
+                    "arguments": {
+                      "task_id": "${vars.atom_handle.task_id}",
+                      "timeout_seconds": 900
+                    },
+                    "timeout_secs": 920
+                  },
+                  "into_var": "atom_wait",
+                  "on_failure": "halt"
+                },
+                {
+                  "op": "mcp_call",
+                  "args": {
+                    "server": "blackbox",
+                    "tool": "atom_status",
+                    "arguments": {
+                      "invocation_id": "${vars.atom_handle.invocation_id}",
+                      "owner": "workflow:${meta.arc_id}"
+                    },
+                    "timeout_secs": 30
+                  },
+                  "into_var": "atom_status",
+                  "on_failure": "halt"
+                },
+                {
+                  "op": "set_var",
+                  "args": {
+                    "key": "atom_result",
+                    "value": "${vars.atom_status}"
+                  }
+                }
+              ],
+              "next": { "type": "terminal" }
+            }
+          }
+        }
+      },
+      "next": { "type": "goto", "to": "Review" }
+    },
+    "Review": {
+      "actor": "pathologist",
+      "prompt": "Review and synthesize the focused atom outputs for Rust architecture pathology.\n\nProject: ${vars.project_dir}\nScope: ${vars.scope_filter}\nWhiteboard id: ${vars.whiteboard_id}\nSurvey JSON: ${vars.survey_json}\nAtom result collection: ${vars.atom_results}\n\nPost whiteboard_post entries for surviving claims, concerns about weak evidence, authority-grade uncertainty, gap-backed remediation, and merged diagnosis proposals. Use agent_name=\"pathologist\" for every whiteboard call; the setup node registered that identity as facilitator. Reject compiler/lint/SAST-shaped findings, duplicate claims, and anything not changing ownership, boundaries, seams, lifecycle handling, public API contracts, or canonical responsibility. If a surviving diagnosis depends on acknowledge_repr or acknowledge_public_api_change, flag it explicitly so SynthesizePlan can surface the operator-authority gate. Do not transition the board; the workflow advances phases after your JSON parses.\n\nReturn strict JSON only with keys: surviving_diagnoses, rejected_or_deferred, merged_claims, uncertainty, authority_grades, atom_mapping, whiteboard_summary. First byte {, final byte }.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Review.output}" },
+          "into_var": "review_json",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "agent_name": "pathologist",
+              "board_id": "${vars.whiteboard_id}",
+              "target_phase": "read",
+              "summary": "Rust architecture pathology claims posted; making review visible."
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "agent_name": "pathologist",
+              "board_id": "${vars.whiteboard_id}",
+              "target_phase": "debate",
+              "summary": "Read phase opened; recording synthesis as debate-ready."
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_transition",
+            "arguments": {
+              "agent_name": "pathologist",
+              "board_id": "${vars.whiteboard_id}",
+              "target_phase": "resolve",
+              "summary": "Rust review synthesis complete; resolving board for correction-plan emission."
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "SynthesizePlan" }
+    },
+    "SynthesizePlan": {
+      "actor": "pathologist",
+      "prompt": "Write the reviewed Rust Architecture Correction Plan payload as strict JSON. Do not write files; the workflow writes markdown after parsing your JSON.\n\nProject: ${vars.project_dir}\nScope: ${vars.scope_filter}\nBaseline commit stdout: ${vars.baseline_result.stdout}\nTarget context window: ${vars.target_context_window}\nSurvey JSON: ${vars.survey_json}\nAtom results: ${vars.atom_results}\nReview JSON: ${vars.review_json}\n\nThe correction plan must have concrete evidence, ordered bounded remediation slices, authority grades, atom mapping, PD-ready acceptance criteria with RAP-* ids, and deferred rejected/speculative/compiler-shaped candidates. It must be explicitly usable as input to phase-decompose-main-edit. The Atom Mapping section must label every slice with a shipped atom, a G-series gap ID, or PD-manual execution. Operator-authority flags such as acknowledge_repr and acknowledge_public_api_change must be surfaced as gates, never assumed.\n\nReturn strict JSON only with keys: slug, title, brief, diagnosis_summary, evidence, authority_grades, atom_mapping, remediation_plan, acceptance_criteria, deferred. Markdown strings are allowed in diagnosis_summary/evidence/authority_grades/atom_mapping/remediation_plan/deferred. First byte {, final byte }.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${SynthesizePlan.output}" },
+          "into_var": "plan_json",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "WritePlan" }
+    },
+    "WritePlan": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "write_arch_pathology_plan",
+          "args": {
+            "project_dir": "${vars.project_dir}",
+            "slug": "${vars.plan_json.slug}",
+            "scope": "${vars.scope_filter}",
+            "baseline_commit": "${vars.baseline_result.stdout}",
+            "target_context_window": "${vars.target_context_window}",
+            "generated_by": "rust-arch-pathology",
+            "criteria_prefix": "RAP",
+            "plan": "${vars.plan_json}"
+          },
+          "into_var": "write_result",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

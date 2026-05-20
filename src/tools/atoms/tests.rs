@@ -648,6 +648,163 @@ async fn shipped_rust_batch2_atoms_install_after_persona_brofile() {
 }
 
 #[tokio::test]
+async fn shipped_rust_architecture_pathology_artifacts_install_and_validate() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let brofile: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../system-defaults/brofiles/refactor/rust-architecture-pathologist.json"
+    ))
+    .unwrap();
+
+    install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Brofile,
+            source: "system-defaults/brofiles/refactor/rust-architecture-pathologist.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        brofile,
+    )
+    .await
+    .unwrap();
+
+    let atoms = [
+        (
+            "system-defaults/atoms/refactor/rust-architecture-impl-role-coherence.json",
+            "rust-architecture-impl-role-coherence",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-impl-role-coherence.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-state-ownership-collapse.json",
+            "rust-architecture-state-ownership-collapse",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-state-ownership-collapse.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-construction-boundary-collapse.json",
+            "rust-architecture-construction-boundary-collapse",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-construction-boundary-collapse.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-trait-boundary-mismatch.json",
+            "rust-architecture-trait-boundary-mismatch",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-trait-boundary-mismatch.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-module-topology-drift.json",
+            "rust-architecture-module-topology-drift",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-module-topology-drift.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-error-contract-drift.json",
+            "rust-architecture-error-contract-drift",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-error-contract-drift.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-feature-cfg-matrix.json",
+            "rust-architecture-feature-cfg-matrix",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-feature-cfg-matrix.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-async-runtime-lifecycle.json",
+            "rust-architecture-async-runtime-lifecycle",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-async-runtime-lifecycle.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-test-implied-architecture.json",
+            "rust-architecture-test-implied-architecture",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-test-implied-architecture.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-unsafe-contract-opacity.json",
+            "rust-architecture-unsafe-contract-opacity",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-unsafe-contract-opacity.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-macro-generated-contract-opacity.json",
+            "rust-architecture-macro-generated-contract-opacity",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-macro-generated-contract-opacity.json"
+            ),
+        ),
+        (
+            "system-defaults/atoms/refactor/rust-architecture-transcript-anchored-pressure.json",
+            "rust-architecture-transcript-anchored-pressure",
+            include_str!(
+                "../../../system-defaults/atoms/refactor/rust-architecture-transcript-anchored-pressure.json"
+            ),
+        ),
+    ];
+
+    for (source, expected_name, body) in atoms {
+        let atom: serde_json::Value = serde_json::from_str(body).unwrap();
+        let meta = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: source.into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            atom,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.kind, artifacts::ArtifactKind::Atom);
+        assert_eq!(meta.name, expected_name);
+        assert!(meta.active);
+    }
+
+    let workflow_value: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../system-defaults/workflows/refactor/arch-pathology-rust.json"
+    ))
+    .unwrap();
+    let workflow_meta = install_artifact_value(
+        &server.state,
+        ArtifactInstallParams {
+            kind: artifacts::ArtifactKind::Workflow,
+            source: "system-defaults/workflows/refactor/arch-pathology-rust.json".into(),
+            name: None,
+            version: None,
+            supersedes: None,
+        },
+        workflow_value.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(workflow_meta.kind, artifacts::ArtifactKind::Workflow);
+    assert_eq!(workflow_meta.name, "arch-pathology-rust");
+    assert!(workflow_meta.active);
+
+    let workflow_spec: workflow::Workflow = serde_json::from_value(workflow_value).unwrap();
+    let compiled = workflow::compile(workflow_spec).unwrap();
+    validate_workflow_capabilities(&compiled, &server.state).unwrap();
+}
+
+#[tokio::test]
 async fn atom_invoke_workflow_wrapper_returns_workflow_handle() {
     let tmp = tempfile::tempdir().unwrap();
     let server = test_server(&tmp);

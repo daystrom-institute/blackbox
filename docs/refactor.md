@@ -243,9 +243,12 @@ general install order and supersession; this section focuses on refactor choices
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-refactor-persona.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/java-architecture-pathologist.json")
 bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-refactor-persona.json")
+bbox_artifact_install(kind="brofile", source="system-defaults/brofiles/refactor/rust-architecture-pathologist.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-extract-cohesive-class.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-architecture-role-behavior-coherence.json")
 bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/arch-pathology-java.json")
+bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-architecture-impl-role-coherence.json")
+bbox_artifact_install(kind="workflow", source="system-defaults/workflows/refactor/arch-pathology-rust.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/java-rename-symbol.json")
 bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-split-god-impl.json")
 ```
@@ -290,11 +293,13 @@ agent follows.
 
 ### Architecture Pathology
 
-`workflow:arch-pathology-java@v1` implements the diagnosis loop from
-`design/refactor-tools/arch-pathology.md`: cheap survey, bounded atom selection,
-focused diagnosis, whiteboard review, and correction-plan markdown under
-`design/refactor/plans/`. It is analysis-only for source code; the only file it
-writes is the reviewed plan document that PD later consumes as normal
+`workflow:arch-pathology-java@v1` implements the Java diagnosis loop from
+`design/refactor-tools/arch-pathology.md`. `workflow:arch-pathology-rust@v1`
+implements the Rust sibling from
+`design/refactor-tools/rust/rust-arch-pathology.md`: cheap survey, bounded atom
+selection, focused diagnosis, whiteboard review, and correction-plan markdown
+under `design/refactor/plans/`. Both are analysis-only for source code; the only
+file they write is the reviewed plan document that PD later consumes as normal
 `phase_doc_text` plus explicit acceptance criteria.
 
 ### Rust Refactor Atoms
@@ -302,6 +307,18 @@ writes is the reviewed plan document that PD later consumes as normal
 | Atom | Job |
 |---|---|
 | `atom:rust-error-migrate@v1` | Rewrite a Rust module's error type and repair construction / `?` sites. |
+| `atom:rust-architecture-async-runtime-lifecycle@v1` | Diagnose runtime/task/channel/lifecycle capture that the borrow checker does not express. |
+| `atom:rust-architecture-construction-boundary-collapse@v1` | Diagnose constructors or builders crossing domain boundaries without owning that integration seam. |
+| `atom:rust-architecture-error-contract-drift@v1` | Diagnose Rust error types and Result contracts as accidental architecture boundaries. |
+| `atom:rust-architecture-feature-cfg-matrix@v1` | Diagnose feature flags, cfg attributes, optional dependencies, and target matrix entanglement. |
+| `atom:rust-architecture-impl-role-coherence@v1` | Diagnose declared-role versus actual-behavior mismatch in Rust impls or modules. |
+| `atom:rust-architecture-macro-generated-contract-opacity@v1` | Diagnose macro-generated contracts hiding ownership, lifecycle, or public API. |
+| `atom:rust-architecture-module-topology-drift@v1` | Diagnose module tree, re-export, or bin/lib ownership drift. |
+| `atom:rust-architecture-state-ownership-collapse@v1` | Diagnose unrelated responsibilities coupled through one struct or receiver. |
+| `atom:rust-architecture-test-implied-architecture@v1` | Infer missing Rust production seams from test pain. |
+| `atom:rust-architecture-trait-boundary-mismatch@v1` | Diagnose missing, too-broad, too-narrow, or service-locator-style trait boundaries. |
+| `atom:rust-architecture-transcript-anchored-pressure@v1` | Link prior Blackbox/operator history to current Rust architectural pressure. |
+| `atom:rust-architecture-unsafe-contract-opacity@v1` | Diagnose unsafe boundaries hiding caller obligations or invariants. |
 | `atom:rust-impl-partition-graph@v1` | Produce a method/field/call graph for a large impl block. |
 | `atom:rust-public-api-guard@v1` | Report public API impact before a Rust refactor. |
 | `atom:rust-split-god-impl@v1` | Split a multi-domain impl block into modules with router wiring and visibility updates. |

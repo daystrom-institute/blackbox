@@ -175,6 +175,7 @@ Use [Atoms](atoms.md) for the full atom contract and runtime reference.
 | `system-defaults/atoms/basic/validate-schema.json` | Deterministic object-shape probe. |
 | `system-defaults/atoms/workflows/echo-review.json` | Workflow-backed atom wrapper around `system-defaults/workflows/atoms/echo-review.json`. |
 | `system-defaults/atoms/refactor/java-architecture-role-behavior-coherence.json` | One of the Java architecture pathology diagnosis atoms used by `arch-pathology-java`. |
+| `system-defaults/atoms/refactor/rust-architecture-impl-role-coherence.json` | One of the Rust architecture pathology diagnosis atoms used by `arch-pathology-rust`. |
 | `system-defaults/atoms/refactor/rust-test-island-extract.json` | Profile-backed refactor atom using the Rust refactor persona. |
 
 Install:
@@ -199,9 +200,10 @@ bbox_artifact_install(kind="atom", source="system-defaults/atoms/refactor/rust-t
 ```
 
 Architecture pathology is a workflow-backed diagnosis lane rather than an edit
-atom. Install `system-defaults/brofiles/refactor/java-architecture-pathologist.json`,
-the `java-architecture-*` atoms, and
-`system-defaults/workflows/refactor/arch-pathology-java.json` to produce a
+atom. Install the language pathologist brofile, the matching
+`*-architecture-*` atoms, and the matching workflow
+(`system-defaults/workflows/refactor/arch-pathology-java.json` or
+`system-defaults/workflows/refactor/arch-pathology-rust.json`) to produce a
 reviewed correction plan for later phase-decompose remediation.
 
 ### Agentic Corpus - producer machinery

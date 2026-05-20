@@ -65,6 +65,106 @@ async fn normalize_arch_pathology_atom_requests_parses_nested_survey_json() {
 }
 
 #[tokio::test]
+async fn normalize_arch_pathology_atom_requests_accepts_explicit_rust_allowlist() {
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::NormalizeArchPathologyAtomRequests,
+        args: json!({
+            "allowed_atoms": ["atom:rust-architecture-impl-role-coherence@v1"],
+            "requests": [
+                {
+                    "atom_ref": "atom:rust-architecture-impl-role-coherence@v1",
+                    "args": {
+                        "survey_json": {"focus": "providers"},
+                        "operator_hints": "provider enum is overloaded"
+                    }
+                }
+            ],
+            "defaults": {
+                "project_dir": "/repo",
+                "scope_filter": ".",
+                "target_loci": [],
+                "operator_hints": [],
+                "layer_model_path": "",
+                "survey_json": {},
+                "target_context_window": 10000,
+                "whole_project_mode": true,
+                "whiteboard_id": "board-rust"
+            }
+        }),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: Some("atom_requests".into()),
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    match effect {
+        OpEffect::SetVar { key, value } => {
+            assert_eq!(key, "atom_requests");
+            assert_eq!(
+                value[0]["atom_ref"],
+                "atom:rust-architecture-impl-role-coherence@v1"
+            );
+            assert_eq!(value[0]["args"]["survey_json"]["focus"], "providers");
+            assert_eq!(
+                value[0]["args"]["operator_hints"],
+                json!(["provider enum is overloaded"])
+            );
+        }
+        _ => panic!("expected SetVar"),
+    }
+}
+
+#[tokio::test]
+async fn write_arch_pathology_plan_can_emit_rust_sections() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().to_string_lossy().to_string();
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::WriteArchPathologyPlan,
+        args: json!({
+            "project_dir": project_dir,
+            "slug": "Rust Provider Plan",
+            "scope": "src/providers.rs",
+            "baseline_commit": "abc123",
+            "target_context_window": 12000,
+            "generated_by": "rust-arch-pathology",
+            "criteria_prefix": "RAP",
+            "plan": {
+                "title": "Rust Architecture Correction Plan: providers",
+                "brief": "Provider split.",
+                "diagnosis_summary": "Provider data and behavior are collapsed.",
+                "evidence": "Indexed hints plus transcript pressure.",
+                "authority_grades": "A1: indexed_hints; requires lsp_verified before apply.",
+                "atom_mapping": "Slice 1: rust-extract-impl-methods.",
+                "remediation_plan": "Split data specs from drivers.",
+                "acceptance_criteria": [
+                    {"criterion_text": "Every slice has atom mapping."}
+                ],
+                "deferred": "Feature cfg movement is G15."
+            }
+        }),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: Some("write_result".into()),
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    let plan_path = match effect {
+        OpEffect::SetVar { key, value } => {
+            assert_eq!(key, "write_result");
+            value["absolute_plan_path"].as_str().unwrap().to_string()
+        }
+        _ => panic!("expected SetVar"),
+    };
+    let body = std::fs::read_to_string(plan_path).unwrap();
+    assert!(body.contains("generated_by: rust-arch-pathology"));
+    assert!(body.contains("## Authority Grades"));
+    assert!(body.contains("## Atom Mapping"));
+    assert!(body.contains("- RAP-1: Every slice has atom mapping."));
+    assert!(body.contains("## Dispatch Payload"));
+    assert!(body.contains("\"phase_doc_path\": \"design/refactor/plans/rust-provider-plan.md\""));
+}
+
+#[tokio::test]
 async fn find_first_returns_match() {
     let ctx = ArcContext::new(ArcMeta::default());
     let hook = HookOp {

@@ -27,7 +27,7 @@ pub(super) fn exec_normalize_arch_pathology_atom_requests(
         anyhow!("NormalizeArchPathologyAtomRequests requires requests to be an array")
     })?;
 
-    let allowed_atoms = [
+    let default_allowed_atoms = [
         "atom:java-architecture-role-behavior-coherence@v1",
         "atom:java-architecture-responsibility-bleed@v1",
         "atom:java-architecture-conceptual-duplicate-discovery@v1",
@@ -37,6 +37,22 @@ pub(super) fn exec_normalize_arch_pathology_atom_requests(
         "atom:java-architecture-test-implied-architecture@v1",
         "atom:java-architecture-transcript-anchored-pressure@v1",
     ];
+    let allowed_atoms = match args.get("allowed_atoms").map(coerce_json_value) {
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| anyhow!("allowed_atoms must be an array"))?
+            .iter()
+            .map(|item| {
+                item.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| anyhow!("allowed_atoms entries must be strings"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        None => default_allowed_atoms
+            .iter()
+            .map(|atom| atom.to_string())
+            .collect(),
+    };
 
     let mut normalized = Vec::with_capacity(requests.len());
     for (idx, request) in requests.iter().enumerate() {
@@ -48,7 +64,7 @@ pub(super) fn exec_normalize_arch_pathology_atom_requests(
             .get("atom_ref")
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("atom request #{idx} missing atom_ref"))?;
-        if !allowed_atoms.contains(&atom_ref) {
+        if !allowed_atoms.iter().any(|allowed| allowed == atom_ref) {
             bail!("atom request #{idx} uses unsupported atom_ref '{atom_ref}'");
         }
 
@@ -125,6 +141,14 @@ pub(super) fn exec_write_arch_pathology_plan(
         .get("target_context_window")
         .and_then(|v| v.as_i64())
         .unwrap_or(10_000);
+    let generated_by = args
+        .get("generated_by")
+        .and_then(Value::as_str)
+        .unwrap_or("arch-pathology");
+    let criteria_prefix = args
+        .get("criteria_prefix")
+        .and_then(Value::as_str)
+        .unwrap_or("AP");
     let plan = args
         .get("plan")
         .and_then(|v| v.as_object())
@@ -176,13 +200,14 @@ pub(super) fn exec_write_arch_pathology_plan(
             "  - architecture\n",
             "date: {}\n",
             "baseline_commit: {}\n",
-            "generated_by: arch-pathology\n",
+            "generated_by: {}\n",
             "scope: \"{}\"\n",
             "brief: \"{}\"\n",
             "---\n\n",
             "# {}\n\n",
             "## Diagnosis Summary\n\n{}\n\n",
             "## Evidence\n\n{}\n\n",
+            "{}{}",
             "## Remediation Plan\n\n{}\n\n",
             "## Acceptance Criteria\n\n{}\n\n",
             "## Deferred\n\n{}\n\n",
@@ -191,6 +216,7 @@ pub(super) fn exec_write_arch_pathology_plan(
         yaml_quote(&title),
         today,
         baseline_commit.trim(),
+        generated_by,
         yaml_quote(scope),
         yaml_quote(brief),
         title,
@@ -199,11 +225,13 @@ pub(super) fn exec_write_arch_pathology_plan(
             "No diagnosis survived review."
         ),
         arch_pathology_markdown(plan.get("evidence"), "No evidence was retained."),
+        arch_pathology_optional_section(plan.get("authority_grades"), "Authority Grades"),
+        arch_pathology_optional_section(plan.get("atom_mapping"), "Atom Mapping"),
         arch_pathology_markdown(
             plan.get("remediation_plan"),
             "No remediation slices were retained."
         ),
-        arch_pathology_criteria_markdown(&criteria),
+        arch_pathology_criteria_markdown(&criteria, criteria_prefix),
         arch_pathology_markdown(
             plan.get("deferred"),
             "No deferred candidates were recorded."
@@ -274,18 +302,34 @@ fn arch_pathology_markdown(value: Option<&Value>, fallback: &str) -> String {
     }
 }
 
-fn arch_pathology_criteria_markdown(criteria: &Value) -> String {
+fn arch_pathology_optional_section(value: Option<&Value>, heading: &str) -> String {
+    match value {
+        Some(Value::String(s)) if !s.trim().is_empty() => {
+            format!("## {heading}\n\n{}\n\n", s.trim())
+        }
+        Some(Value::Array(items)) if !items.is_empty() => {
+            format!("## {heading}\n\n{}\n\n", arch_pathology_markdown(value, ""))
+        }
+        _ => String::new(),
+    }
+}
+
+fn arch_pathology_criteria_markdown(criteria: &Value, criteria_prefix: &str) -> String {
     let Some(items) = criteria.as_array() else {
-        return "- AP-1: The reviewed correction plan has at least one concrete acceptance criterion before PD dispatch.".to_string();
+        return format!(
+            "- {criteria_prefix}-1: The reviewed correction plan has at least one concrete acceptance criterion before PD dispatch."
+        );
     };
     if items.is_empty() {
-        return "- AP-1: The reviewed correction plan has at least one concrete acceptance criterion before PD dispatch.".to_string();
+        return format!(
+            "- {criteria_prefix}-1: The reviewed correction plan has at least one concrete acceptance criterion before PD dispatch."
+        );
     }
     items
         .iter()
         .enumerate()
         .map(|(idx, item)| {
-            let default_id = format!("AP-{}", idx + 1);
+            let default_id = format!("{criteria_prefix}-{}", idx + 1);
             if let Some(obj) = item.as_object() {
                 let id = obj
                     .get("id")

@@ -1,0 +1,66 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-architecture-state-ownership-collapse",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Diagnose Rust structs whose fields and receiver-based behavior collapse unrelated state ownership into one architectural owner.",
+    "when_to_use": [
+      "one struct is the only path to config, stores, caches, runtime handles, provider metadata, and request state",
+      "field clusters and method clusters look unrelated but legal to the compiler",
+      "a correction plan may use rust-state-extract or sequence state extraction with rust-split-god-impl"
+    ],
+    "anti_patterns": [
+      "do not use for field count alone",
+      "do not use for Arc<Mutex<T>> or Rc<RefCell<T>> proliferation without an ownership or lifecycle claim",
+      "do not use on non-Rust targets"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "scope_filter"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "scope_filter": { "type": "string" },
+          "target_loci": { "type": "array", "items": { "type": "string" } },
+          "operator_hints": { "type": "array", "items": { "type": "string" } },
+          "layer_model_path": { "type": "string" },
+          "survey_json": { "type": "object", "additionalProperties": true },
+          "target_context_window": { "type": "integer", "minimum": 1000 },
+          "whole_project_mode": { "type": "boolean" },
+          "whiteboard_id": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are rust-architecture-state-ownership-collapse. Diagnostic question: are unrelated responsibilities coupled because one Rust struct owns too many fields or all behavior reaches through one receiver?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols and bbox_refactor_status for candidate structs and impls. Use bbox_refactor_plan(kind=\"rust_impl_partition_analysis\", deep_analysis=true, ...) for method-field edges. Use bbox_refactor_plan(kind=\"move_rust_struct_fields\", ...) in plan-only mode only when captured_self_fields, remaining_source_accessors, borrow context, or #[repr] risk is needed; never use bbox_refactor_run from this diagnostic atom.\n2. Apply the SAST/compiler gate. Field count, lock count, or interior-mutability count is not enough. A valid claim names the state clusters, their intended owners, and why current ownership couples unrelated responsibilities.\n3. Surface operator gates. Any rust-state-extract slice involving non-default #[repr(...)] must require operator-provided acknowledge_repr; never infer it.\n4. Map remediation to rust-state-extract, rust-split-god-impl sequencing, or PD-manual. Include authority_grades and atom_mapping per slice.\n5. If whiteboard_id is non-empty, post one whiteboard_post claim or concern for each surviving diagnosis candidate.\n6. Emit bbox_note:done with struct count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, authority_grades, evidence_refs, atom_mapping, remediation_slices, acceptance_criteria, deferred, block_reason."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "pathology_atom": { "const": "rust-architecture-state-ownership-collapse" },
+          "sast_gate": { "type": "object", "additionalProperties": true },
+          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
+          "authority_grades": { "type": "array", "items": { "type": "object" } },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "atom_mapping": { "type": "array", "items": { "type": "object" } },
+          "remediation_slices": { "type": "array", "items": { "type": "object" } },
+          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
+          "deferred": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:rust-architecture-pathologist@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-rust-arch-pathology", "created_at": "2026-05-20T00:00:00Z" }
+  }
+}

@@ -1,0 +1,66 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "rust-architecture-error-contract-drift",
+  "version": 1,
+  "subcontract": "refactor/v1",
+  "manifest": {
+    "description": "Diagnose Rust error types, Result signatures, and conversion paths that have become accidental architecture boundaries.",
+    "when_to_use": [
+      "an error enum is not actionable for callers or exposes the wrong layer",
+      "one broad error type hides ownership drift across modules",
+      "a correction plan may use rust-error-migrate and public API guard"
+    ],
+    "anti_patterns": [
+      "do not assert ?-site conversion without compiler validation",
+      "do not use for rustc conversion errors without an architectural contract claim",
+      "do not grant acknowledge_public_api_change on the operator's behalf"
+    ],
+    "inputs": {
+      "schema": {
+        "type": "object",
+        "required": ["project_dir", "scope_filter"],
+        "properties": {
+          "project_dir": { "type": "string" },
+          "scope_filter": { "type": "string" },
+          "target_loci": { "type": "array", "items": { "type": "string" } },
+          "operator_hints": { "type": "array", "items": { "type": "string" } },
+          "layer_model_path": { "type": "string" },
+          "survey_json": { "type": "object", "additionalProperties": true },
+          "target_context_window": { "type": "integer", "minimum": 1000 },
+          "whole_project_mode": { "type": "boolean" },
+          "whiteboard_id": { "type": "string" }
+        }
+      },
+      "prompt_template": "You are rust-architecture-error-contract-drift. Diagnostic question: have Rust error types, Result signatures, and conversion paths become an accidental architecture boundary?\n\nInputs:\nproject_dir={{project_dir}}\nscope_filter={{scope_filter}}\ntarget_loci={{target_loci}}\noperator_hints={{operator_hints}}\nlayer_model_path={{layer_model_path}}\nsurvey_json={{survey_json}}\ntarget_context_window={{target_context_window}}\nwhole_project_mode={{whole_project_mode}}\nwhiteboard_id={{whiteboard_id}}\n\nProtocol:\n1. Cheap grounding first. Use bbox_code_symbols, bbox_refactor_status, public API guard previews when pub surfaces are implicated, construction forms, ? sites, downcast/downcast_ref checks, tests, and transcript pressure.\n2. Apply the SAST/compiler gate. A conversion error is evidence, not diagnosis. A valid claim states current contract, caller needs, layer exposure, and why the error boundary drives architecture.\n3. Record ?-site and From impl uncertainty; defer conversion truth to cargo check/rust_compile_fix_round. Any rust-error-migrate slice that touches pub surfaces must surface acknowledge_public_api_change as an operator gate. Result wrapping across call chains is G16.\n4. If whiteboard_id is non-empty, post one whiteboard_post claim or concern for each surviving diagnosis candidate.\n5. Emit bbox_note:done with error contract count and candidate count. Return strict JSON only: status, pathology_atom, sast_gate, diagnosis_candidates, authority_grades, evidence_refs, atom_mapping, remediation_slices, acceptance_criteria, deferred, block_reason."
+    },
+    "outputs": {
+      "schema": {
+        "type": "object",
+        "required": ["status", "pathology_atom", "diagnosis_candidates"],
+        "properties": {
+          "status": { "enum": ["planned", "blocked", "errored"] },
+          "pathology_atom": { "const": "rust-architecture-error-contract-drift" },
+          "sast_gate": { "type": "object", "additionalProperties": true },
+          "diagnosis_candidates": { "type": "array", "items": { "type": "object" } },
+          "authority_grades": { "type": "array", "items": { "type": "object" } },
+          "evidence_refs": { "type": "array", "items": { "type": "string" } },
+          "atom_mapping": { "type": "array", "items": { "type": "object" } },
+          "remediation_slices": { "type": "array", "items": { "type": "object" } },
+          "acceptance_criteria": { "type": "array", "items": { "type": "object" } },
+          "deferred": { "type": "array", "items": { "type": "object" } },
+          "block_reason": { "type": "string" },
+          "done_note_id": { "type": "string" }
+        }
+      },
+      "evidence_density": "high"
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:rust-architecture-pathologist@v1" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "blackbox-rust-arch-pathology", "created_at": "2026-05-20T00:00:00Z" }
+  }
+}
