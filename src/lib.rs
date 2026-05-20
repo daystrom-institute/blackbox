@@ -75,8 +75,6 @@ mod storage_health;
 mod system_events;
 mod system_memory;
 mod template;
-#[cfg(test)]
-mod tests;
 mod threads;
 mod tool_docs;
 mod tools;

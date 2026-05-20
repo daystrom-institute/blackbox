@@ -360,8 +360,23 @@ async fn call_blackbox_tool(tool: &str, arguments: Value, ctx: &ArcContext) -> R
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::{self, ArtifactInstallParams};
+    use crate::edge_index;
+    use crate::embed;
+    use crate::embed_queue;
+    use crate::entity_ref;
+    use crate::knowledge;
+    use crate::server::install_artifact_value;
+    use crate::server::state::{BlackboxServer, SharedState};
+    use crate::vectors;
+    use crate::workflow;
     use crate::workflow::context::{ArcContext, ArcMeta};
     use serde_json::json;
+    use std::sync::Arc;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
 
     #[tokio::test]
     async fn normalize_arch_pathology_atom_requests_parses_nested_survey_json() {
@@ -1302,5 +1317,225 @@ mod tests {
             err.to_string().contains("EventHub"),
             "expected EventHub error, got: {err}"
         );
+    }
+    #[tokio::test]
+    async fn embed_compaction_arc_gates_against_vector_status_vars() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vector_store =
+            Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let route = "test-compaction-route";
+        for idx in 0..10 {
+            let theta = idx as f32 * 0.01;
+            vector_store
+                .upsert(
+                    route,
+                    &format!("entity-{idx}"),
+                    &format!("hash-{idx}"),
+                    vec![theta.cos(), theta.sin(), 0.0, 0.0],
+                )
+                .unwrap();
+        }
+        for idx in 0..4 {
+            vector_store
+                .delete(route, &format!("entity-{idx}"))
+                .unwrap();
+        }
+        let before = vector_store.metrics().remove(route).unwrap();
+        assert_eq!(before.active_count, 6);
+        assert_eq!(before.deleted_count, 4);
+        assert!(before.deleted_ratio > 0.3);
+
+        let server = test_server(&tmp);
+        let packet_value: Value = serde_json::from_str(include_str!(
+            "../../system-defaults/agentic-corpus/packets/embed/compaction-policy.json"
+        ))
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Packet,
+                source: "system-defaults/agentic-corpus/packets/embed/compaction-policy.json"
+                    .into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            packet_value,
+        )
+        .await
+        .unwrap();
+
+        let workflow_spec: workflow::Workflow = serde_json::from_str(include_str!(
+            "../../system-defaults/agentic-corpus/workflows/embed-compaction-arc.json"
+        ))
+        .unwrap();
+        let compiled = workflow::compile(workflow_spec).unwrap();
+        let result = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            Some(tmp.path().to_string_lossy().into_owned()),
+            Some(20),
+            serde_json::Map::new(),
+        )
+        .await;
+
+        assert_eq!(result.status, "completed");
+        assert_eq!(result.vars.get("rebuild_started"), Some(&Value::Bool(true)));
+        assert_eq!(result.vars.get("swapped"), Some(&Value::Bool(true)));
+        assert!(result.events.iter().any(|event| {
+            event.get("kind").and_then(Value::as_str) == Some("gate_applied")
+                && event
+                    .get("data")
+                    .and_then(|data| data.get("verdict"))
+                    .and_then(Value::as_str)
+                    == Some("compact")
+        }));
+        let after = vector_store.metrics().remove(route).unwrap();
+        assert_eq!(after.active_count, 6);
+        assert_eq!(after.deleted_count, 0);
+    }
+
+    #[tokio::test]
+    async fn write_semantic_edge_projects_describes_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let edges_dir = tmp.path().join("edges");
+        let source = "project_file:proj1234:relhash:chunkhash:0";
+        let target = "symbol:proj1234:EntityRef:defnhash";
+        let ctx = workflow::context::ArcContext::new(workflow::context::ArcMeta {
+            arc_id: "arc-test".into(),
+            workflow_name: "auto-edge-arc".into(),
+            workflow_version: 1,
+            project_dir: Some(tmp.path().to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let hook = workflow::ops::HookOp {
+            op: workflow::ops::OpKind::WriteSemanticEdge,
+            args: json!({
+                "source": source,
+                "target": target,
+                "kind": "DESCRIBES",
+                "edges_dir": edges_dir,
+                "note": "synthetic doc-section describes EntityRef"
+            }),
+            when: None,
+            on_failure: workflow::ops::OnFailure::Halt,
+            into_var: Some("semantic_edge".into()),
+        };
+        workflow::ops::execute_op(&hook, &ctx, None).await.unwrap();
+        let edge_index = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+            index: &server.state.idx.read(),
+            knowledge: &server.state.kb.read(),
+            threads: &server.state.threads.read(),
+            notes: &server.state.notes.read(),
+            task_store: &server.state.task_store.read(),
+            roadmap: &server.state.roadmap.read(),
+            edges_dir,
+            registered_project_ids: None,
+            include_tantivy_projection: true,
+            include_observed: true,
+        });
+        let source_ref = entity_ref::EntityRef::parse(source).unwrap();
+        let target_ref = entity_ref::EntityRef::parse(target).unwrap();
+        assert!(
+            edge_index
+                .forward_edges(&source_ref)
+                .iter()
+                .any(|edge| edge.kind == "DESCRIBES" && edge.target == target_ref)
+        );
+    }
+
+    #[tokio::test]
+    async fn tier0_contradiction_without_arc_surfaces_surprise_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        embed_queue::install_contradiction_threshold(0.85);
+        embed_queue::install_contradiction_state(server.state.clone());
+        let vector_store =
+            Arc::new(vectors::VectorStore::open(tmp.path().join("vectors")).unwrap());
+        let _guard = vectors::install_test_global(vector_store.clone());
+        let now = "2026-01-01T00:00:00Z".to_string();
+        for (id, content) in [
+            ("aaaabbbb", "use provider A for embeddings"),
+            ("ccccdddd", "never use provider A for embeddings"),
+        ] {
+            server
+                .state
+                .kb
+                .write()
+                .upsert_generated(knowledge::KnowledgeEntry {
+                    id: id.into(),
+                    title: id.into(),
+                    content: content.into(),
+                    cluster: None,
+                    variants: Default::default(),
+                    category: knowledge::Category::Memory,
+                    scope: knowledge::Scope::Global,
+                    project: None,
+                    providers: Vec::new(),
+                    priority: knowledge::Priority::Standard,
+                    weight: 100,
+                    status: knowledge::Status::Active,
+                    approval: knowledge::Approval::UserConfirmed,
+                    render: false,
+                    decay: true,
+                    review_at: None,
+                    supersedes: None,
+                    links: Vec::new(),
+                    rationale: None,
+                    expires_at: None,
+                    source: "test".into(),
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                    recall_count: 0,
+                    last_recalled: None,
+                })
+                .unwrap();
+        }
+        vector_store
+            .upsert(
+                "knowledge-test",
+                "knowledge:ccccdddd",
+                "h-old",
+                vec![1.0, 0.0],
+            )
+            .unwrap();
+        vector_store
+            .upsert(
+                "knowledge-test",
+                "knowledge:aaaabbbb",
+                "h-new",
+                vec![0.99, 0.01],
+            )
+            .unwrap();
+        let request = embed::queue::EmbedRequest {
+            bucket: embed::Bucket::Knowledge,
+            project_id: None,
+            entity_id: "knowledge:aaaabbbb".into(),
+            chunk_hash: "h-new".into(),
+            text: "use provider A for embeddings".into(),
+        };
+        embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            "knowledge-test",
+            &[0.99, 0.01],
+        );
+
+        assert!(server.state.notes.read().all().iter().any(|note| {
+            note.body.contains("Tier-0 contradiction detected")
+                && note.body.contains("knowledge:aaaabbbb")
+                && note.body.contains("knowledge:ccccdddd")
+        }));
+
+        embed_queue::install_contradiction_threshold(1.0);
+        let note_count = server.state.notes.read().all().len();
+        embed_queue::maybe_detect_knowledge_contradiction(
+            &request,
+            "knowledge-test",
+            &[0.99, 0.01],
+        );
+        assert_eq!(server.state.notes.read().all().len(), note_count);
+        embed_queue::install_contradiction_threshold(0.85);
     }
 }

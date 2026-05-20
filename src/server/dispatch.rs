@@ -216,3 +216,131 @@ pub(crate) async fn dispatch_routing_verdict_direct(
 ) -> anyhow::Result<Value> {
     dispatch_verdict(state, inlet_name, None, verdict, entity).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::state::BlackboxServer;
+    use crate::slack_proposal_links;
+    use crate::util;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
+    #[tokio::test]
+    async fn proposal_approved_hook_bumps_link_version() {
+        // Verifies the dispatch_verdict signal hook resolves a Slack
+        // message back to its SlackProposalLink and bumps the version
+        // on `proposal-approved`. The HTTP ack post is short-circuited
+        // (no SLACK_BOT_TOKEN set in the test env) but the bump
+        // happens before the token check.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let link = slack_proposal_links::SlackProposalLink {
+            team_id: "T01".into(),
+            channel_id: "C01".into(),
+            msg_ts: "ts1".into(),
+            proposal_id: "triage-1".into(),
+            instance_id: None,
+            authoring_session_id: None,
+            version: 1,
+            project_dir: "/repo/x".into(),
+            posted_at: util::now_iso(),
+        };
+        server.state.slack_proposal_links.record(link).unwrap();
+        let mut correlate = serde_json::Map::new();
+        correlate.insert("thread_ts".into(), Value::String("ts1".into()));
+        let entity = json!({
+            "team_id": "T01",
+            "channel": "C01",
+            "user": "Ualice",
+            "bbox_user": "alice",
+        });
+        // Ensure no token leaks in from the surrounding env so the
+        // hook short-circuits before HTTP. (Safety belt — the test
+        // depends on the bump happening before the token check.)
+        unsafe {
+            std::env::remove_var("SLACK_BOT_TOKEN");
+        }
+        try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity)
+            .await;
+        let bumped = server
+            .state
+            .slack_proposal_links
+            .lookup_by_msg("T01", "C01", "ts1")
+            .unwrap();
+        assert_eq!(bumped.version, 2);
+    }
+
+    #[tokio::test]
+    async fn proposal_clarify_hook_does_not_bump_version() {
+        // Clarify hook resolves the message back to its link and
+        // (will eventually) post a stub reply, but does NOT bump the
+        // link version — version is reserved for chat.update of the
+        // original proposal post when a refined version lands.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let link = slack_proposal_links::SlackProposalLink {
+            team_id: "T01".into(),
+            channel_id: "C01".into(),
+            msg_ts: "ts2".into(),
+            proposal_id: "triage-2".into(),
+            instance_id: None,
+            authoring_session_id: None,
+            version: 1,
+            project_dir: "/repo/x".into(),
+            posted_at: util::now_iso(),
+        };
+        server.state.slack_proposal_links.record(link).unwrap();
+        let mut correlate = serde_json::Map::new();
+        correlate.insert("thread_ts".into(), Value::String("ts2".into()));
+        let entity = json!({
+            "team_id": "T01",
+            "channel": "C01",
+            "user": "Ualice",
+            "text": "actually never mind, this one is fine as-is",
+        });
+        unsafe {
+            std::env::remove_var("SLACK_BOT_TOKEN");
+        }
+        try_slack_proposal_signal_hook("proposal-clarify", &server.state, &correlate, &entity)
+            .await;
+        let unchanged = server
+            .state
+            .slack_proposal_links
+            .lookup_by_msg("T01", "C01", "ts2")
+            .unwrap();
+        assert_eq!(unchanged.version, 1);
+    }
+
+    #[tokio::test]
+    async fn proposal_signal_hook_no_op_for_unknown_thread_ts() {
+        // No SlackProposalLink for the correlated thread_ts → hook is
+        // a silent no-op. Any other in-thread reply or reaction in
+        // the workspace should NOT cause stub acks.
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut correlate = serde_json::Map::new();
+        correlate.insert("thread_ts".into(), Value::String("ts-unknown".into()));
+        let entity = json!({
+            "team_id": "T01",
+            "channel": "C01",
+            "user": "Ualice",
+        });
+        unsafe {
+            std::env::remove_var("SLACK_BOT_TOKEN");
+        }
+        try_slack_proposal_signal_hook("proposal-approved", &server.state, &correlate, &entity)
+            .await;
+        // Nothing to assert beyond "did not panic" — but make a
+        // sanity probe on the link store size to confirm we didn't
+        // accidentally insert anything.
+        assert!(
+            server
+                .state
+                .slack_proposal_links
+                .lookup_by_msg("T01", "C01", "ts-unknown")
+                .is_none()
+        );
+    }
+}

@@ -3,6 +3,8 @@ mod forgejo;
 mod gate;
 mod hub;
 pub mod identity;
+#[cfg(test)]
+mod integration_tests;
 mod outbox;
 pub mod reactions;
 mod store;
