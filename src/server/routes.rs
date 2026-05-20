@@ -2399,6 +2399,10 @@ pub(crate) async fn roster_handler(
 mod tests {
     use super::*;
 
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
     #[tokio::test]
     async fn read_artifact_source_rejects_oversized_http_response() {
         use tokio::io::AsyncWriteExt;
@@ -2424,5 +2428,36 @@ mod tests {
             .to_string();
 
         assert!(err.contains("too large"), "got: {err}");
+    }
+    #[test]
+    fn orchestrate_status_resolves_arc_id_to_arc_thread_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        server.state.running_arcs.write().insert(
+            "thread-test1234".into(),
+            ArcSnapshot {
+                arc_id: "arc-test1234".into(),
+                arc_thread_id: "thread-test1234".into(),
+                workflow_name: "test-workflow".into(),
+                workflow_version: 1,
+                status: "completed".into(),
+                current_node: None,
+                completed_nodes: vec!["Done".into()],
+                in_flight_nodes: vec![],
+                last_verdict: Some("satisfied".into()),
+                visit_counts: std::collections::HashMap::new(),
+                started_at: "2026-05-16T00:00:00Z".into(),
+                updated_at: "2026-05-16T00:00:01Z".into(),
+            },
+        );
+
+        assert_eq!(
+            crate::server::routes::resolve_orchestrate_thread_id(&server.state, "arc-test1234"),
+            "thread-test1234"
+        );
+        assert_eq!(
+            crate::server::routes::resolve_orchestrate_thread_id(&server.state, "thread-test1234"),
+            "thread-test1234"
+        );
     }
 }

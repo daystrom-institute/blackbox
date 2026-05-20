@@ -57,3 +57,90 @@ impl BlackboxServer {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use serde_json::json;
+
+    use crate::packets::CompileParams;
+    use crate::server::state::SharedState;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[test]
+    fn arc_bound_warning_fires_on_residue_and_skips_system_ids() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        {
+            let store = server.state.packets.read();
+            store
+                .compile(&CompileParams {
+                    domain: "content-classification/arc-bound".into(),
+                    classification_lattice: Some(vec!["arc_bound".into(), "standing".into()]),
+                    prefix_inference: Some(
+                        [
+                            ("arc_".into(), "arc_bound".into()),
+                            ("standing_".into(), "standing".into()),
+                        ]
+                        .into(),
+                    ),
+                    rules: json!([
+                        {
+                            "id": "arc_named_migration",
+                            "antecedent": {
+                                "op": "StringContains",
+                                "field": "content",
+                                "needle": "3-tier migration",
+                                "case_insensitive": true
+                            },
+                            "consequent": "ARC_BOUND"
+                        },
+                        {
+                            "id": "standing_catchall",
+                            "classification": "standing",
+                            "emit": "fallback",
+                            "antecedent": {"op": "True"},
+                            "consequent": "STANDING"
+                        }
+                    ]),
+                    scope: Some("global".into()),
+                    project: None,
+                    source_ids: None,
+                    rank_table: None,
+                    rank_lookup_key: None,
+                    threshold_table: None,
+                    threshold_lookup_key: None,
+                })
+                .unwrap();
+        }
+
+        let nag_arc = server.arc_bound_warning(None, "For the 3-tier migration, avoid touching X");
+        assert!(
+            nag_arc
+                .as_deref()
+                .is_some_and(|s| s.contains("arc-bound") && s.contains("bbox_pin")),
+            "arc-bound content should produce a pin-steering nag: {nag_arc:?}"
+        );
+
+        let nag_standing = server.arc_bound_warning(None, "Prefer rustls over openssl");
+        assert!(
+            nag_standing.is_none(),
+            "standing content should not trigger a nag: {nag_standing:?}"
+        );
+
+        let nag_system = server.arc_bound_warning(
+            Some("bb-tool-reference"),
+            "For the 3-tier migration, avoid touching X",
+        );
+        assert!(
+            nag_system.is_none(),
+            "system-generated entries must be exempt from the nag: {nag_system:?}"
+        );
+    }
+}

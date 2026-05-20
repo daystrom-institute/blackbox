@@ -15,14 +15,12 @@ use crate::orchestration;
 use crate::orchestration::TaskStore;
 use crate::orchestration::providers::Provider;
 use crate::orchestration::tail::TailEvent;
-use crate::packets::{CompileParams, Packets};
+use crate::packets::Packets;
 use crate::pins::Pins;
 use crate::projects::ProjectRegistry;
 use crate::roadmap::Roadmap;
 use crate::server::dispatch::try_slack_proposal_signal_hook;
-use crate::server::state::{
-    ArcSnapshot, BlackboxServer, SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP,
-};
+use crate::server::state::{BlackboxServer, SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP};
 use crate::server::workflow_capabilities::validate_workflow_capabilities;
 use crate::server::{install_artifact_value, restore_runtime_artifacts_from_catalog};
 use crate::threads::Threads;
@@ -2267,110 +2265,6 @@ async fn agent_artifact_rejects_non_object() {
     assert!(
         err.contains("JSON object"),
         "expected 'JSON object' in error, got: {err}"
-    );
-}
-
-#[test]
-fn orchestrate_status_resolves_arc_id_to_arc_thread_id() {
-    let tmp = tempfile::tempdir().unwrap();
-    let server = test_server(&tmp);
-    server.state.running_arcs.write().insert(
-        "thread-test1234".into(),
-        ArcSnapshot {
-            arc_id: "arc-test1234".into(),
-            arc_thread_id: "thread-test1234".into(),
-            workflow_name: "test-workflow".into(),
-            workflow_version: 1,
-            status: "completed".into(),
-            current_node: None,
-            completed_nodes: vec!["Done".into()],
-            in_flight_nodes: vec![],
-            last_verdict: Some("satisfied".into()),
-            visit_counts: std::collections::HashMap::new(),
-            started_at: "2026-05-16T00:00:00Z".into(),
-            updated_at: "2026-05-16T00:00:01Z".into(),
-        },
-    );
-
-    assert_eq!(
-        crate::server::routes::resolve_orchestrate_thread_id(&server.state, "arc-test1234"),
-        "thread-test1234"
-    );
-    assert_eq!(
-        crate::server::routes::resolve_orchestrate_thread_id(&server.state, "thread-test1234"),
-        "thread-test1234"
-    );
-}
-
-#[test]
-fn arc_bound_warning_fires_on_residue_and_skips_system_ids() {
-    let tmp = tempfile::tempdir().unwrap();
-    let server = test_server(&tmp);
-
-    {
-        let store = server.state.packets.read();
-        store
-            .compile(&CompileParams {
-                domain: "content-classification/arc-bound".into(),
-                classification_lattice: Some(vec!["arc_bound".into(), "standing".into()]),
-                prefix_inference: Some(
-                    [
-                        ("arc_".into(), "arc_bound".into()),
-                        ("standing_".into(), "standing".into()),
-                    ]
-                    .into(),
-                ),
-                rules: json!([
-                    {
-                        "id": "arc_named_migration",
-                        "antecedent": {
-                            "op": "StringContains",
-                            "field": "content",
-                            "needle": "3-tier migration",
-                            "case_insensitive": true
-                        },
-                        "consequent": "ARC_BOUND"
-                    },
-                    {
-                        "id": "standing_catchall",
-                        "classification": "standing",
-                        "emit": "fallback",
-                        "antecedent": {"op": "True"},
-                        "consequent": "STANDING"
-                    }
-                ]),
-                scope: Some("global".into()),
-                project: None,
-                source_ids: None,
-                rank_table: None,
-                rank_lookup_key: None,
-                threshold_table: None,
-                threshold_lookup_key: None,
-            })
-            .unwrap();
-    }
-
-    let nag_arc = server.arc_bound_warning(None, "For the 3-tier migration, avoid touching X");
-    assert!(
-        nag_arc
-            .as_deref()
-            .is_some_and(|s| s.contains("arc-bound") && s.contains("bbox_pin")),
-        "arc-bound content should produce a pin-steering nag: {nag_arc:?}"
-    );
-
-    let nag_standing = server.arc_bound_warning(None, "Prefer rustls over openssl");
-    assert!(
-        nag_standing.is_none(),
-        "standing content should not trigger a nag: {nag_standing:?}"
-    );
-
-    let nag_system = server.arc_bound_warning(
-        Some("bb-tool-reference"),
-        "For the 3-tier migration, avoid touching X",
-    );
-    assert!(
-        nag_system.is_none(),
-        "system-generated entries must be exempt from the nag: {nag_system:?}"
     );
 }
 
