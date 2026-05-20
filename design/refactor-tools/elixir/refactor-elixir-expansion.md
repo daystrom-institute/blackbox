@@ -1,7 +1,7 @@
 ---
 title: "Elixir Refactor Expansion - plan kinds for atom-tag dispatch, GenServer concerns, and facade delegation"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -11,7 +11,7 @@ tags:
   - elixir
   - beam
 date: 2026-05-15
-status: "design proposal, pure design (no implementation phasing)"
+status: "implemented; archived after code audit"
 brief: "Designs an Elixir refactor surface mirroring the Rust/Java taxonomy where it transfers and adding plan kinds for the BEAM-specific patterns (multi-clause atom-tag dispatch, GenServer triplet boilerplate, defdelegate facades, quote-based codegen)."
 ---
 

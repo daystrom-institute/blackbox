@@ -1,7 +1,7 @@
 ---
 title: "Architecture Pathology"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -10,7 +10,7 @@ tags:
   - architecture
   - pathology
 date: 2026-05-16
-status: "proposal, awaiting review"
+status: "implemented; archived after code audit"
 brief: "PD-shaped forensic architecture workflow: spend LLM time only on bad-code and bad-architecture diagnoses that SAST cannot make, then emit a reviewed correction plan for phase-decompose remediation."
 ---
 

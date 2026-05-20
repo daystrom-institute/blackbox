@@ -1,7 +1,7 @@
 ---
 title: "C# Refactor Expansion - Roslyn-backed third language track"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -13,7 +13,7 @@ tags:
   - msbuild
 date: 2026-05-15
 revision: "rev 4.1 - codex round-4 converge cleanups (Phase 1/2 wording, lsp_verified_partial breadth, AppliedPlanDelta consistency)"
-status: "design proposal, pre-implementation"
+status: "implemented; archived after code audit"
 brief: "Designs the C# refactor track — plan kinds, RX-V4/V5 invariants, Roslyn sidecar architecture, and atoms calibrated to net10.0 + Roslyn source-generator pain."
 ---
 

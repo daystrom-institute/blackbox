@@ -1,7 +1,7 @@
 ---
 title: "Java Refactor Remaining Notes"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
