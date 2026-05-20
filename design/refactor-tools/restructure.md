@@ -1,34 +1,35 @@
 ---
 title: Restructure Proposal - Crate Topology
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - restructure
 tags:
   - refactor-tools
-brief: Live topology cleanup record for the crate restructure that drove the refactor tooling benchmark.
+brief: Archived topology cleanup record for the crate restructure that drove the refactor tooling benchmark.
 ---
 # Restructure Proposal: Crate Topology
 
 Date: 2026-05-05
-Status: topology implemented; decomposition follow-ups active; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; refreshed 2026-05-19
+Status: archived; topology and documented decomposition follow-ups implemented; moved from `design/proposed/` on 2026-05-12; moved to `design/refactor-tools/` on 2026-05-17; archived 2026-05-20
 Related: `design/refactor-tools/restructure-ast.md`
 
 Note: this plan is no longer a pure proposal. The repo now has a `[lib]`
-target, `src/packets/`, `src/server/`, `src/tools/`, and first-pass child
-splits under `src/tools/badgey/` and `src/workflow/engine/`. `src/main.rs` is
-now only the binary entry point, module declarations are owned by `src/lib.rs`,
-and daemon bootstrap has moved out of `src/main.rs` and through focused
-`src/server/` modules. Keep this document `lifecycle: partial` until the
-remaining live work below is implemented in code; do not archive it by moving
-unfinished work to roadmap entries.
+target, `src/packets/`, `src/server/`, `src/tools/`, and child splits under
+`src/tools/badgey/`, `src/tools/atoms/`, `src/workflow/engine/`,
+`src/workflow/ops/`, and `src/orchestration/providers/`. `src/main.rs` is only
+the binary entry point, module declarations are owned by `src/lib.rs`, daemon
+bootstrap has moved out of `src/main.rs` and through focused `src/server/`
+modules, and the documented root/packet/shared facade test islands have moved
+to local modules. No unfinished item from this document was satisfied by a
+roadmap or thread entry.
 
-## Remaining Work Before Archive
+## Archive State
 
-The original crate-topology goal is implemented. The completed entries below
-are retained as implementation context; the doc remains live only for the open
-large-module and test-locality cleanup that the topology move exposed:
+The original crate-topology goal and the follow-up decomposition/test-locality
+work tracked in this document are implemented. The entries below are retained as
+implementation context and archive evidence:
 
 1. **Completed: pay down the `src/lib.rs` compatibility prelude.**
    - Replace broad `use crate::*` dependencies with explicit imports when
@@ -46,16 +47,14 @@ large-module and test-locality cleanup that the topology move exposed:
      `src/tools/badgey/` child modules, and packet implementation modules
      `apply`, `audit`, `compile`, and `scanner` now use explicit imports.
      `src/server/routes.rs` no longer imports `super::*` / `crate::*`,
-     `src/tests.rs` no longer relies on the lib-root prelude,
      `src/workflow/engine/tests.rs` no longer imports the engine prelude
      wholesale, and several now-unused root compatibility imports/re-exports
      have been removed from `src/lib.rs`. `dispatch_mcp_url` is imported
      directly by `server/startup.rs` instead of being re-exported from the lib
-     root. The remaining shared packet test island no longer imports the packet
-     parent prelude wholesale. The root `SharedState` / `BlackboxServer` /
-     `ArcSnapshot` / bro-param compatibility reexports have been removed;
-     callers now import those symbols from `server::state` or
-     `tools::bro_params`.
+     root. The root `SharedState` / `BlackboxServer` / `ArcSnapshot` /
+     bro-param compatibility reexports have been removed; callers now import
+     those symbols from `server::state` or `tools::bro_params`. The old
+     `src/tests.rs` module no longer exists.
 
 2. **Completed: split `src/server/run.rs` by startup concern.**
    - `server/startup.rs` now owns logging, transcript-root discovery, Codex root
@@ -75,7 +74,7 @@ large-module and test-locality cleanup that the topology move exposed:
    - Keep `server/run.rs` as orchestration glue; do not replace it with another
      catch-all startup file.
 
-3. **Continue large-module decomposition where there is a cohesive boundary.**
+3. **Completed: split large modules where there was a cohesive boundary.**
    - `src/tools/atoms.rs`: keep public tool wrappers in the facade and move
      private implementation clusters into child modules. The first helper
      cluster now lives in `src/tools/atoms/helpers.rs`; invocation composition
@@ -84,10 +83,11 @@ large-module and test-locality cleanup that the topology move exposed:
      attachment polling, and action execution now live in
      `src/tools/atoms/supervision.rs`; atom manifest resolution, input schema
      validation, and profile/workflow/runner invocation backends now live in
-     `src/tools/atoms/invoke.rs`.
-   - `src/workflow/engine.rs`: continue extracting runner subsystems after the
-     landed `engine/fanout.rs`, `engine/provider_events.rs`, and
-     `engine/hooks.rs` splits. Arc bookkeeping, policy-packet checks, and
+     `src/tools/atoms/invoke.rs`; atom tests now live in
+     `src/tools/atoms/tests.rs`.
+   - `src/workflow/engine.rs`: runner subsystems have moved into
+     `engine/fanout.rs`, `engine/provider_events.rs`, and
+     `engine/hooks.rs`. Arc bookkeeping, policy-packet checks, and
      compaction anchors now live in `src/workflow/engine/arc_state.rs`. Sleep
      and signal wait node handling now lives in
      `src/workflow/engine/wait_nodes.rs`. The node dispatch coordinator
@@ -99,8 +99,8 @@ large-module and test-locality cleanup that the topology move exposed:
      handling now lives in `src/workflow/engine/ensemble_nodes.rs`, and
      embedded subworkflow execution now lives in
      `src/workflow/engine/subworkflow_nodes.rs`.
-   - `src/workflow/ops.rs`: split hook/action families when changing nearby
-     code. The vector-maintenance hook family now lives in
+   - `src/workflow/ops.rs`: hook/action families have been split. The
+     vector-maintenance hook family now lives in
      `src/workflow/ops/vector.rs`, and worktree create/remove helpers now live
      in `src/workflow/ops/worktree.rs`. System-event hook helpers now live in
      `src/workflow/ops/system_events.rs`, and JSON parse/normalization helpers
@@ -108,9 +108,12 @@ large-module and test-locality cleanup that the topology move exposed:
      hook helpers now live in `src/workflow/ops/auto_digest.rs`, and
      architecture-pathology request/plan helpers now live in
      `src/workflow/ops/arch_pathology.rs`. MCP/HTTP/shell side-effect helpers
-     now live in `src/workflow/ops/external.rs`.
-   - `src/orchestration/providers.rs`: split catalog, credentials, and provider
-     resolution when touching that area. The model/effort catalog now lives in
+     now live in `src/workflow/ops/external.rs`, variable helpers live in
+     `src/workflow/ops/vars.rs`, and ops tests now live in
+     `src/workflow/ops/tests.rs`.
+   - `src/orchestration/providers.rs`: catalog, credentials/session helpers,
+     provider event parsing, and argument construction have been split. The
+     model/effort catalog now lives in
      `src/orchestration/providers/catalog.rs`; session discovery and session-cwd
      resolution helpers now live in `src/orchestration/providers/session.rs`;
      provider event parsing now lives in
@@ -118,11 +121,11 @@ large-module and test-locality cleanup that the topology move exposed:
      dispatch-filter argument builders now live in
      `src/orchestration/providers/mcp_args.rs`; provider binary resolution,
      `ExecOpts`, provider-default suppression, and exec/resume argument builders
-     now live in `src/orchestration/providers/exec_args.rs`.
+     now live in `src/orchestration/providers/exec_args.rs`; provider tests now
+     live in `src/orchestration/providers/tests.rs`.
 
-4. **Improve test locality opportunistically.**
-   - Move `src/packets/tests.rs` cases into per-module `#[cfg(test)]` blocks
-     as packet modules change. Packet event/gap logging tests now live under
+4. **Completed: improve test locality for the broad islands this doc tracked.**
+   - Packet event/gap logging tests now live under
      `src/packets/events.rs` via `src/packets/events_tests.rs`, and
      self-heal scanner tests now live under `src/packets/scanner.rs`. JSON
      coercion helper tests now live under `src/packets/coerce.rs`. Dotted-path,
@@ -137,25 +140,20 @@ large-module and test-locality cleanup that the topology move exposed:
      domain-resolution tests now live under `src/packets/mod.rs`. `ApplyMode`
      serde tests now live under `src/packets/apply.rs`, and `Emit` serde tests
      plus classification-prefix inference tests now live under
-     `src/packets/ast.rs`.
+     `src/packets/ast.rs`. The old shared `src/packets/tests.rs` module no
+     longer exists.
    - Workflow engine unit tests now import the exact parent symbols they cover
      instead of using the parent module prelude.
-   - The remaining daemon-shaped unit test island in `src/tests.rs` now imports
-     its crate dependencies explicitly; moving it to integration tests remains
-     a separate locality cleanup.
    - Dispatch MCP startup URL tests now live in top-level integration test
      `tests/dispatch_mcp.rs` and use `blackbox::dispatch_mcp`.
-   - The remaining shared packet test island in `src/packets/tests.rs` now uses
-     explicit imports instead of `use super::*`; moving those cases into
-     per-module test blocks remains opportunistic locality work.
-   - Move daemon-startup-shaped tests to integration tests using `blackbox::`
-     imports.
+   - The old root unit-test island no longer exists; the remaining
+     system-event emit-site coverage now lives in
+     `src/system_events/integration_tests.rs`.
    - First locality cut landed outside packets: secret-header helper tests moved
      with the external workflow hook helpers in `src/workflow/ops/external.rs`.
 
-Archive criteria: this doc can become `lifecycle: archived` once these
-follow-ups are complete in code. Do not satisfy this criterion by creating
-roadmap/thread items for unfinished work.
+Archive criteria were met in code. This document was archived only after the
+tracked follow-ups were implemented, not by creating roadmap/thread items.
 The companion AST execution plan was a checkpoint artifact for the old
 mechanized sequence and now lives at
 `design/refactor-tools/restructure-ast.md`.
@@ -170,18 +168,17 @@ The crate originally had two god files and no library target:
 | `src/packets.rs` | 6,353 | Complete rule engine: AST, compiler, evaluator, fidelity auditor, self-heal scanner — plus a 3,443-line `#[cfg(test)]` block |
 
 That is no longer the current tree: the `[lib]` target exists and `packets`,
-`server`, and `tools` have been split. The remaining issue is not "no lib" or
-"binary owns daemon modules"; the remaining issue is continuing to split large
-domain modules into smaller implementation files and improving test locality.
+`server`, and `tools` have been split. The follow-up issue exposed by that
+move was splitting large domain modules into smaller implementation files and
+improving test locality; the items tracked in this document are now complete.
 
 Routing-related concerns are now mostly split: `src/routing.rs`,
 `src/webhooks.rs`, `src/pollers.rs`, `src/crons.rs`, `src/workflow/wait.rs`,
 `src/server/routes.rs`, and `src/server/tail.rs` exist as separate files.
-`src/mcp_tools/` contains the agentic graph helper set. The remaining
-concentration has shifted away from `main.rs` and into a few large but more
-domain-specific modules, especially `src/workflow/ops.rs`,
-`src/tools/atoms.rs`, `src/orchestration/providers.rs`, and route/test islands
-that still benefit from locality cleanup.
+`src/mcp_tools/` contains the agentic graph helper set. The concentration that
+shifted away from `main.rs` has been handled for the modules named in this
+document: `src/workflow/ops.rs`, `src/tools/atoms.rs`, and
+`src/orchestration/providers.rs` now have child implementation/test modules.
 
 ## Current Topology Breakdown
 
@@ -202,12 +199,8 @@ lines. It is no longer the 17K-line god file described above or even the
 | `src/server/mcp.rs` | 131 | Axum route assembly plus Streamable HTTP MCP service construction |
 | `src/server/shutdown.rs` | 129 | Signal handling, graceful HTTP shutdown, post-shutdown persistence and vector flush |
 
-The highest-value remaining topology work is no longer in `main.rs`. It is:
-
-1. Continue domain-local decomposition in the remaining large modules where a
-   cohesive boundary exists.
-2. Improve test locality so large shared unit-test islands move closer to the
-   modules they cover.
+The highest-value topology work named by this document is no longer in
+`main.rs` and has been completed in the domain-local modules listed above.
 
 ## Current Packets Breakdown
 
@@ -222,11 +215,8 @@ layout is:
 - `packets/coerce.rs` — JSON string-to-structure coercion
 - `packets/events.rs` — packet event logging
 - `packets/mod.rs` — store and public API
-- `packets/tests.rs` — remaining shared tests
-
-Remaining packet cleanup is test-locality work: move tests out of the shared
-`packets/tests.rs` island into per-module `#[cfg(test)]` blocks when making
-nearby packet changes.
+- `packets/test_support.rs` — shared test builders/helpers
+- `packets/*_tests.rs` — local module-owned test suites
 
 ## Proposed Structure
 
@@ -568,7 +558,7 @@ Split *during* the per-domain tools extraction (step 3 of the migration path), n
 ### 6. Tests relocate
 
 The old 4,534-line `#[cfg(test)]` block at the bottom of `main.rs` has been
-split out. Continue moving remaining broad test islands toward local tests:
+split out. The broad test islands tracked here have moved toward local tests:
 - Unit tests → `#[cfg(test)] mod tests` inside their now-small domain files
 - Integration tests → `tests/` directory, using `blackbox::` imports from the new lib
 
@@ -727,22 +717,19 @@ Landed:
     `src/packets/apply.rs` and `src/packets/ast.rs`.
 54. Classification-prefix inference tests moved from the packet test island to
     `src/packets/ast.rs`.
+55. Slack proposal signal hook tests moved from the root unit-test island to
+    `src/server/dispatch.rs`.
+56. Workflow/vector/semantic-edge/contradiction tests moved from the root
+    unit-test island to `src/workflow/ops/tests.rs`.
+57. System-event emit-site tests moved from the root unit-test island to
+    `src/system_events/integration_tests.rs`, and `src/tests.rs` was removed.
+58. Atom runtime/install tests moved from the `src/tools/atoms.rs` facade to
+    `src/tools/atoms/tests.rs`.
+59. Workflow hook-op tests moved from the `src/workflow/ops.rs` facade to
+    `src/workflow/ops/tests.rs`.
+60. Provider catalog/session/event/argument tests moved from the
+    `src/orchestration/providers.rs` facade to
+    `src/orchestration/providers/tests.rs`.
 
-Next useful cuts:
-
-1. **Keep splitting large domain modules by cohesive internals.**
-   - `workflow/ops.rs`, `tools/atoms.rs`, and `orchestration/providers.rs`
-     should only be split further where the next boundary is as clear as the
-     child modules already landed.
-
-2. **Improve test locality.**
-   - Continue moving remaining `packets/tests.rs` cases into per-module test
-     blocks; event/gap logging, scanner, JSON coercion, and dotted-path
-     predicate evaluator tests have moved, along with string-contains and
-     in-range evaluator tests, simple `CountMatches` evaluator tests, and
-     all-mode audit verifier tests. Predicate serde and value equality tests
-     have also moved.
-   - Move daemon-startup-shaped tests to top-level integration tests using
-     `blackbox::` imports.
-
-Each cut should remain a small `cargo check` / targeted-test verified commit.
+No next-cut list remains in this archive record; the tracked topology and
+locality work is complete.
