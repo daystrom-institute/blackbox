@@ -1,10 +1,16 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 
 use super::{CompiledWorkflow, NodeTransition, TERMINAL_SENTINEL, workflow_structured_exit};
+use crate::server::{BlackboxServer, state::SharedState};
 use crate::workflow::{compile, load_workflow};
+
+fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+    BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+}
 
 fn mini_compiled() -> CompiledWorkflow {
     let json = r#"{
@@ -222,4 +228,214 @@ fn render_with(outputs: &HashMap<String, String>, template: &str) -> String {
         out = out.replace(&key, output);
     }
     out
+}
+#[tokio::test]
+async fn run_workflow_at_depth_rejects_past_ceiling() {
+    // A direct smoke test for the fix driven by the self-audit
+    // live validation: the subworkflow depth counter used to live
+    // in a per-runner HashMap, so nested runners silently reset
+    // it. Now it's threaded through run_workflow_at_depth so the
+    // ceiling is enforced globally across the composition chain.
+    use crate::workflow::{compile, engine, load_workflow};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+
+    // Minimal valid workflow — doesn't actually matter since the
+    // depth check short-circuits before any dispatch.
+    let json = r#"{
+        "name": "depth-test",
+        "version": 1,
+        "actors": {"a": {"kind": "executor", "brofile": "b"}},
+        "nodes": {"N": {"actor": "a", "next": {"type": "terminal"}}},
+        "start": "N"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+
+    // At exactly MAX_COMPOSITION_DEPTH: should proceed (no error
+    // from depth check). We don't actually dispatch because there's
+    // no brofile "b" on this test server — but we confirm the
+    // depth check isn't the thing that errors it out.
+    let at_ceiling = engine::run_workflow_at_depth(
+        &server,
+        &compiled,
+        None,
+        Some(1),
+        engine::MAX_COMPOSITION_DEPTH,
+        std::collections::HashMap::new(),
+        serde_json::Map::new(),
+        None,
+    )
+    .await;
+    assert!(
+        !at_ceiling
+            .status
+            .starts_with("error: subworkflow composition depth"),
+        "at-ceiling depth should not be rejected by the depth guard; got: {}",
+        at_ceiling.status
+    );
+
+    // Past ceiling: short-circuit with a depth-error status.
+    let past_ceiling = engine::run_workflow_at_depth(
+        &server,
+        &compiled,
+        None,
+        Some(1),
+        engine::MAX_COMPOSITION_DEPTH + 1,
+        std::collections::HashMap::new(),
+        serde_json::Map::new(),
+        None,
+    )
+    .await;
+    assert!(
+        past_ceiling
+            .status
+            .starts_with("error: subworkflow composition depth"),
+        "past-ceiling should error on depth; got: {}",
+        past_ceiling.status
+    );
+    assert!(past_ceiling.events.is_empty());
+    assert!(past_ceiling.arc_thread_id.is_none());
+}
+
+#[tokio::test]
+async fn workflow_foreach_runtime_collects_child_exports() {
+    use crate::workflow::{compile, engine, load_workflow};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let json = r#"{
+        "name": "foreach-runtime",
+        "version": 1,
+        "actors": {},
+        "vars_schema": {
+            "parent": {"kind": "string"},
+            "results": {"kind": "array"}
+        },
+        "nodes": {
+            "Each": {
+                "actor": "",
+                "foreach": {
+                    "items": ["a", "b"],
+                    "as_var": "item",
+                    "index_as": "idx",
+                    "key": "${vars.item}-${vars.idx}",
+                    "imports": ["parent"],
+                    "exports": ["summary"],
+                    "collect": {"into_var": "results"},
+                    "subworkflow": {
+                        "name": "foreach-child",
+                        "version": 1,
+                        "actors": {},
+                        "vars_schema": {
+                            "item": {"kind": "string"},
+                            "idx": {"kind": "int"},
+                            "parent": {"kind": "string"},
+                            "summary": {"kind": "object"}
+                        },
+                        "nodes": {
+                            "Make": {
+                                "actor": "",
+                                "on_enter": [{
+                                    "op": "set_var",
+                                    "args": {
+                                        "key": "summary",
+                                        "value": {
+                                            "item": "${vars.item}",
+                                            "idx": "${vars.idx}",
+                                            "parent": "${vars.parent}"
+                                        }
+                                    }
+                                }],
+                                "next": {"type": "terminal"}
+                            }
+                        },
+                        "start": "Make"
+                    }
+                },
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Each"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+    let mut vars = serde_json::Map::new();
+    vars.insert("parent".into(), Value::String("p0".into()));
+    let result =
+        engine::run_workflow_with_initial_vars(&server, &compiled, None, Some(20), vars).await;
+
+    assert_eq!(result.status, "completed", "events: {:?}", result.events);
+    let rows = result
+        .vars
+        .get("results")
+        .and_then(Value::as_array)
+        .expect("results array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0]["status"], "completed");
+    assert_eq!(rows[0]["key"], "a-0");
+    assert_eq!(rows[0]["exports"]["summary"]["item"], "a");
+    assert_eq!(rows[1]["exports"]["summary"]["idx"], 1);
+}
+
+#[tokio::test]
+async fn subworkflow_snapshot_completed_nodes_exclude_seeded_parent_outputs() {
+    use crate::workflow::{compile, engine, load_workflow};
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let json = r#"{
+        "name": "parent-with-seed",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "ParentOnly": {
+                "actor": "",
+                "prompt": "parent-output",
+                "next": {"type": "goto", "to": "Sub"}
+            },
+            "Sub": {
+                "actor": "",
+                "subworkflow": {
+                    "name": "child-only",
+                    "version": 1,
+                    "actors": {},
+                    "nodes": {
+                        "ChildOnly": {
+                            "actor": "",
+                            "prompt": "child saw ${outputs.ParentOnly}",
+                            "next": {"type": "terminal"}
+                        }
+                    },
+                    "start": "ChildOnly"
+                },
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "ParentOnly"
+    }"#;
+    let compiled = compile(load_workflow(json).unwrap()).unwrap();
+    let result = engine::run_workflow_with_initial_vars(
+        &server,
+        &compiled,
+        None,
+        Some(20),
+        serde_json::Map::new(),
+    )
+    .await;
+
+    assert_eq!(result.status, "completed", "events: {:?}", result.events);
+    let child_snapshot = server
+        .state
+        .running_arcs
+        .read()
+        .values()
+        .find(|snapshot| snapshot.workflow_name == "child-only")
+        .cloned()
+        .expect("child snapshot");
+    assert_eq!(child_snapshot.status, "completed");
+    assert_eq!(child_snapshot.completed_nodes, vec!["ChildOnly"]);
+    assert!(
+        !child_snapshot
+            .completed_nodes
+            .iter()
+            .any(|node| node == "ParentOnly"),
+        "seeded parent output must remain template context, not child completion state"
+    );
 }
