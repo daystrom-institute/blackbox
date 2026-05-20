@@ -17,6 +17,7 @@ clients.
 
 - [MCP Surfaces](mcp-surfaces.md)
 - [MCP Surfaces - Implementation Plan](mcp-surfaces-impl.md)
+- [Context Clipboard Tools](context-clipboard-tools.md)
 
 ## Crosscuts
 

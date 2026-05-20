@@ -18,6 +18,7 @@ refactor runs, language-specific expansion, and refactor atoms.
 
 - [AST-Assisted Refactor Mechanization](ast-refactor-mechanization.md)
 - [Refactor Compound Runs](refactor-compound-runs.md)
+- [Context Clipboard Refactor Primitives](context-clipboard-refactor-primitives.md)
 - [Crate Topology Restructure](restructure.md)
 - [AST-Grounded Restructure Execution Plan](restructure-ast.md)
 - [Refactor Surface Benchmark](refactor-restructure-benchmark.md)
