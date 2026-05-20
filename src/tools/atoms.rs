@@ -725,8 +725,22 @@ impl BlackboxServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::artifacts::{self, ArtifactInstallParams};
+    use crate::server::install_artifact_value;
+    use crate::server::state::SharedState;
+    use crate::server::workflow_capabilities::validate_workflow_capabilities;
     use crate::tools::atoms::helpers::bounded_effect_u64;
+    use crate::workflow;
     use std::sync::Arc;
+
+    fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
+        BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
+
+    fn extract_text(result: &CallToolResult) -> String {
+        let wire = serde_json::to_value(result).unwrap();
+        wire["content"][0]["text"].as_str().unwrap().to_string()
+    }
 
     fn make_task(
         server: &BlackboxServer,
@@ -1051,5 +1065,515 @@ mod tests {
             unrelated_task.inner.lock().status,
             orchestration::TaskStatus::Running
         ));
+    }
+    fn deterministic_echo_atom(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "_contract": "atom/v1",
+            "kind": "atom",
+            "name": name,
+            "version": 1,
+            "manifest": {
+                "description": "Echo deterministic atom for runtime tests.",
+                "when_to_use": ["when testing deterministic atom invocation"],
+                "inputs": {
+                    "schema": {
+                        "type": "object",
+                        "additionalProperties": true
+                    }
+                },
+                "outputs": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["echo"],
+                        "properties": {
+                            "echo": {}
+                        }
+                    }
+                },
+                "effects": {
+                    "writes_files": false,
+                    "dispatches_runs": 0,
+                    "max_depth": 0,
+                    "uses_network": false
+                },
+                "composition": {
+                    "may_invoke_atoms": {"kind": "none"}
+                },
+                "implementation": {
+                    "kind": "deterministic",
+                    "runner": "echo"
+                }
+            }
+        })
+    }
+
+    fn badgey_adapter_atom(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "_contract": "atom/v1",
+            "kind": "atom",
+            "name": name,
+            "version": 1,
+            "manifest": {
+                "description": "Badgey adapter atom for runtime tests.",
+                "when_to_use": ["when testing adapter atom invocation"],
+                "inputs": {
+                    "schema": {"type": "object", "additionalProperties": true}
+                },
+                "outputs": {
+                    "schema": {
+                        "type": "object",
+                        "required": ["adapter", "accepted"],
+                        "properties": {
+                            "adapter": {"const": "badgey"},
+                            "accepted": {"const": true}
+                        }
+                    }
+                },
+                "effects": {
+                    "writes_files": false,
+                    "dispatches_runs": 0,
+                    "max_depth": 0,
+                    "uses_network": false
+                },
+                "composition": {
+                    "may_invoke_atoms": {"kind": "none"}
+                },
+                "implementation": {
+                    "kind": "adapter",
+                    "adapter_name": "badgey"
+                }
+            }
+        })
+    }
+
+    fn workflow_wrapper_atom(name: &str, workflow_ref: &str) -> serde_json::Value {
+        serde_json::json!({
+            "_contract": "atom/v1",
+            "kind": "atom",
+            "name": name,
+            "version": 1,
+            "manifest": {
+                "description": "Workflow-backed atom for runtime tests.",
+                "when_to_use": ["when testing workflow atom invocation"],
+                "inputs": {
+                    "schema": {"type": "object", "additionalProperties": true}
+                },
+                "effects": {
+                    "writes_files": false,
+                    "dispatches_runs": 1,
+                    "max_depth": 0,
+                    "uses_network": false
+                },
+                "composition": {
+                    "may_invoke_atoms": {"kind": "none"}
+                },
+                "implementation": {
+                    "kind": "workflow",
+                    "workflow_ref": workflow_ref
+                }
+            }
+        })
+    }
+    #[tokio::test]
+    async fn atom_invoke_deterministic_runner_returns_terminal_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "echo-atom.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            deterministic_echo_atom("echo-atom"),
+        )
+        .await
+        .unwrap();
+
+        let invoke = server
+            .atom_invoke(Parameters(AtomInvokeParams {
+                atom: "atom:echo-atom@v1".into(),
+                args: serde_json::json!({"message": "hello"}),
+                project_dir: None,
+                owner: Some("operator:test".into()),
+                parent_invocation_id: None,
+                runtime: None,
+                supervision_override: None,
+                suppress_auto_supervision: false,
+            }))
+            .await;
+        assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&invoke)).unwrap();
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["data"]["echo"]["message"], "hello");
+        assert_eq!(body["output_shape"]["valid"], true);
+
+        let status = server.atom_status(Parameters(AtomStatusParams {
+            invocation_id: body["invocation_id"].as_str().unwrap().to_string(),
+            owner: Some("operator:test".into()),
+        }));
+        assert_ne!(status.is_error, Some(true), "{}", extract_text(&status));
+        let trace: serde_json::Value = serde_json::from_str(&extract_text(&status)).unwrap();
+        assert_eq!(trace["implementation_kind"], "deterministic");
+        assert_eq!(trace["state"], "succeeded");
+        assert_eq!(trace["effects_observed"]["dispatches_runs"], 0);
+        assert_eq!(trace["output_shape"]["valid"], true);
+    }
+
+    #[tokio::test]
+    async fn atom_invoke_adapter_runner_returns_terminal_trace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "badgey-adapter.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            badgey_adapter_atom("badgey-adapter"),
+        )
+        .await
+        .unwrap();
+
+        let invoke = server
+            .atom_invoke(Parameters(AtomInvokeParams {
+                atom: "atom:badgey-adapter@v1".into(),
+                args: serde_json::json!({"brief": "hello badgey"}),
+                project_dir: None,
+                owner: Some("operator:test".into()),
+                parent_invocation_id: None,
+                runtime: None,
+                supervision_override: None,
+                suppress_auto_supervision: false,
+            }))
+            .await;
+        assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&invoke)).unwrap();
+        assert_eq!(body["status"], "succeeded");
+        assert_eq!(body["data"]["adapter"], "badgey");
+        assert_eq!(body["data"]["accepted"], true);
+        assert_eq!(body["output_shape"]["valid"], true);
+    }
+
+    #[tokio::test]
+    async fn shipped_refactor_atom_installs_after_persona_brofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let brofile: serde_json::Value = serde_json::from_str(include_str!(
+            "../../system-defaults/brofiles/refactor/rust-refactor-persona.json"
+        ))
+        .unwrap();
+        let atom: serde_json::Value = serde_json::from_str(include_str!(
+            "../../system-defaults/atoms/refactor/rust-test-island-extract.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "system-defaults/brofiles/refactor/rust-refactor-persona.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            brofile,
+        )
+        .await
+        .unwrap();
+        let meta = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "system-defaults/atoms/refactor/rust-test-island-extract.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            atom,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(meta.kind, artifacts::ArtifactKind::Atom);
+        assert_eq!(meta.name, "rust-test-island-extract");
+        assert!(meta.active);
+    }
+
+    #[tokio::test]
+    async fn shipped_rust_batch2_atoms_install_after_persona_brofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let brofile: serde_json::Value = serde_json::from_str(include_str!(
+            "../../system-defaults/brofiles/refactor/rust-refactor-persona.json"
+        ))
+        .unwrap();
+
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "system-defaults/brofiles/refactor/rust-refactor-persona.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            brofile,
+        )
+        .await
+        .unwrap();
+
+        let atoms = [
+            (
+                "system-defaults/atoms/refactor/rust-rename-symbol.json",
+                "rust-rename-symbol",
+                include_str!("../../system-defaults/atoms/refactor/rust-rename-symbol.json"),
+            ),
+            (
+                "system-defaults/atoms/refactor/rust-extract-to-submodule.json",
+                "rust-extract-to-submodule",
+                include_str!("../../system-defaults/atoms/refactor/rust-extract-to-submodule.json"),
+            ),
+            (
+                "system-defaults/atoms/refactor/rust-organize-imports.json",
+                "rust-organize-imports",
+                include_str!("../../system-defaults/atoms/refactor/rust-organize-imports.json"),
+            ),
+            (
+                "system-defaults/atoms/refactor/rust-cargo-add-dep.json",
+                "rust-cargo-add-dep",
+                include_str!("../../system-defaults/atoms/refactor/rust-cargo-add-dep.json"),
+            ),
+        ];
+
+        for (source, expected_name, body) in atoms {
+            let atom: serde_json::Value = serde_json::from_str(body).unwrap();
+            let meta = install_artifact_value(
+                &server.state,
+                ArtifactInstallParams {
+                    kind: artifacts::ArtifactKind::Atom,
+                    source: source.into(),
+                    name: None,
+                    version: None,
+                    supersedes: None,
+                },
+                atom,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(meta.kind, artifacts::ArtifactKind::Atom);
+            assert_eq!(meta.name, expected_name);
+            assert!(meta.active);
+        }
+    }
+
+    #[tokio::test]
+    async fn atom_invoke_workflow_wrapper_returns_workflow_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_json = r#"{
+        "name": "hook-workflow",
+        "version": 1,
+        "actors": {},
+        "nodes": {
+            "Done": {
+                "prompt": "workflow complete",
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Done"
+    }"#;
+        let workflow_spec = workflow::load_workflow(workflow_json).unwrap();
+        server
+            .state
+            .workflow_registry
+            .write()
+            .insert("hook-workflow".into(), workflow_spec);
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "workflow-wrapper.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_wrapper_atom("workflow-wrapper", "workflow:hook-workflow@v1"),
+        )
+        .await
+        .unwrap();
+
+        let invoke = server
+            .atom_invoke(Parameters(AtomInvokeParams {
+                atom: "atom:workflow-wrapper@v1".into(),
+                args: serde_json::json!({}),
+                project_dir: None,
+                owner: Some("operator:test".into()),
+                parent_invocation_id: None,
+                runtime: None,
+                supervision_override: None,
+                suppress_auto_supervision: false,
+            }))
+            .await;
+        assert_ne!(invoke.is_error, Some(true), "{}", extract_text(&invoke));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&invoke)).unwrap();
+        let task_id = body["task_id"].as_str().unwrap().to_string();
+        let task = server.state.task_store.read().get(&task_id).unwrap();
+        assert!(orchestration::wait_for_task_with_timeout(&task, Some(2.0)).await);
+
+        let status = server.atom_status(Parameters(AtomStatusParams {
+            invocation_id: body["invocation_id"].as_str().unwrap().to_string(),
+            owner: Some("operator:test".into()),
+        }));
+        assert_ne!(status.is_error, Some(true), "{}", extract_text(&status));
+        let trace: serde_json::Value = serde_json::from_str(&extract_text(&status)).unwrap();
+        assert_eq!(trace["implementation_kind"], "workflow");
+        assert_eq!(trace["state"], "succeeded");
+        assert_eq!(trace["cost"]["dispatched_runs"], 1);
+    }
+
+    #[tokio::test]
+    async fn workflow_atom_rejects_underdeclared_raw_actor_dispatch_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let workflow_json = r#"{
+        "name": "actor-workflow",
+        "version": 1,
+        "actors": {
+            "worker": {"kind": "executor", "brofile": "missing-worker"}
+        },
+        "nodes": {
+            "Work": {
+                "actor": "worker",
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Work"
+    }"#;
+        server.state.workflow_registry.write().insert(
+            "actor-workflow".into(),
+            workflow::load_workflow(workflow_json).unwrap(),
+        );
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "underdeclared-workflow.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            workflow_wrapper_atom("underdeclared-workflow", "workflow:actor-workflow@v1"),
+        )
+        .await
+        .unwrap();
+
+        let invoke = server
+            .atom_invoke(Parameters(AtomInvokeParams {
+                atom: "atom:underdeclared-workflow@v1".into(),
+                args: serde_json::json!({}),
+                project_dir: None,
+                owner: Some("operator:test".into()),
+                parent_invocation_id: None,
+                runtime: None,
+                supervision_override: None,
+                suppress_auto_supervision: false,
+            }))
+            .await;
+        assert_eq!(invoke.is_error, Some(true));
+        assert!(extract_text(&invoke).contains("dispatches_runs_exhausted"));
+    }
+
+    #[tokio::test]
+    async fn atom_binding_workflow_invokes_deterministic_atom() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "echo-atom.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            deterministic_echo_atom("workflow-echo"),
+        )
+        .await
+        .unwrap();
+
+        let workflow_json = r#"{
+        "name": "workflow-atom-binding-runtime",
+        "version": 1,
+        "actors": {},
+        "vars_schema": {
+            "message": {"kind": "string"}
+        },
+        "atom_bindings": {
+            "echo": {
+                "atom_ref": "atom:workflow-echo@v1",
+                "limits": {"dispatches_runs": 0}
+            }
+        },
+        "nodes": {
+            "Echo": {
+                "atom": "echo",
+                "atom_args": {"message": "${vars.message}"},
+                "next": {"type": "terminal"}
+            }
+        },
+        "start": "Echo"
+    }"#;
+        let spec = workflow::load_workflow(workflow_json).unwrap();
+        let compiled = workflow::compile(spec).unwrap();
+        validate_workflow_capabilities(&compiled, &server.state).unwrap();
+        let result = workflow::run_workflow_with_initial_vars(
+            &server,
+            &compiled,
+            None,
+            Some(10),
+            serde_json::Map::from_iter([(
+                "message".to_string(),
+                serde_json::Value::String("from workflow".into()),
+            )]),
+        )
+        .await;
+        assert_eq!(result.status, "completed");
+        let output: serde_json::Value = serde_json::from_str(&result.node_outputs["Echo"]).unwrap();
+        assert_eq!(output["implementation_kind"], "deterministic");
+        assert_eq!(output["state"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn atom_install_rejects_unknown_deterministic_runner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let mut atom = deterministic_echo_atom("bad-runner");
+        atom["manifest"]["implementation"]["runner"] = serde_json::json!("missing-runner");
+        let result = install_artifact_value(
+            &server.state,
+            ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Atom,
+                source: "bad-runner.json".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            atom,
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("unknown deterministic")
+        );
     }
 }
