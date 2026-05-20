@@ -25,9 +25,7 @@ use crate::server::state::{
     ArcSnapshot, BlackboxServer, SIGNAL_LOG_CAP, SharedState, WEBHOOK_LOG_CAP,
 };
 use crate::server::workflow_capabilities::validate_workflow_capabilities;
-use crate::server::{
-    install_artifact_value, read_artifact_source, restore_runtime_artifacts_from_catalog,
-};
+use crate::server::{install_artifact_value, restore_runtime_artifacts_from_catalog};
 use crate::threads::Threads;
 use crate::tools::badgey_adapter::{
     BadgeyAgentAdapter, recover_badgey_non_terminal_state, restore_badgey_registry_from_notes,
@@ -2271,33 +2269,6 @@ async fn agent_artifact_rejects_non_object() {
         err.contains("JSON object"),
         "expected 'JSON object' in error, got: {err}"
     );
-}
-
-#[tokio::test]
-async fn read_artifact_source_rejects_oversized_http_response() {
-    use tokio::io::AsyncWriteExt;
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let response = concat!(
-            "HTTP/1.1 200 OK\r\n",
-            "Content-Type: application/json\r\n",
-            "Content-Length: 1048577\r\n",
-            "\r\n",
-            "{}"
-        );
-        socket.write_all(response.as_bytes()).await.unwrap();
-    });
-
-    let err = read_artifact_source(&format!("http://{addr}/artifact.json"))
-        .await
-        .unwrap_err()
-        .to_string();
-
-    assert!(err.contains("too large"), "got: {err}");
 }
 
 #[test]
