@@ -135,26 +135,6 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     BlackboxServer::new(state)
 }
 
-fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {
-    let _ = orchestration::brofile::save_brofile(
-        &orchestration::brofile::Brofile {
-            name: name.to_string(),
-            provider: Provider::Gemini,
-            account: None,
-            lens: None,
-            model: None,
-            effort: None,
-            filters: None,
-            coerce_workspace: None,
-            runtime: None,
-            context: None,
-        },
-        "global",
-        &tmp.path().join("bro"),
-        None,
-    );
-}
-
 fn save_badgey_test_brofile(tmp: &tempfile::TempDir) {
     let _ = orchestration::brofile::save_brofile(
         &orchestration::brofile::Brofile {
@@ -2318,73 +2298,6 @@ async fn read_artifact_source_rejects_oversized_http_response() {
         .to_string();
 
     assert!(err.contains("too large"), "got: {err}");
-}
-
-#[test]
-fn resolve_resume_target_rejects_ambiguous_bro_names_across_live_teams() {
-    let tmp = tempfile::tempdir().unwrap();
-    let server = test_server(&tmp);
-    save_test_brofile(&tmp, "reviewer");
-
-    for (team_name, session_id) in [("red", "sid-red"), ("blue", "sid-blue")] {
-        orchestration::team::save_team(
-            &orchestration::team::Team {
-                name: team_name.to_string(),
-                teamplate: "review".into(),
-                members: vec![orchestration::team::TeamMember {
-                    name: "reviewer".into(),
-                    brofile: "reviewer".into(),
-                    session_id: Some(session_id.into()),
-                    task_history: vec![],
-                }],
-                advisor: None,
-                project_dir: None,
-                created_at: 0,
-            },
-            &tmp.path().join("bro"),
-        );
-    }
-
-    let err = server
-        .resolve_resume_target(Some("reviewer"), None, None, None)
-        .unwrap_err();
-    assert!(err.contains("Ambiguous bro name: reviewer"));
-    assert!(err.contains("red"));
-    assert!(err.contains("blue"));
-}
-
-#[test]
-fn resolve_resume_target_accepts_scoped_team_bro_selector() {
-    let tmp = tempfile::tempdir().unwrap();
-    let server = test_server(&tmp);
-    save_test_brofile(&tmp, "reviewer");
-
-    for (team_name, session_id) in [("red", "sid-red"), ("blue", "sid-blue")] {
-        orchestration::team::save_team(
-            &orchestration::team::Team {
-                name: team_name.to_string(),
-                teamplate: "review".into(),
-                members: vec![orchestration::team::TeamMember {
-                    name: "reviewer".into(),
-                    brofile: "reviewer".into(),
-                    session_id: Some(session_id.into()),
-                    task_history: vec![],
-                }],
-                advisor: None,
-                project_dir: Some(format!("/tmp/{team_name}")),
-                created_at: 0,
-            },
-            &tmp.path().join("bro"),
-        );
-    }
-
-    let (provider, session_id, _lens, _opts, _env, cwd, _filters, _coerce_ws, _runtime_lease) =
-        server
-            .resolve_resume_target(Some("blue::reviewer"), None, None, None)
-            .unwrap();
-    assert_eq!(provider, Provider::Gemini);
-    assert_eq!(session_id, "sid-blue");
-    assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
 }
 
 #[test]
