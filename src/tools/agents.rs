@@ -936,6 +936,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    use crate::server::install_artifact_value;
     use crate::server::state::SharedState;
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
@@ -1275,5 +1276,421 @@ mod tests {
             .find(|a| a["name"] == "old-agent")
             .unwrap();
         assert_eq!(old["active"], false);
+    }
+    #[test]
+    fn bro_agent_describe_inline_brofile() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_test_agent(
+            &server.state.artifacts.read(),
+            "reviewer.json",
+            "reviewer",
+            1,
+            Some("normal"),
+        );
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "reviewer".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "reviewer");
+        assert_eq!(body["version"], "1");
+        assert_eq!(body["active"], true);
+        assert_eq!(body["brofile_kind"], "inline");
+        assert_eq!(body["brofile_provider"], "claude");
+        assert_eq!(body["embedding_status"], "pending");
+        assert!(body["manifest"].is_object());
+        assert!(body["merged_filters"].is_object());
+        assert!(body["brofile"].is_object());
+        assert_eq!(body["brofile"]["provider"], "claude");
+        assert!(body["install_warnings"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn bro_agent_describe_inline_brofile_filters_in_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        let manifest = serde_json::json!({
+            "description": "Agent with inline brofile filters.",
+            "when_to_use": ["when testing"],
+            "brofile_inline": {
+                "provider": "claude",
+                "filters": {
+                    "allow": ["mcp__blackbox__bbox_search"],
+                    "disallow": ["mcp__blackbox__bro_exec"]
+                }
+            },
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "inline-filtered.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "inline-filtered",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "inline-filtered".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let allow = body["merged_filters"]["allow"].as_array().unwrap();
+        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        assert!(
+            allow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            "inline allow should appear in merged: {allow:?}"
+        );
+        assert!(
+            disallow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            "inline disallow should appear in merged: {disallow:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_missing_is_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "nonexistent".into(),
+        }));
+        assert_eq!(result.is_error, Some(true));
+        let text = extract_text(&result);
+        assert!(text.contains("agent not found"), "got: {text}");
+    }
+
+    #[test]
+    fn bro_agent_describe_deny_wins_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        let manifest = serde_json::json!({
+            "description": "Agent where overlay allows what brofile denies.",
+            "when_to_use": ["when testing"],
+            "brofile_inline": {
+                "provider": "claude",
+                "filters": {
+                    "allow": ["mcp__blackbox__bbox_search"],
+                    "disallow": ["mcp__blackbox__bro_exec", "mcp__blackbox__bbox_cite"]
+                }
+            },
+            "filter_overlay": {
+                "allow": ["mcp__blackbox__bro_exec", "mcp__blackbox__bbox_cite"],
+                "disallow": []
+            },
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "conflict.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "conflict",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "conflict".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let allow = body["merged_filters"]["allow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        let disallow = body["merged_filters"]["disallow"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !allow.contains(&"mcp__blackbox__bro_exec"),
+            "overlay allow should be stripped by deny-wins: {allow:?}"
+        );
+        assert!(
+            !allow.contains(&"mcp__blackbox__bbox_cite"),
+            "overlay allow for cite should be stripped by deny-wins: {allow:?}"
+        );
+        assert!(
+            allow.contains(&"mcp__blackbox__bbox_search"),
+            "non-conflicting allow should survive: {allow:?}"
+        );
+        assert!(
+            disallow.contains(&"mcp__blackbox__bro_exec"),
+            "disallow should win: {disallow:?}"
+        );
+        assert!(
+            disallow.contains(&"mcp__blackbox__bbox_cite"),
+            "disallow should win for cite too: {disallow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_install_records_filter_conflict_warning() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "warning-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent where overlay conflicts are recorded.",
+                    "when_to_use": ["when testing filter warnings"],
+                    "brofile_inline": {
+                        "provider": "claude",
+                        "filters": {
+                            "allow": ["Read"],
+                            "disallow": ["Bash"]
+                        }
+                    },
+                    "filter_overlay": {
+                        "allow": ["Bash"],
+                        "disallow": ["Read"]
+                    }
+                }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "warning-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        let warnings = body["install_warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2, "warnings: {warnings:?}");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("Bash"))),
+            "allow/disallow conflict warning missing: {warnings:?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().is_some_and(|s| s.contains("Read"))),
+            "disallow/allow conflict warning missing: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_brofile_ref_resolved() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        use orchestration::brofile::Brofile;
+        use orchestration::mcp::McpFilters;
+        use orchestration::providers::Provider;
+        let bf = Brofile {
+            name: "auditor".into(),
+            provider: Provider::Claude,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: Some(McpFilters {
+                allow: vec![
+                    "mcp__blackbox__bbox_search".into(),
+                    "mcp__blackbox__bbox_cite".into(),
+                ],
+                disallow: vec!["mcp__blackbox__bro_exec".into()],
+            }),
+            coerce_workspace: None,
+            runtime: None,
+            context: None,
+        };
+        let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
+        let manifest = serde_json::json!({
+            "description": "Agent referencing a saved brofile.",
+            "when_to_use": ["when auditing"],
+            "brofile_ref": "auditor",
+        });
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "auditor-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "auditor-agent",
+                "version": 1,
+                "manifest": manifest,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "auditor-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["brofile_kind"], "ref");
+        assert_eq!(body["brofile_name"], "auditor");
+        assert_eq!(body["brofile_provider"], "claude");
+        assert!(body["brofile"].is_object());
+        assert_eq!(body["brofile"]["name"], "auditor");
+        assert_eq!(body["brofile"]["provider"], "claude");
+        let allow = body["merged_filters"]["allow"].as_array().unwrap();
+        let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
+        assert!(
+            allow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bbox_search")),
+            "brofile allow in merged: {allow:?}"
+        );
+        assert!(
+            disallow
+                .iter()
+                .any(|p| p.as_str() == Some("mcp__blackbox__bro_exec")),
+            "brofile disallow in merged: {disallow:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bro_agent_describe_flags_stale_brofile_ref() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "name": "review-persona",
+                "version": 1,
+                "provider": "claude",
+                "lens": "Review code."
+            }),
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Agent,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "kind": "agent",
+                "name": "stale-agent",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent with a brofile ref that will become stale.",
+                    "when_to_use": ["when testing stale refs"],
+                    "brofile_ref": "review-persona"
+                }
+            }),
+        )
+        .await
+        .unwrap();
+        install_artifact_value(
+            &server.state,
+            artifacts::ArtifactInstallParams {
+                kind: artifacts::ArtifactKind::Brofile,
+                source: "inline".into(),
+                name: None,
+                version: None,
+                supersedes: None,
+            },
+            serde_json::json!({
+                "name": "review-persona-v2",
+                "version": 2,
+                "supersedes": "review-persona",
+                "provider": "claude",
+                "lens": "Review code better."
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "stale-agent".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["degraded"]["manifest_stale"].as_bool(), Some(true));
+        assert!(
+            body["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|warning| warning
+                    .as_str()
+                    .is_some_and(|text| text.contains("review-persona-v2"))),
+            "expected stale warning: {body}"
+        );
+    }
+
+    #[test]
+    fn bro_agent_describe_degraded_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = &server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "broken.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "broken",
+                "version": 1,
+                "manifest": 42,
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let result = server.bro_agent_describe(Parameters(AgentDescribeParams {
+            agent: "broken".into(),
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["name"], "broken");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains("manifest parse failed")
+        );
     }
 }
