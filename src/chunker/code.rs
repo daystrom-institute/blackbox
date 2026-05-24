@@ -409,7 +409,7 @@ fn symbol_name(node: Node<'_>, source: &str, language: &str) -> Option<(String, 
     Some((bare.clone(), bare))
 }
 
-fn is_symbol_node(kind: &str) -> bool {
+pub(crate) fn is_symbol_node(kind: &str) -> bool {
     matches!(
         kind,
         "function_item"

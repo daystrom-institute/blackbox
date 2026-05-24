@@ -1301,3 +1301,108 @@ fn test_code_nav_single_file_tools_reject_oversize() {
     assert_eq!(describe_error.code, "file_too_large_for_code_nav");
     assert_eq!(describe_error.semantic_status, SEMANTIC_STATUS_SYNTAX_ONLY);
 }
+
+/// Breadth-first search for the first node of `kind` in a parsed tree.
+fn find_first_node_of_kind<'a>(
+    root: tree_sitter::Node<'a>,
+    kind: &str,
+) -> Option<tree_sitter::Node<'a>> {
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root);
+    while let Some(node) = queue.pop_front() {
+        if node.kind() == kind {
+            return Some(node);
+        }
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            queue.push_back(child);
+        }
+    }
+    None
+}
+
+/// Axis-1 spike: `is_containing_symbol_kind` is derived from the single
+/// canonical chunker `is_symbol_node` set, plus `impl_item`, minus parser
+/// roots, `package_declaration`, and `field_declaration`. Lock that contract.
+#[test]
+fn is_containing_symbol_kind_contract() {
+    // Symbol kinds that ARE valid containing scopes.
+    assert!(is_containing_symbol_kind("function_item"));
+    assert!(is_containing_symbol_kind("method_declaration"));
+    // impl_item is NOT in is_symbol_node (special-cased in symbol_name) —
+    // it must be accepted explicitly.
+    assert!(is_containing_symbol_kind("impl_item"));
+    // mod_item / method_spec are in is_symbol_node but were MISSING from the
+    // old hand-copied subset; the dedupe now covers them.
+    assert!(is_containing_symbol_kind("mod_item"));
+    assert!(is_containing_symbol_kind("method_spec"));
+
+    // Parser roots are excluded via is_root_kind.
+    assert!(!is_containing_symbol_kind("source_file"));
+    assert!(!is_containing_symbol_kind("program"));
+    // package_declaration is a symbol node but NOT a parser root — it must be
+    // excluded explicitly (R2 finding) so a Java package never resolves as a
+    // containing symbol.
+    assert!(!is_containing_symbol_kind("package_declaration"));
+    // field_declaration is a member, not an enclosing scope.
+    assert!(!is_containing_symbol_kind("field_declaration"));
+}
+
+/// Axis-1 spike: a matched-but-nameless container must NOT terminate the
+/// containing-symbol walk. A Go anonymous `interface_type` is a symbol node
+/// with no `name` field; the walk must climb past it to the enclosing named
+/// function rather than returning `None` (the pre-fix bug).
+#[test]
+fn containing_symbol_for_climbs_past_nameless_container() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("m.go");
+    fs::write(
+        &path,
+        "package main\nfunc Outer() {\n\tvar _ interface{ Foo() }\n}\n",
+    )
+    .unwrap();
+    let parsed = parse_code_nav_source(&path, None).unwrap();
+    // The anonymous interface literal — nameless, but a symbol node.
+    let iface = find_first_node_of_kind(parsed.tree.root_node(), "interface_type")
+        .expect("anonymous interface_type node present");
+    // Start the upward walk from inside the nameless container.
+    let inner = iface
+        .named_child(0)
+        .unwrap_or_else(|| iface.child(0).expect("interface has a child"));
+    let resolved = containing_symbol_for(inner, &parsed.source, &parsed.language);
+    assert_eq!(
+        resolved.as_deref(),
+        Some("Outer"),
+        "walk must climb past the nameless interface_type to the enclosing fn"
+    );
+}
+
+/// Axis-1 spike: `record_declaration` was matched by the Java branch in
+/// `refactor_status_item` but was absent from `is_refactor_item_kind`, making
+/// that branch unreachable. Adding it to the predicate makes a Java record
+/// resolve as a refactor item.
+#[test]
+fn java_record_resolves_as_refactor_item() {
+    // Predicate-level lock.
+    assert!(
+        is_refactor_item_kind("record_declaration"),
+        "record_declaration must be a refactor item kind"
+    );
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("Point.java");
+    // A call in a record-level field initializer: its nearest refactor-item
+    // ancestor is the record_declaration itself (not a method).
+    fs::write(
+        &path,
+        "package x;\nrecord Point(int a, int b) {\n  static final int Z = helper();\n  static int helper() { return 1; }\n}\n",
+    )
+    .unwrap();
+    let parsed = parse_code_nav_source(&path, None).unwrap();
+    let call = find_first_node_of_kind(parsed.tree.root_node(), "method_invocation")
+        .expect("method_invocation present");
+    let status = refactor_status_item(&parsed.source, &parsed.language, call)
+        .expect("a field-initializer call must resolve to its enclosing record");
+    assert_eq!(status.kind, "record_declaration");
+    assert_eq!(status.name.as_deref(), Some("Point"));
+}

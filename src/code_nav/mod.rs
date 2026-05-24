@@ -751,6 +751,7 @@ fn is_refactor_item_kind(kind: &str) -> bool {
             | "constructor_declaration"
             | "class_definition"
             | "class_declaration"
+            | "record_declaration"
             | "struct_item"
             | "struct_specifier"
             | "enum_item"
@@ -1648,10 +1649,54 @@ fn err_invalid_code_refs_kind(raw: &str) -> Result<String> {
     Ok(serde_json::to_string_pretty(&response)?)
 }
 
+/// Returns true when `kind` is a tree-sitter node kind that can act as a
+/// *containing symbol* for a reference. Built from the one canonical
+/// symbol-node set (`chunker::code::is_symbol_node`) rather than a
+/// hand-copied subset, plus `impl_item` (which `is_symbol_node` does not
+/// list — the chunker special-cases it in `symbol_name`), minus kinds that
+/// are not usable containing scopes:
+/// - parser/root wrappers (`is_root_kind`: source_file/program/module/...),
+/// - `package_declaration` (a symbol node, but not a parser root, so
+///   `is_root_kind` does not exclude it; a package is not a containing scope),
+/// - `field_declaration` (a member, not an enclosing scope).
+fn is_containing_symbol_kind(kind: &str) -> bool {
+    (crate::chunker::code::is_symbol_node(kind) || kind == "impl_item")
+        && !is_root_kind(kind)
+        && !matches!(kind, "field_declaration" | "package_declaration")
+}
+
+/// Resolve the display name of a containing-symbol ancestor node, or `None`
+/// when this particular node carries no usable name (e.g. an anonymous Go
+/// `interface_type`). `None` here means "keep climbing", not "give up".
+fn containing_symbol_name(
+    parent: tree_sitter::Node<'_>,
+    source: &str,
+    language: &str,
+) -> Option<String> {
+    if let Some(name_node) = parent.child_by_field_name("name") {
+        if let Ok(s) = name_node.utf8_text(source.as_bytes()) {
+            return Some(s.to_string());
+        }
+    }
+    // Rust impl headers have no `name` field — use the whole header text
+    // up to the body's `{`, mirroring `impl_header` from the chunker.
+    if language == "rust" && parent.kind() == "impl_item" {
+        if let Some(body) = parent.child_by_field_name("body") {
+            let header = &source[parent.start_byte()..body.start_byte()];
+            return Some(header.trim().to_string());
+        }
+    }
+    None
+}
+
 /// Walk up the tree from `node` and return the display name of the
-/// nearest symbol-producing ancestor (same notion of "containing
-/// symbol" as `SymbolSpec.parent_kind`). Best-effort — returns
-/// `None` at file top level or when no ancestor is symbol-producing.
+/// nearest *named* symbol-producing ancestor (same notion of "containing
+/// symbol" as `SymbolSpec.parent_kind`). Best-effort — returns `None` at
+/// file top level or when no named symbol ancestor exists.
+///
+/// A matched-but-nameless container (e.g. an anonymous Go `interface_type`)
+/// does NOT terminate the walk: we keep climbing to the next named symbol
+/// rather than returning `None` prematurely.
 fn containing_symbol_for(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -1659,47 +1704,11 @@ fn containing_symbol_for(
 ) -> Option<String> {
     let mut current = node.parent();
     while let Some(parent) = current {
-        // Skip wrapper nodes; only return when the AST node itself
-        // is one we'd treat as a symbol (function_item / impl_item /
-        // class_declaration / ...). Reuse chunker::code's predicate
-        // by emulating it inline — we keep the symbol-node set in
-        // exactly one place (the chunker) but can mirror enough of
-        // it here for the common cases.
-        let kind = parent.kind();
-        if matches!(
-            kind,
-            "function_item"
-                | "function_definition"
-                | "function_declaration"
-                | "method_definition"
-                | "method_declaration"
-                | "impl_item"
-                | "class_definition"
-                | "class_declaration"
-                | "struct_item"
-                | "enum_item"
-                | "enum_declaration"
-                | "trait_item"
-                | "interface_declaration"
-        ) {
-            // Find the `name` child of the ancestor; that's the
-            // display name we report.
-            if let Some(name_node) = parent.child_by_field_name("name") {
-                if let Ok(s) = name_node.utf8_text(source.as_bytes()) {
-                    return Some(s.to_string());
-                }
+        if is_containing_symbol_kind(parent.kind()) {
+            if let Some(name) = containing_symbol_name(parent, source, language) {
+                return Some(name);
             }
-            // Rust impl headers have no `name` field — use the
-            // whole header text up to the `{`.
-            if language == "rust" && kind == "impl_item" {
-                // Slice the source up to the body's start to
-                // mimic `impl_header` from the chunker.
-                if let Some(body) = parent.child_by_field_name("body") {
-                    let header = &source[parent.start_byte()..body.start_byte()];
-                    return Some(header.trim().to_string());
-                }
-            }
-            return None;
+            // Nameless container — keep climbing instead of giving up.
         }
         current = parent.parent();
     }
