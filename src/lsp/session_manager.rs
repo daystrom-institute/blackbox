@@ -39,10 +39,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use lsp_types::{
-    ClientCapabilities, CodeActionClientCapabilities, CodeActionKind, CodeActionKindLiteralSupport,
-    CodeActionLiteralSupport, InitializeParams, ResourceOperationKind,
-    TextDocumentClientCapabilities, WorkspaceClientCapabilities, WorkspaceEditClientCapabilities,
-    WorkspaceFolder,
+    CallHierarchyClientCapabilities, ClientCapabilities, CodeActionClientCapabilities,
+    CodeActionKind, CodeActionKindLiteralSupport, CodeActionLiteralSupport,
+    DocumentSymbolClientCapabilities, GotoCapability, HoverClientCapabilities, InitializeParams,
+    ReferenceClientCapabilities, ResourceOperationKind, TextDocumentClientCapabilities,
+    WorkspaceClientCapabilities, WorkspaceEditClientCapabilities, WorkspaceFolder,
+    WorkspaceSymbolClientCapabilities,
     notification::{Exit, Initialized, Notification},
     request::{Initialize, Request, Shutdown},
 };
@@ -710,6 +712,9 @@ fn build_init_params(project_root: &Path) -> Result<InitializeParams> {
                     ]),
                     ..Default::default()
                 }),
+                symbol: Some(WorkspaceSymbolClientCapabilities {
+                    ..Default::default()
+                }),
                 ..Default::default()
             }),
             text_document: Some(TextDocumentClientCapabilities {
@@ -721,6 +726,28 @@ fn build_init_params(project_root: &Path) -> Result<InitializeParams> {
                             ],
                         },
                     }),
+                    ..Default::default()
+                }),
+                document_symbol: Some(DocumentSymbolClientCapabilities {
+                    hierarchical_document_symbol_support: Some(true),
+                    ..Default::default()
+                }),
+                references: Some(ReferenceClientCapabilities {
+                    ..Default::default()
+                }),
+                definition: Some(GotoCapability {
+                    ..Default::default()
+                }),
+                type_definition: Some(GotoCapability {
+                    ..Default::default()
+                }),
+                implementation: Some(GotoCapability {
+                    ..Default::default()
+                }),
+                call_hierarchy: Some(CallHierarchyClientCapabilities {
+                    ..Default::default()
+                }),
+                hover: Some(HoverClientCapabilities {
                     ..Default::default()
                 }),
                 ..Default::default()
