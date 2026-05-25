@@ -113,7 +113,7 @@ impl ToolCategory {
                 "Instrumented file read, shell execution, and git operations for registered projects. Prefer these over raw Read/Bash/git when working inside a bbox-registered project — every call is indexed as a tool-call record and enriched with bbox context where relevant."
             }
             Self::Macros => {
-                "Register, inspect, and validate macro recipes. Macros are data-only synthesis plans stored as JSON files. Project macros live under `.bbox/macros/` (reviewable like source). User macros live in operator config. Builtins ship with Blackbox. This milestone covers read/registration only — planning (`macro_plan`), apply (`macro_apply`), and runner (`macro_run`) land in a later milestone."
+                "Register, inspect, plan, and execute macro recipes. Macros are data-only synthesis plans stored as JSON files. Project macros live under `.bbox/macros/` (reviewable like source). User macros live in operator config. Builtins ship with Blackbox. `macro_plan` produces a `MacroPlan` review artifact (read-only); `macro_apply` lowers a `MacroPlan` to a `RefactorPlan` and applies it to disk (requires `confirm=true`); `macro_run` combines plan + apply in one step."
             }
         }
     }

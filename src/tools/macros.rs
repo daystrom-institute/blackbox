@@ -122,8 +122,10 @@ pub struct MacroApplyParams {
     /// Must be `true` to execute. When omitted or `false`, returns an error.
     #[serde(default)]
     pub confirm: Option<bool>,
-    /// Working directory for path resolution. Optional; defaults to the
-    /// `project_dir` recorded in the plan.
+    /// Working directory for path resolution. Optional; when absent, `refactor::apply`
+    /// uses its own cwd logic. Note: `MacroPlan` does not record a `project_dir` field,
+    /// so there is no plan-recorded default to fall back to — pass the project directory
+    /// explicitly when worktree isolation checks (G15) are needed.
     #[serde(default)]
     pub cwd: Option<String>,
 }
@@ -589,7 +591,8 @@ impl BlackboxServer {
             Err(e) => return err_text(&format!("failed to serialize RefactorPlan: {e}")),
         };
 
-        let apply_params = build_macro_apply_params(plan_value, p.confirm, None);
+        let apply_params =
+            build_macro_apply_params(plan_value, p.confirm, Some(p.project_dir.clone()));
 
         // Capture a serialized copy of the plan for the response envelope
         let plan_json = serde_json::to_value(&plan).unwrap_or(serde_json::Value::Null);

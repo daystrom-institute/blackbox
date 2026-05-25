@@ -279,6 +279,11 @@ impl MacroPlanner {
                         ctx,
                     )?;
 
+                    // Residue surfacing: carry non-empty advisory fields forward as
+                    // review questions so they are NOT silently lost when lower()
+                    // constructs the lowered RefactorPlan (which resets them to empty).
+                    surface_delegate_residue(refactor_kind, &rp, &mut plan_questions);
+
                     // Dup-path guard across all delegates
                     for fe in &rp.edits {
                         register_path(&mut touched_paths, &fe.path)?;
@@ -532,10 +537,23 @@ fn build_provenance(def: &MacroDefinition) -> Value {
 /// Checks: required-field presence (from `schema.required`) and JSON type
 /// matching (from `schema.properties.<key>.type`) for each present key.
 /// Full JSON Schema evaluation is deferred to a later phase.
+///
+/// Fail-closed: a null/absent schema means no declared inputs (no constraints).
+/// A present-but-non-object schema is malformed and is rejected with
+/// `error.malformed_inputs_schema` rather than silently disabling validation.
 fn validate_inputs(inputs: &serde_json::Map<String, Value>, schema: &Value) -> Result<()> {
+    // Null/absent schema = legitimately no declared inputs — no constraints to enforce.
+    if schema.is_null() {
+        return Ok(());
+    }
     let schema_obj = match schema.as_object() {
         Some(o) => o,
-        None => return Ok(()), // no schema object — no constraints to enforce
+        None => bail!(
+            "error.malformed_inputs_schema: inputs_schema is present but is not a JSON object \
+             (got {}). A non-null inputs_schema must be a JSON object; null or absent schema \
+             means no declared inputs.",
+            json_type_name(schema)
+        ),
     };
 
     // Check required keys
@@ -578,7 +596,9 @@ fn validate_inputs(inputs: &serde_json::Map<String, Value>, schema: &Value) -> R
 fn json_type_matches(val: &Value, expected: &str) -> bool {
     match expected {
         "string" => val.is_string(),
-        "number" | "integer" => val.is_number(),
+        "number" => val.is_number(),
+        // JSON Schema distinguishes "integer" from "number": reject fractional values.
+        "integer" => val.is_i64() || val.is_u64(),
         "boolean" => val.is_boolean(),
         "null" => val.is_null(),
         "array" => val.is_array(),
@@ -765,6 +785,68 @@ fn plan_delegate(
     let consumed: HashSet<String> = rp.operator_opt_outs_used.iter().cloned().collect();
 
     Ok((rp, consumed))
+}
+
+/// Surface non-empty residue from a delegated [`RefactorPlan`] as review questions.
+///
+/// [`MacroPlanner::lower`] resets all advisory residue fields to empty when
+/// constructing the lowered `RefactorPlan` (they are not merged into the macro's
+/// `EditSet`). This function ensures that residue surviving the delegate plan is
+/// NOT silently dropped — it is carried forward in `MacroPlan.questions` for
+/// operator review before the plan is applied.
+///
+/// Called from the [`MacroOperation::DelegateRefactor`] arm of [`MacroPlanner::plan`].
+fn surface_delegate_residue(kind: &str, rp: &RefactorPlan, questions: &mut Vec<String>) {
+    // leftovers: Vec<String> — each entry is a distinct advisory message.
+    for leftover in &rp.leftovers {
+        questions.push(format!(
+            "[delegate {} residue: leftover] {}",
+            kind, leftover
+        ));
+    }
+    // Count-based residue fields: emit one question per non-empty field.
+    if !rp.items.is_empty() {
+        questions.push(format!(
+            "[delegate {} residue: {} item(s) not merged into macro edit set]",
+            kind,
+            rp.items.len()
+        ));
+    }
+    if !rp.external_calls.is_empty() {
+        questions.push(format!(
+            "[delegate {} residue: {} external_call(s) require operator review]",
+            kind,
+            rp.external_calls.len()
+        ));
+    }
+    if !rp.inherited_dependencies.is_empty() {
+        questions.push(format!(
+            "[delegate {} residue: {} inherited_dependenc(ies) require operator review]",
+            kind,
+            rp.inherited_dependencies.len()
+        ));
+    }
+    if !rp.remaining_source_accessors.is_empty() {
+        questions.push(format!(
+            "[delegate {} residue: {} remaining_source_accessor(s) require operator review]",
+            kind,
+            rp.remaining_source_accessors.len()
+        ));
+    }
+    if !rp.remaining_source_constant_refs.is_empty() {
+        questions.push(format!(
+            "[delegate {} residue: {} remaining_source_constant_ref(s) require operator review]",
+            kind,
+            rp.remaining_source_constant_refs.len()
+        ));
+    }
+    if !rp.captured_variables.is_empty() {
+        questions.push(format!(
+            "[delegate {} residue: {} captured_variable(s) require operator review]",
+            kind,
+            rp.captured_variables.len()
+        ));
+    }
 }
 
 /// Map a [`SemanticStatus`] to the equivalent [`MacroSemanticStatus`].
@@ -1473,6 +1555,122 @@ mod tests {
             plan.questions[0].contains("manual_wiring"),
             "question should include label: {}",
             plan.questions[0]
+        );
+    }
+
+    // ── Delegate residue surfaces in MacroPlan.questions ─────────────────────
+
+    #[test]
+    fn delegate_residue_surfaces_in_questions() {
+        use crate::refactor::{ExternalCall, ExtractedCallSite, PlanStatus};
+
+        // Construct a RefactorPlan with leftovers + external_calls residue.
+        // The dup-check and edit-merge paths in plan() are not exercised here —
+        // we test surface_delegate_residue directly (same file, accessible via
+        // `use super::*`).
+        let rp = RefactorPlan {
+            title: "test delegate plan".into(),
+            kind: "extract_java_methods".into(),
+            semantic_status: crate::refactor::SemanticStatus::SyntaxOnly,
+            dry_run: true,
+            file_moves: vec![],
+            file_creates: vec![],
+            edits: vec![],
+            validations: vec![],
+            items: vec![],
+            leftovers: vec![
+                "MyHelper.doWork() is not in the extraction set".into(),
+                "AnotherHelper.process() is external".into(),
+            ],
+            captured_variables: vec![],
+            remaining_source_accessors: vec![],
+            remaining_source_constant_refs: vec![],
+            external_calls: vec![ExternalCall {
+                method: "compute".into(),
+                signature: "void compute()".into(),
+                signature_partial: false,
+                source_visibility: None,
+                source_is_static: false,
+                recommended_resolution: None,
+                call_sites: vec![ExtractedCallSite {
+                    line: 10,
+                    column: 4,
+                    in_method: "run".into(),
+                    context: "direct".into(),
+                }],
+            }],
+            inherited_dependencies: vec![],
+            deep_analysis: None,
+            plan_status: PlanStatus::Planned,
+            fixme_count: None,
+            operator_opt_outs_used: vec![],
+        };
+
+        let mut questions: Vec<String> = vec![];
+        surface_delegate_residue("extract_java_methods", &rp, &mut questions);
+
+        // 2 leftovers + 1 external_calls count = 3 questions total
+        assert_eq!(
+            questions.len(),
+            3,
+            "expected 2 leftover questions + 1 external_calls question; got: {:?}",
+            questions
+        );
+
+        assert!(
+            questions[0].contains("leftover") && questions[0].contains("MyHelper.doWork()"),
+            "first leftover must surface with kind prefix: {}",
+            questions[0]
+        );
+        assert!(
+            questions[0].contains("extract_java_methods"),
+            "question must include delegate kind: {}",
+            questions[0]
+        );
+        assert!(
+            questions[1].contains("leftover") && questions[1].contains("AnotherHelper"),
+            "second leftover must surface: {}",
+            questions[1]
+        );
+        assert!(
+            questions[2].contains("external_call") && questions[2].contains("1"),
+            "external_calls count (1) must surface: {}",
+            questions[2]
+        );
+    }
+
+    #[test]
+    fn delegate_residue_empty_plan_adds_no_questions() {
+        // A plan with all-empty residue fields must not produce any questions.
+        let rp = RefactorPlan {
+            title: "clean plan".into(),
+            kind: "create_file".into(),
+            semantic_status: crate::refactor::SemanticStatus::SyntaxOnly,
+            dry_run: true,
+            file_moves: vec![],
+            file_creates: vec![],
+            edits: vec![],
+            validations: vec![],
+            items: vec![],
+            leftovers: vec![],
+            captured_variables: vec![],
+            remaining_source_accessors: vec![],
+            remaining_source_constant_refs: vec![],
+            external_calls: vec![],
+            inherited_dependencies: vec![],
+            deep_analysis: None,
+            plan_status: crate::refactor::PlanStatus::Planned,
+            fixme_count: None,
+            operator_opt_outs_used: vec![],
+        };
+
+        let mut questions: Vec<String> = vec![];
+        surface_delegate_residue("create_file", &rp, &mut questions);
+
+        assert!(
+            questions.is_empty(),
+            "all-empty residue must produce no questions; got: {:?}",
+            questions
         );
     }
 }
