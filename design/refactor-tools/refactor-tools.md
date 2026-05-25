@@ -12,13 +12,15 @@ brief: "Hub for Blackbox structural refactor tooling, refactor atoms, Rust expan
 # Refactor Tools
 
 This hub groups the designs around structural refactor primitives, compound
-refactor runs, language-specific expansion, and refactor atoms.
+refactor runs, macro-assisted synthesis, language-specific expansion, and
+refactor atoms.
 
 ## Core Refactor Surface
 
 - [AST-Assisted Refactor Mechanization](ast-refactor-mechanization.md)
 - [Refactor Compound Runs](refactor-compound-runs.md)
 - [Context Clipboard Refactor Primitives](context-clipboard-refactor-primitives.md)
+- [Code Macro System](code-macro-system.md)
 - [Crate Topology Restructure](restructure.md)
 - [AST-Grounded Restructure Execution Plan](restructure-ast.md)
 - [Refactor Surface Benchmark](refactor-restructure-benchmark.md)

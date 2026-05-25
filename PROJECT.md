@@ -18,8 +18,10 @@ Core MCP namespaces:
 
 - `bbox_*` - transcript, knowledge, graph, project, and refactor primitives.
 - `bro_*` - orchestration and dispatch primitives.
-- `work_*` - workspace-tool namespace; do not add new workspace tools under
-  `bbox_*`.
+- `work_*` - restricted workspace-tool namespace for agents operating inside
+  atoms/workflows. Only add tools here when the operator explicitly asks for an
+  atom/workflow-internal surface; do not use `work_*` as the default home for
+  general MCP tool families.
 
 ## Fast Orientation
 

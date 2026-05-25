@@ -18,15 +18,18 @@ For `bbox_refactor_run` invocations dispatched from atomic refactor agents (desi
 
 The rust-analyzer-backed plan kinds `rust_lsp_rename`, `rust_organize_imports`, `rust_ra_move_item_to_module` (RX-R1), and `rust_ra_classify_callbacks` (RX-R2) require an active LspSessionManager. When rust-analyzer is unavailable (binary missing, init timeout, crashed mid-run), these plan kinds MUST fail closed with `error.lsp_unavailable` and the underlying cause. They MUST NOT silently downgrade to a syntax_only / indexed_hints approximation, because callers chose the LSP-backed kind specifically for semantic_status=lsp_verified. This is intentional asymmetry vs the Java side's documented tree-sitter fallback for rust_organize_imports — the Rust LSP-backed kinds in design/refactor-rust-expansion.md treat fallback as a silent semantic downgrade and refuse it.
 
-**Workspace tools use work prefix**
-
-Workspace tool MCP handlers in transcript-search must use the `work_*` namespace, not `bbox_*`. This applies to docs, tool descriptions, ambient coercion guidance, and future workspace-tool additions so the workspace toolset remains distinct from core blackbox `bbox_*` tools.
-
 ### Forgejo Coordination Identity
 
 **Distinct Forgejo Identities For Agent Audit Trail**
 
 For Forgejo-backed coordination, implementers and reviewers must use distinct external identities for auditability. Identity mappings should key at least by coordination instance, bro/role identity, provider, and model; per-dispatch metadata such as effort belongs on system events, audit comments, and performance records rather than multiplying durable external users.
+
+
+### MCP namespaces
+
+**work_* namespace is workflow-agent-facing only**
+
+In transcript-search, `work_*` MCP tools are reserved for restricted agents operating inside atoms/workflows. Only add tools under `work_*` when the operator explicitly asks for an atom/workflow-internal surface; general MCP tool families should use `bbox_*` or a dedicated prefix cluster such as `macro_*` when large enough.
 
 
 ### Provider Catalog
