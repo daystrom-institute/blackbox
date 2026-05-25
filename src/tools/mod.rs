@@ -13,6 +13,7 @@ pub mod councils;
 pub mod dispatch;
 pub mod graph;
 pub mod knowledge;
+pub mod macros;
 pub mod mcp_surface;
 pub mod notes;
 pub mod orchestrate;

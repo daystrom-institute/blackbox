@@ -29,6 +29,7 @@
 
 pub mod expr;
 pub mod model;
+pub mod registry;
 
 // Convenience re-exports for crate-internal consumers. The MCP surface,
 // registry, planner, and backend that consume these land in later macro
@@ -41,3 +42,5 @@ pub use model::{
     MacroPlanCheck, MacroPlanOperation, MacroProbe, MacroRefusal, MacroRefusalHit, MacroScope,
     MacroSemanticStatus, MacroValidation,
 };
+#[allow(unused_imports)]
+pub use registry::{MacroRegistry, RegistryError};

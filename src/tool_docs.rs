@@ -38,6 +38,7 @@ pub enum ToolCategory {
     Roadmap,
     StorageHealth,
     Workspace,
+    Macros,
 }
 
 impl ToolCategory {
@@ -60,6 +61,7 @@ impl ToolCategory {
             Self::Roadmap => "Roadmap",
             Self::StorageHealth => "Storage health",
             Self::Workspace => "Workspace tools",
+            Self::Macros => "Macro registry",
         }
     }
 
@@ -109,6 +111,9 @@ impl ToolCategory {
             Self::StorageHealth => "Read-only storage inventory for edge sidecar hygiene.",
             Self::Workspace => {
                 "Instrumented file read, shell execution, and git operations for registered projects. Prefer these over raw Read/Bash/git when working inside a bbox-registered project — every call is indexed as a tool-call record and enriched with bbox context where relevant."
+            }
+            Self::Macros => {
+                "Register, inspect, and validate macro recipes. Macros are data-only synthesis plans stored as JSON files. Project macros live under `.bbox/macros/` (reviewable like source). User macros live in operator config. Builtins ship with Blackbox. This milestone covers read/registration only — planning (`macro_plan`), apply (`macro_apply`), and runner (`macro_run`) land in a later milestone."
             }
         }
     }
@@ -1596,6 +1601,48 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"identity_get(scope="forgejo", instance="local-forgejo15", subject="bro:keystone-review", provider="claude", model="claude-haiku-4-5-20251001")"#,
         ),
     },
+    // ── Macros ────────────────────────────────────────────────────
+    ToolDoc {
+        name: "macro_list",
+        category: ToolCategory::Macros,
+        summary: "List macros from all scopes, merged and deduplicated by id. Returns id, version, scope, title, language, and effects for each macro. Use macro_describe for the full definition.",
+        when_to_use: "Use to discover available macros. Optionally pass `project_dir` to include project-scoped macros from `.bbox/macros/`. Use `macro_describe` after finding a candidate.",
+        example: Some(r#"macro_list(project_dir="/repo/my-project")"#),
+    },
+    ToolDoc {
+        name: "macro_describe",
+        category: ToolCategory::Macros,
+        summary: "Describe a macro by id: returns the full MacroDefinition plus a human-readable summary of operations, probes, and refusals.",
+        when_to_use: "Use after `macro_list` to get the full definition of a candidate macro. Includes all operations, probes, refusals, and validations.",
+        example: Some(
+            r#"macro_describe(id="java.add_service_boundary", project_dir="/repo/my-project")"#,
+        ),
+    },
+    ToolDoc {
+        name: "macro_validate",
+        category: ToolCategory::Macros,
+        summary: "Validate a macro definition without registering it. Accepts an inline definition JSON object. Returns a validation report listing all issues.",
+        when_to_use: "Use before `macro_register` to check that a definition is well-formed. Validates required fields, predicate structure, and operation kinds. Does NOT write anything.",
+        example: Some(
+            r#"macro_validate(definition={"id": "my.macro", "version": "1", "language": "java", "title": "My Macro", "inputs_schema": {"type": "object"}})"#,
+        ),
+    },
+    ToolDoc {
+        name: "macro_register",
+        category: ToolCategory::Macros,
+        summary: "Register a macro in the project scope. Writes to `<project_dir>/.bbox/macros/<id>.json`. Validates before writing. Refuses duplicate id+version unless overwrite=true.",
+        when_to_use: "Use to add a new macro to a project. The definition is validated and written as a JSON file. Set `overwrite=true` to replace an existing macro with the same id.",
+        example: Some(
+            r#"macro_register(project_dir="/repo/my-project", definition={"id": "my.macro", "version": "1", "language": "java", "title": "My Macro", "inputs_schema": {"type": "object"}})"#,
+        ),
+    },
+    ToolDoc {
+        name: "macro_unregister",
+        category: ToolCategory::Macros,
+        summary: "Remove a project-scope macro by id. Deletes `.bbox/macros/<id>.json` from the project directory. Does not affect user or builtin macros.",
+        when_to_use: "Use to remove a project-scope macro that is no longer needed. Only removes the project-scoped file; user and builtin macros with the same id are unaffected.",
+        example: Some(r#"macro_unregister(id="my.macro", project_dir="/repo/my-project")"#),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\
@@ -2105,6 +2152,7 @@ mod tests {
                     || n.starts_with("system_event_")
                     || n.starts_with("reaction_")
                     || n.starts_with("identity_")
+                    || n.starts_with("macro_")
                 {
                     out.push((n, d));
                 }

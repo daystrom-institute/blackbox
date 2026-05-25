@@ -59,7 +59,8 @@ impl BlackboxServer {
                 + crate::tools::storage_gc::router()
                 + crate::tools::storage_migration::router()
                 + crate::tools::workspace::router()
-                + crate::tools::system_events::router(),
+                + crate::tools::system_events::router()
+                + crate::tools::macros::router(),
             surface: std::sync::OnceLock::new(),
         }
     }

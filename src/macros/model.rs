@@ -33,7 +33,7 @@ use crate::refactor::{FileCreate, FileEdit};
 // ---------------------------------------------------------------------------
 
 /// Where a macro definition originates. Controls trust and search order.
-#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum MacroScope {
     /// Ships with Blackbox. Highest trust.
