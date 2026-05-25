@@ -1,4 +1,5 @@
 use super::*;
+use crate::lsp::convert::{byte_to_lsp_position, workspace_edit_to_file_edits};
 
 pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;

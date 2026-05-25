@@ -18,7 +18,8 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
 use crate::projects::Language;
-use crate::refactor::{PlanContext, RefactorPlanParams, csharp::lsp_rename_helpers, rust};
+use crate::lsp::convert;
+use crate::refactor::{PlanContext, RefactorPlanParams, csharp::lsp_rename_helpers};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageSite {
@@ -64,7 +65,7 @@ pub fn plan_find_csharp_usages(p: &RefactorPlanParams, ctx: &PlanContext) -> Res
         .with_context(|| format!("reading {}", source_path.display()))?;
     let position_byte = lsp_rename_helpers::find_first_identifier_byte(&source, symbol)
         .ok_or_else(|| anyhow!("symbol `{symbol}` not found in {}", source_path.display()))?;
-    let position = rust::byte_to_lsp_position(&source, position_byte);
+    let position = convert::byte_to_lsp_position(&source, position_byte);
 
     let manager = ctx.lsp.as_ref().ok_or_else(|| {
         anyhow!(

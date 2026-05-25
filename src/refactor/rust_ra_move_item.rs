@@ -10,6 +10,7 @@ use lsp_types::{
 };
 
 use crate::lsp::{LspError, LspSessionManager};
+use crate::lsp::convert::{byte_to_lsp_position, workspace_edit_to_file_edits};
 use crate::projects::Language;
 
 use super::*;

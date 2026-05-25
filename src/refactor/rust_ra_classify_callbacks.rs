@@ -12,6 +12,7 @@ use tree_sitter::Node;
 
 use super::*;
 use crate::lsp::LspError;
+use crate::lsp::convert::{byte_to_lsp_position, lsp_position_to_byte};
 use crate::projects::Language;
 
 #[derive(Debug, Serialize)]

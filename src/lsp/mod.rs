@@ -16,5 +16,6 @@
 //! [`session_manager::LspSessionManager::with_session`].
 
 pub mod session_manager;
+pub(crate) mod convert;
 
 pub use session_manager::{LspError, LspSessionManager};

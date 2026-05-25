@@ -19,8 +19,9 @@ use lsp_types::{
 use reqwest::Url;
 
 use crate::projects::Language;
+use crate::lsp::convert;
 use crate::refactor::{
-    PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan, rust,
+    PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
@@ -60,7 +61,7 @@ pub fn plan_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<Stri
             source_path.display()
         )
     })?;
-    let position = rust::byte_to_lsp_position(&source, position_byte);
+    let position = convert::byte_to_lsp_position(&source, position_byte);
 
     let manager = ctx.lsp.as_ref().ok_or_else(|| {
         anyhow!("error.lsp_unavailable: csharp_lsp_rename requires the LSP session manager (RX-V3)")
@@ -100,7 +101,7 @@ pub fn plan_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<Stri
         .map_err(|e| anyhow!("error.lsp_unavailable: {e}"))?;
 
     let file_edits = if let Some(edit) = response {
-        rust::workspace_edit_to_file_edits(edit)?
+        convert::workspace_edit_to_file_edits(edit)?
     } else {
         Vec::new()
     };

@@ -14,9 +14,9 @@ use lsp_types::{
 use reqwest::Url;
 
 use crate::projects::Language;
+use crate::lsp::convert;
 use crate::refactor::{
     FileEdit, PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan,
-    rust,
 };
 
 pub fn plan_organize_usings(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
@@ -89,7 +89,7 @@ fn roslyn_organize_usings(
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
     let source = fs::read_to_string(source_path)
         .with_context(|| format!("reading {}", source_path.display()))?;
-    let end_position = rust::byte_to_lsp_position(&source, source.len());
+    let end_position = convert::byte_to_lsp_position(&source, source.len());
     let code_action_params = CodeActionParams {
         text_document: TextDocumentIdentifier {
             uri: source_uri.clone(),
@@ -133,7 +133,7 @@ fn roslyn_organize_usings(
             && action.kind.as_ref() == Some(&CodeActionKind::SOURCE_ORGANIZE_IMPORTS)
             && let Some(workspace_edit) = action.edit
         {
-            edits.extend(rust::workspace_edit_to_file_edits(workspace_edit)?);
+            edits.extend(convert::workspace_edit_to_file_edits(workspace_edit)?);
         }
     }
     if edits.is_empty() {

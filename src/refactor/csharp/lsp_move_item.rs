@@ -32,8 +32,9 @@ use reqwest::Url;
 
 use super::lex::{is_word_boundary, match_keyword, read_ident, skip_lex_atom, skip_whitespace};
 use crate::projects::Language;
+use crate::lsp::convert;
 use crate::refactor::{
-    PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan, rust,
+    PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan,
 };
 
 pub fn plan_lsp_move_item(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
@@ -70,7 +71,7 @@ pub fn plan_lsp_move_item(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<S
         .with_context(|| format!("reading {}", source_path.display()))?;
 
     let type_byte = locate_type_decl(&source, type_name)?;
-    let type_position = rust::byte_to_lsp_position(&source, type_byte);
+    let type_position = convert::byte_to_lsp_position(&source, type_byte);
 
     let manager = ctx.lsp.as_ref().ok_or_else(|| {
         anyhow!(
@@ -168,7 +169,7 @@ pub fn plan_lsp_move_item(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<S
         )
     })?;
 
-    let file_edits = rust::workspace_edit_to_file_edits(workspace_edit)?;
+    let file_edits = convert::workspace_edit_to_file_edits(workspace_edit)?;
     if file_edits.is_empty() {
         bail!(
             "error.empty_workspace_edit: Roslyn LSP returned a `refactor.move` action with no edits"
