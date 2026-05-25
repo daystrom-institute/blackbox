@@ -27,3 +27,8 @@ symbolic lookup and syntax-grounded exploration surfaces.
 
 - [Agentic Corpus Platform](../agentic-corpus/agentic-corpus-platform.md)
 - [Refactor Tools](../../refactor-tools/refactor-tools.md)
+- [Hoisting Java to First-Class Code Navigation](../../refactor-tools/java/java-code-nav.md)
+  — adds a jdtls-backed semantic tier (symbol/type resolution) to `bbox_code_*`,
+  orthogonal to the syntactic synthesis discussed in the depth-axis docs.
+- [Unified Code Synthesis Model](../../refactor-tools/unified-code-synthesis-model.md)
+  — macro `probe` operations bind to the code-nav query substrate.

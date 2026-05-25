@@ -21,7 +21,11 @@ macro-assisted code synthesis.
 
 - [Java Refactor Gap Inventory](java-refactor-gaps.md)
 - [Java Refactor Remaining Notes](java-refactor-remaining-notes.md)
-- [Code Macro System](../code-macro-system.md)
+- [Unified Code Synthesis Model](../unified-code-synthesis-model.md) — macro
+  synthesis, transaction lowering, and the program dissolving framework-specific
+  Java refactor kinds into macro ontology.
+- [Hoisting Java to First-Class Code Navigation](java-code-nav.md) — jdtls
+  semantic nav tier (References/Implementation/WorkspaceSymbol/Hover).
 - [Vaadin Refactor Tools (archived implemented design)](vaadin-refactor-tools-proposal.md)
 - [jOOQ Refactor Tools Proposal](jooq-refactor-tools-proposal.md)
 

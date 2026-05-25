@@ -20,7 +20,11 @@ refactor atoms.
 - [AST-Assisted Refactor Mechanization](ast-refactor-mechanization.md)
 - [Refactor Compound Runs](refactor-compound-runs.md)
 - [Context Clipboard Refactor Primitives](context-clipboard-refactor-primitives.md)
-- [Code Macro System](code-macro-system.md)
+- [Unified Code Synthesis Model](unified-code-synthesis-model.md) — the
+  slice/refactor/code-nav/macro force-amplifier model: shared `RefactorPlan` IR
+  + transaction, a data-defined macro layer that lowers to it, probe operations
+  bound to the code-nav/LSP substrate, and the program to dissolve
+  framework-specific Rust primitives into macro ontology.
 - [Crate Topology Restructure](restructure.md)
 - [AST-Grounded Restructure Execution Plan](restructure-ast.md)
 - [Refactor Surface Benchmark](refactor-restructure-benchmark.md)
@@ -44,5 +48,8 @@ refactor atoms.
 
 - [Rust Refactor Tools](rust/rust-refactor-tools.md)
 - [Java Refactor Tools](java/java-refactor-tools.md)
+- [Hoisting Java to First-Class Code Navigation](java/java-code-nav.md) —
+  jdtls-backed semantic nav tier (References/Implementation/WorkspaceSymbol/
+  Hover) for macro probes, refactor plan-shaping, and LLM due-diligence.
 - [Elixir Refactor Tools](elixir/elixir-refactor-tools.md)
 - [C# Refactor Tools](csharp/csharp-refactor-tools.md)
