@@ -177,24 +177,14 @@ Writable structural plans are narrower:
   Canonical repair sequence: `[extract_plan, add_mod_decl, cargo_check
   (continue_for_repair, capture=rustc_json), rust_compile_fix_round, cargo_check
   (required=true), cargo_test (required=true)]`.
-- Rust: `bbox_refactor_plan(kind="extract_rust_items")` or
-  `bbox_refactor_plan(kind="extract_rust_impl_methods")` or
-  `bbox_refactor_plan(kind="delete_rust_items")` or
-  `bbox_refactor_plan(kind="add_rust_router_to_sum")` or
-  `bbox_refactor_plan(kind="add_rust_mod_decl")` or
-  `bbox_refactor_plan(kind="add_rust_use_decl")` or
-  `bbox_refactor_plan(kind="copy_rust_mod_decls")` or
-  `bbox_refactor_plan(kind="rewrite_rust_mod_visibility")` or
-  `bbox_refactor_plan(kind="rewrite_rust_item_visibility")` or
-  `bbox_refactor_plan(kind="rewrite_rust_field_visibility")` or
-  `bbox_refactor_plan(kind="rust_lsp_rename")` or
-  `bbox_refactor_plan(kind="rust_organize_imports")`, then
-  `bbox_refactor_apply(confirm=true)`. Use `bbox_refactor_run(confirm=true)`
-  when several primitive plans must succeed or rollback together. The
-  rust-analyzer-backed plan kinds (`rust_lsp_rename`, `rust_organize_imports`)
-  go through the warm `LspSessionManager`: first call per project pays the
-  cold-start cost, subsequent calls reuse the same `(project_root, Rust)`
-  child until idle eviction (`BLACKBOX_LSP_IDLE_SECS`). Tunables:
+- Rust: writable backend with many syntax, indexed-hint, LSP-backed, analysis,
+  and compound-run plan kinds. Use `sm-refactor-rust` for the current Rust
+  plan-kind map, atom signposts, and fail-closed rust-analyzer rules. Use
+  `bbox_refactor_run(confirm=true)` when several primitive plans and cargo
+  validation steps must succeed or rollback together. The rust-analyzer-backed
+  Rust kinds go through the warm `LspSessionManager`: first call per project
+  pays the cold-start cost, subsequent calls reuse the same `(project_root,
+  Rust)` child until idle eviction (`BLACKBOX_LSP_IDLE_SECS`). Tunables:
   `RUST_ANALYZER_BIN` (binary override) and
   `BLACKBOX_RUST_ANALYZER_INIT_TIMEOUT_SECS` (default 60).
 - TypeScript / JavaScript: inspect-only today. Use `sm-refactor-typescript`.

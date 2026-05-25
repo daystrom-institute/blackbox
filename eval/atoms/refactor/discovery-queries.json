@@ -947,6 +947,102 @@
         "elixir-with-clause-extract"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-impl-role-coherence",
+      "query": "diagnose rust impl whose methods do not match the type role",
+      "expected_atoms": [
+        "rust-architecture-impl-role-coherence"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-state-ownership-collapse",
+      "query": "diagnose rust struct with unrelated mutable state collapsed into one owner",
+      "expected_atoms": [
+        "rust-architecture-state-ownership-collapse"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-construction-boundary-collapse",
+      "query": "diagnose rust constructor that wires unrelated policy io and runtime setup",
+      "expected_atoms": [
+        "rust-architecture-construction-boundary-collapse"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-trait-boundary-mismatch",
+      "query": "diagnose rust trait boundary that mixes unrelated roles or hides concrete policy",
+      "expected_atoms": [
+        "rust-architecture-trait-boundary-mismatch"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-module-topology-drift",
+      "query": "diagnose rust module topology drift where files no longer match responsibility",
+      "expected_atoms": [
+        "rust-architecture-module-topology-drift"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-error-contract-drift",
+      "query": "diagnose rust error type whose variants no longer match public failure contract",
+      "expected_atoms": [
+        "rust-architecture-error-contract-drift"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-feature-cfg-matrix",
+      "query": "diagnose rust feature cfg matrix that changes architecture or public behavior",
+      "expected_atoms": [
+        "rust-architecture-feature-cfg-matrix"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-async-runtime-lifecycle",
+      "query": "diagnose rust async task runtime channel or lock lifecycle ownership mismatch",
+      "expected_atoms": [
+        "rust-architecture-async-runtime-lifecycle"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-test-implied-architecture",
+      "query": "diagnose rust tests that imply architecture different from production code",
+      "expected_atoms": [
+        "rust-architecture-test-implied-architecture"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-unsafe-contract-opacity",
+      "query": "diagnose rust unsafe code whose safety contract is hidden or incomplete",
+      "expected_atoms": [
+        "rust-architecture-unsafe-contract-opacity"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-macro-generated-contract-opacity",
+      "query": "diagnose rust macro generated api whose contract is opaque to callers",
+      "expected_atoms": [
+        "rust-architecture-macro-generated-contract-opacity"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-rust-architecture-transcript-anchored-pressure",
+      "query": "diagnose rust architecture pressure anchored in prior transcript decisions",
+      "expected_atoms": [
+        "rust-architecture-transcript-anchored-pressure"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

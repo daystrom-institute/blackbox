@@ -25,6 +25,16 @@ module migration. The atom manifest is the source of truth for version,
 inputs, cost, and prompt text; this memory keeps the primitive plan-kind map
 and safety invariants.
 
+For Rust architecture diagnosis rather than a known mechanical edit, use
+`atom_search(query="rust architecture <pressure>")` or
+`bbox_artifact_list(kind="workflow", name="arch-pathology-rust")` to find the
+cataloged diagnostic lane. The Rust architecture workflow surveys cheap facts
+first, dispatches only justified diagnostic atoms, reviews claims on a
+whiteboard, and writes a correction plan for later PD dispatch. Treat those
+atoms as analysis-only signposts for role/state/module/trait/error/cfg/async
+runtime/test/unsafe/macro/transcript pressure; map any accepted remediation
+back to the primitive plan kinds below or to an explicit manual slice.
+
 When no atom fits the exact shape, the manual plan-kind sequence below is the
 canonical path.
 
@@ -54,16 +64,19 @@ Plan kinds, grouped by intent:
   `move_rust_items_with_callers` (extract_rust_items + cross-file caller-prefix
   rewrite).
 - Caller / accessor rewrites: `update_rust_callers`, `migrate_rust_type_usages`,
-  `migrate_rust_string_field_to_enum`, `add_rust_delegate_field`,
+  `migrate_rust_string_field_to_enum`, `rewrite_rust_error_type`,
+  `rust_match_arm_to_strategy`, `add_rust_delegate_field`,
   `add_rust_router_to_sum`.
 - Module wiring: `add_rust_mod_decl`, `add_rust_use_decl`, `rust_module_wiring`,
-  `copy_rust_mod_decls`, `rust_minimize_imports` (conservative wildcard-import
-  replacement).
+  `copy_rust_mod_decls`, `rewrite_rust_bin_crate_paths`,
+  `rust_minimize_imports` (conservative wildcard-import replacement).
 - Visibility: `rewrite_rust_mod_visibility`, `rewrite_rust_item_visibility`,
   `rewrite_rust_field_visibility`.
 - LSP-backed (rust-analyzer): `rust_lsp_rename` (semantic rename),
   `rust_organize_imports` (per-file `source.organizeImports`),
   `rust_ra_classify_callbacks` (resolve method callees via goto-definition).
+  These fail closed with `error.lsp_unavailable` when rust-analyzer is missing,
+  times out, or crashes; do not downgrade them to syntax-only approximations.
 - LSP-backed but BROKEN: `rust_ra_move_item_to_module` — RA's `refactor.move`
   code-action kind only backs the `move_module_to_file` and `move_to_mod_rs`
   assists. Neither accepts caller-supplied destinations. The `target` param
@@ -281,6 +294,19 @@ Writable plan kinds:
   name + optional position constraint such as `OldType@type_position`), and
   `new_text` (the replacement). Skipped sites surface in `migration_skipped`
   with reasons (illegal-position, ambiguous import, etc.).
+- `rewrite_rust_error_type`: rewrite selected function signatures from one
+  error type to another and rewrite mapped construction sites. Pass `old_text`
+  (from type), `new_text` (to type), `item_names` (functions whose signatures
+  may change), and optional `toml_entries.error_mapping`. Public error types
+  require `toml_entries={"acknowledge_public_api_change": true}` as explicit
+  operator authority; the plan reports `question_mark_sites` so `?`
+  conversions can be repaired through cargo-check plus `rust_compile_fix_round`.
+- `rust_match_arm_to_strategy`: generate per-variant strategy modules and a
+  router function for a match-on-enum shape. Pass `module_name` as the enum
+  name, `item_names` as behavior-family method names, and optional
+  `toml_entries.data_field_names`, `driver_share_groups`, or `driver_name`.
+  Variants carrying associated data are refused in `refused_variants` instead
+  of guessed.
 - `move_rust_struct_fields`: move named fields from one struct to another
   (same file or across files). Pass `item_names` (field names),
   `impl_name`-or-`module_name` (source struct), `target` (destination file

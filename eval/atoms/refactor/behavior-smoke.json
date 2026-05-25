@@ -1358,6 +1358,114 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-impl-role-coherence",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-state-ownership-collapse",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-construction-boundary-collapse",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-trait-boundary-mismatch",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-module-topology-drift",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-error-contract-drift",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-feature-cfg-matrix",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-async-runtime-lifecycle",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-test-implied-architecture",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-unsafe-contract-opacity",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-macro-generated-contract-opacity",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "rust-architecture-transcript-anchored-pressure",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

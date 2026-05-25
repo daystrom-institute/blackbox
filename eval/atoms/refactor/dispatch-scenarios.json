@@ -1824,6 +1824,198 @@
       "expect_response_fields": [
         "status"
       ]
+    },
+    {
+      "id": "dispatch-rust-architecture-impl-role-coherence",
+      "atom": "rust-architecture-impl-role-coherence",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["impl methods may not match the type responsibility"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-state-ownership-collapse",
+      "atom": "rust-architecture-state-ownership-collapse",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["unrelated mutable state may share one owner"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-construction-boundary-collapse",
+      "atom": "rust-architecture-construction-boundary-collapse",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["constructor may mix configuration io and runtime ownership"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-trait-boundary-mismatch",
+      "atom": "rust-architecture-trait-boundary-mismatch",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["trait may combine unrelated roles"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-module-topology-drift",
+      "atom": "rust-architecture-module-topology-drift",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["module layout may no longer match responsibility boundaries"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-error-contract-drift",
+      "atom": "rust-architecture-error-contract-drift",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["error variants may expose the wrong public contract"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-feature-cfg-matrix",
+      "atom": "rust-architecture-feature-cfg-matrix",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["feature flags may change architecture or public behavior"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-async-runtime-lifecycle",
+      "atom": "rust-architecture-async-runtime-lifecycle",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["task or channel lifetime may outlive its owner"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-test-implied-architecture",
+      "atom": "rust-architecture-test-implied-architecture",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["tests may encode a different architecture than production"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-unsafe-contract-opacity",
+      "atom": "rust-architecture-unsafe-contract-opacity",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["unsafe block may hide its safety contract"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-macro-generated-contract-opacity",
+      "atom": "rust-architecture-macro-generated-contract-opacity",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["macro generated api may hide the caller contract"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-rust-architecture-transcript-anchored-pressure",
+      "atom": "rust-architecture-transcript-anchored-pressure",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "target_loci": ["src/lib.rs"],
+        "operator_hints": ["prior transcript decisions may pressure this architecture"],
+        "layer_model_path": "",
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whole_project_mode": false,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
     }
   ]
 }
