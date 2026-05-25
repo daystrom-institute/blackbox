@@ -1359,6 +1359,7 @@ impl BlackboxServer {
             edge: None,
             promoted_to: None,
             kind: None,
+            origin: None,
         });
         Ok(json!({
             "badgey_id": id,

@@ -540,6 +540,7 @@ impl BlackboxServer {
             target_type: None,
             note: None,
             promoted_to: None,
+            origin: None,
         };
         let result = th.thread(&params)?;
         drop(th);

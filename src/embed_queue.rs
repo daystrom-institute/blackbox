@@ -725,6 +725,7 @@ mod tests {
             project: "/repo/blackbox".into(),
             status: ThreadStatus::Active,
             kind: Some(ThreadKind::WorkItem),
+            origin: None,
             sessions: vec![SessionLink {
                 session_id: "session-1".into(),
                 provider: "claude".into(),
@@ -800,6 +801,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: Some("investigation".into()),
+                origin: None,
             })
             .unwrap();
         let thread_id = regex::Regex::new(r"thread-[0-9a-f]{8}")

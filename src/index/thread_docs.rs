@@ -32,6 +32,9 @@ fn thread_content(thread: &Thread) -> String {
     if let Some(kind) = thread.kind {
         fields.push(format!("kind: {}", kind.as_ref()));
     }
+    if let Some(origin) = thread.origin {
+        fields.push(format!("origin: {}", origin.as_ref()));
+    }
     if let Some(handoff_doc) = &thread.handoff_doc {
         fields.push(format!("handoff_doc:\n{handoff_doc}"));
     }
@@ -191,6 +194,7 @@ mod tests {
             project: "/repo".into(),
             status: ThreadStatus::Active,
             kind: Some(ThreadKind::Investigation),
+            origin: None,
             sessions: Vec::new(),
             handoff_doc: Some("handoff marker".into()),
             notes: vec!["inline note marker".into()],

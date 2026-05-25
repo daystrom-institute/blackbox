@@ -28,6 +28,7 @@ impl WorkflowRunner<'_> {
             edge: None,
             promoted_to: None,
             kind: Some("work_item".into()),
+            origin: Some("workflow".into()),
         };
         let result = {
             let mut threads = self.server.state.threads.write();

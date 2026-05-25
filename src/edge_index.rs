@@ -1671,6 +1671,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: None,
+                origin: None,
             }
         }
 

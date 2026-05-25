@@ -282,6 +282,7 @@ impl BlackboxServer {
                 edge: None,
                 promoted_to: None,
                 kind: Some("work_item".to_string()),
+                origin: None,
             })
             .map_err(|e| format!("opening badgey thread of record: {e:#}"))?;
         let thread_id = self.badgey_thread_id_from_open_result(&thread_result)?;
@@ -337,6 +338,7 @@ impl BlackboxServer {
             edge: None,
             promoted_to: None,
             kind: None,
+            origin: None,
         });
         self.badgey_write_event(
             &instance,

@@ -52,6 +52,9 @@ pub struct ThreadParams {
     /// Thread kind (e.g. "work_item"). Optional; defaults to general.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Thread origin marker (e.g. "workflow"). Optional for normal/manual threads.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -71,6 +74,10 @@ pub struct ThreadListParams {
     /// Filter by thread kind (e.g. "work_item")
     #[serde(default)]
     pub kind: Option<String>,
+    /// Include workflow-origin threads. Defaults to false so workflow arc
+    /// scaffolding does not dominate normal continuity scans.
+    #[serde(default)]
+    pub include_workflows: Option<bool>,
 }
 
 // ── Schema ─────────────────────────────────────────────────────────
@@ -96,6 +103,16 @@ pub enum ThreadKind {
     WorkItem,
     /// Investigation or QC walk
     Investigation,
+}
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ThreadOrigin {
+    /// Thread was opened by the workflow runtime for an arc.
+    Workflow,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, strum::EnumString, strum::AsRefStr)]
@@ -156,6 +173,8 @@ pub struct Thread {
     pub status: ThreadStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ThreadKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<ThreadOrigin>,
     pub sessions: Vec<SessionLink>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub handoff_doc: Option<String>,
@@ -334,6 +353,12 @@ impl Threads {
                     p.kind
                 )
             })?;
+        let origin = p
+            .origin
+            .as_deref()
+            .map(ThreadOrigin::from_str)
+            .transpose()
+            .map_err(|_| anyhow::anyhow!("Unknown thread origin: {:?}. Use: workflow", p.origin))?;
 
         let thread = Thread {
             id: id.clone(),
@@ -342,6 +367,7 @@ impl Threads {
             project: project.to_string(),
             status: ThreadStatus::Open,
             kind,
+            origin,
             sessions,
             handoff_doc: p.handoff_doc.clone(),
             notes,
@@ -396,6 +422,9 @@ impl Threads {
         out.push_str(&format!("Status: {}\n", thread.status.as_ref()));
         if let Some(k) = thread.kind {
             out.push_str(&format!("Kind: {}\n", k.as_ref()));
+        }
+        if let Some(origin) = thread.origin {
+            out.push_str(&format!("Origin: {}\n", origin.as_ref()));
         }
         out.push_str(&format!(
             "Project: {}\n",
@@ -735,6 +764,7 @@ impl Threads {
         let name_filter = p.name.as_deref();
         let min_idle_days = p.min_idle_days;
         let include_resolved = p.include_resolved.unwrap_or(false);
+        let include_workflows = p.include_workflows.unwrap_or(false);
         let kind_filter = p
             .kind
             .as_deref()
@@ -789,6 +819,12 @@ impl Threads {
                 if !name_matches && !topic_matches {
                     continue;
                 }
+            }
+
+            // Workflow-origin threads are operational scaffolding. Hide them
+            // from default continuity scans unless the caller explicitly opts in.
+            if !include_workflows && thread.origin == Some(ThreadOrigin::Workflow) {
+                continue;
             }
 
             // Idle-age filter
@@ -990,6 +1026,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: None,
+                origin: None,
             })
             .unwrap();
         let thread_id = created.split_whitespace().nth(2).unwrap().to_string();
@@ -1010,6 +1047,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: None,
+                origin: None,
             })
             .unwrap();
 
@@ -1021,6 +1059,7 @@ mod tests {
                 min_idle_days: None,
                 include_resolved: None,
                 kind: None,
+                include_workflows: None,
             })
             .unwrap();
 
@@ -1050,6 +1089,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: None,
+                origin: None,
             })
             .unwrap();
         let thread_id = created.split_whitespace().nth(2).unwrap().to_string();
@@ -1064,9 +1104,85 @@ mod tests {
                 min_idle_days: Some(7),
                 include_resolved: None,
                 kind: None,
+                include_workflows: None,
             })
             .unwrap();
 
         assert!(out.contains("old work"));
+    }
+
+    #[test]
+    fn thread_list_hides_workflow_origin_by_default() {
+        let dir = tempdir().unwrap();
+        let store_path = dir.path().join("threads.json");
+        let mut threads = Threads::open(&store_path).unwrap();
+        threads
+            .thread(&ThreadParams {
+                action: "open".into(),
+                topic: Some("manual work".into()),
+                project: Some("/repo/x".into()),
+                name: Some("manual".into()),
+                id: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".into()),
+                origin: None,
+            })
+            .unwrap();
+        threads
+            .thread(&ThreadParams {
+                action: "open".into(),
+                topic: Some("workflow arc: hidden".into()),
+                project: Some("/repo/x".into()),
+                name: Some("wf-hidden".into()),
+                id: None,
+                session_id: None,
+                provider: None,
+                session_name: None,
+                handoff_doc: None,
+                note: None,
+                target: None,
+                target_type: None,
+                edge: None,
+                promoted_to: None,
+                kind: Some("work_item".into()),
+                origin: Some("workflow".into()),
+            })
+            .unwrap();
+
+        let default_out = threads
+            .thread_list(&ThreadListParams {
+                status: Some("open".into()),
+                project: Some("/repo/x".into()),
+                name: None,
+                min_idle_days: None,
+                include_resolved: None,
+                kind: None,
+                include_workflows: None,
+            })
+            .unwrap();
+        assert!(default_out.contains("manual work"));
+        assert!(!default_out.contains("workflow arc: hidden"));
+
+        let explicit_out = threads
+            .thread_list(&ThreadListParams {
+                status: Some("open".into()),
+                project: Some("/repo/x".into()),
+                name: None,
+                min_idle_days: None,
+                include_resolved: None,
+                kind: None,
+                include_workflows: Some(true),
+            })
+            .unwrap();
+        assert!(explicit_out.contains("manual work"));
+        assert!(explicit_out.contains("workflow arc: hidden"));
     }
 }

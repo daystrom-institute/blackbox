@@ -961,6 +961,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: Some("work_item".to_string()),
+                origin: None,
             })
             .unwrap();
         let thread_id = server
@@ -1024,6 +1025,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: Some("work_item".to_string()),
+                origin: None,
             })
             .unwrap();
         let thread_id = server
@@ -1201,6 +1203,7 @@ mod tests {
                 edge: None,
                 promoted_to: None,
                 kind: Some("work_item".to_string()),
+                origin: None,
             })
             .unwrap();
         let thread_id = server

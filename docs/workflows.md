@@ -947,8 +947,10 @@ template ships at `0.0.0.0`; prod stays at loopback.
 
 ## Audit and observability
 
-Every `bro orchestrate run` opens a `bbox_thread(kind=work_item)`. The
-returned `arc_thread_id` is the audit handle.
+Every `bro orchestrate run` opens a workflow-origin
+`bbox_thread(kind=work_item)`. The returned `arc_thread_id` is the audit handle.
+Normal `bbox_thread_list` calls hide workflow-origin threads by default; pass
+`include_workflows=true` to inspect arc scaffolding explicitly.
 
 For direct task supervision without workflow state, use [Bro Runtime](bro-runtime.md).
 For inbox and note hygiene, use [Knowledge Store](knowledge-store.md).
@@ -977,7 +979,7 @@ reconstruct arc state without reading every event.
 ```text
 spawn arc
   → seed initial_vars (schema-validated)
-  → open arc thread (bbox_thread kind=work_item)
+  → open arc thread (bbox_thread kind=work_item, origin=workflow)
   → walk graph from [*]
       → for each activity node:
           on_enter hooks (gated)
