@@ -436,13 +436,14 @@ impl CodeNavProbeRunner {
     // -----------------------------------------------------------------------
 
     fn run_workspace_symbol(&self, query: &str, project_dir: &str) -> Result<ProbeOutput> {
-        // RX-V3: fail closed when LSP is absent.
-        let lsp = self
-            .lsp
-            .as_ref()
-            .ok_or_else(|| anyhow!("error.lsp_unavailable: no LspSessionManager configured"))?;
-
-        // Cap query length.
+        // Validate the spec BEFORE touching the backend: an empty/broad or
+        // over-long query is a definition error and must be rejected regardless
+        // of LSP availability (otherwise no-LSP masks the real problem).
+        if query.trim().is_empty() {
+            return Err(anyhow!(
+                "error.empty_query: broad/empty workspace_symbol queries are not allowed"
+            ));
+        }
         if query.len() > MAX_QUERY_BYTES {
             return Err(anyhow!(
                 "error.query_too_long: probe query is {} bytes (max {})",
@@ -450,6 +451,12 @@ impl CodeNavProbeRunner {
                 MAX_QUERY_BYTES
             ));
         }
+
+        // RX-V3: fail closed when LSP is absent.
+        let lsp = self
+            .lsp
+            .as_ref()
+            .ok_or_else(|| anyhow!("error.lsp_unavailable: no LspSessionManager configured"))?;
 
         let project_path = PathBuf::from(project_dir)
             .canonicalize()
@@ -461,15 +468,31 @@ impl CodeNavProbeRunner {
         let mut diagnostics = Vec::new();
         let mut truncated = false;
 
-        // Annotate each symbol with `project_local` (path under project_dir).
-        let all_symbols: Vec<Value> = report
-            .symbols
-            .iter()
+        // Cap BEFORE annotation: take only MAX_ITEMS_PER_PROBE from the raw
+        // symbol list. This bounds the annotation work to the capped slice and
+        // keeps project_local counting correct for the returned set.
+        let cap = MAX_ITEMS_PER_PROBE;
+        let raw_total = report.symbol_count;
+        let capped_symbols: Vec<_> = report.symbols.iter().take(cap).collect();
+
+        if capped_symbols.len() < raw_total {
+            truncated = true;
+            diagnostics.push(format!(
+                "symbols array capped at {} (total symbol_count={}); \
+                 project_local count reflects capped set only",
+                capped_symbols.len(),
+                raw_total
+            ));
+        }
+
+        // Annotate only the capped slice.
+        let symbols: Vec<Value> = capped_symbols
+            .into_iter()
             .map(|sym| annotate_symbol(sym, &project_path))
             .collect();
 
-        // Count only project-local symbols for `exists`/`count`.
-        let local_count = all_symbols
+        // Count project-local among the capped set only (consistent with returned symbols).
+        let local_count = symbols
             .iter()
             .filter(|v| {
                 v.get("project_local")
@@ -477,18 +500,6 @@ impl CodeNavProbeRunner {
                     .unwrap_or(false)
             })
             .count();
-
-        // Cap the symbols array.
-        let symbols: Vec<Value> = all_symbols.into_iter().take(MAX_ITEMS_PER_PROBE).collect();
-
-        if symbols.len() < report.symbol_count {
-            truncated = true;
-            diagnostics.push(format!(
-                "symbols array capped at {} (total symbol_count={})",
-                symbols.len(),
-                report.symbol_count
-            ));
-        }
 
         let exists = local_count > 0;
 
@@ -1072,6 +1083,45 @@ mod tests {
             jdt_annotated.get("project_local"),
             Some(&json!(false)),
             "jdt:// path should be project_local=false"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 1: empty/whitespace-only workspace_symbol query rejected
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn workspace_symbol_empty_query_rejected() {
+        let runner = CodeNavProbeRunner::new(None, vec![]);
+        // Even without an LSP, the empty-query check fires first.
+        let spec = ProbeSpec::WorkspaceSymbol { query: "".into() };
+        let inv = minimal_invocation("/tmp");
+        let err = runner
+            .run_probe("ws", &spec, &Context::default(), &inv)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.empty_query")
+                || msg.contains("broad/empty workspace_symbol queries are not allowed"),
+            "empty query must be rejected with clear error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn workspace_symbol_whitespace_only_query_rejected() {
+        let runner = CodeNavProbeRunner::new(None, vec![]);
+        let spec = ProbeSpec::WorkspaceSymbol {
+            query: "   ".into(),
+        };
+        let inv = minimal_invocation("/tmp");
+        let err = runner
+            .run_probe("ws", &spec, &Context::default(), &inv)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.empty_query")
+                || msg.contains("broad/empty workspace_symbol queries are not allowed"),
+            "whitespace-only query must be rejected, got: {msg}"
         );
     }
 }

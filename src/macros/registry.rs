@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::macros::expr::Predicate;
-use crate::macros::model::{MacroDefinition, MacroScope};
+use crate::macros::model::{MacroDefinition, MacroOperation, MacroScope};
 use crate::macros::probe::ProbeSpec;
 
 // ---------------------------------------------------------------------------
@@ -315,6 +315,22 @@ impl MacroRegistry {
     // Validation
     // -----------------------------------------------------------------------
 
+    /// Returns `true` if any string field within `spec` contains a literal `${`.
+    ///
+    /// Interpolation in probe/operation specs is not yet supported. A spec
+    /// containing `${...}` would survive deserialization as a literal string and
+    /// silently evaluate to false in any predicate — a dangerous footgun. Reject
+    /// at registry time so authors receive a clear error rather than silent
+    /// wrong-answer behaviour.
+    fn spec_contains_interpolation(spec: &serde_json::Value) -> bool {
+        match spec {
+            serde_json::Value::String(s) => s.contains("${"),
+            serde_json::Value::Array(arr) => arr.iter().any(Self::spec_contains_interpolation),
+            serde_json::Value::Object(map) => map.values().any(Self::spec_contains_interpolation),
+            _ => false,
+        }
+    }
+
     /// Check that all `Predicate` values in refusals are structurally valid.
     fn validate_predicates(def: &MacroDefinition) -> Result<(), Vec<String>> {
         let mut errors = Vec::new();
@@ -410,23 +426,45 @@ impl MacroRegistry {
         }
 
         // Probe validation: cap count, reject duplicate names, validate spec kind.
-        if def.probes.len() > MAX_PROBE_COUNT {
+        //
+        // Inline MacroOperation::Probe entries share the same name namespace as
+        // top-level def.probes (both populate Context.probes), so they are counted
+        // and deduplicated together. The combined total must not exceed MAX_PROBE_COUNT.
+        let inline_probe_count = def
+            .operations
+            .iter()
+            .filter(|op| matches!(op, MacroOperation::Probe { .. }))
+            .count();
+        let total_probe_count = def.probes.len() + inline_probe_count;
+        if total_probe_count > MAX_PROBE_COUNT {
             issues.push(ValidationIssue::error(
                 "probes",
                 &format!(
-                    "macro declares {} probes; maximum allowed is {MAX_PROBE_COUNT}",
-                    def.probes.len()
+                    "macro declares {} probe(s) total ({} top-level + {} inline); \
+                     maximum allowed is {MAX_PROBE_COUNT}",
+                    total_probe_count,
+                    def.probes.len(),
+                    inline_probe_count
                 ),
             ));
         }
 
-        // Duplicate probe name check.
-        let mut seen_probe_names = std::collections::HashSet::new();
+        // Duplicate probe name check across BOTH top-level and inline probes.
+        // Top-level and inline probe names share one namespace.
+        let mut seen_probe_names: std::collections::HashSet<&str> =
+            std::collections::HashSet::new();
         for (i, probe) in def.probes.iter().enumerate() {
-            if !seen_probe_names.insert(&probe.name) {
+            if !seen_probe_names.insert(probe.name.as_str()) {
                 issues.push(ValidationIssue::error(
                     &format!("probes[{i}].name"),
                     &format!("duplicate probe name '{}'", probe.name),
+                ));
+            }
+            // Reject interpolation placeholders in probe specs (not yet supported).
+            if Self::spec_contains_interpolation(&probe.spec) {
+                issues.push(ValidationIssue::error(
+                    &format!("probes[{i}].spec"),
+                    "interpolation in probe/operation specs is not yet supported; remove ${...}",
                 ));
             }
             // ProbeSpec deserialization: reject unknown kinds / malformed specs.
@@ -440,6 +478,45 @@ impl MacroRegistry {
                              code_symbols, workspace_symbol): {e}"
                         ),
                     ));
+                }
+            }
+        }
+
+        // Validate inline MacroOperation::Probe entries: same checks as top-level.
+        for (i, op) in def.operations.iter().enumerate() {
+            if let MacroOperation::Probe {
+                name,
+                spec: spec_val,
+            } = op
+            {
+                if !seen_probe_names.insert(name.as_str()) {
+                    issues.push(ValidationIssue::error(
+                        &format!("operations[{i}].name"),
+                        &format!(
+                            "duplicate probe name '{}' (shared namespace with top-level probes)",
+                            name
+                        ),
+                    ));
+                }
+                // Reject interpolation placeholders in inline probe specs.
+                if Self::spec_contains_interpolation(spec_val) {
+                    issues.push(ValidationIssue::error(
+                        &format!("operations[{i}].spec"),
+                        "interpolation in probe/operation specs is not yet supported; remove ${...}",
+                    ));
+                }
+                match serde_json::from_value::<ProbeSpec>(spec_val.clone()) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        issues.push(ValidationIssue::error(
+                            &format!("operations[{i}].spec"),
+                            &format!(
+                                "inline Probe operation '{}' has invalid or unknown spec kind \
+                                 (bounded to code_query, code_symbols, workspace_symbol): {e}",
+                                name
+                            ),
+                        ));
+                    }
                 }
             }
         }
@@ -1240,6 +1317,233 @@ mod tests {
                 .iter()
                 .any(|i| i.field == "probes" && i.message.contains("maximum")),
             "issues should mention probe count: {:?}",
+            report.issues
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 2: inline MacroOperation::Probe validation
+    // -----------------------------------------------------------------------
+
+    fn example_def_with_ops(operations: Vec<MacroOperation>) -> MacroDefinition {
+        MacroDefinition {
+            id: "inline.probe.test".into(),
+            version: "1".into(),
+            language: "java".into(),
+            scope: MacroScope::Project,
+            title: "Inline Probe Test".into(),
+            inputs_schema: json!({"type": "object"}),
+            effects: vec![],
+            authority_gates: vec![],
+            probes: vec![],
+            operations,
+            validations: vec![],
+            refusals: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_inline_probe_op() {
+        let ops = vec![MacroOperation::Probe {
+            name: "inline_sym".into(),
+            spec: json!({ "kind": "code_symbols" }),
+        }];
+        let def = example_def_with_ops(ops);
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            report.valid,
+            "valid inline probe op should pass: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_inline_probe_exceeds_budget() {
+        use crate::macros::model::MacroProbe;
+        // MAX_PROBE_COUNT top-level + 1 inline = over budget
+        let mut def = MacroDefinition {
+            id: "inline.probe.test".into(),
+            version: "1".into(),
+            language: "java".into(),
+            scope: MacroScope::Project,
+            title: "Inline Probe Over Budget".into(),
+            inputs_schema: json!({"type": "object"}),
+            effects: vec![],
+            authority_gates: vec![],
+            probes: (0..MAX_PROBE_COUNT)
+                .map(|i| MacroProbe {
+                    name: format!("probe{i}"),
+                    description: "x".into(),
+                    spec: json!({ "kind": "code_symbols" }),
+                })
+                .collect(),
+            operations: vec![MacroOperation::Probe {
+                name: "inline_extra".into(),
+                spec: json!({ "kind": "code_symbols" }),
+            }],
+            validations: vec![],
+            refusals: vec![],
+        };
+        // Ensure we don't accidentally exceed the budget with the top-level probes alone
+        def.probes.truncate(MAX_PROBE_COUNT); // exactly at limit
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            !report.valid,
+            "MAX_PROBE_COUNT top-level + 1 inline must exceed budget: {:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.field == "probes" && i.message.contains("maximum")),
+            "issues should mention probe count: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_probe_name_across_top_level_and_inline() {
+        use crate::macros::model::MacroProbe;
+        // top-level probe "binding" and inline Probe op also named "binding" → collision
+        let def = MacroDefinition {
+            id: "dup.cross.test".into(),
+            version: "1".into(),
+            language: "java".into(),
+            scope: MacroScope::Project,
+            title: "Cross-set Dup".into(),
+            inputs_schema: json!({"type": "object"}),
+            effects: vec![],
+            authority_gates: vec![],
+            probes: vec![MacroProbe {
+                name: "binding".into(),
+                description: "top-level".into(),
+                spec: json!({ "kind": "code_symbols" }),
+            }],
+            operations: vec![MacroOperation::Probe {
+                name: "binding".into(), // collision!
+                spec: json!({ "kind": "code_symbols" }),
+            }],
+            validations: vec![],
+            refusals: vec![],
+        };
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            !report.valid,
+            "duplicate name across top-level and inline probes must fail: {:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("duplicate probe name")
+                    || i.message.contains("shared namespace")),
+            "issues should mention duplicate name: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_inline_probe_spec_kind() {
+        let ops = vec![MacroOperation::Probe {
+            name: "bad_inline".into(),
+            spec: json!({ "kind": "find_usages", "symbol": "Foo" }),
+        }];
+        let def = example_def_with_ops(ops);
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            !report.valid,
+            "bad inline probe spec kind must fail: {:?}",
+            report.issues
+        );
+        assert!(
+            report.issues.iter().any(|i| i.field.contains("operations")
+                && i.message.contains("invalid or unknown")
+                && i.message.contains("spec kind")),
+            "issues should mention inline probe spec: {:?}",
+            report.issues
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX 4: interpolation placeholders rejected in probe/op specs
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_rejects_interpolation_in_top_level_probe_spec() {
+        use crate::macros::model::MacroProbe;
+        let probe = MacroProbe {
+            name: "sym".into(),
+            description: "has interpolation".into(),
+            spec: json!({
+                "kind": "code_query",
+                "file": "${inputs.file}",  // interpolation not supported
+                "query": "(class_declaration) @c"
+            }),
+        };
+        let def = example_def_with_probes(vec![probe]);
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            !report.valid,
+            "probe spec with interpolation must be rejected: {:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("interpolation")
+                    || i.message.contains("${")
+                    || i.message.contains("not yet supported")),
+            "error should mention interpolation: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_interpolation_in_inline_probe_spec() {
+        let ops = vec![MacroOperation::Probe {
+            name: "inline_sym".into(),
+            spec: json!({
+                "kind": "workspace_symbol",
+                "query": "${inputs.class_name}"  // interpolation not supported
+            }),
+        }];
+        let def = example_def_with_ops(ops);
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            !report.valid,
+            "inline probe spec with interpolation must be rejected: {:?}",
+            report.issues
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("interpolation")
+                    || i.message.contains("not yet supported")),
+            "error should mention interpolation: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_accepts_spec_without_interpolation() {
+        use crate::macros::model::MacroProbe;
+        let probe = MacroProbe {
+            name: "sym".into(),
+            description: "clean spec".into(),
+            spec: json!({
+                "kind": "workspace_symbol",
+                "query": "PaymentService"  // no ${...}
+            }),
+        };
+        let def = example_def_with_probes(vec![probe]);
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            report.valid,
+            "spec without interpolation must pass: {:?}",
             report.issues
         );
     }

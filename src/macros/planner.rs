@@ -15,8 +15,11 @@
 //!    `ctx.probe_runner`. Each result is inserted into `Context.probes[name]`
 //!    immediately so later probes and refusal predicates can reference it. A probe
 //!    error propagates as a planning error (fail closed). Unknown-root validation
-//!    follows: any predicate or interpolation referencing a root that is neither
-//!    `"inputs"` nor a declared probe name is a hard `error.unknown_context_root`.
+//!    is **phase-aware**: refusal predicates may only reference `"inputs"` or
+//!    top-level `def.probes` names (inline-operation probe names are excluded —
+//!    they don't exist yet when refusals evaluate). Validation guards and Record
+//!    op bodies may additionally reference inline probe names. Any root outside
+//!    the applicable set is a hard `error.unknown_context_root`.
 //! 5. **Refusals**: each `def.refusals[].when` predicate is evaluated; any match
 //!    short-circuits planning and returns a plan containing only the refusals (empty
 //!    `EditSet`, no apply).
@@ -87,7 +90,9 @@ const AUTHORITY_PREFIX: &str = "acknowledge_";
 
 /// Stateless macro planner.
 ///
-/// Both methods are pure (no I/O, no side effects on `self`).
+/// [`MacroPlanner::plan`] executes probes via the injectable [`ProbeRunner`] (read-only,
+/// no file mutations) and is therefore **not pure** — it performs I/O through the
+/// runner. [`MacroPlanner::lower`] remains pure (no I/O, no side effects on `self`).
 pub struct MacroPlanner;
 
 impl MacroPlanner {
@@ -101,7 +106,7 @@ impl MacroPlanner {
     ///
     /// - Version mismatch (`invocation.version` vs `def.version`)
     /// - Missing required inputs or type mismatch
-    /// - Non-empty `def.probes` (Phase 4 gated)
+    /// - Probe execution failure (fail closed; any probe error is a planning error)
     /// - Backend unavailable for `Emit`/`Rewrite` ops
     /// - `DelegateRefactor` plan failure, blocked/errored plan, or dup paths
     pub fn plan(
@@ -151,6 +156,18 @@ impl MacroPlanner {
         let mut probe_summaries: Vec<Value> = vec![];
 
         for probe in &def.probes {
+            // Defense-in-depth: interpolation in probe specs is not supported
+            // (should have been caught at registry validate() time, but re-check
+            // here in case a definition was loaded without going through the registry).
+            if spec_contains_interpolation(&probe.spec) {
+                bail!(
+                    "error.probe_spec_interpolation: macro '{}' probe '{}' contains '${{' \
+                     in its spec — interpolation in probe/operation specs is not yet supported; \
+                     remove ${{...}}",
+                    def.id,
+                    probe.name
+                );
+            }
             let spec: ProbeSpec =
                 serde_json::from_value(probe.spec.clone()).with_context(|| {
                     format!(
@@ -219,17 +236,29 @@ impl MacroPlanner {
             });
         }
 
-        // ── Unknown-root validation ───────────────────────────────────────────
+        // ── Unknown-root validation (phase-aware) ────────────────────────────
         //
-        // Collect every declared probe name (from def.probes AND inline
-        // MacroOperation::Probe entries). Any path root that is neither
-        // "inputs" nor a declared probe name is a hard planning error.
-        let allowed_roots: HashSet<String> = {
+        // REFUSAL phase: predicates and messages evaluate BEFORE inline-operation
+        // probes run, so only top-level def.probes names are in scope. Including
+        // inline-operation probe names here would silently allow references to
+        // context roots that don't exist yet, causing `eval` to return false
+        // instead of surfacing the typo as an error.
+        //
+        // OPERATION/interpolation phase: Record op bodies and validation guards
+        // execute after inline probes in operation order, so all declared probe
+        // names (top-level + inline) are valid roots there.
+        let refusal_allowed_roots: HashSet<String> = {
             let mut s: HashSet<String> = HashSet::new();
             s.insert("inputs".to_string());
             for p in &def.probes {
                 s.insert(p.name.clone());
             }
+            // Inline-operation probe names are deliberately excluded from the
+            // refusal-phase set: they don't exist when refusals are evaluated.
+            s
+        };
+        let op_allowed_roots: HashSet<String> = {
+            let mut s = refusal_allowed_roots.clone();
             for op in &def.operations {
                 if let MacroOperation::Probe { name, .. } = op {
                     s.insert(name.clone());
@@ -237,7 +266,7 @@ impl MacroPlanner {
             }
             s
         };
-        validate_context_roots(def, &allowed_roots)?;
+        validate_context_roots(def, &refusal_allowed_roots, &op_allowed_roots)?;
 
         // ── Constraint 5: refusal evaluation (short-circuits all further work) ──
         let refusal_hits: Vec<MacroRefusalHit> = def
@@ -288,6 +317,17 @@ impl MacroPlanner {
                     // Inline probe operation: same execution semantics as
                     // def.probes, but runs in operation order so later ops
                     // can reference its result via expr_ctx.
+
+                    // Defense-in-depth: reject interpolation placeholders in specs.
+                    if spec_contains_interpolation(spec_val) {
+                        bail!(
+                            "error.probe_spec_interpolation: macro '{}' inline Probe '{}' \
+                             contains '${{' in its spec — interpolation in probe/operation \
+                             specs is not yet supported; remove ${{...}}",
+                            def.id,
+                            name
+                        );
+                    }
                     let spec: ProbeSpec =
                         serde_json::from_value(spec_val.clone()).with_context(|| {
                             format!(
@@ -658,6 +698,20 @@ impl MacroPlanner {
 // ─────────────────────────────────────────────────────────────────────────────
 // Private helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Returns `true` if any string field within a JSON spec value contains `${`.
+///
+/// Interpolation in probe/operation specs is not yet supported. Specs containing
+/// `${...}` would survive deserialization as literal strings and silently produce
+/// wrong results. Used at both registry-validate and planner time for defense-in-depth.
+fn spec_contains_interpolation(spec: &Value) -> bool {
+    match spec {
+        Value::String(s) => s.contains("${"),
+        Value::Array(arr) => arr.iter().any(spec_contains_interpolation),
+        Value::Object(map) => map.values().any(spec_contains_interpolation),
+        _ => false,
+    }
+}
 
 /// Register a path in `touched`; bail with a clear error on duplicate.
 fn register_path(touched: &mut HashSet<String>, path: &str) -> Result<()> {
@@ -1145,26 +1199,40 @@ fn collect_interpolation_roots(template: &str, out: &mut Vec<String>) {
 }
 
 /// Validate that all context-path roots in refusals, validation guards, and
-/// Record operation bodies are members of `allowed_roots`.
+/// Record operation bodies reference known probe names.
 ///
-/// Any root that is neither `"inputs"` nor a declared probe name is a hard
-/// planning error (`error.unknown_context_root`). Missing *nested* fields under
-/// a valid root remain soft-false (existing [`expr::eval`] behaviour).
+/// # Phase-aware validation
 ///
-/// This check is performed after all probe names are known (static) but before
-/// any predicate evaluation so typos surface immediately.
-fn validate_context_roots(def: &MacroDefinition, allowed_roots: &HashSet<String>) -> Result<()> {
+/// `refusal_allowed_roots` = `{"inputs"}` ∪ top-level `def.probes` names.
+/// These are the only roots that exist when refusal predicates are evaluated
+/// (before any inline-operation probe has run).
+///
+/// `op_allowed_roots` = `refusal_allowed_roots` ∪ inline `MacroOperation::Probe`
+/// names. Validation guards and Record op bodies may reference inline probe
+/// names because they execute (or are checked) after inline probes run.
+///
+/// Any root outside the applicable set is a hard planning error
+/// (`error.unknown_context_root`). Missing *nested* fields under a valid root
+/// remain soft-false (existing [`expr::eval`] behaviour).
+fn validate_context_roots(
+    def: &MacroDefinition,
+    refusal_allowed_roots: &HashSet<String>,
+    op_allowed_roots: &HashSet<String>,
+) -> Result<()> {
     let mut bad: Vec<String> = vec![];
 
-    // Refusal predicates and messages
+    // Refusal predicates and messages: refusal-phase roots only.
+    // Inline-operation probe names are excluded — they don't exist yet when
+    // refusals evaluate, so a reference to one is always a typo or logic error.
     for refusal in &def.refusals {
         let mut roots = vec![];
         collect_predicate_roots(&refusal.when, &mut roots);
         for r in roots {
-            if !allowed_roots.contains(&r) {
+            if !refusal_allowed_roots.contains(&r) {
                 bad.push(format!(
                     "refusal '{}' predicate references unknown root '{}' \
-                     (not 'inputs' or a declared probe name)",
+                     (not 'inputs' or a top-level probe name; \
+                     inline-operation probe names are not in scope at refusal time)",
                     refusal.code, r
                 ));
             }
@@ -1172,23 +1240,24 @@ fn validate_context_roots(def: &MacroDefinition, allowed_roots: &HashSet<String>
         let mut msg_roots = vec![];
         collect_interpolation_roots(&refusal.message, &mut msg_roots);
         for r in msg_roots {
-            if !allowed_roots.contains(&r) {
+            if !refusal_allowed_roots.contains(&r) {
                 bad.push(format!(
                     "refusal '{}' message interpolation references unknown root '{}' \
-                     (not 'inputs' or a declared probe name)",
+                     (not 'inputs' or a top-level probe name; \
+                     inline-operation probe names are not in scope at refusal time)",
                     refusal.code, r
                 ));
             }
         }
     }
 
-    // Validation guards
+    // Validation guards: operation-phase roots (includes inline probe names).
     for val in &def.validations {
         if let Some(guard) = &val.when {
             let mut roots = vec![];
             collect_predicate_roots(guard, &mut roots);
             for r in roots {
-                if !allowed_roots.contains(&r) {
+                if !op_allowed_roots.contains(&r) {
                     bad.push(format!(
                         "validation guard predicate references unknown root '{}' \
                          (not 'inputs' or a declared probe name)",
@@ -1199,13 +1268,13 @@ fn validate_context_roots(def: &MacroDefinition, allowed_roots: &HashSet<String>
         }
     }
 
-    // Record operation bodies
+    // Record operation bodies: operation-phase roots (includes inline probe names).
     for op in &def.operations {
         if let MacroOperation::Record { label, body } = op {
             let mut roots = vec![];
             collect_interpolation_roots(body, &mut roots);
             for r in roots {
-                if !allowed_roots.contains(&r) {
+                if !op_allowed_roots.contains(&r) {
                     bad.push(format!(
                         "Record operation '{}' body interpolation references unknown root '{}' \
                          (not 'inputs' or a declared probe name)",
@@ -2343,6 +2412,135 @@ mod tests {
         // lower() sees no mutating ops → defaults to SyntaxOnly
         let rp = MacroPlanner::lower(&plan).expect("lowering probe-only plan must succeed");
         assert_eq!(rp.semantic_status, SemanticStatus::SyntaxOnly);
+    }
+
+    // ── FIX 3: refusal referencing inline-op probe name → error.unknown_context_root
+    //
+    // Inline-operation probe names are not in scope when refusal predicates
+    // evaluate (refusals fire before operations run). A refusal that references
+    // an inline probe name must surface as error.unknown_context_root — NOT
+    // silently return false (which would hide the logic error).
+
+    #[test]
+    fn refusal_referencing_inline_probe_name_is_unknown_context_root() {
+        let mut def = minimal_def();
+
+        // Inline probe named "inline_sym" — NOT a top-level probe.
+        def.operations = vec![MacroOperation::Probe {
+            name: "inline_sym".into(),
+            spec: json!({"kind": "code_symbols"}),
+        }];
+
+        // Refusal predicate references "inline_sym" which is only populated
+        // by the inline probe op (executed AFTER refusals). This must error.
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::Exists {
+                path: "inline_sym.exists".into(),
+            },
+            code: "error.should_not_reach".into(),
+            message: "inline probe result not available at refusal time".into(),
+        }];
+
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.unknown_context_root"),
+            "refusal referencing inline probe name must be error.unknown_context_root, got: {msg}"
+        );
+        assert!(
+            msg.contains("inline_sym"),
+            "error must name the unknown root: {msg}"
+        );
+    }
+
+    #[test]
+    fn refusal_referencing_top_level_probe_name_succeeds() {
+        // Sanity-check: top-level probe name IS in scope at refusal time.
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "top_probe".into(),
+            description: "top-level".into(),
+            spec: json!({"kind": "code_symbols"}),
+        }];
+        // Use Eq (not Exists): the normalized probe shape always has an
+        // `exists` key, so Exists{"top_probe.exists"} is always true. To gate
+        // on the boolean value we compare it. With exists=false below, the
+        // refusal must NOT fire — proving the top-level probe name resolves.
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::Eq {
+                path: "top_probe.exists".into(),
+                value: json!(true),
+            },
+            code: "error.already_exists".into(),
+            message: "already exists".into(),
+        }];
+
+        let mock = MockProbeRunner::new().with(
+            "top_probe",
+            json!({"exists": false, "count": 0}),
+            MacroSemanticStatus::SyntaxOnly,
+        );
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        // Should not error — top-level probe name is valid in refusal predicates.
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("top-level probe name must be valid in refusal predicate");
+        assert!(
+            plan.refusals.is_empty(),
+            "refusal should not fire (exists=false)"
+        );
+    }
+
+    // ── FIX 4: planner-side interpolation rejection (defense-in-depth)
+
+    #[test]
+    fn planner_rejects_interpolation_in_top_level_probe_spec() {
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "sym".into(),
+            description: "bad spec".into(),
+            spec: json!({
+                "kind": "code_query",
+                "file": "${inputs.file}",
+                "query": "(class_declaration) @c"
+            }),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.probe_spec_interpolation")
+                || msg.contains("interpolation in probe/operation specs is not yet supported"),
+            "planner must reject interpolation in probe spec, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn planner_rejects_interpolation_in_inline_probe_spec() {
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Probe {
+            name: "inline_sym".into(),
+            spec: json!({
+                "kind": "workspace_symbol",
+                "query": "${inputs.class_name}"
+            }),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.probe_spec_interpolation")
+                || msg.contains("interpolation in probe/operation specs is not yet supported"),
+            "planner must reject interpolation in inline probe spec, got: {msg}"
+        );
     }
 }
 
