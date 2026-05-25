@@ -38,6 +38,11 @@ pub enum RegistryError {
     /// The definition failed structural validation (missing fields, bad
     /// predicates, etc.).
     InvalidDefinition(String),
+    /// The `id` violates the allowed grammar `^[a-z0-9]+(?:[._-][a-z0-9]+)*$`.
+    ///
+    /// Rejected **before** any `PathBuf` join to prevent path traversal
+    /// (e.g. `../../etc/x`, `a/b`, `..` all fail here).
+    InvalidId(String),
     /// The path supplied as `project_dir` does not exist or is not a
     /// directory.
     NotAProjectDirectory(PathBuf),
@@ -56,6 +61,12 @@ impl std::fmt::Display for RegistryError {
             }
             Self::NotFound { id } => write!(f, "macro not found: '{id}'"),
             Self::InvalidDefinition(msg) => write!(f, "invalid definition: {msg}"),
+            Self::InvalidId(id) => write!(
+                f,
+                "invalid macro id '{id}': must match ^[a-z0-9]+(?:[._-][a-z0-9]+)*$ \
+                 (lowercase alnum segments separated by single '.' '_' or '-'; \
+                 no path separators, no consecutive separators)"
+            ),
             Self::NotAProjectDirectory(p) => write!(f, "not a project directory: {}", p.display()),
         }
     }
@@ -253,6 +264,50 @@ impl MacroRegistry {
     }
 
     // -----------------------------------------------------------------------
+    // Id grammar
+    // -----------------------------------------------------------------------
+
+    /// Validate a macro id against the allowed grammar.
+    ///
+    /// Grammar: `^[a-z0-9]+(?:[._-][a-z0-9]+)*$`
+    ///
+    /// - Segments: one or more lowercase ASCII alphanumeric chars.
+    /// - Separators: exactly one of `'.'`, `'_'`, or `'-'` between segments.
+    /// - No path separators (`/`, `\`), no `..`, no consecutive separators,
+    ///   no leading/trailing separator.
+    ///
+    /// Called **before** any `PathBuf` join to prevent path traversal.
+    fn is_valid_macro_id(id: &str) -> bool {
+        if id.is_empty() {
+            return false;
+        }
+        let bytes = id.as_bytes();
+        let is_alnum = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+        let is_sep = |b: u8| matches!(b, b'.' | b'_' | b'-');
+
+        // Must start and end with an alnum character.
+        if !is_alnum(bytes[0]) || !is_alnum(*bytes.last().unwrap()) {
+            return false;
+        }
+
+        // Scan interior: valid chars only, no consecutive separators.
+        let mut prev_sep = false;
+        for &b in bytes {
+            if is_alnum(b) {
+                prev_sep = false;
+            } else if is_sep(b) {
+                if prev_sep {
+                    return false; // consecutive separators
+                }
+                prev_sep = true;
+            } else {
+                return false; // invalid character (includes '/', '\', uppercase, etc.)
+            }
+        }
+        true
+    }
+
+    // -----------------------------------------------------------------------
     // Validation
     // -----------------------------------------------------------------------
 
@@ -287,6 +342,13 @@ impl MacroRegistry {
             issues.push(ValidationIssue::error(
                 "id",
                 "id is required and must be non-empty",
+            ));
+        } else if !Self::is_valid_macro_id(&def.id) {
+            issues.push(ValidationIssue::error(
+                "id",
+                "id must match ^[a-z0-9]+(?:[._-][a-z0-9]+)*$ \
+                 (lowercase alnum segments separated by single '.' '_' or '-'; \
+                 no path separators, uppercase, or consecutive separators)",
             ));
         }
         if def.version.trim().is_empty() {
@@ -371,10 +433,18 @@ impl MacroRegistry {
 
     /// Look up a single macro by `id`. Returns `None` when no scope has a
     /// definition with that `id`.
+    ///
+    /// Rejects `id` values that violate the id grammar before any path
+    /// construction — see [`RegistryError::InvalidId`].
     pub fn get(
         project_dir: Option<&Path>,
         id: &str,
     ) -> Result<Option<MacroDefinition>, RegistryError> {
+        // Reject non-empty ids that violate the grammar before any path
+        // construction (path traversal guard).
+        if !id.is_empty() && !Self::is_valid_macro_id(id) {
+            return Err(RegistryError::InvalidId(id.to_string()));
+        }
         let all = Self::list(project_dir);
         Ok(all.into_iter().find(|m| m.id == id))
     }
@@ -382,6 +452,8 @@ impl MacroRegistry {
     /// Register a macro in the **project scope** by writing it to
     /// `<project_dir>/.bbox/macros/<id>.json`.
     ///
+    /// - Rejects `def.id` values that violate the id grammar **before** any
+    ///   path join — see [`RegistryError::InvalidId`].
     /// - Creates the `.bbox/macros/` directory if it does not exist.
     /// - Validates the definition before writing.
     /// - When `overwrite` is `false` (default) and a file with the same `id`
@@ -392,6 +464,13 @@ impl MacroRegistry {
         def: MacroDefinition,
         overwrite: bool,
     ) -> Result<(), RegistryError> {
+        // Reject non-empty ids that violate the grammar before any PathBuf join
+        // (path traversal guard). Empty ids are caught by validate() below as a
+        // required-field error.
+        if !def.id.is_empty() && !Self::is_valid_macro_id(&def.id) {
+            return Err(RegistryError::InvalidId(def.id.clone()));
+        }
+
         if !project_dir.is_dir() {
             return Err(RegistryError::NotAProjectDirectory(
                 project_dir.to_path_buf(),
@@ -427,7 +506,15 @@ impl MacroRegistry {
     }
 
     /// Remove a project-scope macro by `id`.
+    ///
+    /// Rejects `id` values that violate the id grammar before any path
+    /// construction — see [`RegistryError::InvalidId`].
     pub fn unregister(project_dir: &Path, id: &str) -> Result<(), RegistryError> {
+        // Reject non-empty ids that violate the grammar before any path
+        // construction (path traversal guard).
+        if !id.is_empty() && !Self::is_valid_macro_id(id) {
+            return Err(RegistryError::InvalidId(id.to_string()));
+        }
         let dir = Self::project_macros_dir(project_dir);
         let file_path = dir.join(format!("{id}.json"));
         if !file_path.exists() {
@@ -866,6 +953,106 @@ mod tests {
         assert!(ids.contains(&"project.only"));
         assert!(ids.contains(&"user.only"));
         assert!(ids.contains(&"builtin.only"));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_valid_macro_id — id grammar (path traversal guard)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn valid_ids_accepted() {
+        let valid = [
+            "java",
+            "java2",
+            "java.add-service_boundary",
+            "test.macro",
+            "a1b2c3",
+            "x.y.z",
+            "abc-def",
+            "abc_def",
+            "a0",
+        ];
+        for id in valid {
+            assert!(
+                MacroRegistry::is_valid_macro_id(id),
+                "expected '{id}' to be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn path_traversal_ids_rejected() {
+        // The three cases mandated by the task brief plus extras.
+        let invalid = [
+            "../../etc/x",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "../foo",
+            "foo/../bar",
+            "\\windows\\path",
+            "foo\\bar",
+            "Uppercase",
+            "JAVA",
+            "java..ops",
+            "java--ops",
+            "java__ops",
+            ".java",
+            "java.",
+            "-java",
+            "java-",
+        ];
+        for id in invalid {
+            assert!(
+                !MacroRegistry::is_valid_macro_id(id),
+                "expected '{id}' to be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn register_rejects_path_traversal_id() {
+        let (_dir, project) = setup_tempdir();
+        let traversal_ids = ["../../etc/x", "a/b", ".."];
+        for bad_id in traversal_ids {
+            let mut def = example_def(MacroScope::Project);
+            def.id = bad_id.into();
+            match MacroRegistry::register(&project, def, false) {
+                Err(RegistryError::InvalidId(id)) => {
+                    assert_eq!(id, bad_id, "InvalidId should carry the bad id");
+                }
+                other => panic!("expected InvalidId for '{bad_id}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn get_rejects_path_traversal_id() {
+        let (_dir, project) = setup_tempdir();
+        let traversal_ids = ["../../etc/x", "a/b", ".."];
+        for bad_id in traversal_ids {
+            match MacroRegistry::get(Some(&project), bad_id) {
+                Err(RegistryError::InvalidId(id)) => {
+                    assert_eq!(id, bad_id);
+                }
+                other => panic!("expected InvalidId for '{bad_id}', got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unregister_rejects_path_traversal_id() {
+        let (_dir, project) = setup_tempdir();
+        let traversal_ids = ["../../etc/x", "a/b", ".."];
+        for bad_id in traversal_ids {
+            match MacroRegistry::unregister(&project, bad_id) {
+                Err(RegistryError::InvalidId(id)) => {
+                    assert_eq!(id, bad_id);
+                }
+                other => panic!("expected InvalidId for '{bad_id}', got {other:?}"),
+            }
+        }
     }
 
     // -----------------------------------------------------------------------

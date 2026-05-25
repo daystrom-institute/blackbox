@@ -27,13 +27,19 @@
 //! Those concerns land in later milestones (Phase 3 — Java backend sidecar;
 //! Phase 4 — probe bindings; Phase 2 MCP surface).
 
+pub mod backend;
 pub mod expr;
 pub mod model;
+pub mod planner_ctx;
 pub mod registry;
 
 // Convenience re-exports for crate-internal consumers. The MCP surface,
 // registry, planner, and backend that consume these land in later macro
 // milestones (M2-M4); allow unused until then.
+#[allow(unused_imports)]
+pub use backend::{
+    BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp, UnavailableBackend,
+};
 #[allow(unused_imports)]
 pub use expr::{Context, InterpolateError, Predicate, eval, interpolate};
 #[allow(unused_imports)]
@@ -42,5 +48,7 @@ pub use model::{
     MacroPlanCheck, MacroPlanOperation, MacroProbe, MacroRefusal, MacroRefusalHit, MacroScope,
     MacroSemanticStatus, MacroValidation,
 };
+#[allow(unused_imports)]
+pub use planner_ctx::MacroPlannerContext;
 #[allow(unused_imports)]
 pub use registry::{MacroRegistry, RegistryError};

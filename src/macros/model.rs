@@ -15,9 +15,10 @@
 //!    → refactor::apply()  (the sole writer; all safety guards live here)
 //! ```
 //!
-//! `EditSet` maps to `RefactorPlan` as follows:
+//! `EditSet` maps 1:1 onto `RefactorPlan` as follows:
 //! - `EditSet.file_edits`   → `RefactorPlan.edits`
 //! - `EditSet.file_creates` → `RefactorPlan.file_creates`
+//! - `EditSet.file_moves`   → `RefactorPlan.file_moves`
 //! - `EditSet.backends_used` is preserved on `MacroPlan.backends_used` and
 //!   promoted to `RefactorPlan` title/provenance metadata at lowering time.
 
@@ -26,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::macros::expr::Predicate;
-use crate::refactor::{FileCreate, FileEdit};
+use crate::refactor::{FileCreate, FileEdit, FileMove};
 
 // ---------------------------------------------------------------------------
 // MacroScope
@@ -345,12 +346,13 @@ pub struct MacroPlanCheck {
 /// aggregate it, `macro_apply` lowers it to a single `RefactorPlan` and
 /// calls `refactor::apply()`. No file is ever written from `EditSet` directly.
 ///
-/// ### Lowering to `RefactorPlan`
+/// ### Lowering to `RefactorPlan` (1:1 mapping)
 ///
-/// | `EditSet` field      | `RefactorPlan` field       |
+/// | `EditSet` field      | `RefactorPlan` field        |
 /// |---|---|
-/// | `file_edits`         | `edits`                    |
-/// | `file_creates`       | `file_creates`             |
+/// | `file_edits`         | `edits`                     |
+/// | `file_creates`       | `file_creates`              |
+/// | `file_moves`         | `file_moves`                |
 /// | `backends_used`      | title / provenance metadata |
 #[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct EditSet {
@@ -361,7 +363,13 @@ pub struct EditSet {
     /// New files to create. Maps to `RefactorPlan.file_creates`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_creates: Vec<FileCreate>,
-    /// Backend identifiers that contributed edits/creates to this set,
+    /// File rename/move operations. Maps to `RefactorPlan.file_moves`.
+    ///
+    /// Each `FileMove` carries a preimage SHA-256 that `refactor::apply`
+    /// verifies before executing the move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_moves: Vec<FileMove>,
+    /// Backend identifiers that contributed edits/creates/moves to this set,
     /// e.g. `["java_poet", "open_rewrite"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backends_used: Vec<String>,
@@ -458,6 +466,7 @@ mod tests {
                     path: "/repo/src/PaymentService.java".into(),
                     content: "public interface PaymentService {}".into(),
                 }],
+                file_moves: vec![],
                 backends_used: vec!["java_poet".into()],
             },
             checks: vec![MacroPlanCheck {
@@ -557,6 +566,7 @@ mod tests {
                 path: "/repo/Foo.java".into(),
                 content: "class Foo {}".into(),
             }],
+            file_moves: vec![],
             backends_used: vec!["java_poet".into()],
         };
         let json = serde_json::to_value(&es).expect("to_value");
@@ -585,6 +595,36 @@ mod tests {
             let back: MacroSemanticStatus = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(&back, status);
         }
+    }
+
+    #[test]
+    fn edit_set_file_moves_round_trip() {
+        use crate::refactor::FileMove;
+        let es = EditSet {
+            file_edits: vec![],
+            file_creates: vec![],
+            file_moves: vec![FileMove {
+                source_path: "/repo/src/Old.java".into(),
+                target_path: "/repo/src/New.java".into(),
+                original_sha256: "deadbeef".into(),
+            }],
+            backends_used: vec!["open_rewrite".into()],
+        };
+        let json = serde_json::to_value(&es).expect("serialize");
+        // file_moves present when non-empty
+        assert!(json.get("file_moves").is_some());
+        let es2: EditSet = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(es2.file_moves.len(), 1);
+        assert_eq!(es2.file_moves[0].source_path, "/repo/src/Old.java");
+        assert_eq!(es2.file_moves[0].target_path, "/repo/src/New.java");
+
+        // When file_moves is empty it should be omitted in serialization
+        let es_empty = EditSet::default();
+        let json_empty = serde_json::to_value(&es_empty).expect("serialize empty");
+        assert!(
+            json_empty.get("file_moves").is_none(),
+            "empty file_moves should be omitted"
+        );
     }
 
     #[test]
