@@ -32,6 +32,7 @@ pub mod expr;
 pub mod model;
 pub mod planner;
 pub mod planner_ctx;
+pub mod probe;
 pub mod registry;
 
 // Convenience re-exports for crate-internal consumers. The MCP surface,
@@ -53,5 +54,7 @@ pub use model::{
 pub use planner::MacroPlanner;
 #[allow(unused_imports)]
 pub use planner_ctx::MacroPlannerContext;
+#[allow(unused_imports)]
+pub use probe::{CodeNavProbeRunner, ProbeOutput, ProbeRunner, ProbeSpec, UnavailableProbeRunner};
 #[allow(unused_imports)]
 pub use registry::{MacroRegistry, RegistryError};

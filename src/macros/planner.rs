@@ -939,14 +939,10 @@ fn status_rank(s: &MacroSemanticStatus) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use serde_json::json;
 
     use super::*;
-    use crate::macros::model::{
-        MacroAnchors, MacroProbe, MacroRefusal, MacroScope, MacroValidation,
-    };
+    use crate::macros::model::{MacroProbe, MacroRefusal, MacroScope};
     use crate::macros::planner_ctx::MacroPlannerContext;
     use crate::refactor;
 

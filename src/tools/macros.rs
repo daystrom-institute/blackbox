@@ -19,6 +19,7 @@ use crate::macros::backend::UnavailableBackend;
 use crate::macros::model::{MacroAnchors, MacroDefinition, MacroInvocation, MacroPlan};
 use crate::macros::planner::{MacroPlanner, build_macro_apply_params};
 use crate::macros::planner_ctx::MacroPlannerContext;
+use crate::macros::probe::UnavailableProbeRunner;
 use crate::macros::registry::{MacroRegistry, RegistryError};
 use crate::refactor;
 use crate::server::state::BlackboxServer;
@@ -442,10 +443,12 @@ impl BlackboxServer {
             operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
         };
 
-        // Build a planner context: fail-closed backend + LSP from daemon state
+        // Build a planner context: fail-closed backend + LSP from daemon state.
+        // Probe runner is UnavailableProbeRunner until P4b wires the real runner.
         let ctx = MacroPlannerContext::new(
             Box::new(UnavailableBackend),
             Some(self.state.lsp_sessions.clone()),
+            Box::new(UnavailableProbeRunner),
         );
 
         match MacroPlanner::plan(&invocation, &def, &ctx) {
@@ -552,9 +555,11 @@ impl BlackboxServer {
             operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
         };
 
+        // Probe runner is UnavailableProbeRunner until P4b wires the real runner.
         let ctx = MacroPlannerContext::new(
             Box::new(UnavailableBackend),
             Some(self.state.lsp_sessions.clone()),
+            Box::new(UnavailableProbeRunner),
         );
 
         // Plan phase

@@ -18,6 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::macros::expr::Predicate;
 use crate::macros::model::{MacroDefinition, MacroScope};
+use crate::macros::probe::ProbeSpec;
 
 // ---------------------------------------------------------------------------
 // RegistryError
@@ -137,6 +138,9 @@ impl ValidationIssue {
 // ---------------------------------------------------------------------------
 // MacroRegistry
 // ---------------------------------------------------------------------------
+
+/// Maximum number of probe slots a single [`MacroDefinition`] may declare.
+const MAX_PROBE_COUNT: usize = 32;
 
 /// Stateless registry that resolves [`MacroDefinition`]s from three scopes.
 ///
@@ -402,6 +406,41 @@ impl MacroRegistry {
                     &format!("validations[{i}].targets"),
                     "targets must not be empty",
                 ));
+            }
+        }
+
+        // Probe validation: cap count, reject duplicate names, validate spec kind.
+        if def.probes.len() > MAX_PROBE_COUNT {
+            issues.push(ValidationIssue::error(
+                "probes",
+                &format!(
+                    "macro declares {} probes; maximum allowed is {MAX_PROBE_COUNT}",
+                    def.probes.len()
+                ),
+            ));
+        }
+
+        // Duplicate probe name check.
+        let mut seen_probe_names = std::collections::HashSet::new();
+        for (i, probe) in def.probes.iter().enumerate() {
+            if !seen_probe_names.insert(&probe.name) {
+                issues.push(ValidationIssue::error(
+                    &format!("probes[{i}].name"),
+                    &format!("duplicate probe name '{}'", probe.name),
+                ));
+            }
+            // ProbeSpec deserialization: reject unknown kinds / malformed specs.
+            match serde_json::from_value::<ProbeSpec>(probe.spec.clone()) {
+                Ok(_) => {}
+                Err(e) => {
+                    issues.push(ValidationIssue::error(
+                        &format!("probes[{i}].spec"),
+                        &format!(
+                            "invalid or unknown probe spec kind (bounded to code_query, \
+                             code_symbols, workspace_symbol): {e}"
+                        ),
+                    ));
+                }
             }
         }
 
@@ -1075,5 +1114,133 @@ mod tests {
         let def = example_def_with_predicate(MacroScope::Project);
         let report = MacroRegistry::validate(&def);
         assert!(report.valid, "definition with valid predicate should pass");
+    }
+
+    // -----------------------------------------------------------------------
+    // Probe validation (P4a)
+    // -----------------------------------------------------------------------
+
+    fn example_def_with_probes(probes: Vec<crate::macros::model::MacroProbe>) -> MacroDefinition {
+        MacroDefinition {
+            id: "probe.test".into(),
+            version: "1".into(),
+            language: "java".into(),
+            scope: MacroScope::Project,
+            title: "Probe Test".into(),
+            inputs_schema: json!({"type": "object"}),
+            effects: vec![],
+            authority_gates: vec![],
+            probes,
+            operations: vec![],
+            validations: vec![],
+            refusals: vec![],
+        }
+    }
+
+    #[test]
+    fn validate_accepts_valid_probes() {
+        use crate::macros::model::MacroProbe;
+        let probes = vec![
+            MacroProbe {
+                name: "binding".into(),
+                description: "Find class declarations".into(),
+                spec: json!({
+                    "kind": "code_query",
+                    "file": "src/Foo.java",
+                    "query": "(class_declaration) @c"
+                }),
+            },
+            MacroProbe {
+                name: "symbols".into(),
+                description: "Find service symbols".into(),
+                spec: json!({ "kind": "code_symbols", "query": "Service" }),
+            },
+        ];
+        let def = example_def_with_probes(probes);
+        let report = MacroRegistry::validate(&def);
+        assert!(
+            report.valid,
+            "valid probes should pass: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_probe_names() {
+        use crate::macros::model::MacroProbe;
+        let probe = MacroProbe {
+            name: "binding".into(),
+            description: "dup".into(),
+            spec: json!({ "kind": "code_symbols" }),
+        };
+        let def = example_def_with_probes(vec![probe.clone(), probe]);
+        let report = MacroRegistry::validate(&def);
+        assert!(!report.valid, "duplicate probe names should fail");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.message.contains("duplicate probe name")),
+            "issues should mention duplicate name: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_bad_probe_spec_kind() {
+        use crate::macros::model::MacroProbe;
+        let probe = MacroProbe {
+            name: "bad".into(),
+            description: "bad kind".into(),
+            spec: json!({ "kind": "find_usages", "symbol": "Foo" }),
+        };
+        let def = example_def_with_probes(vec![probe]);
+        let report = MacroRegistry::validate(&def);
+        assert!(!report.valid, "bad probe spec kind should fail");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.field.contains("probes") && i.field.contains("spec")),
+            "issues should mention probe spec: {:?}",
+            report.issues
+        );
+    }
+
+    #[test]
+    fn validate_rejects_malformed_probe_spec() {
+        use crate::macros::model::MacroProbe;
+        let probe = MacroProbe {
+            name: "bad".into(),
+            description: "missing file".into(),
+            // code_query requires "file" and "query"
+            spec: json!({ "kind": "code_query" }),
+        };
+        let def = example_def_with_probes(vec![probe]);
+        let report = MacroRegistry::validate(&def);
+        assert!(!report.valid, "malformed probe spec should fail");
+    }
+
+    #[test]
+    fn validate_rejects_too_many_probes() {
+        use crate::macros::model::MacroProbe;
+        let probes: Vec<MacroProbe> = (0..=MAX_PROBE_COUNT)
+            .map(|i| MacroProbe {
+                name: format!("probe{i}"),
+                description: "x".into(),
+                spec: json!({ "kind": "code_symbols" }),
+            })
+            .collect();
+        let def = example_def_with_probes(probes);
+        let report = MacroRegistry::validate(&def);
+        assert!(!report.valid, "too many probes should fail");
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.field == "probes" && i.message.contains("maximum")),
+            "issues should mention probe count: {:?}",
+            report.issues
+        );
     }
 }

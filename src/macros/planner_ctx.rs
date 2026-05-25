@@ -16,6 +16,7 @@
 
 use crate::lsp::LspSessionManager;
 use crate::macros::backend::{JavaMacroBackend, UnavailableBackend};
+use crate::macros::probe::{ProbeRunner, UnavailableProbeRunner};
 
 // ---------------------------------------------------------------------------
 // MacroPlannerContext
@@ -38,21 +39,43 @@ pub struct MacroPlannerContext {
     /// `None` at construction until Phase 4 probe bindings are wired in; the
     /// planner must check for `Some` before issuing LSP-backed probe ops.
     pub lsp: Option<LspSessionManager>,
+
+    /// Probe runner for evaluating [`crate::macros::model::MacroProbe`] slots
+    /// at plan time.
+    ///
+    /// Defaults to [`UnavailableProbeRunner`] (fail-closed) until a real
+    /// [`crate::macros::probe::CodeNavProbeRunner`] is injected at service
+    /// startup (Phase 4 P4b wires the planner to this runner).
+    pub probe_runner: Box<dyn ProbeRunner>,
 }
 
 impl MacroPlannerContext {
-    /// Construct a context with an explicit backend and optional LSP manager.
-    pub fn new(backend: Box<dyn JavaMacroBackend>, lsp: Option<LspSessionManager>) -> Self {
-        Self { backend, lsp }
+    /// Construct a context with an explicit backend, optional LSP manager,
+    /// and a probe runner.
+    ///
+    /// Pass [`UnavailableProbeRunner`] when no real runner is available yet;
+    /// pass a [`crate::macros::probe::CodeNavProbeRunner`] for production use.
+    pub fn new(
+        backend: Box<dyn JavaMacroBackend>,
+        lsp: Option<LspSessionManager>,
+        probe_runner: Box<dyn ProbeRunner>,
+    ) -> Self {
+        Self {
+            backend,
+            lsp,
+            probe_runner,
+        }
     }
 }
 
 impl Default for MacroPlannerContext {
-    /// Returns a fail-closed context: [`UnavailableBackend`] + no LSP.
+    /// Returns a fail-closed context:
+    /// [`UnavailableBackend`] + no LSP + [`UnavailableProbeRunner`].
     fn default() -> Self {
         Self {
             backend: Box::new(UnavailableBackend),
             lsp: None,
+            probe_runner: Box::new(UnavailableProbeRunner),
         }
     }
 }
@@ -89,8 +112,42 @@ mod tests {
     }
 
     #[test]
+    fn default_context_probe_runner_fails_closed() {
+        use crate::macros::expr::Context;
+        use crate::macros::model::MacroInvocation;
+        use crate::macros::probe::ProbeSpec;
+        let ctx = MacroPlannerContext::default();
+        let spec = ProbeSpec::CodeSymbols {
+            query: None,
+            item_kinds: None,
+            languages: None,
+        };
+        let inv = MacroInvocation {
+            macro_id: "test".into(),
+            version: None,
+            project_dir: "/tmp".into(),
+            inputs: serde_json::Map::new(),
+            anchors: None,
+            operator_opt_outs: vec![],
+        };
+        let err = ctx
+            .probe_runner
+            .run_probe("probe", &spec, &Context::default(), &inv)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("error.probe_backend_unavailable"),
+            "default probe_runner should use UnavailableProbeRunner"
+        );
+    }
+
+    #[test]
     fn new_constructor_accepts_unavailable_backend() {
-        let ctx = MacroPlannerContext::new(Box::new(UnavailableBackend), None);
+        use crate::macros::probe::UnavailableProbeRunner;
+        let ctx = MacroPlannerContext::new(
+            Box::new(UnavailableBackend),
+            None,
+            Box::new(UnavailableProbeRunner),
+        );
         let op = JavaRewriteOp::InsertMember {
             target_file: "Foo.java".into(),
             target_type: "Foo".into(),
