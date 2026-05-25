@@ -45,6 +45,7 @@ mod index;
 pub mod json_store;
 mod knowledge;
 mod lsp;
+pub(crate) mod macros;
 mod manifest;
 mod mcp_client;
 mod mcp_tools;
