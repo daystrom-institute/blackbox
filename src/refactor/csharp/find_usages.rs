@@ -17,8 +17,8 @@ use lsp_types::{
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
-use crate::projects::Language;
 use crate::lsp::convert;
+use crate::projects::Language;
 use crate::refactor::{PlanContext, RefactorPlanParams, csharp::lsp_rename_helpers};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

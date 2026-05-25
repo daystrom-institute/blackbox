@@ -145,6 +145,7 @@ pub(crate) fn plan_organize_aliases(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     let wrapped = PlanWithReport {
@@ -183,6 +184,7 @@ fn empty_plan(parsed: &ParsedSource) -> RefactorPlan {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     }
 }
 

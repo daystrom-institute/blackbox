@@ -250,6 +250,7 @@ pub fn plan_match_to_strategy(p: &crate::refactor::RefactorPlanParams) -> anyhow
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan).context("rust_match_arm_to_strategy plan validation")?;

@@ -4134,6 +4134,7 @@ mod tests {
             deep_analysis: None,
             plan_status: PlanStatus::Planned,
             fixme_count: None,
+            operator_opt_outs_used: Vec::new(),
         };
         let err = apply(
             &RefactorApplyParams {
@@ -4184,6 +4185,7 @@ mod tests {
             deep_analysis: None,
             plan_status: PlanStatus::Planned,
             fixme_count: None,
+            operator_opt_outs_used: Vec::new(),
         };
 
         let response = apply(
@@ -6294,15 +6296,13 @@ impl Cache {
         let new_file = dir.path().join("new_module.rs");
         let content = "pub fn hello() -> &'static str { \"world\" }\n";
 
-        let result = plan(
-            &RefactorPlanParams {
-                kind: "create_file".to_string(),
-                source: new_file.to_string_lossy().to_string(),
-                new_text: Some(content.to_string()),
-                project_dir: None,
-                ..Default::default()
-            },
-        )
+        let result = plan(&RefactorPlanParams {
+            kind: "create_file".to_string(),
+            source: new_file.to_string_lossy().to_string(),
+            new_text: Some(content.to_string()),
+            project_dir: None,
+            ..Default::default()
+        })
         .unwrap();
 
         let parsed: RefactorPlan = serde_json::from_str(&result).unwrap();
@@ -6321,15 +6321,13 @@ impl Cache {
         let new_file = dir.path().join("created.rs");
         let content = "pub fn answer() -> i32 { 42 }\n";
 
-        let plan_json = plan(
-            &RefactorPlanParams {
-                kind: "create_file".to_string(),
-                source: new_file.to_string_lossy().to_string(),
-                new_text: Some(content.to_string()),
-                project_dir: None,
-                ..Default::default()
-            },
-        )
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "create_file".to_string(),
+            source: new_file.to_string_lossy().to_string(),
+            new_text: Some(content.to_string()),
+            project_dir: None,
+            ..Default::default()
+        })
         .unwrap();
 
         let response = apply(
@@ -6386,7 +6384,8 @@ impl Cache {
         .unwrap_err();
 
         assert!(
-            err.to_string().contains("refusing to create") && err.to_string().contains("already exists"),
+            err.to_string().contains("refusing to create")
+                && err.to_string().contains("already exists"),
             "unexpected error: {}",
             err
         );
@@ -6431,6 +6430,164 @@ impl Cache {
         let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
         // Parse validation fires before disk writes, so the file must not exist
         assert_eq!(applied.status, "validation_failed");
-        assert!(!new_file.exists(), "file must not be created when parse validation fails");
+        assert!(
+            !new_file.exists(),
+            "file must not be created when parse validation fails"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RX-V1: operator_opt_outs_used field tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod rx_v1_operator_opt_outs_tests {
+    use super::*;
+
+    /// rewrite_rust_error_type with acknowledge_public_api_change=true records
+    /// the flag on the RefactorPlan.
+    #[test]
+    fn rewrite_error_type_records_opt_out_on_plan() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("main.rs");
+        std::fs::write(
+            &src,
+            r#"pub enum OldErr { IoFail }
+fn do_something() -> Result<(), OldErr> { Ok(()) }
+"#,
+        )
+        .unwrap();
+
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "acknowledge_public_api_change".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_error_type".into(),
+            source: path_string(&src),
+            old_text: Some("OldErr".into()),
+            new_text: Some("NewErr".into()),
+            item_names: Some(vec!["do_something".into()]),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert!(
+            p.operator_opt_outs_used
+                .contains(&"acknowledge_public_api_change".to_string()),
+            "expected acknowledge_public_api_change in operator_opt_outs_used, got {:?}",
+            p.operator_opt_outs_used
+        );
+    }
+
+    /// rewrite_rust_error_type without acknowledge_public_api_change
+    /// (non-pub error type) leaves operator_opt_outs_used empty.
+    #[test]
+    fn rewrite_error_type_non_pub_has_empty_opt_outs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("main.rs");
+        std::fs::write(
+            &src,
+            r#"enum OldErr { IoFail }
+fn do_something() -> Result<(), OldErr> { Ok(()) }
+"#,
+        )
+        .unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_error_type".into(),
+            source: path_string(&src),
+            old_text: Some("OldErr".into()),
+            new_text: Some("NewErr".into()),
+            item_names: Some(vec!["do_something".into()]),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert!(
+            p.operator_opt_outs_used.is_empty(),
+            "expected empty operator_opt_outs_used, got {:?}",
+            p.operator_opt_outs_used
+        );
+    }
+
+    /// move_rust_struct_fields with acknowledge_repr=true records the flag.
+    #[test]
+    fn move_rust_struct_fields_records_repr_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+        std::fs::write(
+            &src,
+            r#"#[repr(C)]
+struct Point {
+    x: f64,
+    y: f64,
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(&tgt, "struct State { }\n").unwrap();
+
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "acknowledge_repr".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "move_rust_struct_fields".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["x".into()]),
+            impl_name: Some("Point".into()),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert!(
+            p.operator_opt_outs_used
+                .contains(&"acknowledge_repr".to_string()),
+            "expected acknowledge_repr in operator_opt_outs_used, got {:?}",
+            p.operator_opt_outs_used
+        );
+    }
+
+    /// move_rust_struct_fields without acknowledge_repr (non-repr struct)
+    /// leaves operator_opt_outs_used empty.
+    #[test]
+    fn move_rust_struct_fields_non_repr_has_empty_opt_outs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.rs");
+        let tgt = dir.path().join("tgt.rs");
+        std::fs::write(
+            &src,
+            r#"struct Point { x: f64, y: f64 }
+"#,
+        )
+        .unwrap();
+        std::fs::write(&tgt, "struct State { }\n").unwrap();
+
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "move_rust_struct_fields".into(),
+            source: path_string(&src),
+            target: Some(path_string(&tgt)),
+            item_names: Some(vec!["x".into()]),
+            impl_name: Some("Point".into()),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert!(
+            p.operator_opt_outs_used.is_empty(),
+            "expected empty operator_opt_outs_used, got {:?}",
+            p.operator_opt_outs_used
+        );
     }
 }

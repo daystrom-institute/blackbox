@@ -18,8 +18,6 @@ pub(crate) struct PlanWithQuestionMarkSites {
     plan: RefactorPlan,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     question_mark_sites: Vec<QuestionMarkSite>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    operator_opt_outs_used: Vec<String>,
 }
 
 pub fn plan_rewrite_error_type(p: &crate::refactor::RefactorPlanParams) -> Result<String> {
@@ -193,13 +191,13 @@ pub fn plan_rewrite_error_type(p: &crate::refactor::RefactorPlanParams) -> Resul
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: operator_opt_outs,
     };
 
     validate_plan_shape(&plan).context("failed to validate rewrite_error_type plan")?;
     let response = PlanWithQuestionMarkSites {
         plan,
         question_mark_sites,
-        operator_opt_outs_used: operator_opt_outs,
     };
     Ok(serde_json::to_string_pretty(&response)?)
 }

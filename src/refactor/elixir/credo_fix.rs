@@ -110,6 +110,7 @@ pub(crate) fn plan_credo_fix_round(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string(&PlanWithReport {
         plan,

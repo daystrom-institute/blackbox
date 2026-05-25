@@ -117,6 +117,8 @@ pub fn plan_unseal(p: &RefactorPlanParams) -> Result<String> {
         },
         SemanticStatus::SyntaxOnly,
     );
+    plan.operator_opt_outs_used
+        .push("acknowledge_subclass_surface_change".to_string());
     plan.validations.push(ValidationStep::TreeSitterNoErrors {
         path: path_string(&source_path),
         byte_range: None,

@@ -59,9 +59,7 @@ pub(crate) fn lsp_position_to_byte(source: &str, line: u32, character: u32) -> R
 
 /// Flatten an LSP [`WorkspaceEdit`] into a list of [`FileEdit`] values
 /// that `apply_file_edits` can consume.
-pub(crate) fn workspace_edit_to_file_edits(
-    workspace_edit: WorkspaceEdit,
-) -> Result<Vec<FileEdit>> {
+pub(crate) fn workspace_edit_to_file_edits(workspace_edit: WorkspaceEdit) -> Result<Vec<FileEdit>> {
     let mut grouped: BTreeMap<PathBuf, Vec<lsp_types::TextEdit>> = BTreeMap::new();
 
     if let Some(changes) = workspace_edit.changes {

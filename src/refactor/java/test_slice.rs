@@ -290,6 +290,7 @@ pub(crate) fn plan_extract_java_test_slice(p: &RefactorPlanParams) -> Result<Str
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }

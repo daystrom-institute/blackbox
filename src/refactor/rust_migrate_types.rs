@@ -281,6 +281,7 @@ pub fn plan_migrate_type_usages(p: &crate::refactor::RefactorPlanParams) -> Resu
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan).context("failed to validate migrate_rust_type_usages plan")?;

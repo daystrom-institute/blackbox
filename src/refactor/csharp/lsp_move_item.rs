@@ -31,8 +31,8 @@ use lsp_types::{
 use reqwest::Url;
 
 use super::lex::{is_word_boundary, match_keyword, read_ident, skip_lex_atom, skip_whitespace};
-use crate::projects::Language;
 use crate::lsp::convert;
+use crate::projects::Language;
 use crate::refactor::{
     PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan,
 };

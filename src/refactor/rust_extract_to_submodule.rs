@@ -295,6 +295,7 @@ pub(crate) fn plan_extract_rust_items_to_submodule(p: &RefactorPlanParams) -> Re
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan).context("validate extract_rust_items_to_submodule plan")?;

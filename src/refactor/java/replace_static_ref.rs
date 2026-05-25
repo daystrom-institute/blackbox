@@ -202,6 +202,7 @@ pub(crate) fn plan_replace_java_static_reference(p: &RefactorPlanParams) -> Resu
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }

@@ -1334,6 +1334,7 @@ pub(crate) fn plan_lombokify_java_tree(p: &RefactorPlanParams, dir: &Path) -> Re
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1952,6 +1953,7 @@ pub(crate) fn plan_lombokify_java_class_single(
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }

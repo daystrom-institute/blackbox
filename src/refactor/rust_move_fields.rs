@@ -242,6 +242,11 @@ pub fn plan_move_struct_fields(p: &RefactorPlanParams) -> anyhow::Result<String>
         v
     };
 
+    let mut operator_opt_outs = Vec::new();
+    if acknowledge_repr && has_non_default_repr {
+        operator_opt_outs.push("acknowledge_repr".to_string());
+    }
+
     let plan = RefactorPlan {
         title: format!(
             "move {} field(s) from `{struct_name}` to target struct",
@@ -264,6 +269,7 @@ pub fn plan_move_struct_fields(p: &RefactorPlanParams) -> anyhow::Result<String>
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: operator_opt_outs,
     };
 
     validate_plan_shape(&plan).context("validate move_rust_struct_fields plan")?;

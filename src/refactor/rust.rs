@@ -175,6 +175,7 @@ pub(crate) fn plan_extract_rust_items(p: &RefactorPlanParams) -> Result<String> 
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -571,6 +572,7 @@ pub(crate) fn plan_extract_rust_impl_methods(p: &RefactorPlanParams) -> Result<S
         deep_analysis,
         plan_status,
         fixme_count,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -728,6 +730,7 @@ pub(crate) fn build_delete_rust_plan(
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -796,6 +799,7 @@ pub(crate) fn plan_add_rust_router_to_sum(p: &RefactorPlanParams) -> Result<Stri
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -873,6 +877,7 @@ pub(crate) fn plan_add_rust_mod_decl(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -948,6 +953,7 @@ pub(crate) fn plan_add_rust_use_decl(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1011,6 +1017,7 @@ pub(crate) fn plan_rust_module_wiring(p: &RefactorPlanParams) -> Result<String> 
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1313,6 +1320,7 @@ pub(crate) fn plan_copy_rust_mod_decls(p: &RefactorPlanParams) -> Result<String>
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1389,6 +1397,7 @@ pub(crate) fn plan_rewrite_rust_mod_visibility(p: &RefactorPlanParams) -> Result
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1502,6 +1511,7 @@ pub(crate) fn plan_rewrite_rust_item_visibility(p: &RefactorPlanParams) -> Resul
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1600,6 +1610,7 @@ pub(crate) fn plan_rewrite_rust_field_visibility(p: &RefactorPlanParams) -> Resu
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1667,6 +1678,7 @@ pub(crate) fn plan_rust_lsp_rename(p: &RefactorPlanParams, ctx: &PlanContext) ->
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -1722,6 +1734,7 @@ pub(crate) fn plan_rust_organize_imports(
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -2454,12 +2467,12 @@ pub(crate) fn rust_node_by_range<'a>(
     None
 }
 
+use crate::lsp::convert::{byte_to_lsp_position, workspace_edit_to_file_edits};
 use lsp_types::{
-    CodeActionContext, CodeActionKind, CodeActionParams, Position, Range,
-    RenameParams, TextDocumentIdentifier, TextDocumentPositionParams, Url,
+    CodeActionContext, CodeActionKind, CodeActionParams, Position, Range, RenameParams,
+    TextDocumentIdentifier, TextDocumentPositionParams, Url,
     request::{CodeActionRequest, Rename},
 };
-use crate::lsp::convert::{byte_to_lsp_position, workspace_edit_to_file_edits};
 
 use crate::lsp::LspSessionManager;
 use crate::projects::Language;
@@ -2486,7 +2499,6 @@ pub(crate) fn rust_rename_position_byte(parsed: &ParsedSource, old_name: &str) -
         .ok_or_else(|| anyhow!("could not find `{old_name}` text inside selected item"))?;
     Ok(item.byte_start + relative + old_name.len().saturating_sub(1) / 2)
 }
-
 
 /// Ask rust-analyzer for a workspace rename via the shared session
 /// pool. The session is lazily spawned on first call for

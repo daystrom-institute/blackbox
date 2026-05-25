@@ -9,8 +9,8 @@ use lsp_types::{
     notification::DidOpenTextDocument, request::CodeActionRequest,
 };
 
-use crate::lsp::{LspError, LspSessionManager};
 use crate::lsp::convert::{byte_to_lsp_position, workspace_edit_to_file_edits};
+use crate::lsp::{LspError, LspSessionManager};
 use crate::projects::Language;
 
 use super::*;
@@ -112,6 +112,7 @@ pub fn plan_ra_move(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;

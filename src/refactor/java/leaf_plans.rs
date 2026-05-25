@@ -81,6 +81,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -367,6 +368,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -457,6 +459,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -604,6 +607,7 @@ pub(crate) fn plan_java_lsp_organize_imports(
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)

@@ -591,6 +591,7 @@ fn plan_from_edits(
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     validate_plan_shape(&plan)?;
     Ok(plan)

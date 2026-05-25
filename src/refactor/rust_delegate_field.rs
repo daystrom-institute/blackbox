@@ -138,6 +138,7 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan).context("validate add_rust_delegate_field plan")?;

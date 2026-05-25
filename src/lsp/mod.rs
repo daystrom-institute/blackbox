@@ -15,7 +15,7 @@
 //! short-lived [`session_manager::LspClient`] handle through
 //! [`session_manager::LspSessionManager::with_session`].
 
-pub mod session_manager;
 pub(crate) mod convert;
+pub mod session_manager;
 
 pub use session_manager::{LspError, LspSessionManager};

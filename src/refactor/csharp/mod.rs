@@ -99,5 +99,6 @@ pub(crate) fn empty_plan(kind: &str, title: String, status: SemanticStatus) -> R
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     }
 }

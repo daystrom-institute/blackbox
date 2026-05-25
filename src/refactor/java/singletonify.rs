@@ -201,6 +201,7 @@ pub(crate) fn plan_singletonify_java_holder(p: &RefactorPlanParams) -> Result<St
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -577,6 +578,7 @@ pub(crate) fn plan_singletonify_java_util(p: &RefactorPlanParams) -> Result<Stri
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }

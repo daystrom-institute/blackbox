@@ -145,6 +145,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     // Gap 17: when a cross-class instance-method move was detected,

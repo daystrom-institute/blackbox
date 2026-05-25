@@ -18,8 +18,8 @@ use lsp_types::{
 };
 use reqwest::Url;
 
-use crate::projects::Language;
 use crate::lsp::convert;
+use crate::projects::Language;
 use crate::refactor::{
     PlanContext, RefactorPlanParams, SemanticStatus, ValidationStep, csharp::empty_plan,
 };

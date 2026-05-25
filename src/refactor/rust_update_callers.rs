@@ -255,6 +255,7 @@ pub fn plan_update_callers(p: &RefactorPlanParams) -> anyhow::Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: fixme_count_override,
+        operator_opt_outs_used: Vec::new(),
     };
 
     // validate_plan_shape rejects empty edits; skip it when nothing was rewritten.

@@ -1,21 +1,21 @@
 use std::path::PathBuf;
 
-use anyhow::{anyhow, Context};
-use crate::code_nav::{
-    CodeNodeDescribeParams, CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
-    code_node_describe, code_query, code_refs, code_symbols,
-};
 use crate::code_nav::semantic::{
     java_document_outline, java_find_implementations, java_find_usages, java_type_at,
     java_workspace_symbols, resolve_path_for_usages, resolve_project_dir_for_usages,
 };
+use crate::code_nav::{
+    CodeNodeDescribeParams, CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
+    code_node_describe, code_query, code_refs, code_symbols,
+};
 use crate::server::BlackboxServer;
+use anyhow::{Context, anyhow};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
-use rmcp::{tool, tool_router};
 use rmcp::schemars;
+use rmcp::{tool, tool_router};
 use serde::Deserialize;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {

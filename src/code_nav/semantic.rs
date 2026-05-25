@@ -16,8 +16,9 @@ use lsp_types::{
     HoverContents, Location, MarkedString, ReferenceContext, ReferenceParams, SymbolInformation,
     SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
     WorkspaceSymbol, WorkspaceSymbolParams,
-    request::{DocumentSymbolRequest, GotoImplementation, HoverRequest, References,
-               WorkspaceSymbolRequest},
+    request::{
+        DocumentSymbolRequest, GotoImplementation, HoverRequest, References, WorkspaceSymbolRequest,
+    },
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -85,7 +86,10 @@ pub(crate) fn java_find_usages(
     // Convert the caller-supplied 0-based (line, column) into an LSP
     // Position.  We construct it directly because byte_to_lsp_position
     // takes a byte offset; the caller already knows the LSP coordinates.
-    let position = lsp_types::Position { line, character: column };
+    let position = lsp_types::Position {
+        line,
+        character: column,
+    };
 
     let params = ReferenceParams {
         text_document_position: TextDocumentPositionParams {
@@ -212,17 +216,10 @@ pub(crate) fn resolve_project_dir_for_usages(
     project_dir: Option<&str>,
     source_path: &Path,
 ) -> PathBuf {
-    project_dir
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            crate::entity_ref::git_root_for_path(source_path)
-                .unwrap_or_else(|| {
-                    source_path
-                        .parent()
-                        .unwrap_or(Path::new("."))
-                        .to_path_buf()
-                })
-        })
+    project_dir.map(PathBuf::from).unwrap_or_else(|| {
+        crate::entity_ref::git_root_for_path(source_path)
+            .unwrap_or_else(|| source_path.parent().unwrap_or(Path::new(".")).to_path_buf())
+    })
 }
 
 /// A single resolved implementation site returned by
@@ -324,7 +321,10 @@ pub(crate) fn java_find_implementations(
     let source_uri = Url::from_file_path(source_path)
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
 
-    let position = lsp_types::Position { line, character: column };
+    let position = lsp_types::Position {
+        line,
+        character: column,
+    };
 
     let params = GotoDefinitionParams {
         text_document_position_params: TextDocumentPositionParams {
@@ -426,7 +426,10 @@ pub(crate) fn java_type_at(
     let source_uri = Url::from_file_path(source_path)
         .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
 
-    let position = lsp_types::Position { line, character: column };
+    let position = lsp_types::Position {
+        line,
+        character: column,
+    };
 
     let params = lsp_types::HoverParams {
         text_document_position_params: TextDocumentPositionParams {
@@ -515,12 +518,10 @@ pub(crate) fn java_workspace_symbols(
     // We flatten both into a unified list of symbol items.
     let response_was_some = response.is_some();
     let symbols = match response {
-        Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols)) => {
-            symbols
-                .into_iter()
-                .map(|sym| symbol_info_to_item(&sym, &project_dir_str))
-                .collect()
-        }
+        Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols)) => symbols
+            .into_iter()
+            .map(|sym| symbol_info_to_item(&sym, &project_dir_str))
+            .collect(),
         Some(lsp_types::WorkspaceSymbolResponse::Nested(symbols)) => {
             flatten_workspace_symbols(symbols, &project_dir_str)
         }
@@ -562,7 +563,10 @@ fn symbol_info_to_item(sym: &SymbolInformation, project_dir: &str) -> WorkspaceS
 
 /// Convert a WorkspaceSymbol to a WorkspaceSymbolItem.
 /// WorkspaceSymbol.location is OneOf<Location, WorkspaceLocation>.
-fn workspace_symbol_to_item(sym: WorkspaceSymbol, project_dir: &str) -> Option<WorkspaceSymbolItem> {
+fn workspace_symbol_to_item(
+    sym: WorkspaceSymbol,
+    project_dir: &str,
+) -> Option<WorkspaceSymbolItem> {
     let (kind_str, kind_number) = symbol_kind_info(sym.kind);
 
     let (path, line, character) = match sym.location {
@@ -572,7 +576,11 @@ fn workspace_symbol_to_item(sym: WorkspaceSymbol, project_dir: &str) -> Option<W
                 .to_file_path()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| loc.uri.to_string());
-            (path, Some(loc.range.start.line), Some(loc.range.start.character))
+            (
+                path,
+                Some(loc.range.start.line),
+                Some(loc.range.start.character),
+            )
         }
         lsp_types::OneOf::Right(ws_loc) => {
             // WorkspaceLocation only has uri, no range
@@ -757,11 +765,17 @@ fn document_symbol_to_outline(sym: DocumentSymbol) -> OutlineSymbol {
 
 /// Count all nodes in an outline tree (including nested children).
 fn count_outline_symbols(symbols: &[OutlineSymbol]) -> usize {
-    symbols.iter().map(|s| 1 + count_outline_symbols(&s.children)).sum()
+    symbols
+        .iter()
+        .map(|s| 1 + count_outline_symbols(&s.children))
+        .sum()
 }
 
 /// Flatten a Vec<WorkspaceSymbol> (nested) into Vec<WorkspaceSymbolItem>.
-fn flatten_workspace_symbols(symbols: Vec<WorkspaceSymbol>, project_dir: &str) -> Vec<WorkspaceSymbolItem> {
+fn flatten_workspace_symbols(
+    symbols: Vec<WorkspaceSymbol>,
+    project_dir: &str,
+) -> Vec<WorkspaceSymbolItem> {
     symbols
         .into_iter()
         .filter_map(|sym| workspace_symbol_to_item(sym, project_dir))
@@ -798,7 +812,10 @@ fn symbol_kind_info(kind: SymbolKind) -> (String, u32) {
         SymbolKind::EVENT => ("event".to_string(), 24),
         SymbolKind::OPERATOR => ("operator".to_string(), 25),
         SymbolKind::TYPE_PARAMETER => ("type_parameter".to_string(), 26),
-        _ => (format!("unknown_{}", symbol_kind_to_number(kind)), symbol_kind_to_number(kind)),
+        _ => (
+            format!("unknown_{}", symbol_kind_to_number(kind)),
+            symbol_kind_to_number(kind),
+        ),
     }
 }
 
@@ -979,8 +996,7 @@ mod tests {
         let result = java_find_usages(&manager, &fixtures_dir, &source_path, lsp_line, lsp_col);
         match result {
             Ok(report) => {
-                let json = serde_json::to_string_pretty(&report)
-                    .expect("serialise UsagesReport");
+                let json = serde_json::to_string_pretty(&report).expect("serialise UsagesReport");
                 println!("--- live_jdtls_references output ---\n{json}\n---");
                 assert_eq!(
                     report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,
@@ -1080,8 +1096,8 @@ mod tests {
             java_find_implementations(&manager, &fixtures_dir, &source_path, lsp_line, lsp_col);
         match result {
             Ok(report) => {
-                let json = serde_json::to_string_pretty(&report)
-                    .expect("serialise ImplementationsReport");
+                let json =
+                    serde_json::to_string_pretty(&report).expect("serialise ImplementationsReport");
                 println!("--- live_jdtls_implementations output ---\n{json}\n---");
                 assert_eq!(
                     report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,
@@ -1174,8 +1190,7 @@ mod tests {
         let result = java_type_at(&manager, &fixtures_dir, &source_path, lsp_line, lsp_col);
         match result {
             Ok(report) => {
-                let json = serde_json::to_string_pretty(&report)
-                    .expect("serialise TypeAtReport");
+                let json = serde_json::to_string_pretty(&report).expect("serialise TypeAtReport");
                 println!("--- live_jdtls_hover output ---\n{json}\n---");
                 assert_eq!(
                     report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,
@@ -1225,7 +1240,8 @@ mod tests {
     /// Verify WorkspaceSymbolsReport serialises correctly.
     #[test]
     fn workspace_symbols_report_serializes() {
-        let (interface_kind_str, interface_kind_num) = symbol_kind_info(lsp_types::SymbolKind::INTERFACE);
+        let (interface_kind_str, interface_kind_num) =
+            symbol_kind_info(lsp_types::SymbolKind::INTERFACE);
         let (class_kind_str, class_kind_num) = symbol_kind_info(lsp_types::SymbolKind::CLASS);
         let report = WorkspaceSymbolsReport {
             kind: "java_workspace_symbols".to_string(),
@@ -1348,25 +1364,21 @@ mod tests {
             source: "/repo/Hello.java".to_string(),
             resolved: true,
             symbol_count: 3,
-            symbols: vec![
-                OutlineSymbol {
-                    name: "Hello".to_string(),
-                    kind: "class".to_string(),
-                    detail: None,
-                    line: Some(0),
-                    character: Some(0),
-                    children: vec![
-                        OutlineSymbol {
-                            name: "greet".to_string(),
-                            kind: "method".to_string(),
-                            detail: Some("String greet()".to_string()),
-                            line: Some(2),
-                            character: Some(4),
-                            children: vec![],
-                        },
-                    ],
-                },
-            ],
+            symbols: vec![OutlineSymbol {
+                name: "Hello".to_string(),
+                kind: "class".to_string(),
+                detail: None,
+                line: Some(0),
+                character: Some(0),
+                children: vec![OutlineSymbol {
+                    name: "greet".to_string(),
+                    kind: "method".to_string(),
+                    detail: Some("String greet()".to_string()),
+                    line: Some(2),
+                    character: Some(4),
+                    children: vec![],
+                }],
+            }],
             handoff: usage_site_handoff("/repo/Hello.java", "/repo"),
         };
 
@@ -1410,8 +1422,7 @@ mod tests {
         let result = java_document_outline(&manager, &fixtures_dir, &source_path);
         match result {
             Ok(report) => {
-                let json = serde_json::to_string_pretty(&report)
-                    .expect("serialise OutlineReport");
+                let json = serde_json::to_string_pretty(&report).expect("serialise OutlineReport");
                 println!("--- live_jdtls_document_outline output ---\n{json}\n---");
                 assert_eq!(
                     report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,

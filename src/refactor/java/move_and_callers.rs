@@ -143,6 +143,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -196,6 +197,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }

@@ -202,6 +202,7 @@ pub(crate) fn plan_extract_java_nested_classes(p: &RefactorPlanParams) -> Result
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -614,6 +615,7 @@ pub(crate) fn plan_add_java_fields(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -674,6 +676,7 @@ pub(crate) fn plan_add_java_constructor(p: &RefactorPlanParams) -> Result<String
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -778,6 +781,7 @@ pub(crate) fn plan_move_java_field(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -875,6 +879,7 @@ pub(crate) fn plan_add_java_delegate_field(p: &RefactorPlanParams) -> Result<Str
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -994,6 +999,7 @@ pub(crate) fn plan_rewrite_java_visibility(p: &RefactorPlanParams) -> Result<Str
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     Ok(serde_json::to_string_pretty(&plan)?)

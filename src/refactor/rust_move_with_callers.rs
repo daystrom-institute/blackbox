@@ -206,6 +206,7 @@ pub(crate) fn plan_move_rust_items_with_callers(p: &RefactorPlanParams) -> Resul
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan).context("validate move_rust_items_with_callers plan")?;

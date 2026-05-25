@@ -119,6 +119,7 @@ pub(crate) fn plan_migrate_string_field_to_enum(p: &RefactorPlanParams) -> Resul
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     validate_plan_shape(&plan)?;
     Ok(serde_json::to_string_pretty(&plan)?)

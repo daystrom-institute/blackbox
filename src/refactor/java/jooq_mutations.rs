@@ -207,6 +207,17 @@ fn build_plan_response(
     validations: Vec<ValidationStep>,
     leftovers: Vec<String>,
 ) -> Result<String> {
+    build_plan_response_with_opt_outs(title, kind, file_edits, validations, leftovers, Vec::new())
+}
+
+fn build_plan_response_with_opt_outs(
+    title: String,
+    kind: &str,
+    file_edits: Vec<FileEdit>,
+    validations: Vec<ValidationStep>,
+    leftovers: Vec<String>,
+    operator_opt_outs: Vec<String>,
+) -> Result<String> {
     let plan = RefactorPlan {
         title,
         kind: kind.to_string(),
@@ -226,6 +237,7 @@ fn build_plan_response(
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: operator_opt_outs,
     };
     let mut value = serde_json::to_value(&plan)?;
     value["operator_policy_inputs_used"] =
@@ -560,6 +572,7 @@ pub(crate) fn plan_java_jooq_extract_repository(p: &RefactorPlanParams) -> Resul
         deep_analysis: None,
         plan_status: PlanStatus::Blocked,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -1170,7 +1183,7 @@ pub(crate) fn plan_java_jooq_generated_record_boundary_rewrite(
     ];
     leftovers.push("operator_opt_outs_used=[acknowledge_public_api_change]".to_string());
 
-    build_plan_response(
+    build_plan_response_with_opt_outs(
         format!(
             "rewrite generated-record boundary in {}",
             path_string(&source_path)
@@ -1188,6 +1201,7 @@ pub(crate) fn plan_java_jooq_generated_record_boundary_rewrite(
         }],
         parse_validation_step_for_path(&source_path),
         leftovers,
+        vec!["acknowledge_public_api_change".to_string()],
     )
 }
 

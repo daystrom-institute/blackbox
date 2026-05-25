@@ -136,6 +136,7 @@ pub(crate) fn plan_genserver_state_audit(p: &RefactorPlanParams) -> Result<Strin
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     let report = StateAuditReport {

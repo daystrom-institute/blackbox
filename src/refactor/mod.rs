@@ -938,6 +938,12 @@ pub struct RefactorPlan {
     /// Counts of FIXME markers emitted in the target text (RX-A2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixme_count: Option<FixmeCount>,
+    /// RX-V1: operator-authority opt-out flag names actually consumed during
+    /// planning (e.g. "acknowledge_repr", "acknowledge_public_api_change").
+    /// Empty when no opt-outs were exercised. Populated only when the flag was
+    /// set *and* consumed (not merely present-but-false).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_opt_outs_used: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -1510,6 +1516,7 @@ fn plan_rewrite_rust_bin_crate_paths(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     validate_plan_shape(&plan)?;
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -1576,6 +1583,7 @@ fn plan_rust_impl_partition_analysis(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     let body = serde_json::json!({
         "title": plan.title,
@@ -1625,6 +1633,7 @@ fn plan_rust_public_api_guard(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     let body = serde_json::json!({
         "title": plan.title,
@@ -1784,10 +1793,7 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             ensure_path_in_registered_project(&path, projects)?;
         }
         if path.exists() {
-            bail!(
-                "refusing to create {}: already exists",
-                path.display()
-            );
+            bail!("refusing to create {}: already exists", path.display());
         }
         creates.push((path, file_create.content.as_bytes().to_vec()));
     }
@@ -3671,6 +3677,7 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -3748,6 +3755,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -3789,6 +3797,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;
@@ -3823,6 +3832,7 @@ fn plan_create_file(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
     validate_plan_shape(&plan)?;
     Ok(serde_json::to_string_pretty(&plan)?)
@@ -3877,6 +3887,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
+        operator_opt_outs_used: Vec::new(),
     };
 
     validate_plan_shape(&plan)?;

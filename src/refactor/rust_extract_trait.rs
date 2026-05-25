@@ -301,6 +301,7 @@ pub fn plan_extract_trait(p: &crate::refactor::RefactorPlanParams) -> Result<Str
             deep_analysis: None,
             plan_status: PlanStatus::Planned,
             fixme_count: None,
+            operator_opt_outs_used: Vec::new(),
         },
         dyn_compatible,
         object_safety_report: object_safety,
