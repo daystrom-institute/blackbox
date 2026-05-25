@@ -20,6 +20,7 @@ symbolic lookup and syntax-grounded exploration surfaces.
 
 - [Code Navigation And Symbolic Exploration](code-nav-symbolic-exploration.md)
 - [Code Navigation And Symbolic Exploration - Implementation Skeleton](code-nav-symbolic-exploration-impl.md)
+- [Code Navigation Depth - Axis 1 (Symbol Resolution)](code-nav-depth-axis1.md)
 
 ## Crosscuts
 
