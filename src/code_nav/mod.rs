@@ -17,6 +17,8 @@ use crate::refactor::{
 #[cfg(test)]
 mod tests;
 
+pub(crate) mod semantic;
+
 /// Top-level `semantic_status` value for every code-nav tool response.
 ///
 /// Code-nav tools (`bbox_code_query`, `bbox_code_node_describe`,

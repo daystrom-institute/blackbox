@@ -394,6 +394,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bbox_code_refs(file="src/main.rs", kind="calls", query="parse")"#),
     },
     ToolDoc {
+        name: "bbox_code_usages",
+        category: ToolCategory::Refactor,
+        summary: "Resolve binding-aware usages of the Java symbol at a file position via JDTLS (LSP textDocument/references). Returns semantically-verified usage sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; use bbox_code_refs for syntax-only cross-language reference extraction.",
+        when_to_use: "Use when you need cross-file, binding-aware usages of a Java symbol (method, field, class, local) and syntactic heuristics from bbox_code_refs are not sufficient. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative), 1-based `line` and `column` (same convention as bbox_code_node_describe; converted to 0-based LSP coordinates internally), and optionally `project_dir`. Each returned usage site carries `path`, `line`, `character`, and a `handoff` pointing to bbox_refactor_status / bbox_refactor_project_refs on the usage file. `symbol_resolved=false` means JDTLS found no references at that position (wrong coordinates or wrong language). Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
+        example: Some(r#"bbox_code_usages(file="src/main/java/com/example/Foo.java", line=12, column=19, project_dir="/repo")"#),
+    },
+    ToolDoc {
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
