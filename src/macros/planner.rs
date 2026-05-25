@@ -9,9 +9,14 @@
 //! 1. **Version**: `invocation.version` must exactly equal `def.version` when set.
 //! 2. **Inputs**: validated against `def.inputs_schema` (required-field presence +
 //!    JSON type check; full jsonschema deferred to a later phase).
-//! 3. **Context**: [`expr::Context`] built from inputs; `probes` map is empty until
-//!    Phase 4.
-//! 4. **Probes fail closed**: non-empty `def.probes` → `error.probe_backend_unavailable`.
+//! 3. **Context**: [`expr::Context`] built from inputs; populated incrementally as
+//!    probes execute (Phase 4 / P4b).
+//! 4. **Probes** (P4b): `def.probes` executed in declared order via
+//!    `ctx.probe_runner`. Each result is inserted into `Context.probes[name]`
+//!    immediately so later probes and refusal predicates can reference it. A probe
+//!    error propagates as a planning error (fail closed). Unknown-root validation
+//!    follows: any predicate or interpolation referencing a root that is neither
+//!    `"inputs"` nor a declared probe name is a hard `error.unknown_context_root`.
 //! 5. **Refusals**: each `def.refusals[].when` predicate is evaluated; any match
 //!    short-circuits planning and returns a plan containing only the refusals (empty
 //!    `EditSet`, no apply).
@@ -41,7 +46,9 @@
 //! - `EditSet.{file_edits → edits, file_creates, file_moves}`
 //! - `MacroPlan.checks` (kind=`"parse"`) → `RefactorPlan.validations`
 //! - `operator_opt_outs_used` carried verbatim
-//! - `semantic_status` = worst concrete tier across mutating ops
+//! - `semantic_status` = worst concrete tier across **mutating ops only**
+//!   (kinds `"probe"` and `"record"` are excluded — probe status must not
+//!   leak into the lowered `RefactorPlan` tier).
 //!
 //! Lowering is **refused** when any mutating operation has `template_only`
 //! semantic status. The caller must connect the Java backend (Phase 3) and
@@ -59,6 +66,7 @@ use crate::macros::model::{
     MacroPlanOperation, MacroRefusalHit, MacroSemanticStatus,
 };
 use crate::macros::planner_ctx::MacroPlannerContext;
+use crate::macros::probe::ProbeSpec;
 use crate::refactor::{
     self, PlanContext, RefactorApplyParams, RefactorPlan, RefactorPlanParams, SemanticStatus,
     ValidationStep,
@@ -118,22 +126,118 @@ impl MacroPlanner {
         // ── Constraint 2: validate inputs ────────────────────────────────────
         validate_inputs(&invocation.inputs, &def.inputs_schema)?;
 
-        // ── Constraint 3: build expr::Context (probes empty until Phase 4) ───
-        let expr_ctx = expr::Context {
+        // ── Constraint 3: build expr::Context (populated incrementally by probes) ─
+        let mut expr_ctx = expr::Context {
             inputs: invocation.inputs.clone(),
             probes: HashMap::new(),
         };
 
-        // ── Constraint 4: probe fail-closed ──────────────────────────────────
-        if !def.probes.is_empty() {
-            bail!(
-                "error.probe_backend_unavailable: macro '{}' declares {} probe(s). \
-                 Probe evaluation requires the Phase 4 code-nav/LSP substrate which is not yet \
-                 connected. Only probe-free macros can be planned in Phase 2.",
-                def.id,
-                def.probes.len()
+        // ── Constraint 4: execute pre-refusal probes in declared order ────────
+        //
+        // Each probe result is inserted into `expr_ctx.probes[name]` immediately
+        // so the next probe (and later refusal predicates) can reference it.
+        // A probe error propagates as a planning error (fail closed).
+        let mut edit_set = EditSet::default();
+        let mut plan_ops: Vec<MacroPlanOperation> = vec![];
+        let mut plan_checks: Vec<MacroPlanCheck> = vec![];
+        let mut plan_questions: Vec<String> = vec![];
+        let mut op_statuses: Vec<MacroSemanticStatus> = vec![];
+        let mut backends_used: HashSet<String> = HashSet::new();
+        // Constraint 7: collect ONLY consumed flags from delegates
+        let mut opt_outs_used: HashSet<String> = HashSet::new();
+        // Dup-path guard across all operations
+        let mut touched_paths: HashSet<String> = HashSet::new();
+        // Probe provenance summaries for MacroPlan.provenance
+        let mut probe_summaries: Vec<Value> = vec![];
+
+        for probe in &def.probes {
+            let spec: ProbeSpec =
+                serde_json::from_value(probe.spec.clone()).with_context(|| {
+                    format!(
+                        "error.probe_spec_invalid: macro '{}' probe '{}' has an invalid or \
+                         unknown spec kind. Spec: {}",
+                        def.id, probe.name, probe.spec
+                    )
+                })?;
+
+            // Preserve the underlying error code (error.probe_backend_unavailable /
+            // error.lsp_unavailable) in the Display string — a generic context wrapper
+            // would mask it, and callers/operators rely on the specific fail-closed code.
+            let output = ctx
+                .probe_runner
+                .run_probe(&probe.name, &spec, &expr_ctx, invocation)
+                .map_err(|e| {
+                    anyhow!(
+                        "error.probe_failed: macro '{}' probe '{}': {e:#}",
+                        def.id,
+                        probe.name
+                    )
+                })?;
+
+            // Build provenance summary (name, kind, exists, count, truncated) —
+            // do NOT dump full result arrays.
+            let probe_kind = probe_spec_kind_str(&spec);
+            let probe_exists = output.value.get("exists").cloned();
+            let probe_count = output.value.get("count").cloned();
+            probe_summaries.push(serde_json::json!({
+                "name": probe.name,
+                "kind": probe_kind,
+                "semantic_status": output.semantic_status,
+                "truncated": output.truncated,
+                "exists": probe_exists,
+                "count": probe_count,
+            }));
+
+            // Insert result into context BEFORE processing next probe/refusal.
+            expr_ctx
+                .probes
+                .insert(probe.name.clone(), output.value.clone());
+
+            // Record as a plan operation (kind="probe") — contributes to
+            // MacroPlan.semantic_status aggregation but is excluded from
+            // lower()'s mutating-tier computation.
+            let probe_op_summary = format!(
+                "Probe '{}' ({}): exists={}, count={}, truncated={}",
+                probe.name,
+                probe_kind,
+                probe_exists
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                probe_count
+                    .as_ref()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                output.truncated,
             );
+            op_statuses.push(output.semantic_status.clone());
+            plan_ops.push(MacroPlanOperation {
+                kind: "probe".to_string(),
+                name: Some(probe.name.clone()),
+                semantic_status: output.semantic_status,
+                summary: probe_op_summary,
+            });
         }
+
+        // ── Unknown-root validation ───────────────────────────────────────────
+        //
+        // Collect every declared probe name (from def.probes AND inline
+        // MacroOperation::Probe entries). Any path root that is neither
+        // "inputs" nor a declared probe name is a hard planning error.
+        let allowed_roots: HashSet<String> = {
+            let mut s: HashSet<String> = HashSet::new();
+            s.insert("inputs".to_string());
+            for p in &def.probes {
+                s.insert(p.name.clone());
+            }
+            for op in &def.operations {
+                if let MacroOperation::Probe { name, .. } = op {
+                    s.insert(name.clone());
+                }
+            }
+            s
+        };
+        validate_context_roots(def, &allowed_roots)?;
 
         // ── Constraint 5: refusal evaluation (short-circuits all further work) ──
         let refusal_hits: Vec<MacroRefusalHit> = def
@@ -159,41 +263,82 @@ impl MacroPlanner {
             return Ok(MacroPlan {
                 macro_id: def.id.clone(),
                 summary: format!("Macro '{}' refused to plan: {}", def.id, codes),
-                // Vacuous status for a refused plan — has no mutating output
+                // Vacuous status for a refused plan — has no mutating output.
+                // Include probe ops so the review artifact shows what ran.
                 semantic_status: MacroSemanticStatus::TemplateOnly,
-                operations: vec![],
+                operations: plan_ops,
                 edits: EditSet::default(),
                 checks: vec![],
                 questions: vec![],
                 refusals: refusal_hits,
                 backends_used: vec![],
                 operator_opt_outs_used: vec![],
-                provenance: build_provenance(def),
+                provenance: build_provenance(def, &probe_summaries),
             });
         }
 
         // ── Constraint 6: process operations ─────────────────────────────────
-        let mut edit_set = EditSet::default();
-        let mut plan_ops: Vec<MacroPlanOperation> = vec![];
-        let mut plan_checks: Vec<MacroPlanCheck> = vec![];
-        let mut plan_questions: Vec<String> = vec![];
-        let mut op_statuses: Vec<MacroSemanticStatus> = vec![];
-        let mut backends_used: HashSet<String> = HashSet::new();
-        // Constraint 7: collect ONLY consumed flags from delegates
-        let mut opt_outs_used: HashSet<String> = HashSet::new();
-        // Dup-path guard across all operations
-        let mut touched_paths: HashSet<String> = HashSet::new();
 
         for op in &def.operations {
             match op {
-                MacroOperation::Probe { .. } => {
-                    // Non-empty probes list is already caught in constraint 4.
-                    // An inline Probe *operation* is also blocked here.
-                    bail!(
-                        "error.probe_backend_unavailable: macro '{}' contains a Probe operation. \
-                         Probe operations require the Phase 4 code-nav/LSP substrate.",
-                        def.id
+                MacroOperation::Probe {
+                    name,
+                    spec: spec_val,
+                } => {
+                    // Inline probe operation: same execution semantics as
+                    // def.probes, but runs in operation order so later ops
+                    // can reference its result via expr_ctx.
+                    let spec: ProbeSpec =
+                        serde_json::from_value(spec_val.clone()).with_context(|| {
+                            format!(
+                                "error.probe_spec_invalid: macro '{}' inline Probe operation \
+                                 '{}' has an invalid spec: {}",
+                                def.id, name, spec_val
+                            )
+                        })?;
+                    let output = ctx
+                        .probe_runner
+                        .run_probe(name, &spec, &expr_ctx, invocation)
+                        .map_err(|e| {
+                            anyhow!(
+                                "error.probe_failed: macro '{}' inline Probe '{}': {e:#}",
+                                def.id,
+                                name
+                            )
+                        })?;
+                    let probe_kind = probe_spec_kind_str(&spec);
+                    let probe_exists = output.value.get("exists").cloned();
+                    let probe_count = output.value.get("count").cloned();
+                    probe_summaries.push(serde_json::json!({
+                        "name": name,
+                        "kind": probe_kind,
+                        "semantic_status": output.semantic_status,
+                        "truncated": output.truncated,
+                        "exists": probe_exists,
+                        "count": probe_count,
+                    }));
+                    expr_ctx.probes.insert(name.clone(), output.value.clone());
+                    let probe_op_summary = format!(
+                        "Probe '{}' ({}): exists={}, count={}, truncated={}",
+                        name,
+                        probe_kind,
+                        probe_exists
+                            .as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        probe_count
+                            .as_ref()
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "?".into()),
+                        output.truncated,
                     );
+                    op_statuses.push(output.semantic_status.clone());
+                    plan_ops.push(MacroPlanOperation {
+                        kind: "probe".to_string(),
+                        name: Some(name.clone()),
+                        semantic_status: output.semantic_status,
+                        summary: probe_op_summary,
+                    });
                 }
 
                 MacroOperation::Emit { name, .. } => {
@@ -422,7 +567,7 @@ impl MacroPlanner {
             refusals: vec![],
             backends_used: backends_vec,
             operator_opt_outs_used: opt_outs_vec,
-            provenance: build_provenance(def),
+            provenance: build_provenance(def, &probe_summaries),
         })
     }
 
@@ -445,9 +590,12 @@ impl MacroPlanner {
     /// `template_only` semantic status. The plan must be re-generated after
     /// connecting the Java backend (Phase 3).
     pub fn lower(plan: &MacroPlan) -> Result<RefactorPlan> {
-        // Refuse template_only on any mutating op
+        // Refuse template_only on any mutating op (probes and records are not mutating)
         for op in &plan.operations {
-            if op.kind != "record" && op.semantic_status == MacroSemanticStatus::TemplateOnly {
+            if op.kind != "record"
+                && op.kind != "probe"
+                && op.semantic_status == MacroSemanticStatus::TemplateOnly
+            {
                 bail!(
                     "error.template_only_lowering_refused: macro '{}' operation '{}' \
                      (kind='{}') has template_only semantic status. Backend verification \
@@ -524,11 +672,15 @@ fn register_path(touched: &mut HashSet<String>, path: &str) -> Result<()> {
 }
 
 /// Build a provenance `Value` for a `MacroPlan`.
-fn build_provenance(def: &MacroDefinition) -> Value {
+///
+/// `probe_summaries` carries `{name, kind, semantic_status, truncated, exists, count}`
+/// for each executed probe — full result arrays are NOT included (audit-only).
+fn build_provenance(def: &MacroDefinition, probe_summaries: &[Value]) -> Value {
     serde_json::json!({
         "macro_id": def.id,
         "version": def.version,
         "timestamp": chrono::Utc::now().to_rfc3339(),
+        "probes": probe_summaries,
     })
 }
 
@@ -882,7 +1034,12 @@ fn aggregate_status(statuses: &[MacroSemanticStatus]) -> MacroSemanticStatus {
 /// Record ops (non-mutating, TemplateOnly) are excluded. `Mixed` and `TemplateOnly`
 /// on mutating ops cause lowering to be refused (called before this point).
 fn worst_refactor_tier(ops: &[MacroPlanOperation]) -> Result<SemanticStatus> {
-    let mutating: Vec<&MacroPlanOperation> = ops.iter().filter(|op| op.kind != "record").collect();
+    // Exclude non-mutating kinds: "record" (metadata) and "probe" (read-only).
+    // Probe semantic status must NOT leak into the lowered RefactorPlan tier.
+    let mutating: Vec<&MacroPlanOperation> = ops
+        .iter()
+        .filter(|op| op.kind != "record" && op.kind != "probe")
+        .collect();
 
     if mutating.is_empty() {
         // Only record ops or empty plan; use SyntaxOnly as a conservative default.
@@ -930,6 +1087,144 @@ fn status_rank(s: &MacroSemanticStatus) -> u8 {
         MacroSemanticStatus::IndexedHints => 2,
         MacroSemanticStatus::LspVerifiedPartial => 3,
         MacroSemanticStatus::LspVerified => 4,
+    }
+}
+
+/// Return the `"kind"` discriminant string for a [`ProbeSpec`].
+fn probe_spec_kind_str(spec: &ProbeSpec) -> &'static str {
+    match spec {
+        ProbeSpec::CodeQuery { .. } => "code_query",
+        ProbeSpec::CodeSymbols { .. } => "code_symbols",
+        ProbeSpec::WorkspaceSymbol { .. } => "workspace_symbol",
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Unknown-root validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Extract the root (first dotted segment) of a context path.
+fn path_root(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+/// Recursively collect the root segments referenced by a [`Predicate`].
+fn collect_predicate_roots(pred: &crate::macros::expr::Predicate, out: &mut Vec<String>) {
+    use crate::macros::expr::Predicate;
+    match pred {
+        Predicate::Exists { path } | Predicate::Eq { path, .. } | Predicate::In { path, .. } => {
+            out.push(path_root(path).to_string());
+        }
+        Predicate::All { predicates } | Predicate::Any { predicates } => {
+            for p in predicates {
+                collect_predicate_roots(p, out);
+            }
+        }
+        Predicate::Not { predicate } => collect_predicate_roots(predicate, out),
+    }
+}
+
+/// Scan a template string for `${path}` placeholders and collect root segments.
+fn collect_interpolation_roots(template: &str, out: &mut Vec<String>) {
+    let mut chars = template.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '$' && chars.peek() == Some(&'{') {
+            chars.next(); // consume '{'
+            let mut path = String::new();
+            for ch in chars.by_ref() {
+                if ch == '}' {
+                    break;
+                }
+                path.push(ch);
+            }
+            if !path.is_empty() {
+                out.push(path_root(&path).to_string());
+            }
+        }
+    }
+}
+
+/// Validate that all context-path roots in refusals, validation guards, and
+/// Record operation bodies are members of `allowed_roots`.
+///
+/// Any root that is neither `"inputs"` nor a declared probe name is a hard
+/// planning error (`error.unknown_context_root`). Missing *nested* fields under
+/// a valid root remain soft-false (existing [`expr::eval`] behaviour).
+///
+/// This check is performed after all probe names are known (static) but before
+/// any predicate evaluation so typos surface immediately.
+fn validate_context_roots(def: &MacroDefinition, allowed_roots: &HashSet<String>) -> Result<()> {
+    let mut bad: Vec<String> = vec![];
+
+    // Refusal predicates and messages
+    for refusal in &def.refusals {
+        let mut roots = vec![];
+        collect_predicate_roots(&refusal.when, &mut roots);
+        for r in roots {
+            if !allowed_roots.contains(&r) {
+                bad.push(format!(
+                    "refusal '{}' predicate references unknown root '{}' \
+                     (not 'inputs' or a declared probe name)",
+                    refusal.code, r
+                ));
+            }
+        }
+        let mut msg_roots = vec![];
+        collect_interpolation_roots(&refusal.message, &mut msg_roots);
+        for r in msg_roots {
+            if !allowed_roots.contains(&r) {
+                bad.push(format!(
+                    "refusal '{}' message interpolation references unknown root '{}' \
+                     (not 'inputs' or a declared probe name)",
+                    refusal.code, r
+                ));
+            }
+        }
+    }
+
+    // Validation guards
+    for val in &def.validations {
+        if let Some(guard) = &val.when {
+            let mut roots = vec![];
+            collect_predicate_roots(guard, &mut roots);
+            for r in roots {
+                if !allowed_roots.contains(&r) {
+                    bad.push(format!(
+                        "validation guard predicate references unknown root '{}' \
+                         (not 'inputs' or a declared probe name)",
+                        r
+                    ));
+                }
+            }
+        }
+    }
+
+    // Record operation bodies
+    for op in &def.operations {
+        if let MacroOperation::Record { label, body } = op {
+            let mut roots = vec![];
+            collect_interpolation_roots(body, &mut roots);
+            for r in roots {
+                if !allowed_roots.contains(&r) {
+                    bad.push(format!(
+                        "Record operation '{}' body interpolation references unknown root '{}' \
+                         (not 'inputs' or a declared probe name)",
+                        label, r
+                    ));
+                }
+            }
+        }
+    }
+
+    if bad.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "error.unknown_context_root: {} unknown root segment(s) in macro '{}' context paths:\n{}",
+            bad.len(),
+            def.id,
+            bad.join("\n")
+        )
     }
 }
 
@@ -1029,23 +1324,29 @@ mod tests {
         );
     }
 
-    // ── Constraint 4: probes fail closed ─────────────────────────────────────
+    // ── Constraint 4: probe fail-closed via UnavailableProbeRunner ───────────
+    //
+    // With the P4b implementation, "fail closed" means the runner returns an
+    // error, not a static guard. A valid ProbeSpec + UnavailableProbeRunner
+    // must still propagate error.probe_backend_unavailable.
 
     #[test]
     fn probe_backend_unavailable_when_probes_declared() {
         let mut def = minimal_def();
+        // Use a valid ProbeSpec kind so deserialization succeeds and the runner is reached.
         def.probes = vec![MacroProbe {
             name: "caller_type".into(),
             description: "Finds the caller type".into(),
-            spec: json!({"kind": "java.search.type"}),
+            spec: json!({"kind": "code_symbols"}), // valid ProbeSpec::CodeSymbols
         }];
         let inv = minimal_invocation(&def, "/tmp");
+        // MacroPlannerContext::default() uses UnavailableProbeRunner.
         let ctx = MacroPlannerContext::default();
         let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("error.probe_backend_unavailable"),
-            "expected probe_backend_unavailable, got: {msg}"
+            "expected probe_backend_unavailable from UnavailableProbeRunner, got: {msg}"
         );
     }
 
@@ -1668,6 +1969,380 @@ mod tests {
             "all-empty residue must produce no questions; got: {:?}",
             questions
         );
+    }
+
+    // ── P4b: MockProbeRunner + probe execution tests ──────────────────────────
+
+    /// Test-only probe runner that returns canned [`ProbeOutput`] by probe name.
+    ///
+    /// If the probe name is not in `canned`, returns an error so tests can
+    /// exercise the fail-closed path. Also supports a `ctx_check` mode where
+    /// probe B can assert that probe A's result is already in `ctx.probes`.
+    struct MockProbeRunner {
+        /// Canned outputs keyed by probe name.
+        canned: std::collections::HashMap<String, crate::macros::probe::ProbeOutput>,
+    }
+
+    impl MockProbeRunner {
+        fn new() -> Self {
+            Self {
+                canned: std::collections::HashMap::new(),
+            }
+        }
+
+        fn with(
+            mut self,
+            name: &str,
+            value: serde_json::Value,
+            status: MacroSemanticStatus,
+        ) -> Self {
+            self.canned.insert(
+                name.to_string(),
+                crate::macros::probe::ProbeOutput {
+                    value,
+                    semantic_status: status,
+                    truncated: false,
+                    diagnostics: vec![],
+                },
+            );
+            self
+        }
+    }
+
+    impl crate::macros::probe::ProbeRunner for MockProbeRunner {
+        fn run_probe(
+            &self,
+            name: &str,
+            _spec: &crate::macros::probe::ProbeSpec,
+            _ctx: &crate::macros::expr::Context,
+            _invocation: &crate::macros::model::MacroInvocation,
+        ) -> anyhow::Result<crate::macros::probe::ProbeOutput> {
+            self.canned.get(name).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "mock: no canned output for probe '{}'; returning error",
+                    name
+                )
+            })
+        }
+    }
+
+    /// Build a `MacroPlannerContext` with a mock probe runner.
+    fn ctx_with_mock(mock: MockProbeRunner) -> MacroPlannerContext {
+        use crate::macros::backend::UnavailableBackend;
+        MacroPlannerContext::new(Box::new(UnavailableBackend), None, Box::new(mock))
+    }
+
+    fn probe_spec_code_symbols() -> serde_json::Value {
+        json!({"kind": "code_symbols"})
+    }
+
+    // ── probe-driven refusal: exists=true fires ───────────────────────────────
+
+    #[test]
+    fn probe_driven_refusal_fires_when_exists_true() {
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "binding".into(),
+            description: "Check binding".into(),
+            spec: probe_spec_code_symbols(),
+        }];
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::Exists {
+                path: "binding.exists".into(),
+            },
+            code: "error.already_bound".into(),
+            message: "Already bound: ${binding.exists}".into(),
+        }];
+
+        let mock = MockProbeRunner::new().with(
+            "binding",
+            json!({"exists": true, "count": 1}),
+            MacroSemanticStatus::SyntaxOnly,
+        );
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("probe-driven refusal should return Ok(MacroPlan)");
+
+        assert!(!plan.refusals.is_empty(), "refusal must fire");
+        assert_eq!(plan.refusals[0].code, "error.already_bound");
+        assert!(
+            plan.refusals[0].message.contains("true"),
+            "message must interpolate binding.exists: {}",
+            plan.refusals[0].message
+        );
+        // Probe ops are still recorded in the plan for auditability.
+        assert!(
+            plan.operations.iter().any(|op| op.kind == "probe"),
+            "probe op should appear in plan.operations even on refusal"
+        );
+    }
+
+    // ── probe-driven refusal: exists=false does NOT fire ──────────────────────
+
+    #[test]
+    fn probe_driven_refusal_does_not_fire_when_exists_false() {
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "binding".into(),
+            description: "Check binding".into(),
+            spec: probe_spec_code_symbols(),
+        }];
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::Exists {
+                path: "binding.exists".into(),
+            },
+            code: "error.already_bound".into(),
+            message: "already bound".into(),
+        }];
+
+        // binding.exists is false → Exists predicate is true only when path
+        // resolves. Since binding.exists = false (bool), it DOES resolve.
+        // Use a path that won't resolve: "binding.nonexistent"
+        let mut def2 = def.clone();
+        def2.refusals[0].when = crate::macros::expr::Predicate::Exists {
+            path: "binding.nonexistent".into(),
+        };
+
+        let mock = MockProbeRunner::new().with(
+            "binding",
+            json!({"exists": false, "count": 0}),
+            MacroSemanticStatus::SyntaxOnly,
+        );
+        let inv = minimal_invocation(&def2, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        let plan = MacroPlanner::plan(&inv, &def2, &ctx)
+            .expect("plan should succeed when refusal does not fire");
+
+        assert!(plan.refusals.is_empty(), "refusal must NOT fire");
+    }
+
+    // ── ordered cross-probe: probe B sees probe A's result ────────────────────
+
+    #[test]
+    fn ordered_cross_probe_b_refusal_references_a_result() {
+        let mut def = minimal_def();
+        def.probes = vec![
+            MacroProbe {
+                name: "probe_a".into(),
+                description: "First probe".into(),
+                spec: probe_spec_code_symbols(),
+            },
+            MacroProbe {
+                name: "probe_b".into(),
+                description: "Second probe (references probe_a context)".into(),
+                spec: probe_spec_code_symbols(),
+            },
+        ];
+        // Refusal fires when BOTH probe_a.exists AND probe_b.exists are true.
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::All {
+                predicates: vec![
+                    crate::macros::expr::Predicate::Eq {
+                        path: "probe_a.exists".into(),
+                        value: json!(true),
+                    },
+                    crate::macros::expr::Predicate::Eq {
+                        path: "probe_b.exists".into(),
+                        value: json!(true),
+                    },
+                ],
+            },
+            code: "error.both_probes_found".into(),
+            message: "Both probes found".into(),
+        }];
+
+        let mock = MockProbeRunner::new()
+            .with(
+                "probe_a",
+                json!({"exists": true, "count": 1}),
+                MacroSemanticStatus::SyntaxOnly,
+            )
+            .with(
+                "probe_b",
+                json!({"exists": true, "count": 2}),
+                MacroSemanticStatus::SyntaxOnly,
+            );
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        let plan =
+            MacroPlanner::plan(&inv, &def, &ctx).expect("cross-probe refusal should return Ok");
+        assert!(!plan.refusals.is_empty(), "cross-probe refusal must fire");
+        assert_eq!(plan.refusals[0].code, "error.both_probes_found");
+        // Both probe ops must be in the plan
+        let probe_ops: Vec<_> = plan
+            .operations
+            .iter()
+            .filter(|op| op.kind == "probe")
+            .collect();
+        assert_eq!(probe_ops.len(), 2, "both probe ops must appear");
+    }
+
+    // ── unknown-root typo in refusal predicate → planning ERROR ──────────────
+
+    #[test]
+    fn unknown_root_in_refusal_predicate_is_planning_error() {
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "binding".into(),
+            description: "binding probe".into(),
+            spec: probe_spec_code_symbols(),
+        }];
+        // Typo: "bindng" instead of "binding"
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::Exists {
+                path: "bindng.exists".into(), // typo
+            },
+            code: "error.bad_predicate".into(),
+            message: "bad".into(),
+        }];
+
+        let mock = MockProbeRunner::new().with(
+            "binding",
+            json!({"exists": true}),
+            MacroSemanticStatus::SyntaxOnly,
+        );
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.unknown_context_root"),
+            "typo 'bindng' must be a planning error, got: {msg}"
+        );
+        assert!(
+            msg.contains("bindng"),
+            "error must name the bad root: {msg}"
+        );
+    }
+
+    // ── probe runner error propagates as planning error ───────────────────────
+
+    #[test]
+    fn probe_runner_error_propagates_as_planning_error() {
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "failing_probe".into(),
+            description: "This will fail".into(),
+            spec: probe_spec_code_symbols(),
+        }];
+
+        // MockProbeRunner returns Err for "failing_probe" (no canned output).
+        let mock = MockProbeRunner::new(); // empty → will error on any name
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failing_probe") || msg.contains("error.probe_failed"),
+            "probe runner error must propagate, got: {msg}"
+        );
+    }
+
+    // ── UnavailableProbeRunner default → error.probe_backend_unavailable ──────
+
+    #[test]
+    fn unavailable_probe_runner_fails_closed() {
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "syms".into(),
+            description: "symbols probe".into(),
+            spec: json!({"kind": "code_symbols"}),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default(); // UnavailableProbeRunner
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.probe_backend_unavailable"),
+            "UnavailableProbeRunner must fail closed: {msg}"
+        );
+    }
+
+    // ── semantic_status: worst-tier aggregation and lower() isolation ─────────
+
+    #[test]
+    fn probe_status_included_in_macro_plan_aggregate_but_excluded_from_lower() {
+        // A probe with LspVerified status + a create_file delegate (SyntaxOnly).
+        // MacroPlan.semantic_status → Mixed (LspVerified vs SyntaxOnly differ).
+        // lower() → SyntaxOnly (worst of mutating ops only, probe excluded).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_dir = tmp.path().to_string_lossy().to_string();
+        let target_path = tmp.path().join("Gen.java").to_string_lossy().to_string();
+
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "ws".into(),
+            description: "workspace probe".into(),
+            spec: json!({"kind": "code_symbols"}),
+        }];
+        def.operations = vec![MacroOperation::DelegateRefactor {
+            refactor_kind: "create_file".into(),
+            params: json!({"source": target_path, "new_text": "class Gen {}"}),
+        }];
+
+        let mock = MockProbeRunner::new().with(
+            "ws",
+            json!({"exists": true, "count": 1}),
+            MacroSemanticStatus::LspVerified, // better than SyntaxOnly from create_file
+        );
+        let inv = minimal_invocation(&def, &project_dir);
+        let ctx = ctx_with_mock(mock);
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
+
+        // MacroPlan aggregate: LspVerified (probe) + SyntaxOnly (delegate) → Mixed
+        assert_eq!(
+            plan.semantic_status,
+            MacroSemanticStatus::Mixed,
+            "aggregate must be Mixed when probe and op differ: {:?}",
+            plan.semantic_status
+        );
+
+        // lower() uses only mutating ops → SyntaxOnly from create_file only
+        let rp = MacroPlanner::lower(&plan).expect("lowering must succeed");
+        assert_eq!(
+            rp.semantic_status,
+            SemanticStatus::SyntaxOnly,
+            "lowered plan must use SyntaxOnly (probe status must not leak): {:?}",
+            rp.semantic_status
+        );
+    }
+
+    // ── probe-only plan: lower() to SyntaxOnly default ───────────────────────
+
+    #[test]
+    fn probe_only_plan_lowers_to_syntax_only_default() {
+        // A plan with only probe ops (no mutating ops) should lower to SyntaxOnly.
+        let mut def = minimal_def();
+        def.probes = vec![MacroProbe {
+            name: "ws".into(),
+            description: "probe".into(),
+            spec: json!({"kind": "code_symbols"}),
+        }];
+        // No operations → pure probe plan
+
+        let mock = MockProbeRunner::new().with(
+            "ws",
+            json!({"exists": false, "count": 0}),
+            MacroSemanticStatus::LspVerified,
+        );
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = ctx_with_mock(mock);
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
+        // LspVerified probe → aggregate = LspVerified (single status, all same)
+        assert_eq!(plan.semantic_status, MacroSemanticStatus::LspVerified);
+
+        // lower() sees no mutating ops → defaults to SyntaxOnly
+        let rp = MacroPlanner::lower(&plan).expect("lowering probe-only plan must succeed");
+        assert_eq!(rp.semantic_status, SemanticStatus::SyntaxOnly);
     }
 }
 
