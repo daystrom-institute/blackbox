@@ -108,7 +108,13 @@ The guards `apply()` already enforces, in order (`src/refactor/mod.rs:1633`):
 6. Preimage sha verification (`read_original_for_edit` against
    `FileEdit.original_sha256`).
 7. Snapshot into `originals` for multi-file rollback (`:1732`).
-8. Atomic write + `TreeSitterNoErrors` validation, rollback on any failure.
+8. Parse validation of the rewritten content **before any write**
+   (`validate_rewritten_files`), then atomic write with rollback from the
+   per-file snapshots on failure.
+
+(Ordering above is representative, not byte-exact: snapshots are captured
+per-file alongside the preimage reads, and validation runs pre-write — not as a
+post-write `ValidationStep` loop.)
 
 Multi-file atomicity and rollback are therefore **already present** — but only
 if a macro lowers to **one** `RefactorPlan`, not N orchestrated refactor calls.
@@ -151,7 +157,7 @@ Consequences:
 
 ### Transaction additions genuinely required
 
-Three additions, all incremental to existing types — no new subsystem:
+Four additions, all incremental to existing types — no new subsystem:
 
 1. **`FileCreate` as the one new transaction primitive.** Today new-file
    emission rides a 0-byte-preimage `FileEdit` (`sha256_hex(&[])`, as in
@@ -166,6 +172,12 @@ Three additions, all incremental to existing types — no new subsystem:
 3. **`ValidationStep::CommandSucceeds { ... }`** — backs the macro command
    policy (`mvn`/`gradle`/`javac`/test), gated by origin (operator vs agent
    allowlist), distinct from the cargo-only refactor-atom allowlist (RX-V2).
+4. **`operator_opt_outs_used` on the durable `RefactorPlan`.** RX-V1 requires
+   this audit field on the durable plan, "not just the summary." The current
+   `RefactorPlan` struct (`src/refactor/mod.rs:891`) has **no such field** — the
+   existing code threads opt-out audit through wrapper/leftover side channels.
+   Macros surface it on `MacroPlan`, but the durable record must live on the
+   lowered `RefactorPlan`; adding the field is part of this transaction work.
 
 ## Macro layer
 
@@ -426,8 +438,10 @@ fail-closed).
 - Recipe packs are operator-installed, artifact-catalog-versioned code.
 - Public-API/destructive/transaction-boundary/runtime-behavior effects require
   explicit authority gates. Agents may pass through operator-supplied authority
-  flags but must not infer them (RX-V1). Consumed flags recorded on
-  `MacroPlan.operator_opt_outs_used`.
+  flags but must not infer them (RX-V1). Consumed flags are surfaced on
+  `MacroPlan` and, per RX-V1, recorded durably on the lowered
+  `RefactorPlan.operator_opt_outs_used` (a field that must be added — see
+  Transaction additions), not on the summary alone.
 - LLM-generated bodies are `template_only`/`mixed` unless parser/LSP/build checks
   validate them.
 - RA/jdtls-backed probes fail closed on LSP unavailability (RX-V3); no silent

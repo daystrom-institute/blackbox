@@ -120,12 +120,26 @@ sharing the two seams that already exist.
 ### The `semantic_status` ladder is the contract
 
 Syntactic results stay `SyntaxOnly`. Semantic results return `LspVerified` (or
-`LspVerifiedPartial`), and **fail closed** to `error.lsp_unavailable` per RX-V3
-— never a silent downgrade. The honest framing for *queries* (unlike
-organize-imports, which can fall back to a heuristic edit) is: when jdtls is
-unavailable, return the syntactic answer **explicitly labeled `syntax_only` with
-a caveat** so plan-shaping is not blocked, but never present a syntactic answer
-as resolved.
+`LspVerifiedPartial`), and **fail closed** to `error.lsp_unavailable` when jdtls
+is unavailable — never a silent downgrade. The precedent for this is the
+**RX-V3 Rust LSP-backed kinds** (`rust_lsp_rename`, `rust_organize_imports`,
+etc.), which fail closed by design — **not** `jdtls_organize_imports`, which
+does the opposite: on JDTLS failure it falls back to a heuristic syntax-only
+edit (`src/refactor/java/leaf_plans.rs:557`). That fallback is acceptable for an
+*edit* but is exactly what a *query* promising resolution must not do.
+
+The hard split (this tier's core contract):
+
+- A query that promises `lsp_verified` MUST return `error.lsp_unavailable` when
+  jdtls is down. It must never relabel a syntactic guess as resolved.
+- A code-nav tool MAY still offer a syntactic answer in that case, but only as a
+  **separately labeled `syntax_only` result with an explicit caveat**, so
+  plan-shaping is not blocked while the resolution promise stays honest.
+
+Caveat to fix in passing: the existing Rust LSP kinds fail closed but do not
+consistently prefix the missing-manager failure with `error.lsp_unavailable`
+(`src/refactor/rust.rs:1631`); the new tier should use the typed error
+uniformly and not inherit that inconsistency.
 
 ### The `CodeRefactorHandoff` seam is the stitch
 
