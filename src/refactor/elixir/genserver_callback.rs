@@ -301,7 +301,13 @@ pub(crate) fn plan_extract_genserver_callback_group(p: &RefactorPlanParams) -> R
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
-        operator_opt_outs_used: Vec::new(),
+        operator_opt_outs_used: {
+            let mut opts = Vec::new();
+            if has_use_genserver && ack_use {
+                opts.push("acknowledge_use_at_scope".to_string());
+            }
+            opts
+        },
     };
     let wrapped = PlanWithReport {
         plan,

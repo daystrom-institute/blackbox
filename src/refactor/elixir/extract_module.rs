@@ -232,6 +232,18 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
         });
     }
 
+    // Record operator opt-outs for flags that were actually consumed.
+    let mut operator_opt_outs: Vec<String> = Vec::new();
+    if use_at_scope.is_some() && ack_use {
+        operator_opt_outs.push("acknowledge_use_at_scope".to_string());
+    }
+    if moved.iter().any(|m| m.is_macro) && ack_macro {
+        operator_opt_outs.push("acknowledge_defmacro_move".to_string());
+    }
+    if moved.iter().any(|m| m.contains_quote) && ack_quote {
+        operator_opt_outs.push("acknowledge_quote_in_moved".to_string());
+    }
+
     // ── compute byte ranges to remove from source ────────────────────────────
     // For each selected def, remove from the start of the FIRST attached
     // attribute (or the def's leading_trivia_start) to the end of the def
@@ -369,7 +381,7 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
-        operator_opt_outs_used: Vec::new(),
+        operator_opt_outs_used: operator_opt_outs,
     };
 
     let wrapped = PlanWithReport {

@@ -174,6 +174,7 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
     let ack_macro = toml_bool(&p.toml_entries, "acknowledge_defmacro_move");
     let ack_guard = toml_bool(&p.toml_entries, "acknowledge_unpreservable_guards");
     let ack_dyn = toml_bool(&p.toml_entries, "acknowledge_dynamic_dispatch");
+    let mut consumed_unpreservable_guards = false;
 
     // ── pre-check: use at scope ──────────────────────────────────────────────
     let body_stmts = defmodule_body_statements(defmodule, &parsed.source);
@@ -470,11 +471,14 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         // known Elixir guard, refuse unless acknowledged.
         for clause in &bucket_clauses {
             if let Some(g) = &clause.guard_text {
-                if !guard_is_preservable(g, &bucket_helper_keys) && !ack_guard {
-                    bail!(
-                        "error.guarded_clauses_require_review: clause at line {} has guard `{g}` that references a non-moved helper or non-builtin; pass acknowledge_unpreservable_guards=true to proceed",
-                        clause.line
-                    );
+                if !guard_is_preservable(g, &bucket_helper_keys) {
+                    consumed_unpreservable_guards = true;
+                    if !ack_guard {
+                        bail!(
+                            "error.guarded_clauses_require_review: clause at line {} has guard `{g}` that references a non-moved helper or non-builtin; pass acknowledge_unpreservable_guards=true to proceed",
+                            clause.line
+                        );
+                    }
                 }
             }
         }
@@ -577,6 +581,28 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         })
         .collect();
 
+    // Record operator opt-outs for flags that were actually consumed.
+    let mut operator_opt_outs: Vec<String> = Vec::new();
+    if use_at_scope.is_some() && ack_use {
+        operator_opt_outs.push("acknowledge_use_at_scope".to_string());
+    }
+    if moved_indices.iter().any(|&i| clauses[i].is_macro) && ack_macro {
+        operator_opt_outs.push("acknowledge_defmacro_move".to_string());
+    }
+    if moved_indices.iter().any(|&i| clauses[i].contains_quote) && ack_quote {
+        operator_opt_outs.push("acknowledge_quote_in_moved".to_string());
+    }
+    if moved_indices
+        .iter()
+        .any(|&i| !clauses[i].dynamic_dispatch_sites.is_empty())
+        && ack_dyn
+    {
+        operator_opt_outs.push("acknowledge_dynamic_dispatch".to_string());
+    }
+    if consumed_unpreservable_guards && ack_guard {
+        operator_opt_outs.push("acknowledge_unpreservable_guards".to_string());
+    }
+
     let plan = RefactorPlan {
         title: format!(
             "split_elixir_clauses_by_tag: {}.{}/{} → {} bucket(s)",
@@ -602,7 +628,7 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
-        operator_opt_outs_used: Vec::new(),
+        operator_opt_outs_used: operator_opt_outs,
     };
 
     let wrapped = PlanWithReport {

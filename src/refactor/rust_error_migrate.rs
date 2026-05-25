@@ -67,7 +67,7 @@ pub fn plan_rewrite_error_type(p: &crate::refactor::RefactorPlanParams) -> Resul
             source_path.display()
         );
     }
-    if acknowledge_public_api_change {
+    if acknowledge_public_api_change && is_error_type_pub(root, source, old_text) {
         operator_opt_outs.push("acknowledge_public_api_change".to_string());
     }
 

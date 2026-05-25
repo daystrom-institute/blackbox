@@ -1702,6 +1702,18 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
                     plan.file_moves
                         .first()
                         .map(|m| PathBuf::from(&m.source_path))
+                })
+                .or_else(|| {
+                    // FIX 1 (G15): create-only plans have no edits/moves,
+                    // so include file_creates in the anchor fallback so
+                    // cross-worktree creates are also refused. The create
+                    // target does not exist yet, so anchor on its parent
+                    // directory — git_root_for_path can't resolve a repo
+                    // root from a nonexistent file path.
+                    plan.file_creates.first().map(|c| {
+                        let p = PathBuf::from(&c.path);
+                        p.parent().map(|parent| parent.to_path_buf()).unwrap_or(p)
+                    })
                 });
             if let Some(plan_anchor) = plan_anchor {
                 let cwd_top = crate::git::git_root_for_path(&cwd_path);
@@ -1791,6 +1803,10 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
         let path = PathBuf::from(&file_create.path);
         if p.allow_unregistered_paths != Some(true) {
             ensure_path_in_registered_project(&path, projects)?;
+        }
+        // FIX 3: guard creates against dirty-worktree state just as edits/moves do.
+        if p.allow_dirty_worktree != Some(true) {
+            ensure_git_clean_for_path(&path)?;
         }
         if path.exists() {
             bail!("refusing to create {}: already exists", path.display());
@@ -1913,7 +1929,12 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
                 })?);
             }
         }
-        if let Err(err) = write_atomic(path, bytes) {
+        // FIX 2: use noclobber write so a file racing into existence between
+        // the early path.exists() check and the actual write is refused rather
+        // than silently clobbered.  The rollback entry is pushed ONLY on
+        // success, so a noclobber failure cannot cause rollback to delete a
+        // pre-existing file.
+        if let Err(err) = write_atomic_noclobber(path, bytes) {
             let rollback_errors = restore_snapshots(&originals);
             return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
                 status: "write_failed".to_string(),
@@ -1925,6 +1946,9 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             })?);
         }
         // Register for rollback: None means "delete this file on rollback".
+        // This push is intentionally AFTER the successful write so that a
+        // noclobber failure (pre-existing file) never adds an entry that would
+        // cause rollback to delete the pre-existing file.
         originals.push((path.clone(), None));
         files_written.push(path_string(path));
     }
@@ -4829,6 +4853,39 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     tmp.as_file_mut().sync_all()?;
     tmp.persist(path)
         .map_err(|err| anyhow!("persist failed: {}", err.error))?;
+    if let Ok(dir) = fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Atomically write `bytes` to `path`, but ONLY if `path` does not already
+/// exist at the moment of the rename (O_EXCL / noclobber semantics).
+///
+/// This closes the TOCTOU window in `file_creates`: even if a file appears
+/// between the early `path.exists()` check and the actual write, the OS-level
+/// exclusive rename will fail rather than silently clobbering the file.
+///
+/// Uses `NamedTempFile::persist_noclobber`, which wraps the platform's atomic
+/// `link` / `rename` with an existence check.  On failure the temp file is
+/// cleaned up automatically; the caller receives an error and must NOT push
+/// the target into the rollback list (no pre-existing file was touched).
+fn write_atomic_noclobber(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("{} has no parent directory", path.display()))?;
+    fs::create_dir_all(parent)?;
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(bytes)?;
+    tmp.as_file_mut().sync_all()?;
+    tmp.persist_noclobber(path).map_err(|err| {
+        anyhow!(
+            "noclobber persist failed for {}: {} \
+             (file appeared between pre-check and write)",
+            path.display(),
+            err.error
+        )
+    })?;
     if let Ok(dir) = fs::File::open(parent) {
         let _ = dir.sync_all();
     }

@@ -6435,6 +6435,149 @@ impl Cache {
             "file must not be created when parse validation fails"
         );
     }
+
+    // FIX 1 (G15): a create-only plan (no edits, no moves) must be refused
+    // when the apply cwd is in a different git worktree than the plan's
+    // recorded create path.  Before the fix, the anchor chain fell through to
+    // None and the G15 guard was silently bypassed.
+    #[test]
+    fn g15_create_only_plan_refused_across_worktrees() {
+        let plan_repo = tempfile::tempdir().unwrap();
+        let cwd_repo = tempfile::tempdir().unwrap();
+        for repo in [plan_repo.path(), cwd_repo.path()] {
+            std::process::Command::new("git")
+                .arg("init")
+                .arg("-q")
+                .current_dir(repo)
+                .status()
+                .expect("git init");
+        }
+
+        // A create-only plan whose target lives under plan_repo.
+        let new_file = plan_repo.path().join("generated.rs");
+        let content = "pub fn new() {}\n";
+        let plan_value = serde_json::json!({
+            "title": "create-only g15 test",
+            "kind": "create_file",
+            "semantic_status": "syntax_only",
+            "dry_run": false,
+            "file_moves": [],
+            "file_creates": [{"path": new_file.to_string_lossy(), "content": content}],
+            "edits": [],
+            "validations": [],
+            "items": [],
+            "leftovers": [],
+        });
+
+        // cwd in a different repo — must refuse with cross_worktree_apply.
+        let result = apply(
+            &RefactorApplyParams {
+                plan: plan_value.clone(),
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                cwd: Some(cwd_repo.path().to_string_lossy().into_owned()),
+                force_path: None,
+            },
+            &[g15_project_record(plan_repo.path())],
+        );
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("cross_worktree_apply"),
+            "expected cross_worktree_apply refusal for create-only plan, got: {err}"
+        );
+        // The file must not have been written.
+        assert!(!new_file.exists(), "create must not write across worktrees");
+
+        // With force_path=true the G15 guard must be bypassed.
+        let result_force = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                cwd: Some(cwd_repo.path().to_string_lossy().into_owned()),
+                force_path: Some(true),
+            },
+            &[g15_project_record(plan_repo.path())],
+        );
+        if let Err(err) = &result_force {
+            assert!(
+                !err.to_string().contains("cross_worktree_apply"),
+                "force_path=true must bypass G15 for create-only plan, got: {err}"
+            );
+        }
+    }
+
+    // FIX 2 (noclobber / TOCTOU): even if a file races into existence between
+    // the early exists() check and the atomic write, the noclobber write must
+    // fail and rollback must NOT delete the pre-existing file.
+    //
+    // We simulate the race by pre-writing the target between plan and apply
+    // (i.e. the file did not exist at plan time but does at apply time).
+    // The early exists() path already covers the "file was there all along"
+    // case; this test exercises the write-time noclobber guard by using a
+    // plan JSON built without a pre-existence check (so apply reaches the
+    // write path), but the file having been written externally just before
+    // apply runs.
+    #[test]
+    fn apply_create_noclobber_refuses_racing_file_and_does_not_delete_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let racing_file = dir.path().join("racing.rs");
+        let original_content = "// written by someone else\n";
+        let new_content = "pub fn created() {}\n";
+
+        // Build the plan JSON as if the file did not exist yet.
+        let plan_value = serde_json::json!({
+            "title": "noclobber race test",
+            "kind": "create_file",
+            "semantic_status": "syntax_only",
+            "dry_run": false,
+            "file_moves": [],
+            "file_creates": [{"path": racing_file.to_string_lossy(), "content": new_content}],
+            "edits": [],
+            "validations": [],
+            "items": [],
+            "leftovers": [],
+        });
+
+        // Simulate the race: write the file between plan and apply.
+        fs::write(&racing_file, original_content).unwrap();
+
+        // apply must fail (either at the early exists() check or the noclobber
+        // write) without clobbering the pre-existing file.
+        let err = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: Some(true),
+                allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("refusing to create")
+                || err.to_string().contains("noclobber persist failed"),
+            "expected a create-refusal error, got: {err}"
+        );
+        // The pre-existing file must be intact — rollback must not have deleted it.
+        assert!(
+            racing_file.exists(),
+            "pre-existing file was deleted during rollback — noclobber guard broken"
+        );
+        assert_eq!(
+            fs::read_to_string(&racing_file).unwrap(),
+            original_content,
+            "pre-existing file content was mutated"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6587,6 +6730,75 @@ struct Point {
         assert!(
             p.operator_opt_outs_used.is_empty(),
             "expected empty operator_opt_outs_used, got {:?}",
+            p.operator_opt_outs_used
+        );
+    }
+
+    /// rewrite_rust_error_type: non-pub type WITH acknowledge_public_api_change=true
+    /// must NOT record the flag (FIX 4 regression — ack was supplied but not consumed).
+    #[test]
+    fn rewrite_error_type_non_pub_with_ack_still_empty_opt_outs() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("main.rs");
+        std::fs::write(
+            &src,
+            r#"enum OldErr { IoFail }
+fn do_something() -> Result<(), OldErr> { Ok(()) }
+"#,
+        )
+        .unwrap();
+
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "acknowledge_public_api_change".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "rewrite_rust_error_type".into(),
+            source: path_string(&src),
+            old_text: Some("OldErr".into()),
+            new_text: Some("NewErr".into()),
+            item_names: Some(vec!["do_something".into()]),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert!(
+            p.operator_opt_outs_used.is_empty(),
+            "expected empty operator_opt_outs_used for non-pub type even with ack=true, got {:?}",
+            p.operator_opt_outs_used
+        );
+    }
+
+    /// csharp_to_record_migrate records acknowledge_equality_semantics_change
+    /// when the plan succeeds (flag is always consumed).
+    #[test]
+    fn csharp_record_migrate_records_opt_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Foo.cs");
+        std::fs::write(&path, "public class Foo { public int X { get; init; } }\n").unwrap();
+
+        let mut entries = std::collections::BTreeMap::new();
+        entries.insert(
+            "acknowledge_equality_semantics_change".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        let plan_json = plan(&RefactorPlanParams {
+            kind: "csharp_to_record_migrate".into(),
+            source: path_string(&path),
+            item_names: Some(vec!["Foo".into()]),
+            toml_entries: Some(entries),
+            ..Default::default()
+        })
+        .unwrap();
+
+        let p: RefactorPlan = serde_json::from_str(&plan_json).unwrap();
+        assert!(
+            p.operator_opt_outs_used
+                .contains(&"acknowledge_equality_semantics_change".to_string()),
+            "expected acknowledge_equality_semantics_change in operator_opt_outs_used, got {:?}",
             p.operator_opt_outs_used
         );
     }

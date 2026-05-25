@@ -184,6 +184,14 @@ pub(crate) fn plan_test_fixture_extract(p: &RefactorPlanParams) -> Result<String
     // EX-V6 v1 floor: target file content parses cleanly.
     super::roundtrip::verify_parse_clean(&fixture_content)?;
 
+    let mut operator_opt_outs: Vec<String> = Vec::new();
+    if any_attr_ref && ack_attr_scope {
+        operator_opt_outs.push("acknowledge_attribute_scope".to_string());
+    }
+    if any_describe && ack_describe {
+        operator_opt_outs.push("acknowledge_describe_context".to_string());
+    }
+
     let plan = RefactorPlan {
         title: format!(
             "elixir_test_fixture_extract: {} → {} ({} groups)",
@@ -216,7 +224,7 @@ pub(crate) fn plan_test_fixture_extract(p: &RefactorPlanParams) -> Result<String
         deep_analysis: None,
         plan_status: PlanStatus::Planned,
         fixme_count: None,
-        operator_opt_outs_used: Vec::new(),
+        operator_opt_outs_used: operator_opt_outs,
     };
     let wrapped = PlanWithReport {
         plan,

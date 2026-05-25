@@ -78,6 +78,8 @@ pub fn plan_to_record_migrate(p: &RefactorPlanParams) -> Result<String> {
         ),
         SemanticStatus::SyntaxOnly,
     );
+    plan.operator_opt_outs_used
+        .push("acknowledge_equality_semantics_change".to_string());
     plan.validations.push(ValidationStep::TreeSitterNoErrors {
         path: path_string(&source_path),
         byte_range: None,
