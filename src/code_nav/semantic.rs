@@ -274,9 +274,11 @@ pub struct WorkspaceSymbolItem {
     /// File path containing this symbol.
     pub path: String,
     /// 0-based line number of the symbol's location.
-    pub line: u32,
+    /// `None` when JDTLS returns a range-less workspace location (uri only).
+    pub line: Option<u32>,
     /// 0-based character offset of the symbol's location.
-    pub character: u32,
+    /// `None` when JDTLS returns a range-less workspace location (uri only).
+    pub character: Option<u32>,
     /// Handoff hint pointing the agent to `bbox_refactor_status` /
     /// `bbox_refactor_project_refs` on this specific file.
     pub handoff: CodeRefactorHandoff,
@@ -355,6 +357,7 @@ pub(crate) fn java_find_implementations(
     let source_str = source_path.to_string_lossy().to_string();
 
     // Normalize GotoDefinitionResponse (Scalar/Array/Link) → Vec<Location>.
+    let response_was_some = response.is_some();
     let locations: Vec<Location> = match response {
         Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
         Some(GotoDefinitionResponse::Array(locs)) => locs,
@@ -388,7 +391,7 @@ pub(crate) fn java_find_implementations(
         })
         .collect();
 
-    let symbol_resolved = !sites.is_empty();
+    let symbol_resolved = response_was_some;
 
     Ok(ImplementationsReport {
         kind: "java_find_implementations".to_string(),
@@ -508,6 +511,7 @@ pub(crate) fn java_workspace_symbols(
     // Normalize the response: WorkspaceSymbolResponse is
     // Flat(Vec<SymbolInformation>) | Nested(Vec<WorkspaceSymbol>)
     // We flatten both into a unified list of symbol items.
+    let response_was_some = response.is_some();
     let symbols = match response {
         Some(lsp_types::WorkspaceSymbolResponse::Flat(symbols)) => {
             symbols
@@ -521,7 +525,7 @@ pub(crate) fn java_workspace_symbols(
         None => Vec::new(),
     };
 
-    let resolved = !symbols.is_empty();
+    let resolved = response_was_some;
 
     Ok(WorkspaceSymbolsReport {
         kind: "java_workspace_symbols".to_string(),
@@ -548,8 +552,8 @@ fn symbol_info_to_item(sym: &SymbolInformation, project_dir: &str) -> WorkspaceS
         kind: kind_str,
         kind_number,
         path,
-        line: sym.location.range.start.line,
-        character: sym.location.range.start.character,
+        line: Some(sym.location.range.start.line),
+        character: Some(sym.location.range.start.character),
         handoff,
     }
 }
@@ -566,7 +570,7 @@ fn workspace_symbol_to_item(sym: WorkspaceSymbol, project_dir: &str) -> Option<W
                 .to_file_path()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| loc.uri.to_string());
-            (path, loc.range.start.line, loc.range.start.character)
+            (path, Some(loc.range.start.line), Some(loc.range.start.character))
         }
         lsp_types::OneOf::Right(ws_loc) => {
             // WorkspaceLocation only has uri, no range
@@ -575,7 +579,7 @@ fn workspace_symbol_to_item(sym: WorkspaceSymbol, project_dir: &str) -> Option<W
                 .to_file_path()
                 .map(|p| p.to_string_lossy().to_string())
                 .unwrap_or_else(|_| ws_loc.uri.to_string());
-            (path, 0, 0)
+            (path, None, None)
         }
     };
 
@@ -1070,8 +1074,8 @@ mod tests {
                     kind: interface_kind_str,
                     kind_number: interface_kind_num,
                     path: "/repo/Hello.java".to_string(),
-                    line: 14,
-                    character: 10,
+                    line: Some(14),
+                    character: Some(10),
                     handoff: usage_site_handoff("/repo/Hello.java", "/repo"),
                 },
                 WorkspaceSymbolItem {
@@ -1079,8 +1083,8 @@ mod tests {
                     kind: class_kind_str,
                     kind_number: class_kind_num,
                     path: "/repo/Hello.java".to_string(),
-                    line: 19,
-                    character: 0,
+                    line: Some(19),
+                    character: Some(0),
                     handoff: usage_site_handoff("/repo/Hello.java", "/repo"),
                 },
             ],
