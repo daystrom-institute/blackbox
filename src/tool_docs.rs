@@ -1643,6 +1643,31 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         when_to_use: "Use to remove a project-scope macro that is no longer needed. Only removes the project-scoped file; user and builtin macros with the same id are unaffected.",
         example: Some(r#"macro_unregister(id="my.macro", project_dir="/repo/my-project")"#),
     },
+    ToolDoc {
+        name: "macro_plan",
+        category: ToolCategory::Macros,
+        summary: "Plan a macro invocation: resolve the named macro, validate inputs, run the planner pipeline, and return a MacroPlan review artifact. Read-only — never writes files.",
+        when_to_use: "Use before macro_apply or macro_run to preview what a macro will do. Validates inputs against the macro schema, evaluates refusals, and produces a MacroPlan with the full edit set and checks. Always inspect the plan before applying to production code.",
+        example: Some(
+            r#"macro_plan(macro_id="java.add_service_boundary", project_dir="/repo/my-project", inputs={"service_name": "OrderService"})"#,
+        ),
+    },
+    ToolDoc {
+        name: "macro_apply",
+        category: ToolCategory::Macros,
+        summary: "Lower a MacroPlan to a RefactorPlan and apply it to disk. Wraps refactor::apply — no bypass flags are set by default. Requires confirm=true.",
+        when_to_use: "Use after reviewing a MacroPlan returned by macro_plan. Lowers the plan to a RefactorPlan and applies it. Requires confirm=true. No bypass flags (allow_dirty_worktree, allow_unregistered_paths, force_path) are set — use bbox_refactor_apply directly if bypass flags are needed.",
+        example: Some(r#"macro_apply(plan=<MacroPlan JSON from macro_plan>, confirm=true)"#),
+    },
+    ToolDoc {
+        name: "macro_run",
+        category: ToolCategory::Macros,
+        summary: "Plan and apply a macro in a single step. Equivalent to macro_plan followed by macro_apply. Requires confirm=true to execute.",
+        when_to_use: "Use when you have already reviewed what the macro does and want to plan + apply in one call. Short-circuits and returns the plan (without applying) if refusals fire. Requires confirm=true.",
+        example: Some(
+            r#"macro_run(macro_id="java.add_service_boundary", project_dir="/repo/my-project", inputs={"service_name": "OrderService"}, confirm=true)"#,
+        ),
+    },
 ];
 
 pub const WORKFLOW_NOTES: &str = "\

@@ -30,6 +30,7 @@
 pub mod backend;
 pub mod expr;
 pub mod model;
+pub mod planner;
 pub mod planner_ctx;
 pub mod registry;
 
@@ -48,6 +49,8 @@ pub use model::{
     MacroPlanCheck, MacroPlanOperation, MacroProbe, MacroRefusal, MacroRefusalHit, MacroScope,
     MacroSemanticStatus, MacroValidation,
 };
+#[allow(unused_imports)]
+pub use planner::MacroPlanner;
 #[allow(unused_imports)]
 pub use planner_ctx::MacroPlannerContext;
 #[allow(unused_imports)]

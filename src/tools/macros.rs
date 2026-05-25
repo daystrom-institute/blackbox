@@ -1,11 +1,9 @@
-//! MCP tool surface for the macro registry.
+//! MCP tool surface for the macro layer.
 //!
-//! This module implements the read/registration half of the `macro_*` tool
-//! namespace: `macro_list`, `macro_describe`, `macro_validate`,
-//! `macro_register`, and `macro_unregister`.
-//!
-//! Planning (`macro_plan`), apply (`macro_apply`), and runner (`macro_run`)
-//! land in the next milestone — do NOT add stubs for them here.
+//! This module implements the `macro_*` tool namespace:
+//! - `macro_list`, `macro_describe`, `macro_validate`, `macro_register`,
+//!   `macro_unregister` — registry read/write surface (M2).
+//! - `macro_plan`, `macro_apply`, `macro_run` — planner and apply surface (M3).
 
 use std::path::PathBuf;
 
@@ -17,8 +15,12 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::macros::model::MacroDefinition;
+use crate::macros::backend::UnavailableBackend;
+use crate::macros::model::{MacroAnchors, MacroDefinition, MacroInvocation, MacroPlan};
+use crate::macros::planner::{MacroPlanner, build_macro_apply_params};
+use crate::macros::planner_ctx::MacroPlannerContext;
 use crate::macros::registry::{MacroRegistry, RegistryError};
+use crate::refactor;
 use crate::server::state::BlackboxServer;
 
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
@@ -83,6 +85,70 @@ pub struct MacroUnregisterParams {
     pub id: String,
     /// Project root directory containing `.bbox/macros/<id>.json`.
     pub project_dir: String,
+}
+
+/// Parameters for `macro_plan`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MacroPlanParams {
+    /// Stable identifier of the macro to plan.
+    pub macro_id: String,
+    /// Optional pinned version. When set, must exactly match the registered
+    /// version (registry resolves by id only). Omit to accept whatever
+    /// version is registered.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Absolute path to the project root directory. Used to resolve
+    /// project-scoped macros and to set `project_dir` on delegates.
+    pub project_dir: String,
+    /// Typed input values. Must conform to the macro's `inputs_schema`.
+    #[serde(default)]
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+    /// Optional source anchors (files, symbols, byte/line ranges).
+    #[serde(default)]
+    pub anchors: Option<MacroAnchors>,
+    /// Operator-supplied authority opt-out flags (e.g.
+    /// `"acknowledge_public_api_change"`). Agents MUST NOT default or infer
+    /// these (RX-V1). Pass only when the operator explicitly provides them.
+    #[serde(default)]
+    pub operator_opt_outs: Option<Vec<String>>,
+}
+
+/// Parameters for `macro_apply`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MacroApplyParams {
+    /// `MacroPlan` JSON returned by `macro_plan`. The plan is lowered to a
+    /// `RefactorPlan` and applied to disk.
+    pub plan: serde_json::Value,
+    /// Must be `true` to execute. When omitted or `false`, returns an error.
+    #[serde(default)]
+    pub confirm: Option<bool>,
+    /// Working directory for path resolution. Optional; defaults to the
+    /// `project_dir` recorded in the plan.
+    #[serde(default)]
+    pub cwd: Option<String>,
+}
+
+/// Parameters for `macro_run`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MacroRunParams {
+    /// Stable identifier of the macro to run.
+    pub macro_id: String,
+    /// Typed input values. Must conform to the macro's `inputs_schema`.
+    #[serde(default)]
+    pub inputs: serde_json::Map<String, serde_json::Value>,
+    /// Absolute path to the project root directory.
+    pub project_dir: String,
+    /// Must be `true` to execute. When omitted or `false`, returns an error.
+    #[serde(default)]
+    pub confirm: Option<bool>,
+    /// Optional pinned version. Must exactly match the registered version
+    /// when provided.
+    #[serde(default)]
+    pub version: Option<String>,
+    /// Operator-supplied authority opt-out flags (RX-V1). Pass only when the
+    /// operator explicitly provides them.
+    #[serde(default)]
+    pub operator_opt_outs: Option<Vec<String>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -334,5 +400,210 @@ impl BlackboxServer {
             })),
             Err(e) => registry_err(e),
         }
+    }
+
+    /// Plan a macro invocation without writing anything to disk.
+    ///
+    /// Resolves the macro definition from the registry, validates inputs,
+    /// evaluates refusals, and runs the planner pipeline. Returns a
+    /// `MacroPlan` review artifact that can be inspected before applying.
+    ///
+    /// # READ-ONLY
+    ///
+    /// This tool never writes files. Use `macro_apply` or `macro_run` to
+    /// execute the plan.
+    #[tool(
+        name = "macro_plan",
+        description = "Plan a macro invocation: resolve the named macro, validate inputs, run the planner pipeline, and return a MacroPlan review artifact. Read-only — never writes files."
+    )]
+    pub(crate) fn macro_plan(&self, Parameters(p): Parameters<MacroPlanParams>) -> CallToolResult {
+        let project_dir = resolve_project_dir(Some(&p.project_dir));
+
+        // Resolve definition from registry
+        let def = match MacroRegistry::get(project_dir.as_deref(), &p.macro_id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return err_text(&format!(
+                    "macro '{}' not found in any scope (project_dir={:?})",
+                    p.macro_id, p.project_dir
+                ));
+            }
+            Err(e) => return registry_err(e),
+        };
+
+        let invocation = MacroInvocation {
+            macro_id: p.macro_id,
+            version: p.version,
+            project_dir: p.project_dir,
+            inputs: p.inputs,
+            anchors: p.anchors,
+            operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
+        };
+
+        // Build a planner context: fail-closed backend + LSP from daemon state
+        let ctx = MacroPlannerContext::new(
+            Box::new(UnavailableBackend),
+            Some(self.state.lsp_sessions.clone()),
+        );
+
+        match MacroPlanner::plan(&invocation, &def, &ctx) {
+            Ok(plan) => match serde_json::to_value(&plan) {
+                Ok(v) => ok_json(&v),
+                Err(e) => err_text(&format!("failed to serialize MacroPlan: {e}")),
+            },
+            Err(e) => err_text(&e.to_string()),
+        }
+    }
+
+    /// Lower a `MacroPlan` to a `RefactorPlan` and apply it to disk.
+    ///
+    /// Accepts a `MacroPlan` JSON value (as returned by `macro_plan`). Lowers
+    /// it to a `RefactorPlan` and delegates to `refactor::apply`. No bypass
+    /// flags (`allow_dirty_worktree`, `allow_unregistered_paths`, `force_path`)
+    /// are set — the caller must use `bbox_refactor_apply` directly if bypass
+    /// flags are needed.
+    ///
+    /// Requires `confirm=true` to execute (mirrors `bbox_refactor_apply`).
+    #[tool(
+        name = "macro_apply",
+        description = "Lower a MacroPlan to a RefactorPlan and apply it to disk. Wraps refactor::apply — no bypass flags are set by default. Requires confirm=true."
+    )]
+    pub(crate) fn macro_apply(
+        &self,
+        Parameters(p): Parameters<MacroApplyParams>,
+    ) -> CallToolResult {
+        // Deserialize the plan value as MacroPlan
+        let plan: MacroPlan = match serde_json::from_value(p.plan) {
+            Ok(pl) => pl,
+            Err(e) => {
+                return err_text(&format!(
+                    "failed to parse `plan` as MacroPlan: {e}. \
+                     Use macro_plan to generate a valid MacroPlan JSON."
+                ));
+            }
+        };
+
+        // Refuse plans with outstanding refusals (empty edit set, nothing to apply)
+        if !plan.refusals.is_empty() {
+            let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
+            return err_text(&format!(
+                "macro '{}' has unresolved refusals: {}. \
+                 Resolve the refusal conditions before applying.",
+                plan.macro_id,
+                codes.join(", ")
+            ));
+        }
+
+        // Lower to RefactorPlan
+        let refactor_plan = match MacroPlanner::lower(&plan) {
+            Ok(rp) => rp,
+            Err(e) => return err_text(&e.to_string()),
+        };
+
+        // Serialize to Value for RefactorApplyParams
+        let plan_value = match serde_json::to_value(&refactor_plan) {
+            Ok(v) => v,
+            Err(e) => return err_text(&format!("failed to serialize RefactorPlan: {e}")),
+        };
+
+        let apply_params = build_macro_apply_params(plan_value, p.confirm, p.cwd);
+
+        Self::run("macro_apply", || {
+            let projects = self.state.projects.read().list();
+            refactor::apply(&apply_params, &projects)
+        })
+    }
+
+    /// Plan and apply a macro in a single step.
+    ///
+    /// Equivalent to calling `macro_plan` followed by `macro_apply`. The plan
+    /// is returned alongside the apply result for audit purposes. Requires
+    /// `confirm=true` to execute.
+    ///
+    /// Short-circuits and returns the plan (without applying) if the macro
+    /// produces refusals.
+    #[tool(
+        name = "macro_run",
+        description = "Plan and apply a macro in a single step. Equivalent to macro_plan followed by macro_apply. Requires confirm=true to execute."
+    )]
+    pub(crate) fn macro_run(&self, Parameters(p): Parameters<MacroRunParams>) -> CallToolResult {
+        let project_dir = resolve_project_dir(Some(&p.project_dir));
+
+        // Resolve definition from registry
+        let def = match MacroRegistry::get(project_dir.as_deref(), &p.macro_id) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                return err_text(&format!(
+                    "macro '{}' not found in any scope (project_dir={:?})",
+                    p.macro_id, p.project_dir
+                ));
+            }
+            Err(e) => return registry_err(e),
+        };
+
+        let invocation = MacroInvocation {
+            macro_id: p.macro_id,
+            version: p.version,
+            project_dir: p.project_dir.clone(),
+            inputs: p.inputs,
+            anchors: None,
+            operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
+        };
+
+        let ctx = MacroPlannerContext::new(
+            Box::new(UnavailableBackend),
+            Some(self.state.lsp_sessions.clone()),
+        );
+
+        // Plan phase
+        let plan = match MacroPlanner::plan(&invocation, &def, &ctx) {
+            Ok(pl) => pl,
+            Err(e) => return err_text(&e.to_string()),
+        };
+
+        // Short-circuit on refusals — return the plan for inspection
+        if !plan.refusals.is_empty() {
+            let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
+            return match serde_json::to_value(&plan) {
+                Ok(v) => {
+                    let mut r = ok_json(&json!({
+                        "status": "refused",
+                        "refusals": codes,
+                        "plan": v,
+                    }));
+                    r.is_error = Some(true);
+                    r
+                }
+                Err(e) => err_text(&format!("macro refused; failed to serialize plan: {e}")),
+            };
+        }
+
+        // Lower to RefactorPlan
+        let refactor_plan = match MacroPlanner::lower(&plan) {
+            Ok(rp) => rp,
+            Err(e) => return err_text(&e.to_string()),
+        };
+
+        let plan_value = match serde_json::to_value(&refactor_plan) {
+            Ok(v) => v,
+            Err(e) => return err_text(&format!("failed to serialize RefactorPlan: {e}")),
+        };
+
+        let apply_params = build_macro_apply_params(plan_value, p.confirm, None);
+
+        // Capture a serialized copy of the plan for the response envelope
+        let plan_json = serde_json::to_value(&plan).unwrap_or(serde_json::Value::Null);
+
+        Self::run("macro_run", || {
+            let projects = self.state.projects.read().list();
+            let apply_result = refactor::apply(&apply_params, &projects)?;
+            // Return both the plan and the apply result for audit
+            let envelope = json!({
+                "plan": plan_json,
+                "apply_result": apply_result,
+            });
+            serde_json::to_string_pretty(&envelope)
+                .map_err(|e| anyhow::anyhow!("failed to serialize macro_run result: {e}"))
+        })
     }
 }
