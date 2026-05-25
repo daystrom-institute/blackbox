@@ -1773,6 +1773,7 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: all_edits,
         validations: all_validations,
         items: selected_methods

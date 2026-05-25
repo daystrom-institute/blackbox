@@ -138,6 +138,7 @@ pub(crate) fn plan_inline_module(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![
             FileEdit {
                 path: source_path.to_string_lossy().into_owned(),

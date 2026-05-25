@@ -257,6 +257,7 @@ pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<Str
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),

@@ -123,6 +123,7 @@ pub(crate) fn plan_genserver_state_audit(p: &RefactorPlanParams) -> Result<Strin
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::<FileEdit>::new(),
         validations: Vec::<ValidationStep>::new(),
         items: Vec::new(),

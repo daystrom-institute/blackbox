@@ -318,6 +318,7 @@ pub(crate) fn plan_promote_java_inner_class(p: &RefactorPlanParams) -> Result<St
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),

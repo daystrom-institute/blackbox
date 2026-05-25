@@ -99,6 +99,7 @@ pub fn plan_ra_move(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::LspVerified,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: selected.clone(),

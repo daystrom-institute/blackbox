@@ -129,6 +129,7 @@ pub(crate) fn plan_organize_aliases(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![file_edit],
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: source_path.to_string_lossy().into_owned(),
@@ -169,6 +170,7 @@ fn empty_plan(parsed: &ParsedSource) -> RefactorPlan {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::new(),
         validations: Vec::new(),
         items: Vec::new(),

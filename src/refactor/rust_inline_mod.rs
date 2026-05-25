@@ -142,6 +142,7 @@ pub(crate) fn plan_inline_mod_to_file_submodule(p: &RefactorPlanParams) -> Resul
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),

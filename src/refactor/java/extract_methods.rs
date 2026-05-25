@@ -115,6 +115,7 @@ pub(crate) fn plan_extract_java_methods(p: &RefactorPlanParams) -> Result<String
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),

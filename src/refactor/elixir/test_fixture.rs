@@ -195,6 +195,7 @@ pub(crate) fn plan_test_fixture_extract(p: &RefactorPlanParams) -> Result<String
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: target_file.to_string_lossy().into_owned(),
             original_sha256: sha256_hex(b""),

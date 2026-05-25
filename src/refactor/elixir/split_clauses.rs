@@ -589,6 +589,7 @@ pub(crate) fn plan_split_clauses_by_tag(p: &RefactorPlanParams) -> Result<String
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: Vec::new(),

@@ -359,6 +359,7 @@ pub(crate) fn plan_extract_java_code_block_to_method(p: &RefactorPlanParams) -> 
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),

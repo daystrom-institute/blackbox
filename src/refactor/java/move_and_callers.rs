@@ -127,6 +127,7 @@ pub(crate) fn plan_move_java_constant(p: &RefactorPlanParams) -> Result<String> 
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations: parse_validation_step_for_path(&source_path)
             .into_iter()
@@ -177,6 +178,7 @@ pub(crate) fn plan_update_java_callers(p: &RefactorPlanParams) -> Result<String>
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),

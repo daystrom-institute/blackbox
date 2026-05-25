@@ -70,6 +70,7 @@ pub(crate) fn plan_dialyzer_attribution(p: &RefactorPlanParams) -> Result<String
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::<FileEdit>::new(),
         validations: Vec::<ValidationStep>::new(),
         items: Vec::new(),

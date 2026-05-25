@@ -63,6 +63,7 @@ pub(crate) fn plan_add_java_implements(p: &RefactorPlanParams) -> Result<String>
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -353,6 +354,7 @@ pub(crate) fn plan_extract_java_interface(p: &RefactorPlanParams) -> Result<Stri
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations,
         items: Vec::new(),
@@ -437,6 +439,7 @@ pub(crate) fn plan_migrate_java_type_usages(p: &RefactorPlanParams) -> Result<St
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),
@@ -588,6 +591,7 @@ pub(crate) fn plan_java_lsp_organize_imports(
         semantic_status,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: Vec::new(),

@@ -86,6 +86,7 @@ pub(crate) fn empty_plan(kind: &str, title: String, status: SemanticStatus) -> R
         semantic_status: status,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::new(),
         validations: Vec::new(),
         items: Vec::new(),

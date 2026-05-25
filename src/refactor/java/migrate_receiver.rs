@@ -231,6 +231,7 @@ pub(crate) fn plan_migrate_java_method_receiver(p: &RefactorPlanParams) -> Resul
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: Vec::new(),

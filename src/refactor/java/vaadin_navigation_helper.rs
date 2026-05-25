@@ -175,6 +175,7 @@ pub(crate) fn plan_java_vaadin_navigation_helper_extract(p: &RefactorPlanParams)
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations,
         items: Vec::new(),

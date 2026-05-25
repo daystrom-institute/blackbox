@@ -101,6 +101,7 @@ pub(crate) fn plan_java_vaadin_provider_binding_generation(
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: if edits.is_empty() {
             Vec::new()
         } else {

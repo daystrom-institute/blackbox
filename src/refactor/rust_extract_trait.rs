@@ -263,6 +263,7 @@ pub fn plan_extract_trait(p: &crate::refactor::RefactorPlanParams) -> Result<Str
             semantic_status: SemanticStatus::IndexedHints,
             dry_run: true,
             file_moves: Vec::new(),
+            file_creates: Vec::new(),
             edits: vec![
                 FileEdit {
                     path: path_string(&source_path),

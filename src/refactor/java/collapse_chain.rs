@@ -186,6 +186,7 @@ pub(crate) fn plan_java_collapse_call_chain(p: &RefactorPlanParams) -> Result<St
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: Vec::new(),

@@ -270,6 +270,7 @@ pub(crate) fn plan_facade_delegations(p: &RefactorPlanParams) -> Result<String> 
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: facade_path.to_string_lossy().into_owned(),
             original_sha256: sha256_hex(facade.source.as_bytes()),

@@ -190,6 +190,7 @@ pub(crate) fn plan_module_dependency_analysis(p: &RefactorPlanParams) -> Result<
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::<FileEdit>::new(),
         validations: Vec::<ValidationStep>::new(),
         items: Vec::new(),

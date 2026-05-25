@@ -223,6 +223,7 @@ pub(crate) fn plan_move_across_apps(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: false,
         file_moves: vec![file_move],
+        file_creates: Vec::new(),
         edits: Vec::<FileEdit>::new(),
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: target_path.to_string_lossy().into_owned(),

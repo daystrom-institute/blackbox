@@ -122,6 +122,7 @@ pub fn plan_add_delegate(p: &RefactorPlanParams) -> anyhow::Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations: vec![ValidationStep::TreeSitterNoErrors {
             path: path_string(&source_path),

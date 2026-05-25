@@ -262,6 +262,7 @@ pub fn plan_compile_fix(p: &RefactorPlanParams, diagnostics: &[RustcDiagnostic])
         semantic_status: SemanticStatus::LspVerified,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations,
         items: Vec::new(),

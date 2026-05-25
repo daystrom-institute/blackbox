@@ -251,6 +251,7 @@ pub fn plan_move_struct_fields(p: &RefactorPlanParams) -> anyhow::Result<String>
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations,
         items: Vec::new(),

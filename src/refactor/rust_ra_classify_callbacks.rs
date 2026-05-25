@@ -152,6 +152,7 @@ fn empty_plan(title: &str, kind: &str) -> RefactorPlan {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::new(),
         validations: Vec::new(),
         items: Vec::new(),

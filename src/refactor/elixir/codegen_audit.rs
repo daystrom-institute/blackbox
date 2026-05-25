@@ -90,6 +90,7 @@ pub(crate) fn plan_codegen_audit(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::<FileEdit>::new(),
         validations: Vec::<ValidationStep>::new(),
         items: Vec::new(),

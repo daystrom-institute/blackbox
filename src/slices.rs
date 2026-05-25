@@ -578,6 +578,7 @@ fn plan_from_edits(
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations,
         items: Vec::new(),

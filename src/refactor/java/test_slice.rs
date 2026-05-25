@@ -277,6 +277,7 @@ pub(crate) fn plan_extract_java_test_slice(p: &RefactorPlanParams) -> Result<Str
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: Vec::new(),

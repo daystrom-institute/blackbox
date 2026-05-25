@@ -175,6 +175,7 @@ pub fn plan_rewrite_error_type(p: &crate::refactor::RefactorPlanParams) -> Resul
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(parsed.source.as_bytes()),

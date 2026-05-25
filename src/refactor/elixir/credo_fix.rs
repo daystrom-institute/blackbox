@@ -97,6 +97,7 @@ pub(crate) fn plan_credo_fix_round(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations: Vec::<ValidationStep>::new(),
         items: Vec::new(),

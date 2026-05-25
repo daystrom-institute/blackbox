@@ -237,6 +237,7 @@ pub fn plan_match_to_strategy(p: &crate::refactor::RefactorPlanParams) -> anyhow
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations: Vec::new(),
         items: Vec::new(),

@@ -347,6 +347,7 @@ pub(crate) fn plan_extract_module(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: false,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![source_file_edit, target_file_edit],
         validations: vec![
             ValidationStep::TreeSitterNoErrors {

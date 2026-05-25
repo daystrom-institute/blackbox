@@ -242,6 +242,7 @@ pub fn plan_update_callers(p: &RefactorPlanParams) -> anyhow::Result<String> {
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: Vec::new(),

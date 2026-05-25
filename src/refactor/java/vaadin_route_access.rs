@@ -143,6 +143,7 @@ pub(crate) fn plan_java_vaadin_register_route_access(p: &RefactorPlanParams) -> 
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: registry.path.clone(),
             original_sha256: sha256_hex(registry.text.as_bytes()),

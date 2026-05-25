@@ -193,6 +193,7 @@ pub(crate) fn plan_move_rust_items_with_callers(p: &RefactorPlanParams) -> Resul
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: file_edits,
         validations,
         items: selected.into_iter().cloned().collect(),

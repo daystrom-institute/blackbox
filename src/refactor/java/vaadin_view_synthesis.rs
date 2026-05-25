@@ -153,6 +153,7 @@ pub(crate) fn plan_java_vaadin_synthesize_view(p: &RefactorPlanParams) -> Result
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits,
         validations: parse_validation_step_for_path(&target_path),
         items: Vec::new(),

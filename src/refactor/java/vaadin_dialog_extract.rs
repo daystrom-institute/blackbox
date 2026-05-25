@@ -234,6 +234,7 @@ pub(crate) fn plan_java_vaadin_extract_dialog_class(p: &RefactorPlanParams) -> R
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![
             FileEdit {
                 path: path_string(&source_path),

@@ -831,6 +831,12 @@ pub struct FileMove {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
+pub struct FileCreate {
+    pub path: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SemanticStatus {
     SyntaxOnly,
@@ -895,6 +901,8 @@ pub struct RefactorPlan {
     pub dry_run: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub file_moves: Vec<FileMove>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_creates: Vec<FileCreate>,
     pub edits: Vec<FileEdit>,
     pub validations: Vec<ValidationStep>,
     pub items: Vec<SyntaxItem>,
@@ -1412,12 +1420,13 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "csharp_nullable_annotation_repair" => csharp::plan_nullable_annotation_repair(p),
         "unseal_csharp_class" => csharp::plan_unseal(p),
         "move_csharp_members_to_partial" => csharp::plan_move_members_to_partial(p),
+        "create_file" => plan_create_file(p),
         "move_file" => plan_move_file(p),
         "replace_text" => plan_replace_text(p),
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_provider_binding_generation, java_vaadin_extract_component, java_vaadin_extract_grid_component, java_vaadin_extract_dialog_class, java_vaadin_synthesize_view, java_vaadin_register_route_access, java_vaadin_navigation_helper_extract, java_vaadin_route_inventory, java_vaadin_static_ui_context_audit, java_vaadin_view_structure_analysis, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_provider_binding_generation, java_vaadin_extract_component, java_vaadin_extract_grid_component, java_vaadin_extract_dialog_class, java_vaadin_synthesize_view, java_vaadin_register_route_access, java_vaadin_navigation_helper_extract, java_vaadin_route_inventory, java_vaadin_static_ui_context_audit, java_vaadin_view_structure_analysis, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, create_file, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -1480,6 +1489,7 @@ fn plan_rewrite_rust_bin_crate_paths(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(source.as_bytes()),
@@ -1553,6 +1563,7 @@ fn plan_rust_impl_partition_analysis(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::new(),
         validations: Vec::new(),
         items: Vec::new(),
@@ -1601,6 +1612,7 @@ fn plan_rust_public_api_guard(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::IndexedHints,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: Vec::new(),
         validations: Vec::new(),
         items: Vec::new(),
@@ -1764,6 +1776,22 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
         moved_files.push((source_path, target_path, original));
     }
 
+    // Collect file_creates: refuse if target exists, accumulate for write phase.
+    let mut creates: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+    for file_create in &plan.file_creates {
+        let path = PathBuf::from(&file_create.path);
+        if p.allow_unregistered_paths != Some(true) {
+            ensure_path_in_registered_project(&path, projects)?;
+        }
+        if path.exists() {
+            bail!(
+                "refusing to create {}: already exists",
+                path.display()
+            );
+        }
+        creates.push((path, file_create.content.as_bytes().to_vec()));
+    }
+
     let mut rewritten = Vec::new();
     for edit in &plan.edits {
         let path = PathBuf::from(&edit.path);
@@ -1797,6 +1825,7 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
             .iter()
             .map(|(_, target_path, bytes)| (target_path.clone(), bytes.clone())),
     );
+    validation_inputs.extend(creates.iter().map(|(p, b)| (p.clone(), b.clone())));
     let validations = validate_rewritten_files(&validation_inputs)?;
     if validations
         .iter()
@@ -1859,6 +1888,39 @@ pub fn apply(p: &RefactorApplyParams, projects: &[ProjectRecord]) -> Result<Stri
                 rollback_errors,
             })?);
         }
+    }
+
+    for (path, bytes) in &creates {
+        if let Some(parent) = path.parent() {
+            if let Err(err) = fs::create_dir_all(parent) {
+                let rollback_errors = restore_snapshots(&originals);
+                return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
+                    status: "write_failed".to_string(),
+                    files_written,
+                    validations,
+                    rolled_back: rollback_errors.is_empty(),
+                    error: Some(format!(
+                        "failed to create parent directory {}: {err:#}",
+                        parent.display()
+                    )),
+                    rollback_errors,
+                })?);
+            }
+        }
+        if let Err(err) = write_atomic(path, bytes) {
+            let rollback_errors = restore_snapshots(&originals);
+            return Ok(serde_json::to_string_pretty(&RefactorApplyResponse {
+                status: "write_failed".to_string(),
+                files_written,
+                validations,
+                rolled_back: rollback_errors.is_empty(),
+                error: Some(format!("failed to create {}: {err:#}", path.display())),
+                rollback_errors,
+            })?);
+        }
+        // Register for rollback: None means "delete this file on rollback".
+        originals.push((path.clone(), None));
+        files_written.push(path_string(path));
     }
 
     for (path, bytes) in &rewritten {
@@ -3596,6 +3658,7 @@ fn plan_move_file(p: &RefactorPlanParams) -> Result<String> {
             target_path: path_string(&target_path),
             original_sha256: sha256_hex(&original),
         }],
+        file_creates: Vec::new(),
         edits: Vec::new(),
         validations,
         items: Vec::new(),
@@ -3667,6 +3730,7 @@ fn plan_replace_text(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(source.as_bytes()),
@@ -3703,6 +3767,7 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(source.as_bytes()),
@@ -3726,6 +3791,39 @@ fn plan_write_file(p: &RefactorPlanParams) -> Result<String> {
         fixme_count: None,
     };
 
+    validate_plan_shape(&plan)?;
+    Ok(serde_json::to_string_pretty(&plan)?)
+}
+
+fn plan_create_file(p: &RefactorPlanParams) -> Result<String> {
+    let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;
+    let new_text = p
+        .new_text
+        .as_deref()
+        .ok_or_else(|| anyhow!("new_text is required for create_file"))?;
+    let plan = RefactorPlan {
+        title: format!("create file {}", path_string(&source_path)),
+        kind: "create_file".to_string(),
+        semantic_status: SemanticStatus::SyntaxOnly,
+        dry_run: true,
+        file_moves: Vec::new(),
+        file_creates: vec![FileCreate {
+            path: path_string(&source_path),
+            content: new_text.to_string(),
+        }],
+        edits: Vec::new(),
+        validations: parse_validation_step_for_path(&source_path),
+        items: Vec::new(),
+        leftovers: Vec::new(),
+        captured_variables: Vec::new(),
+        remaining_source_accessors: Vec::new(),
+        remaining_source_constant_refs: Vec::new(),
+        external_calls: Vec::new(),
+        inherited_dependencies: Vec::new(),
+        deep_analysis: None,
+        plan_status: PlanStatus::Planned,
+        fixme_count: None,
+    };
     validate_plan_shape(&plan)?;
     Ok(serde_json::to_string_pretty(&plan)?)
 }
@@ -3757,6 +3855,7 @@ fn plan_ensure_toml_table(p: &RefactorPlanParams) -> Result<String> {
         semantic_status: SemanticStatus::SyntaxOnly,
         dry_run: true,
         file_moves: Vec::new(),
+        file_creates: Vec::new(),
         edits: vec![FileEdit {
             path: path_string(&source_path),
             original_sha256: sha256_hex(source.as_bytes()),
@@ -4186,8 +4285,8 @@ fn select_items<'a>(
 }
 
 pub(crate) fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
-    if plan.edits.is_empty() && plan.file_moves.is_empty() {
-        bail!("plan has no edits or file moves");
+    if plan.edits.is_empty() && plan.file_moves.is_empty() && plan.file_creates.is_empty() {
+        bail!("plan has no edits, file moves, or file creates");
     }
     let mut paths = HashSet::new();
     for file_move in &plan.file_moves {
@@ -4207,6 +4306,14 @@ pub(crate) fn validate_plan_shape(plan: &RefactorPlan) -> Result<()> {
         }
         ensure_non_overlapping(&edit.edits)
             .with_context(|| format!("overlapping edits in {}", edit.path))?;
+    }
+    for file_create in &plan.file_creates {
+        if file_create.path.is_empty() {
+            bail!("file_create path must be non-empty");
+        }
+        if !paths.insert(file_create.path.clone()) {
+            bail!("duplicate refactor path {}", file_create.path);
+        }
     }
     Ok(())
 }

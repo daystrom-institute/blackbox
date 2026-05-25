@@ -4116,6 +4116,7 @@ mod tests {
             semantic_status: SemanticStatus::SyntaxOnly,
             dry_run: true,
             file_moves: Vec::new(),
+            file_creates: Vec::new(),
             edits: vec![FileEdit {
                 path: path_string(&source),
                 original_sha256: sha256_hex(b"fn f() {}\n"),
@@ -4161,6 +4162,7 @@ mod tests {
             semantic_status: SemanticStatus::SyntaxOnly,
             dry_run: true,
             file_moves: Vec::new(),
+            file_creates: Vec::new(),
             edits: vec![FileEdit {
                 path: path_string(&source),
                 original_sha256: sha256_hex(b"fn f() {}\n"),
@@ -6284,5 +6286,151 @@ impl Cache {
                 .iter()
                 .any(|warning| warning.as_str().unwrap_or_default().contains("macro_user"))
         );
+    }
+
+    #[test]
+    fn plan_create_file_dry_run_produces_plan_with_one_file_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_file = dir.path().join("new_module.rs");
+        let content = "pub fn hello() -> &'static str { \"world\" }\n";
+
+        let result = plan(
+            &RefactorPlanParams {
+                kind: "create_file".to_string(),
+                source: new_file.to_string_lossy().to_string(),
+                new_text: Some(content.to_string()),
+                project_dir: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let parsed: RefactorPlan = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed.kind, "create_file");
+        assert!(parsed.dry_run);
+        assert_eq!(parsed.file_creates.len(), 1);
+        assert_eq!(parsed.file_creates[0].path, new_file.to_string_lossy());
+        assert_eq!(parsed.file_creates[0].content, content);
+        assert!(parsed.edits.is_empty());
+        assert!(!new_file.exists(), "dry_run must not write the file");
+    }
+
+    #[test]
+    fn apply_create_file_writes_content_on_confirm() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_file = dir.path().join("created.rs");
+        let content = "pub fn answer() -> i32 { 42 }\n";
+
+        let plan_json = plan(
+            &RefactorPlanParams {
+                kind: "create_file".to_string(),
+                source: new_file.to_string_lossy().to_string(),
+                new_text: Some(content.to_string()),
+                project_dir: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let response = apply(
+            &RefactorApplyParams {
+                plan: serde_json::from_str(&plan_json).unwrap(),
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(applied.status, "ok");
+        assert_eq!(fs::read_to_string(&new_file).unwrap(), content);
+    }
+
+    #[test]
+    fn apply_create_file_refuses_if_target_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing.rs");
+        fs::write(&existing, "// already here\n").unwrap();
+        let content = "pub fn new() {}\n";
+
+        let plan_value = serde_json::json!({
+            "title": "create file",
+            "kind": "create_file",
+            "semantic_status": "syntax_only",
+            "dry_run": false,
+            "file_moves": [],
+            "file_creates": [{"path": existing.to_string_lossy(), "content": content}],
+            "edits": [],
+            "validations": [],
+            "items": [],
+            "leftovers": [],
+        });
+
+        let err = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
+            },
+            &[],
+        )
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("refusing to create") && err.to_string().contains("already exists"),
+            "unexpected error: {}",
+            err
+        );
+        // Original file must be untouched
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "// already here\n");
+    }
+
+    #[test]
+    fn apply_create_file_rolls_back_on_parse_validation_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let new_file = dir.path().join("bad.rs");
+        // Invalid Rust — will fail parse validation
+        let bad_content = "this is not valid rust }{{\n";
+
+        let plan_value = serde_json::json!({
+            "title": "create bad file",
+            "kind": "create_file",
+            "semantic_status": "syntax_only",
+            "dry_run": false,
+            "file_moves": [],
+            "file_creates": [{"path": new_file.to_string_lossy(), "content": bad_content}],
+            "edits": [],
+            "validations": [{"type": "tree_sitter_no_errors", "path": new_file.to_string_lossy()}],
+            "items": [],
+            "leftovers": [],
+        });
+
+        let response = apply(
+            &RefactorApplyParams {
+                plan: plan_value,
+                plan_path: None,
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: Some(true),
+                cwd: None,
+                force_path: None,
+            },
+            &[],
+        )
+        .unwrap();
+
+        let applied: RefactorApplyResponse = serde_json::from_str(&response).unwrap();
+        // Parse validation fires before disk writes, so the file must not exist
+        assert_eq!(applied.status, "validation_failed");
+        assert!(!new_file.exists(), "file must not be created when parse validation fails");
     }
 }
