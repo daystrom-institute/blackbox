@@ -12,8 +12,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use lsp_types::{
+    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, Location, MarkedString,
     ReferenceContext, ReferenceParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, request::References,
+    TextDocumentPositionParams, request::{GotoImplementation, HoverRequest, References},
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -221,9 +222,264 @@ pub(crate) fn resolve_project_dir_for_usages(
         })
 }
 
+/// A single resolved implementation site returned by
+/// `java_find_implementations`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationSite {
+    pub path: String,
+    pub line: u32,
+    pub character: u32,
+    /// Handoff hint pointing the agent to `bbox_refactor_status` /
+    /// `bbox_refactor_project_refs` on this specific file.
+    pub handoff: CodeRefactorHandoff,
+}
+
+/// Top-level report returned by `java_find_implementations`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImplementationsReport {
+    pub kind: String,
+    pub semantic_status: String,
+    pub source: String,
+    /// `true` when JDTLS resolved the symbol at the requested position.
+    pub symbol_resolved: bool,
+    pub site_count: usize,
+    pub sites: Vec<ImplementationSite>,
+}
+
+/// Top-level report returned by `java_type_at`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TypeAtReport {
+    pub kind: String,
+    pub semantic_status: String,
+    pub source: String,
+    /// `true` when JDTLS returned hover content for the position.
+    pub resolved: bool,
+    /// Flattened hover contents as a single string. Empty when
+    /// `resolved` is `false`.
+    pub contents: String,
+    /// Handoff for the source file at the queried position.
+    pub handoff: CodeRefactorHandoff,
+}
+
+/// Resolve implementations of the Java symbol at `(line, column)` in
+/// `source_path` via JDTLS `textDocument/implementation`.
+///
+/// Fail-closed (RX-V3): returns `Err` with an `error.lsp_unavailable`
+/// message when the session manager is unavailable or JDTLS fails to
+/// initialise.
+///
+/// `line` and `column` are **0-based** LSP coordinates.
+pub(crate) fn java_find_implementations(
+    manager: &LspSessionManager,
+    project_dir: &Path,
+    source_path: &Path,
+    line: u32,
+    column: u32,
+) -> Result<ImplementationsReport> {
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
+
+    let position = lsp_types::Position { line, character: column };
+
+    let params = GotoDefinitionParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: source_uri.clone(),
+            },
+            position,
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+
+    let response = manager
+        .with_session(project_dir, Language::Java, |mut client| {
+            client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+                &lsp_types::DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: source_uri.clone(),
+                        language_id: "java".to_string(),
+                        version: 0,
+                        text: source.clone(),
+                    },
+                },
+            )?;
+            client.wait_for_diagnostics(source_uri.as_str(), std::time::Duration::from_secs(60));
+            let id = client.send_request::<GotoImplementation>(&params)?;
+            client.read_response::<GotoImplementation>(id)
+        })
+        .map_err(|e| anyhow!("error.lsp_unavailable: {e}"))?;
+
+    let project_dir_str = project_dir.to_string_lossy().to_string();
+    let source_str = source_path.to_string_lossy().to_string();
+
+    // Normalize GotoDefinitionResponse (Scalar/Array/Link) → Vec<Location>.
+    let locations: Vec<Location> = match response {
+        Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+        Some(GotoDefinitionResponse::Array(locs)) => locs,
+        Some(GotoDefinitionResponse::Link(links)) => links
+            .into_iter()
+            .map(|link| Location {
+                uri: link.target_uri,
+                range: link.target_range,
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
+    let sites: Vec<ImplementationSite> = locations
+        .into_iter()
+        .map(|loc| {
+            let path = loc
+                .uri
+                .to_file_path()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| loc.uri.to_string());
+            let site_line = loc.range.start.line;
+            let site_char = loc.range.start.character;
+            let handoff = usage_site_handoff(&path, &project_dir_str);
+            ImplementationSite {
+                path,
+                line: site_line,
+                character: site_char,
+                handoff,
+            }
+        })
+        .collect();
+
+    let symbol_resolved = !sites.is_empty();
+
+    Ok(ImplementationsReport {
+        kind: "java_find_implementations".to_string(),
+        semantic_status: SEMANTIC_STATUS_LSP_VERIFIED.to_string(),
+        source: source_str,
+        symbol_resolved,
+        site_count: sites.len(),
+        sites,
+    })
+}
+
+/// Resolve the type/signature/documentation at a Java position via JDTLS
+/// `textDocument/hover`.
+///
+/// Fail-closed (RX-V3): returns `Err` with an `error.lsp_unavailable`
+/// message when the session manager is unavailable or JDTLS fails to
+/// initialise.
+///
+/// `line` and `column` are **0-based** LSP coordinates.
+pub(crate) fn java_type_at(
+    manager: &LspSessionManager,
+    project_dir: &Path,
+    source_path: &Path,
+    line: u32,
+    column: u32,
+) -> Result<TypeAtReport> {
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
+
+    let position = lsp_types::Position { line, character: column };
+
+    let params = lsp_types::HoverParams {
+        text_document_position_params: TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier {
+                uri: source_uri.clone(),
+            },
+            position,
+        },
+        work_done_progress_params: Default::default(),
+    };
+
+    let response = manager
+        .with_session(project_dir, Language::Java, |mut client| {
+            client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+                &lsp_types::DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: source_uri.clone(),
+                        language_id: "java".to_string(),
+                        version: 0,
+                        text: source.clone(),
+                    },
+                },
+            )?;
+            client.wait_for_diagnostics(source_uri.as_str(), std::time::Duration::from_secs(60));
+            let id = client.send_request::<HoverRequest>(&params)?;
+            client.read_response::<HoverRequest>(id)
+        })
+        .map_err(|e| anyhow!("error.lsp_unavailable: {e}"))?;
+
+    let project_dir_str = project_dir.to_string_lossy().to_string();
+    let source_str = source_path.to_string_lossy().to_string();
+
+    let (resolved, contents) = match response {
+        Some(hover) => {
+            let flat = flatten_hover_contents(&hover.contents);
+            (true, flat)
+        }
+        None => (false, String::new()),
+    };
+
+    let handoff = usage_site_handoff(&source_str, &project_dir_str);
+
+    Ok(TypeAtReport {
+        kind: "java_type_at".to_string(),
+        semantic_status: SEMANTIC_STATUS_LSP_VERIFIED.to_string(),
+        source: source_str,
+        resolved,
+        contents,
+        handoff,
+    })
+}
+
+/// Flatten `HoverContents` (Scalar/Array/Markup) into a single string.
+/// Each element is separated by newlines.
+fn flatten_hover_contents(contents: &HoverContents) -> String {
+    match contents {
+        HoverContents::Scalar(ms) => marked_string_to_string(ms),
+        HoverContents::Array(arr) => arr
+            .iter()
+            .map(marked_string_to_string)
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        HoverContents::Markup(mc) => mc.value.clone(),
+    }
+}
+
+fn marked_string_to_string(ms: &MarkedString) -> String {
+    match ms {
+        MarkedString::String(s) => s.clone(),
+        MarkedString::LanguageString(ls) => {
+            if ls.language.is_empty() {
+                ls.value.clone()
+            } else {
+                format!("```{}\n{}\n```", ls.language, ls.value)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes the live JDTLS tests. Cargo runs `#[test]` fns on parallel
+    /// threads by default; each live test spawns its own `LspSessionManager`
+    /// + jdtls process against the *same* fixture workspace, and 3 concurrent
+    /// jdtls JVMs race on the workspace and the init timeout. Every live test
+    /// acquires this lock first so only one jdtls runs at a time, making the
+    /// `--ignored` suite reliable without requiring `--test-threads=1`.
+    static LIVE_LSP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Acquire the live-LSP serialization lock, tolerating a poisoned mutex
+    /// (a prior live test panicking must not cascade-fail the rest).
+    fn live_lsp_guard() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_LSP_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     /// Fail-closed: when no LSP manager is configured (simulated by
     /// constructing a manager that has been shut down immediately), the
@@ -295,6 +551,7 @@ mod tests {
     #[test]
     #[ignore = "requires a live JDTLS (/usr/bin/jdtls); ~60s cold start"]
     fn live_jdtls_references() {
+        let _serial = live_lsp_guard();
         let fixtures_dir =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
         assert!(
@@ -339,6 +596,201 @@ mod tests {
             }
             Err(e) => {
                 panic!("live JDTLS references failed: {e:#}");
+            }
+        }
+        manager.shutdown_all();
+    }
+
+    // --- implementations tests ---
+
+    /// Fail-closed (RX-V3) for java_find_implementations.
+    #[test]
+    fn implementations_fail_closed_when_lsp_unavailable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("Foo.java");
+        std::fs::write(&source_path, "public class Foo {}\n").unwrap();
+
+        let manager = LspSessionManager::new();
+        manager.shutdown_all();
+
+        let err = java_find_implementations(&manager, dir.path(), &source_path, 0, 7)
+            .expect_err("expected error.lsp_unavailable");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("error.lsp_unavailable"),
+            "expected 'error.lsp_unavailable' in error message, got: {msg}"
+        );
+    }
+
+    /// Verify ImplementationsReport serialises correctly.
+    #[test]
+    fn implementations_report_serializes() {
+        let report = ImplementationsReport {
+            kind: "java_find_implementations".to_string(),
+            semantic_status: SEMANTIC_STATUS_LSP_VERIFIED.to_string(),
+            source: "/repo/Greeter.java".to_string(),
+            symbol_resolved: true,
+            site_count: 1,
+            sites: vec![ImplementationSite {
+                path: "/repo/FriendlyGreeter.java".to_string(),
+                line: 3,
+                character: 8,
+                handoff: usage_site_handoff("/repo/FriendlyGreeter.java", "/repo"),
+            }],
+        };
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("\"lsp_verified\""));
+        assert!(json.contains("\"java_find_implementations\""));
+        assert!(json.contains("\"symbol_resolved\": true"));
+        assert!(json.contains("\"site_count\": 1"));
+        assert!(json.contains("bbox_refactor_status"));
+    }
+
+    /// Live integration test: implementations of the `Greeter` interface.
+    ///
+    /// Fixture: `tests/fixtures/java/Hello.java`
+    ///   - `interface Greeter` at 1-based line=15, col=11 → 0-based line=14, col=10
+    ///   - `FriendlyGreeter implements Greeter` at line=20
+    ///   - Expected: >=1 implementation site
+    ///
+    /// Run with:
+    ///   BLACKBOX_JDTLS_BIN=/usr/bin/jdtls cargo test --lib code_nav::semantic::tests::live_jdtls_implementations -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a live JDTLS (/usr/bin/jdtls); ~60s cold start"]
+    fn live_jdtls_implementations() {
+        let _serial = live_lsp_guard();
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+        let source_path = fixtures_dir.join("Hello.java");
+
+        // Anchor: `Greeter` interface type name.
+        // 1-based: line=15, col=11 (the 'G' in 'Greeter')
+        // → 0-based LSP: line=14, col=10
+        let lsp_line: u32 = 15u32.saturating_sub(1); // = 14
+        let lsp_col: u32 = 11u32.saturating_sub(1); // = 10
+
+        let manager = LspSessionManager::new();
+        let result =
+            java_find_implementations(&manager, &fixtures_dir, &source_path, lsp_line, lsp_col);
+        match result {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report)
+                    .expect("serialise ImplementationsReport");
+                println!("--- live_jdtls_implementations output ---\n{json}\n---");
+                assert_eq!(
+                    report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,
+                    "semantic_status must be lsp_verified"
+                );
+                assert!(
+                    report.symbol_resolved,
+                    "symbol_resolved must be true for `Greeter` interface; got report: {json}"
+                );
+                assert!(
+                    report.site_count >= 1,
+                    "expected >=1 implementation site for `Greeter`; got {}: {json}",
+                    report.site_count
+                );
+            }
+            Err(e) => {
+                panic!("live JDTLS implementations failed: {e:#}");
+            }
+        }
+        manager.shutdown_all();
+    }
+
+    // --- type_at tests ---
+
+    /// Fail-closed (RX-V3) for java_type_at.
+    #[test]
+    fn type_at_fail_closed_when_lsp_unavailable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("Foo.java");
+        std::fs::write(&source_path, "public class Foo {}\n").unwrap();
+
+        let manager = LspSessionManager::new();
+        manager.shutdown_all();
+
+        let err = java_type_at(&manager, dir.path(), &source_path, 0, 7)
+            .expect_err("expected error.lsp_unavailable");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("error.lsp_unavailable"),
+            "expected 'error.lsp_unavailable' in error message, got: {msg}"
+        );
+    }
+
+    /// Verify TypeAtReport serialises correctly.
+    #[test]
+    fn type_at_report_serializes() {
+        let report = TypeAtReport {
+            kind: "java_type_at".to_string(),
+            semantic_status: SEMANTIC_STATUS_LSP_VERIFIED.to_string(),
+            source: "/repo/Foo.java".to_string(),
+            resolved: true,
+            contents: "String Foo.greet()".to_string(),
+            handoff: usage_site_handoff("/repo/Foo.java", "/repo"),
+        };
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("\"lsp_verified\""));
+        assert!(json.contains("\"java_type_at\""));
+        assert!(json.contains("\"resolved\": true"));
+        assert!(json.contains("\"contents\":"));
+        assert!(json.contains("bbox_refactor_status"));
+    }
+
+    /// Live integration test: hover type at `greet()` declaration.
+    ///
+    /// Fixture: `tests/fixtures/java/Hello.java`
+    ///   - `greet` method name at 1-based line=3, col=19 → 0-based line=2, col=18
+    ///   - Expected: resolved=true, contents mentions "String"
+    ///
+    /// Run with:
+    ///   BLACKBOX_JDTLS_BIN=/usr/bin/jdtls cargo test --lib code_nav::semantic::tests::live_jdtls_hover -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a live JDTLS (/usr/bin/jdtls); ~60s cold start"]
+    fn live_jdtls_hover() {
+        let _serial = live_lsp_guard();
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+        let source_path = fixtures_dir.join("Hello.java");
+
+        // Anchor: `greet` method name.
+        // 1-based: line=3, col=19
+        // → 0-based LSP: line=2, col=18
+        let lsp_line: u32 = 3u32.saturating_sub(1); // = 2
+        let lsp_col: u32 = 19u32.saturating_sub(1); // = 18
+
+        let manager = LspSessionManager::new();
+        let result = java_type_at(&manager, &fixtures_dir, &source_path, lsp_line, lsp_col);
+        match result {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report)
+                    .expect("serialise TypeAtReport");
+                println!("--- live_jdtls_hover output ---\n{json}\n---");
+                assert_eq!(
+                    report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,
+                    "semantic_status must be lsp_verified"
+                );
+                assert!(
+                    report.resolved,
+                    "resolved must be true for `greet`; got report: {json}"
+                );
+                assert!(
+                    report.contents.contains("String"),
+                    "expected hover contents to mention 'String'; got: {}",
+                    report.contents
+                );
+            }
+            Err(e) => {
+                panic!("live JDTLS hover failed: {e:#}");
             }
         }
         manager.shutdown_all();

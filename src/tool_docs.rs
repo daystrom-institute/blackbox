@@ -401,6 +401,20 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bbox_code_usages(file="src/main/java/com/example/Foo.java", line=12, column=19, project_dir="/repo")"#),
     },
     ToolDoc {
+        name: "bbox_code_implementations",
+        category: ToolCategory::Refactor,
+        summary: "Resolve implementations of the Java symbol at a file position via JDTLS (LSP textDocument/implementation). Returns semantically-verified implementor sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only.",
+        when_to_use: "Use when you need to find all implementors of a Java interface, abstract method, or type. Anchor on the interface/method/type name. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative), 1-based `line` and `column` (same convention as bbox_code_node_describe; converted to 0-based LSP coordinates internally), and optionally `project_dir`. Each returned site carries `path`, `line`, `character`, and a `handoff` pointing to bbox_refactor_status / bbox_refactor_project_refs on the implementation file. `symbol_resolved=false` means JDTLS found no implementations at that position. Normalises Scalar/Array/Link response variants to a flat location list. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
+        example: Some(r#"bbox_code_implementations(file="src/main/java/com/example/Greeter.java", line=1, column=10, project_dir="/repo")"#),
+    },
+    ToolDoc {
+        name: "bbox_code_type_at",
+        category: ToolCategory::Refactor,
+        summary: "Resolve the type/signature/documentation at a Java position via JDTLS (LSP textDocument/hover). Returns resolved type info with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only.",
+        when_to_use: "Use when you need the resolved type, signature, or Javadoc at a Java expression position — \"what type is this?\" or \"what does this method return?\". Anchor on any identifier or expression. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative), 1-based `line` and `column` (same convention as bbox_code_node_describe; converted to 0-based LSP coordinates internally), and optionally `project_dir`. Returns `resolved: true` and `contents` (a flattened string from Hover.contents — Scalar/Array/Markup forms are normalised into a single string) when JDTLS has type info; `resolved: false` and empty `contents` when not. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
+        example: Some(r#"bbox_code_type_at(file="src/main/java/com/example/Foo.java", line=12, column=19, project_dir="/repo")"#),
+    },
+    ToolDoc {
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",

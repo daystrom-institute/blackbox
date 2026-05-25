@@ -3,7 +3,8 @@ use crate::code_nav::{
     code_node_describe, code_query, code_refs, code_symbols,
 };
 use crate::code_nav::semantic::{
-    java_find_usages, resolve_path_for_usages, resolve_project_dir_for_usages,
+    java_find_implementations, java_find_usages, java_type_at, resolve_path_for_usages,
+    resolve_project_dir_for_usages,
 };
 use crate::server::BlackboxServer;
 
@@ -21,6 +22,48 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 /// Parameters for `bbox_code_usages`.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CodeUsagesParams {
+    /// Source file containing the symbol. Absolute, or relative to
+    /// `project_dir` when that is supplied.
+    pub file: String,
+    /// 1-based line number of the symbol position (same convention as
+    /// `bbox_code_node_describe`). Converted to 0-based internally before
+    /// the LSP request is issued.
+    pub line: u32,
+    /// 1-based UTF-16 character offset of the symbol position (same
+    /// convention as `bbox_code_node_describe`). Converted to 0-based
+    /// internally before the LSP request is issued.
+    pub column: u32,
+    /// Project root used to spawn the JDTLS session and resolve
+    /// relative `file` paths. When omitted, the git root above
+    /// `file` is used (or the file's parent directory as a fallback).
+    #[serde(default)]
+    pub project_dir: Option<String>,
+}
+
+/// Parameters for `bbox_code_implementations`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodeImplementationsParams {
+    /// Source file containing the symbol. Absolute, or relative to
+    /// `project_dir` when that is supplied.
+    pub file: String,
+    /// 1-based line number of the symbol position (same convention as
+    /// `bbox_code_node_describe`). Converted to 0-based internally before
+    /// the LSP request is issued.
+    pub line: u32,
+    /// 1-based UTF-16 character offset of the symbol position (same
+    /// convention as `bbox_code_node_describe`). Converted to 0-based
+    /// internally before the LSP request is issued.
+    pub column: u32,
+    /// Project root used to spawn the JDTLS session and resolve
+    /// relative `file` paths. When omitted, the git root above
+    /// `file` is used (or the file's parent directory as a fallback).
+    #[serde(default)]
+    pub project_dir: Option<String>,
+}
+
+/// Parameters for `bbox_code_type_at`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodeTypeAtParams {
     /// Source file containing the symbol. Absolute, or relative to
     /// `project_dir` when that is supplied.
     pub file: String,
@@ -126,6 +169,83 @@ impl BlackboxServer {
             let lsp_line = p.line.saturating_sub(1);
             let lsp_col = p.column.saturating_sub(1);
             let report = java_find_usages(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
+            Ok(serde_json::to_string_pretty(&report)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_code_implementations",
+        description = "Resolve implementations of the Java symbol at a file position via JDTLS (LSP textDocument/implementation). Returns semantically-verified implementor sites with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only."
+    )]
+    pub(crate) fn bbox_code_implementations(
+        &self,
+        Parameters(p): Parameters<CodeImplementationsParams>,
+    ) -> CallToolResult {
+        let lsp = self.state.lsp_sessions.clone();
+        Self::run("bbox_code_implementations", || {
+            let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
+            let ext = source_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if ext != "java" {
+                let resp = serde_json::json!({
+                    "status": "error",
+                    "code": "unsupported_language",
+                    "message": format!(
+                        "bbox_code_implementations currently supports Java (.java) only; got extension {:?}",
+                        ext
+                    ),
+                    "suggestion": "Use bbox_code_refs for syntax-only reference extraction across other languages.",
+                    "semantic_status": "syntax_only"
+                });
+                return Ok(serde_json::to_string_pretty(&resp)?);
+            }
+
+            let project_dir =
+                resolve_project_dir_for_usages(p.project_dir.as_deref(), &source_path);
+            let lsp_line = p.line.saturating_sub(1);
+            let lsp_col = p.column.saturating_sub(1);
+            let report =
+                java_find_implementations(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
+            Ok(serde_json::to_string_pretty(&report)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_code_type_at",
+        description = "Resolve the type/signature/documentation at a Java position via JDTLS (LSP textDocument/hover). Returns resolved type info with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only."
+    )]
+    pub(crate) fn bbox_code_type_at(
+        &self,
+        Parameters(p): Parameters<CodeTypeAtParams>,
+    ) -> CallToolResult {
+        let lsp = self.state.lsp_sessions.clone();
+        Self::run("bbox_code_type_at", || {
+            let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
+            let ext = source_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if ext != "java" {
+                let resp = serde_json::json!({
+                    "status": "error",
+                    "code": "unsupported_language",
+                    "message": format!(
+                        "bbox_code_type_at currently supports Java (.java) only; got extension {:?}",
+                        ext
+                    ),
+                    "suggestion": "Use bbox_code_node_describe for syntax-only type information across other languages.",
+                    "semantic_status": "syntax_only"
+                });
+                return Ok(serde_json::to_string_pretty(&resp)?);
+            }
+
+            let project_dir =
+                resolve_project_dir_for_usages(p.project_dir.as_deref(), &source_path);
+            let lsp_line = p.line.saturating_sub(1);
+            let lsp_col = p.column.saturating_sub(1);
+            let report = java_type_at(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
     }

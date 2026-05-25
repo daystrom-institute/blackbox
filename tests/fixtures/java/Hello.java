@@ -11,3 +11,14 @@ public class Hello {
         System.out.println(msg);
     }
 }
+
+interface Greeter {
+    String greet();
+}
+
+class FriendlyGreeter implements Greeter {
+    @Override
+    public String greet() {
+        return "Hi there!";
+    }
+}
