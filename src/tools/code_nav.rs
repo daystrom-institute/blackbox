@@ -6,8 +6,8 @@ use crate::code_nav::{
     code_node_describe, code_query, code_refs, code_symbols,
 };
 use crate::code_nav::semantic::{
-    java_find_implementations, java_find_usages, java_type_at, java_workspace_symbols,
-    resolve_path_for_usages, resolve_project_dir_for_usages,
+    java_document_outline, java_find_implementations, java_find_usages, java_type_at,
+    java_workspace_symbols, resolve_path_for_usages, resolve_project_dir_for_usages,
 };
 use crate::server::BlackboxServer;
 
@@ -92,6 +92,18 @@ pub struct WorkspaceSymbolsParams {
     pub query: String,
     /// Project root directory. Required — workspace/symbol is project-wide.
     /// When omitted, the current working directory is used as the project root.
+    #[serde(default)]
+    pub project_dir: Option<String>,
+}
+
+/// Parameters for `bbox_code_outline`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodeOutlineParams {
+    /// Source file to outline. Absolute, or relative to `project_dir`.
+    pub file: String,
+    /// Project root used to spawn the JDTLS session and resolve
+    /// relative `file` paths. When omitted, the git root above
+    /// `file` is used (or the file's parent directory as a fallback).
     #[serde(default)]
     pub project_dir: Option<String>,
 }
@@ -285,6 +297,42 @@ impl BlackboxServer {
                 .with_context(|| format!("failed to canonicalize {}", project_dir.display()))?;
 
             let report = java_workspace_symbols(&lsp, &canonical, &p.query)?;
+            Ok(serde_json::to_string_pretty(&report)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_code_outline",
+        description = "Return a file-scoped, hierarchical symbol outline for a Java source file via JDTLS (LSP textDocument/documentSymbol). Returns a recursive tree of OutlineSymbol nodes with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; no position anchor required — the whole file is outlined."
+    )]
+    pub(crate) fn bbox_code_outline(
+        &self,
+        Parameters(p): Parameters<CodeOutlineParams>,
+    ) -> CallToolResult {
+        let lsp = self.state.lsp_sessions.clone();
+        Self::run("bbox_code_outline", || {
+            let source_path = resolve_path_for_usages(p.project_dir.as_deref(), &p.file)?;
+            let ext = source_path
+                .extension()
+                .and_then(|s| s.to_str())
+                .unwrap_or("");
+            if ext != "java" {
+                let resp = serde_json::json!({
+                    "status": "error",
+                    "code": "unsupported_language",
+                    "message": format!(
+                        "bbox_code_outline currently supports Java (.java) only; got extension {:?}",
+                        ext
+                    ),
+                    "suggestion": "Use bbox_code_symbols or bbox_refactor_status for syntax-only symbol extraction across other languages.",
+                    "semantic_status": "syntax_only"
+                });
+                return Ok(serde_json::to_string_pretty(&resp)?);
+            }
+
+            let project_dir =
+                resolve_project_dir_for_usages(p.project_dir.as_deref(), &source_path);
+            let report = java_document_outline(&lsp, &project_dir, &source_path)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
     }

@@ -422,6 +422,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bbox_workspace_symbols(query="Greeter", project_dir="/repo")"#),
     },
     ToolDoc {
+        name: "bbox_code_outline",
+        category: ToolCategory::Refactor,
+        summary: "Return a file-scoped, hierarchical symbol outline for a Java source file via JDTLS (LSP textDocument/documentSymbol). Returns a recursive tree of OutlineSymbol nodes with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; no position anchor required — the whole file is outlined.",
+        when_to_use: "Use when you need a hierarchical, JDTLS-resolved symbol tree for a single Java file — the structure and nesting of classes, interfaces, methods, fields, and constructors. Unlike bbox_code_symbols (which is a project inventory tool with indexed/live modes) and bbox_workspace_symbols (which queries the whole workspace by name), this is file-scoped and always LSP-resolved. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `file` (absolute or project-relative) and optionally `project_dir`. Each returned OutlineSymbol carries `name`, `kind` (string), optional `detail` (typically the type signature), optional `line`/`character` (0-based, may be null when the LSP returns no range), and `children` (nested member symbols). `resolved=false` only when JDTLS could not resolve (returned a null response); `symbol_count` is the total node count including all nested children. Normalises Flat/Nested DocumentSymbolResponse variants — Flat produces a flat list (empty children), Nested preserves the recursive hierarchy. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
+        example: Some(r#"bbox_code_outline(file="src/main/java/com/example/Hello.java", project_dir="/repo")"#),
+    },
+    ToolDoc {
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",

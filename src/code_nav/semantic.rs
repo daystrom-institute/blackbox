@@ -12,10 +12,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use lsp_types::{
-    GotoDefinitionParams, GotoDefinitionResponse, HoverContents, Location, MarkedString,
-    ReferenceContext, ReferenceParams, SymbolInformation, SymbolKind, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, WorkspaceSymbol, WorkspaceSymbolParams,
-    request::{GotoImplementation, HoverRequest, References, WorkspaceSymbolRequest},
+    DocumentSymbol, DocumentSymbolParams, GotoDefinitionParams, GotoDefinitionResponse,
+    HoverContents, Location, MarkedString, ReferenceContext, ReferenceParams, SymbolInformation,
+    SymbolKind, TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams,
+    WorkspaceSymbol, WorkspaceSymbolParams,
+    request::{DocumentSymbolRequest, GotoImplementation, HoverRequest, References,
+               WorkspaceSymbolRequest},
 };
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
@@ -595,6 +597,169 @@ fn workspace_symbol_to_item(sym: WorkspaceSymbol, project_dir: &str) -> Option<W
     })
 }
 
+/// A single symbol node in a hierarchical document outline.
+/// Recursive: `children` carries nested members for container symbols.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlineSymbol {
+    /// Symbol name (e.g., class name, method name, field name).
+    pub name: String,
+    /// Symbol kind as a human-readable string (e.g., "class", "method", "field").
+    pub kind: String,
+    /// Optional detail string — typically the type signature (e.g., "void greet()").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// 0-based line number. `None` when the LSP returns no range (unlikely for
+    /// DocumentSymbol but we keep the honest-coord contract).
+    pub line: Option<u32>,
+    /// 0-based character offset. `None` when the LSP returns no range.
+    pub character: Option<u32>,
+    /// Child symbols nested inside this symbol (e.g., methods inside a class).
+    pub children: Vec<OutlineSymbol>,
+}
+
+/// Top-level report returned by `java_document_outline`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutlineReport {
+    pub kind: String,
+    /// Always `"lsp_verified"` when this report is produced.
+    pub semantic_status: String,
+    /// The source file that was outlined.
+    pub source: String,
+    /// `true` when JDTLS returned a document symbol response.
+    /// `false` means the LSP returned `None` (empty outline).
+    pub resolved: bool,
+    /// Total number of symbol nodes including all nested children.
+    pub symbol_count: usize,
+    /// Hierarchical symbol tree. Flat SymbolInformation responses produce
+    /// a flat list (all `children` are empty).
+    pub symbols: Vec<OutlineSymbol>,
+    /// Handoff hint for the source file.
+    pub handoff: CodeRefactorHandoff,
+}
+
+/// Resolve a hierarchical document outline for a Java file via JDTLS
+/// `textDocument/documentSymbol`.
+///
+/// File-scoped: no line/column anchor is required. Opens the file, waits
+/// for diagnostics, then sends a `DocumentSymbolRequest`.
+///
+/// Fail-closed (RX-V3): returns `Err` with an `error.lsp_unavailable`
+/// message when the session manager is unavailable or JDTLS fails to
+/// initialise. Never returns a syntactic approximation labelled as
+/// `lsp_verified`.
+pub(crate) fn java_document_outline(
+    manager: &LspSessionManager,
+    project_dir: &Path,
+    source_path: &Path,
+) -> Result<OutlineReport> {
+    let source = fs::read_to_string(source_path)
+        .with_context(|| format!("reading {}", source_path.display()))?;
+
+    let source_uri = Url::from_file_path(source_path)
+        .map_err(|_| anyhow!("failed to convert {} to file URL", source_path.display()))?;
+
+    let params = DocumentSymbolParams {
+        text_document: TextDocumentIdentifier {
+            uri: source_uri.clone(),
+        },
+        work_done_progress_params: Default::default(),
+        partial_result_params: Default::default(),
+    };
+
+    let response = manager
+        .with_session(project_dir, Language::Java, |mut client| {
+            client.send_notification::<lsp_types::notification::DidOpenTextDocument>(
+                &lsp_types::DidOpenTextDocumentParams {
+                    text_document: TextDocumentItem {
+                        uri: source_uri.clone(),
+                        language_id: "java".to_string(),
+                        version: 0,
+                        text: source.clone(),
+                    },
+                },
+            )?;
+            client.wait_for_diagnostics(source_uri.as_str(), std::time::Duration::from_secs(60));
+            let id = client.send_request::<DocumentSymbolRequest>(&params)?;
+            client.read_response::<DocumentSymbolRequest>(id)
+        })
+        .map_err(|e| anyhow!("error.lsp_unavailable: {e}"))?;
+
+    let project_dir_str = project_dir.to_string_lossy().to_string();
+    let source_str = source_path.to_string_lossy().to_string();
+    let handoff = usage_site_handoff(&source_str, &project_dir_str);
+
+    let resolved = response.is_some();
+    let symbols = match response {
+        Some(lsp_types::DocumentSymbolResponse::Flat(symbols)) => {
+            // Flat Vec<SymbolInformation> — no hierarchy. Produce flat
+            // OutlineSymbol list (children always empty).
+            symbols
+                .into_iter()
+                .map(|sym| {
+                    let (kind_str, _) = symbol_kind_info(sym.kind);
+                    let detail = sym.container_name.clone();
+                    OutlineSymbol {
+                        name: sym.name,
+                        kind: kind_str,
+                        detail,
+                        line: Some(sym.location.range.start.line),
+                        character: Some(sym.location.range.start.character),
+                        children: Vec::new(),
+                    }
+                })
+                .collect()
+        }
+        Some(lsp_types::DocumentSymbolResponse::Nested(symbols)) => {
+            // Nested Vec<DocumentSymbol> — recursive hierarchy.
+            symbols
+                .into_iter()
+                .map(document_symbol_to_outline)
+                .collect()
+        }
+        None => Vec::new(),
+    };
+
+    let symbol_count = count_outline_symbols(&symbols);
+
+    Ok(OutlineReport {
+        kind: "java_document_outline".to_string(),
+        semantic_status: SEMANTIC_STATUS_LSP_VERIFIED.to_string(),
+        source: source_str,
+        resolved,
+        symbol_count,
+        symbols,
+        handoff,
+    })
+}
+
+/// Convert a single nested `DocumentSymbol` into an `OutlineSymbol`,
+/// recursing into `children`.
+fn document_symbol_to_outline(sym: DocumentSymbol) -> OutlineSymbol {
+    let (kind_str, _) = symbol_kind_info(sym.kind);
+    // Use selection_range.start for the most precise name position.
+    let line = Some(sym.selection_range.start.line);
+    let character = Some(sym.selection_range.start.character);
+    let children = sym
+        .children
+        .unwrap_or_default()
+        .into_iter()
+        .map(document_symbol_to_outline)
+        .collect();
+    OutlineSymbol {
+        name: sym.name,
+        kind: kind_str,
+        detail: sym.detail,
+        line,
+        character,
+        children,
+    }
+}
+
+/// Count all nodes in an outline tree (including nested children).
+fn count_outline_symbols(symbols: &[OutlineSymbol]) -> usize {
+    symbols.iter().map(|s| 1 + count_outline_symbols(&s.children)).sum()
+}
+
 /// Flatten a Vec<WorkspaceSymbol> (nested) into Vec<WorkspaceSymbolItem>.
 fn flatten_workspace_symbols(symbols: Vec<WorkspaceSymbol>, project_dir: &str) -> Vec<WorkspaceSymbolItem> {
     symbols
@@ -1145,6 +1310,137 @@ mod tests {
             }
             Err(e) => {
                 panic!("live JDTLS workspace symbols failed: {e:#}");
+            }
+        }
+        manager.shutdown_all();
+    }
+
+    // --- document_outline tests ---
+
+    /// Fail-closed (RX-V3) for java_document_outline.
+    #[test]
+    fn document_outline_fail_closed_when_lsp_unavailable() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let source_path = dir.path().join("Foo.java");
+        std::fs::write(&source_path, "public class Foo {}\n").unwrap();
+
+        let manager = LspSessionManager::new();
+        manager.shutdown_all();
+
+        let err = java_document_outline(&manager, dir.path(), &source_path)
+            .expect_err("expected error.lsp_unavailable");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("error.lsp_unavailable"),
+            "expected 'error.lsp_unavailable' in error message, got: {msg}"
+        );
+    }
+
+    /// Verify OutlineReport serialises correctly.
+    #[test]
+    fn outline_report_serializes() {
+        let report = OutlineReport {
+            kind: "java_document_outline".to_string(),
+            semantic_status: SEMANTIC_STATUS_LSP_VERIFIED.to_string(),
+            source: "/repo/Hello.java".to_string(),
+            resolved: true,
+            symbol_count: 3,
+            symbols: vec![
+                OutlineSymbol {
+                    name: "Hello".to_string(),
+                    kind: "class".to_string(),
+                    detail: None,
+                    line: Some(0),
+                    character: Some(0),
+                    children: vec![
+                        OutlineSymbol {
+                            name: "greet".to_string(),
+                            kind: "method".to_string(),
+                            detail: Some("String greet()".to_string()),
+                            line: Some(2),
+                            character: Some(4),
+                            children: vec![],
+                        },
+                    ],
+                },
+            ],
+            handoff: usage_site_handoff("/repo/Hello.java", "/repo"),
+        };
+
+        let json = serde_json::to_string_pretty(&report).unwrap();
+        assert!(json.contains("\"lsp_verified\""));
+        assert!(json.contains("\"java_document_outline\""));
+        assert!(json.contains("\"resolved\": true"));
+        assert!(json.contains("\"symbol_count\": 3"));
+        assert!(json.contains("bbox_refactor_status"));
+    }
+
+    /// Live integration test: document outline for Hello.java.
+    ///
+    /// Fixture: `tests/fixtures/java/Hello.java`
+    ///   - class Hello with greet()/main(), interface Greeter, class FriendlyGreeter
+    ///   - Expected: resolved==true, symbol_count >= 1, hierarchy has Hello class
+    ///     with at least one child method
+    ///
+    /// Run with:
+    ///   BLACKBOX_JDTLS_BIN=/usr/bin/jdtls cargo test --lib code_nav::semantic::tests::live_jdtls_document_outline -- --ignored --nocapture
+    #[test]
+    #[ignore = "requires a live JDTLS (/usr/bin/jdtls); ~60s cold start"]
+    fn live_jdtls_document_outline() {
+        let _serial = live_lsp_guard();
+        let fixtures_dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/java");
+        assert!(
+            fixtures_dir.exists(),
+            "Java fixture directory missing: {}",
+            fixtures_dir.display()
+        );
+
+        let source_path = fixtures_dir.join("Hello.java");
+        assert!(
+            source_path.exists(),
+            "Hello.java fixture missing: {}",
+            source_path.display()
+        );
+
+        let manager = LspSessionManager::new();
+        let result = java_document_outline(&manager, &fixtures_dir, &source_path);
+        match result {
+            Ok(report) => {
+                let json = serde_json::to_string_pretty(&report)
+                    .expect("serialise OutlineReport");
+                println!("--- live_jdtls_document_outline output ---\n{json}\n---");
+                assert_eq!(
+                    report.semantic_status, SEMANTIC_STATUS_LSP_VERIFIED,
+                    "semantic_status must be lsp_verified"
+                );
+                assert!(
+                    report.resolved,
+                    "resolved must be true for Hello.java; got report: {json}"
+                );
+                assert!(
+                    report.symbol_count >= 1,
+                    "expected >=1 symbol in Hello.java outline; got {}: {json}",
+                    report.symbol_count
+                );
+                // The outline should contain the Hello class with children.
+                let hello_class = report.symbols.iter().find(|s| s.name == "Hello");
+                assert!(
+                    hello_class.is_some(),
+                    "expected 'Hello' class in outline; symbols: {:?}",
+                    report.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+                );
+                let hello_class = hello_class.unwrap();
+                assert!(
+                    !hello_class.children.is_empty(),
+                    "expected Hello class to have at least one child method; got report: {json}"
+                );
+            }
+            Err(e) => {
+                panic!("live JDTLS document outline failed: {e:#}");
             }
         }
         manager.shutdown_all();
