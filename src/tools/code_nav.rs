@@ -1,10 +1,13 @@
+use std::path::PathBuf;
+
+use anyhow::{anyhow, Context};
 use crate::code_nav::{
     CodeNodeDescribeParams, CodeQueryParams, CodeRefsParams, CodeSymbolSearchParams,
     code_node_describe, code_query, code_refs, code_symbols,
 };
 use crate::code_nav::semantic::{
-    java_find_implementations, java_find_usages, java_type_at, resolve_path_for_usages,
-    resolve_project_dir_for_usages,
+    java_find_implementations, java_find_usages, java_type_at, java_workspace_symbols,
+    resolve_path_for_usages, resolve_project_dir_for_usages,
 };
 use crate::server::BlackboxServer;
 
@@ -78,6 +81,17 @@ pub struct CodeTypeAtParams {
     /// Project root used to spawn the JDTLS session and resolve
     /// relative `file` paths. When omitted, the git root above
     /// `file` is used (or the file's parent directory as a fallback).
+    #[serde(default)]
+    pub project_dir: Option<String>,
+}
+
+/// Parameters for `bbox_workspace_symbols`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceSymbolsParams {
+    /// Query string to search for symbols (e.g., class name, method name).
+    pub query: String,
+    /// Project root directory. Required — workspace/symbol is project-wide.
+    /// When omitted, the current working directory is used as the project root.
     #[serde(default)]
     pub project_dir: Option<String>,
 }
@@ -246,6 +260,31 @@ impl BlackboxServer {
             let lsp_line = p.line.saturating_sub(1);
             let lsp_col = p.column.saturating_sub(1);
             let report = java_type_at(&lsp, &project_dir, &source_path, lsp_line, lsp_col)?;
+            Ok(serde_json::to_string_pretty(&report)?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_workspace_symbols",
+        description = "Resolve workspace symbols matching a query via JDTLS (LSP workspace/symbol). Returns semantically-verified workspace symbol matches with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; project-wide query."
+    )]
+    pub(crate) fn bbox_workspace_symbols(
+        &self,
+        Parameters(p): Parameters<WorkspaceSymbolsParams>,
+    ) -> CallToolResult {
+        let lsp = self.state.lsp_sessions.clone();
+        Self::run("bbox_workspace_symbols", || {
+            // Resolve project_dir: if supplied use it, otherwise use cwd
+            let project_dir: PathBuf = match p.project_dir {
+                Some(ref dir) => PathBuf::from(dir),
+                None => std::env::current_dir().map_err(|e| anyhow!(e))?,
+            };
+
+            let canonical = project_dir
+                .canonicalize()
+                .with_context(|| format!("failed to canonicalize {}", project_dir.display()))?;
+
+            let report = java_workspace_symbols(&lsp, &canonical, &p.query)?;
             Ok(serde_json::to_string_pretty(&report)?)
         })
     }

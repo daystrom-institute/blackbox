@@ -415,6 +415,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         example: Some(r#"bbox_code_type_at(file="src/main/java/com/example/Foo.java", line=12, column=19, project_dir="/repo")"#),
     },
     ToolDoc {
+        name: "bbox_workspace_symbols",
+        category: ToolCategory::Refactor,
+        summary: "Resolve workspace symbols matching a query via JDTLS (LSP workspace/symbol). Returns semantically-verified workspace symbol matches with semantic_status=\"lsp_verified\". Fail-closed: returns error.lsp_unavailable when JDTLS is absent or fails to initialise (RX-V3). Java only; project-wide query.",
+        when_to_use: "Use when you need to find all symbols matching a name query across a whole Java project workspace. Unlike file-position queries (bbox_code_usages, bbox_code_implementations, bbox_code_type_at), this queries the entire indexed workspace without needing a specific file position. Requires JDTLS — expect a ~60s cold start on first call per project. Supply `query` (the symbol name to search for) and `project_dir` (the project root; defaults to cwd). Each returned symbol carries `name`, `kind` (string and numeric), `path`, `line`, `character`, and a `handoff` pointing to bbox_refactor_status / bbox_refactor_project_refs on the symbol's file. `resolved=false` means JDTLS found no symbols matching the query. Normalises Flat/Nested response variants into a flat symbol list. Never falls back to syntax-only output when the LSP is unavailable — that case returns error.lsp_unavailable.",
+        example: Some(r#"bbox_workspace_symbols(query="Greeter", project_dir="/repo")"#),
+    },
+    ToolDoc {
         name: "bbox_refactor_status",
         category: ToolCategory::Refactor,
         summary: "Inspect a supported source file for tree-sitter parse health and refactorable items.",
