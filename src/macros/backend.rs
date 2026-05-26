@@ -20,6 +20,7 @@
 //! unverified template output.
 
 use anyhow::{Result, anyhow};
+use serde::{Deserialize, Serialize};
 
 use crate::refactor::{FileCreate, FileEdit};
 
@@ -50,17 +51,24 @@ pub struct BackendEditSet {
 /// Variants cover the source-generation cases the macro layer needs. New
 /// generation forms require a new variant — no raw `serde_json::Value` escape
 /// hatch here so the compiler enforces completeness.
-#[derive(Debug, Clone)]
+///
+/// Serde: tagged with `op` field (e.g. `{"op": "emit_type", ...}`) so the
+/// planner can decode backend_op Value leaves into a typed variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JavaEmitOp {
-    /// Emit a new top-level Java type (class, interface, enum, annotation,
-    /// or record) as a new source file.
+    /// Emit a new top-level Java type (class, interface, enum, or record)
+    /// as a new source file. (Annotation types are not supported in v1.)
     EmitType {
+        /// Absolute path to the Java source root (e.g. `"src/main/java"`).
+        /// Forwarded to the sidecar so it can compute the file path from the
+        /// package and type name.
+        source_root: String,
         /// Java package, e.g. `"com.example.payments"`.
         package: String,
         /// Simple type name, e.g. `"PaymentService"`.
         name: String,
-        /// Type kind: `"class"`, `"interface"`, `"enum"`, `"annotation"`, or
-        /// `"record"`.
+        /// Type kind: `"class"`, `"interface"`, `"enum"`, or `"record"`.
         kind: String,
         /// Full source text of the new type (including package declaration and
         /// imports). Backend validates parse-validity before returning.
@@ -75,7 +83,11 @@ pub enum JavaEmitOp {
 /// A typed "rewrite existing source" operation for the Java macro backend.
 ///
 /// Variants cover the source-modification cases the macro layer needs.
-#[derive(Debug, Clone)]
+///
+/// Serde: tagged with `op` field (e.g. `{"op": "insert_member", ...}`) so the
+/// planner can decode backend_op Value leaves into a typed variant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum JavaRewriteOp {
     /// Insert a new member (field, method, constructor, or nested type)
     /// into an existing type in a source file.
@@ -156,6 +168,7 @@ mod tests {
     fn unavailable_backend_emit_returns_backend_unavailable() {
         let backend = UnavailableBackend;
         let op = JavaEmitOp::EmitType {
+            source_root: "/repo/src/main/java".into(),
             package: "com.example".into(),
             name: "Foo".into(),
             kind: "interface".into(),
@@ -184,5 +197,57 @@ mod tests {
             msg.contains("error.backend_unavailable"),
             "rewrite error should contain error.backend_unavailable; got: {msg}"
         );
+    }
+
+    #[test]
+    fn java_emit_op_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaEmitOp::EmitType {
+            source_root: "/repo/src/main/java".into(),
+            package: "com.example".into(),
+            name: "PaymentService".into(),
+            kind: "interface".into(),
+            source_text: "package com.example;\npublic interface PaymentService {}".into(),
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("emit_type"), "tagged op field");
+        assert_eq!(v["source_root"], json!("/repo/src/main/java"));
+        assert_eq!(v["package"], json!("com.example"));
+        let back: JavaEmitOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaEmitOp::EmitType { name, source_root, .. } => {
+                assert_eq!(name, "PaymentService");
+                assert_eq!(source_root, "/repo/src/main/java");
+            }
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::InsertMember {
+            target_file: "/repo/src/FooImpl.java".into(),
+            target_type: "FooImpl".into(),
+            member_text: "public void doWork() {}".into(),
+            imports: vec!["com.example.Port".into()],
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("insert_member"), "tagged op field");
+        assert_eq!(v["target_file"], json!("/repo/src/FooImpl.java"));
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::InsertMember { target_type, imports, .. } => {
+                assert_eq!(target_type, "FooImpl");
+                assert_eq!(imports, vec!["com.example.Port"]);
+            }
+        }
+    }
+
+    #[test]
+    fn java_emit_op_decode_fails_on_unknown_op() {
+        use serde_json::json;
+        let v = json!({"op": "unknown_emit_op", "package": "com.x", "name": "X"});
+        let err = serde_json::from_value::<JavaEmitOp>(v);
+        assert!(err.is_err(), "unknown op tag should fail to decode");
     }
 }

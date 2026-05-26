@@ -1,0 +1,12 @@
+target/
+*.jar
+*.class
+.classpath
+.project
+.settings/
+*.iml
+.idea/
+*.log
+
+# maven-shade-plugin byproduct
+dependency-reduced-pom.xml

@@ -381,18 +381,29 @@ impl MacroPlanner {
                     });
                 }
 
-                MacroOperation::Emit { name, .. } => {
-                    // Constraint 6 (Emit): always call the backend and propagate its
-                    // error. UnavailableBackend always returns error.backend_unavailable.
-                    // We pass a dummy op because the backend_op Value is opaque at this
-                    // layer and the UnavailableBackend ignores op contents.
-                    let dummy_emit = JavaEmitOp::EmitType {
-                        package: String::new(),
-                        name: String::new(),
-                        kind: "interface".to_string(),
-                        source_text: String::new(),
-                    };
-                    let bes = ctx.backend.emit(&dummy_emit).with_context(|| {
+                MacroOperation::Emit { name, backend_op } => {
+                    // Constraint 6 (Emit): interpolate backend_op Value string leaves,
+                    // decode to a typed JavaEmitOp, then call the backend.
+                    // Fail closed: decode failure or backend unavailability is a hard
+                    // planning error (never silently downgrades to template_only).
+                    let interpolated_op =
+                        interpolate_value_strings(backend_op, &expr_ctx).map_err(|e| {
+                            anyhow!(
+                                "error.macro_invalid: Emit operation '{}' in macro '{}' \
+                                 backend_op interpolation failed: {}",
+                                name,
+                                def.id,
+                                e
+                            )
+                        })?;
+                    let typed_emit: JavaEmitOp =
+                        serde_json::from_value(interpolated_op).map_err(|e| {
+                            anyhow!(
+                                "error.macro_invalid: emit backend_op did not match a typed \
+                                 JavaEmitOp variant: {e}"
+                            )
+                        })?;
+                    let bes = ctx.backend.emit(&typed_emit).with_context(|| {
                         format!(
                             "error.backend_unavailable: Emit operation '{}' in macro '{}' \
                              requires the Java macro backend (Phase 3); the backend is not connected",
@@ -418,15 +429,37 @@ impl MacroPlanner {
                     });
                 }
 
-                MacroOperation::Rewrite { targets, .. } => {
-                    let target_file = targets.first().cloned().unwrap_or_default();
-                    let dummy_rewrite = JavaRewriteOp::InsertMember {
-                        target_file,
-                        target_type: String::new(),
-                        member_text: String::new(),
-                        imports: vec![],
-                    };
-                    let bes = ctx.backend.rewrite(&dummy_rewrite).with_context(|| {
+                MacroOperation::Rewrite {
+                    targets,
+                    backend_op,
+                } => {
+                    // Constraint 6 (Rewrite): interpolate backend_op Value string leaves,
+                    // decode to a typed JavaRewriteOp, then call the backend.
+                    // target_file comes from InsertMember.target_file (the typed op),
+                    // not just targets[0] — we also keep registering targets for path
+                    // tracking to guard against duplicates.
+                    let interpolated_op =
+                        interpolate_value_strings(backend_op, &expr_ctx).map_err(|e| {
+                            anyhow!(
+                                "error.macro_invalid: Rewrite operation in macro '{}' \
+                                 backend_op interpolation failed: {}",
+                                def.id,
+                                e
+                            )
+                        })?;
+                    let typed_rewrite: JavaRewriteOp =
+                        serde_json::from_value(interpolated_op).map_err(|e| {
+                            anyhow!(
+                                "error.macro_invalid: emit backend_op did not match a typed \
+                                 JavaRewriteOp variant: {e}"
+                            )
+                        })?;
+                    // R1: Only register paths that the backend actually returns, not the
+                    // declared targets list. The backend's JavaRewriteOp::InsertMember
+                    // owns target_file; registering pre-interpolation targets would double-
+                    // register and incorrectly block legitimate second passes on the same file
+                    // from different operations.
+                    let bes = ctx.backend.rewrite(&typed_rewrite).with_context(|| {
                         format!(
                             "error.backend_unavailable: Rewrite operation in macro '{}' \
                              requires the Java macro backend (Phase 3); the backend is not connected",
@@ -797,6 +830,41 @@ fn validate_inputs(inputs: &serde_json::Map<String, Value>, schema: &Value) -> R
     }
 
     Ok(())
+}
+
+/// Recursively walk a `serde_json::Value` and call [`expr::interpolate`] on
+/// every string leaf.
+///
+/// Used by the Emit/Rewrite planner arms to expand `${path}` placeholders in
+/// `backend_op` values before decoding them to typed op structs. Non-string
+/// leaves (numbers, booleans, null, arrays, objects) pass through unchanged.
+///
+/// Returns `Err` with the [`expr::InterpolateError`] message on the first
+/// leaf that fails to interpolate.
+fn interpolate_value_strings(v: &Value, ctx: &expr::Context) -> Result<Value> {
+    match v {
+        Value::String(s) => {
+            let expanded = expr::interpolate(s, ctx)
+                .map_err(|e| anyhow!("interpolation error in backend_op string leaf: {e}"))?;
+            Ok(Value::String(expanded))
+        }
+        Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                out.push(interpolate_value_strings(item, ctx)?);
+            }
+            Ok(Value::Array(out))
+        }
+        Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                out.insert(k.clone(), interpolate_value_strings(v, ctx)?);
+            }
+            Ok(Value::Object(out))
+        }
+        // Numbers, booleans, and null pass through unchanged.
+        other => Ok(other.clone()),
+    }
 }
 
 fn json_type_matches(val: &Value, expected: &str) -> bool {
@@ -1486,7 +1554,15 @@ mod tests {
         let mut def = minimal_def();
         def.operations = vec![MacroOperation::Emit {
             name: "interface_file".into(),
-            backend_op: json!({"backend": "java_poet", "class": "PaymentService"}),
+            // Valid typed op so decode succeeds and the call reaches UnavailableBackend.
+            backend_op: json!({
+                "op": "emit_type",
+                "source_root": "/tmp/src",
+                "package": "com.example",
+                "name": "PaymentService",
+                "kind": "interface",
+                "source_text": "package com.example;\npublic interface PaymentService {}"
+            }),
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default(); // UnavailableBackend
@@ -1504,7 +1580,14 @@ mod tests {
         let mut def = minimal_def();
         def.operations = vec![MacroOperation::Rewrite {
             targets: vec!["src/Foo.java".into()],
-            backend_op: json!({"recipe": "AddImport"}),
+            // Valid typed op so decode succeeds and the call reaches UnavailableBackend.
+            backend_op: json!({
+                "op": "insert_member",
+                "target_file": "src/Foo.java",
+                "target_type": "Foo",
+                "member_text": "void x() {}",
+                "imports": []
+            }),
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default(); // UnavailableBackend
@@ -2540,6 +2623,161 @@ mod tests {
             msg.contains("error.probe_spec_interpolation")
                 || msg.contains("interpolation in probe/operation specs is not yet supported"),
             "planner must reject interpolation in inline probe spec, got: {msg}"
+        );
+    }
+
+    // ── P3a: interpolate_value_strings helper ─────────────────────────────────
+
+    #[test]
+    fn interpolate_value_strings_expands_string_leaves() {
+        let ctx = expr::Context {
+            inputs: {
+                let mut m = serde_json::Map::new();
+                m.insert("pkg".into(), json!("com.example"));
+                m.insert("name".into(), json!("PaymentService"));
+                m
+            },
+            probes: std::collections::HashMap::new(),
+        };
+        let v = json!({
+            "op": "emit_type",
+            "source_root": "/repo/src/main/java",
+            "package": "${inputs.pkg}",
+            "name": "${inputs.name}",
+            "kind": "interface",
+            "source_text": "package ${inputs.pkg};\npublic interface ${inputs.name} {}",
+            "count": 5,
+            "flag": true
+        });
+        let out = interpolate_value_strings(&v, &ctx).expect("interpolation should succeed");
+        assert_eq!(out["package"], json!("com.example"));
+        assert_eq!(out["name"], json!("PaymentService"));
+        // Non-string leaves unchanged
+        assert_eq!(out["count"], json!(5));
+        assert_eq!(out["flag"], json!(true));
+        // source_text expanded
+        assert!(
+            out["source_text"].as_str().unwrap().contains("com.example"),
+            "source_text leaf should be interpolated"
+        );
+    }
+
+    #[test]
+    fn interpolate_value_strings_passes_through_non_string_leaves() {
+        let ctx = expr::Context::default();
+        let v = json!({
+            "count": 42,
+            "active": false,
+            "ratio": 3.14,
+            "nothing": null,
+            "arr": [1, 2, 3]
+        });
+        let out = interpolate_value_strings(&v, &ctx).expect("no strings to interpolate");
+        assert_eq!(out, v);
+    }
+
+    #[test]
+    fn interpolate_value_strings_errors_on_missing_path() {
+        let ctx = expr::Context::default();
+        let v = json!({"package": "${inputs.ghost}"});
+        let err = interpolate_value_strings(&v, &ctx).unwrap_err();
+        assert!(
+            err.to_string().contains("ghost") || err.to_string().contains("interpolation"),
+            "error should mention the missing path or interpolation"
+        );
+    }
+
+    // ── P3a: Emit/Rewrite with UnavailableBackend still fails closed ──────────
+
+    #[test]
+    fn emit_with_unavailable_backend_yields_backend_unavailable() {
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Emit {
+            name: "interface_file".into(),
+            backend_op: json!({
+                "op": "emit_type",
+                "source_root": "/repo/src/main/java",
+                "package": "com.example",
+                "name": "Foo",
+                "kind": "interface",
+                "source_text": "package com.example;\npublic interface Foo {}"
+            }),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        // Default ctx uses UnavailableBackend
+        let ctx = MacroPlannerContext::default();
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.backend_unavailable"),
+            "Emit with UnavailableBackend should yield error.backend_unavailable; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rewrite_with_unavailable_backend_yields_backend_unavailable() {
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Rewrite {
+            targets: vec!["/repo/src/FooImpl.java".into()],
+            backend_op: json!({
+                "op": "insert_member",
+                "target_file": "/repo/src/FooImpl.java",
+                "target_type": "FooImpl",
+                "member_text": "public void doWork() {}",
+                "imports": []
+            }),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.backend_unavailable"),
+            "Rewrite with UnavailableBackend should yield error.backend_unavailable; got: {msg}"
+        );
+    }
+
+    // ── P3a: malformed backend_op is a hard planning error ────────────────────
+
+    #[test]
+    fn emit_malformed_backend_op_is_hard_plan_error() {
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Emit {
+            name: "bad_op".into(),
+            // Missing required fields; unknown op tag
+            backend_op: json!({"op": "unknown_unknown_op", "foo": "bar"}),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        // Either the decode fails with error.macro_invalid or the UnavailableBackend
+        // triggers error.backend_unavailable. Both are valid fail-closed outcomes;
+        // the key is that neither silently produces a plan.
+        assert!(
+            msg.contains("error.macro_invalid")
+                || msg.contains("error.backend_unavailable")
+                || msg.contains("unknown variant"),
+            "malformed emit backend_op must yield a hard plan error; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn rewrite_malformed_backend_op_is_hard_plan_error() {
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Rewrite {
+            targets: vec!["/repo/src/Foo.java".into()],
+            backend_op: json!({"op": "totally_unknown_rewrite", "x": 99}),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.macro_invalid")
+                || msg.contains("error.backend_unavailable")
+                || msg.contains("unknown variant"),
+            "malformed rewrite backend_op must yield a hard plan error; got: {msg}"
         );
     }
 }

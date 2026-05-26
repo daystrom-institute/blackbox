@@ -15,7 +15,7 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::macros::backend::UnavailableBackend;
+use crate::macros::sidecar_backend::SidecarBackend;
 use crate::macros::model::{MacroAnchors, MacroDefinition, MacroInvocation, MacroPlan};
 use crate::macros::planner::{MacroPlanner, build_macro_apply_params};
 use crate::macros::planner_ctx::MacroPlannerContext;
@@ -434,6 +434,19 @@ impl BlackboxServer {
             Err(e) => return registry_err(e),
         };
 
+        // Build a planner context: sidecar backend (fails at call time when JAR
+        // is absent — fail-closed per RX-V3) + LSP from daemon state.
+        // P4b: wire the real CodeNavProbeRunner backed by lsp_sessions + project list.
+        let probe_runner = {
+            let projects = self.state.projects.read().list();
+            CodeNavProbeRunner::new(Some(self.state.lsp_sessions.clone()), projects)
+        };
+        let backend = {
+            let project_path = resolve_project_dir(Some(&p.project_dir))
+                .unwrap_or_else(|| std::path::PathBuf::from(&p.project_dir));
+            SidecarBackend::new(project_path)
+        };
+
         let invocation = MacroInvocation {
             macro_id: p.macro_id,
             version: p.version,
@@ -442,15 +455,8 @@ impl BlackboxServer {
             anchors: p.anchors,
             operator_opt_outs: p.operator_opt_outs.unwrap_or_default(),
         };
-
-        // Build a planner context: fail-closed backend + LSP from daemon state.
-        // P4b: wire the real CodeNavProbeRunner backed by lsp_sessions + project list.
-        let probe_runner = {
-            let projects = self.state.projects.read().list();
-            CodeNavProbeRunner::new(Some(self.state.lsp_sessions.clone()), projects)
-        };
         let ctx = MacroPlannerContext::new(
-            Box::new(UnavailableBackend),
+            Box::new(backend),
             Some(self.state.lsp_sessions.clone()),
             Box::new(probe_runner),
         );
@@ -564,8 +570,13 @@ impl BlackboxServer {
             let projects = self.state.projects.read().list();
             CodeNavProbeRunner::new(Some(self.state.lsp_sessions.clone()), projects)
         };
+        let backend = {
+            let project_path = resolve_project_dir(Some(&p.project_dir))
+                .unwrap_or_else(|| std::path::PathBuf::from(&p.project_dir));
+            SidecarBackend::new(project_path)
+        };
         let ctx = MacroPlannerContext::new(
-            Box::new(UnavailableBackend),
+            Box::new(backend),
             Some(self.state.lsp_sessions.clone()),
             Box::new(probe_runner),
         );

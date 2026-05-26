@@ -29,11 +29,14 @@
 
 pub mod backend;
 pub mod expr;
+pub mod java_sidecar;
+pub mod java_sidecar_protocol;
 pub mod model;
 pub mod planner;
 pub mod planner_ctx;
 pub mod probe;
 pub mod registry;
+pub mod sidecar_backend;
 
 // Convenience re-exports for crate-internal consumers. The MCP surface,
 // registry, planner, and backend that consume these land in later macro
@@ -54,6 +57,8 @@ pub use model::{
 pub use planner::MacroPlanner;
 #[allow(unused_imports)]
 pub use planner_ctx::MacroPlannerContext;
+#[allow(unused_imports)]
+pub use sidecar_backend::SidecarBackend;
 #[allow(unused_imports)]
 pub use probe::{CodeNavProbeRunner, ProbeOutput, ProbeRunner, ProbeSpec, UnavailableProbeRunner};
 #[allow(unused_imports)]

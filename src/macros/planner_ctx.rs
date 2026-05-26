@@ -93,6 +93,7 @@ mod tests {
     fn default_context_uses_unavailable_backend() {
         let ctx = MacroPlannerContext::default();
         let op = JavaEmitOp::EmitType {
+            source_root: "/repo/src/main/java".into(),
             package: "com.example".into(),
             name: "Stub".into(),
             kind: "interface".into(),

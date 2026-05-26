@@ -465,7 +465,10 @@ Phased so each phase is independently useful and testable.
 - **Phase 3 — Java backend sidecar**: OpenRewrite (existing-source rewrite) +
   JavaPoet (generation) behind one `JavaMacroBackend` adapter, with a
   sidecar-owned small declaration model and fail-closed availability reporting;
-  whole-file output → full-span `TextEdit`.
+  whole-file output → full-span `TextEdit`. The sidecar runs as an isolated
+  subprocess pinned to the bundled `rewrite-java-21` grammar module and must be
+  launched with a JDK 21 `java` binary (`BLACKBOX_JAVA_BIN`); the Rust client
+  enforces this at spawn time via the `getCapabilities` `java_version` field.
 - **Phase 4 — probe bindings**: wire macro `probe` ops to code-nav syntactic and
   jdtls semantic tiers via the `CodeRefactorHandoff` seam; codify
   prefilter-then-resolve.
