@@ -167,7 +167,7 @@ impl JavaMacroBackend for SidecarBackend {
                     .map_err(|e| classify_rewrite_rpc_err(e, "insertMember"))?;
                 build_rewrite_edit_set(
                     target_file,
-                    &source_text,
+                    source_text.len(),
                     original_sha256,
                     result.rewritten_source,
                     result.changed,
@@ -205,7 +205,7 @@ impl JavaMacroBackend for SidecarBackend {
                     .map_err(|e| classify_rewrite_rpc_err(e, "replaceMethodBody"))?;
                 build_rewrite_edit_set(
                     target_file,
-                    &source_text,
+                    source_text.len(),
                     original_sha256,
                     result.rewritten_source,
                     result.changed,
@@ -246,12 +246,142 @@ impl JavaMacroBackend for SidecarBackend {
                         .map_err(|e| classify_rewrite_rpc_err(e, "insertStatementInMethod"))?;
                 build_rewrite_edit_set(
                     target_file,
-                    &source_text,
+                    source_text.len(),
                     original_sha256,
                     result.rewritten_source,
                     result.changed,
                     result.no_op,
                     "insertStatementInMethod",
+                )
+            }
+        }
+    }
+
+    fn rewrite_with_source_override(
+        &self,
+        op: &JavaRewriteOp,
+        source_override: Option<(&str, &str, usize)>,
+    ) -> anyhow::Result<BackendEditSet> {
+        // When no override is supplied, fall back to the standard disk-read path.
+        let Some((override_content, original_sha256_on_disk, original_byte_len)) = source_override
+        else {
+            return self.rewrite(op);
+        };
+
+        let canonical_root = self.canonical_root()?;
+
+        // For each rewrite variant, use override_content as source_text and
+        // original_sha256_on_disk as the FileEdit's original_sha256.  This keeps
+        // the plan anchored to the on-disk hash so refactor::apply can verify
+        // the file hasn't changed between plan and apply time.
+        match op {
+            JavaRewriteOp::InsertMember {
+                target_file,
+                target_type,
+                member_text,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertMember(override)")?;
+                let result: super::java_sidecar_protocol::InsertMemberResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_INSERT_MEMBER,
+                        InsertMemberParams {
+                            target_file: target_file.clone(),
+                            source_text: override_content.to_string(),
+                            target_type: target_type.clone(),
+                            member_text: member_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "insertMember"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertMember(override)",
+                )
+            }
+
+            JavaRewriteOp::ReplaceMethodBody {
+                target_file,
+                target_type,
+                method_name,
+                parameter_types,
+                new_body,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/replaceMethodBody(override)")?;
+                let result: super::java_sidecar_protocol::ReplaceMethodBodyResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_REPLACE_METHOD_BODY,
+                        ReplaceMethodBodyParams {
+                            target_file: target_file.clone(),
+                            source_text: override_content.to_string(),
+                            target_type: target_type.clone(),
+                            method_name: method_name.clone(),
+                            parameter_types: parameter_types.clone(),
+                            new_body: new_body.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "replaceMethodBody"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "replaceMethodBody(override)",
+                )
+            }
+
+            JavaRewriteOp::InsertStatementInMethod {
+                target_file,
+                target_type,
+                method_name,
+                parameter_types,
+                statement_text,
+                placement,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertStatementInMethod(override)")?;
+                let result: super::java_sidecar_protocol::InsertStatementInMethodResult =
+                    worker_arc
+                        .lock()
+                        .unwrap()
+                        .call(
+                            METHOD_INSERT_STATEMENT_IN_METHOD,
+                            InsertStatementInMethodParams {
+                                target_file: target_file.clone(),
+                                source_text: override_content.to_string(),
+                                target_type: target_type.clone(),
+                                method_name: method_name.clone(),
+                                parameter_types: parameter_types.clone(),
+                                statement_text: statement_text.clone(),
+                                placement: placement.clone(),
+                                imports: imports.clone(),
+                            },
+                        )
+                        .map_err(|e| classify_rewrite_rpc_err(e, "insertStatementInMethod"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertStatementInMethod(override)",
                 )
             }
         }
@@ -327,9 +457,15 @@ fn classify_rewrite_rpc_err(e: anyhow::Error, rpc_method: &str) -> anyhow::Error
 /// - `no_op=true` → empty set (idempotent, no changes needed).
 /// - `changed=true` → single full-span `FileEdit` replacing the entire original file.
 /// - Both false → protocol violation (R2 invariant); returns `error.backend_unavailable`.
+///
+/// `original_byte_len` is the byte length of the **on-disk** original file (not the
+/// override/intermediate content).  The `TextEdit` is always `[0, original_byte_len)` so
+/// that `refactor::apply` can validate the range against the on-disk file before applying.
+/// For the non-override path, pass `source_text.len()`.  For the override path, pass the
+/// length from the pending chain (established by the first disk-read rewrite for this file).
 fn build_rewrite_edit_set(
     path: &str,
-    source_text: &str,
+    original_byte_len: usize,
     original_sha256: String,
     rewritten_source: String,
     changed: bool,
@@ -340,7 +476,7 @@ fn build_rewrite_edit_set(
         return Ok(BackendEditSet::default());
     }
     if changed {
-        let byte_end = source_text.len();
+        let byte_end = original_byte_len;
         let edit = FileEdit {
             path: path.to_string(),
             original_sha256,

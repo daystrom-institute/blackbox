@@ -152,6 +152,16 @@ impl MacroPlanner {
         let mut opt_outs_used: HashSet<String> = HashSet::new();
         // Dup-path guard across all operations
         let mut touched_paths: HashSet<String> = HashSet::new();
+        // Pending Rewrite content: path → (new_content, original_sha256_on_disk, original_byte_len).
+        //
+        // `original_sha256_on_disk` and `original_byte_len` are established by the
+        // FIRST rewrite for each file (disk-read path) and remain frozen for all
+        // subsequent chained rewrites.  Subsequent ops receive the latest composed
+        // content as their sidecar source_text while the FileEdit is always built
+        // with `byte_end = original_byte_len` and `original_sha256 = S0` so that
+        // refactor::apply's range check and SHA verify both target the on-disk
+        // original (not the intermediate C1 content).
+        let mut pending_rewrite_content: HashMap<String, (String, String, usize)> = HashMap::new();
         // Probe provenance summaries for MacroPlan.provenance
         let mut probe_summaries: Vec<Value> = vec![];
 
@@ -208,24 +218,28 @@ impl MacroPlanner {
         }
 
         for probe in &def.probes {
-            // Defense-in-depth: interpolation in probe specs is not supported
-            // (should have been caught at registry validate() time, but re-check
-            // here in case a definition was loaded without going through the registry).
-            if spec_contains_interpolation(&probe.spec) {
-                bail!(
-                    "error.probe_spec_interpolation: macro '{}' probe '{}' contains '${{' \
-                     in its spec — interpolation in probe/operation specs is not yet supported; \
-                     remove ${{...}}",
-                    def.id,
-                    probe.name
-                );
-            }
+            // Interpolate probe spec string leaves using the current context
+            // (inputs are available; probe results from earlier probes are also
+            // available since context is populated incrementally).
+            // Only `inputs.*` references are meaningful here — probe specs must
+            // NOT reference other probe names (they run before most probes), but
+            // the interpolate call is safe: unresolvable paths surface as errors.
+            let interpolated_spec =
+                interpolate_value_strings(&probe.spec, &expr_ctx).map_err(|e| {
+                    anyhow!(
+                        "error.probe_spec_interpolation: macro '{}' probe '{}' spec \
+                         interpolation failed: {}",
+                        def.id,
+                        probe.name,
+                        e
+                    )
+                })?;
             let spec: ProbeSpec =
-                serde_json::from_value(probe.spec.clone()).with_context(|| {
+                serde_json::from_value(interpolated_spec.clone()).with_context(|| {
                     format!(
                         "error.probe_spec_invalid: macro '{}' probe '{}' has an invalid or \
-                         unknown spec kind. Spec: {}",
-                        def.id, probe.name, probe.spec
+                         unknown spec kind after interpolation. Spec: {}",
+                        def.id, probe.name, interpolated_spec
                     )
                 })?;
 
@@ -369,23 +383,24 @@ impl MacroPlanner {
                     // Inline probe operation: same execution semantics as
                     // def.probes, but runs in operation order so later ops
                     // can reference its result via expr_ctx.
-
-                    // Defense-in-depth: reject interpolation placeholders in specs.
-                    if spec_contains_interpolation(spec_val) {
-                        bail!(
-                            "error.probe_spec_interpolation: macro '{}' inline Probe '{}' \
-                             contains '${{' in its spec — interpolation in probe/operation \
-                             specs is not yet supported; remove ${{...}}",
-                            def.id,
-                            name
-                        );
-                    }
+                    // Interpolate ${inputs.*} (and prior probe results already in
+                    // expr_ctx) before decoding to a typed ProbeSpec.
+                    let interpolated_spec =
+                        interpolate_value_strings(spec_val, &expr_ctx).map_err(|e| {
+                            anyhow!(
+                                "error.probe_spec_interpolation: macro '{}' inline Probe '{}' \
+                                 spec interpolation failed: {}",
+                                def.id,
+                                name,
+                                e
+                            )
+                        })?;
                     let spec: ProbeSpec =
-                        serde_json::from_value(spec_val.clone()).with_context(|| {
+                        serde_json::from_value(interpolated_spec.clone()).with_context(|| {
                             format!(
                                 "error.probe_spec_invalid: macro '{}' inline Probe operation \
-                                 '{}' has an invalid spec: {}",
-                                def.id, name, spec_val
+                                 '{}' has an invalid spec after interpolation: {}",
+                                def.id, name, interpolated_spec
                             )
                         })?;
                     let output = ctx
@@ -487,9 +502,6 @@ impl MacroPlanner {
                 } => {
                     // Constraint 6 (Rewrite): interpolate backend_op Value string leaves,
                     // decode to a typed JavaRewriteOp, then call the backend.
-                    // target_file comes from InsertMember.target_file (the typed op),
-                    // not just targets[0] — we also keep registering targets for path
-                    // tracking to guard against duplicates.
                     let interpolated_op =
                         interpolate_value_strings(backend_op, &expr_ctx).map_err(|e| {
                             anyhow!(
@@ -502,25 +514,70 @@ impl MacroPlanner {
                     let typed_rewrite: JavaRewriteOp =
                         serde_json::from_value(interpolated_op).map_err(|e| {
                             anyhow!(
-                                "error.macro_invalid: emit backend_op did not match a typed \
+                                "error.macro_invalid: rewrite backend_op did not match a typed \
                                  JavaRewriteOp variant: {e}"
                             )
                         })?;
-                    // R1: Only register paths that the backend actually returns, not the
-                    // declared targets list. The backend's JavaRewriteOp::InsertMember
-                    // owns target_file; registering pre-interpolation targets would double-
-                    // register and incorrectly block legitimate second passes on the same file
-                    // from different operations.
-                    let bes = ctx.backend.rewrite(&typed_rewrite).with_context(|| {
-                        format!(
-                            "error.backend_unavailable: Rewrite operation in macro '{}' \
-                             requires the Java macro backend (Phase 3); the backend is not connected",
-                            def.id
-                        )
-                    })?;
+
+                    // Same-file chaining: if a prior Rewrite op already touched this file,
+                    // pass the pending content to the backend so ops are applied
+                    // sequentially without writing intermediate results to disk.
+                    // The returned FileEdit is anchored to the on-disk original SHA so
+                    // refactor::apply verifies the pre-apply state correctly.
+                    let target_file = rewrite_target_file(&typed_rewrite);
+                    let source_override = pending_rewrite_content
+                        .get(target_file)
+                        .map(|(content, sha, orig_len)| {
+                            (content.as_str(), sha.as_str(), *orig_len)
+                        });
+
+                    let bes = ctx
+                        .backend
+                        .rewrite_with_source_override(&typed_rewrite, source_override)
+                        .with_context(|| {
+                            format!(
+                                "error.backend_unavailable: Rewrite operation in macro '{}' \
+                                 requires the Java macro backend (Phase 3); the backend is not connected",
+                                def.id
+                            )
+                        })?;
+
                     backends_used.insert("open_rewrite".to_string());
+
                     for fe in &bes.file_edits {
-                        register_path(&mut touched_paths, &fe.path)?;
+                        if pending_rewrite_content.contains_key(&fe.path) {
+                            // ── Sidecar chain case ────────────────────────────
+                            // This path was already rewritten by an earlier Rewrite
+                            // op in this macro.  The new FileEdit supersedes the
+                            // intermediate one: replace it so only the final
+                            // composed edit reaches apply.
+                            // `touched_paths` already contains the path — no
+                            // dup-guard call needed (the chain is intentional).
+                            edit_set.file_edits.retain(|e| e.path != fe.path);
+                            touched_paths.insert(fe.path.clone());
+                        } else {
+                            // ── First-time or cross-op case ──────────────────
+                            // If another op kind (e.g. DelegateRefactor) already
+                            // registered this path, `register_path` will detect the
+                            // duplicate and return error.duplicate_touched_path,
+                            // preventing the silent drop of the prior edit.
+                            register_path(&mut touched_paths, &fe.path)?;
+                        }
+                        // Track the new content for potential subsequent ops on this file.
+                        // `original_byte_len` is taken from the full-span TextEdit's byte_end,
+                        // which equals the on-disk original length regardless of whether this
+                        // was the first (disk-read) or a subsequent (override) op.
+                        if let Some(new_text) = &fe.new_text {
+                            let orig_len = fe
+                                .edits
+                                .first()
+                                .map(|e| e.byte_end)
+                                .unwrap_or(new_text.len());
+                            pending_rewrite_content.insert(
+                                fe.path.clone(),
+                                (new_text.clone(), fe.original_sha256.clone(), orig_len),
+                            );
+                        }
                     }
                     for fc in &bes.file_creates {
                         register_path(&mut touched_paths, &fc.path)?;
@@ -786,15 +843,28 @@ impl MacroPlanner {
 
 /// Returns `true` if any string field within a JSON spec value contains `${`.
 ///
-/// Interpolation in probe/operation specs is not yet supported. Specs containing
-/// `${...}` would survive deserialization as literal strings and silently produce
-/// wrong results. Used at both registry-validate and planner time for defense-in-depth.
+/// Used to detect whether a probe spec contains interpolation placeholders that
+/// need to be expanded before deserialization. No longer used as a rejection guard
+/// in the planner (probe specs now support `${inputs.*}` interpolation); kept as
+/// a utility for diagnostics and the registry's structural validator.
 fn spec_contains_interpolation(spec: &Value) -> bool {
     match spec {
         Value::String(s) => s.contains("${"),
         Value::Array(arr) => arr.iter().any(spec_contains_interpolation),
         Value::Object(map) => map.values().any(spec_contains_interpolation),
         _ => false,
+    }
+}
+
+/// Extract the target file path from a typed [`JavaRewriteOp`].
+///
+/// Used by the same-file chaining logic in the `Rewrite` operation handler to
+/// look up any pending content from a prior Rewrite on the same file.
+fn rewrite_target_file(op: &JavaRewriteOp) -> &str {
+    match op {
+        JavaRewriteOp::InsertMember { target_file, .. } => target_file.as_str(),
+        JavaRewriteOp::ReplaceMethodBody { target_file, .. } => target_file.as_str(),
+        JavaRewriteOp::InsertStatementInMethod { target_file, .. } => target_file.as_str(),
     }
 }
 
@@ -901,9 +971,32 @@ fn interpolate_value_strings(v: &Value, ctx: &expr::Context) -> Result<Value> {
             Ok(Value::String(expanded))
         }
         Value::Array(arr) => {
-            let mut out = Vec::with_capacity(arr.len());
+            // Splice-interpolation: if an array element is a whole-placeholder
+            // string like "${inputs.my_array}" that resolves to a JSON array in
+            // the context, flatten its elements into the parent array.  This
+            // allows macro backend_op to express `"parameter_types":
+            // ["${inputs.caller_method_parameter_types}"]` and have the runtime
+            // splice in e.g. `["Order", "int"]`.  Any other string element
+            // undergoes normal scalar interpolation; non-string elements pass
+            // through recursively.
+            let mut out = Vec::new();
             for item in arr {
-                out.push(interpolate_value_strings(item, ctx)?);
+                match item {
+                    Value::String(s) => {
+                        if let Some(spliced) = splice_interpolate(s, ctx) {
+                            match spliced {
+                                Value::Array(inner) => out.extend(inner),
+                                other => out.push(other),
+                            }
+                        } else {
+                            let expanded = expr::interpolate(s, ctx).map_err(|e| {
+                                anyhow!("interpolation error in backend_op array element: {e}")
+                            })?;
+                            out.push(Value::String(expanded));
+                        }
+                    }
+                    _ => out.push(interpolate_value_strings(item, ctx)?),
+                }
             }
             Ok(Value::Array(out))
         }
@@ -917,6 +1010,29 @@ fn interpolate_value_strings(v: &Value, ctx: &expr::Context) -> Result<Value> {
         // Numbers, booleans, and null pass through unchanged.
         other => Ok(other.clone()),
     }
+}
+
+/// Attempt splice-interpolation for a string element that is a *pure*
+/// `${path}` placeholder (no surrounding text).
+///
+/// If `s` is exactly `"${path}"` and `path` resolves to a non-scalar JSON
+/// value (array or object) in `ctx`, returns `Some(resolved_value)`.
+/// Returns `None` for partial-template strings or when the resolved value is
+/// a scalar (scalars go through normal [`expr::interpolate`] path).
+fn splice_interpolate(s: &str, ctx: &expr::Context) -> Option<Value> {
+    let s = s.trim();
+    if s.starts_with("${") && s.ends_with('}') && s.len() > 3 {
+        let path = &s[2..s.len() - 1];
+        // Only act on pure paths (no nested `${` inside the placeholder).
+        if !path.contains("${") && !path.is_empty() {
+            if let Some(v) = ctx.resolve(path) {
+                if v.is_array() || v.is_object() {
+                    return Some(v.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 fn json_type_matches(val: &Value, expected: &str) -> bool {
@@ -1754,6 +1870,89 @@ mod tests {
         assert!(
             msg.contains("error.duplicate_touched_path") || msg.contains("duplicate"),
             "expected dup path error, got: {msg}"
+        );
+    }
+
+    /// A `DelegateRefactor` op that creates a file must conflict with a later
+    /// `Rewrite` op on the same path — the Rewrite must NOT silently drop the
+    /// DelegateRefactor's edit.
+    ///
+    /// This is the BLOCKER-2 guard: `pending_rewrite_content` does not contain
+    /// the path (only Rewrite-on-Rewrite chains register there), so the Rewrite
+    /// arm falls through to `register_path`, which detects the duplicate.
+    #[test]
+    fn delegate_refactor_then_rewrite_same_path_is_duplicate() {
+        use crate::macros::backend::{
+            BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp,
+        };
+        use crate::refactor::{FileEdit, TextEdit};
+
+        // A test-only backend that returns a canned FileEdit for any rewrite.
+        struct CannedRewriteBackend {
+            rewrite_path: String,
+        }
+        impl JavaMacroBackend for CannedRewriteBackend {
+            fn emit(&self, _: &JavaEmitOp) -> anyhow::Result<BackendEditSet> {
+                unimplemented!("emit not used in this test")
+            }
+            fn rewrite(&self, _: &JavaRewriteOp) -> anyhow::Result<BackendEditSet> {
+                Ok(BackendEditSet {
+                    file_edits: vec![FileEdit {
+                        path: self.rewrite_path.clone(),
+                        original_sha256: "deadbeef".into(),
+                        edits: vec![TextEdit {
+                            byte_start: 0,
+                            byte_end: 12,
+                            replacement: "class New {}".into(),
+                        }],
+                        new_text: Some("class New {}".into()),
+                    }],
+                    file_creates: vec![],
+                })
+            }
+        }
+
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let target_path = tmp.path().join("Shared.java").to_string_lossy().to_string();
+        let project_dir = tmp.path().to_string_lossy().to_string();
+
+        let mut def = minimal_def();
+        def.operations = vec![
+            // Op 1: DelegateRefactor creates the file → registers it in touched_paths.
+            MacroOperation::DelegateRefactor {
+                refactor_kind: "create_file".into(),
+                params: json!({
+                    "source": target_path,
+                    "new_text": "class Shared {}"
+                }),
+            },
+            // Op 2: Rewrite touches the same path.
+            // pending_rewrite_content does NOT contain the path (only Rewrite-on-Rewrite
+            // chains go there), so the Rewrite arm calls register_path → dup error.
+            MacroOperation::Rewrite {
+                targets: vec![target_path.clone()],
+                backend_op: json!({
+                    "op": "insert_member",
+                    "target_file": target_path,
+                    "target_type": "Shared",
+                    "member_text": "private int x;",
+                    "imports": []
+                }),
+            },
+        ];
+
+        let inv = minimal_invocation(&def, &project_dir);
+        let ctx = MacroPlannerContext::new(
+            Box::new(CannedRewriteBackend { rewrite_path: target_path }),
+            None,
+            Box::new(crate::macros::probe::UnavailableProbeRunner),
+        );
+
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.duplicate_touched_path"),
+            "DelegateRefactor → Rewrite same path must produce error.duplicate_touched_path; got: {msg}"
         );
     }
 
@@ -2870,6 +3069,110 @@ mod tests {
         assert!(
             err.to_string().contains("ghost") || err.to_string().contains("interpolation"),
             "error should mention the missing path or interpolation"
+        );
+    }
+
+    // ── P3a: probe spec ${inputs.*} interpolation ────────────────────────────
+
+    /// A probe spec containing `"${inputs.method}"` should expand from inputs
+    /// before the ProbeSpec is decoded — so the runner sees the real query
+    /// string, not a literal placeholder.
+    #[test]
+    fn probe_spec_inputs_interpolation_runs_before_decode() {
+        use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+
+        struct CapturingProbeRunner {
+            captured_query: std::sync::Mutex<Option<String>>,
+        }
+        impl ProbeRunner for CapturingProbeRunner {
+            fn run_probe(
+                &self,
+                _name: &str,
+                spec: &ProbeSpec,
+                _ctx: &crate::macros::expr::Context,
+                _inv: &crate::macros::model::MacroInvocation,
+            ) -> anyhow::Result<ProbeOutput> {
+                if let ProbeSpec::CodeSymbols { query, .. } = spec {
+                    *self.captured_query.lock().unwrap() = query.clone();
+                }
+                Ok(ProbeOutput {
+                    value: json!({"exists": true, "count": 1, "items": []}),
+                    semantic_status: crate::macros::model::MacroSemanticStatus::SyntaxOnly,
+                    truncated: false,
+                    diagnostics: vec![],
+                })
+            }
+        }
+
+        let mut def = minimal_def();
+        def.probes = vec![crate::macros::model::MacroProbe {
+            name: "method_probe".into(),
+            description: "checks method exists".into(),
+            // spec contains ${inputs.method_name} placeholder
+            spec: json!({"kind": "code_symbols", "query": "${inputs.method_name}"}),
+        }];
+
+        let runner = std::sync::Arc::new(CapturingProbeRunner {
+            captured_query: std::sync::Mutex::new(None),
+        });
+
+        // We need a ProbeRunner that is Send + Sync — wrap in a newtype.
+        struct SharedRunner(std::sync::Arc<CapturingProbeRunner>);
+        impl ProbeRunner for SharedRunner {
+            fn run_probe(
+                &self,
+                name: &str,
+                spec: &ProbeSpec,
+                ctx: &crate::macros::expr::Context,
+                inv: &crate::macros::model::MacroInvocation,
+            ) -> anyhow::Result<ProbeOutput> {
+                self.0.run_probe(name, spec, ctx, inv)
+            }
+        }
+
+        let ctx = MacroPlannerContext::new(
+            Box::new(crate::macros::backend::UnavailableBackend),
+            None,
+            Box::new(SharedRunner(runner.clone())),
+        );
+
+        let mut inv = minimal_invocation(&def, "/tmp");
+        inv.inputs
+            .insert("method_name".into(), json!("processOrder"));
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
+        assert!(plan.refusals.is_empty(), "no refusals expected");
+
+        // The runner should have received "processOrder", not "${inputs.method_name}"
+        let captured = runner.captured_query.lock().unwrap().clone();
+        assert_eq!(
+            captured.as_deref(),
+            Some("processOrder"),
+            "probe spec query should be interpolated to the input value before decode"
+        );
+    }
+
+    /// Splice-interpolation: a pure `"${path}"` element in an array whose
+    /// resolved value is itself an array is flattened into the parent array.
+    #[test]
+    fn interpolate_value_strings_splices_array_valued_inputs() {
+        let ctx = expr::Context {
+            inputs: {
+                let mut m = serde_json::Map::new();
+                m.insert(
+                    "param_types".into(),
+                    json!(["Order", "int"]),
+                );
+                m
+            },
+            probes: std::collections::HashMap::new(),
+        };
+        let v = json!({"parameter_types": ["${inputs.param_types}"]});
+        let out = interpolate_value_strings(&v, &ctx).expect("splice interpolation should succeed");
+        assert_eq!(
+            out["parameter_types"],
+            json!(["Order", "int"]),
+            "array-valued input should be spliced into the parent array"
         );
     }
 

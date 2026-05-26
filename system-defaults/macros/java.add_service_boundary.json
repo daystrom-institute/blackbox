@@ -1,0 +1,264 @@
+{
+  "id": "java.add_service_boundary",
+  "version": "1.0.0",
+  "language": "java",
+  "scope": "builtin",
+  "title": "Add Service Boundary (Guice)",
+  "inputs_schema": {
+    "type": "object",
+    "required": [
+      "caller_file",
+      "caller_type",
+      "caller_method",
+      "caller_method_parameter_types",
+      "method_contract",
+      "method_signature",
+      "implementation_body",
+      "caller_replacement",
+      "service_name",
+      "service_package",
+      "service_source_root",
+      "service_field_name",
+      "guice_module_file",
+      "guice_module_type"
+    ],
+    "properties": {
+      "caller_file": {
+        "type": "string",
+        "description": "Absolute path to the caller's Java source file"
+      },
+      "caller_type": {
+        "type": "string",
+        "description": "Simple name of the class that delegates to the service (e.g. CallerService)"
+      },
+      "caller_method": {
+        "type": "string",
+        "description": "Name of the method being extracted into the service boundary (e.g. processOrder)"
+      },
+      "caller_method_parameter_types": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Written parameter types for disambiguation (e.g. [\"String\"] or [])"
+      },
+      "method_contract": {
+        "type": "string",
+        "description": "Complete abstract method declaration for the interface body, including semicolon (e.g. \"void processOrder(String orderId);\")"
+      },
+      "method_signature": {
+        "type": "string",
+        "description": "Method signature for the implementation — without semicolon and without visibility modifier (e.g. \"void processOrder(String orderId)\")"
+      },
+      "implementation_body": {
+        "type": "string",
+        "description": "Statements for the implementation method body (no surrounding braces). Empty string triggers error.behavior_move_unsupported."
+      },
+      "caller_replacement": {
+        "type": "string",
+        "description": "Statements that replace the caller's extracted method body, delegating to the injected service field (no surrounding braces)"
+      },
+      "service_name": {
+        "type": "string",
+        "description": "Base service name (e.g. Inventory); interface becomes <name>Service, implementation becomes <name>ServiceImpl"
+      },
+      "service_package": {
+        "type": "string",
+        "description": "Java package for the new service interface and implementation (e.g. com.example)"
+      },
+      "service_source_root": {
+        "type": "string",
+        "description": "Absolute path to the Java source root where service files are emitted (e.g. /repo/src/main/java)"
+      },
+      "service_field_name": {
+        "type": "string",
+        "description": "Field name for the injected service reference in the caller (e.g. inventoryService)"
+      },
+      "guice_module_file": {
+        "type": "string",
+        "description": "Absolute path to the Guice AbstractModule source file"
+      },
+      "guice_module_type": {
+        "type": "string",
+        "description": "Simple name of the Guice AbstractModule class (e.g. AppModule)"
+      }
+    },
+    "additionalProperties": false
+  },
+  "effects": [
+    "creates_type",
+    "modifies_existing_type",
+    "changes_dependency_injection"
+  ],
+  "authority_gates": [
+    "acknowledge_public_api_change"
+  ],
+  "probes": [
+    {
+      "name": "caller_method_probe",
+      "description": "Locates the target method by name scoped to the caller file; count=0 → not found, count>1 → genuine overloads in the same file",
+      "spec": {
+        "kind": "code_symbols",
+        "query": "${inputs.caller_method}",
+        "languages": ["java"],
+        "item_kinds": ["method_declaration"],
+        "name_equals": "${inputs.caller_method}",
+        "path_contains": "${inputs.caller_file}"
+      }
+    },
+    {
+      "name": "service_type_exists",
+      "description": "Checks whether the service interface already exists (idempotency guard)",
+      "spec": {
+        "kind": "code_symbols",
+        "query": "${inputs.service_name}Service",
+        "languages": ["java"],
+        "item_kinds": ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"],
+        "name_equals": "${inputs.service_name}Service"
+      }
+    },
+    {
+      "name": "impl_type_exists",
+      "description": "Checks whether the service implementation class already exists (idempotency guard)",
+      "spec": {
+        "kind": "code_symbols",
+        "query": "${inputs.service_name}ServiceImpl",
+        "languages": ["java"],
+        "item_kinds": ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"],
+        "name_equals": "${inputs.service_name}ServiceImpl"
+      }
+    },
+    {
+      "name": "guice_module",
+      "description": "Locates the Guice module class scoped to the supplied module file; count=0 → not found, count>1 → ambiguous",
+      "spec": {
+        "kind": "code_symbols",
+        "query": "${inputs.guice_module_type}",
+        "languages": ["java"],
+        "item_kinds": ["class_declaration", "interface_declaration", "enum_declaration", "record_declaration"],
+        "name_equals": "${inputs.guice_module_type}",
+        "path_contains": "${inputs.guice_module_file}"
+      }
+    }
+  ],
+  "refusals": [
+    {
+      "when": {"op": "eq", "path": "caller_method_probe.count", "value": 0},
+      "code": "error.caller_method_not_found",
+      "message": "Method '${inputs.caller_method}' was not found in the project; confirm caller_type and caller_method are correct and the source is indexed"
+    },
+    {
+      "when": {
+        "op": "all",
+        "predicates": [
+          {"op": "not", "predicate": {"op": "eq", "path": "caller_method_probe.count", "value": 0}},
+          {"op": "not", "predicate": {"op": "eq", "path": "caller_method_probe.count", "value": 1}}
+        ]
+      },
+      "code": "error.caller_method_ambiguous",
+      "message": "Method '${inputs.caller_method}' matches more than one symbol; provide caller_method_parameter_types to disambiguate or rename the method before extracting"
+    },
+    {
+      "when": {"op": "not", "predicate": {"op": "eq", "path": "service_type_exists.count", "value": 0}},
+      "code": "error.type_already_exists",
+      "message": "A type named '${inputs.service_name}Service' already exists in the project; delete it first or choose a different service_name"
+    },
+    {
+      "when": {"op": "not", "predicate": {"op": "eq", "path": "impl_type_exists.count", "value": 0}},
+      "code": "error.type_already_exists",
+      "message": "A type named '${inputs.service_name}ServiceImpl' already exists in the project; delete it first or choose a different service_name"
+    },
+    {
+      "when": {"op": "eq", "path": "guice_module.count", "value": 0},
+      "code": "error.guice_module_not_found",
+      "message": "Guice module '${inputs.guice_module_type}' was not found; confirm guice_module_type and guice_module_file are correct"
+    },
+    {
+      "when": {
+        "op": "all",
+        "predicates": [
+          {"op": "not", "predicate": {"op": "eq", "path": "guice_module.count", "value": 0}},
+          {"op": "not", "predicate": {"op": "eq", "path": "guice_module.count", "value": 1}}
+        ]
+      },
+      "code": "error.guice_module_ambiguous",
+      "message": "More than one type matches '${inputs.guice_module_type}'; qualify guice_module_type or rename the module to avoid ambiguity"
+    },
+    {
+      "when": {"op": "eq", "path": "inputs.implementation_body", "value": ""},
+      "code": "error.behavior_move_unsupported",
+      "message": "implementation_body is empty; provide the extracted method body statements or set implementation_body to a non-empty stub before applying this macro"
+    }
+  ],
+  "operations": [
+    {
+      "kind": "emit",
+      "name": "service_interface",
+      "backend_op": {
+        "op": "emit_type",
+        "source_root": "${inputs.service_source_root}",
+        "package": "${inputs.service_package}",
+        "name": "${inputs.service_name}Service",
+        "kind": "interface",
+        "source_text": "package ${inputs.service_package};\n\npublic interface ${inputs.service_name}Service {\n    ${inputs.method_contract}\n}\n"
+      }
+    },
+    {
+      "kind": "emit",
+      "name": "service_impl",
+      "backend_op": {
+        "op": "emit_type",
+        "source_root": "${inputs.service_source_root}",
+        "package": "${inputs.service_package}",
+        "name": "${inputs.service_name}ServiceImpl",
+        "kind": "class",
+        "source_text": "package ${inputs.service_package};\n\npublic class ${inputs.service_name}ServiceImpl implements ${inputs.service_name}Service {\n\n    @Override\n    public ${inputs.method_signature} {\n        ${inputs.implementation_body}\n    }\n}\n"
+      }
+    },
+    {
+      "kind": "rewrite",
+      "targets": ["${inputs.caller_file}"],
+      "backend_op": {
+        "op": "insert_member",
+        "target_file": "${inputs.caller_file}",
+        "target_type": "${inputs.caller_type}",
+        "member_text": "@com.google.inject.Inject\n    private ${inputs.service_name}Service ${inputs.service_field_name};",
+        "imports": ["${inputs.service_package}.${inputs.service_name}Service"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "targets": ["${inputs.caller_file}"],
+      "backend_op": {
+        "op": "replace_method_body",
+        "target_file": "${inputs.caller_file}",
+        "target_type": "${inputs.caller_type}",
+        "method_name": "${inputs.caller_method}",
+        "parameter_types": ["${inputs.caller_method_parameter_types}"],
+        "new_body": "${inputs.caller_replacement}",
+        "imports": []
+      }
+    },
+    {
+      "kind": "rewrite",
+      "targets": ["${inputs.guice_module_file}"],
+      "backend_op": {
+        "op": "insert_statement_in_method",
+        "target_file": "${inputs.guice_module_file}",
+        "target_type": "${inputs.guice_module_type}",
+        "method_name": "configure",
+        "parameter_types": [],
+        "statement_text": "bind(${inputs.service_name}Service.class).to(${inputs.service_name}ServiceImpl.class);",
+        "placement": "append",
+        "imports": [
+          "${inputs.service_package}.${inputs.service_name}Service",
+          "${inputs.service_package}.${inputs.service_name}ServiceImpl"
+        ]
+      }
+    },
+    {
+      "kind": "record",
+      "label": "verify_compilation",
+      "body": "Service boundary applied: ${inputs.service_name}Service interface + ${inputs.service_name}ServiceImpl created, ${inputs.caller_type}.${inputs.caller_method} delegates via injected field '${inputs.service_field_name}'. Verify the project compiles and add any missing imports in the caller file."
+    }
+  ],
+  "validations": []
+}

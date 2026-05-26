@@ -122,6 +122,8 @@ mod tests {
             query: None,
             item_kinds: None,
             languages: None,
+            name_equals: None,
+            path_contains: None,
         };
         let inv = MacroInvocation {
             macro_id: "test".into(),

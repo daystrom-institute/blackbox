@@ -166,6 +166,35 @@ pub trait JavaMacroBackend: Send + Sync {
 
     /// Rewrite existing Java source via the backend (e.g. OpenRewrite).
     fn rewrite(&self, op: &JavaRewriteOp) -> Result<BackendEditSet>;
+
+    /// Rewrite with an optional source content override.
+    ///
+    /// When `source_override = Some((content, original_sha256, original_byte_len))` the
+    /// backend MUST use `content` as the source text sent to the sidecar (instead of
+    /// reading the file from disk), MUST preserve `original_sha256` in the returned
+    /// `FileEdit`, and MUST use `original_byte_len` as the `byte_end` of the
+    /// full-span `TextEdit` (not `content.len()`).  Together these ensure the
+    /// `FileEdit` is anchored to the on-disk original: `original_sha256` lets
+    /// `refactor::apply` verify the file is unchanged, and `byte_end = original_byte_len`
+    /// produces a valid range against the on-disk file length.
+    ///
+    /// This allows the planner to chain multiple Rewrite operations on the same
+    /// file without writing intermediate results to disk: op N gets op N-1's
+    /// output as its source, while the final `FileEdit` still carries the
+    /// SHA-256 and byte length of the unmodified on-disk file so `refactor::apply`
+    /// can verify the file hasn't changed between plan and apply.
+    ///
+    /// Default: ignores `source_override` and delegates to [`Self::rewrite`].
+    /// Backends that only ever process one Rewrite per file can leave the
+    /// default; backends that must support sequential same-file rewrites
+    /// (e.g. [`super::sidecar_backend::SidecarBackend`]) must override.
+    fn rewrite_with_source_override(
+        &self,
+        op: &JavaRewriteOp,
+        _source_override: Option<(&str, &str, usize)>,
+    ) -> Result<BackendEditSet> {
+        self.rewrite(op)
+    }
 }
 
 // ---------------------------------------------------------------------------

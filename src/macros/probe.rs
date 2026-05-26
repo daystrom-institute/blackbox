@@ -98,6 +98,10 @@ pub enum ProbeSpec {
     /// index.
     CodeSymbols {
         /// Optional substring filter applied to item name / kind / path.
+        /// Note: substring matching includes path, so a query of `"Foo"` will
+        /// match ALL symbols inside `Foo.java` as well as symbols named `Foo`
+        /// or `FooImpl`.  Use [`CodeSymbols::name_equals`] for exact-name
+        /// type-existence checks.
         #[serde(default)]
         query: Option<String>,
         /// Optional item kind filter, e.g. `["class_declaration"]`.
@@ -106,6 +110,43 @@ pub enum ProbeSpec {
         /// Optional language filter, e.g. `["java"]`.
         #[serde(default)]
         languages: Option<Vec<String>>,
+        /// When set, only items whose `name` field exactly equals this string
+        /// are counted.  `count` and `exists` in the probe output are
+        /// recomputed from the exact-match filtered set (not from the
+        /// server-side `matching_items`).
+        ///
+        /// Use this for type-existence checks where the symbol name uniquely
+        /// identifies the type (e.g. `"InventoryService"`).  Passing `query`
+        /// alongside `name_equals` is useful as a pre-filter hint to the
+        /// server (narrows the candidate set before client-side filtering);
+        /// the `name_equals` filter is always applied on top.
+        ///
+        /// **Interpolation**: `${inputs.*}` references are expanded before
+        /// the spec is decoded (via `interpolate_value_strings`), so
+        /// `"${inputs.service_name}Service"` expands to e.g.
+        /// `"InventoryService"` before the filter is applied.
+        ///
+        /// **Cap caveat**: if the server result is truncated (more items
+        /// matched the `query` than the cap) some exact-match items may be
+        /// hidden; the count is then a lower bound.  For unique type names
+        /// this is acceptable.
+        #[serde(default)]
+        name_equals: Option<String>,
+        /// When set, restricts the file walk to paths that contain this
+        /// substring (passed directly to `CodeSymbolSearchParams.path_contains`).
+        ///
+        /// Use this to anchor a probe to a known file path — e.g.
+        /// `"${inputs.caller_file}"` limits the scan to the single caller file
+        /// so a common method name in an unrelated file does not inflate the
+        /// count.  Combined with `name_equals` and `item_kinds`, this keeps
+        /// ambiguity probes scoped to the file the operator actually named.
+        ///
+        /// **Interpolation**: supports `${inputs.*}` expansion.
+        ///
+        /// Leave absent (or `null`) for probes that must check project-wide,
+        /// e.g. type-existence idempotency guards.
+        #[serde(default)]
+        path_contains: Option<String>,
     },
 
     /// Semantic workspace-symbol lookup via JDTLS.
@@ -357,11 +398,37 @@ impl CodeNavProbeRunner {
     // CodeSymbols
     // -----------------------------------------------------------------------
 
+    /// Fail closed when `name_equals` filtering cannot be exact because the
+    /// server truncated its result.
+    ///
+    /// When the server caps the returned item set, client-side exact-name
+    /// filtering operates on an incomplete population.  An undercounted result
+    /// could silently hide a duplicate (→ false uniqueness) or miss a real
+    /// symbol (→ false absence).  Either direction corrupts refusal-driving
+    /// probe counts, so we surface a hard error instead.
+    ///
+    /// Adding `item_kinds` to the probe spec (to restrict to type declarations
+    /// in a large project) is the recommended fix when this error fires.
+    fn check_name_filter_truncation(name_equals: &str, server_truncated: bool) -> Result<()> {
+        if server_truncated {
+            Err(anyhow!(
+                "error.probe_truncated: name_equals='{}' filter applied to a \
+                 server-truncated result; exact count cannot be determined. \
+                 Add item_kinds to the probe spec to narrow the candidate set.",
+                name_equals
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     fn run_code_symbols(
         &self,
         query: Option<&str>,
         item_kinds: Option<&[String]>,
         languages: Option<&[String]>,
+        name_equals: Option<&str>,
+        path_contains: Option<&str>,
         project_dir: &str,
     ) -> Result<ProbeOutput> {
         // Cap query length.
@@ -375,12 +442,31 @@ impl CodeNavProbeRunner {
             }
         }
 
+        // When name_equals is set, pass it as `query` to the server as a
+        // pre-filter hint (substring match narrows the candidate set).  The
+        // server-side count is then refined by client-side exact filtering.
+        let server_query = name_equals.or(query);
+
+        // `path_contains` is substring-matched against the project-RELATIVE
+        // path by the code-nav lane. Operators naturally supply an absolute
+        // file path (e.g. an absolute `caller_file`); normalize it to a
+        // project-relative path so the substring match lands. Non-absolute
+        // values (already relative, or a bare suffix) pass through unchanged.
+        let normalized_path_contains = path_contains.map(|s| {
+            std::path::Path::new(s)
+                .strip_prefix(project_dir)
+                .ok()
+                .and_then(|rel| rel.to_str())
+                .map(|rel| rel.to_owned())
+                .unwrap_or_else(|| s.to_owned())
+        });
+
         let params = CodeSymbolSearchParams {
             project_dir: project_dir.to_owned(),
-            query: query.map(|s| s.to_owned()),
+            query: server_query.map(|s| s.to_owned()),
             languages: languages.map(|v| v.to_vec()),
             item_kinds: item_kinds.map(|v| v.to_vec()),
-            path_contains: None,
+            path_contains: normalized_path_contains,
             limit: Some(MAX_ITEMS_PER_PROBE),
             file_limit: None,
             include_attributes: None,
@@ -393,24 +479,47 @@ impl CodeNavProbeRunner {
         let mut diagnostics = Vec::new();
         let mut truncated = response.truncated;
 
-        // Cap items array.
-        let items: Vec<Value> = response
-            .items
-            .iter()
-            .take(MAX_ITEMS_PER_PROBE)
-            .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
-            .collect();
-        if items.len() < response.items.len() {
-            truncated = true;
-            diagnostics.push(format!(
-                "items array capped at {} (total matching_items={})",
-                items.len(),
-                response.matching_items
-            ));
-        }
+        let (items, count, exists) = if let Some(exact_name) = name_equals {
+            // Exact-name mode: fail closed on truncation BEFORE filtering.
+            // If the server truncated the result set, candidates beyond the cap
+            // are invisible to the client-side filter.  An undercounted result
+            // could hide a genuine duplicate (→ silent false uniqueness) or a
+            // genuinely missing symbol (→ silent false existence).  Either error
+            // direction is unsafe for refusal-driving probes, so we surface an
+            // explicit Err and let the planner fail closed.
+            Self::check_name_filter_truncation(exact_name, response.truncated)?;
 
-        let count = response.matching_items;
-        let exists = count > 0;
+            let exact_items: Vec<Value> = response
+                .items
+                .iter()
+                .filter(|i| i.name.as_deref() == Some(exact_name))
+                .take(MAX_ITEMS_PER_PROBE)
+                .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+                .collect();
+            let count = exact_items.len();
+            let exists = count > 0;
+            (exact_items, count, exists)
+        } else {
+            // Substring mode: use server-side matching_items as count (accurate
+            // when result is not truncated) and cap the items array locally.
+            let items: Vec<Value> = response
+                .items
+                .iter()
+                .take(MAX_ITEMS_PER_PROBE)
+                .map(|i| serde_json::to_value(i).unwrap_or(Value::Null))
+                .collect();
+            if items.len() < response.items.len() {
+                truncated = true;
+                diagnostics.push(format!(
+                    "items array capped at {} (total matching_items={})",
+                    items.len(),
+                    response.matching_items
+                ));
+            }
+            let count = response.matching_items;
+            let exists = count > 0;
+            (items, count, exists)
+        };
 
         let value = Self::cap_value(
             serde_json::json!({
@@ -615,10 +724,14 @@ impl ProbeRunner for CodeNavProbeRunner {
                 query,
                 item_kinds,
                 languages,
+                name_equals,
+                path_contains,
             } => self.run_code_symbols(
                 query.as_deref(),
                 item_kinds.as_deref(),
                 languages.as_deref(),
+                name_equals.as_deref(),
+                path_contains.as_deref(),
                 &invocation.project_dir,
             ),
             ProbeSpec::WorkspaceSymbol { query } => {
@@ -712,9 +825,143 @@ mod tests {
             ProbeSpec::CodeSymbols {
                 query: None,
                 item_kinds: None,
-                languages: None
+                languages: None,
+                name_equals: None,
+                path_contains: None,
             }
         ));
+    }
+
+    #[test]
+    fn probe_spec_code_symbols_path_contains_deserialize() {
+        let json = json!({
+            "kind": "code_symbols",
+            "query": "processOrder",
+            "languages": ["java"],
+            "item_kinds": ["method_declaration"],
+            "path_contains": "/src/main/java/com/example/CallerService.java"
+        });
+        let spec: ProbeSpec =
+            serde_json::from_value(json).expect("deserialize CodeSymbols with path_contains");
+        assert!(matches!(
+            spec,
+            ProbeSpec::CodeSymbols {
+                path_contains: Some(ref pc),
+                ..
+            } if pc == "/src/main/java/com/example/CallerService.java"
+        ));
+    }
+
+    #[test]
+    fn probe_spec_code_symbols_path_contains_round_trip() {
+        let spec = ProbeSpec::CodeSymbols {
+            query: Some("processOrder".into()),
+            item_kinds: Some(vec!["method_declaration".into()]),
+            languages: Some(vec!["java".into()]),
+            name_equals: Some("processOrder".into()),
+            path_contains: Some("/repo/src/main/java/com/example/CallerService.java".into()),
+        };
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let back: ProbeSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(spec, back, "path_contains round-trip failed");
+        // Confirm path_contains is present in the serialized JSON.
+        assert!(
+            json.contains("path_contains"),
+            "serialized JSON must include 'path_contains' key; got: {json}"
+        );
+    }
+
+    #[test]
+    fn probe_spec_code_symbols_name_equals_deserialize() {
+        let json = json!({
+            "kind": "code_symbols",
+            "query": "AppModule",
+            "languages": ["java"],
+            "name_equals": "AppModule"
+        });
+        let spec: ProbeSpec =
+            serde_json::from_value(json).expect("deserialize CodeSymbols with name_equals");
+        assert!(matches!(
+            spec,
+            ProbeSpec::CodeSymbols {
+                query: Some(ref q),
+                name_equals: Some(ref ne),
+                ..
+            } if q == "AppModule" && ne == "AppModule"
+        ));
+    }
+
+    #[test]
+    fn probe_spec_code_symbols_name_equals_round_trip() {
+        let spec = ProbeSpec::CodeSymbols {
+            query: Some("AppModule".into()),
+            item_kinds: None,
+            languages: Some(vec!["java".into()]),
+            name_equals: Some("AppModule".into()),
+            path_contains: None,
+        };
+        let json = serde_json::to_string(&spec).expect("serialize");
+        let back: ProbeSpec = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(spec, back, "name_equals round-trip failed");
+    }
+
+    /// Validates the exact-name filter predicate used by `run_code_symbols`.
+    ///
+    /// `CodeSymbols.query` is a substring filter over name/kind/path on the
+    /// server side, so querying `"AppModule"` matches ALL symbols inside
+    /// `AppModule.java` (path contains the string).  The `name_equals`
+    /// client-side filter recomputes `count` from items whose `name` field
+    /// exactly equals the target — excluding path-based matches and superset
+    /// names like `AppModuleTest`.
+    #[test]
+    fn name_equals_filter_excludes_substring_matches() {
+        // Minimal stand-in — only the `name` field matters for the predicate.
+        struct FakeSym {
+            name: Option<String>,
+        }
+
+        let items = vec![
+            FakeSym { name: Some("AppModule".into()) },      // exact match → keep
+            FakeSym { name: Some("AppModuleTest".into()) },  // superset → reject
+            FakeSym { name: Some("configure".into()) },      // unrelated method in same file → reject
+            FakeSym { name: None },                          // no name (path-only hit) → reject
+        ];
+
+        let exact_name = "AppModule";
+        let filtered: Vec<&FakeSym> = items
+            .iter()
+            .filter(|i| i.name.as_deref() == Some(exact_name))
+            .collect();
+
+        assert_eq!(
+            filtered.len(),
+            1,
+            "only the exact-name item should survive"
+        );
+        assert_eq!(filtered[0].name.as_deref(), Some("AppModule"));
+    }
+
+    /// `check_name_filter_truncation` must return `Err("error.probe_truncated")`
+    /// when the server result is truncated, and `Ok(())` when it is not.
+    ///
+    /// This exercises the fail-closed guard without needing a real sidecar.
+    #[test]
+    fn name_equals_truncation_fails_closed() {
+        let err = CodeNavProbeRunner::check_name_filter_truncation("AppModule", true)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.probe_truncated"),
+            "must contain error.probe_truncated code; got: {msg}"
+        );
+        assert!(
+            msg.contains("AppModule"),
+            "error should name the filter value; got: {msg}"
+        );
+
+        // Non-truncated case: must not error.
+        CodeNavProbeRunner::check_name_filter_truncation("AppModule", false)
+            .expect("non-truncated name_equals must succeed");
     }
 
     #[test]
@@ -766,6 +1013,8 @@ mod tests {
                 query: Some("Service".into()),
                 item_kinds: Some(vec!["class_declaration".into()]),
                 languages: Some(vec!["java".into()]),
+                name_equals: None,
+                path_contains: None,
             },
             ProbeSpec::WorkspaceSymbol {
                 query: "PaymentService".into(),
@@ -811,6 +1060,8 @@ mod tests {
             query: None,
             item_kinds: None,
             languages: None,
+            name_equals: None,
+            path_contains: None,
         };
         let inv = minimal_invocation("/tmp");
         let err = runner

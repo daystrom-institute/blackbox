@@ -186,9 +186,33 @@ impl MacroRegistry {
     // Load helpers
     // -----------------------------------------------------------------------
 
-    /// Builtin macro definitions — currently empty.
+    /// Builtin macro definitions — shipped with Blackbox as embedded JSON.
+    ///
+    /// Each definition is embedded via `include_str!` so it is compiled into the
+    /// binary and available without any filesystem access at runtime. Parse errors
+    /// in builtin files are compile-time panics (caught by the `builtin_roundtrip`
+    /// unit test before release).
     fn builtin_definitions() -> Vec<MacroDefinition> {
-        vec![]
+        const BUILTINS: &[(&str, &str)] = &[(
+            "java.add_service_boundary",
+            include_str!(
+                "../../system-defaults/macros/java.add_service_boundary.json"
+            ),
+        )];
+
+        let mut out = Vec::with_capacity(BUILTINS.len());
+        for (id, src) in BUILTINS {
+            match serde_json::from_str::<MacroDefinition>(src) {
+                Ok(def) => out.push(def),
+                Err(e) => {
+                    // Builtin parse failure is a programming error, not a runtime
+                    // error. Panic so it is caught in tests rather than silently
+                    // dropping the builtin at runtime.
+                    panic!("builtin macro '{id}' failed to deserialize: {e}");
+                }
+            }
+        }
+        out
     }
 
     /// Load every `.json` file in `dir` as a [`MacroDefinition`].
@@ -317,17 +341,57 @@ impl MacroRegistry {
 
     /// Returns `true` if any string field within `spec` contains a literal `${`.
     ///
-    /// Interpolation in probe/operation specs is not yet supported. A spec
-    /// containing `${...}` would survive deserialization as a literal string and
-    /// silently evaluate to false in any predicate — a dangerous footgun. Reject
-    /// at registry time so authors receive a clear error rather than silent
-    /// wrong-answer behaviour.
+    /// Used to decide whether structural validation needs to strip interpolation
+    /// placeholders before attempting ProbeSpec deserialization.
     fn spec_contains_interpolation(spec: &serde_json::Value) -> bool {
         match spec {
             serde_json::Value::String(s) => s.contains("${"),
             serde_json::Value::Array(arr) => arr.iter().any(Self::spec_contains_interpolation),
             serde_json::Value::Object(map) => map.values().any(Self::spec_contains_interpolation),
             _ => false,
+        }
+    }
+
+    /// Replace every `${...}` placeholder within string leaves of `v` with an
+    /// inert placeholder value (`"__placeholder__"`) so that the resulting JSON
+    /// can be structurally validated as a typed spec (e.g. [`ProbeSpec`]) even
+    /// when the real values are only known at plan time.
+    ///
+    /// Only whole-substring replacements are performed — the spec `"kind"` field
+    /// is never itself an interpolation placeholder, so the tag discriminant
+    /// remains intact after stripping.
+    fn strip_interpolation_for_validation(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::String(s) => {
+                // Replace every ${...} occurrence with the placeholder string.
+                let mut out = String::with_capacity(s.len());
+                let mut chars = s.chars().peekable();
+                while let Some(c) = chars.next() {
+                    if c == '$' && chars.peek() == Some(&'{') {
+                        chars.next(); // consume '{'
+                        for ch in chars.by_ref() {
+                            if ch == '}' {
+                                break;
+                            }
+                        }
+                        out.push_str("__placeholder__");
+                    } else {
+                        out.push(c);
+                    }
+                }
+                serde_json::Value::String(out)
+            }
+            serde_json::Value::Array(arr) => serde_json::Value::Array(
+                arr.iter()
+                    .map(Self::strip_interpolation_for_validation)
+                    .collect(),
+            ),
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .map(|(k, v)| (k.clone(), Self::strip_interpolation_for_validation(v)))
+                    .collect(),
+            ),
+            other => other.clone(),
         }
     }
 
@@ -460,15 +524,17 @@ impl MacroRegistry {
                     &format!("duplicate probe name '{}'", probe.name),
                 ));
             }
-            // Reject interpolation placeholders in probe specs (not yet supported).
-            if Self::spec_contains_interpolation(&probe.spec) {
-                issues.push(ValidationIssue::error(
-                    &format!("probes[{i}].spec"),
-                    "interpolation in probe/operation specs is not yet supported; remove ${...}",
-                ));
-            }
-            // ProbeSpec deserialization: reject unknown kinds / malformed specs.
-            match serde_json::from_value::<ProbeSpec>(probe.spec.clone()) {
+            // ProbeSpec structural validation: probe specs may contain
+            // `${inputs.*}` interpolation (expanded at plan time).  Strip
+            // placeholders before attempting deserialization so we can still
+            // validate that the `kind` discriminant and required fields are
+            // structurally present.
+            let spec_for_validation = if Self::spec_contains_interpolation(&probe.spec) {
+                Self::strip_interpolation_for_validation(&probe.spec)
+            } else {
+                probe.spec.clone()
+            };
+            match serde_json::from_value::<ProbeSpec>(spec_for_validation) {
                 Ok(_) => {}
                 Err(e) => {
                     issues.push(ValidationIssue::error(
@@ -498,14 +564,15 @@ impl MacroRegistry {
                         ),
                     ));
                 }
-                // Reject interpolation placeholders in inline probe specs.
-                if Self::spec_contains_interpolation(spec_val) {
-                    issues.push(ValidationIssue::error(
-                        &format!("operations[{i}].spec"),
-                        "interpolation in probe/operation specs is not yet supported; remove ${...}",
-                    ));
-                }
-                match serde_json::from_value::<ProbeSpec>(spec_val.clone()) {
+                // Inline probe specs may contain `${inputs.*}` interpolation
+                // (expanded at plan time).  Strip placeholders before
+                // attempting deserialization so we validate structure only.
+                let spec_for_validation = if Self::spec_contains_interpolation(spec_val) {
+                    Self::strip_interpolation_for_validation(spec_val)
+                } else {
+                    spec_val.clone()
+                };
+                match serde_json::from_value::<ProbeSpec>(spec_for_validation) {
                     Ok(_) => {}
                     Err(e) => {
                         issues.push(ValidationIssue::error(
@@ -722,10 +789,15 @@ mod tests {
     fn list_empty_when_no_macros() {
         let (_dir, project) = setup_tempdir();
         let macros = MacroRegistry::list(Some(&project));
+        // Builtins are always present; the intent is that no project/user macros load.
+        let non_builtin: Vec<_> = macros
+            .iter()
+            .filter(|m| m.scope != MacroScope::Builtin)
+            .collect();
         assert!(
-            macros.is_empty(),
-            "expected no macros, got {}",
-            macros.len()
+            non_builtin.is_empty(),
+            "expected no project/user macros, got {} non-builtin macro(s)",
+            non_builtin.len()
         );
     }
 
@@ -737,9 +809,12 @@ mod tests {
         MacroRegistry::register(&project, def.clone(), false).expect("register");
 
         let macros = MacroRegistry::list(Some(&project));
-        assert_eq!(macros.len(), 1);
-        assert_eq!(macros[0].id, "test.macro");
-        assert_eq!(macros[0].scope, MacroScope::Project);
+        // Builtins are always present; verify the registered macro appears by id/scope.
+        let found = macros
+            .iter()
+            .find(|m| m.id == "test.macro")
+            .expect("registered macro 'test.macro' should be in list");
+        assert_eq!(found.scope, MacroScope::Project);
     }
 
     #[test]
@@ -812,7 +887,11 @@ mod tests {
         MacroRegistry::unregister(&project, "test.macro").expect("unregister");
 
         let macros = MacroRegistry::list(Some(&project));
-        assert!(macros.is_empty(), "expected no macros after unregister");
+        // Builtins remain after unregister; the intent is that the project macro is gone.
+        assert!(
+            macros.iter().all(|m| m.id != "test.macro"),
+            "unregistered macro 'test.macro' should not appear in list after removal"
+        );
     }
 
     #[test]
@@ -944,15 +1023,20 @@ mod tests {
         let bad_path = macros_dir.join("bad.json");
         std::fs::write(&bad_path, "not valid json").unwrap();
 
-        // list should succeed, returning only the valid one
+        // list should succeed; the valid project macro must be present, the bad file skipped.
         let macros = MacroRegistry::list(Some(&project));
+        let project_macros: Vec<_> = macros
+            .iter()
+            .filter(|m| m.scope != MacroScope::Builtin)
+            .collect();
         assert_eq!(
-            macros.len(),
+            project_macros.len(),
             1,
-            "expected 1 valid macro, got {}",
-            macros.len()
+            "expected exactly 1 non-builtin (valid) macro, got {}: {:?}",
+            project_macros.len(),
+            project_macros.iter().map(|m| &m.id).collect::<Vec<_>>()
         );
-        assert_eq!(macros[0].id, "test.macro");
+        assert_eq!(project_macros[0].id, "test.macro");
     }
 
     #[test]
@@ -964,7 +1048,16 @@ mod tests {
         std::fs::write(macros_dir.join("readme.txt"), "not a macro").unwrap();
 
         let macros = MacroRegistry::list(Some(&project));
-        assert!(macros.is_empty(), "non-.json files should be skipped");
+        // Builtins are always present; the intent is that no project/user macros load.
+        let non_builtin: Vec<_> = macros
+            .iter()
+            .filter(|m| m.scope != MacroScope::Builtin)
+            .collect();
+        assert!(
+            non_builtin.is_empty(),
+            "non-.json files should be skipped; got {} unexpected non-builtin macro(s)",
+            non_builtin.len()
+        );
     }
 
     #[test]
@@ -997,9 +1090,17 @@ mod tests {
         )
         .unwrap();
 
-        // list should skip it (load_file validates predicates)
+        // list should skip it (load_file validates predicates); builtins remain.
         let macros = MacroRegistry::list(Some(&project));
-        assert!(macros.is_empty(), "bad predicate macro should be skipped");
+        let non_builtin: Vec<_> = macros
+            .iter()
+            .filter(|m| m.scope != MacroScope::Builtin)
+            .collect();
+        assert!(
+            non_builtin.is_empty(),
+            "macro with bad predicate should be skipped; got {} unexpected non-builtin macro(s)",
+            non_builtin.len()
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1467,63 +1568,73 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // FIX 4: interpolation placeholders rejected in probe/op specs
+    // Probe spec interpolation: allowed, validated structurally
     // -----------------------------------------------------------------------
 
     #[test]
-    fn validate_rejects_interpolation_in_top_level_probe_spec() {
+    fn validate_allows_interpolation_in_top_level_probe_spec() {
+        // `${inputs.file}` is a valid interpolation placeholder.  After stripping
+        // (replacing `${...}` with `"__placeholder__"`) the spec should still
+        // deserialize as a valid CodeQuery with a non-empty file field.
         use crate::macros::model::MacroProbe;
         let probe = MacroProbe {
             name: "sym".into(),
             description: "has interpolation".into(),
             spec: json!({
                 "kind": "code_query",
-                "file": "${inputs.file}",  // interpolation not supported
+                "file": "${inputs.file}",
                 "query": "(class_declaration) @c"
             }),
         };
         let def = example_def_with_probes(vec![probe]);
         let report = MacroRegistry::validate(&def);
         assert!(
-            !report.valid,
-            "probe spec with interpolation must be rejected: {:?}",
-            report.issues
-        );
-        assert!(
-            report
-                .issues
-                .iter()
-                .any(|i| i.message.contains("interpolation")
-                    || i.message.contains("${")
-                    || i.message.contains("not yet supported")),
-            "error should mention interpolation: {:?}",
+            report.valid,
+            "probe spec with valid interpolation must pass structural validation: {:?}",
             report.issues
         );
     }
 
     #[test]
-    fn validate_rejects_interpolation_in_inline_probe_spec() {
+    fn validate_allows_interpolation_in_inline_probe_spec() {
+        // `${inputs.class_name}` in a workspace_symbol query is a valid
+        // interpolation placeholder; after stripping it becomes `"__placeholder__"`,
+        // which is a valid non-empty query string.
         let ops = vec![MacroOperation::Probe {
             name: "inline_sym".into(),
             spec: json!({
                 "kind": "workspace_symbol",
-                "query": "${inputs.class_name}"  // interpolation not supported
+                "query": "${inputs.class_name}"
             }),
         }];
         let def = example_def_with_ops(ops);
         let report = MacroRegistry::validate(&def);
         assert!(
-            !report.valid,
-            "inline probe spec with interpolation must be rejected: {:?}",
+            report.valid,
+            "inline probe spec with valid interpolation must pass structural validation: {:?}",
             report.issues
         );
+    }
+
+    #[test]
+    fn validate_rejects_probe_spec_with_unknown_kind_even_after_stripping() {
+        // A probe spec with an unknown `kind` discriminant must still fail validation
+        // even when the spec contains interpolation.  Stripping `${...}` should not
+        // mask a missing or misspelled `kind` field.
+        use crate::macros::model::MacroProbe;
+        let probe = MacroProbe {
+            name: "bad_kind".into(),
+            description: "unknown kind".into(),
+            spec: json!({
+                "kind": "not_a_valid_probe_kind",
+                "query": "${inputs.q}"
+            }),
+        };
+        let def = example_def_with_probes(vec![probe]);
+        let report = MacroRegistry::validate(&def);
         assert!(
-            report
-                .issues
-                .iter()
-                .any(|i| i.message.contains("interpolation")
-                    || i.message.contains("not yet supported")),
-            "error should mention interpolation: {:?}",
+            !report.valid,
+            "probe spec with unknown kind must fail validation: {:?}",
             report.issues
         );
     }
