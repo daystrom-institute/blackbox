@@ -30,6 +30,12 @@ final class SidecarException extends RuntimeException {
     /** Declared package, name, or kind in source_text does not match params. */
     static final int TYPE_MISMATCH = -32003;
 
+    /** No method matching the given name and parameter types was found in the target type. */
+    static final int METHOD_NOT_FOUND = -32004;
+
+    /** Multiple methods match the given name and parameter types — the combination is ambiguous. */
+    static final int METHOD_AMBIGUOUS = -32005;
+
     private final int code;
 
     SidecarException(int code, String message) {

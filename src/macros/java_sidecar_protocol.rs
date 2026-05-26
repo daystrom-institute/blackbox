@@ -143,6 +143,78 @@ pub struct InsertMemberResult {
     pub diagnostics: Vec<String>,
 }
 
+// ── replaceMethodBody ─────────────────────────────────────────────────────────
+
+/// `replaceMethodBody()` request: replace an existing method's body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceMethodBodyParams {
+    /// Absolute path to the file (for reference; not read by worker).
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Simple name of the type containing the method.
+    pub target_type: String,
+    /// Simple name of the method to replace the body of.
+    pub method_name: String,
+    /// Written parameter types for disambiguation, e.g. `["String", "int"]`.
+    pub parameter_types: Vec<String>,
+    /// New body text (statements only, no surrounding braces).
+    pub new_body: String,
+    /// Fully-qualified imports to add if not already present.
+    pub imports: Vec<String>,
+}
+
+/// `replaceMethodBody()` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplaceMethodBodyResult {
+    /// Full rewritten source text of the file after the body is replaced.
+    pub rewritten_source: String,
+    /// True when the source was actually modified.
+    pub changed: bool,
+    /// True when the body already matched and no replacement was needed.
+    pub no_op: bool,
+    /// Non-fatal diagnostic messages from the worker.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+// ── insertStatementInMethod ───────────────────────────────────────────────────
+
+/// `insertStatementInMethod()` request: append statements to a method body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsertStatementInMethodParams {
+    /// Absolute path to the file (for reference; not read by worker).
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Simple name of the type containing the method.
+    pub target_type: String,
+    /// Simple name of the method to insert statements into.
+    pub method_name: String,
+    /// Written parameter types for disambiguation.
+    pub parameter_types: Vec<String>,
+    /// Statement text to insert (one or more Java statements).
+    pub statement_text: String,
+    /// Insertion position. Must be `"append"` in v1.
+    pub placement: String,
+    /// Fully-qualified imports to add if not already present.
+    pub imports: Vec<String>,
+}
+
+/// `insertStatementInMethod()` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsertStatementInMethodResult {
+    /// Full rewritten source text of the file after insertion.
+    pub rewritten_source: String,
+    /// True when the source was actually modified.
+    pub changed: bool,
+    /// True when the statement(s) already existed and no insertion was needed.
+    pub no_op: bool,
+    /// Non-fatal diagnostic messages from the worker.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
 // ── shutdown ─────────────────────────────────────────────────────────────────
 
 /// `shutdown()` request: no parameters.
@@ -154,6 +226,8 @@ pub struct ShutdownParams {}
 pub const METHOD_GET_CAPABILITIES: &str = "getCapabilities";
 pub const METHOD_EMIT_TYPE: &str = "emitType";
 pub const METHOD_INSERT_MEMBER: &str = "insertMember";
+pub const METHOD_REPLACE_METHOD_BODY: &str = "replaceMethodBody";
+pub const METHOD_INSERT_STATEMENT_IN_METHOD: &str = "insertStatementInMethod";
 pub const METHOD_SHUTDOWN: &str = "shutdown";
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -285,6 +359,93 @@ mod tests {
         assert_eq!(METHOD_GET_CAPABILITIES, "getCapabilities");
         assert_eq!(METHOD_EMIT_TYPE, "emitType");
         assert_eq!(METHOD_INSERT_MEMBER, "insertMember");
+        assert_eq!(METHOD_REPLACE_METHOD_BODY, "replaceMethodBody");
+        assert_eq!(METHOD_INSERT_STATEMENT_IN_METHOD, "insertStatementInMethod");
         assert_eq!(METHOD_SHUTDOWN, "shutdown");
+    }
+
+    #[test]
+    fn replace_method_body_params_round_trips() {
+        let params = ReplaceMethodBodyParams {
+            target_file: "/repo/src/FooImpl.java".to_string(),
+            source_text: "package com.example;\npublic class FooImpl { void doWork(String s) {} }"
+                .to_string(),
+            target_type: "FooImpl".to_string(),
+            method_name: "doWork".to_string(),
+            parameter_types: vec!["String".to_string()],
+            new_body: "System.out.println(s);".to_string(),
+            imports: vec![],
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        let back: ReplaceMethodBodyParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_type, "FooImpl");
+        assert_eq!(back.method_name, "doWork");
+        assert_eq!(back.parameter_types, vec!["String"]);
+        assert!(back.new_body.contains("println"));
+    }
+
+    #[test]
+    fn replace_method_body_result_round_trips() {
+        let result = ReplaceMethodBodyResult {
+            rewritten_source: "package com.example;\npublic class FooImpl { void doWork(String s) { System.out.println(s); } }".to_string(),
+            changed: true,
+            no_op: false,
+            diagnostics: vec![],
+        };
+        let s = serde_json::to_string(&result).unwrap();
+        let back: ReplaceMethodBodyResult = serde_json::from_str(&s).unwrap();
+        assert!(back.changed);
+        assert!(!back.no_op);
+        assert!(back.rewritten_source.contains("println"));
+    }
+
+    #[test]
+    fn replace_method_body_result_no_op_round_trips() {
+        let result = ReplaceMethodBodyResult {
+            rewritten_source: "unchanged".to_string(),
+            changed: false,
+            no_op: true,
+            diagnostics: vec!["body already matches".to_string()],
+        };
+        let s = serde_json::to_string(&result).unwrap();
+        let back: ReplaceMethodBodyResult = serde_json::from_str(&s).unwrap();
+        assert!(!back.changed);
+        assert!(back.no_op);
+        assert_eq!(back.diagnostics.len(), 1);
+    }
+
+    #[test]
+    fn insert_statement_in_method_params_round_trips() {
+        let params = InsertStatementInMethodParams {
+            target_file: "/repo/src/FooImpl.java".to_string(),
+            source_text: "package com.example;\npublic class FooImpl { void init() {} }"
+                .to_string(),
+            target_type: "FooImpl".to_string(),
+            method_name: "init".to_string(),
+            parameter_types: vec![],
+            statement_text: "this.ready = true;".to_string(),
+            placement: "append".to_string(),
+            imports: vec![],
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        let back: InsertStatementInMethodParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.method_name, "init");
+        assert_eq!(back.placement, "append");
+        assert!(back.statement_text.contains("ready"));
+        assert!(back.parameter_types.is_empty());
+    }
+
+    #[test]
+    fn insert_statement_in_method_result_round_trips() {
+        let result = InsertStatementInMethodResult {
+            rewritten_source: "package com.example;\npublic class FooImpl { void init() { this.ready = true; } }".to_string(),
+            changed: true,
+            no_op: false,
+            diagnostics: vec![],
+        };
+        let s = serde_json::to_string(&result).unwrap();
+        let back: InsertStatementInMethodResult = serde_json::from_str(&s).unwrap();
+        assert!(back.changed);
+        assert!(!back.no_op);
     }
 }

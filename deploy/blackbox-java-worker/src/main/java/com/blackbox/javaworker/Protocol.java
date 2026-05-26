@@ -107,6 +107,8 @@ final class Methods {
     public static final String GET_CAPABILITIES = "getCapabilities";
     public static final String EMIT_TYPE = "emitType";
     public static final String INSERT_MEMBER = "insertMember";
+    public static final String REPLACE_METHOD_BODY = "replaceMethodBody";
+    public static final String INSERT_STATEMENT_IN_METHOD = "insertStatementInMethod";
     public static final String SHUTDOWN = "shutdown";
 
     private Methods() {}
@@ -304,6 +306,162 @@ final class InsertMemberResult {
     /** No-op: member already exists; {@code reason} is an advisory string. */
     public static InsertMemberResult noOp(String originalSource, String reason) {
         return new InsertMemberResult(originalSource, false, true, List.of(reason));
+    }
+
+    public String getRewrittenSource() { return rewrittenSource; }
+    public boolean isChanged() { return changed; }
+    public boolean isNoOp() { return noOp; }
+    public List<String> getDiagnostics() { return diagnostics; }
+}
+
+// ---------------------------------------------------------------------------
+// replaceMethodBody
+// ---------------------------------------------------------------------------
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class ReplaceMethodBodyParams {
+    private final String targetFile;
+    private final String sourceText;
+    private final String targetType;
+    private final String methodName;
+    private final List<String> parameterTypes;
+    private final String newBody;
+    private final List<String> imports;
+
+    @JsonCreator
+    public ReplaceMethodBodyParams(
+            @JsonProperty("target_file") String targetFile,
+            @JsonProperty("source_text") String sourceText,
+            @JsonProperty("target_type") String targetType,
+            @JsonProperty("method_name") String methodName,
+            @JsonProperty("parameter_types") List<String> parameterTypes,
+            @JsonProperty("new_body") String newBody,
+            @JsonProperty("imports") List<String> imports) {
+        this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
+        this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
+        this.targetType = Objects.requireNonNull(targetType, "target_type is required");
+        this.methodName = Objects.requireNonNull(methodName, "method_name is required");
+        this.parameterTypes = parameterTypes != null ? parameterTypes : List.of();
+        this.newBody = Objects.requireNonNull(newBody, "new_body is required");
+        this.imports = imports != null ? imports : List.of();
+    }
+
+    public String getTargetFile() { return targetFile; }
+    public String getSourceText() { return sourceText; }
+    public String getTargetType() { return targetType; }
+    public String getMethodName() { return methodName; }
+    public List<String> getParameterTypes() { return parameterTypes; }
+    public String getNewBody() { return newBody; }
+    public List<String> getImports() { return imports; }
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class ReplaceMethodBodyResult {
+    private final String rewrittenSource;
+    private final boolean changed;
+    private final boolean noOp;
+    private final List<String> diagnostics;
+
+    @JsonCreator
+    public ReplaceMethodBodyResult(
+            @JsonProperty("rewritten_source") String rewrittenSource,
+            @JsonProperty("changed") boolean changed,
+            @JsonProperty("no_op") boolean noOp,
+            @JsonProperty("diagnostics") List<String> diagnostics) {
+        this.rewrittenSource = rewrittenSource;
+        this.changed = changed;
+        this.noOp = noOp;
+        this.diagnostics = diagnostics != null ? diagnostics : List.of();
+    }
+
+    public static ReplaceMethodBodyResult changed(String rewrittenSource) {
+        return new ReplaceMethodBodyResult(rewrittenSource, true, false, List.of());
+    }
+
+    public static ReplaceMethodBodyResult noOp(String originalSource, String reason) {
+        return new ReplaceMethodBodyResult(originalSource, false, true, List.of(reason));
+    }
+
+    public String getRewrittenSource() { return rewrittenSource; }
+    public boolean isChanged() { return changed; }
+    public boolean isNoOp() { return noOp; }
+    public List<String> getDiagnostics() { return diagnostics; }
+}
+
+// ---------------------------------------------------------------------------
+// insertStatementInMethod
+// ---------------------------------------------------------------------------
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class InsertStatementInMethodParams {
+    private final String targetFile;
+    private final String sourceText;
+    private final String targetType;
+    private final String methodName;
+    private final List<String> parameterTypes;
+    private final String statementText;
+    private final String placement;
+    private final List<String> imports;
+
+    @JsonCreator
+    public InsertStatementInMethodParams(
+            @JsonProperty("target_file") String targetFile,
+            @JsonProperty("source_text") String sourceText,
+            @JsonProperty("target_type") String targetType,
+            @JsonProperty("method_name") String methodName,
+            @JsonProperty("parameter_types") List<String> parameterTypes,
+            @JsonProperty("statement_text") String statementText,
+            @JsonProperty("placement") String placement,
+            @JsonProperty("imports") List<String> imports) {
+        this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
+        this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
+        this.targetType = Objects.requireNonNull(targetType, "target_type is required");
+        this.methodName = Objects.requireNonNull(methodName, "method_name is required");
+        this.parameterTypes = parameterTypes != null ? parameterTypes : List.of();
+        this.statementText = Objects.requireNonNull(statementText, "statement_text is required");
+        this.placement = placement != null ? placement : "append";
+        this.imports = imports != null ? imports : List.of();
+    }
+
+    public String getTargetFile() { return targetFile; }
+    public String getSourceText() { return sourceText; }
+    public String getTargetType() { return targetType; }
+    public String getMethodName() { return methodName; }
+    public List<String> getParameterTypes() { return parameterTypes; }
+    public String getStatementText() { return statementText; }
+    public String getPlacement() { return placement; }
+    public List<String> getImports() { return imports; }
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class InsertStatementInMethodResult {
+    private final String rewrittenSource;
+    private final boolean changed;
+    private final boolean noOp;
+    private final List<String> diagnostics;
+
+    @JsonCreator
+    public InsertStatementInMethodResult(
+            @JsonProperty("rewritten_source") String rewrittenSource,
+            @JsonProperty("changed") boolean changed,
+            @JsonProperty("no_op") boolean noOp,
+            @JsonProperty("diagnostics") List<String> diagnostics) {
+        this.rewrittenSource = rewrittenSource;
+        this.changed = changed;
+        this.noOp = noOp;
+        this.diagnostics = diagnostics != null ? diagnostics : List.of();
+    }
+
+    public static InsertStatementInMethodResult changed(String rewrittenSource) {
+        return new InsertStatementInMethodResult(rewrittenSource, true, false, List.of());
+    }
+
+    public static InsertStatementInMethodResult noOp(String originalSource, String reason) {
+        return new InsertStatementInMethodResult(originalSource, false, true, List.of(reason));
     }
 
     public String getRewrittenSource() { return rewrittenSource; }

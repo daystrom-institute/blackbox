@@ -73,7 +73,7 @@ Returns worker metadata and the set of supported operations.
     "worker_version": "1.0.0",
     "java_version": "21.0.11",
     "openrewrite_version": "8.41.0",
-    "supported_ops": ["emit_type", "insert_member"]
+    "supported_ops": ["emit_type", "insert_member", "replace_method_body", "insert_statement_in_method"]
 }
 ```
 
@@ -163,6 +163,68 @@ If the member already exists, `changed` is `false` and `no_op` is `true`.
 
 ---
 
+### `replaceMethodBody`
+
+Replace the body of an existing method in the provided source text.
+
+**Params:**
+
+```json
+{
+    "target_file": "/path/to/MyClass.java",
+    "source_text": "package com.example;\n\npublic class MyClass {\n\n    public void greet() {\n        System.out.println(\"old\");\n    }\n}",
+    "target_type": "MyClass",
+    "method_name": "greet",
+    "parameter_types": [],
+    "new_body": "System.out.println(\"new\");",
+    "imports": []
+}
+```
+
+- `target_file` — file path (for reference only; not read)
+- `source_text` — full file content
+- `target_type` — simple name of the class containing the method
+- `method_name` — simple name of the method to replace
+- `parameter_types` — written param types for disambiguation (e.g. `["String", "int"]`); empty for no-arg methods
+- `new_body` — replacement body text (statements only, no braces)
+- `imports` — optional fully-qualified type names to import
+
+**Result:** same shape as `insertMember` (`rewritten_source`, `changed`, `no_op`, `diagnostics`).
+
+**Errors:** `error.parse_invalid`, `error.method_not_found`, `error.method_ambiguous`.
+
+---
+
+### `insertStatementInMethod`
+
+Append one or more statements to the body of an existing method.
+
+**Params:**
+
+```json
+{
+    "target_file": "/path/to/MyClass.java",
+    "source_text": "package com.example;\n\npublic class MyClass {\n\n    public void init() {\n    }\n}",
+    "target_type": "MyClass",
+    "method_name": "init",
+    "parameter_types": [],
+    "statement_text": "this.ready = true;",
+    "placement": "append",
+    "imports": []
+}
+```
+
+- `placement` — must be `"append"` in v1 (other values are rejected with `error.parse_invalid`)
+- All other fields follow the same conventions as `replaceMethodBody`
+
+**Result:** same shape as `insertMember` (`rewritten_source`, `changed`, `no_op`, `diagnostics`).
+
+If the statement(s) already exist in the body, `changed` is `false` and `no_op` is `true`.
+
+**Errors:** `error.parse_invalid`, `error.method_not_found`, `error.method_ambiguous`.
+
+---
+
 ### `shutdown`
 
 Graceful shutdown. Returns `{"ok": true}` and the process exits 0.
@@ -203,6 +265,22 @@ OpenRewrite ships support for newer Java versions.
 
 - **`emitType` kind is limited to class/interface/enum/record.** Annotation
   types (`@interface`) are not accepted in v1.
+
+- **`insertStatementInMethod` placement is `"append"` only.** Inserting at the
+  beginning of a method body or at a specific line is not yet supported.
+
+- **Method identity in `replaceMethodBody` and `insertStatementInMethod` uses
+  written type names.** `"String"` and `"java.lang.String"` are NOT considered
+  equal — use whatever form appears in the source declaration. A mismatch fails
+  closed with `error.method_not_found`; the fix is to supply the type name
+  exactly as it is written in the parameter list.
+
+- **`insertStatementInMethod` idempotency is source-text based.** A single-
+  statement snippet that is already present will not be duplicated (all-or-
+  nothing check). However, a multi-statement snippet that is only *partially*
+  already in the body will be re-inserted in full, duplicating the statements
+  that were already there. This is fail-permissive rather than fail-closed for
+  the multi-statement partial case; a follow-up is per-statement presence tracking.
 
 ## Dependencies
 

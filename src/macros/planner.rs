@@ -155,6 +155,58 @@ impl MacroPlanner {
         // Probe provenance summaries for MacroPlan.provenance
         let mut probe_summaries: Vec<Value> = vec![];
 
+        // ── Authority gate enforcement ────────────────────────────────────────
+        //
+        // Runs BEFORE probes so a missing-authority invocation never triggers
+        // any read-only I/O (LSP queries, file reads). Gate checks depend only
+        // on def.authority_gates and invocation.operator_opt_outs — no probe
+        // results are needed.
+        //
+        // RX-V1 invariant: agents must NOT default or infer gate presence ("delta
+        // looks small" is not a reason). Only explicit operator_opt_outs supply
+        // authority.
+        let mut gate_refusals: Vec<MacroRefusalHit> = vec![];
+        for gate in &def.authority_gates {
+            if invocation.operator_opt_outs.iter().any(|o| o == gate) {
+                // Gate supplied — record in the audit set.
+                opt_outs_used.insert(gate.clone());
+            } else {
+                // Gate missing — collect a typed refusal hit.
+                gate_refusals.push(MacroRefusalHit {
+                    code: "error.authority_required".to_string(),
+                    message: format!(
+                        "Authority gate '{}' is required to invoke macro '{}' but was not \
+                         present in operator_opt_outs. Add '{}' to the invocation's \
+                         operator_opt_outs to acknowledge this effect.",
+                        gate, def.id, gate
+                    ),
+                });
+            }
+        }
+        if !gate_refusals.is_empty() {
+            // Carry opt_outs_used (supplied gates) so the audit field is accurate even
+            // on refusal — the operator can see which gates they got right.
+            let mut opt_outs_vec: Vec<String> = opt_outs_used.iter().cloned().collect();
+            opt_outs_vec.sort();
+            return Ok(MacroPlan {
+                macro_id: def.id.clone(),
+                summary: format!(
+                    "Macro '{}' refused: {} missing authority gate(s)",
+                    def.id,
+                    gate_refusals.len()
+                ),
+                semantic_status: MacroSemanticStatus::TemplateOnly,
+                operations: plan_ops,
+                edits: EditSet::default(),
+                checks: vec![],
+                questions: vec![],
+                refusals: gate_refusals,
+                backends_used: vec![],
+                operator_opt_outs_used: opt_outs_vec,
+                provenance: build_provenance(def, &probe_summaries),
+            });
+        }
+
         for probe in &def.probes {
             // Defense-in-depth: interpolation in probe specs is not supported
             // (should have been caught at registry validate() time, but re-check
@@ -1778,6 +1830,140 @@ mod tests {
             plan.operator_opt_outs_used.is_empty(),
             "create_file doesn't consume authority flags; used set must be empty: {:?}",
             plan.operator_opt_outs_used
+        );
+    }
+
+    // ── Authority gate enforcement ─────────────────────────────────────────────
+
+    #[test]
+    fn authority_gate_missing_from_opt_outs_produces_refusal() {
+        let mut def = minimal_def();
+        def.authority_gates = vec!["acknowledge_public_api_change".to_string()];
+        // Invocation does NOT supply the gate.
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("authority gate refusal should return Ok(MacroPlan)");
+
+        assert!(
+            !plan.refusals.is_empty(),
+            "missing authority gate should produce a refusal"
+        );
+        assert_eq!(
+            plan.refusals[0].code,
+            "error.authority_required",
+            "refusal code must be error.authority_required"
+        );
+        assert!(
+            plan.refusals[0]
+                .message
+                .contains("acknowledge_public_api_change"),
+            "refusal message must name the missing gate: {}",
+            plan.refusals[0].message
+        );
+        assert!(
+            plan.edits.file_edits.is_empty() && plan.edits.file_creates.is_empty(),
+            "authority-gate refusal must have empty EditSet"
+        );
+    }
+
+    #[test]
+    fn authority_gate_present_in_opt_outs_proceeds_and_appears_in_used() {
+        let mut def = minimal_def();
+        def.authority_gates = vec!["acknowledge_public_api_change".to_string()];
+        // Operations list is empty → plan succeeds without touching the backend.
+        let mut inv = minimal_invocation(&def, "/tmp");
+        inv.operator_opt_outs = vec!["acknowledge_public_api_change".to_string()];
+        let ctx = MacroPlannerContext::default();
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("supplied authority gate should allow planning to proceed");
+
+        assert!(
+            plan.refusals.is_empty(),
+            "no refusals expected when gate is supplied"
+        );
+        assert!(
+            plan.operator_opt_outs_used
+                .contains(&"acknowledge_public_api_change".to_string()),
+            "supplied gate must appear in operator_opt_outs_used: {:?}",
+            plan.operator_opt_outs_used
+        );
+    }
+
+    #[test]
+    fn authority_gate_supplied_appears_in_opt_outs_used_even_on_other_gate_refusal() {
+        // Two gates: gate A is supplied, gate B is missing.
+        // Gate A must appear in opt_outs_used even though the plan is refused.
+        let mut def = minimal_def();
+        def.authority_gates = vec![
+            "acknowledge_public_api_change".to_string(),
+            "acknowledge_repr".to_string(),
+        ];
+        let mut inv = minimal_invocation(&def, "/tmp");
+        // Supply only one of the two gates.
+        inv.operator_opt_outs = vec!["acknowledge_public_api_change".to_string()];
+        let ctx = MacroPlannerContext::default();
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("partial gate supply should return Ok(MacroPlan) with refusal");
+
+        // One refusal for the missing gate.
+        assert_eq!(plan.refusals.len(), 1, "exactly one gate is missing");
+        assert_eq!(plan.refusals[0].code, "error.authority_required");
+        assert!(
+            plan.refusals[0].message.contains("acknowledge_repr"),
+            "refusal must name the missing gate: {}",
+            plan.refusals[0].message
+        );
+
+        // The supplied gate must appear in operator_opt_outs_used.
+        assert!(
+            plan.operator_opt_outs_used
+                .contains(&"acknowledge_public_api_change".to_string()),
+            "supplied gate must appear in operator_opt_outs_used even on refusal: {:?}",
+            plan.operator_opt_outs_used
+        );
+    }
+
+    #[test]
+    fn no_authority_gates_declared_does_not_refuse() {
+        // A macro with no authority_gates always proceeds regardless of operator_opt_outs.
+        let def = minimal_def(); // authority_gates = vec![] by default
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("macro with no authority gates should plan without refusal");
+        assert!(plan.refusals.is_empty(), "no refusals expected");
+    }
+
+    #[test]
+    fn authority_gate_refusal_fires_before_regular_refusals() {
+        // A macro with both an authority gate and a regular refusal.
+        // When the gate is missing, we get a gate refusal (not the regular one).
+        let mut def = minimal_def();
+        def.authority_gates = vec!["acknowledge_repr".to_string()];
+        def.refusals = vec![MacroRefusal {
+            when: crate::macros::expr::Predicate::Exists {
+                path: "inputs.foo".into(),
+            },
+            code: "error.regular_refusal".into(),
+            message: "this should not appear".into(),
+        }];
+        // Do NOT supply the gate.
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx)
+            .expect("gate refusal returns Ok(MacroPlan)");
+
+        assert_eq!(plan.refusals.len(), 1, "only the gate refusal should fire");
+        assert_eq!(
+            plan.refusals[0].code,
+            "error.authority_required",
+            "gate refusal must take precedence over regular refusals"
         );
     }
 

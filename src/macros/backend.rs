@@ -104,6 +104,48 @@ pub enum JavaRewriteOp {
         /// present, e.g. `["com.example.core.Port"]`.
         imports: Vec<String>,
     },
+
+    /// Replace the body of an existing method in the target type.
+    ///
+    /// The method is located by `method_name` + `parameter_types` (written form,
+    /// e.g. `["String", "int"]`). If no matching method is found the sidecar
+    /// returns `error.method_not_found`; if more than one match exists it returns
+    /// `error.method_ambiguous`.
+    ReplaceMethodBody {
+        /// Absolute path to the file containing the target type.
+        target_file: String,
+        /// Simple name of the type containing the method.
+        target_type: String,
+        /// Simple name of the method to replace the body of.
+        method_name: String,
+        /// Written parameter types used for disambiguation, e.g. `["String", "int"]`.
+        /// Pass an empty list for no-arg methods.
+        parameter_types: Vec<String>,
+        /// New method body text (statements only, no surrounding braces).
+        new_body: String,
+        /// Fully-qualified import statements to add if not already present.
+        imports: Vec<String>,
+    },
+
+    /// Append one or more statements to the body of an existing method.
+    ///
+    /// `placement` must be `"append"` (the only supported value in v1).
+    InsertStatementInMethod {
+        /// Absolute path to the file containing the target type.
+        target_file: String,
+        /// Simple name of the type containing the method.
+        target_type: String,
+        /// Simple name of the method to insert statements into.
+        method_name: String,
+        /// Written parameter types used for disambiguation.
+        parameter_types: Vec<String>,
+        /// Statement text to insert (one or more Java statements).
+        statement_text: String,
+        /// Insertion position. Must be `"append"` in v1.
+        placement: String,
+        /// Fully-qualified import statements to add if not already present.
+        imports: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -240,6 +282,64 @@ mod tests {
                 assert_eq!(target_type, "FooImpl");
                 assert_eq!(imports, vec!["com.example.Port"]);
             }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_replace_method_body_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::ReplaceMethodBody {
+            target_file: "/repo/src/FooImpl.java".into(),
+            target_type: "FooImpl".into(),
+            method_name: "doWork".into(),
+            parameter_types: vec!["String".into(), "int".into()],
+            new_body: "return input.length() + n;".into(),
+            imports: vec![],
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("replace_method_body"));
+        assert_eq!(v["method_name"], json!("doWork"));
+        assert_eq!(v["parameter_types"][0], json!("String"));
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::ReplaceMethodBody { method_name, parameter_types, new_body, .. } => {
+                assert_eq!(method_name, "doWork");
+                assert_eq!(parameter_types, vec!["String", "int"]);
+                assert!(new_body.contains("length"));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_insert_statement_in_method_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::InsertStatementInMethod {
+            target_file: "/repo/src/FooImpl.java".into(),
+            target_type: "FooImpl".into(),
+            method_name: "init".into(),
+            parameter_types: vec![],
+            statement_text: "this.ready = true;".into(),
+            placement: "append".into(),
+            imports: vec![],
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("insert_statement_in_method"));
+        assert_eq!(v["placement"], json!("append"));
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::InsertStatementInMethod {
+                method_name,
+                placement,
+                statement_text,
+                ..
+            } => {
+                assert_eq!(method_name, "init");
+                assert_eq!(placement, "append");
+                assert!(statement_text.contains("ready"));
+            }
+            _ => panic!("unexpected variant"),
         }
     }
 

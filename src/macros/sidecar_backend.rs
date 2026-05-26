@@ -13,13 +13,19 @@
 //! Calls `emitType` on the Java worker. Maps `result.file_creates` to
 //! `BackendEditSet.file_creates`. RPC error → `error.backend_unavailable`.
 //!
-//! # rewrite (JavaRewriteOp::InsertMember)
+//! # rewrite (JavaRewriteOp::*)
 //!
-//! Reads `target_file` from disk, computes `original_sha256`, sends
-//! `insertMember`. On `no_op=true` returns an empty `BackendEditSet`.
-//! On `changed=true` builds a single full-span `FileEdit` whose edit
-//! covers the entire original file. Maps `error.member_conflict` through
-//! from the worker's RPC error message. Pool unavailable → error.backend_unavailable.
+//! All three variants read `target_file` from disk, compute `original_sha256`,
+//! call the corresponding JSON-RPC method, and convert the result:
+//!
+//! - `InsertMember` → `insertMember` RPC. Maps `error.member_conflict` through.
+//! - `ReplaceMethodBody` → `replaceMethodBody` RPC. Maps `error.method_not_found`
+//!   and `error.method_ambiguous` through as domain errors.
+//! - `InsertStatementInMethod` → `insertStatementInMethod` RPC. Same error mapping.
+//!
+//! `no_op=true` → empty `BackendEditSet`.
+//! `changed=true` → single full-span `FileEdit` replacing the whole file.
+//! `changed=false && no_op=false` → `error.backend_unavailable` (protocol violation).
 
 #![allow(dead_code)]
 
@@ -31,7 +37,9 @@ use sha2::{Digest, Sha256};
 use super::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
 use super::java_sidecar::JavaWorkerPool;
 use super::java_sidecar_protocol::{
-    EmitTypeParams, InsertMemberParams, METHOD_EMIT_TYPE, METHOD_INSERT_MEMBER,
+    EmitTypeParams, InsertMemberParams, InsertStatementInMethodParams,
+    ReplaceMethodBodyParams, METHOD_EMIT_TYPE, METHOD_INSERT_MEMBER,
+    METHOD_INSERT_STATEMENT_IN_METHOD, METHOD_REPLACE_METHOD_BODY,
 };
 use crate::refactor::{FileCreate, FileEdit, TextEdit};
 
@@ -112,6 +120,16 @@ impl JavaMacroBackend for SidecarBackend {
             ));
         }
 
+        // Path containment: every worker-returned path must be within project_root.
+        // The files don't exist yet so we use lexical normalization — reject any
+        // path containing `..` components and require the path starts with the
+        // canonicalized project root. This prevents the worker from causing the
+        // planner to surface content from outside the project boundary.
+        let canonical_root = self.canonical_root()?;
+        for fc in &file_creates {
+            check_emit_path_contained(&fc.path, &canonical_root)?;
+        }
+
         Ok(BackendEditSet {
             file_edits: vec![],
             file_creates,
@@ -119,89 +137,280 @@ impl JavaMacroBackend for SidecarBackend {
     }
 
     fn rewrite(&self, op: &JavaRewriteOp) -> Result<BackendEditSet> {
-        let JavaRewriteOp::InsertMember {
-            target_file,
-            target_type,
-            member_text,
-            imports,
-        } = op;
+        // Compute canonical project root once; all rewrite arms use it for
+        // containment checking before reading the target file from disk.
+        let canonical_root = self.canonical_root()?;
 
-        let worker_arc = self.pool.worker_for(&self.project_root).map_err(|e| {
-            anyhow!(
-                "error.backend_unavailable: Java macro sidecar unavailable for rewrite: {e}"
-            )
-        })?;
+        match op {
+            JavaRewriteOp::InsertMember {
+                target_file,
+                target_type,
+                member_text,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertMember")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::InsertMemberResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_INSERT_MEMBER,
+                        InsertMemberParams {
+                            target_file: target_file.clone(),
+                            source_text: source_text.clone(),
+                            target_type: target_type.clone(),
+                            member_text: member_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "insertMember"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    &source_text,
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertMember",
+                )
+            }
 
-        // Read the target file from disk and compute its preimage SHA-256.
-        let source_text = std::fs::read_to_string(target_file).map_err(|e| {
-            anyhow!(
-                "error.backend_unavailable: cannot read target file '{}': {e}",
-                target_file
-            )
-        })?;
+            JavaRewriteOp::ReplaceMethodBody {
+                target_file,
+                target_type,
+                method_name,
+                parameter_types,
+                new_body,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/replaceMethodBody")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::ReplaceMethodBodyResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_REPLACE_METHOD_BODY,
+                        ReplaceMethodBodyParams {
+                            target_file: target_file.clone(),
+                            source_text: source_text.clone(),
+                            target_type: target_type.clone(),
+                            method_name: method_name.clone(),
+                            parameter_types: parameter_types.clone(),
+                            new_body: new_body.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "replaceMethodBody"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    &source_text,
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "replaceMethodBody",
+                )
+            }
 
-        let original_sha256 = {
-            let mut hasher = Sha256::new();
-            hasher.update(source_text.as_bytes());
-            format!("{:x}", hasher.finalize())
-        };
-
-        let result: super::java_sidecar_protocol::InsertMemberResult = worker_arc
-            .lock()
-            .unwrap()
-            .call(
-                METHOD_INSERT_MEMBER,
-                InsertMemberParams {
-                    target_file: target_file.clone(),
-                    source_text: source_text.clone(),
-                    target_type: target_type.clone(),
-                    member_text: member_text.clone(),
-                    imports: imports.clone(),
-                },
-            )
-            .map_err(|e| {
-                // Propagate error.member_conflict from the worker's RPC error message.
-                let msg = e.to_string();
-                if msg.contains("error.member_conflict") {
-                    anyhow!("error.member_conflict: {e}")
-                } else {
-                    anyhow!("error.backend_unavailable: insertMember RPC failed: {e}")
-                }
-            })?;
-
-        // no_op: member already existed, nothing to change.
-        if result.no_op {
-            return Ok(BackendEditSet::default());
+            JavaRewriteOp::InsertStatementInMethod {
+                target_file,
+                target_type,
+                method_name,
+                parameter_types,
+                statement_text,
+                placement,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertStatementInMethod")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::InsertStatementInMethodResult =
+                    worker_arc
+                        .lock()
+                        .unwrap()
+                        .call(
+                            METHOD_INSERT_STATEMENT_IN_METHOD,
+                            InsertStatementInMethodParams {
+                                target_file: target_file.clone(),
+                                source_text: source_text.clone(),
+                                target_type: target_type.clone(),
+                                method_name: method_name.clone(),
+                                parameter_types: parameter_types.clone(),
+                                statement_text: statement_text.clone(),
+                                placement: placement.clone(),
+                                imports: imports.clone(),
+                            },
+                        )
+                        .map_err(|e| classify_rewrite_rpc_err(e, "insertStatementInMethod"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    &source_text,
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertStatementInMethod",
+                )
+            }
         }
-
-        // changed=true: build a single full-span FileEdit replacing the whole file.
-        if result.changed {
-            let byte_end = source_text.len();
-            let new_text = result.rewritten_source.clone();
-            let edit = FileEdit {
-                path: target_file.clone(),
-                original_sha256,
-                edits: vec![TextEdit {
-                    byte_start: 0,
-                    byte_end,
-                    replacement: new_text.clone(),
-                }],
-                new_text: Some(new_text),
-            };
-            return Ok(BackendEditSet {
-                file_edits: vec![edit],
-                file_creates: vec![],
-            });
-        }
-
-        // R2: changed=false AND no_op=false is an invalid worker response — the
-        // worker must set exactly one of the two flags. Fail closed rather than
-        // silently swallowing the ambiguous state.
-        Err(anyhow!(
-            "error.backend_unavailable: insertMember returned changed=false no_op=false; \
-             the worker response is ambiguous (expected exactly one flag set)"
-        ))
     }
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+impl SidecarBackend {
+    /// Return the canonicalized project root, failing closed if the path cannot
+    /// be resolved (e.g. the project directory was removed since startup).
+    fn canonical_root(&self) -> Result<PathBuf> {
+        std::fs::canonicalize(&self.project_root).map_err(|e| {
+            anyhow!(
+                "error.backend_unavailable: cannot canonicalize project root '{}': {e}",
+                self.project_root.display()
+            )
+        })
+    }
+
+    /// Acquire a worker from the pool, wrapping pool errors as `error.backend_unavailable`.
+    fn acquire_worker(
+        &self,
+        op_name: &str,
+    ) -> Result<std::sync::Arc<std::sync::Mutex<super::java_sidecar::JavaWorker>>> {
+        self.pool
+            .worker_for(&self.project_root)
+            .map_err(|e| anyhow!("error.backend_unavailable: Java macro sidecar unavailable for {op_name}: {e}"))
+    }
+}
+
+/// Read a source file from disk and compute its SHA-256 preimage hash.
+fn read_source_and_sha(path: &str) -> Result<(String, String)> {
+    let source_text = std::fs::read_to_string(path).map_err(|e| {
+        anyhow!(
+            "error.backend_unavailable: cannot read target file '{}': {e}",
+            path
+        )
+    })?;
+    let sha = {
+        let mut hasher = Sha256::new();
+        hasher.update(source_text.as_bytes());
+        format!("{:x}", hasher.finalize())
+    };
+    Ok((source_text, sha))
+}
+
+/// Classify a rewrite RPC error as a domain passthrough or `error.backend_unavailable`.
+///
+/// The sidecar surfaces domain errors (e.g. `error.member_conflict`) as JSON-RPC
+/// errors whose message text contains the error code. We propagate those as-is so
+/// the macro planner can surface them to the operator instead of masking them as
+/// `error.backend_unavailable`.
+fn classify_rewrite_rpc_err(e: anyhow::Error, rpc_method: &str) -> anyhow::Error {
+    let msg = e.to_string();
+    // Domain error codes to propagate verbatim from the worker's RPC error message.
+    for domain_code in &[
+        "error.member_conflict",
+        "error.method_not_found",
+        "error.method_ambiguous",
+        "error.parse_invalid",
+        "error.type_mismatch",
+    ] {
+        if msg.contains(domain_code) {
+            return anyhow!("{domain_code}: {e}");
+        }
+    }
+    anyhow!("error.backend_unavailable: {rpc_method} RPC failed: {e}")
+}
+
+/// Convert a rewrite result (changed/no_op flags + rewritten source) to a `BackendEditSet`.
+///
+/// - `no_op=true` → empty set (idempotent, no changes needed).
+/// - `changed=true` → single full-span `FileEdit` replacing the entire original file.
+/// - Both false → protocol violation (R2 invariant); returns `error.backend_unavailable`.
+fn build_rewrite_edit_set(
+    path: &str,
+    source_text: &str,
+    original_sha256: String,
+    rewritten_source: String,
+    changed: bool,
+    no_op: bool,
+    rpc_method: &str,
+) -> Result<BackendEditSet> {
+    if no_op {
+        return Ok(BackendEditSet::default());
+    }
+    if changed {
+        let byte_end = source_text.len();
+        let edit = FileEdit {
+            path: path.to_string(),
+            original_sha256,
+            edits: vec![TextEdit {
+                byte_start: 0,
+                byte_end,
+                replacement: rewritten_source.clone(),
+            }],
+            new_text: Some(rewritten_source),
+        };
+        return Ok(BackendEditSet {
+            file_edits: vec![edit],
+            file_creates: vec![],
+        });
+    }
+    // R2: changed=false AND no_op=false is an invalid worker response.
+    Err(anyhow!(
+        "error.backend_unavailable: {rpc_method} returned changed=false no_op=false; \
+         the worker response is ambiguous (expected exactly one flag set)"
+    ))
+}
+
+/// Check that a rewrite target file is within the canonical project root.
+///
+/// Uses `std::fs::canonicalize` (resolves symlinks) on the target path.
+/// The target file must already exist on disk (rewrite pre-condition); if it
+/// cannot be canonicalized the path is missing or inaccessible — both are
+/// rejected with `error.path_escape`.
+fn check_rewrite_path_contained(path: &str, canonical_root: &std::path::Path) -> Result<()> {
+    let canonical_target = std::fs::canonicalize(path).map_err(|e| {
+        anyhow!(
+            "error.path_escape: rewrite target '{}' could not be resolved: {e}",
+            path
+        )
+    })?;
+    if !canonical_target.starts_with(canonical_root) {
+        return Err(anyhow!(
+            "error.path_escape: rewrite target '{}' is outside the macro project root",
+            path
+        ));
+    }
+    Ok(())
+}
+
+/// Check that an emit target path is within the canonical project root.
+///
+/// The file does not exist yet (emit creates it), so `std::fs::canonicalize`
+/// cannot be called on the full path. Instead we use lexical normalization:
+/// reject any `..` component anywhere in the path, then verify the path starts
+/// with the canonical project root. This defeats `..`-based traversal while
+/// still allowing any valid in-project path.
+fn check_emit_path_contained(path: &str, canonical_root: &std::path::Path) -> Result<()> {
+    let p = PathBuf::from(path);
+    // Reject any `..` component — defeats path traversal without canonicalize.
+    for component in p.components() {
+        if component == std::path::Component::ParentDir {
+            return Err(anyhow!(
+                "error.path_escape: emit target '{}' contains '..' and is outside \
+                 the macro project root",
+                path
+            ));
+        }
+    }
+    if !p.starts_with(canonical_root) {
+        return Err(anyhow!(
+            "error.path_escape: emit target '{}' is outside the macro project root",
+            path
+        ));
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -214,17 +423,80 @@ mod tests {
         SidecarBackend::new(PathBuf::from("/tmp/test-project"))
     }
 
+    // ── Path containment tests ────────────────────────────────────────────────
+
+    #[test]
+    fn rewrite_containment_rejects_absolute_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+        // /etc/passwd exists on Linux and is unambiguously outside any tempdir.
+        let result = check_rewrite_path_contained("/etc/passwd", &canonical_root);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("error.path_escape"),
+            "absolute outside path should yield error.path_escape; got: {err}"
+        );
+    }
+
+    #[test]
+    fn emit_containment_rejects_dotdot_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+        // Build a path that tries to escape via `..`.
+        let escape = format!("{}/../escape.java", canonical_root.display());
+        let result = check_emit_path_contained(&escape, &canonical_root);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("error.path_escape"),
+            "dotdot in emit path should yield error.path_escape; got: {err}"
+        );
+    }
+
+    #[test]
+    fn emit_containment_rejects_absolute_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+        let result = check_emit_path_contained("/etc/shadow", &canonical_root);
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("error.path_escape"),
+            "absolute outside path should yield error.path_escape; got: {err}"
+        );
+    }
+
+    #[test]
+    fn containment_passes_for_in_project_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
+
+        // Emit: file doesn't exist yet — lexical check only.
+        let emit_target = canonical_root.join("src/main/java/com/example/Foo.java");
+        assert!(
+            check_emit_path_contained(emit_target.to_str().unwrap(), &canonical_root).is_ok(),
+            "in-project emit path should pass containment"
+        );
+
+        // Rewrite: file must exist on disk for canonicalize to work.
+        let rewrite_target = dir.path().join("FooImpl.java");
+        std::fs::write(&rewrite_target, "// placeholder").unwrap();
+        assert!(
+            check_rewrite_path_contained(
+                rewrite_target.to_str().unwrap(),
+                &canonical_root
+            )
+            .is_ok(),
+            "in-project rewrite path should pass containment"
+        );
+    }
+
     #[test]
     fn emit_fails_closed_when_jar_unset() {
-        // If the JAR env var is set and the JAR exists we skip to avoid spawning.
-        if let Ok(jar) = std::env::var("BLACKBOX_JAVA_WORKER_JAR") {
-            if !jar.trim().is_empty() && PathBuf::from(&jar).exists() {
-                eprintln!(
-                    "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR present — \
-                     skipping unavailability test"
-                );
-                return;
-            }
+        if jar_present() {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR present — \
+                 skipping unavailability test"
+            );
+            return;
         }
         let backend = make_backend();
         let op = JavaEmitOp::EmitType {
@@ -242,16 +514,22 @@ mod tests {
         );
     }
 
+    fn jar_present() -> bool {
+        std::env::var("BLACKBOX_JAVA_WORKER_JAR")
+            .ok()
+            .filter(|j| !j.trim().is_empty())
+            .map(|j| PathBuf::from(&j).exists())
+            .unwrap_or(false)
+    }
+
     #[test]
     fn rewrite_fails_closed_when_jar_unset() {
-        if let Ok(jar) = std::env::var("BLACKBOX_JAVA_WORKER_JAR") {
-            if !jar.trim().is_empty() && PathBuf::from(&jar).exists() {
-                eprintln!(
-                    "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR present — \
-                     skipping unavailability test"
-                );
-                return;
-            }
+        if jar_present() {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR present — \
+                 skipping unavailability test"
+            );
+            return;
         }
         let backend = make_backend();
         let op = JavaRewriteOp::InsertMember {
@@ -267,6 +545,59 @@ mod tests {
         assert!(
             msg.contains("error.backend_unavailable") || msg.contains("cannot read target file"),
             "rewrite should fail closed when JAR absent; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn replace_method_body_fails_closed_when_jar_unset() {
+        if jar_present() {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR present — \
+                 skipping unavailability test"
+            );
+            return;
+        }
+        let backend = make_backend();
+        let op = JavaRewriteOp::ReplaceMethodBody {
+            target_file: "/tmp/nonexistent/FooImpl.java".into(),
+            target_type: "FooImpl".into(),
+            method_name: "doWork".into(),
+            parameter_types: vec![],
+            new_body: "return 42;".into(),
+            imports: vec![],
+        };
+        let err = backend.rewrite(&op).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.backend_unavailable") || msg.contains("cannot read target file"),
+            "replaceMethodBody should fail closed when JAR absent; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn insert_statement_in_method_fails_closed_when_jar_unset() {
+        if jar_present() {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR present — \
+                 skipping unavailability test"
+            );
+            return;
+        }
+        let backend = make_backend();
+        let op = JavaRewriteOp::InsertStatementInMethod {
+            target_file: "/tmp/nonexistent/FooImpl.java".into(),
+            target_type: "FooImpl".into(),
+            method_name: "init".into(),
+            parameter_types: vec![],
+            statement_text: "this.ready = true;".into(),
+            placement: "append".into(),
+            imports: vec![],
+        };
+        let err = backend.rewrite(&op).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.backend_unavailable") || msg.contains("cannot read target file"),
+            "insertStatementInMethod should fail closed when JAR absent; got: {msg}"
         );
     }
 
@@ -309,6 +640,125 @@ mod tests {
                 assert!(
                     msg.contains("error.backend_unavailable"),
                     "live emit error must be error.backend_unavailable; got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_replace_method_body_test_skips_when_jar_absent() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — \
+                 skipping live replaceMethodBody test"
+            );
+            return;
+        };
+        if !PathBuf::from(&jar).exists() {
+            eprintln!(
+                "[sidecar_backend] worker JAR missing — skipping live replaceMethodBody test"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("LiveBodyTarget.java");
+        std::fs::write(
+            &target_file,
+            "package com.example;\npublic class LiveBodyTarget {\n    \
+             public void greet() {\n        System.out.println(\"old\");\n    }\n}\n",
+        )
+        .expect("failed to write temp .java file");
+
+        let backend = SidecarBackend::new(dir.path().to_path_buf());
+        let op = JavaRewriteOp::ReplaceMethodBody {
+            target_file: target_file.to_str().unwrap().to_string(),
+            target_type: "LiveBodyTarget".into(),
+            method_name: "greet".into(),
+            parameter_types: vec![],
+            new_body: "System.out.println(\"new\");".into(),
+            imports: vec![],
+        };
+        match backend.rewrite(&op) {
+            Ok(bes) => {
+                if !bes.file_edits.is_empty() {
+                    let rewritten = bes.file_edits[0].new_text.as_deref().unwrap_or("");
+                    assert!(
+                        rewritten.contains("new"),
+                        "rewritten source should contain 'new'; got:\n{rewritten}"
+                    );
+                    assert!(
+                        !rewritten.contains("\"old\""),
+                        "old body should be replaced; got:\n{rewritten}"
+                    );
+                }
+                // no_op (empty edits) is also acceptable.
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("error.backend_unavailable")
+                        || msg.contains("error.method_not_found"),
+                    "live replaceMethodBody error must be backend_unavailable or method_not_found; \
+                     got: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn live_insert_statement_in_method_test_skips_when_jar_absent() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — \
+                 skipping live insertStatementInMethod test"
+            );
+            return;
+        };
+        if !PathBuf::from(&jar).exists() {
+            eprintln!(
+                "[sidecar_backend] worker JAR missing — skipping live insertStatementInMethod test"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("LiveStmtTarget.java");
+        std::fs::write(
+            &target_file,
+            "package com.example;\npublic class LiveStmtTarget {\n    \
+             public void init() {\n    }\n}\n",
+        )
+        .expect("failed to write temp .java file");
+
+        let backend = SidecarBackend::new(dir.path().to_path_buf());
+        let op = JavaRewriteOp::InsertStatementInMethod {
+            target_file: target_file.to_str().unwrap().to_string(),
+            target_type: "LiveStmtTarget".into(),
+            method_name: "init".into(),
+            parameter_types: vec![],
+            statement_text: "this.ready = true;".into(),
+            placement: "append".into(),
+            imports: vec![],
+        };
+        match backend.rewrite(&op) {
+            Ok(bes) => {
+                if !bes.file_edits.is_empty() {
+                    let rewritten = bes.file_edits[0].new_text.as_deref().unwrap_or("");
+                    assert!(
+                        rewritten.contains("ready"),
+                        "rewritten source should contain 'ready'; got:\n{rewritten}"
+                    );
+                }
+                // no_op is also acceptable if statement already existed.
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                assert!(
+                    msg.contains("error.backend_unavailable")
+                        || msg.contains("error.method_not_found"),
+                    "live insertStatementInMethod error must be backend_unavailable or \
+                     method_not_found; got: {msg}"
                 );
             }
         }

@@ -14,11 +14,15 @@ final class Dispatcher {
     private final ObjectMapper mapper;
     private final EmitTypeHandler emitTypeHandler;
     private final InsertMemberHandler insertMemberHandler;
+    private final ReplaceMethodBodyHandler replaceMethodBodyHandler;
+    private final InsertStatementInMethodHandler insertStatementInMethodHandler;
 
     Dispatcher(ObjectMapper mapper) {
         this.mapper = mapper;
         this.emitTypeHandler = new EmitTypeHandler();
         this.insertMemberHandler = new InsertMemberHandler();
+        this.replaceMethodBodyHandler = new ReplaceMethodBodyHandler();
+        this.insertStatementInMethodHandler = new InsertStatementInMethodHandler();
     }
 
     RpcResponse dispatch(RpcRequest request) {
@@ -34,6 +38,10 @@ final class Dispatcher {
                     return handleEmitType(request);
                 case Methods.INSERT_MEMBER:
                     return handleInsertMember(request);
+                case Methods.REPLACE_METHOD_BODY:
+                    return handleReplaceMethodBody(request);
+                case Methods.INSERT_STATEMENT_IN_METHOD:
+                    return handleInsertStatementInMethod(request);
                 case Methods.SHUTDOWN:
                     return handleShutdown(request);
                 default:
@@ -68,7 +76,11 @@ final class Dispatcher {
                 "1.0.0",                        // worker_version
                 javaVersion,
                 openrewriteVersion,
-                java.util.List.of("emit_type", "insert_member"));
+                java.util.List.of(
+                        "emit_type",
+                        "insert_member",
+                        "replace_method_body",
+                        "insert_statement_in_method"));
 
         return success(request.getId(), caps);
     }
@@ -82,6 +94,19 @@ final class Dispatcher {
     private RpcResponse handleInsertMember(RpcRequest request) {
         InsertMemberParams params = deserializeParams(request, InsertMemberParams.class);
         InsertMemberResult result = insertMemberHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handleReplaceMethodBody(RpcRequest request) {
+        ReplaceMethodBodyParams params = deserializeParams(request, ReplaceMethodBodyParams.class);
+        ReplaceMethodBodyResult result = replaceMethodBodyHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handleInsertStatementInMethod(RpcRequest request) {
+        InsertStatementInMethodParams params =
+                deserializeParams(request, InsertStatementInMethodParams.class);
+        InsertStatementInMethodResult result = insertStatementInMethodHandler.handle(params);
         return success(request.getId(), result);
     }
 
