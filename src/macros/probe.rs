@@ -17,7 +17,7 @@
 //! - [`UnavailableProbeRunner`] — fail-closed default: every call returns
 //!   `error.probe_backend_unavailable`.
 //! - [`CodeNavProbeRunner`] — real runner backed by `code_query`,
-//!   `code_symbols_live`, and optionally `java_workspace_symbols`.
+//!   `code_symbols_live`, `project_text_search`, and optionally `java_workspace_symbols`.
 //!
 //! # Safety invariants
 //!
@@ -43,6 +43,7 @@ use serde_json::Value;
 use crate::code_nav::semantic::{WorkspaceSymbolItem, java_workspace_symbols};
 use crate::code_nav::{
     CodeQueryParams, CodeQueryResponse, CodeSymbolSearchParams, CodeSymbolSearchResponse,
+    ProjectTextMatch, ProjectTextNormalization, project_text_search,
 };
 use crate::lsp::LspSessionManager;
 use crate::macros::expr::Context;
@@ -149,6 +150,44 @@ pub enum ProbeSpec {
         path_contains: Option<String>,
     },
 
+    /// Generic project-wide text search — scan every source file for one or
+    /// more literal string needles.
+    ///
+    /// Backed by [`crate::code_nav::project_text_search`].
+    ///
+    /// Probe output shape:
+    /// ```json
+    /// { "exists": bool, "count": usize, "matched_needles": [...], "files": [...] }
+    /// ```
+    ///
+    /// **Truncation safety**: when the file scan is capped and `exists=false`,
+    /// the runner returns `Err("error.probe_truncated")` — the needles may
+    /// exist in files beyond the cap.  Add `languages` or `path_contains` to
+    /// narrow the search and avoid hitting the cap.
+    ProjectText {
+        /// Literal strings to look for in file content.
+        needles: Vec<String>,
+        /// `"any"` (default): match when ANY needle is present.
+        /// `"all"`: match only when ALL needles are present in the same file.
+        #[serde(rename = "match", default)]
+        match_mode: ProjectTextMatch,
+        /// Optional language filter, e.g. `["java"]`.
+        #[serde(default)]
+        languages: Option<Vec<String>>,
+        /// Optional path substring filter.
+        #[serde(default)]
+        path_contains: Option<String>,
+        /// When `false`, case-insensitive ASCII comparison. Default `true`.
+        #[serde(default = "default_true")]
+        case_sensitive: bool,
+        /// `"raw"` (default) or `"remove_whitespace"`.
+        #[serde(default)]
+        normalization: ProjectTextNormalization,
+        /// Maximum files to scan. `None` uses the built-in default (5000).
+        #[serde(default)]
+        max_files: Option<usize>,
+    },
+
     /// Semantic workspace-symbol lookup via JDTLS.
     ///
     /// Requires an active [`LspSessionManager`]. Fails closed with
@@ -158,6 +197,10 @@ pub enum ProbeSpec {
         /// Query string forwarded to JDTLS `workspace/symbol`.
         query: String,
     },
+}
+
+fn default_true() -> bool {
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -541,6 +584,105 @@ impl CodeNavProbeRunner {
     }
 
     // -----------------------------------------------------------------------
+    // ProjectText
+    // -----------------------------------------------------------------------
+
+    fn run_project_text(
+        &self,
+        needles: &[String],
+        match_mode: &ProjectTextMatch,
+        languages: Option<&[String]>,
+        path_contains: Option<&str>,
+        case_sensitive: bool,
+        normalization: &ProjectTextNormalization,
+        max_files: Option<usize>,
+        project_dir: &str,
+    ) -> Result<ProbeOutput> {
+        // Validate needles: at least one required, each non-empty.
+        if needles.is_empty() {
+            return Err(anyhow!(
+                "error.empty_needles: project_text probe requires at least one needle"
+            ));
+        }
+        for (i, n) in needles.iter().enumerate() {
+            if n.is_empty() {
+                return Err(anyhow!(
+                    "error.empty_needle: project_text probe needle[{i}] is empty"
+                ));
+            }
+            if n.len() > MAX_QUERY_BYTES {
+                return Err(anyhow!(
+                    "error.query_too_long: project_text probe needle[{i}] is {} bytes (max {})",
+                    n.len(),
+                    MAX_QUERY_BYTES
+                ));
+            }
+        }
+
+        let result = project_text_search(
+            project_dir,
+            needles,
+            match_mode,
+            languages,
+            path_contains,
+            case_sensitive,
+            normalization,
+            max_files,
+        )?;
+
+        // Fail closed: truncated scan with no matches is unsafe — needles may
+        // exist beyond the cap. Surface an explicit error instead of returning
+        // exists=false, which could drive a false-absence refusal to skip.
+        if result.truncated && !result.exists {
+            return Err(anyhow!(
+                "error.probe_truncated: project_text scan capped at {} files; \
+                 no matches found but search was incomplete. \
+                 Add 'languages' or 'path_contains' to narrow the search, \
+                 or increase 'max_files'.",
+                max_files.unwrap_or(crate::code_nav::TEXT_SCAN_DEFAULT_MAX_FILES)
+            ));
+        }
+
+        let mut diagnostics = Vec::new();
+        let mut truncated = result.truncated;
+
+        // Cap the files array to MAX_ITEMS_PER_PROBE for the probe output.
+        let files: Vec<Value> = result
+            .files
+            .iter()
+            .take(MAX_ITEMS_PER_PROBE)
+            .map(|f| Value::String(f.clone()))
+            .collect();
+        if files.len() < result.files.len() {
+            truncated = true;
+            diagnostics.push(format!(
+                "files array capped at {} (total matching files={})",
+                files.len(),
+                result.count
+            ));
+        }
+
+        let value = Self::cap_value(
+            serde_json::json!({
+                "exists": result.exists,
+                "count": result.count,
+                "matched_needles": result.matched_needles,
+                "files": files
+            }),
+            &mut truncated,
+            &mut diagnostics,
+            "files",
+        );
+
+        Ok(ProbeOutput {
+            value,
+            semantic_status: MacroSemanticStatus::SyntaxOnly,
+            truncated,
+            diagnostics,
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // WorkspaceSymbol
     // -----------------------------------------------------------------------
 
@@ -732,6 +874,24 @@ impl ProbeRunner for CodeNavProbeRunner {
                 languages.as_deref(),
                 name_equals.as_deref(),
                 path_contains.as_deref(),
+                &invocation.project_dir,
+            ),
+            ProbeSpec::ProjectText {
+                needles,
+                match_mode,
+                languages,
+                path_contains,
+                case_sensitive,
+                normalization,
+                max_files,
+            } => self.run_project_text(
+                needles,
+                match_mode,
+                languages.as_deref(),
+                path_contains.as_deref(),
+                *case_sensitive,
+                normalization,
+                *max_files,
                 &invocation.project_dir,
             ),
             ProbeSpec::WorkspaceSymbol { query } => {
@@ -1016,6 +1176,15 @@ mod tests {
                 name_equals: None,
                 path_contains: None,
             },
+            ProbeSpec::ProjectText {
+                needles: vec!["import com.example.Foo".into()],
+                match_mode: ProjectTextMatch::Any,
+                languages: Some(vec!["java".into()]),
+                path_contains: None,
+                case_sensitive: true,
+                normalization: ProjectTextNormalization::Raw,
+                max_files: None,
+            },
             ProbeSpec::WorkspaceSymbol {
                 query: "PaymentService".into(),
             },
@@ -1025,6 +1194,219 @@ mod tests {
             let back: ProbeSpec = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(spec, back, "round-trip failed for {json}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // ProbeSpec::ProjectText deserialization
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn probe_spec_project_text_deserialize_minimal() {
+        let json = json!({
+            "kind": "project_text",
+            "needles": ["import com.example.Service"]
+        });
+        let spec: ProbeSpec =
+            serde_json::from_value(json).expect("deserialize ProjectText minimal");
+        match spec {
+            ProbeSpec::ProjectText {
+                needles,
+                match_mode,
+                case_sensitive,
+                normalization,
+                languages,
+                path_contains,
+                max_files,
+            } => {
+                assert_eq!(needles, vec!["import com.example.Service"]);
+                assert_eq!(match_mode, ProjectTextMatch::Any);
+                assert!(case_sensitive, "default case_sensitive must be true");
+                assert_eq!(normalization, ProjectTextNormalization::Raw);
+                assert!(languages.is_none());
+                assert!(path_contains.is_none());
+                assert!(max_files.is_none());
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn probe_spec_project_text_deserialize_full() {
+        let json = json!({
+            "kind": "project_text",
+            "needles": ["import com.example.A", "import com.example.B"],
+            "match": "all",
+            "languages": ["java"],
+            "path_contains": "src/main",
+            "case_sensitive": false,
+            "normalization": "remove_whitespace",
+            "max_files": 100
+        });
+        let spec: ProbeSpec = serde_json::from_value(json).expect("deserialize ProjectText full");
+        match spec {
+            ProbeSpec::ProjectText {
+                needles,
+                match_mode,
+                languages,
+                path_contains,
+                case_sensitive,
+                normalization,
+                max_files,
+            } => {
+                assert_eq!(needles.len(), 2);
+                assert_eq!(match_mode, ProjectTextMatch::All);
+                assert_eq!(languages.as_deref(), Some(["java".to_string()].as_ref()));
+                assert_eq!(path_contains.as_deref(), Some("src/main"));
+                assert!(!case_sensitive);
+                assert_eq!(normalization, ProjectTextNormalization::RemoveWhitespace);
+                assert_eq!(max_files, Some(100));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    /// Unknown `match` value must fail to deserialize (fail closed).
+    #[test]
+    fn probe_spec_project_text_unknown_match_fails_to_deserialize() {
+        let json = serde_json::json!({
+            "kind": "project_text",
+            "needles": ["foo"],
+            "match": "unknown_value"
+        });
+        let result: serde_json::Result<ProbeSpec> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "unknown match mode must be a deserialization error (fail closed)"
+        );
+    }
+
+    /// Unknown `normalization` value must fail to deserialize (fail closed).
+    #[test]
+    fn probe_spec_project_text_unknown_normalization_fails_to_deserialize() {
+        let json = serde_json::json!({
+            "kind": "project_text",
+            "needles": ["foo"],
+            "normalization": "unknown_normalization"
+        });
+        let result: serde_json::Result<ProbeSpec> = serde_json::from_value(json);
+        assert!(
+            result.is_err(),
+            "unknown normalization must be a deserialization error (fail closed)"
+        );
+    }
+
+    /// ProjectText probe finds files containing the needle.
+    #[test]
+    fn project_text_probe_finds_match() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let proj = dir.path().to_str().unwrap().to_owned();
+
+        // Write a Java file containing the needle.
+        let src = dir.path().join("Foo.java");
+        fs::write(&src, "import com.example.Service;\npublic class Foo {}").unwrap();
+
+        let runner = CodeNavProbeRunner::new(None, vec![]);
+        let spec = ProbeSpec::ProjectText {
+            needles: vec!["import com.example.Service".into()],
+            match_mode: ProjectTextMatch::Any,
+            languages: None,
+            path_contains: None,
+            case_sensitive: true,
+            normalization: ProjectTextNormalization::Raw,
+            max_files: None,
+        };
+        let inv = minimal_invocation(&proj);
+        let out = runner
+            .run_probe("text", &spec, &Context::default(), &inv)
+            .expect("probe should succeed");
+        assert_eq!(out.value["exists"], true);
+        assert_eq!(out.value["count"], 1);
+        let needles_arr = out.value["matched_needles"].as_array().unwrap();
+        assert!(
+            needles_arr.iter().any(|v| v == "import com.example.Service"),
+            "matched_needles should contain the needle"
+        );
+    }
+
+    /// ProjectText probe returns exists=false for no match (non-truncated).
+    #[test]
+    fn project_text_probe_no_match() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let proj = dir.path().to_str().unwrap().to_owned();
+        fs::write(dir.path().join("Empty.java"), "public class Empty {}").unwrap();
+
+        let runner = CodeNavProbeRunner::new(None, vec![]);
+        let spec = ProbeSpec::ProjectText {
+            needles: vec!["import com.example.Missing".into()],
+            match_mode: ProjectTextMatch::Any,
+            languages: None,
+            path_contains: None,
+            case_sensitive: true,
+            normalization: ProjectTextNormalization::Raw,
+            max_files: None,
+        };
+        let inv = minimal_invocation(&proj);
+        let out = runner
+            .run_probe("text", &spec, &Context::default(), &inv)
+            .expect("probe should succeed (no match is not an error when not truncated)");
+        assert_eq!(out.value["exists"], false);
+        assert_eq!(out.value["count"], 0);
+    }
+
+    /// ProjectText probe with max_files=1 and no match → truncated → fails closed.
+    #[test]
+    fn project_text_probe_truncated_no_match_fails_closed() {
+        use tempfile::tempdir;
+        let dir = tempdir().expect("tempdir");
+        let proj = dir.path().to_str().unwrap().to_owned();
+        // Write two files so the cap of 1 causes truncation.
+        fs::write(dir.path().join("A.java"), "public class A {}").unwrap();
+        fs::write(dir.path().join("B.java"), "public class B {}").unwrap();
+
+        let runner = CodeNavProbeRunner::new(None, vec![]);
+        let spec = ProbeSpec::ProjectText {
+            needles: vec!["import com.example.Missing".into()],
+            match_mode: ProjectTextMatch::Any,
+            languages: None,
+            path_contains: None,
+            case_sensitive: true,
+            normalization: ProjectTextNormalization::Raw,
+            max_files: Some(1), // force truncation
+        };
+        let inv = minimal_invocation(&proj);
+        let err = runner
+            .run_probe("text", &spec, &Context::default(), &inv)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.probe_truncated"),
+            "must fail closed on truncated-no-match: {msg}"
+        );
+    }
+
+    /// UnavailableProbeRunner fails closed for ProjectText too.
+    #[test]
+    fn unavailable_runner_project_text_fails_closed() {
+        let runner = unavailable_runner();
+        let spec = ProbeSpec::ProjectText {
+            needles: vec!["import com.example.Foo".into()],
+            match_mode: ProjectTextMatch::Any,
+            languages: None,
+            path_contains: None,
+            case_sensitive: true,
+            normalization: ProjectTextNormalization::Raw,
+            max_files: None,
+        };
+        let inv = minimal_invocation("/tmp");
+        let err = runner
+            .run_probe("text", &spec, &Context::default(), &inv)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("error.probe_backend_unavailable"),
+            "expected backend_unavailable, got: {err}"
+        );
     }
 
     // -----------------------------------------------------------------------

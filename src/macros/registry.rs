@@ -193,12 +193,18 @@ impl MacroRegistry {
     /// in builtin files are compile-time panics (caught by the `builtin_roundtrip`
     /// unit test before release).
     fn builtin_definitions() -> Vec<MacroDefinition> {
-        const BUILTINS: &[(&str, &str)] = &[(
-            "java.add_service_boundary",
-            include_str!(
-                "../../system-defaults/macros/java.add_service_boundary.json"
+        const BUILTINS: &[(&str, &str)] = &[
+            (
+                "java.add_service_boundary",
+                include_str!("../../system-defaults/macros/java.add_service_boundary.json"),
             ),
-        )];
+            (
+                "builtin.java.vaadin.ensure_provider_bindings",
+                include_str!(
+                    "../../system-defaults/macros/builtin.java.vaadin.ensure_provider_bindings.json"
+                ),
+            ),
+        ];
 
         let mut out = Vec::with_capacity(BUILTINS.len());
         for (id, src) in BUILTINS {
@@ -541,7 +547,7 @@ impl MacroRegistry {
                         &format!("probes[{i}].spec"),
                         &format!(
                             "invalid or unknown probe spec kind (bounded to code_query, \
-                             code_symbols, workspace_symbol): {e}"
+                             code_symbols, project_text, workspace_symbol): {e}"
                         ),
                     ));
                 }
@@ -579,7 +585,7 @@ impl MacroRegistry {
                             &format!("operations[{i}].spec"),
                             &format!(
                                 "inline Probe operation '{}' has invalid or unknown spec kind \
-                                 (bounded to code_query, code_symbols, workspace_symbol): {e}",
+                                 (bounded to code_query, code_symbols, project_text, workspace_symbol): {e}",
                                 name
                             ),
                         ));

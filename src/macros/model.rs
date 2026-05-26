@@ -201,6 +201,14 @@ pub enum MacroOperation {
         name: String,
         /// Backend op spec (JavaPoet, template, etc.); opaque at this layer.
         backend_op: Value,
+        /// Optional guard predicate. When present and evaluating to `false`
+        /// against the planning [`crate::macros::expr::Context`], this
+        /// operation is skipped entirely — the backend is NOT called and a
+        /// `"skipped (guard false)"` summary is recorded in the plan.
+        ///
+        /// When absent (`null`), the operation always runs (default behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<Predicate>,
     },
 
     /// Transform existing source via a backend (e.g. OpenRewrite).
@@ -210,6 +218,14 @@ pub enum MacroOperation {
         targets: Vec<String>,
         /// Backend op spec (OpenRewrite recipe, etc.); opaque at this layer.
         backend_op: Value,
+        /// Optional guard predicate. When present and evaluating to `false`
+        /// against the planning [`crate::macros::expr::Context`], this
+        /// operation is skipped entirely — the backend is NOT called and a
+        /// `"skipped (guard false)"` summary is recorded in the plan.
+        ///
+        /// When absent (`null`), the operation always runs (default behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        when: Option<Predicate>,
     },
 
     /// Delegate to an existing `bbox_refactor_plan` primitive when that is the
@@ -523,10 +539,12 @@ mod tests {
             MacroOperation::Emit {
                 name: "interface_file".into(),
                 backend_op: json!({"backend": "java_poet", "class": "PaymentService"}),
+                when: None,
             },
             MacroOperation::Rewrite {
                 targets: vec!["src/Caller.java".into()],
                 backend_op: json!({"recipe": "AddImport"}),
+                when: None,
             },
             MacroOperation::DelegateRefactor {
                 refactor_kind: "extract_java_class".into(),

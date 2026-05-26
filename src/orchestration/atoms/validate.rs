@@ -1372,7 +1372,6 @@ mod tests {
             "migrate_java_method_receiver",
             "java_split_provider",
             "replace_java_static_reference",
-            "java_vaadin_provider_binding_generation",
             "java_vaadin_extract_component",
             "java_vaadin_extract_grid_component",
             "java_vaadin_extract_dialog_class",

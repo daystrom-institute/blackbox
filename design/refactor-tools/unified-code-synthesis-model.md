@@ -340,8 +340,8 @@ For each existing framework-specific Rust helper:
 5. Fill only generic gaps in the engine/backend, or ship framework-specific
    logic as an installable JVM recipe pack owned by the macro library. Never add
    a Guice/Vaadin-specific primitive to Rust core.
-6. Keep the old refactor plan kind as a compatibility wrapper if callers depend
-   on it.
+6. After the parity proof, DELETE the old refactor plan kind and all atom/eval/doc
+   references — no compatibility wrapper (it fabricates legacy concerns that don't exist).
 
 ### Ontology gap record
 
@@ -357,26 +357,34 @@ For each existing framework-specific Rust helper:
 }
 ```
 
-### Worked example — `java_vaadin_provider_binding_generation`
+### Worked example — `java_vaadin_provider_binding_generation` → `builtin.java.vaadin.ensure_provider_bindings`
 
-Migrates to library macro `builtin.java.vaadin.ensure_provider_bindings`.
+The Rust primitive was dissolved after parity proof (P5-2/P5-3). The Rust kind,
+its atom `java-vaadin-provider-binding-generation`, and all eval/doc references
+were deleted with no compatibility wrapper.
+
+**Generic substrate gaps filled to enable the migration:**
+- `ProbeSpec::ProjectText` — project-wide file-content scan (needles, match_mode
+  any/all, language filter, path_contains scoping, normalization) enabling
+  framework-marker detection and whitespace-normalized idempotency checks without
+  a Rust-coded tree-sitter walk.
+- `when: Option<Predicate>` on `MacroOperation::Emit` / `Rewrite` — per-op guard
+  that skips the backend call when the predicate is false, enabling idempotency
+  without a separate refusal rule.
 
 **Macro data owns** (was Rust in `vaadin_provider_bindings.rs`): the required
 bindings (`Provider<UI>`, `Provider<VaadinSession>`); imports
 (`com.google.inject.Provides/Provider`, `com.vaadin.flow.component.UI`,
 `com.vaadin.flow.server.VaadinSession`); provider method names/bodies
 (`return UI::getCurrent;`, `return VaadinSession::getCurrent;`); refusal policy
-(Spring detected → refuse; non-Guice module; Vaadin not detected; duplicate
-provider present).
+(Spring detected → refuse; non-Guice module; Vaadin not detected).
 
 **Generic backend/probe capabilities it binds to:** `java.search.type` (find the
 module type → `bbox_code_symbols` / `WorkspaceSymbol`); `java.search.project_text`
-(detect framework markers with build-dir exclusions → `code_symbols` live-lane,
-which already excludes `target/build/.gradle/node_modules`);
-`java.search.member` (methods by annotation + return type → `code_query`
-prefilter + `Hover` resolve); `java.template.insert_member` (OpenRewrite
-`JavaTemplate`); `java.validate.parse` + organize imports (existing
-`jdtls_organize_imports`).
+(detect framework markers with build-dir exclusions → `ProbeSpec::ProjectText`
+which prunes `target/build/.gradle/node_modules`);
+`java.template.insert_member` (OpenRewrite `JavaTemplate`); idempotency via
+`ProjectText` + `when`-guard on each rewrite op.
 
 No gap may mention `UI`, `VaadinSession`, `@Provides`, or Spring refusal as
 *engine* concepts. Those stay macro-library data.
@@ -390,7 +398,7 @@ No gap may mention `UI`, `VaadinSession`, `@Provides`, or Spring refusal as
 | `extract_class.rs` `G7` Guice wiring-mode enum (`constructor_args`/`guice_field_inject`/`manual`) | **Library policy.** → macro data (wiring choice as input/refusal). |
 | `migrate_receiver.rs`, `split_provider.rs`, `replace_static_ref.rs` | **Generic DI-aware rewrites.** Keep as `delegate_refactor` targets. |
 | `leaf_plans.rs` `extract_java_interface`, `add_java_implements`, `java_lsp_organize_imports` | **Generic.** Keep; callable as backend/delegate ops. |
-| `vaadin_provider_bindings.rs` | **Library policy.** → `builtin.java.vaadin` macro + generic probes. |
+| `vaadin_provider_bindings.rs` | **Dissolved → `builtin.java.vaadin.ensure_provider_bindings`.** Rust kind deleted after parity proof; no compat wrapper. Generic substrate gaps filled: `ProbeSpec::ProjectText` + `when`-guard on mutating ops. |
 | `vaadin_view_synthesis.rs`, `vaadin_*_extract.rs` | **Library policy.** → `builtin.java.vaadin` macros (route collision, access-policy) over generic emit/probe. |
 
 ## Useful V1 — `java.add_service_boundary`
@@ -474,7 +482,8 @@ Phased so each phase is independently useful and testable.
   prefilter-then-resolve.
 - **Phase 5 — dissolution proof**: ship `builtin.java.guice` and
   `builtin.java.vaadin` with at least one current Rust helper represented as
-  macro data; record ontology gaps; keep the old plan kind as a compat wrapper.
+  macro data; record ontology gaps; delete the old plan kind outright after the
+  parity proof — no compatibility wrapper.
 - **v1 macro**: implement `java.add_service_boundary` with fixtures proving
   boundary creation in a Guice project and refusal of the ambiguous cases.
 

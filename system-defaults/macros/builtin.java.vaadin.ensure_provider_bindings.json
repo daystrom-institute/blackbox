@@ -1,0 +1,299 @@
+{
+  "id": "builtin.java.vaadin.ensure_provider_bindings",
+  "version": "1.1.0",
+  "language": "java",
+  "scope": "builtin",
+  "title": "Ensure Vaadin Provider Bindings (Guice)",
+  "inputs_schema": {
+    "type": "object",
+    "required": ["module_file", "module_name"],
+    "properties": {
+      "module_file": {
+        "type": "string",
+        "description": "Absolute path to the Guice module source file that should receive the provider methods"
+      },
+      "module_name": {
+        "type": "string",
+        "description": "Simple name of the Guice module class (e.g. AppModule)"
+      }
+    },
+    "additionalProperties": false
+  },
+  "effects": [
+    "modifies_existing_type",
+    "changes_dependency_injection"
+  ],
+  "authority_gates": [],
+  "probes": [
+    {
+      "name": "spring_markers",
+      "description": "Detects Spring usage anywhere in the project; presence triggers a refusal because this macro only supports Guice-managed Vaadin projects",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["org.springframework", "@SpringBootApplication"],
+        "match": "any",
+        "languages": ["java"]
+      }
+    },
+    {
+      "name": "vaadin_markers",
+      "description": "Detects Vaadin usage anywhere in the project; absence triggers a refusal",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["com.vaadin.flow", "VaadinSession", "UI.getCurrent"],
+        "match": "any",
+        "languages": ["java"]
+      }
+    },
+    {
+      "name": "guice_module",
+      "description": "Confirms the target module file contains Guice module markers; absence triggers a refusal to prevent adding provider methods to a non-Guice class",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["com.google.inject", "extends AbstractModule", "@Provides"],
+        "match": "any",
+        "languages": ["java"],
+        "path_contains": "${inputs.module_file}"
+      }
+    },
+    {
+      "name": "module_class",
+      "description": "Locates the module class declaration scoped to the module file; count=0 → not found, count>1 → ambiguous",
+      "spec": {
+        "kind": "code_symbols",
+        "query": "${inputs.module_name}",
+        "languages": ["java"],
+        "item_kinds": ["class_declaration"],
+        "name_equals": "${inputs.module_name}",
+        "path_contains": "${inputs.module_file}"
+      }
+    },
+    {
+      "name": "ui_binding_present",
+      "description": "Idempotency guard (:: form): checks whether Provider<UI>/UI::getCurrent binding already exists in the module file",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["Provider<UI>", "UI::getCurrent"],
+        "match": "all",
+        "normalization": "remove_whitespace",
+        "languages": ["java"],
+        "path_contains": "${inputs.module_file}"
+      }
+    },
+    {
+      "name": "ui_binding_present_dot",
+      "description": "Idempotency guard (dot form): checks whether Provider<UI>/UI.getCurrent binding already exists in the module file",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["Provider<UI>", "UI.getCurrent"],
+        "match": "all",
+        "normalization": "remove_whitespace",
+        "languages": ["java"],
+        "path_contains": "${inputs.module_file}"
+      }
+    },
+    {
+      "name": "session_binding_present",
+      "description": "Idempotency guard (:: form): checks whether Provider<VaadinSession>/VaadinSession::getCurrent binding already exists in the module file",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["Provider<VaadinSession>", "VaadinSession::getCurrent"],
+        "match": "all",
+        "normalization": "remove_whitespace",
+        "languages": ["java"],
+        "path_contains": "${inputs.module_file}"
+      }
+    },
+    {
+      "name": "session_binding_present_dot",
+      "description": "Idempotency guard (dot form): checks whether Provider<VaadinSession>/VaadinSession.getCurrent binding already exists in the module file",
+      "spec": {
+        "kind": "project_text",
+        "needles": ["Provider<VaadinSession>", "VaadinSession.getCurrent"],
+        "match": "all",
+        "normalization": "remove_whitespace",
+        "languages": ["java"],
+        "path_contains": "${inputs.module_file}"
+      }
+    },
+    {
+      "name": "provider_import_present",
+      "description": "Checks whether a Provider import (jakarta, javax, or guice) is already present in the module file; controls whether com.google.inject.Provider is added to new imports",
+      "spec": {
+        "kind": "project_text",
+        "needles": [
+          "import jakarta.inject.Provider;",
+          "import javax.inject.Provider;",
+          "import com.google.inject.Provider;",
+          "import com.google.inject.*;"
+        ],
+        "match": "any",
+        "languages": ["java"],
+        "path_contains": "${inputs.module_file}"
+      }
+    }
+  ],
+  "refusals": [
+    {
+      "when": {"op": "eq", "path": "spring_markers.exists", "value": true},
+      "code": "error.spring_detected",
+      "message": "Spring usage detected in the project; this macro only supports Guice-managed Vaadin projects (no org.springframework or @SpringBootApplication)"
+    },
+    {
+      "when": {"op": "eq", "path": "guice_module.exists", "value": false},
+      "code": "error.not_guice_module",
+      "message": "The target file does not appear to be a Guice module (no com.google.inject import, no 'extends AbstractModule', and no @Provides annotation); pass the Guice module source file via module_file"
+    },
+    {
+      "when": {"op": "eq", "path": "vaadin_markers.exists", "value": false},
+      "code": "error.no_vaadin_detected",
+      "message": "No Vaadin usage detected in the project (com.vaadin.flow, VaadinSession, or UI.getCurrent must appear in at least one Java source file)"
+    },
+    {
+      "when": {"op": "eq", "path": "module_class.count", "value": 0},
+      "code": "error.module_class_not_found",
+      "message": "Class '${inputs.module_name}' was not found in '${inputs.module_file}'; confirm module_name matches the class name declared in that file"
+    },
+    {
+      "when": {
+        "op": "all",
+        "predicates": [
+          {"op": "not", "predicate": {"op": "eq", "path": "module_class.count", "value": 0}},
+          {"op": "not", "predicate": {"op": "eq", "path": "module_class.count", "value": 1}}
+        ]
+      },
+      "code": "error.module_class_ambiguous",
+      "message": "More than one class matches '${inputs.module_name}' in '${inputs.module_file}'; rename the class or correct module_name to disambiguate"
+    }
+  ],
+  "operations": [
+    {
+      "kind": "rewrite",
+      "when": {
+        "op": "all",
+        "predicates": [
+          {
+            "op": "not",
+            "predicate": {
+              "op": "any",
+              "predicates": [
+                {"op": "eq", "path": "ui_binding_present.exists", "value": true},
+                {"op": "eq", "path": "ui_binding_present_dot.exists", "value": true}
+              ]
+            }
+          },
+          {"op": "eq", "path": "provider_import_present.exists", "value": false}
+        ]
+      },
+      "targets": ["${inputs.module_file}"],
+      "backend_op": {
+        "op": "insert_member",
+        "target_file": "${inputs.module_file}",
+        "target_type": "${inputs.module_name}",
+        "member_text": "@Provides\n    Provider<UI> provideUiProvider() {\n        return UI::getCurrent;\n    }",
+        "imports": [
+          "com.google.inject.Provides",
+          "com.vaadin.flow.component.UI",
+          "com.google.inject.Provider"
+        ]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {
+        "op": "all",
+        "predicates": [
+          {
+            "op": "not",
+            "predicate": {
+              "op": "any",
+              "predicates": [
+                {"op": "eq", "path": "ui_binding_present.exists", "value": true},
+                {"op": "eq", "path": "ui_binding_present_dot.exists", "value": true}
+              ]
+            }
+          },
+          {"op": "eq", "path": "provider_import_present.exists", "value": true}
+        ]
+      },
+      "targets": ["${inputs.module_file}"],
+      "backend_op": {
+        "op": "insert_member",
+        "target_file": "${inputs.module_file}",
+        "target_type": "${inputs.module_name}",
+        "member_text": "@Provides\n    Provider<UI> provideUiProvider() {\n        return UI::getCurrent;\n    }",
+        "imports": [
+          "com.google.inject.Provides",
+          "com.vaadin.flow.component.UI"
+        ]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {
+        "op": "all",
+        "predicates": [
+          {
+            "op": "not",
+            "predicate": {
+              "op": "any",
+              "predicates": [
+                {"op": "eq", "path": "session_binding_present.exists", "value": true},
+                {"op": "eq", "path": "session_binding_present_dot.exists", "value": true}
+              ]
+            }
+          },
+          {"op": "eq", "path": "provider_import_present.exists", "value": false}
+        ]
+      },
+      "targets": ["${inputs.module_file}"],
+      "backend_op": {
+        "op": "insert_member",
+        "target_file": "${inputs.module_file}",
+        "target_type": "${inputs.module_name}",
+        "member_text": "@Provides\n    Provider<VaadinSession> provideVaadinSessionProvider() {\n        return VaadinSession::getCurrent;\n    }",
+        "imports": [
+          "com.google.inject.Provides",
+          "com.vaadin.flow.server.VaadinSession",
+          "com.google.inject.Provider"
+        ]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {
+        "op": "all",
+        "predicates": [
+          {
+            "op": "not",
+            "predicate": {
+              "op": "any",
+              "predicates": [
+                {"op": "eq", "path": "session_binding_present.exists", "value": true},
+                {"op": "eq", "path": "session_binding_present_dot.exists", "value": true}
+              ]
+            }
+          },
+          {"op": "eq", "path": "provider_import_present.exists", "value": true}
+        ]
+      },
+      "targets": ["${inputs.module_file}"],
+      "backend_op": {
+        "op": "insert_member",
+        "target_file": "${inputs.module_file}",
+        "target_type": "${inputs.module_name}",
+        "member_text": "@Provides\n    Provider<VaadinSession> provideVaadinSessionProvider() {\n        return VaadinSession::getCurrent;\n    }",
+        "imports": [
+          "com.google.inject.Provides",
+          "com.vaadin.flow.server.VaadinSession"
+        ]
+      }
+    },
+    {
+      "kind": "record",
+      "label": "verify_bindings",
+      "body": "Vaadin provider bindings ensured in '${inputs.module_name}': Provider<UI>/provideUiProvider() and Provider<VaadinSession>/provideVaadinSessionProvider() are now present. Verify the project compiles and that injected Provider<UI>/Provider<VaadinSession> fields resolve correctly at runtime."
+    }
+  ],
+  "validations": []
+}

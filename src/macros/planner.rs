@@ -448,7 +448,28 @@ impl MacroPlanner {
                     });
                 }
 
-                MacroOperation::Emit { name, backend_op } => {
+                MacroOperation::Emit {
+                    name,
+                    backend_op,
+                    when,
+                } => {
+                    // Guard predicate: skip the op (without calling the backend)
+                    // when `when` is present and evaluates to false.
+                    if let Some(guard) = when {
+                        if !expr::eval(guard, &expr_ctx) {
+                            op_statuses.push(MacroSemanticStatus::SyntaxOnly);
+                            plan_ops.push(MacroPlanOperation {
+                                kind: "emit".to_string(),
+                                name: Some(name.clone()),
+                                semantic_status: MacroSemanticStatus::SyntaxOnly,
+                                summary: format!(
+                                    "Emit artifact '{}': skipped (guard false)",
+                                    name
+                                ),
+                            });
+                            continue;
+                        }
+                    }
                     // Constraint 6 (Emit): interpolate backend_op Value string leaves,
                     // decode to a typed JavaEmitOp, then call the backend.
                     // Fail closed: decode failure or backend unavailability is a hard
@@ -499,7 +520,25 @@ impl MacroPlanner {
                 MacroOperation::Rewrite {
                     targets,
                     backend_op,
+                    when,
                 } => {
+                    // Guard predicate: skip the op (without calling the backend)
+                    // when `when` is present and evaluates to false.
+                    if let Some(guard) = when {
+                        if !expr::eval(guard, &expr_ctx) {
+                            op_statuses.push(MacroSemanticStatus::SyntaxOnly);
+                            plan_ops.push(MacroPlanOperation {
+                                kind: "rewrite".to_string(),
+                                name: None,
+                                semantic_status: MacroSemanticStatus::SyntaxOnly,
+                                summary: format!(
+                                    "Rewrite {} target(s): skipped (guard false)",
+                                    targets.len()
+                                ),
+                            });
+                            continue;
+                        }
+                    }
                     // Constraint 6 (Rewrite): interpolate backend_op Value string leaves,
                     // decode to a typed JavaRewriteOp, then call the backend.
                     let interpolated_op =
@@ -1385,6 +1424,7 @@ fn probe_spec_kind_str(spec: &ProbeSpec) -> &'static str {
     match spec {
         ProbeSpec::CodeQuery { .. } => "code_query",
         ProbeSpec::CodeSymbols { .. } => "code_symbols",
+        ProbeSpec::ProjectText { .. } => "project_text",
         ProbeSpec::WorkspaceSymbol { .. } => "workspace_symbol",
     }
 }
@@ -1496,6 +1536,28 @@ fn validate_context_roots(
                 if !op_allowed_roots.contains(&r) {
                     bad.push(format!(
                         "validation guard predicate references unknown root '{}' \
+                         (not 'inputs' or a declared probe name)",
+                        r
+                    ));
+                }
+            }
+        }
+    }
+
+    // Emit/Rewrite guard predicates: operation-phase roots.
+    for (i, op) in def.operations.iter().enumerate() {
+        let guard = match op {
+            MacroOperation::Emit { when, .. } => when.as_ref(),
+            MacroOperation::Rewrite { when, .. } => when.as_ref(),
+            _ => None,
+        };
+        if let Some(guard_pred) = guard {
+            let mut roots = vec![];
+            collect_predicate_roots(guard_pred, &mut roots);
+            for r in roots {
+                if !op_allowed_roots.contains(&r) {
+                    bad.push(format!(
+                        "operations[{i}] 'when' guard predicate references unknown root '{}' \
                          (not 'inputs' or a declared probe name)",
                         r
                     ));
@@ -1731,6 +1793,7 @@ mod tests {
                 "kind": "interface",
                 "source_text": "package com.example;\npublic interface PaymentService {}"
             }),
+            when: None,
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default(); // UnavailableBackend
@@ -1756,6 +1819,7 @@ mod tests {
                 "member_text": "void x() {}",
                 "imports": []
             }),
+            when: None,
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default(); // UnavailableBackend
@@ -1938,6 +2002,7 @@ mod tests {
                     "member_text": "private int x;",
                     "imports": []
                 }),
+                when: None,
             },
         ];
 
@@ -3191,6 +3256,7 @@ mod tests {
                 "kind": "interface",
                 "source_text": "package com.example;\npublic interface Foo {}"
             }),
+            when: None,
         }];
         let inv = minimal_invocation(&def, "/tmp");
         // Default ctx uses UnavailableBackend
@@ -3215,6 +3281,7 @@ mod tests {
                 "member_text": "public void doWork() {}",
                 "imports": []
             }),
+            when: None,
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default();
@@ -3235,6 +3302,7 @@ mod tests {
             name: "bad_op".into(),
             // Missing required fields; unknown op tag
             backend_op: json!({"op": "unknown_unknown_op", "foo": "bar"}),
+            when: None,
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default();
@@ -3257,6 +3325,7 @@ mod tests {
         def.operations = vec![MacroOperation::Rewrite {
             targets: vec!["/repo/src/Foo.java".into()],
             backend_op: json!({"op": "totally_unknown_rewrite", "x": 99}),
+            when: None,
         }];
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default();
@@ -3267,6 +3336,127 @@ mod tests {
                 || msg.contains("error.backend_unavailable")
                 || msg.contains("unknown variant"),
             "malformed rewrite backend_op must yield a hard plan error; got: {msg}"
+        );
+    }
+
+    // ── when-guard predicate on Emit/Rewrite ──────────────────────────────────
+
+    /// When the `when` guard on an Emit op evaluates to `false`, the backend
+    /// is NOT called (UnavailableBackend would return Err if called) and a
+    /// "skipped (guard false)" summary is recorded in the plan.
+    #[test]
+    fn emit_with_false_guard_is_skipped_without_calling_backend() {
+        use crate::macros::expr::Predicate;
+        let mut def = minimal_def();
+        // inject probe result: service_type_exists.count = 1 (type already exists)
+        def.probes = vec![]; // no real probes — we inject via inputs trick below
+        def.operations = vec![MacroOperation::Emit {
+            name: "interface_file".into(),
+            backend_op: json!({
+                "op": "emit_type",
+                "source_root": "/repo/src/main/java",
+                "package": "com.example",
+                "name": "Foo",
+                "kind": "interface",
+                "source_text": "package com.example;\npublic interface Foo {}"
+            }),
+            // Guard: only emit when inputs.skip is NOT "true".
+            // Here we use Eq on an input that equals "yes" → guard = false.
+            when: Some(Predicate::Eq {
+                path: "inputs.skip".into(),
+                value: serde_json::json!("no"),
+            }),
+        }];
+        let mut inv = minimal_invocation(&def, "/tmp");
+        // Set inputs.skip = "yes" so the guard (Eq skip=="no") = false.
+        inv.inputs.insert("skip".into(), serde_json::json!("yes"));
+        // UnavailableBackend would fail if called — proves the backend is NOT reached.
+        let ctx = MacroPlannerContext::default();
+        let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
+        // Exactly one op recorded: the skipped emit.
+        assert_eq!(plan.operations.len(), 1, "expected exactly one op entry");
+        let op = &plan.operations[0];
+        assert_eq!(op.kind, "emit");
+        assert!(
+            op.summary.contains("skipped (guard false)"),
+            "op summary must say 'skipped (guard false)'; got: {}",
+            op.summary
+        );
+        // No edits produced (backend was not called).
+        assert!(plan.edits.file_creates.is_empty(), "no file_creates expected");
+        assert!(plan.edits.file_edits.is_empty(), "no file_edits expected");
+    }
+
+    /// When the `when` guard on a Rewrite op evaluates to `false`, the backend
+    /// is NOT called and a "skipped (guard false)" summary is recorded.
+    #[test]
+    fn rewrite_with_false_guard_is_skipped_without_calling_backend() {
+        use crate::macros::expr::Predicate;
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Rewrite {
+            targets: vec!["/repo/src/FooImpl.java".into()],
+            backend_op: json!({
+                "op": "insert_member",
+                "target_file": "/repo/src/FooImpl.java",
+                "target_type": "FooImpl",
+                "member_text": "public void doWork() {}",
+                "imports": []
+            }),
+            // Guard: only rewrite when inputs.enabled == "yes".
+            when: Some(Predicate::Eq {
+                path: "inputs.enabled".into(),
+                value: serde_json::json!("yes"),
+            }),
+        }];
+        let mut inv = minimal_invocation(&def, "/tmp");
+        // inputs.enabled = "no" → guard is false → op skipped.
+        inv.inputs.insert("enabled".into(), serde_json::json!("no"));
+        // UnavailableBackend would fail if called.
+        let ctx = MacroPlannerContext::default();
+        let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
+        assert_eq!(plan.operations.len(), 1);
+        let op = &plan.operations[0];
+        assert_eq!(op.kind, "rewrite");
+        assert!(
+            op.summary.contains("skipped (guard false)"),
+            "op summary must say 'skipped (guard false)'; got: {}",
+            op.summary
+        );
+        assert!(plan.edits.file_edits.is_empty());
+    }
+
+    /// When the `when` guard evaluates to `true`, the op proceeds normally.
+    /// With UnavailableBackend this means an error propagates — which confirms
+    /// the backend WAS actually called (not skipped).
+    #[test]
+    fn emit_with_true_guard_calls_backend() {
+        use crate::macros::expr::Predicate;
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::Emit {
+            name: "interface_file".into(),
+            backend_op: json!({
+                "op": "emit_type",
+                "source_root": "/repo/src/main/java",
+                "package": "com.example",
+                "name": "Foo",
+                "kind": "interface",
+                "source_text": "package com.example;\npublic interface Foo {}"
+            }),
+            // Guard: inputs.enabled == "yes" → true → backend is called.
+            when: Some(Predicate::Eq {
+                path: "inputs.enabled".into(),
+                value: serde_json::json!("yes"),
+            }),
+        }];
+        let mut inv = minimal_invocation(&def, "/tmp");
+        inv.inputs.insert("enabled".into(), serde_json::json!("yes"));
+        // UnavailableBackend returns Err — proves the backend was reached.
+        let ctx = MacroPlannerContext::default();
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("error.backend_unavailable"),
+            "backend should be called when guard is true; expected backend_unavailable, got: {msg}"
         );
     }
 }

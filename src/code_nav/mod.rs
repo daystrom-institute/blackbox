@@ -2248,3 +2248,252 @@ pub fn code_node_describe(p: &CodeNodeDescribeParams) -> Result<String> {
 
     Ok(serde_json::to_string_pretty(&response)?)
 }
+
+// ---------------------------------------------------------------------------
+// project_text_search — generic project-wide needle scan
+// ---------------------------------------------------------------------------
+
+/// How needles are combined when checking a single file for a match.
+///
+/// Serializes/deserializes as `"any"` / `"all"`.
+/// Unknown values are **deserialization errors** (fail closed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectTextMatch {
+    /// Match when ANY needle is present in the file (default).
+    #[default]
+    Any,
+    /// Match only when ALL needles are present in the same file.
+    All,
+}
+
+/// Normalization applied to both needles and file content before comparison.
+///
+/// Serializes/deserializes as `"raw"` / `"remove_whitespace"`.
+/// Unknown values are **deserialization errors** (fail closed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectTextNormalization {
+    /// No normalization; compare raw bytes (default).
+    #[default]
+    Raw,
+    /// Collapse every run of ASCII whitespace to a single space, then strip
+    /// leading/trailing whitespace.  Enables needle matching across line
+    /// breaks and indentation differences.
+    RemoveWhitespace,
+}
+
+/// Result of a [`project_text_search`] call.
+#[derive(Debug, Clone)]
+pub struct ProjectTextSearchResult {
+    /// True when at least one file matched (subject to `match_mode`).
+    pub exists: bool,
+    /// Number of files containing at least one matching needle.
+    pub count: usize,
+    /// Needles that were found in at least one file.
+    pub matched_needles: Vec<String>,
+    /// Files (project-relative paths) in which at least one needle was found.
+    /// Capped to `max_files` (or the global scan cap).
+    pub files: Vec<String>,
+    /// True when the file walk was stopped early due to a cap.
+    pub truncated: bool,
+}
+
+/// Directories excluded from all project text scans.
+const TEXT_SCAN_EXCLUDE_DIRS: &[&str] = &[".git", "target", "build", ".gradle", "node_modules"];
+
+/// Global cap on files scanned per `project_text_search` call when the caller
+/// supplies no `max_files`.
+pub const TEXT_SCAN_DEFAULT_MAX_FILES: usize = 5_000;
+
+/// Scan every source file under `project_dir` for one or more text needles.
+///
+/// # Arguments
+///
+/// * `project_dir` — Absolute path to the project root.
+/// * `needles` — Strings to look for in each file's content.
+/// * `match_mode` — `"any"`: a file matches if it contains ANY needle;
+///   `"all"`: a file matches only when it contains ALL needles.
+/// * `languages` — When `Some`, only files whose language tag (derived from
+///   extension) is in this set are checked.  `None` means all text files.
+/// * `path_contains` — When `Some`, only files whose path contains this
+///   substring are checked.
+/// * `case_sensitive` — `true` → byte-level comparison;
+///   `false` → ASCII-fold both needle and content before comparison.
+/// * `normalization` — `"raw"` (default): compare needle to file bytes as-is.
+///   `"remove_whitespace"`: collapse all runs of whitespace in both needle and
+///   content before comparison (useful for import statement matching where
+///   formatting may vary).
+/// * `max_files` — Maximum number of files to scan before setting
+///   `truncated = true`.  `None` uses [`TEXT_SCAN_DEFAULT_MAX_FILES`].
+///
+/// # Truncation safety
+///
+/// When `truncated = true` AND `exists = false`, the caller (probe runner)
+/// must fail closed: the needles may exist in files beyond the cap.
+pub fn project_text_search(
+    project_dir: &str,
+    needles: &[String],
+    match_mode: &ProjectTextMatch,
+    languages: Option<&[String]>,
+    path_contains: Option<&str>,
+    case_sensitive: bool,
+    normalization: &ProjectTextNormalization,
+    max_files: Option<usize>,
+) -> Result<ProjectTextSearchResult> {
+    if needles.is_empty() {
+        return Ok(ProjectTextSearchResult {
+            exists: false,
+            count: 0,
+            matched_needles: vec![],
+            files: vec![],
+            truncated: false,
+        });
+    }
+
+    let cap = max_files.unwrap_or(TEXT_SCAN_DEFAULT_MAX_FILES);
+    let project_root = PathBuf::from(project_dir);
+
+    // Pre-process needles according to normalization + case settings.
+    let processed_needles: Vec<String> = needles
+        .iter()
+        .map(|n| prepare_needle(n, case_sensitive, normalization))
+        .collect();
+
+    let mut matched_files: Vec<String> = Vec::new();
+    let mut matched_needle_set: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut scanned = 0usize;
+    let mut truncated = false;
+
+    // Manual stack-based walk so we can prune excluded directories eagerly
+    // (preventing descent into "target", "node_modules", etc.).
+    let mut stack = vec![project_root.clone()];
+    'walk: while let Some(current) = stack.pop() {
+        let meta = match fs::metadata(&current) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+
+        if meta.is_dir() {
+            // Prune excluded directories without descending.
+            if let Some(name) = current.file_name().and_then(|n| n.to_str()) {
+                if TEXT_SCAN_EXCLUDE_DIRS.contains(&name) {
+                    continue;
+                }
+            }
+            let entries = match fs::read_dir(&current) {
+                Ok(rd) => rd,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                stack.push(entry.path());
+            }
+            continue;
+        }
+
+        // From here on: regular file.
+
+        let path = &current;
+
+        // path_contains filter (applied against the full absolute path string).
+        if let Some(pc) = path_contains {
+            if !path.to_string_lossy().contains(pc) {
+                continue;
+            }
+        }
+
+        // Language filter.
+        if let Some(langs) = languages {
+            if !langs.is_empty() {
+                let lang = language_for_path(path).unwrap_or_default();
+                if !langs.iter().any(|l| l == lang) {
+                    continue;
+                }
+            }
+        }
+
+        // File cap check BEFORE reading.
+        if scanned >= cap {
+            truncated = true;
+            break 'walk;
+        }
+        scanned += 1;
+
+        // Read and normalize content.
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue, // binary / unreadable — skip
+        };
+        let processed_content = prepare_needle(&content, case_sensitive, normalization);
+
+        // Check which needles appear in this file.
+        let mut file_hit_indices: Vec<usize> = Vec::new();
+        for (idx, pn) in processed_needles.iter().enumerate() {
+            if processed_content.contains(pn.as_str()) {
+                file_hit_indices.push(idx);
+            }
+        }
+
+        let file_matches = match match_mode {
+            ProjectTextMatch::All => file_hit_indices.len() == processed_needles.len(),
+            ProjectTextMatch::Any => !file_hit_indices.is_empty(),
+        };
+
+        if file_matches {
+            // Use project-relative path for output.
+            let rel = path
+                .strip_prefix(&project_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .into_owned();
+            matched_files.push(rel);
+            for idx in file_hit_indices {
+                matched_needle_set.insert(needles[idx].clone());
+            }
+        }
+    }
+
+    let exists = !matched_files.is_empty();
+
+    let mut matched_needles: Vec<String> = matched_needle_set.into_iter().collect();
+    matched_needles.sort();
+
+    Ok(ProjectTextSearchResult {
+        exists,
+        count: matched_files.len(),
+        matched_needles,
+        files: matched_files,
+        truncated,
+    })
+}
+
+/// Apply normalization and optional case-folding to a string for text matching.
+fn prepare_needle(s: &str, case_sensitive: bool, normalization: &ProjectTextNormalization) -> String {
+    let base = if matches!(normalization, ProjectTextNormalization::RemoveWhitespace) {
+        // Collapse all runs of ASCII whitespace to a single space, then strip
+        // leading/trailing whitespace.
+        let mut out = String::with_capacity(s.len());
+        let mut in_ws = false;
+        for c in s.chars() {
+            if c.is_ascii_whitespace() {
+                if !in_ws {
+                    out.push(' ');
+                    in_ws = true;
+                }
+            } else {
+                out.push(c);
+                in_ws = false;
+            }
+        }
+        out.trim().to_string()
+    } else {
+        s.to_string()
+    };
+
+    if case_sensitive {
+        base
+    } else {
+        base.to_ascii_lowercase()
+    }
+}

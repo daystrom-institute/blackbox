@@ -213,14 +213,6 @@
       "forbidden_atoms": []
     },
     {
-      "id": "find-java-vaadin-provider-binding-generation",
-      "query": "generate Guice Provider UI and VaadinSession bindings for a Vaadin project",
-      "expected_atoms": [
-        "java-vaadin-provider-binding-generation"
-      ],
-      "forbidden_atoms": []
-    },
-    {
       "id": "find-java-vaadin-view-structure-analysis",
       "query": "inventory route metadata fields grids dialogs data providers and services before decomposing a Vaadin view",
       "expected_atoms": [

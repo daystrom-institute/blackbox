@@ -295,16 +295,6 @@
       "done_note_required": true
     },
     {
-      "atom": "java-vaadin-provider-binding-generation",
-      "expected_plan_sequence": [
-        "bbox_refactor_status",
-        "bbox_code_symbols",
-        "bbox_refactor_plan:java_vaadin_provider_binding_generation",
-        "bbox_note:done"
-      ],
-      "done_note_required": true
-    },
-    {
       "atom": "java-vaadin-view-structure-analysis",
       "expected_plan_sequence": [
         "bbox_refactor_status",

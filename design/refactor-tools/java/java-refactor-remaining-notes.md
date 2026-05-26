@@ -51,7 +51,6 @@ Grounding references:
 - `extract_java_class_cohesive_clusters`
 - `cluster_inject_params_java`
 - `java_concurrency_antipattern_audit`
-- `java_vaadin_provider_binding_generation`
 - `java_lsp_organize_imports`
 - `lombokify_java_class`
 
@@ -78,7 +77,7 @@ is found:
 | Vaadin Flow view decomposition/synthesis toolsuite | Landed | `java_vaadin_view_structure_analysis`, component/grid/dialog extraction, static UI audit, route inventory, view synthesis, route access, navigation helper extraction, and Vaadin workflow atoms |
 | `note-7c819189` static holder caller rewrite | Landed for callers | `replace_java_static_reference` field mode and `java-migrate-static-holder` atom exist |
 | `note-e5439c0a` static util caller rewrite | Landed for callers | `replace_java_static_reference` method mode and `java-singletonify-static-util` atom exist |
-| `note-4257caaa` production-side holder/util conversion | Landed in worktree | `singletonify_java_holder`, `singletonify_java_util`, and Guice-only `java_vaadin_provider_binding_generation` exist |
+| `note-4257caaa` production-side holder/util conversion | Landed | `singletonify_java_holder`, `singletonify_java_util`; Guice-only provider-binding generation dissolved into `builtin.java.vaadin.ensure_provider_bindings` macro after parity proof |
 | `note-e09391c4` shared DI plumbing helper | Landed | `src/refactor/java/di_plumbing.rs` plus use in receiver, provider, and static-reference rewrites |
 | `note-0c749e44` Mockito stub synthesis | Landed | `extract_java_test_slice` mixed-test Mockito mode |
 | `note-8eaf7bac` organize-imports newline / cold classpath weakness | Landed enough for original gap | JDTLS readiness drain and fallback hardening landed in `db21889`; any new JDTLS behavior should be filed separately |
@@ -101,8 +100,10 @@ the prompt/runbook drift:
   coverage.
 - `java_concurrency_antipattern_audit` plus
   `java-concurrency-antipattern-audit` atom and eval coverage.
-- `java_vaadin_provider_binding_generation` plus
-  `java-vaadin-provider-binding-generation` atom and eval coverage.
+- Vaadin provider-binding generation — originally `java_vaadin_provider_binding_generation`
+  plus `java-vaadin-provider-binding-generation` atom and eval coverage; dissolved after
+  parity proof into `builtin.java.vaadin.ensure_provider_bindings` macro (Rust kind
+  and atom deleted, no compat wrapper).
 - Higher-order workflow atoms and eval coverage:
   `java-decompose-god-class`, `java-introduce-repository-pattern`,
   `java-split-god-method`, and `java-eliminate-dead-code`.
@@ -223,13 +224,12 @@ Acceptance criteria if implemented:
 - Add provider methods only when absent.
 - Refuse Spring/Vaadin variants unless explicitly supported.
 
-Status in worktree: implemented as the Guice-only
-`java_vaadin_provider_binding_generation` helper with
-`java-vaadin-provider-binding-generation` atom and eval coverage. v1 requires
-the operator to pass the intended Guice module/config source file; it verifies
-Vaadin presence, refuses Spring/Vaadin variants, adds missing imports/provider
-methods only when absent, and treats project builds as operator-run outside the
-atom.
+Status: dissolved. Implemented as `builtin.java.vaadin.ensure_provider_bindings`
+macro — the Rust kind `java_vaadin_provider_binding_generation` and its atom
+`java-vaadin-provider-binding-generation` were deleted after the parity proof
+(P5-2/P5-3). No compat wrapper. The macro requires the operator to pass
+`module_file` and `module_name`; it verifies Vaadin presence, refuses Spring
+variants, and adds missing provider methods only when absent via when-guards.
 
 ### 6. Higher-Order Java Refactor Atoms
 

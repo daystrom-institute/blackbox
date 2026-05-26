@@ -407,20 +407,6 @@
       ]
     },
     {
-      "id": "dispatch-java-vaadin-provider-binding-generation-planonly",
-      "atom": "java-vaadin-provider-binding-generation",
-      "args": {
-        "project_dir": "${FIXTURE_JAVA_PROJECT}",
-        "source": "src/main/java/com/example/UiModule.java",
-        "module_name": "UiModule",
-        "apply": false
-      },
-      "expect_response_fields": [
-        "status",
-        "binding_module"
-      ]
-    },
-    {
       "id": "dispatch-java-vaadin-view-structure-analysis-planonly",
       "atom": "java-vaadin-view-structure-analysis",
       "args": {

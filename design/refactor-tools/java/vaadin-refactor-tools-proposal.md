@@ -60,7 +60,7 @@ Existing Java atoms should remain the base layer:
 - `java-split-god-method`
 - `java-eliminate-dead-code`
 - `java-replace-vaadin-static-lookup`
-- `java-vaadin-provider-binding-generation`
+- ~~`java-vaadin-provider-binding-generation`~~ (dissolved → `builtin.java.vaadin.ensure_provider_bindings` macro; atom deleted P5-3)
 - `java-concurrency-antipattern-audit`
 
 The Vaadin-specific layer should call these where they fit, but it should not

@@ -41,6 +41,9 @@ pub mod sidecar_backend;
 #[cfg(test)]
 mod java_service_boundary_tests;
 
+#[cfg(test)]
+mod ensure_provider_bindings_tests;
+
 // Convenience re-exports for crate-internal consumers. The MCP surface,
 // registry, planner, and backend that consume these land in later macro
 // milestones (M2-M4); allow unused until then.
