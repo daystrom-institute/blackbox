@@ -173,6 +173,55 @@ fn guice_macro_plans_even_when_source_has_no_inject_fields() {
     );
 }
 
+// Typed-scalar forwarding through DelegateRefactor: deep_analysis is a bool.
+// If interpolation stringified the whole-placeholder to "true", the delegate's
+// RefactorPlanParams deserialize (Option<bool>) would fail and the plan would
+// error. A successful plan proves the value is forwarded as a typed bool.
+#[test]
+fn guice_macro_forwards_deep_analysis_as_typed_bool() {
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/a");
+    std::fs::create_dir_all(&pkg).unwrap();
+    let source = pkg.join("Admin.java");
+    let target = pkg.join("Service.java");
+    std::fs::write(
+        &source,
+        "package a;\n\
+             import javax.inject.Inject;\n\
+             public class Admin {\n\
+            \x20   @Inject private Helper helper;\n\
+            \x20   public Long save() { return helper.compute(); }\n\
+             }\n",
+    )
+    .unwrap();
+
+    let def = MacroRegistry::get(None, "builtin.java.guice")
+        .expect("registry get must not error")
+        .expect("builtin.java.guice must be registered");
+
+    let mut inputs = serde_json::Map::new();
+    inputs.insert("source".into(), serde_json::json!(source.to_string_lossy()));
+    inputs.insert("target".into(), serde_json::json!(target.to_string_lossy()));
+    inputs.insert("module_name".into(), serde_json::json!("Service"));
+    inputs.insert("delegate_field".into(), serde_json::json!("service"));
+    inputs.insert("item_names".into(), serde_json::json!(["save"]));
+    // Explicit bool — must survive as a JSON bool through the delegate param.
+    inputs.insert("deep_analysis".into(), serde_json::json!(true));
+
+    let inv = MacroInvocation {
+        macro_id: "builtin.java.guice".into(),
+        version: None,
+        project_dir: dir.path().to_string_lossy().into_owned(),
+        inputs,
+        anchors: None,
+        operator_opt_outs: vec![],
+    };
+    let ctx = MacroPlannerContext::default();
+    let plan = MacroPlanner::plan(&inv, &def, &ctx)
+        .expect("plan must succeed — deep_analysis must forward as a typed bool, not a string");
+    assert!(plan.refusals.is_empty(), "no refusals: {:?}", plan.refusals);
+}
+
 // The shipped builtin must delegate to extract_java_class with the exact
 // external-injection WiringSpec object — proving the Guice policy lives as
 // macro data, not engine Rust.

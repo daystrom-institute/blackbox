@@ -576,6 +576,19 @@ impl MacroPlanner {
                             e
                         )
                     })?;
+                    // Drop top-level params that resolved to JSON null, so an
+                    // omitted optional macro input (declared with a null default,
+                    // forwarded as a whole-placeholder `${inputs.x}`) falls back
+                    // to the delegated kind's own default rather than forcing an
+                    // explicit null. Authority stripping still runs in
+                    // plan_delegate after this.
+                    let params = match params {
+                        Value::Object(mut map) => {
+                            map.retain(|_, v| !v.is_null());
+                            Value::Object(map)
+                        }
+                        other => other,
+                    };
                     // plan_delegate enforces RX-V1 authority boundary (see fn doc).
                     let (rp, consumed_flags) = plan_delegate(
                         refactor_kind,
@@ -1144,6 +1157,17 @@ fn validate_inputs(inputs: &serde_json::Map<String, Value>, schema: &Value) -> R
 fn interpolate_value_strings(v: &Value, ctx: &expr::Context) -> Result<Value> {
     match v {
         Value::String(s) => {
+            // Whole-placeholder typed substitution: when the entire string is a
+            // sole `${path}` that resolves in the context, return the resolved
+            // JSON value VERBATIM, preserving its type (bool/number/array/object/
+            // null) rather than stringifying it. This lets a macro forward a
+            // typed input (e.g. a bool `deep_analysis` or an array `item_names`)
+            // through a DelegateRefactor param. Non-whole or unresolved
+            // placeholders fall through to scalar string interpolation (which
+            // still errors on a genuinely missing required path).
+            if let Some(resolved) = resolve_whole_placeholder_any(s, ctx) {
+                return Ok(resolved);
+            }
             let expanded = expr::interpolate(s, ctx)
                 .map_err(|e| anyhow!("interpolation error in backend_op string leaf: {e}"))?;
             Ok(Value::String(expanded))
@@ -1197,6 +1221,22 @@ fn interpolate_value_strings(v: &Value, ctx: &expr::Context) -> Result<Value> {
 /// value (array or object) in `ctx`, returns `Some(resolved_value)`.
 /// Returns `None` for partial-template strings or when the resolved value is
 /// a scalar (scalars go through normal [`expr::interpolate`] path).
+/// If `s` is a sole `${path}` placeholder (no surrounding text, no nesting)
+/// that resolves in `ctx`, return the resolved JSON value VERBATIM, preserving
+/// its type. Returns `None` when `s` is not a whole placeholder or the path
+/// does not resolve, so the caller falls back to scalar string interpolation
+/// (which preserves the genuine-missing-path error for required inputs).
+fn resolve_whole_placeholder_any(s: &str, ctx: &expr::Context) -> Option<Value> {
+    let t = s.trim();
+    if t.starts_with("${") && t.ends_with('}') && t.len() > 3 {
+        let path = &t[2..t.len() - 1];
+        if !path.contains("${") && !path.is_empty() {
+            return ctx.resolve(path).cloned();
+        }
+    }
+    None
+}
+
 fn splice_interpolate(s: &str, ctx: &expr::Context) -> Option<Value> {
     let s = s.trim();
     if s.starts_with("${") && s.ends_with('}') && s.len() > 3 {

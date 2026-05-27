@@ -34,6 +34,42 @@
         "items": {"type": "string"},
         "default": [],
         "description": "Field names to move into the target class."
+      },
+      "deep_analysis": {
+        "type": "boolean",
+        "default": false,
+        "description": "Forwarded to extract_java_class. When true, runs deep dependency analysis (surfaces external_calls / inherited_dependencies / remaining-accessor reports and may return a Blocked plan that the macro propagates as a refusal)."
+      },
+      "callback_externals": {
+        "type": "array",
+        "items": {"type": "string"},
+        "default": null,
+        "description": "Optional. Method names whose externals should be threaded as functional-interface callbacks. Omitted → extract_java_class default."
+      },
+      "visibility": {
+        "type": "string",
+        "default": null,
+        "description": "Optional moved-method visibility floor (package/protected/public/private). Omitted → extract_java_class's package/public floor logic."
+      },
+      "target_prelude": {
+        "type": "string",
+        "default": null,
+        "description": "Optional package/import prelude for the target file. Omitted → extract_java_class default."
+      },
+      "rewrite_remaining_accessors": {
+        "type": "boolean",
+        "default": null,
+        "description": "Optional. Forwarded to extract_java_class when set; omitted → its default."
+      },
+      "source_delegate_wrappers": {
+        "type": "boolean",
+        "default": false,
+        "description": "When true, generate thin wrapper methods on the source for moved public non-static methods so cross-file callers still compile."
+      },
+      "propagate_class_annotations": {
+        "type": "string",
+        "default": null,
+        "description": "Optional class-annotation propagation mode (e.g. auto). Omitted → extract_java_class default."
       }
     },
     "additionalProperties": false
@@ -54,9 +90,15 @@
         "target": "${inputs.target}",
         "module_name": "${inputs.module_name}",
         "delegate_field": "${inputs.delegate_field}",
-        "item_names": ["${inputs.item_names}"],
-        "move_fields": ["${inputs.move_fields}"],
-        "deep_analysis": false,
+        "item_names": "${inputs.item_names}",
+        "move_fields": "${inputs.move_fields}",
+        "deep_analysis": "${inputs.deep_analysis}",
+        "callback_externals": "${inputs.callback_externals}",
+        "visibility": "${inputs.visibility}",
+        "target_prelude": "${inputs.target_prelude}",
+        "rewrite_remaining_accessors": "${inputs.rewrite_remaining_accessors}",
+        "source_delegate_wrappers": "${inputs.source_delegate_wrappers}",
+        "propagate_class_annotations": "${inputs.propagate_class_annotations}",
         "wiring_mode": {
           "strategy": "external_injection",
           "delegate_field_annotations": ["@Inject"],
