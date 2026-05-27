@@ -135,6 +135,7 @@ impl MacroPlanner {
         let mut expr_ctx = expr::Context {
             inputs: invocation.inputs.clone(),
             probes: HashMap::new(),
+            locals: HashMap::new(),
         };
 
         // ── Constraint 4: execute pre-refusal probes in declared order ────────
@@ -453,68 +454,15 @@ impl MacroPlanner {
                     backend_op,
                     when,
                 } => {
-                    // Guard predicate: skip the op (without calling the backend)
-                    // when `when` is present and evaluates to false.
-                    if let Some(guard) = when {
-                        if !expr::eval(guard, &expr_ctx) {
-                            op_statuses.push(MacroSemanticStatus::SyntaxOnly);
-                            plan_ops.push(MacroPlanOperation {
-                                kind: "emit".to_string(),
-                                name: Some(name.clone()),
-                                semantic_status: MacroSemanticStatus::SyntaxOnly,
-                                summary: format!(
-                                    "Emit artifact '{}': skipped (guard false)",
-                                    name
-                                ),
-                            });
-                            continue;
-                        }
-                    }
-                    // Constraint 6 (Emit): interpolate backend_op Value string leaves,
-                    // decode to a typed JavaEmitOp, then call the backend.
-                    // Fail closed: decode failure or backend unavailability is a hard
-                    // planning error (never silently downgrades to template_only).
-                    let interpolated_op =
-                        interpolate_value_strings(backend_op, &expr_ctx).map_err(|e| {
-                            anyhow!(
-                                "error.macro_invalid: Emit operation '{}' in macro '{}' \
-                                 backend_op interpolation failed: {}",
-                                name,
-                                def.id,
-                                e
-                            )
-                        })?;
-                    let typed_emit: JavaEmitOp =
-                        serde_json::from_value(interpolated_op).map_err(|e| {
-                            anyhow!(
-                                "error.macro_invalid: emit backend_op did not match a typed \
-                                 JavaEmitOp variant: {e}"
-                            )
-                        })?;
-                    let bes = ctx.backend.emit(&typed_emit).with_context(|| {
-                        format!(
-                            "error.backend_unavailable: Emit operation '{}' in macro '{}' \
-                             requires the Java macro backend (Phase 3); the backend is not connected",
-                            name, def.id
-                        )
-                    })?;
-                    backends_used.insert("java_poet".to_string());
-                    for fc in &bes.file_creates {
-                        register_path(&mut touched_paths, &fc.path)?;
-                    }
-                    for fe in &bes.file_edits {
-                        register_path(&mut touched_paths, &fe.path)?;
-                    }
-                    edit_set.file_edits.extend(bes.file_edits);
-                    edit_set.file_creates.extend(bes.file_creates);
-                    // Backend-produced output: SyntaxOnly minimum when backend is live
-                    op_statuses.push(MacroSemanticStatus::SyntaxOnly);
-                    plan_ops.push(MacroPlanOperation {
-                        kind: "emit".to_string(),
-                        name: Some(name.clone()),
-                        semantic_status: MacroSemanticStatus::SyntaxOnly,
-                        summary: format!("Emit artifact '{}'", name),
-                    });
+                    let mut sink = OpSink {
+                        edit_set: &mut edit_set,
+                        plan_ops: &mut plan_ops,
+                        op_statuses: &mut op_statuses,
+                        backends_used: &mut backends_used,
+                        touched_paths: &mut touched_paths,
+                        pending_rewrite_content: &mut pending_rewrite_content,
+                    };
+                    process_emit(def, ctx, &expr_ctx, name, backend_op, when, &mut sink)?;
                 }
 
                 MacroOperation::Rewrite {
@@ -522,113 +470,88 @@ impl MacroPlanner {
                     backend_op,
                     when,
                 } => {
-                    // Guard predicate: skip the op (without calling the backend)
-                    // when `when` is present and evaluates to false.
-                    if let Some(guard) = when {
-                        if !expr::eval(guard, &expr_ctx) {
-                            op_statuses.push(MacroSemanticStatus::SyntaxOnly);
-                            plan_ops.push(MacroPlanOperation {
-                                kind: "rewrite".to_string(),
-                                name: None,
-                                semantic_status: MacroSemanticStatus::SyntaxOnly,
-                                summary: format!(
-                                    "Rewrite {} target(s): skipped (guard false)",
-                                    targets.len()
-                                ),
-                            });
-                            continue;
-                        }
-                    }
-                    // Constraint 6 (Rewrite): interpolate backend_op Value string leaves,
-                    // decode to a typed JavaRewriteOp, then call the backend.
-                    let interpolated_op =
-                        interpolate_value_strings(backend_op, &expr_ctx).map_err(|e| {
-                            anyhow!(
-                                "error.macro_invalid: Rewrite operation in macro '{}' \
-                                 backend_op interpolation failed: {}",
-                                def.id,
-                                e
-                            )
-                        })?;
-                    let typed_rewrite: JavaRewriteOp =
-                        serde_json::from_value(interpolated_op).map_err(|e| {
-                            anyhow!(
-                                "error.macro_invalid: rewrite backend_op did not match a typed \
-                                 JavaRewriteOp variant: {e}"
-                            )
-                        })?;
+                    let mut sink = OpSink {
+                        edit_set: &mut edit_set,
+                        plan_ops: &mut plan_ops,
+                        op_statuses: &mut op_statuses,
+                        backends_used: &mut backends_used,
+                        touched_paths: &mut touched_paths,
+                        pending_rewrite_content: &mut pending_rewrite_content,
+                    };
+                    process_rewrite(def, ctx, &expr_ctx, targets, backend_op, when, &mut sink)?;
+                }
 
-                    // Same-file chaining: if a prior Rewrite op already touched this file,
-                    // pass the pending content to the backend so ops are applied
-                    // sequentially without writing intermediate results to disk.
-                    // The returned FileEdit is anchored to the on-disk original SHA so
-                    // refactor::apply verifies the pre-apply state correctly.
-                    let target_file = rewrite_target_file(&typed_rewrite);
-                    let source_override = pending_rewrite_content
-                        .get(target_file)
-                        .map(|(content, sha, orig_len)| {
-                            (content.as_str(), sha.as_str(), *orig_len)
-                        });
+                MacroOperation::ForEach { over, bind, body } => {
+                    // Resolve the collection; fail closed if the path is missing
+                    // or does not point at an array.
+                    let collection = expr_ctx.resolve(over).cloned().ok_or_else(|| {
+                        anyhow!(
+                            "error.macro_invalid: ForEach 'over' path '{}' did not resolve \
+                             in macro '{}'",
+                            over,
+                            def.id
+                        )
+                    })?;
+                    let elements = match collection {
+                        Value::Array(v) => v,
+                        _ => bail!(
+                            "error.macro_invalid: ForEach 'over' path '{}' in macro '{}' \
+                             must resolve to an array",
+                            over,
+                            def.id
+                        ),
+                    };
 
-                    let bes = ctx
-                        .backend
-                        .rewrite_with_source_override(&typed_rewrite, source_override)
-                        .with_context(|| {
-                            format!(
-                                "error.backend_unavailable: Rewrite operation in macro '{}' \
-                                 requires the Java macro backend (Phase 3); the backend is not connected",
+                    let mut expanded = 0usize;
+                    for elem in &elements {
+                        // Per-item context: clone the base and bind the element
+                        // under `bind` so `${bind.*}` / predicate paths `bind.*`
+                        // resolve into it. Locals shadow probes within scope.
+                        let mut item_ctx = expr_ctx.clone();
+                        item_ctx.locals.insert(bind.clone(), elem.clone());
+
+                        let mut sink = OpSink {
+                            edit_set: &mut edit_set,
+                            plan_ops: &mut plan_ops,
+                            op_statuses: &mut op_statuses,
+                            backends_used: &mut backends_used,
+                            touched_paths: &mut touched_paths,
+                            pending_rewrite_content: &mut pending_rewrite_content,
+                        };
+                        match body.as_ref() {
+                            MacroOperation::Emit {
+                                name,
+                                backend_op,
+                                when,
+                            } => process_emit(
+                                def, ctx, &item_ctx, name, backend_op, when, &mut sink,
+                            )?,
+                            MacroOperation::Rewrite {
+                                targets,
+                                backend_op,
+                                when,
+                            } => process_rewrite(
+                                def, ctx, &item_ctx, targets, backend_op, when, &mut sink,
+                            )?,
+                            // Defense-in-depth: registry validation already rejects
+                            // a non-emit/rewrite ForEach body, but fail closed here too.
+                            _ => bail!(
+                                "error.macro_invalid: ForEach body in macro '{}' must be an \
+                                 emit or rewrite operation",
                                 def.id
-                            )
-                        })?;
-
-                    backends_used.insert("open_rewrite".to_string());
-
-                    for fe in &bes.file_edits {
-                        if pending_rewrite_content.contains_key(&fe.path) {
-                            // ── Sidecar chain case ────────────────────────────
-                            // This path was already rewritten by an earlier Rewrite
-                            // op in this macro.  The new FileEdit supersedes the
-                            // intermediate one: replace it so only the final
-                            // composed edit reaches apply.
-                            // `touched_paths` already contains the path — no
-                            // dup-guard call needed (the chain is intentional).
-                            edit_set.file_edits.retain(|e| e.path != fe.path);
-                            touched_paths.insert(fe.path.clone());
-                        } else {
-                            // ── First-time or cross-op case ──────────────────
-                            // If another op kind (e.g. DelegateRefactor) already
-                            // registered this path, `register_path` will detect the
-                            // duplicate and return error.duplicate_touched_path,
-                            // preventing the silent drop of the prior edit.
-                            register_path(&mut touched_paths, &fe.path)?;
+                            ),
                         }
-                        // Track the new content for potential subsequent ops on this file.
-                        // `original_byte_len` is taken from the full-span TextEdit's byte_end,
-                        // which equals the on-disk original length regardless of whether this
-                        // was the first (disk-read) or a subsequent (override) op.
-                        if let Some(new_text) = &fe.new_text {
-                            let orig_len = fe
-                                .edits
-                                .first()
-                                .map(|e| e.byte_end)
-                                .unwrap_or(new_text.len());
-                            pending_rewrite_content.insert(
-                                fe.path.clone(),
-                                (new_text.clone(), fe.original_sha256.clone(), orig_len),
-                            );
-                        }
+                        expanded += 1;
                     }
-                    for fc in &bes.file_creates {
-                        register_path(&mut touched_paths, &fc.path)?;
-                    }
-                    edit_set.file_edits.extend(bes.file_edits);
-                    edit_set.file_creates.extend(bes.file_creates);
                     op_statuses.push(MacroSemanticStatus::SyntaxOnly);
                     plan_ops.push(MacroPlanOperation {
-                        kind: "rewrite".to_string(),
+                        kind: "for_each".to_string(),
                         name: None,
                         semantic_status: MacroSemanticStatus::SyntaxOnly,
-                        summary: format!("Rewrite {} target(s) via backend", targets.len()),
+                        summary: format!(
+                            "ForEach over '{}': expanded {} item(s)",
+                            over, expanded
+                        ),
                     });
                 }
 
@@ -895,6 +818,180 @@ fn spec_contains_interpolation(spec: &Value) -> bool {
     }
 }
 
+/// Mutable plan accumulators shared by the per-operation processors.
+///
+/// Bundling them lets both the top-level operation loop and `ForEach` fan-out
+/// write into the same plan state through one `&mut` handle, so a fanned-out
+/// `Rewrite` participates in the same `touched_paths` dup-guard and same-file
+/// chaining (`pending_rewrite_content`) as a top-level one.
+struct OpSink<'a> {
+    edit_set: &'a mut EditSet,
+    plan_ops: &'a mut Vec<MacroPlanOperation>,
+    op_statuses: &'a mut Vec<MacroSemanticStatus>,
+    backends_used: &'a mut HashSet<String>,
+    touched_paths: &'a mut HashSet<String>,
+    pending_rewrite_content: &'a mut HashMap<String, (String, String, usize)>,
+}
+
+/// Process one `Emit` operation against `expr_ctx`, writing into `sink`.
+///
+/// Factored out of the operation loop so `ForEach` can invoke it per element
+/// with a per-item context. Behavior is identical to the inline arm: guard
+/// skip, interpolate, decode to `JavaEmitOp`, call the backend, register paths.
+fn process_emit(
+    def: &MacroDefinition,
+    ctx: &MacroPlannerContext,
+    expr_ctx: &expr::Context,
+    name: &str,
+    backend_op: &Value,
+    when: &Option<expr::Predicate>,
+    sink: &mut OpSink<'_>,
+) -> Result<()> {
+    if let Some(guard) = when {
+        if !expr::eval(guard, expr_ctx) {
+            sink.op_statuses.push(MacroSemanticStatus::SyntaxOnly);
+            sink.plan_ops.push(MacroPlanOperation {
+                kind: "emit".to_string(),
+                name: Some(name.to_string()),
+                semantic_status: MacroSemanticStatus::SyntaxOnly,
+                summary: format!("Emit artifact '{}': skipped (guard false)", name),
+            });
+            return Ok(());
+        }
+    }
+    let interpolated_op = interpolate_value_strings(backend_op, expr_ctx).map_err(|e| {
+        anyhow!(
+            "error.macro_invalid: Emit operation '{}' in macro '{}' \
+             backend_op interpolation failed: {}",
+            name,
+            def.id,
+            e
+        )
+    })?;
+    let typed_emit: JavaEmitOp = serde_json::from_value(interpolated_op).map_err(|e| {
+        anyhow!(
+            "error.macro_invalid: emit backend_op did not match a typed \
+             JavaEmitOp variant: {e}"
+        )
+    })?;
+    let bes = ctx.backend.emit(&typed_emit).with_context(|| {
+        format!(
+            "error.backend_unavailable: Emit operation '{}' in macro '{}' \
+             requires the Java macro backend (Phase 3); the backend is not connected",
+            name, def.id
+        )
+    })?;
+    sink.backends_used.insert("java_poet".to_string());
+    for fc in &bes.file_creates {
+        register_path(sink.touched_paths, &fc.path)?;
+    }
+    for fe in &bes.file_edits {
+        register_path(sink.touched_paths, &fe.path)?;
+    }
+    sink.edit_set.file_edits.extend(bes.file_edits);
+    sink.edit_set.file_creates.extend(bes.file_creates);
+    sink.op_statuses.push(MacroSemanticStatus::SyntaxOnly);
+    sink.plan_ops.push(MacroPlanOperation {
+        kind: "emit".to_string(),
+        name: Some(name.to_string()),
+        semantic_status: MacroSemanticStatus::SyntaxOnly,
+        summary: format!("Emit artifact '{}'", name),
+    });
+    Ok(())
+}
+
+/// Process one `Rewrite` operation against `expr_ctx`, writing into `sink`.
+///
+/// Factored out of the operation loop so `ForEach` can invoke it per element.
+/// Preserves same-file chaining: a prior rewrite's output is fed forward via
+/// `pending_rewrite_content`, and a later edit on the same path supersedes the
+/// intermediate one so only the final composed edit reaches apply.
+fn process_rewrite(
+    def: &MacroDefinition,
+    ctx: &MacroPlannerContext,
+    expr_ctx: &expr::Context,
+    targets: &[String],
+    backend_op: &Value,
+    when: &Option<expr::Predicate>,
+    sink: &mut OpSink<'_>,
+) -> Result<()> {
+    if let Some(guard) = when {
+        if !expr::eval(guard, expr_ctx) {
+            sink.op_statuses.push(MacroSemanticStatus::SyntaxOnly);
+            sink.plan_ops.push(MacroPlanOperation {
+                kind: "rewrite".to_string(),
+                name: None,
+                semantic_status: MacroSemanticStatus::SyntaxOnly,
+                summary: format!("Rewrite {} target(s): skipped (guard false)", targets.len()),
+            });
+            return Ok(());
+        }
+    }
+    let interpolated_op = interpolate_value_strings(backend_op, expr_ctx).map_err(|e| {
+        anyhow!(
+            "error.macro_invalid: Rewrite operation in macro '{}' \
+             backend_op interpolation failed: {}",
+            def.id,
+            e
+        )
+    })?;
+    let typed_rewrite: JavaRewriteOp = serde_json::from_value(interpolated_op).map_err(|e| {
+        anyhow!(
+            "error.macro_invalid: rewrite backend_op did not match a typed \
+             JavaRewriteOp variant: {e}"
+        )
+    })?;
+
+    let target_file = rewrite_target_file(&typed_rewrite);
+    let source_override = sink
+        .pending_rewrite_content
+        .get(target_file)
+        .map(|(content, sha, orig_len)| (content.as_str(), sha.as_str(), *orig_len));
+
+    let bes = ctx
+        .backend
+        .rewrite_with_source_override(&typed_rewrite, source_override)
+        .with_context(|| {
+            format!(
+                "error.backend_unavailable: Rewrite operation in macro '{}' \
+                 requires the Java macro backend (Phase 3); the backend is not connected",
+                def.id
+            )
+        })?;
+
+    sink.backends_used.insert("open_rewrite".to_string());
+
+    for fe in &bes.file_edits {
+        if sink.pending_rewrite_content.contains_key(&fe.path) {
+            // Same-file chain: supersede the intermediate edit for this path.
+            sink.edit_set.file_edits.retain(|e| e.path != fe.path);
+            sink.touched_paths.insert(fe.path.clone());
+        } else {
+            register_path(sink.touched_paths, &fe.path)?;
+        }
+        if let Some(new_text) = &fe.new_text {
+            let orig_len = fe.edits.first().map(|e| e.byte_end).unwrap_or(new_text.len());
+            sink.pending_rewrite_content.insert(
+                fe.path.clone(),
+                (new_text.clone(), fe.original_sha256.clone(), orig_len),
+            );
+        }
+    }
+    for fc in &bes.file_creates {
+        register_path(sink.touched_paths, &fc.path)?;
+    }
+    sink.edit_set.file_edits.extend(bes.file_edits);
+    sink.edit_set.file_creates.extend(bes.file_creates);
+    sink.op_statuses.push(MacroSemanticStatus::SyntaxOnly);
+    sink.plan_ops.push(MacroPlanOperation {
+        kind: "rewrite".to_string(),
+        name: None,
+        semantic_status: MacroSemanticStatus::SyntaxOnly,
+        summary: format!("Rewrite {} target(s) via backend", targets.len()),
+    });
+    Ok(())
+}
+
 /// Extract the target file path from a typed [`JavaRewriteOp`].
 ///
 /// Used by the same-file chaining logic in the `Rewrite` operation handler to
@@ -904,6 +1001,10 @@ fn rewrite_target_file(op: &JavaRewriteOp) -> &str {
         JavaRewriteOp::InsertMember { target_file, .. } => target_file.as_str(),
         JavaRewriteOp::ReplaceMethodBody { target_file, .. } => target_file.as_str(),
         JavaRewriteOp::InsertStatementInMethod { target_file, .. } => target_file.as_str(),
+        JavaRewriteOp::InsertClassAnnotation { target_file, .. } => target_file.as_str(),
+        JavaRewriteOp::DeleteMember { target_file, .. } => target_file.as_str(),
+        JavaRewriteOp::InsertFieldAnnotation { target_file, .. } => target_file.as_str(),
+        JavaRewriteOp::PruneUnusedImport { target_file, .. } => target_file.as_str(),
     }
 }
 
@@ -1426,6 +1527,7 @@ fn probe_spec_kind_str(spec: &ProbeSpec) -> &'static str {
         ProbeSpec::CodeSymbols { .. } => "code_symbols",
         ProbeSpec::ProjectText { .. } => "project_text",
         ProbeSpec::WorkspaceSymbol { .. } => "workspace_symbol",
+        ProbeSpec::JavaClassAnalysis { .. } => "java_class_analysis",
     }
 }
 
@@ -1579,6 +1681,27 @@ fn validate_context_roots(
                         label, r
                     ));
                 }
+            }
+        }
+    }
+
+    // ForEach: structural validation. The body must be an edit-producing op
+    // (emit | rewrite) in v1; a probe/delegate_refactor/validate/record/nested
+    // for_each body is rejected. The `over` path must be non-empty.
+    for (i, op) in def.operations.iter().enumerate() {
+        if let MacroOperation::ForEach { over, body, .. } = op {
+            match body.as_ref() {
+                MacroOperation::Emit { .. } | MacroOperation::Rewrite { .. } => {}
+                _ => bad.push(format!(
+                    "operations[{i}] ForEach body must be an emit or rewrite operation \
+                     (probe, delegate_refactor, validate, record, and nested for_each \
+                     bodies are not supported in v1)"
+                )),
+            }
+            if over.trim().is_empty() {
+                bad.push(format!(
+                    "operations[{i}] ForEach 'over' path must be a non-empty context path"
+                ));
             }
         }
     }
@@ -2018,6 +2141,236 @@ mod tests {
         assert!(
             msg.contains("error.duplicate_touched_path"),
             "DelegateRefactor → Rewrite same path must produce error.duplicate_touched_path; got: {msg}"
+        );
+    }
+
+    // ── ForEach fan-out ────────────────────────────────────────────────────────
+
+    /// ForEach expands one rewrite per probe-discovered item, interpolating
+    /// `${item.*}` per element and honoring the body's per-item `when` guard.
+    #[test]
+    fn for_each_fans_out_rewrite_per_probe_item_with_per_item_guard() {
+        use crate::macros::backend::{
+            BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp,
+        };
+        use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+        use crate::refactor::{FileEdit, TextEdit};
+        use std::sync::Mutex;
+
+        // Records the target_type of every rewrite op it receives, echoing the
+        // op's target_file into the resulting FileEdit path.
+        struct RecordingBackend {
+            seen: Mutex<Vec<String>>,
+        }
+        impl JavaMacroBackend for RecordingBackend {
+            fn emit(&self, _: &JavaEmitOp) -> anyhow::Result<BackendEditSet> {
+                unimplemented!("emit not used in this test")
+            }
+            fn rewrite(&self, op: &JavaRewriteOp) -> anyhow::Result<BackendEditSet> {
+                let (path, ttype) = match op {
+                    JavaRewriteOp::InsertMember {
+                        target_file,
+                        target_type,
+                        ..
+                    } => (target_file.clone(), target_type.clone()),
+                    _ => unimplemented!("only insert_member used in this test"),
+                };
+                self.seen.lock().unwrap().push(ttype);
+                Ok(BackendEditSet {
+                    file_edits: vec![FileEdit {
+                        path,
+                        original_sha256: "deadbeef".into(),
+                        edits: vec![TextEdit {
+                            byte_start: 0,
+                            byte_end: 1,
+                            replacement: "x".into(),
+                        }],
+                        new_text: Some("x".into()),
+                    }],
+                    file_creates: vec![],
+                })
+            }
+        }
+
+        // Canned probe runner: returns a 3-item list, two of which are kept.
+        struct CannedItemsRunner;
+        impl ProbeRunner for CannedItemsRunner {
+            fn run_probe(
+                &self,
+                _name: &str,
+                _spec: &ProbeSpec,
+                _ctx: &crate::macros::expr::Context,
+                _inv: &crate::macros::model::MacroInvocation,
+            ) -> anyhow::Result<ProbeOutput> {
+                Ok(ProbeOutput {
+                    value: json!({
+                        "exists": true,
+                        "count": 3,
+                        "items": [
+                            {"name": "Alpha", "keep": true},
+                            {"name": "Beta",  "keep": false},
+                            {"name": "Gamma", "keep": true}
+                        ]
+                    }),
+                    semantic_status: MacroSemanticStatus::SyntaxOnly,
+                    truncated: false,
+                    diagnostics: vec![],
+                })
+            }
+        }
+
+        let mut def = minimal_def();
+        def.language = "java".into();
+        def.operations = vec![
+            // Discover the collection.
+            MacroOperation::Probe {
+                name: "members".into(),
+                spec: json!({
+                    "kind": "code_symbols",
+                    "query": "x",
+                    "languages": ["java"],
+                    "item_kinds": ["method_declaration"]
+                }),
+            },
+            // Fan out a rewrite per item, skipping items whose `keep` is false.
+            MacroOperation::ForEach {
+                over: "members.items".into(),
+                bind: "item".into(),
+                body: Box::new(MacroOperation::Rewrite {
+                    targets: vec!["${item.name}.java".into()],
+                    backend_op: json!({
+                        "op": "insert_member",
+                        "target_file": "${item.name}.java",
+                        "target_type": "${item.name}",
+                        "member_text": "// generated",
+                        "imports": []
+                    }),
+                    when: Some(crate::macros::expr::Predicate::Eq {
+                        path: "item.keep".into(),
+                        value: json!(true),
+                    }),
+                }),
+            },
+        ];
+
+        let backend = Box::new(RecordingBackend {
+            seen: Mutex::new(vec![]),
+        });
+        // Keep a raw pointer-free handle: re-create assertion via plan output instead.
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::new(backend, None, Box::new(CannedItemsRunner));
+
+        let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
+        assert!(plan.refusals.is_empty(), "no refusals expected: {:?}", plan.refusals);
+
+        // Two of three items kept → two distinct file edits (Beta skipped by guard).
+        let mut paths: Vec<String> =
+            plan.edits.file_edits.iter().map(|e| e.path.clone()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["Alpha.java".to_string(), "Gamma.java".to_string()],
+            "ForEach must fan out one edit per kept item with ${{item.*}} interpolated; \
+             Beta must be skipped by its per-item guard"
+        );
+
+        // The for_each op summary records the expansion count (all 3 visited).
+        let foreach_summary = plan
+            .operations
+            .iter()
+            .find(|o| o.kind == "for_each")
+            .expect("plan must contain a for_each operation summary");
+        assert!(
+            foreach_summary.summary.contains("expanded 3 item(s)"),
+            "for_each summary should report 3 visited items; got: {}",
+            foreach_summary.summary
+        );
+    }
+
+    /// A ForEach whose `over` path resolves to a non-array value fails closed.
+    #[test]
+    fn for_each_over_non_array_fails_closed() {
+        use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
+        struct ScalarRunner;
+        impl ProbeRunner for ScalarRunner {
+            fn run_probe(
+                &self,
+                _name: &str,
+                _spec: &ProbeSpec,
+                _ctx: &crate::macros::expr::Context,
+                _inv: &crate::macros::model::MacroInvocation,
+            ) -> anyhow::Result<ProbeOutput> {
+                Ok(ProbeOutput {
+                    value: json!({"exists": true, "count": 1, "items": "not-an-array"}),
+                    semantic_status: MacroSemanticStatus::SyntaxOnly,
+                    truncated: false,
+                    diagnostics: vec![],
+                })
+            }
+        }
+
+        let mut def = minimal_def();
+        def.language = "java".into();
+        def.operations = vec![
+            MacroOperation::Probe {
+                name: "members".into(),
+                spec: json!({
+                    "kind": "code_symbols",
+                    "query": "x",
+                    "languages": ["java"],
+                    "item_kinds": ["method_declaration"]
+                }),
+            },
+            MacroOperation::ForEach {
+                over: "members.items".into(),
+                bind: "item".into(),
+                body: Box::new(MacroOperation::Rewrite {
+                    targets: vec!["x".into()],
+                    backend_op: json!({
+                        "op": "insert_member",
+                        "target_file": "x.java",
+                        "target_type": "X",
+                        "member_text": "// x",
+                        "imports": []
+                    }),
+                    when: None,
+                }),
+            },
+        ];
+
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::new(
+            Box::new(crate::macros::backend::UnavailableBackend),
+            None,
+            Box::new(ScalarRunner),
+        );
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("must resolve to an array"),
+            "ForEach over a non-array must fail closed; got: {msg}"
+        );
+    }
+
+    /// Registry-style validation rejects a ForEach whose body is not emit/rewrite.
+    #[test]
+    fn for_each_non_edit_body_is_rejected() {
+        let mut def = minimal_def();
+        def.operations = vec![MacroOperation::ForEach {
+            over: "members.items".into(),
+            bind: "item".into(),
+            body: Box::new(MacroOperation::Record {
+                label: "x".into(),
+                body: "y".into(),
+            }),
+        }];
+        let inv = minimal_invocation(&def, "/tmp");
+        let ctx = MacroPlannerContext::default();
+        let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ForEach body must be an emit or rewrite"),
+            "non-edit ForEach body must be rejected; got: {msg}"
         );
     }
 
@@ -3088,6 +3441,7 @@ mod tests {
                 m
             },
             probes: std::collections::HashMap::new(),
+            locals: std::collections::HashMap::new(),
         };
         let v = json!({
             "op": "emit_type",
@@ -3231,6 +3585,7 @@ mod tests {
                 m
             },
             probes: std::collections::HashMap::new(),
+            locals: std::collections::HashMap::new(),
         };
         let v = json!({"parameter_types": ["${inputs.param_types}"]});
         let out = interpolate_value_strings(&v, &ctx).expect("splice interpolation should succeed");

@@ -4,7 +4,7 @@ tags:
 ---
 +++
 title = "Refactor mechanization catalog — language routing and support matrix"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "language", "catalog", "support-matrix", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "rust", "typescript", "javascript", "csharp", "python", "java", "go", "c", "cpp", "elixir", "sm-refactor-rust", "sm-refactor-typescript", "sm-refactor-csharp", "sm-refactor-python", "sm-refactor-java", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify", "sm-refactor-go", "sm-refactor-c-cpp", "sm-refactor-elixir"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "language", "catalog", "support-matrix", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "rust", "typescript", "javascript", "csharp", "python", "java", "go", "c", "cpp", "elixir", "sm-refactor-rust", "sm-refactor-typescript", "sm-refactor-csharp", "sm-refactor-python", "sm-refactor-java", "sm-refactor-java-extract-class", "sm-refactor-go", "sm-refactor-c-cpp", "sm-refactor-elixir"]
 order = 7
 template = false
 +++

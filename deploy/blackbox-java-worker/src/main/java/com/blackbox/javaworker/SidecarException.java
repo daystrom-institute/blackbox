@@ -36,6 +36,9 @@ final class SidecarException extends RuntimeException {
     /** Multiple methods match the given name and parameter types — the combination is ambiguous. */
     static final int METHOD_AMBIGUOUS = -32005;
 
+    /** A name-only deleteMember matched more than one member — supply parameter_types. */
+    static final int MEMBER_AMBIGUOUS = -32006;
+
     private final int code;
 
     SidecarException(int code, String message) {

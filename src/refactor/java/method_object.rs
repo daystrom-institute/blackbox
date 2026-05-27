@@ -49,7 +49,7 @@
 
 use super::scope::{ScopeTree, analyze_range};
 use super::*;
-use crate::refactor::java::lombokify::formal_parameters;
+use crate::refactor::java::method_params::formal_parameters;
 use std::collections::HashMap;
 
 pub(crate) fn plan_convert_method_to_class(p: &RefactorPlanParams) -> Result<String> {

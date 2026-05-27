@@ -65,8 +65,6 @@ Files in `system-defaults/memories/` use bare slugs such as
   validation, and Java plan routing.
 - [sm-refactor-java-extract-class](refactor-java-extract-class.md) - composite
   Java class extraction, capture analysis, and generated FIXME catalog.
-- [sm-refactor-java-lombokify](refactor-java-lombokify.md) - Java POJO
-  boilerplate to Lombok annotations.
 - [sm-refactor-typescript](refactor-typescript.md) - TypeScript and JavaScript
   inventory and validation workflow.
 - [sm-refactor-python](refactor-python.md) - Python inventory and Pyright/Rope

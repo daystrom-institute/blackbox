@@ -1742,8 +1742,8 @@ mod tests {
         fs::write(&source, "fn keep() {}\n").unwrap();
 
         // Use `delete_rust_items` against a non-existent item as the
-        // failing plan kind — same shape as lombokify's "no boilerplate"
-        // bail in the wild but works in the rust-only test harness.
+        // failing plan kind — same shape as a "nothing to do" bail in the
+        // wild but works in the rust-only test harness.
         let response = run(
             &RefactorRunParams {
                 title: "optional skip preserves prior writes".into(),

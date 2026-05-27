@@ -146,6 +146,90 @@ pub enum JavaRewriteOp {
         /// Fully-qualified import statements to add if not already present.
         imports: Vec<String>,
     },
+
+    /// Add an annotation to an existing type declaration (class-level
+    /// placement), idempotently.
+    ///
+    /// Generic by construction: the annotation text and its import are caller
+    /// data, so this op carries no library-specific knowledge. Any
+    /// annotation-codegen library (Lombok `@Getter`/`@Data`, Immutables
+    /// `@Value.Immutable`, AutoValue `@AutoValue`, MapStruct `@Mapper`, …) is
+    /// expressed by passing the appropriate `annotation_text` + `imports`.
+    ///
+    /// Idempotency: if the type already carries an annotation of the same type,
+    /// the sidecar returns a no-op (no duplicate annotation).
+    InsertClassAnnotation {
+        /// Absolute path to the file containing the target type.
+        target_file: String,
+        /// Simple name of the type to annotate, e.g. `"User"`.
+        target_type: String,
+        /// Full annotation source text, e.g. `"@Getter"` or
+        /// `"@EqualsAndHashCode(callSuper = false)"`.
+        annotation_text: String,
+        /// Fully-qualified import statements to add if not already present,
+        /// e.g. `["lombok.Getter"]`.
+        imports: Vec<String>,
+    },
+
+    /// Remove a member (method/field/constructor) from an existing type by
+    /// simple name, optionally disambiguated by written parameter types.
+    ///
+    /// Generic by construction: carries no library knowledge. Composed with
+    /// `ForEach` to sweep away hand-written boilerplate that a class-level
+    /// annotation now generates (e.g. delete every trivial getter once
+    /// `@Getter` is added).
+    ///
+    /// Idempotency: if no matching member exists, the sidecar returns a no-op.
+    /// Ambiguity: a name-only match (`parameter_types = None`) that hits more
+    /// than one member fails closed with `error.member_ambiguous`.
+    DeleteMember {
+        /// Absolute path to the file containing the target type.
+        target_file: String,
+        /// Simple name of the type to delete the member from.
+        target_type: String,
+        /// Simple name of the member to delete (for a constructor, the type's
+        /// simple name).
+        member_name: String,
+        /// Optional written parameter types for overload disambiguation, e.g.
+        /// `["String", "int"]`. `None` matches by name alone (ambiguity →
+        /// error). `Some(vec![])` matches a no-arg method/constructor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        parameter_types: Option<Vec<String>>,
+    },
+
+    /// Add an annotation immediately above a named field (per-field placement),
+    /// idempotently.
+    ///
+    /// Generic by construction. Complements `InsertClassAnnotation` for the
+    /// partial-coverage case where, say, only one field gets `@Getter` rather
+    /// than the whole type.
+    ///
+    /// Idempotency: if the field already carries an annotation of the same
+    /// type, the sidecar returns a no-op.
+    InsertFieldAnnotation {
+        /// Absolute path to the file containing the target type.
+        target_file: String,
+        /// Simple name of the type containing the field.
+        target_type: String,
+        /// Simple name of the field to annotate.
+        field_name: String,
+        /// Full annotation source text, e.g. `"@Getter"`.
+        annotation_text: String,
+        /// Fully-qualified import statements to add if not already present.
+        imports: Vec<String>,
+    },
+
+    /// Remove each named import **only if** its symbol is no longer referenced.
+    ///
+    /// Generic by construction. Used after a `ForEach` + `DeleteMember` sweep
+    /// removes the last reference to an imported type. A still-referenced import
+    /// is left untouched (not an error); an absent one is a no-op.
+    PruneUnusedImport {
+        /// Absolute path to the file.
+        target_file: String,
+        /// Fully-qualified imports to remove if unreferenced.
+        imports: Vec<String>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -367,6 +451,126 @@ mod tests {
                 assert_eq!(method_name, "init");
                 assert_eq!(placement, "append");
                 assert!(statement_text.contains("ready"));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_insert_class_annotation_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::InsertClassAnnotation {
+            target_file: "/repo/src/User.java".into(),
+            target_type: "User".into(),
+            annotation_text: "@Getter".into(),
+            imports: vec!["lombok.Getter".into()],
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("insert_class_annotation"), "tagged op field");
+        assert_eq!(v["target_type"], json!("User"));
+        assert_eq!(v["annotation_text"], json!("@Getter"));
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::InsertClassAnnotation {
+                target_type,
+                annotation_text,
+                imports,
+                ..
+            } => {
+                assert_eq!(target_type, "User");
+                assert_eq!(annotation_text, "@Getter");
+                assert_eq!(imports, vec!["lombok.Getter"]);
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_delete_member_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::DeleteMember {
+            target_file: "/repo/src/User.java".into(),
+            target_type: "User".into(),
+            member_name: "getName".into(),
+            parameter_types: Some(vec![]),
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("delete_member"), "tagged op field");
+        assert_eq!(v["member_name"], json!("getName"));
+        assert_eq!(v["parameter_types"], json!([]));
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::DeleteMember {
+                target_type,
+                member_name,
+                parameter_types,
+                ..
+            } => {
+                assert_eq!(target_type, "User");
+                assert_eq!(member_name, "getName");
+                assert_eq!(parameter_types, Some(vec![]));
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_delete_member_name_only_omits_parameter_types() {
+        use serde_json::json;
+        let op = JavaRewriteOp::DeleteMember {
+            target_file: "/repo/src/User.java".into(),
+            target_type: "User".into(),
+            member_name: "log".into(),
+            parameter_types: None,
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("delete_member"));
+        assert!(
+            v.get("parameter_types").is_none(),
+            "None parameter_types must be omitted; got: {v}"
+        );
+    }
+
+    #[test]
+    fn java_rewrite_op_insert_field_annotation_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::InsertFieldAnnotation {
+            target_file: "/repo/src/User.java".into(),
+            target_type: "User".into(),
+            field_name: "name".into(),
+            annotation_text: "@Getter".into(),
+            imports: vec!["lombok.Getter".into()],
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("insert_field_annotation"), "tagged op field");
+        assert_eq!(v["field_name"], json!("name"));
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::InsertFieldAnnotation {
+                field_name,
+                annotation_text,
+                ..
+            } => {
+                assert_eq!(field_name, "name");
+                assert_eq!(annotation_text, "@Getter");
+            }
+            _ => panic!("unexpected variant"),
+        }
+    }
+
+    #[test]
+    fn java_rewrite_op_prune_unused_import_serde_round_trip() {
+        use serde_json::json;
+        let op = JavaRewriteOp::PruneUnusedImport {
+            target_file: "/repo/src/Bean.java".into(),
+            imports: vec!["org.apache.commons.lang3.builder.EqualsBuilder".into()],
+        };
+        let v = serde_json::to_value(&op).unwrap();
+        assert_eq!(v["op"], json!("prune_unused_import"), "tagged op field");
+        let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
+        match back {
+            JavaRewriteOp::PruneUnusedImport { imports, .. } => {
+                assert_eq!(imports.len(), 1);
             }
             _ => panic!("unexpected variant"),
         }

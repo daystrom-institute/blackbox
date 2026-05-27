@@ -22,6 +22,16 @@
 //! - `ReplaceMethodBody` → `replaceMethodBody` RPC. Maps `error.method_not_found`
 //!   and `error.method_ambiguous` through as domain errors.
 //! - `InsertStatementInMethod` → `insertStatementInMethod` RPC. Same error mapping.
+//! - `InsertClassAnnotation` → `insertClassAnnotation` RPC. Adds a class-level
+//!   annotation (idempotent: no-op when an annotation of the same simple name
+//!   is already present).
+//! - `DeleteMember` → `deleteMember` RPC. Removes a member by name (+ optional
+//!   parameter types); no-op when absent, `error.member_ambiguous` on an
+//!   ambiguous name-only match.
+//! - `InsertFieldAnnotation` → `insertFieldAnnotation` RPC. Adds an annotation
+//!   above a named field (idempotent; per-field analogue of the class form).
+//! - `PruneUnusedImport` → `pruneUnusedImport` RPC. Removes named imports only
+//!   when unreferenced (still-referenced imports are left; absent → no-op).
 //!
 //! `no_op=true` → empty `BackendEditSet`.
 //! `changed=true` → single full-span `FileEdit` replacing the whole file.
@@ -37,9 +47,11 @@ use sha2::{Digest, Sha256};
 use super::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
 use super::java_sidecar::JavaWorkerPool;
 use super::java_sidecar_protocol::{
-    EmitTypeParams, InsertMemberParams, InsertStatementInMethodParams,
-    ReplaceMethodBodyParams, METHOD_EMIT_TYPE, METHOD_INSERT_MEMBER,
-    METHOD_INSERT_STATEMENT_IN_METHOD, METHOD_REPLACE_METHOD_BODY,
+    DeleteMemberParams, EmitTypeParams, InsertClassAnnotationParams, InsertFieldAnnotationParams,
+    InsertMemberParams, InsertStatementInMethodParams, PruneUnusedImportParams,
+    ReplaceMethodBodyParams, METHOD_DELETE_MEMBER, METHOD_EMIT_TYPE, METHOD_INSERT_CLASS_ANNOTATION,
+    METHOD_INSERT_FIELD_ANNOTATION, METHOD_INSERT_MEMBER, METHOD_INSERT_STATEMENT_IN_METHOD,
+    METHOD_PRUNE_UNUSED_IMPORT, METHOD_REPLACE_METHOD_BODY,
 };
 use crate::refactor::{FileCreate, FileEdit, TextEdit};
 
@@ -254,6 +266,140 @@ impl JavaMacroBackend for SidecarBackend {
                     "insertStatementInMethod",
                 )
             }
+
+            JavaRewriteOp::InsertClassAnnotation {
+                target_file,
+                target_type,
+                annotation_text,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertClassAnnotation")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::InsertClassAnnotationResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_INSERT_CLASS_ANNOTATION,
+                        InsertClassAnnotationParams {
+                            target_file: target_file.clone(),
+                            source_text: source_text.clone(),
+                            target_type: target_type.clone(),
+                            annotation_text: annotation_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "insertClassAnnotation"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    source_text.len(),
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertClassAnnotation",
+                )
+            }
+
+            JavaRewriteOp::DeleteMember {
+                target_file,
+                target_type,
+                member_name,
+                parameter_types,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/deleteMember")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::DeleteMemberResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_DELETE_MEMBER,
+                        DeleteMemberParams {
+                            target_file: target_file.clone(),
+                            source_text: source_text.clone(),
+                            target_type: target_type.clone(),
+                            member_name: member_name.clone(),
+                            parameter_types: parameter_types.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "deleteMember"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    source_text.len(),
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "deleteMember",
+                )
+            }
+
+            JavaRewriteOp::InsertFieldAnnotation {
+                target_file,
+                target_type,
+                field_name,
+                annotation_text,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertFieldAnnotation")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::InsertFieldAnnotationResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_INSERT_FIELD_ANNOTATION,
+                        InsertFieldAnnotationParams {
+                            target_file: target_file.clone(),
+                            source_text: source_text.clone(),
+                            target_type: target_type.clone(),
+                            field_name: field_name.clone(),
+                            annotation_text: annotation_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "insertFieldAnnotation"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    source_text.len(),
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertFieldAnnotation",
+                )
+            }
+
+            JavaRewriteOp::PruneUnusedImport {
+                target_file,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/pruneUnusedImport")?;
+                let (source_text, original_sha256) = read_source_and_sha(target_file)?;
+                let result: super::java_sidecar_protocol::PruneUnusedImportResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_PRUNE_UNUSED_IMPORT,
+                        PruneUnusedImportParams {
+                            target_file: target_file.clone(),
+                            source_text: source_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "pruneUnusedImport"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    source_text.len(),
+                    original_sha256,
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "pruneUnusedImport",
+                )
+            }
         }
     }
 
@@ -384,6 +530,136 @@ impl JavaMacroBackend for SidecarBackend {
                     "insertStatementInMethod(override)",
                 )
             }
+
+            JavaRewriteOp::InsertClassAnnotation {
+                target_file,
+                target_type,
+                annotation_text,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertClassAnnotation(override)")?;
+                let result: super::java_sidecar_protocol::InsertClassAnnotationResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_INSERT_CLASS_ANNOTATION,
+                        InsertClassAnnotationParams {
+                            target_file: target_file.clone(),
+                            source_text: override_content.to_string(),
+                            target_type: target_type.clone(),
+                            annotation_text: annotation_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "insertClassAnnotation"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertClassAnnotation(override)",
+                )
+            }
+
+            JavaRewriteOp::DeleteMember {
+                target_file,
+                target_type,
+                member_name,
+                parameter_types,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/deleteMember(override)")?;
+                let result: super::java_sidecar_protocol::DeleteMemberResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_DELETE_MEMBER,
+                        DeleteMemberParams {
+                            target_file: target_file.clone(),
+                            source_text: override_content.to_string(),
+                            target_type: target_type.clone(),
+                            member_name: member_name.clone(),
+                            parameter_types: parameter_types.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "deleteMember"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "deleteMember(override)",
+                )
+            }
+
+            JavaRewriteOp::InsertFieldAnnotation {
+                target_file,
+                target_type,
+                field_name,
+                annotation_text,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/insertFieldAnnotation(override)")?;
+                let result: super::java_sidecar_protocol::InsertFieldAnnotationResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_INSERT_FIELD_ANNOTATION,
+                        InsertFieldAnnotationParams {
+                            target_file: target_file.clone(),
+                            source_text: override_content.to_string(),
+                            target_type: target_type.clone(),
+                            field_name: field_name.clone(),
+                            annotation_text: annotation_text.clone(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "insertFieldAnnotation"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "insertFieldAnnotation(override)",
+                )
+            }
+
+            JavaRewriteOp::PruneUnusedImport {
+                target_file,
+                imports,
+            } => {
+                check_rewrite_path_contained(target_file, &canonical_root)?;
+                let worker_arc = self.acquire_worker("rewrite/pruneUnusedImport(override)")?;
+                let result: super::java_sidecar_protocol::PruneUnusedImportResult = worker_arc
+                    .lock()
+                    .unwrap()
+                    .call(
+                        METHOD_PRUNE_UNUSED_IMPORT,
+                        PruneUnusedImportParams {
+                            target_file: target_file.clone(),
+                            source_text: override_content.to_string(),
+                            imports: imports.clone(),
+                        },
+                    )
+                    .map_err(|e| classify_rewrite_rpc_err(e, "pruneUnusedImport"))?;
+                build_rewrite_edit_set(
+                    target_file,
+                    original_byte_len,
+                    original_sha256_on_disk.to_string(),
+                    result.rewritten_source,
+                    result.changed,
+                    result.no_op,
+                    "pruneUnusedImport(override)",
+                )
+            }
         }
     }
 }
@@ -440,6 +716,7 @@ fn classify_rewrite_rpc_err(e: anyhow::Error, rpc_method: &str) -> anyhow::Error
     // Domain error codes to propagate verbatim from the worker's RPC error message.
     for domain_code in &[
         "error.member_conflict",
+        "error.member_ambiguous",
         "error.method_not_found",
         "error.method_ambiguous",
         "error.parse_invalid",
@@ -950,5 +1227,322 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// End-to-end proof for `InsertClassAnnotation` (Phase 6, gap 1).
+    ///
+    /// Unlike the lenient `live_*` tests above, the happy path here is
+    /// **strict**: with a real worker the op MUST change the file, the rewritten
+    /// source MUST carry the annotation and its import, and a second run against
+    /// the already-annotated source MUST be a no-op. This is what actually
+    /// exercises the OpenRewrite `JavaTemplate.addAnnotation` idiom — the part
+    /// that compiling alone does not prove.
+    #[test]
+    fn live_insert_class_annotation_adds_then_is_idempotent() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — \
+                 skipping live insertClassAnnotation test"
+            );
+            return;
+        };
+        if !PathBuf::from(&jar).exists() {
+            eprintln!(
+                "[sidecar_backend] worker JAR missing — skipping live insertClassAnnotation test"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("User.java");
+        std::fs::write(
+            &target_file,
+            "package com.example;\n\npublic class User {\n    private String name;\n}\n",
+        )
+        .expect("failed to write temp .java file");
+        let target_str = target_file.to_str().unwrap().to_string();
+
+        let backend = SidecarBackend::new(dir.path().to_path_buf());
+        let op = JavaRewriteOp::InsertClassAnnotation {
+            target_file: target_str.clone(),
+            target_type: "User".into(),
+            annotation_text: "@Getter".into(),
+            imports: vec!["lombok.Getter".into()],
+        };
+
+        // -- (1) Happy path: STRICT — must change and produce a valid result ----
+        let bes = backend
+            .rewrite(&op)
+            .expect("live insertClassAnnotation must succeed with a real worker");
+        assert_eq!(
+            bes.file_edits.len(),
+            1,
+            "insertClassAnnotation must produce exactly one file edit on a fresh class"
+        );
+        let rewritten = bes.file_edits[0]
+            .new_text
+            .clone()
+            .expect("changed FileEdit must carry new_text");
+        assert!(
+            rewritten.contains("@Getter"),
+            "rewritten source must contain the @Getter annotation; got:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("import lombok.Getter;"),
+            "rewritten source must contain the lombok.Getter import; got:\n{rewritten}"
+        );
+        // The annotation must precede the class keyword (class-level placement).
+        let anno_at = rewritten.find("@Getter").unwrap();
+        let class_at = rewritten.find("class User").unwrap();
+        assert!(
+            anno_at < class_at,
+            "@Getter must be placed above the class declaration; got:\n{rewritten}"
+        );
+        // The original member must survive untouched.
+        assert!(
+            rewritten.contains("private String name;"),
+            "the original field must be preserved; got:\n{rewritten}"
+        );
+
+        // -- (2) Idempotency: STRICT — re-run on annotated source is a no-op ----
+        std::fs::write(&target_file, &rewritten).expect("write rewritten source back to disk");
+        let bes2 = backend
+            .rewrite(&op)
+            .expect("second insertClassAnnotation run must succeed");
+        assert!(
+            bes2.file_edits.is_empty(),
+            "second run on already-annotated source must be a no-op (empty edit set); \
+             got {} edit(s)",
+            bes2.file_edits.len()
+        );
+    }
+
+    /// End-to-end proof for `DeleteMember` (Phase 6, gap 2). Strict: deletes a
+    /// named method, leaves siblings intact, is idempotent on re-run, and fails
+    /// closed (`error.member_ambiguous`) on an ambiguous name-only match.
+    #[test]
+    fn live_delete_member_removes_then_idempotent_and_ambiguity_fails() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — \
+                 skipping live deleteMember test"
+            );
+            return;
+        };
+        if !PathBuf::from(&jar).exists() {
+            eprintln!("[sidecar_backend] worker JAR missing — skipping live deleteMember test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("Bean.java");
+        std::fs::write(
+            &target_file,
+            "package com.example;\n\npublic class Bean {\n    \
+             private String name;\n    \
+             public String getName() { return name; }\n    \
+             public void setName(String name) { this.name = name; }\n}\n",
+        )
+        .expect("write temp .java file");
+        let target_str = target_file.to_str().unwrap().to_string();
+        let backend = SidecarBackend::new(dir.path().to_path_buf());
+
+        // -- (1) Delete getName() (no-arg) — STRICT ------------------------
+        let del_getter = JavaRewriteOp::DeleteMember {
+            target_file: target_str.clone(),
+            target_type: "Bean".into(),
+            member_name: "getName".into(),
+            parameter_types: Some(vec![]),
+        };
+        let bes = backend.rewrite(&del_getter).expect("deleteMember must succeed");
+        assert_eq!(bes.file_edits.len(), 1, "deleting getName must produce one edit");
+        let rewritten = bes.file_edits[0].new_text.clone().unwrap();
+        assert!(
+            !rewritten.contains("getName"),
+            "getName must be removed; got:\n{rewritten}"
+        );
+        // Siblings preserved.
+        assert!(
+            rewritten.contains("setName") && rewritten.contains("private String name;"),
+            "sibling members must be preserved; got:\n{rewritten}"
+        );
+
+        // -- (2) Idempotency: deleting an absent member is a no-op ---------
+        std::fs::write(&target_file, &rewritten).expect("write rewritten back");
+        let bes2 = backend.rewrite(&del_getter).expect("second deleteMember must succeed");
+        assert!(
+            bes2.file_edits.is_empty(),
+            "deleting an already-absent member must be a no-op; got {} edit(s)",
+            bes2.file_edits.len()
+        );
+
+        // -- (3) Ambiguity: name-only match on an overloaded name fails ----
+        let overloaded_file = dir.path().join("Over.java");
+        std::fs::write(
+            &overloaded_file,
+            "package com.example;\n\npublic class Over {\n    \
+             public void run() {}\n    \
+             public void run(int n) {}\n}\n",
+        )
+        .expect("write overloaded file");
+        let del_ambiguous = JavaRewriteOp::DeleteMember {
+            target_file: overloaded_file.to_str().unwrap().to_string(),
+            target_type: "Over".into(),
+            member_name: "run".into(),
+            parameter_types: None, // name-only → ambiguous
+        };
+        let err = backend.rewrite(&del_ambiguous).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("error.member_ambiguous"),
+            "name-only delete of an overloaded method must fail with error.member_ambiguous; \
+             got: {msg}"
+        );
+
+        // -- (4) Same overload, disambiguated by parameter_types, succeeds -
+        let del_specific = JavaRewriteOp::DeleteMember {
+            target_file: overloaded_file.to_str().unwrap().to_string(),
+            target_type: "Over".into(),
+            member_name: "run".into(),
+            parameter_types: Some(vec!["int".into()]),
+        };
+        let bes3 = backend.rewrite(&del_specific).expect("disambiguated delete must succeed");
+        let rewritten3 = bes3.file_edits[0].new_text.clone().unwrap();
+        assert!(
+            rewritten3.contains("run()") && !rewritten3.contains("run(int n)"),
+            "only run(int) must be removed; got:\n{rewritten3}"
+        );
+    }
+
+    /// End-to-end proof for `InsertFieldAnnotation` (Phase 6, gap 3a). Strict:
+    /// annotates the named field only, adds the import, is idempotent on re-run.
+    #[test]
+    fn live_insert_field_annotation_adds_then_idempotent() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — \
+                 skipping live insertFieldAnnotation test"
+            );
+            return;
+        };
+        if !PathBuf::from(&jar).exists() {
+            eprintln!(
+                "[sidecar_backend] worker JAR missing — skipping live insertFieldAnnotation test"
+            );
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target_file = dir.path().join("Bean.java");
+        std::fs::write(
+            &target_file,
+            "package com.example;\n\npublic class Bean {\n    \
+             private String name;\n    private int count;\n}\n",
+        )
+        .expect("write temp .java file");
+        let target_str = target_file.to_str().unwrap().to_string();
+        let backend = SidecarBackend::new(dir.path().to_path_buf());
+
+        let op = JavaRewriteOp::InsertFieldAnnotation {
+            target_file: target_str.clone(),
+            target_type: "Bean".into(),
+            field_name: "name".into(),
+            annotation_text: "@Getter".into(),
+            imports: vec!["lombok.Getter".into()],
+        };
+
+        let bes = backend.rewrite(&op).expect("insertFieldAnnotation must succeed");
+        assert_eq!(bes.file_edits.len(), 1, "must produce one edit");
+        let rewritten = bes.file_edits[0].new_text.clone().unwrap();
+        assert!(
+            rewritten.contains("@Getter"),
+            "rewritten must contain @Getter; got:\n{rewritten}"
+        );
+        assert!(
+            rewritten.contains("import lombok.Getter;"),
+            "rewritten must contain the lombok.Getter import; got:\n{rewritten}"
+        );
+        // The annotation must attach to `name`, not `count`: @Getter appears
+        // before `name` and there must be exactly one @Getter.
+        assert_eq!(
+            rewritten.matches("@Getter").count(),
+            1,
+            "exactly one @Getter (only the `name` field); got:\n{rewritten}"
+        );
+        let getter_at = rewritten.find("@Getter").unwrap();
+        let name_at = rewritten.find("String name").unwrap();
+        let count_at = rewritten.find("int count").unwrap();
+        assert!(
+            getter_at < name_at && getter_at < count_at,
+            "@Getter must precede the `name` field; got:\n{rewritten}"
+        );
+
+        // Idempotency: re-run on annotated source is a no-op.
+        std::fs::write(&target_file, &rewritten).expect("write rewritten back");
+        let bes2 = backend.rewrite(&op).expect("second run must succeed");
+        assert!(
+            bes2.file_edits.is_empty(),
+            "second run on annotated field must be a no-op; got {} edit(s)",
+            bes2.file_edits.len()
+        );
+    }
+
+    /// End-to-end proof for `PruneUnusedImport` (Phase 6, gap 3b). Strict: an
+    /// unreferenced import is removed; a still-referenced import is kept (no-op).
+    #[test]
+    fn live_prune_unused_import_removes_unreferenced_keeps_referenced() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!(
+                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — \
+                 skipping live pruneUnusedImport test"
+            );
+            return;
+        };
+        if !PathBuf::from(&jar).exists() {
+            eprintln!("[sidecar_backend] worker JAR missing — skipping live pruneUnusedImport test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let backend = SidecarBackend::new(dir.path().to_path_buf());
+
+        // -- Unreferenced import → removed --------------------------------
+        let unused_file = dir.path().join("Unused.java");
+        std::fs::write(
+            &unused_file,
+            "package com.example;\n\nimport java.util.List;\n\npublic class Unused {\n    \
+             private int x;\n}\n",
+        )
+        .expect("write unused-import file");
+        let op_unused = JavaRewriteOp::PruneUnusedImport {
+            target_file: unused_file.to_str().unwrap().to_string(),
+            imports: vec!["java.util.List".into()],
+        };
+        let bes = backend.rewrite(&op_unused).expect("prune must succeed");
+        assert_eq!(bes.file_edits.len(), 1, "unreferenced import must be removed");
+        let rewritten = bes.file_edits[0].new_text.clone().unwrap();
+        assert!(
+            !rewritten.contains("import java.util.List;"),
+            "the unused import must be gone; got:\n{rewritten}"
+        );
+
+        // -- Still-referenced import → kept (no-op) -----------------------
+        let used_file = dir.path().join("Used.java");
+        std::fs::write(
+            &used_file,
+            "package com.example;\n\nimport java.util.List;\n\npublic class Used {\n    \
+             private List<String> items;\n}\n",
+        )
+        .expect("write used-import file");
+        let op_used = JavaRewriteOp::PruneUnusedImport {
+            target_file: used_file.to_str().unwrap().to_string(),
+            imports: vec!["java.util.List".into()],
+        };
+        let bes2 = backend.rewrite(&op_used).expect("prune must succeed");
+        assert!(
+            bes2.file_edits.is_empty(),
+            "a still-referenced import must be kept (no-op); got {} edit(s)",
+            bes2.file_edits.len()
+        );
     }
 }

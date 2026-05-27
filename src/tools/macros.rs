@@ -264,6 +264,7 @@ impl BlackboxServer {
                 }
                 crate::macros::model::MacroOperation::Validate { .. } => "validate",
                 crate::macros::model::MacroOperation::Record { .. } => "record",
+                crate::macros::model::MacroOperation::ForEach { .. } => "for_each",
             })
             .collect();
 

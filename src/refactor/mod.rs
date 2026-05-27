@@ -484,20 +484,6 @@ pub struct RefactorPlanParams {
     /// planner refuses with `error.bad_input(code=callback_arity_unsupported)`.
     #[serde(default)]
     pub callback_externals: Option<Vec<String>>,
-    /// `lombokify_java_class`: how to handle a primitive `boolean` field
-    /// whose hand-rolled getter uses `get-` prefix (e.g., `getShowFlag()`
-    /// for `boolean showFlag`). Lombok's @Getter generates `isShowFlag()`,
-    /// so dropping the original would break every caller of the get-prefix
-    /// form. Values: `skip` (default — leave the field alone, fall back to
-    /// per-field placement on others), `bridge` (drop original, emit
-    /// `public boolean getXxx() { return isXxx(); }` after @Getter so
-    /// callers continue to compile), `rename` (drop original and accept
-    /// Lombok's name change — only safe when callers don't exist or are
-    /// being rewritten in the same pass). The same logic applies in
-    /// reverse for boxed `Boolean` fields whose hand-rolled getter uses
-    /// `is-` prefix (Lombok generates `getXxx()` for boxed types).
-    #[serde(default)]
-    pub boolean_getter_strategy: Option<String>,
     /// `find_java_usages`: optional declaring class simple name. When set,
     /// filter results to call sites whose receiver expression plausibly
     /// resolves to a field of that type within the enclosing class (G9).
@@ -734,10 +720,10 @@ pub enum RefactorRunStep {
         /// When true, plan-time failure (e.g. "no boilerplate") is logged
         /// as a `skipped` step in the run report rather than aborting the
         /// batch and rolling back prior writes. Default false preserves
-        /// strict batch semantics. Use this when batching lombokify or
-        /// similar plans across many files where a subset will return
-        /// "no boilerplate" — those files become per-step skips, not
-        /// batch-failures (Gap 2 from JAVA_TOOL_GAPS).
+        /// strict batch semantics. Use this when batching a plan kind across
+        /// many files where a subset legitimately has nothing to do — those
+        /// files become per-step skips, not batch-failures (Gap 2 from
+        /// JAVA_TOOL_GAPS).
         #[serde(default)]
         optional: bool,
     },
@@ -1315,7 +1301,6 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "java_concurrency_antipattern_audit" => plan_java_concurrency_antipattern_audit(p),
         "cluster_inject_params_java" => plan_cluster_inject_params_java(p),
         "java_public_api_guard" => plan_java_public_api_guard(p),
-        "lombokify_java_class" => plan_lombokify_java_class(p),
         "prune_java_orphans" => plan_prune_java_orphans(p),
         "extract_java_code_block_to_method" => plan_extract_java_code_block_to_method(p),
         "convert_method_to_class" => plan_convert_method_to_class(p),
@@ -1429,7 +1414,7 @@ fn plan_dispatch(p: &RefactorPlanParams, ctx: &PlanContext) -> Result<String> {
         "write_file" => plan_write_file(p),
         "ensure_toml_table" => plan_ensure_toml_table(p),
         other => bail!(
-            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, lombokify_java_class, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_extract_component, java_vaadin_extract_grid_component, java_vaadin_extract_dialog_class, java_vaadin_synthesize_view, java_vaadin_register_route_access, java_vaadin_navigation_helper_extract, java_vaadin_route_inventory, java_vaadin_static_ui_context_audit, java_vaadin_view_structure_analysis, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, create_file, move_file, replace_text, write_file, ensure_toml_table"
+            "unsupported refactor plan kind `{other}`; supported: extract_rust_items, extract_rust_section, move_rust_items_with_local_deps, extract_rust_impl_methods, extract_rust_function_region, lift_rust_inherent_to_free, delete_rust_items, add_rust_router_to_sum, add_rust_mod_decl, add_rust_use_decl, rust_module_wiring, copy_rust_mod_decls, rewrite_rust_mod_visibility, rewrite_rust_item_visibility, rewrite_rust_field_visibility, rust_lsp_rename, rust_organize_imports, inline_mod_to_file_submodule, extract_rust_items_to_submodule, move_rust_items_with_callers, extract_java_methods, extract_java_class, extract_java_nested_classes, add_java_fields, add_java_constructor, move_java_field, move_java_constant, update_java_callers, add_java_delegate_field, rewrite_java_visibility, java_lsp_organize_imports, add_java_implements, extract_java_interface, migrate_java_type_usages, find_java_usages, rename_java_symbol, java_class_dependency_analysis, extract_java_class_cohesive_clusters, java_concurrency_antipattern_audit, cluster_inject_params_java, java_public_api_guard, prune_java_orphans, extract_java_code_block_to_method, convert_method_to_class, inline_java_class, inline_java_method, extract_java_test_slice, java_collapse_call_chain, migrate_java_method_receiver, java_split_provider, replace_java_static_reference, singletonify_java_holder, singletonify_java_util, java_vaadin_extract_component, java_vaadin_extract_grid_component, java_vaadin_extract_dialog_class, java_vaadin_synthesize_view, java_vaadin_register_route_access, java_vaadin_navigation_helper_extract, java_vaadin_route_inventory, java_vaadin_static_ui_context_audit, java_vaadin_view_structure_analysis, rewrite_rust_error_type, migrate_rust_string_field_to_enum, migrate_rust_type_usages, extract_rust_trait, rust_match_arm_to_strategy, move_rust_struct_fields, add_rust_delegate_field, update_rust_callers, rust_ra_move_item_to_module, rust_ra_classify_callbacks, rust_impl_partition_analysis, rust_top_level_dependency_analysis, rust_public_api_guard, rust_minimize_imports, rewrite_rust_bin_crate_paths, rust_compile_fix_round, add_elixir_facade_delegations, elixir_codegen_audit, elixir_compile_fix_round, elixir_credo_fix_round, elixir_dialyzer_attribution, elixir_genserver_state_audit, elixir_module_dependency_analysis, elixir_move_module_across_apps, elixir_organize_aliases, elixir_pipe_chain_extract, elixir_public_api_guard, elixir_test_fixture_extract, elixir_with_clause_extract, extract_elixir_behaviour, extract_elixir_module, extract_genserver_callback_group, inline_elixir_module, rename_elixir_symbol, split_elixir_clauses_by_tag, create_file, move_file, replace_text, write_file, ensure_toml_table"
         ),
     }
 }
@@ -2182,8 +2167,8 @@ pub fn run_with_ctx(
                         Err(err) if *optional => {
                             // Optional step — log as skipped, keep prior writes,
                             // continue to the next step. This is the bulk-batch
-                            // path: many files where a subset has nothing to
-                            // lombokify shouldn't kill the whole batch.
+                            // path: many files where a subset legitimately has
+                            // nothing to do shouldn't kill the whole batch.
                             reports.push(RefactorRunStepReport {
                                 index: idx,
                                 op: "plan".to_string(),

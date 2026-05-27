@@ -400,6 +400,7 @@ No gap may mention `UI`, `VaadinSession`, `@Provides`, or Spring refusal as
 | `leaf_plans.rs` `extract_java_interface`, `add_java_implements`, `java_lsp_organize_imports` | **Generic.** Keep; callable as backend/delegate ops. |
 | `vaadin_provider_bindings.rs` | **Dissolved → `builtin.java.vaadin.ensure_provider_bindings`.** Rust kind deleted after parity proof; no compat wrapper. Generic substrate gaps filled: `ProbeSpec::ProjectText` + `when`-guard on mutating ops. |
 | `vaadin_view_synthesis.rs`, `vaadin_*_extract.rs` | **Library policy.** → `builtin.java.vaadin` macros (route collision, access-policy) over generic emit/probe. |
+| `lombokify.rs` (`lombokify_java_class`) | **Dissolved → `builtin.java.lombok`.** Rust kind, `java-lombokify` atom, `sm-refactor-java-lombokify` memory, `pojo-modernize` workflow, and lombokify tests all deleted after parity proof; no compat wrapper. The generic `formal_parameters` helper was preserved (moved to `method_params`). Generic substrate added: `ForEach` fan-out, `DeleteMember` / `insert_class_annotation` / `insert_field_annotation` / `prune_unused_import` ops, and an `analyzeClass` structural probe. All Lombok policy (`@Data`/`@Value` collapse, annotation names, declines) is macro data. |
 
 ## Useful V1 — `java.add_service_boundary`
 
@@ -484,6 +485,20 @@ Phased so each phase is independently useful and testable.
   `builtin.java.vaadin` with at least one current Rust helper represented as
   macro data; record ontology gaps; delete the old plan kind outright after the
   parity proof — no compatibility wrapper.
+- **Phase 6 — Lombok dissolution** *(done)*: `lombokify_java_class` dissolved
+  into the `builtin.java.lombok` macro. This required completing the macro
+  ontology for variable-cardinality, member-level work: the `ForEach` fan-out
+  operation (the engine was previously loop-free), the generic leaf ops
+  `DeleteMember` / `insert_class_annotation` / `insert_field_annotation` /
+  `prune_unused_import`, and a generic `analyzeClass` structural probe (trivial
+  accessors, canonical constructors, builder equals/hashCode/toString, logger
+  field). Parity proven against the Rust kind on 8 scenarios (class-level/
+  per-field accessors, `@Data`/`@Value` collapse, `@Slf4j`, and the
+  conservative declines: custom hashCode seed, Javadoc getter, validation
+  setter), then the Rust kind + atom + memory + workflow + tests were deleted
+  with no compat wrapper. Confirms the doc's thesis: the gaps were
+  ontology-completeness gaps fillable generically, not reasons to keep
+  library-specific Rust.
 - **v1 macro**: implement `java.add_service_boundary` with fixtures proving
   boundary creation in a Guice project and refusal of the ambiguous cases.
 

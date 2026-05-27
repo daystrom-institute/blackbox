@@ -3895,7 +3895,6 @@ pub(crate) use leaf_plans::{
     plan_add_java_implements, plan_extract_java_interface, plan_java_lsp_organize_imports,
     plan_migrate_java_type_usages,
 };
-pub(crate) use lombokify::plan_lombokify_java_class;
 pub(crate) use method_object::plan_convert_method_to_class;
 pub(crate) use migrate_receiver::plan_migrate_java_method_receiver;
 pub(crate) use move_and_callers::{plan_move_java_constant, plan_update_java_callers};
@@ -3927,8 +3926,8 @@ mod inline_method;
 mod jooq_analysis;
 mod jooq_mutations;
 mod leaf_plans;
-mod lombokify;
 mod method_object;
+mod method_params;
 mod migrate_receiver;
 mod move_and_callers;
 mod promote_inner;

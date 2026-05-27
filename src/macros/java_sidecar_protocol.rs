@@ -215,6 +215,176 @@ pub struct InsertStatementInMethodResult {
     pub diagnostics: Vec<String>,
 }
 
+// ── insertClassAnnotation ──────────────────────────────────────────────────────
+
+/// `insertClassAnnotation()` request: add a marker/normal annotation to a type
+/// declaration (class-level placement).
+///
+/// Generic: carries no library-specific knowledge. The annotation text and its
+/// import are supplied by the caller (macro data), so any annotation-codegen
+/// library (Lombok, Immutables, AutoValue, MapStruct, …) can drive it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsertClassAnnotationParams {
+    /// Absolute path to the file containing the target type.
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Simple name of the type to annotate.
+    pub target_type: String,
+    /// Full annotation source text, e.g. `"@Getter"` or
+    /// `"@EqualsAndHashCode(callSuper = false)"`.
+    pub annotation_text: String,
+    /// Fully-qualified imports to add if not already present, e.g.
+    /// `["lombok.Getter"]`.
+    pub imports: Vec<String>,
+}
+
+/// `insertClassAnnotation()` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsertClassAnnotationResult {
+    /// Full rewritten source text of the file after the annotation is added.
+    pub rewritten_source: String,
+    /// True when the source was actually modified.
+    pub changed: bool,
+    /// True when an annotation of the same type was already present and no
+    /// insertion was needed (idempotent).
+    pub no_op: bool,
+    /// Non-fatal diagnostic messages from the worker.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+// ── deleteMember ───────────────────────────────────────────────────────────────
+
+/// `deleteMember()` request: remove a member (method/field/constructor) from a
+/// type by simple name, optionally disambiguated by written parameter types.
+///
+/// Generic: carries no library-specific knowledge. Used (with `ForEach`) to
+/// sweep away hand-written boilerplate that an annotation now generates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteMemberParams {
+    /// Absolute path to the file containing the target type.
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Simple name of the type to delete the member from.
+    pub target_type: String,
+    /// Simple name of the member to delete (method/field/constructor name; for
+    /// a constructor this is the type's simple name).
+    pub member_name: String,
+    /// Optional written parameter types for method/constructor overload
+    /// disambiguation, e.g. `["String", "int"]`. When `null`, the member is
+    /// matched by name alone — and if more than one member shares that name the
+    /// worker returns `error.member_ambiguous` (fail closed). Pass an empty list
+    /// to match a no-arg method/constructor specifically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_types: Option<Vec<String>>,
+}
+
+/// `deleteMember()` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteMemberResult {
+    /// Full rewritten source text of the file after the member is removed.
+    pub rewritten_source: String,
+    /// True when the source was actually modified.
+    pub changed: bool,
+    /// True when no member matched and nothing was removed (idempotent).
+    pub no_op: bool,
+    /// Non-fatal diagnostic messages from the worker.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+// ── insertFieldAnnotation ──────────────────────────────────────────────────────
+
+/// `insertFieldAnnotation()` request: add an annotation immediately above a
+/// named field (per-field placement), idempotently.
+///
+/// Generic: carries no library-specific knowledge. Complements
+/// `insertClassAnnotation` for the partial-coverage case where an annotation
+/// applies to one field rather than the whole type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsertFieldAnnotationParams {
+    /// Absolute path to the file containing the target type.
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Simple name of the type containing the field.
+    pub target_type: String,
+    /// Simple name of the field to annotate.
+    pub field_name: String,
+    /// Full annotation source text, e.g. `"@Getter"`.
+    pub annotation_text: String,
+    /// Fully-qualified imports to add if not already present.
+    pub imports: Vec<String>,
+}
+
+/// `insertFieldAnnotation()` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsertFieldAnnotationResult {
+    /// Full rewritten source text of the file after the annotation is added.
+    pub rewritten_source: String,
+    /// True when the source was actually modified.
+    pub changed: bool,
+    /// True when an annotation of the same type was already present on the
+    /// field and no insertion was needed (idempotent).
+    pub no_op: bool,
+    /// Non-fatal diagnostic messages from the worker.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+// ── pruneUnusedImport ───────────────────────────────────────────────────────────
+
+/// `pruneUnusedImport()` request: remove each named import **only if** its
+/// symbol is no longer referenced in the file.
+///
+/// Generic: carries no library-specific knowledge. Used after a `ForEach` +
+/// `DeleteMember` sweep removes the last reference to an imported type (e.g.
+/// Apache Commons builders after equals/hashCode/toString are deleted). An
+/// import that is still referenced is left untouched (not an error).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneUnusedImportParams {
+    /// Absolute path to the file.
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Fully-qualified import statements to remove if unreferenced, e.g.
+    /// `["org.apache.commons.lang3.builder.EqualsBuilder"]`.
+    pub imports: Vec<String>,
+}
+
+/// `pruneUnusedImport()` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PruneUnusedImportResult {
+    /// Full rewritten source text after unreferenced imports are removed.
+    pub rewritten_source: String,
+    /// True when at least one import was removed.
+    pub changed: bool,
+    /// True when nothing was removed (all absent or still referenced).
+    pub no_op: bool,
+    /// Non-fatal diagnostic messages from the worker.
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
+}
+
+// ── analyzeClass ───────────────────────────────────────────────────────────────
+
+/// `analyzeClass()` request: generic structural analysis of a Java type.
+///
+/// Read-only. The worker returns structured facts (trivial accessors, canonical
+/// constructors, builder-delegating equals/hashCode/toString, logger field,
+/// existing annotations) as a JSON object the probe layer surfaces verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AnalyzeClassParams {
+    /// Absolute path to the file containing the target type.
+    pub target_file: String,
+    /// Full content of the target file as it currently exists on disk.
+    pub source_text: String,
+    /// Simple name of the type to analyze.
+    pub target_type: String,
+}
+
 // ── shutdown ─────────────────────────────────────────────────────────────────
 
 /// `shutdown()` request: no parameters.
@@ -228,6 +398,11 @@ pub const METHOD_EMIT_TYPE: &str = "emitType";
 pub const METHOD_INSERT_MEMBER: &str = "insertMember";
 pub const METHOD_REPLACE_METHOD_BODY: &str = "replaceMethodBody";
 pub const METHOD_INSERT_STATEMENT_IN_METHOD: &str = "insertStatementInMethod";
+pub const METHOD_INSERT_CLASS_ANNOTATION: &str = "insertClassAnnotation";
+pub const METHOD_DELETE_MEMBER: &str = "deleteMember";
+pub const METHOD_INSERT_FIELD_ANNOTATION: &str = "insertFieldAnnotation";
+pub const METHOD_PRUNE_UNUSED_IMPORT: &str = "pruneUnusedImport";
+pub const METHOD_ANALYZE_CLASS: &str = "analyzeClass";
 pub const METHOD_SHUTDOWN: &str = "shutdown";
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -361,7 +536,125 @@ mod tests {
         assert_eq!(METHOD_INSERT_MEMBER, "insertMember");
         assert_eq!(METHOD_REPLACE_METHOD_BODY, "replaceMethodBody");
         assert_eq!(METHOD_INSERT_STATEMENT_IN_METHOD, "insertStatementInMethod");
+        assert_eq!(METHOD_INSERT_CLASS_ANNOTATION, "insertClassAnnotation");
+        assert_eq!(METHOD_DELETE_MEMBER, "deleteMember");
+        assert_eq!(METHOD_INSERT_FIELD_ANNOTATION, "insertFieldAnnotation");
+        assert_eq!(METHOD_PRUNE_UNUSED_IMPORT, "pruneUnusedImport");
         assert_eq!(METHOD_SHUTDOWN, "shutdown");
+    }
+
+    #[test]
+    fn prune_unused_import_params_round_trips() {
+        let params = PruneUnusedImportParams {
+            target_file: "/repo/src/Bean.java".to_string(),
+            source_text: "x".to_string(),
+            imports: vec!["org.apache.commons.lang3.builder.EqualsBuilder".to_string()],
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        let back: PruneUnusedImportParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.imports.len(), 1);
+        assert!(back.imports[0].contains("EqualsBuilder"));
+    }
+
+    #[test]
+    fn insert_field_annotation_params_round_trips() {
+        let params = InsertFieldAnnotationParams {
+            target_file: "/repo/src/User.java".to_string(),
+            source_text: "x".to_string(),
+            target_type: "User".to_string(),
+            field_name: "name".to_string(),
+            annotation_text: "@Getter".to_string(),
+            imports: vec!["lombok.Getter".to_string()],
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        let back: InsertFieldAnnotationParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.field_name, "name");
+        assert_eq!(back.annotation_text, "@Getter");
+    }
+
+    #[test]
+    fn delete_member_params_round_trips() {
+        let params = DeleteMemberParams {
+            target_file: "/repo/src/User.java".to_string(),
+            source_text: "package com.example;\npublic class User { public String getName(){return name;} }".to_string(),
+            target_type: "User".to_string(),
+            member_name: "getName".to_string(),
+            parameter_types: Some(vec![]),
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        assert!(s.contains("\"member_name\":\"getName\""));
+        assert!(s.contains("\"parameter_types\":[]"));
+        let back: DeleteMemberParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.member_name, "getName");
+        assert_eq!(back.parameter_types, Some(vec![]));
+    }
+
+    #[test]
+    fn delete_member_params_omits_none_parameter_types() {
+        let params = DeleteMemberParams {
+            target_file: "/repo/src/User.java".to_string(),
+            source_text: "x".to_string(),
+            target_type: "User".to_string(),
+            member_name: "log".to_string(),
+            parameter_types: None,
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        assert!(
+            !s.contains("parameter_types"),
+            "None parameter_types must be omitted from the wire form; got: {s}"
+        );
+        let back: DeleteMemberParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.parameter_types, None);
+    }
+
+    #[test]
+    fn delete_member_result_round_trips() {
+        let result = DeleteMemberResult {
+            rewritten_source: "package com.example;\npublic class User {}".to_string(),
+            changed: true,
+            no_op: false,
+            diagnostics: vec![],
+        };
+        let s = serde_json::to_string(&result).unwrap();
+        let back: DeleteMemberResult = serde_json::from_str(&s).unwrap();
+        assert!(back.changed);
+        assert!(!back.no_op);
+    }
+
+    #[test]
+    fn insert_class_annotation_params_round_trips() {
+        let params = InsertClassAnnotationParams {
+            target_file: "/repo/src/User.java".to_string(),
+            source_text: "package com.example;\npublic class User { private String name; }"
+                .to_string(),
+            target_type: "User".to_string(),
+            annotation_text: "@Getter".to_string(),
+            imports: vec!["lombok.Getter".to_string()],
+        };
+        let s = serde_json::to_string(&params).unwrap();
+        // snake_case wire form (matches the JVM worker's @JsonProperty names).
+        assert!(s.contains("\"annotation_text\":\"@Getter\""));
+        let back: InsertClassAnnotationParams = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.target_type, "User");
+        assert_eq!(back.annotation_text, "@Getter");
+        assert_eq!(back.imports, vec!["lombok.Getter"]);
+    }
+
+    #[test]
+    fn insert_class_annotation_result_round_trips() {
+        let result = InsertClassAnnotationResult {
+            rewritten_source:
+                "package com.example;\nimport lombok.Getter;\n@Getter\npublic class User { private String name; }"
+                    .to_string(),
+            changed: true,
+            no_op: false,
+            diagnostics: vec![],
+        };
+        let s = serde_json::to_string(&result).unwrap();
+        let back: InsertClassAnnotationResult = serde_json::from_str(&s).unwrap();
+        assert!(back.changed);
+        assert!(!back.no_op);
+        assert!(back.rewritten_source.contains("@Getter"));
     }
 
     #[test]

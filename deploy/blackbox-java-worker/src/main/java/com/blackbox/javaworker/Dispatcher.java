@@ -16,6 +16,11 @@ final class Dispatcher {
     private final InsertMemberHandler insertMemberHandler;
     private final ReplaceMethodBodyHandler replaceMethodBodyHandler;
     private final InsertStatementInMethodHandler insertStatementInMethodHandler;
+    private final InsertClassAnnotationHandler insertClassAnnotationHandler;
+    private final DeleteMemberHandler deleteMemberHandler;
+    private final InsertFieldAnnotationHandler insertFieldAnnotationHandler;
+    private final PruneUnusedImportHandler pruneUnusedImportHandler;
+    private final AnalyzeClassHandler analyzeClassHandler;
 
     Dispatcher(ObjectMapper mapper) {
         this.mapper = mapper;
@@ -23,6 +28,11 @@ final class Dispatcher {
         this.insertMemberHandler = new InsertMemberHandler();
         this.replaceMethodBodyHandler = new ReplaceMethodBodyHandler();
         this.insertStatementInMethodHandler = new InsertStatementInMethodHandler();
+        this.insertClassAnnotationHandler = new InsertClassAnnotationHandler();
+        this.deleteMemberHandler = new DeleteMemberHandler();
+        this.insertFieldAnnotationHandler = new InsertFieldAnnotationHandler();
+        this.pruneUnusedImportHandler = new PruneUnusedImportHandler();
+        this.analyzeClassHandler = new AnalyzeClassHandler();
     }
 
     RpcResponse dispatch(RpcRequest request) {
@@ -42,6 +52,16 @@ final class Dispatcher {
                     return handleReplaceMethodBody(request);
                 case Methods.INSERT_STATEMENT_IN_METHOD:
                     return handleInsertStatementInMethod(request);
+                case Methods.INSERT_CLASS_ANNOTATION:
+                    return handleInsertClassAnnotation(request);
+                case Methods.DELETE_MEMBER:
+                    return handleDeleteMember(request);
+                case Methods.INSERT_FIELD_ANNOTATION:
+                    return handleInsertFieldAnnotation(request);
+                case Methods.PRUNE_UNUSED_IMPORT:
+                    return handlePruneUnusedImport(request);
+                case Methods.ANALYZE_CLASS:
+                    return handleAnalyzeClass(request);
                 case Methods.SHUTDOWN:
                     return handleShutdown(request);
                 default:
@@ -80,7 +100,12 @@ final class Dispatcher {
                         "emit_type",
                         "insert_member",
                         "replace_method_body",
-                        "insert_statement_in_method"));
+                        "insert_statement_in_method",
+                        "insert_class_annotation",
+                        "delete_member",
+                        "insert_field_annotation",
+                        "prune_unused_import",
+                        "analyze_class"));
 
         return success(request.getId(), caps);
     }
@@ -107,6 +132,39 @@ final class Dispatcher {
         InsertStatementInMethodParams params =
                 deserializeParams(request, InsertStatementInMethodParams.class);
         InsertStatementInMethodResult result = insertStatementInMethodHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handleInsertClassAnnotation(RpcRequest request) {
+        InsertClassAnnotationParams params =
+                deserializeParams(request, InsertClassAnnotationParams.class);
+        InsertClassAnnotationResult result = insertClassAnnotationHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handleDeleteMember(RpcRequest request) {
+        DeleteMemberParams params = deserializeParams(request, DeleteMemberParams.class);
+        DeleteMemberResult result = deleteMemberHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handleInsertFieldAnnotation(RpcRequest request) {
+        InsertFieldAnnotationParams params =
+                deserializeParams(request, InsertFieldAnnotationParams.class);
+        InsertFieldAnnotationResult result = insertFieldAnnotationHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handlePruneUnusedImport(RpcRequest request) {
+        PruneUnusedImportParams params =
+                deserializeParams(request, PruneUnusedImportParams.class);
+        PruneUnusedImportResult result = pruneUnusedImportHandler.handle(params);
+        return success(request.getId(), result);
+    }
+
+    private RpcResponse handleAnalyzeClass(RpcRequest request) {
+        AnalyzeClassParams params = deserializeParams(request, AnalyzeClassParams.class);
+        AnalyzeClassResult result = analyzeClassHandler.handle(params);
         return success(request.getId(), result);
     }
 

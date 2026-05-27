@@ -45,6 +45,12 @@ use serde_json::Value;
 pub struct Context {
     pub inputs: serde_json::Map<String, Value>,
     pub probes: HashMap<String, Value>,
+    /// Per-iteration local bindings. A `ForEach` operation binds the current
+    /// element here under its declared name (e.g. `item`), so paths like
+    /// `item.name` resolve into the element. Locals **shadow** probe names (and
+    /// the reserved `inputs` root) within their scope; the map is empty outside
+    /// a `ForEach` body, so non-fan-out evaluation is unaffected.
+    pub locals: HashMap<String, Value>,
 }
 
 impl Context {
@@ -53,6 +59,15 @@ impl Context {
     pub fn resolve(&self, path: &str) -> Option<&Value> {
         let mut parts = path.split('.');
         let head = parts.next()?;
+
+        // Per-iteration locals shadow everything else within their scope.
+        if let Some(local) = self.locals.get(head) {
+            let mut current = local;
+            for segment in parts {
+                current = walk_one(current, segment)?;
+            }
+            return Some(current);
+        }
 
         if head == "inputs" {
             let key = parts.next()?;
@@ -221,7 +236,39 @@ mod tests {
         Context {
             inputs,
             probes: HashMap::new(),
+            locals: HashMap::new(),
         }
+    }
+
+    #[test]
+    fn resolve_locals_and_shadowing() {
+        let mut probes = HashMap::new();
+        probes.insert("item".into(), json!({"name": "from_probe"}));
+        let mut locals = HashMap::new();
+        locals.insert("item".into(), json!({"name": "Alpha", "keep": true}));
+        let ctx = Context {
+            inputs: serde_json::Map::new(),
+            probes,
+            locals,
+        };
+        // Local resolves and shadows the same-named probe.
+        assert_eq!(ctx.resolve("item.name"), Some(&json!("Alpha")));
+        assert_eq!(ctx.resolve("item.keep"), Some(&json!(true)));
+        // Missing nested field under a present local → None (soft-false).
+        assert_eq!(ctx.resolve("item.missing"), None);
+    }
+
+    #[test]
+    fn resolve_without_locals_unaffected() {
+        let mut probes = HashMap::new();
+        probes.insert("binding".into(), json!({"exists": true}));
+        let ctx = Context {
+            inputs: serde_json::Map::new(),
+            probes,
+            locals: HashMap::new(),
+        };
+        assert_eq!(ctx.resolve("binding.exists"), Some(&json!(true)));
+        assert_eq!(ctx.resolve("nonexistent.x"), None);
     }
 
     fn make_ctx() -> Context {
@@ -236,7 +283,11 @@ mod tests {
         probes.insert("binding".into(), json!({"exists": true, "kind": "guice"}));
         probes.insert("type_count".into(), json!(5));
 
-        Context { inputs, probes }
+        Context {
+            inputs,
+            probes,
+            locals: HashMap::new(),
+        }
     }
 
     // -----------------------------------------------------------------------

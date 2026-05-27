@@ -204,6 +204,10 @@ impl MacroRegistry {
                     "../../system-defaults/macros/builtin.java.vaadin.ensure_provider_bindings.json"
                 ),
             ),
+            (
+                "builtin.java.lombok",
+                include_str!("../../system-defaults/macros/builtin.java.lombok.json"),
+            ),
         ];
 
         let mut out = Vec::with_capacity(BUILTINS.len());

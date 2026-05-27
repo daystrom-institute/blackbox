@@ -522,7 +522,6 @@ mod tests {
             keep_copy: None,
             deep_analysis: None,
             rewrite_remaining_accessors: None,
-            boolean_getter_strategy: None,
             declaring_class: None,
             summary_only: None,
             propagate_class_annotations: None,

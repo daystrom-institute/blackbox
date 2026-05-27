@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java refactor mechanization — tree-sitter inventory and JDT validation workflow"
-tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "lombokify_java_class", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "migrate_java_method_receiver", "java_split_provider", "replace_java_static_reference", "sm-refactor-java-extract-class", "sm-refactor-java-lombokify"]
+tags = ["refactor", "refactoring", "mechanization", "restructure", "java", "jdt", "jdtls", "intellij", "eclipse", "maven", "gradle", "tree-sitter", "bbox_refactor_status", "bbox_refactor_plan", "bbox_refactor_apply", "bbox_refactor_run", "bbox_code_refs", "symbol", "rename", "move", "extract", "extract_java_methods", "extract_java_class", "extract_java_nested_classes", "promote_java_inner_class", "extract_java_interface", "add_java_implements", "migrate_java_type_usages", "java_lsp_organize_imports", "rewrite_java_visibility", "find_java_usages", "rename_java_symbol", "java_class_dependency_analysis", "java_public_api_guard", "prune_java_orphans", "extract_java_code_block_to_method", "convert_method_to_class", "inline_java_method", "extract_java_test_slice", "java_collapse_call_chain", "migrate_java_method_receiver", "java_split_provider", "replace_java_static_reference", "sm-refactor-java-extract-class"]
 order = 12
 template = false
 +++
@@ -21,8 +21,9 @@ for patterns such as class dependency inventory, public-API preflight,
 project-wide usage enumeration, cohesive-class extraction, inner-class
 promotion, interface extraction, lightweight method moves, source-local caller
 rewrites, low-level field/constructor/delegate wiring, visibility rewrites,
-type-use migration, import organization, Java symbol rename, or Lombok
-conversion. The atom manifest is the source of truth for version, inputs, cost,
+type-use migration, import organization, or Java symbol rename. (POJO → Lombok
+conversion is the `builtin.java.lombok` macro, not a refactor atom.) The atom
+manifest is the source of truth for version, inputs, cost,
 and prompt text; this memory keeps the primitive plan-kind map and safety
 invariants.
 
@@ -33,8 +34,8 @@ canonical path.
 
 Java has full inspect-and-extract support, plus composite class extraction,
 field/constructor wiring, caller delegation, interface extraction, visibility
-rewriting, type migration, import organization, and Lombok-ification of
-hand-rolled boilerplate (POJO DOJO).
+rewriting, type migration, and import organization. POJO-boilerplate →
+Lombok conversion is the separate `builtin.java.lombok` macro.
 
 Every Java refactor plan kind has at least one shipped refactor atom wrapper
 under `system-defaults/atoms/refactor/`. The coverage guard
@@ -46,7 +47,7 @@ memory as an atom ledger.
 - Inspect: supported with `bbox_refactor_status`; syntax grounding also uses
   `bbox_code_symbols`, `bbox_code_node_describe`, `bbox_code_query`, and
   `bbox_code_refs` from the shared `sm-refactor` toolkit.
-- Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, import organization, and `lombokify_java_class` (POJO boilerplate → Lombok annotations).
+- Plan/apply: method extraction, composite class extraction, nested class extraction, field moves/adds, constructor creation, delegate-field wiring, caller delegation, interface extraction, visibility rewriting, implements clause injection, type-use migration, and import organization. (POJO boilerplate → Lombok annotations is the `builtin.java.lombok` macro, not a plan kind.)
 - Find usages: supported with `bbox_refactor_plan(kind="find_java_usages")`.
   Walks every `.java` file under `project_dir` and reports
   AST-grounded references (type position, method invocation, field
@@ -104,9 +105,12 @@ Tree-sitter language: `java`.
   `propagate_class_annotations`, `callback_externals`, etc.), capture-analysis
   and accessor-rewrite semantics, and the catalog of operator-facing FIXME
   markers the planner emits when it cannot resolve a dependency on its own.
-- `sm-refactor-java-lombokify` — `lombokify_java_class` plan kind: detection
-  table, collapse rules, conservative refusals, `boolean_getter_strategy`,
-  bulk mode, plan-to-file, classpath prerequisites, curated-batch composition.
+- POJO boilerplate → Lombok annotations is the `builtin.java.lombok` **macro**
+  (discover via `macro_describe`), not a refactor plan kind. The former
+  `lombokify_java_class` kind was dissolved into it: a generic `analyzeClass`
+  probe + `ForEach` fan-out over `delete_member` / `insert_class_annotation` /
+  `insert_field_annotation` / `prune_unused_import`, with all Lombok policy
+  (annotation names, `@Data`/`@Value` collapse, declines) as macro data.
 
 This parent also keeps concise sections for `promote_java_inner_class`,
 `extract_java_nested_classes`, `find_java_usages`, `rename_java_symbol`,
@@ -502,12 +506,13 @@ heuristic, not a classpath resolver — it cannot identify unused static
 imports from third-party jars; only the LSP-backed path can, and only after
 the workspace-import drain has completed.
 
-14b. Lombokify hand-rolled POJO boilerplate — see
-    `sm-refactor-java-lombokify` for `lombokify_java_class` (single-file
-    + bulk + curated-batch), the detection table, collapse rules,
-    refusal heuristics, `boolean_getter_strategy`, and prerequisites.
-    Lombok must already be on the classpath; the planner does not
-    modify the build.
+14b. Lombokify hand-rolled POJO boilerplate — use the `builtin.java.lombok`
+    **macro** (`macro_describe` / `macro_plan` / `macro_apply`), not a refactor
+    plan kind. It detects trivial getters/setters, canonical constructors,
+    builder equals/hashCode/toString, and an SLF4J logger via a generic
+    `analyzeClass` probe, then emits class-level or per-field annotations
+    (with `@Data`/`@Value` collapse) and deletes the boilerplate. Lombok must
+    already be on the classpath; the macro does not modify the build.
 
 14b9. Replace static references with provider expressions:
 

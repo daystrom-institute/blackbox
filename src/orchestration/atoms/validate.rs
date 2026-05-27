@@ -1354,7 +1354,6 @@ mod tests {
             "rewrite_java_visibility",
             "rename_java_symbol",
             "migrate_java_type_usages",
-            "lombokify_java_class",
             "find_java_usages",
             "java_class_dependency_analysis",
             "extract_java_class_cohesive_clusters",

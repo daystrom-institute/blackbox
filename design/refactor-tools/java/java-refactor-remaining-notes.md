@@ -52,7 +52,9 @@ Grounding references:
 - `cluster_inject_params_java`
 - `java_concurrency_antipattern_audit`
 - `java_lsp_organize_imports`
-- `lombokify_java_class`
+
+(POJO → Lombok conversion was the `lombokify_java_class` plan kind; it has been
+dissolved into the `builtin.java.lombok` macro and is no longer a plan kind.)
 
 The atom coverage guard includes the shipped Java atoms for these plan kinds.
 The remaining work is therefore not "basic Java plan-kind coverage"; it is

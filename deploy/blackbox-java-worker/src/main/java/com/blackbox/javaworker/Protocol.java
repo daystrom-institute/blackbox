@@ -109,6 +109,11 @@ final class Methods {
     public static final String INSERT_MEMBER = "insertMember";
     public static final String REPLACE_METHOD_BODY = "replaceMethodBody";
     public static final String INSERT_STATEMENT_IN_METHOD = "insertStatementInMethod";
+    public static final String INSERT_CLASS_ANNOTATION = "insertClassAnnotation";
+    public static final String DELETE_MEMBER = "deleteMember";
+    public static final String INSERT_FIELD_ANNOTATION = "insertFieldAnnotation";
+    public static final String PRUNE_UNUSED_IMPORT = "pruneUnusedImport";
+    public static final String ANALYZE_CLASS = "analyzeClass";
     public static final String SHUTDOWN = "shutdown";
 
     private Methods() {}
@@ -462,6 +467,276 @@ final class InsertStatementInMethodResult {
 
     public static InsertStatementInMethodResult noOp(String originalSource, String reason) {
         return new InsertStatementInMethodResult(originalSource, false, true, List.of(reason));
+    }
+
+    public String getRewrittenSource() { return rewrittenSource; }
+    public boolean isChanged() { return changed; }
+    public boolean isNoOp() { return noOp; }
+    public List<String> getDiagnostics() { return diagnostics; }
+}
+
+// ---------------------------------------------------------------------------
+// insertClassAnnotation
+// ---------------------------------------------------------------------------
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class InsertClassAnnotationParams {
+    private final String targetFile;
+    private final String sourceText;
+    private final String targetType;
+    private final String annotationText;
+    private final List<String> imports;
+
+    @JsonCreator
+    public InsertClassAnnotationParams(
+            @JsonProperty("target_file") String targetFile,
+            @JsonProperty("source_text") String sourceText,
+            @JsonProperty("target_type") String targetType,
+            @JsonProperty("annotation_text") String annotationText,
+            @JsonProperty("imports") List<String> imports) {
+        this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
+        this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
+        this.targetType = Objects.requireNonNull(targetType, "target_type is required");
+        this.annotationText = Objects.requireNonNull(annotationText, "annotation_text is required");
+        this.imports = imports;
+    }
+
+    public String getTargetFile() { return targetFile; }
+    public String getSourceText() { return sourceText; }
+    public String getTargetType() { return targetType; }
+    public String getAnnotationText() { return annotationText; }
+    public List<String> getImports() { return imports; }
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class InsertClassAnnotationResult {
+    private final String rewrittenSource;
+    private final boolean changed;
+    private final boolean noOp;
+    private final List<String> diagnostics;
+
+    @JsonCreator
+    public InsertClassAnnotationResult(
+            @JsonProperty("rewritten_source") String rewrittenSource,
+            @JsonProperty("changed") boolean changed,
+            @JsonProperty("no_op") boolean noOp,
+            @JsonProperty("diagnostics") List<String> diagnostics) {
+        this.rewrittenSource = rewrittenSource;
+        this.changed = changed;
+        this.noOp = noOp;
+        this.diagnostics = diagnostics != null ? diagnostics : List.of();
+    }
+
+    public static InsertClassAnnotationResult changed(String rewrittenSource) {
+        return new InsertClassAnnotationResult(rewrittenSource, true, false, List.of());
+    }
+
+    public static InsertClassAnnotationResult noOp(String originalSource, String reason) {
+        return new InsertClassAnnotationResult(originalSource, false, true, List.of(reason));
+    }
+
+    public String getRewrittenSource() { return rewrittenSource; }
+    public boolean isChanged() { return changed; }
+    public boolean isNoOp() { return noOp; }
+    public List<String> getDiagnostics() { return diagnostics; }
+}
+
+// ---------------------------------------------------------------------------
+// deleteMember
+// ---------------------------------------------------------------------------
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class DeleteMemberParams {
+    private final String targetFile;
+    private final String sourceText;
+    private final String targetType;
+    private final String memberName;
+    private final List<String> parameterTypes;
+
+    @JsonCreator
+    public DeleteMemberParams(
+            @JsonProperty("target_file") String targetFile,
+            @JsonProperty("source_text") String sourceText,
+            @JsonProperty("target_type") String targetType,
+            @JsonProperty("member_name") String memberName,
+            @JsonProperty("parameter_types") List<String> parameterTypes) {
+        this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
+        this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
+        this.targetType = Objects.requireNonNull(targetType, "target_type is required");
+        this.memberName = Objects.requireNonNull(memberName, "member_name is required");
+        // Nullable by design: null = match by name alone; non-null (incl. empty)
+        // = method/constructor with exactly these written parameter types.
+        this.parameterTypes = parameterTypes;
+    }
+
+    public String getTargetFile() { return targetFile; }
+    public String getSourceText() { return sourceText; }
+    public String getTargetType() { return targetType; }
+    public String getMemberName() { return memberName; }
+    public List<String> getParameterTypes() { return parameterTypes; }
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class DeleteMemberResult {
+    private final String rewrittenSource;
+    private final boolean changed;
+    private final boolean noOp;
+    private final List<String> diagnostics;
+
+    @JsonCreator
+    public DeleteMemberResult(
+            @JsonProperty("rewritten_source") String rewrittenSource,
+            @JsonProperty("changed") boolean changed,
+            @JsonProperty("no_op") boolean noOp,
+            @JsonProperty("diagnostics") List<String> diagnostics) {
+        this.rewrittenSource = rewrittenSource;
+        this.changed = changed;
+        this.noOp = noOp;
+        this.diagnostics = diagnostics != null ? diagnostics : List.of();
+    }
+
+    public static DeleteMemberResult changed(String rewrittenSource) {
+        return new DeleteMemberResult(rewrittenSource, true, false, List.of());
+    }
+
+    public static DeleteMemberResult noOp(String originalSource, String reason) {
+        return new DeleteMemberResult(originalSource, false, true, List.of(reason));
+    }
+
+    public String getRewrittenSource() { return rewrittenSource; }
+    public boolean isChanged() { return changed; }
+    public boolean isNoOp() { return noOp; }
+    public List<String> getDiagnostics() { return diagnostics; }
+}
+
+// ---------------------------------------------------------------------------
+// insertFieldAnnotation
+// ---------------------------------------------------------------------------
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class InsertFieldAnnotationParams {
+    private final String targetFile;
+    private final String sourceText;
+    private final String targetType;
+    private final String fieldName;
+    private final String annotationText;
+    private final List<String> imports;
+
+    @JsonCreator
+    public InsertFieldAnnotationParams(
+            @JsonProperty("target_file") String targetFile,
+            @JsonProperty("source_text") String sourceText,
+            @JsonProperty("target_type") String targetType,
+            @JsonProperty("field_name") String fieldName,
+            @JsonProperty("annotation_text") String annotationText,
+            @JsonProperty("imports") List<String> imports) {
+        this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
+        this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
+        this.targetType = Objects.requireNonNull(targetType, "target_type is required");
+        this.fieldName = Objects.requireNonNull(fieldName, "field_name is required");
+        this.annotationText = Objects.requireNonNull(annotationText, "annotation_text is required");
+        this.imports = imports;
+    }
+
+    public String getTargetFile() { return targetFile; }
+    public String getSourceText() { return sourceText; }
+    public String getTargetType() { return targetType; }
+    public String getFieldName() { return fieldName; }
+    public String getAnnotationText() { return annotationText; }
+    public List<String> getImports() { return imports; }
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class InsertFieldAnnotationResult {
+    private final String rewrittenSource;
+    private final boolean changed;
+    private final boolean noOp;
+    private final List<String> diagnostics;
+
+    @JsonCreator
+    public InsertFieldAnnotationResult(
+            @JsonProperty("rewritten_source") String rewrittenSource,
+            @JsonProperty("changed") boolean changed,
+            @JsonProperty("no_op") boolean noOp,
+            @JsonProperty("diagnostics") List<String> diagnostics) {
+        this.rewrittenSource = rewrittenSource;
+        this.changed = changed;
+        this.noOp = noOp;
+        this.diagnostics = diagnostics != null ? diagnostics : List.of();
+    }
+
+    public static InsertFieldAnnotationResult changed(String rewrittenSource) {
+        return new InsertFieldAnnotationResult(rewrittenSource, true, false, List.of());
+    }
+
+    public static InsertFieldAnnotationResult noOp(String originalSource, String reason) {
+        return new InsertFieldAnnotationResult(originalSource, false, true, List.of(reason));
+    }
+
+    public String getRewrittenSource() { return rewrittenSource; }
+    public boolean isChanged() { return changed; }
+    public boolean isNoOp() { return noOp; }
+    public List<String> getDiagnostics() { return diagnostics; }
+}
+
+// ---------------------------------------------------------------------------
+// pruneUnusedImport
+// ---------------------------------------------------------------------------
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class PruneUnusedImportParams {
+    private final String targetFile;
+    private final String sourceText;
+    private final List<String> imports;
+
+    @JsonCreator
+    public PruneUnusedImportParams(
+            @JsonProperty("target_file") String targetFile,
+            @JsonProperty("source_text") String sourceText,
+            @JsonProperty("imports") List<String> imports) {
+        this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
+        this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
+        this.imports = imports;
+    }
+
+    public String getTargetFile() { return targetFile; }
+    public String getSourceText() { return sourceText; }
+    public List<String> getImports() { return imports; }
+}
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+@JsonNaming(PropertyNamingStrategies.SnakeCaseStrategy.class)
+final class PruneUnusedImportResult {
+    private final String rewrittenSource;
+    private final boolean changed;
+    private final boolean noOp;
+    private final List<String> diagnostics;
+
+    @JsonCreator
+    public PruneUnusedImportResult(
+            @JsonProperty("rewritten_source") String rewrittenSource,
+            @JsonProperty("changed") boolean changed,
+            @JsonProperty("no_op") boolean noOp,
+            @JsonProperty("diagnostics") List<String> diagnostics) {
+        this.rewrittenSource = rewrittenSource;
+        this.changed = changed;
+        this.noOp = noOp;
+        this.diagnostics = diagnostics != null ? diagnostics : List.of();
+    }
+
+    public static PruneUnusedImportResult changed(String rewrittenSource) {
+        return new PruneUnusedImportResult(rewrittenSource, true, false, List.of());
+    }
+
+    public static PruneUnusedImportResult noOp(String originalSource, String reason) {
+        return new PruneUnusedImportResult(originalSource, false, true, List.of(reason));
     }
 
     public String getRewrittenSource() { return rewrittenSource; }

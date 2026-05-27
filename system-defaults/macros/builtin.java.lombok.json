@@ -1,0 +1,363 @@
+{
+  "id": "builtin.java.lombok",
+  "version": "1.0.0",
+  "language": "java",
+  "scope": "builtin",
+  "title": "Convert hand-rolled Java POJO boilerplate to Lombok annotations",
+  "inputs_schema": {
+    "type": "object",
+    "required": ["file", "target_type"],
+    "properties": {
+      "file": {
+        "type": "string",
+        "description": "Absolute or project-relative path to the .java file containing the target type."
+      },
+      "target_type": {
+        "type": "string",
+        "description": "Simple name of the class to lombokify."
+      }
+    }
+  },
+  "effects": ["modifies_existing_type"],
+  "authority_gates": [],
+  "probes": [
+    {
+      "name": "analysis",
+      "description": "Generic structural analysis of the target type (trivial accessors, canonical constructors, builder equals/hashCode/toString, logger field).",
+      "spec": {
+        "kind": "java_class_analysis",
+        "file": "${inputs.file}",
+        "target_type": "${inputs.target_type}"
+      }
+    }
+  ],
+  "refusals": [
+    {
+      "when": {"op": "eq", "path": "analysis.found", "value": false},
+      "code": "error.type_not_found",
+      "message": "Type '${inputs.target_type}' was not found in ${inputs.file}."
+    }
+  ],
+  "operations": [
+    {
+      "kind": "rewrite",
+      "when": {"op": "eq", "path": "analysis.data_eligible", "value": true},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@Data",
+        "imports": ["lombok.Data"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "eq", "path": "analysis.value_eligible", "value": true},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@Value",
+        "imports": ["lombok.Value"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.getter_covers_all_fields", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.data_eligible", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@Getter",
+        "imports": ["lombok.Getter"]
+      }
+    },
+    {
+      "kind": "for_each",
+      "over": "analysis.trivial_getters",
+      "bind": "item",
+      "body": {
+        "kind": "rewrite",
+        "when": {"op": "all", "predicates": [
+          {"op": "not", "predicate": {"op": "eq", "path": "analysis.getter_covers_all_fields", "value": true}},
+          {"op": "not", "predicate": {"op": "eq", "path": "item.boolean_get_form_on_boolean", "value": true}}
+        ]},
+        "targets": ["${inputs.file}"],
+        "backend_op": {
+          "op": "insert_field_annotation",
+          "target_file": "${inputs.file}",
+          "target_type": "${inputs.target_type}",
+          "field_name": "${item.field}",
+          "annotation_text": "@Getter",
+          "imports": ["lombok.Getter"]
+        }
+      }
+    },
+    {
+      "kind": "for_each",
+      "over": "analysis.trivial_getters",
+      "bind": "item",
+      "body": {
+        "kind": "rewrite",
+        "when": {"op": "not", "predicate": {"op": "eq", "path": "item.boolean_get_form_on_boolean", "value": true}},
+        "targets": ["${inputs.file}"],
+        "backend_op": {
+          "op": "delete_member",
+          "target_file": "${inputs.file}",
+          "target_type": "${inputs.target_type}",
+          "member_name": "${item.method}",
+          "parameter_types": []
+        }
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.setter_covers_all_non_final_fields", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.data_eligible", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@Setter",
+        "imports": ["lombok.Setter"]
+      }
+    },
+    {
+      "kind": "for_each",
+      "over": "analysis.trivial_setters",
+      "bind": "item",
+      "body": {
+        "kind": "rewrite",
+        "when": {"op": "not", "predicate": {"op": "eq", "path": "analysis.setter_covers_all_non_final_fields", "value": true}},
+        "targets": ["${inputs.file}"],
+        "backend_op": {
+          "op": "insert_field_annotation",
+          "target_file": "${inputs.file}",
+          "target_type": "${inputs.target_type}",
+          "field_name": "${item.field}",
+          "annotation_text": "@Setter",
+          "imports": ["lombok.Setter"]
+        }
+      }
+    },
+    {
+      "kind": "for_each",
+      "over": "analysis.trivial_setters",
+      "bind": "item",
+      "body": {
+        "kind": "rewrite",
+        "targets": ["${inputs.file}"],
+        "backend_op": {
+          "op": "delete_member",
+          "target_file": "${inputs.file}",
+          "target_type": "${inputs.target_type}",
+          "member_name": "${item.method}",
+          "parameter_types": ["${item.type}"]
+        }
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.equals.covers_all", "value": true},
+        {"op": "eq", "path": "analysis.hash_code.covers_all", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.hash_code.custom_seed", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.data_eligible", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@EqualsAndHashCode",
+        "imports": ["lombok.EqualsAndHashCode"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.equals.covers_all", "value": true},
+        {"op": "eq", "path": "analysis.hash_code.covers_all", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.hash_code.custom_seed", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "delete_member",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "member_name": "equals",
+        "parameter_types": ["Object"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.equals.covers_all", "value": true},
+        {"op": "eq", "path": "analysis.hash_code.covers_all", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.hash_code.custom_seed", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "delete_member",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "member_name": "hashCode",
+        "parameter_types": []
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.to_string.covers_all", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.data_eligible", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@ToString",
+        "imports": ["lombok.ToString"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "eq", "path": "analysis.to_string.covers_all", "value": true},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "delete_member",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "member_name": "toString",
+        "parameter_types": []
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.has_no_args_constructor", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.data_eligible", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@NoArgsConstructor",
+        "imports": ["lombok.NoArgsConstructor"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.has_all_args_constructor", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@AllArgsConstructor",
+        "imports": ["lombok.AllArgsConstructor"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.has_required_args_constructor", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.data_eligible", "value": true}},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.value_eligible", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@RequiredArgsConstructor",
+        "imports": ["lombok.RequiredArgsConstructor"]
+      }
+    },
+    {
+      "kind": "for_each",
+      "over": "analysis.canonical_constructors",
+      "bind": "item",
+      "body": {
+        "kind": "rewrite",
+        "targets": ["${inputs.file}"],
+        "backend_op": {
+          "op": "delete_member",
+          "target_file": "${inputs.file}",
+          "target_type": "${inputs.target_type}",
+          "member_name": "${inputs.target_type}",
+          "parameter_types": ["${item.parameter_types}"]
+        }
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "eq", "path": "analysis.logger_field_present", "value": true},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "insert_class_annotation",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "annotation_text": "@Slf4j",
+        "imports": ["lombok.extern.slf4j.Slf4j"]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "eq", "path": "analysis.logger_field_present", "value": true},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "delete_member",
+        "target_file": "${inputs.file}",
+        "target_type": "${inputs.target_type}",
+        "member_name": "${analysis.logger_field_name}"
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "all", "predicates": [
+        {"op": "eq", "path": "analysis.equals.covers_all", "value": true},
+        {"op": "eq", "path": "analysis.hash_code.covers_all", "value": true},
+        {"op": "not", "predicate": {"op": "eq", "path": "analysis.hash_code.custom_seed", "value": true}}
+      ]},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "prune_unused_import",
+        "target_file": "${inputs.file}",
+        "imports": [
+          "org.apache.commons.lang3.builder.EqualsBuilder",
+          "org.apache.commons.lang3.builder.HashCodeBuilder"
+        ]
+      }
+    },
+    {
+      "kind": "rewrite",
+      "when": {"op": "eq", "path": "analysis.to_string.covers_all", "value": true},
+      "targets": ["${inputs.file}"],
+      "backend_op": {
+        "op": "prune_unused_import",
+        "target_file": "${inputs.file}",
+        "imports": ["org.apache.commons.lang3.builder.ToStringBuilder"]
+      }
+    }
+  ],
+  "validations": []
+}

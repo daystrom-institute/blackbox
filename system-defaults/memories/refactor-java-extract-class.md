@@ -20,7 +20,8 @@ remaining-source accessors / external calls / inherited dependencies.
 
 Parent runbook: `sm-refactor-java` (general Java tool sequence, capability
 matrix, contextual atom signposts, interface/visibility/migration/imports
-primitives). For Lombok conversion, see `sm-refactor-java-lombokify`.
+primitives). For Lombok conversion, use the `builtin.java.lombok` macro
+(`macro_describe`).
 
 ## Minimal invocation skeleton
 

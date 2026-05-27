@@ -41,7 +41,7 @@
 //! caller site if the caller is in a different class.
 
 use super::*;
-use crate::refactor::java::lombokify::formal_parameters;
+use crate::refactor::java::method_params::formal_parameters;
 
 pub(crate) fn plan_inline_java_method(p: &RefactorPlanParams) -> Result<String> {
     let source_path = resolve_path(p.project_dir.as_deref(), &p.source)?;

@@ -258,6 +258,38 @@ pub enum MacroOperation {
         /// [`crate::macros::expr::interpolate`].
         body: String,
     },
+
+    /// Fan out a single operation over a probe-discovered collection.
+    ///
+    /// This is the **only** construct that produces a *variable* number of
+    /// backend operations; the grammar otherwise stays loop-free. `over` is a
+    /// dotted path to a JSON **array** in the planning context — typically a
+    /// probe's `items`, e.g. `"trivial_getters.items"`. For each element, the
+    /// element is bound as a local under `bind` (default `"item"`) and `body`
+    /// is planned once with `${<bind>.*}` (and predicate paths `<bind>.*`)
+    /// resolving into that element. The body's own `when` guard is therefore
+    /// evaluated per element, enabling data-driven per-item skips.
+    ///
+    /// `body` is restricted at registry-validation time to `Emit` or `Rewrite`
+    /// (the edit-producing ops). A `Probe`, `DelegateRefactor`, `Validate`,
+    /// `Record`, or nested `ForEach` body is rejected in v1.
+    ForEach {
+        /// Dotted path to an array in the planning context (e.g. a probe's
+        /// `items`). A missing path or non-array value fails the plan closed.
+        over: String,
+        /// Local binding name for each element. Referenced as `${<bind>.*}` in
+        /// string leaves and as `<bind>.*` in predicate paths. Defaults to
+        /// `"item"`.
+        #[serde(default = "default_foreach_bind")]
+        bind: String,
+        /// The operation instantiated once per element.
+        body: Box<MacroOperation>,
+    },
+}
+
+/// Default binding name for [`MacroOperation::ForEach::bind`].
+fn default_foreach_bind() -> String {
+    "item".to_string()
 }
 
 // ---------------------------------------------------------------------------

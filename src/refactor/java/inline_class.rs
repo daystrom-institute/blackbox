@@ -15,7 +15,7 @@
 //! extra instance-method dependencies, and unsupported call shapes refuse.
 
 use super::*;
-use crate::refactor::java::lombokify::formal_parameters;
+use crate::refactor::java::method_params::formal_parameters;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn plan_inline_java_class(p: &RefactorPlanParams) -> Result<String> {

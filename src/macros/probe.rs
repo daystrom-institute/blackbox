@@ -197,6 +197,25 @@ pub enum ProbeSpec {
         /// Query string forwarded to JDTLS `workspace/symbol`.
         query: String,
     },
+
+    /// Generic structural analysis of one Java type via the JVM macro worker
+    /// (`analyzeClass`).
+    ///
+    /// Surfaces the worker's structured facts verbatim into the probe slot —
+    /// e.g. `analysis.trivial_getters` (a list the macro fans out over with
+    /// `ForEach`), `analysis.getter_covers_all_fields` (a coverage flag for a
+    /// class-level-vs-per-field guard), `analysis.has_no_args_constructor`,
+    /// `analysis.equals`, `analysis.logger_field_present`. The analysis is
+    /// library-agnostic; the macro owns the mapping to annotations.
+    ///
+    /// Fails closed with `error.backend_unavailable` when the worker is absent
+    /// (mirrors the rewrite/emit ops — never silently downgrades).
+    JavaClassAnalysis {
+        /// Project-relative or absolute path to the file (containment-checked).
+        file: String,
+        /// Simple name of the type to analyze.
+        target_type: String,
+    },
 }
 
 fn default_true() -> bool {
@@ -774,6 +793,61 @@ impl CodeNavProbeRunner {
     }
 
     // -----------------------------------------------------------------------
+    // JavaClassAnalysis
+    // -----------------------------------------------------------------------
+
+    /// Run a generic structural analysis of `target_type` in `file` via the JVM
+    /// macro worker's `analyzeClass`, surfacing the worker's fact JSON verbatim
+    /// into the probe slot. Fails closed when the worker is unavailable.
+    fn run_java_class_analysis(
+        &self,
+        file: &str,
+        target_type: &str,
+        project_dir: &str,
+    ) -> Result<ProbeOutput> {
+        if target_type.trim().is_empty() {
+            return Err(anyhow!(
+                "error.empty_query: java_class_analysis requires a target_type"
+            ));
+        }
+        // Containment check + read the source from disk.
+        let contained = Self::resolve_contained_file(project_dir, file)?;
+        let source_text = std::fs::read_to_string(&contained)
+            .map_err(|e| anyhow!("error.file_not_found: probe file '{file}': {e}"))?;
+
+        // Acquire the per-project worker from the process-wide pool. Fail closed
+        // (error.backend_unavailable) when the JAR/JVM is not configured.
+        let project_root = PathBuf::from(project_dir)
+            .canonicalize()
+            .map_err(|e| anyhow!("error.project_dir_invalid: {e}"))?;
+        let worker = super::java_sidecar::pool()
+            .worker_for(&project_root)
+            .map_err(|e| {
+                anyhow!("error.backend_unavailable: Java macro worker unavailable for analyzeClass: {e}")
+            })?;
+
+        let value: Value = worker
+            .lock()
+            .unwrap()
+            .call(
+                super::java_sidecar_protocol::METHOD_ANALYZE_CLASS,
+                super::java_sidecar_protocol::AnalyzeClassParams {
+                    target_file: contained.to_string_lossy().into_owned(),
+                    source_text,
+                    target_type: target_type.to_owned(),
+                },
+            )
+            .map_err(|e| anyhow!("error.backend_unavailable: analyzeClass RPC failed: {e}"))?;
+
+        Ok(ProbeOutput {
+            value,
+            semantic_status: MacroSemanticStatus::SyntaxOnly,
+            truncated: false,
+            diagnostics: vec![],
+        })
+    }
+
+    // -----------------------------------------------------------------------
     // JSON size cap helper
     // -----------------------------------------------------------------------
 
@@ -896,6 +970,9 @@ impl ProbeRunner for CodeNavProbeRunner {
             ),
             ProbeSpec::WorkspaceSymbol { query } => {
                 self.run_workspace_symbol(query, &invocation.project_dir)
+            }
+            ProbeSpec::JavaClassAnalysis { file, target_type } => {
+                self.run_java_class_analysis(file, target_type, &invocation.project_dir)
             }
         }
     }
@@ -1755,6 +1832,91 @@ mod tests {
             msg.contains("error.empty_query")
                 || msg.contains("broad/empty workspace_symbol queries are not allowed"),
             "whitespace-only query must be rejected, got: {msg}"
+        );
+    }
+
+    /// End-to-end proof for the generic `analyzeClass` probe: it reports trivial
+    /// getters/setters correlated to fields, coverage flags, canonical
+    /// constructors, builder equals/hashCode/toString, and a logger field.
+    #[test]
+    fn live_java_class_analysis_reports_structural_facts() {
+        let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
+            eprintln!("[probe] BLACKBOX_JAVA_WORKER_JAR unset — skipping analyzeClass test");
+            return;
+        };
+        if !std::path::PathBuf::from(&jar).exists() {
+            eprintln!("[probe] worker JAR missing — skipping analyzeClass test");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pkg = dir.path().join("src/main/java/com/example");
+        fs::create_dir_all(&pkg).unwrap();
+        let file = pkg.join("Bean.java");
+        fs::write(
+            &file,
+            "package com.example;\n\
+             import org.apache.commons.lang3.builder.EqualsBuilder;\n\
+             import org.apache.commons.lang3.builder.HashCodeBuilder;\n\
+             import org.apache.commons.lang3.builder.ToStringBuilder;\n\
+             import org.slf4j.Logger;\n\
+             import org.slf4j.LoggerFactory;\n\n\
+             public class Bean {\n\
+             \x20   private static final Logger log = LoggerFactory.getLogger(Bean.class);\n\
+             \x20   private String name;\n\
+             \x20   private int count;\n\n\
+             \x20   public Bean() {}\n\
+             \x20   public String getName() { return name; }\n\
+             \x20   public int getCount() { return count; }\n\
+             \x20   public void setName(String name) { this.name = name; }\n\
+             \x20   public void setCount(int count) { this.count = count; }\n\
+             \x20   public boolean equals(Object other) {\n\
+             \x20       if (this == other) return true;\n\
+             \x20       Bean that = (Bean) other;\n\
+             \x20       return new EqualsBuilder().append(name, that.name).append(count, that.count).isEquals();\n\
+             \x20   }\n\
+             \x20   public int hashCode() {\n\
+             \x20       return new HashCodeBuilder().append(name).append(count).toHashCode();\n\
+             \x20   }\n\
+             \x20   public String toString() {\n\
+             \x20       return new ToStringBuilder(this).append(\"name\", name).append(\"count\", count).toString();\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+
+        let runner = CodeNavProbeRunner::new(None, vec![]);
+        let spec = ProbeSpec::JavaClassAnalysis {
+            file: file.to_string_lossy().into_owned(),
+            target_type: "Bean".into(),
+        };
+        let inv = minimal_invocation(&dir.path().to_string_lossy());
+        let out = runner
+            .run_probe("analysis", &spec, &Context::default(), &inv)
+            .expect("analyzeClass must succeed with a live worker");
+        let v = &out.value;
+
+        assert_eq!(v["found"], json!(true));
+        // Two instance fields (the static logger is excluded).
+        assert_eq!(v["fields"].as_array().unwrap().len(), 2, "fields: {v}");
+        // Trivial getters/setters correlated to both fields → full coverage.
+        assert_eq!(v["trivial_getters"].as_array().unwrap().len(), 2, "getters: {v}");
+        assert_eq!(v["trivial_setters"].as_array().unwrap().len(), 2, "setters: {v}");
+        assert_eq!(v["getter_covers_all_fields"], json!(true));
+        assert_eq!(v["setter_covers_all_non_final_fields"], json!(true));
+        // Canonical no-arg constructor.
+        assert_eq!(v["has_no_args_constructor"], json!(true));
+        // Builder equals/hashCode/toString covering both fields in order.
+        assert_eq!(v["equals"]["covers_all"], json!(true), "equals: {v}");
+        assert_eq!(v["hash_code"]["covers_all"], json!(true), "hashCode: {v}");
+        assert_eq!(v["to_string"]["covers_all"], json!(true), "toString: {v}");
+        // SLF4J logger field.
+        assert_eq!(v["logger_field_present"], json!(true));
+        // A getter is correlated to its field with the field's type.
+        let getters = v["trivial_getters"].as_array().unwrap();
+        assert!(
+            getters.iter().any(|g| g["field"] == json!("name") && g["type"] == json!("String")),
+            "expected a getName→name:String getter; got: {v}"
         );
     }
 }
