@@ -2317,9 +2317,10 @@ fn g13_extract_java_class_none_mode_strips_annotations() {
 
 // The "@Inject field detected → refuse" auto-detection was removed from the
 // engine when the Guice wiring policy was dissolved into the macro layer
-// (`builtin.java.guice`). The generic extract no longer inspects the source
-// for DI markers; the refusal now lives in the macro as a syntactic
-// field-annotation probe and is covered by the macro's own tests, not here.
+// (`builtin.java.guice`). The generic extract no longer inspects the source for
+// DI markers. That default-path guard was consciously RETIRED, not relocated:
+// builtin.java.guice is the affirmative external_injection choice, so it needs
+// no @Inject refusal (and carries none). See guice_macro_tests.rs.
 
 /// The wiring spec the `builtin.java.guice` macro supplies for an
 /// external-injection (DI field-injected) extract. Defined here so these
