@@ -112,6 +112,14 @@ final class AnalyzeClassHandler {
         result.fields = fields;
 
         // -- Trivial getters & setters ------------------------------------
+        // Accessor-name-mismatch handling (e.g. getX on a boolean field whose
+        // generated accessor is isX) follows the strategy:
+        //   skip   — exclude the getter entirely (kept in source, not counted
+        //            toward coverage, no annotation);
+        //   bridge — include it, but rewrite its body to delegate to the
+        //            generated accessor so callers of the old name still work;
+        //   rename — include it as a normal delete (accept the name change).
+        String strategy = params.getBooleanGetterStrategy();
         for (Statement s : members) {
             if (!(s instanceof J.MethodDeclaration md) || md.isConstructor()) {
                 continue;
@@ -121,6 +129,16 @@ final class AnalyzeClassHandler {
             }
             GetterFact g = asTrivialGetter(md, fields, cu);
             if (g != null) {
+                if (g.apiMismatch) {
+                    switch (strategy) {
+                        case "skip" -> { continue; } // leave it; do not count it
+                        case "bridge" -> {
+                            g.bridge = true;
+                            g.bridgeTo = g.lombokName;
+                        }
+                        default -> { } // "rename": normal delete
+                    }
+                }
                 result.trivialGetters.add(g);
                 continue;
             }
@@ -355,8 +373,8 @@ final class AnalyzeClassHandler {
                 g.method = name;
                 g.field = f.name;
                 g.type = retType;
-                g.booleanIsForm = isBoolean && name.equals("is" + cap);
-                g.booleanGetFormOnBoolean = isBoolean && name.equals("get" + cap);
+                g.lombokName = generatedGetterName(f.name, retType);
+                g.apiMismatch = !name.equals(g.lombokName);
                 return g;
             }
         }
@@ -509,6 +527,23 @@ final class AnalyzeClassHandler {
             return s;
         }
         return Character.toUpperCase(s.charAt(0)) + s.substring(1);
+    }
+
+    /**
+     * The accessor name a default getter-generator emits for {@code fieldName}
+     * of {@code retType}: {@code isX} for primitive {@code boolean} (unless the
+     * field is already {@code is}-prefixed), otherwise {@code getX}. Boxed
+     * {@code Boolean} uses {@code getX}. Mirrors the convention the dissolved
+     * lombokify kind used, so accessor-name mismatches are detected identically.
+     */
+    private static String generatedGetterName(String fieldName, String retType) {
+        if (retType.equals("boolean")) {
+            boolean startsWithIs = fieldName.startsWith("is")
+                    && fieldName.length() > 2
+                    && Character.isUpperCase(fieldName.charAt(2));
+            return startsWithIs ? fieldName : "is" + capitalize(fieldName);
+        }
+        return "get" + capitalize(fieldName);
     }
 
     /** Visitor that finds a class declaration by simple name. */

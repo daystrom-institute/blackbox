@@ -383,6 +383,11 @@ pub struct AnalyzeClassParams {
     pub source_text: String,
     /// Simple name of the type to analyze.
     pub target_type: String,
+    /// How to treat a trivial accessor whose name differs from the generated
+    /// one (`skip` | `bridge` | `rename`); defaults to `skip` on the worker
+    /// when absent. Affects which getters are reported and their `bridge` flag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boolean_getter_strategy: Option<String>,
 }
 
 // ── shutdown ─────────────────────────────────────────────────────────────────

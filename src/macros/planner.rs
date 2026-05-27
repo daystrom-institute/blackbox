@@ -132,8 +132,12 @@ impl MacroPlanner {
         validate_inputs(&invocation.inputs, &def.inputs_schema)?;
 
         // ── Constraint 3: build expr::Context (populated incrementally by probes) ─
+        // Apply inputs_schema `default` values for any input the operator omitted,
+        // so `${inputs.*}` interpolation and predicates see declared defaults.
+        let mut ctx_inputs = invocation.inputs.clone();
+        apply_input_schema_defaults(&mut ctx_inputs, &def.inputs_schema);
         let mut expr_ctx = expr::Context {
-            inputs: invocation.inputs.clone(),
+            inputs: ctx_inputs,
             probes: HashMap::new(),
             locals: HashMap::new(),
         };
@@ -1039,6 +1043,27 @@ fn build_provenance(def: &MacroDefinition, probe_summaries: &[Value]) -> Value {
 /// matching (from `schema.properties.<key>.type`) for each present key.
 /// Full JSON Schema evaluation is deferred to a later phase.
 ///
+/// Fill `inputs` with `default` values declared in the inputs schema for any
+/// property the caller omitted. Only inserts absent keys; never overrides a
+/// supplied value. No-op when the schema is not an object or has no properties.
+fn apply_input_schema_defaults(inputs: &mut serde_json::Map<String, Value>, schema: &Value) {
+    let Some(props) = schema
+        .as_object()
+        .and_then(|o| o.get("properties"))
+        .and_then(|p| p.as_object())
+    else {
+        return;
+    };
+    for (key, prop) in props {
+        if inputs.contains_key(key) {
+            continue;
+        }
+        if let Some(default) = prop.as_object().and_then(|o| o.get("default")) {
+            inputs.insert(key.clone(), default.clone());
+        }
+    }
+}
+
 /// Fail-closed: a null/absent schema means no declared inputs (no constraints).
 /// A present-but-non-object schema is malformed and is rejected with
 /// `error.malformed_inputs_schema` rather than silently disabling validation.
@@ -2142,6 +2167,35 @@ mod tests {
             msg.contains("error.duplicate_touched_path"),
             "DelegateRefactor → Rewrite same path must produce error.duplicate_touched_path; got: {msg}"
         );
+    }
+
+    // ── inputs_schema defaults ───────────────────────────────────────────────────
+
+    #[test]
+    fn apply_input_schema_defaults_fills_absent_only() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "strategy": {"type": "string", "default": "skip"},
+                "name": {"type": "string"},
+                "count": {"type": "integer", "default": 3}
+            }
+        });
+        let mut inputs = serde_json::Map::new();
+        inputs.insert("strategy".into(), json!("bridge")); // supplied — must win
+        apply_input_schema_defaults(&mut inputs, &schema);
+        assert_eq!(inputs.get("strategy"), Some(&json!("bridge")), "supplied value must not be overridden");
+        assert_eq!(inputs.get("count"), Some(&json!(3)), "absent default must be filled");
+        assert_eq!(inputs.get("name"), None, "property without a default stays absent");
+    }
+
+    #[test]
+    fn apply_input_schema_defaults_noop_without_properties() {
+        let mut inputs = serde_json::Map::new();
+        inputs.insert("x".into(), json!(1));
+        apply_input_schema_defaults(&mut inputs, &json!({"type": "object"}));
+        apply_input_schema_defaults(&mut inputs, &serde_json::Value::Null);
+        assert_eq!(inputs.len(), 1, "no properties → no change");
     }
 
     // ── ForEach fan-out ────────────────────────────────────────────────────────

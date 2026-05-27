@@ -111,6 +111,14 @@ Tree-sitter language: `java`.
   probe + `ForEach` fan-out over `delete_member` / `insert_class_annotation` /
   `insert_field_annotation` / `prune_unused_import`, with all Lombok policy
   (annotation names, `@Data`/`@Value` collapse, declines) as macro data.
+  - `boolean_getter_strategy` input (`skip` default | `bridge` | `rename`)
+    handles a hand-rolled `getX()` on a boolean field whose generated accessor
+    is `isX()`: skip leaves it, bridge keeps it delegating to `isX()`, rename
+    drops it.
+  - **Bulk/directory**: the macro is per-class (one `target_type`). Lombokify a
+    whole tree by discovering classes (e.g. `bbox_code_symbols`, which skips
+    build dirs) and invoking the macro once per class — non-POJO classes are
+    non-fatal no-ops. Iteration is orchestration, not baked into the macro.
 
 This parent also keeps concise sections for `promote_java_inner_class`,
 `extract_java_nested_classes`, `find_java_usages`, `rename_java_symbol`,

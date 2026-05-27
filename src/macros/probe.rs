@@ -215,6 +215,10 @@ pub enum ProbeSpec {
         file: String,
         /// Simple name of the type to analyze.
         target_type: String,
+        /// Accessor-name-mismatch strategy (`skip` | `bridge` | `rename`),
+        /// forwarded to the worker. Absent → worker default (`skip`).
+        #[serde(default)]
+        boolean_getter_strategy: Option<String>,
     },
 }
 
@@ -803,6 +807,7 @@ impl CodeNavProbeRunner {
         &self,
         file: &str,
         target_type: &str,
+        boolean_getter_strategy: Option<&str>,
         project_dir: &str,
     ) -> Result<ProbeOutput> {
         if target_type.trim().is_empty() {
@@ -835,6 +840,7 @@ impl CodeNavProbeRunner {
                     target_file: contained.to_string_lossy().into_owned(),
                     source_text,
                     target_type: target_type.to_owned(),
+                    boolean_getter_strategy: boolean_getter_strategy.map(str::to_owned),
                 },
             )
             .map_err(|e| anyhow!("error.backend_unavailable: analyzeClass RPC failed: {e}"))?;
@@ -971,9 +977,16 @@ impl ProbeRunner for CodeNavProbeRunner {
             ProbeSpec::WorkspaceSymbol { query } => {
                 self.run_workspace_symbol(query, &invocation.project_dir)
             }
-            ProbeSpec::JavaClassAnalysis { file, target_type } => {
-                self.run_java_class_analysis(file, target_type, &invocation.project_dir)
-            }
+            ProbeSpec::JavaClassAnalysis {
+                file,
+                target_type,
+                boolean_getter_strategy,
+            } => self.run_java_class_analysis(
+                file,
+                target_type,
+                boolean_getter_strategy.as_deref(),
+                &invocation.project_dir,
+            ),
         }
     }
 }
@@ -1889,6 +1902,7 @@ mod tests {
         let spec = ProbeSpec::JavaClassAnalysis {
             file: file.to_string_lossy().into_owned(),
             target_type: "Bean".into(),
+            boolean_getter_strategy: None,
         };
         let inv = minimal_invocation(&dir.path().to_string_lossy());
         let out = runner

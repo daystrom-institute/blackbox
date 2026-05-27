@@ -23,20 +23,27 @@ final class AnalyzeClassParams {
     private final String targetFile;
     private final String sourceText;
     private final String targetType;
+    private final String booleanGetterStrategy;
 
     @JsonCreator
     AnalyzeClassParams(
             @JsonProperty("target_file") String targetFile,
             @JsonProperty("source_text") String sourceText,
-            @JsonProperty("target_type") String targetType) {
+            @JsonProperty("target_type") String targetType,
+            @JsonProperty("boolean_getter_strategy") String booleanGetterStrategy) {
         this.targetFile = Objects.requireNonNull(targetFile, "target_file is required");
         this.sourceText = Objects.requireNonNull(sourceText, "source_text is required");
         this.targetType = Objects.requireNonNull(targetType, "target_type is required");
+        // Default "skip" — leave a name-mismatched accessor (e.g. getX on a
+        // boolean field whose generated accessor is isX) untouched.
+        this.booleanGetterStrategy =
+                booleanGetterStrategy == null ? "skip" : booleanGetterStrategy;
     }
 
     String getTargetFile() { return targetFile; }
     String getSourceText() { return sourceText; }
     String getTargetType() { return targetType; }
+    String getBooleanGetterStrategy() { return booleanGetterStrategy; }
 }
 
 @JsonAutoDetect(fieldVisibility = JsonAutoDetect.Visibility.ANY)
@@ -98,10 +105,18 @@ final class GetterFact {
     public String method = "";
     public String field = "";
     public String type = "";
-    /** {@code isX()} form on a boolean field. */
-    public boolean booleanIsForm;
-    /** {@code getX()} form on a boolean field (subject to the boolean strategy). */
-    public boolean booleanGetFormOnBoolean;
+    /** The accessor name a default getter-generator would emit for this field
+     *  ({@code isX} for primitive boolean, else {@code getX}). */
+    public String lombokName = "";
+    /** True when the hand-rolled method name differs from {@link #lombokName}
+     *  — dropping it for a generated accessor would change the public API. */
+    public boolean apiMismatch;
+    /** When true (bridge strategy on a mismatch), the method body is rewritten
+     *  to delegate to {@link #bridgeTo} rather than being deleted, so existing
+     *  callers of the original name keep compiling. */
+    public boolean bridge;
+    /** The generated accessor the bridge delegates to (== {@link #lombokName}). */
+    public String bridgeTo = "";
 }
 
 @JsonAutoDetect(fieldVisibility = JsonAutoDetect.Visibility.ANY)

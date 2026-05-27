@@ -32,6 +32,16 @@ fn jar_ready() -> bool {
 /// Run the `builtin.java.lombok` macro and return the rewritten source for
 /// `file` (or the original content when the macro produces no edit).
 fn run_macro(project_dir: &Path, file: &Path, target_type: &str) -> String {
+    run_macro_strategy(project_dir, file, target_type, None)
+}
+
+/// As [`run_macro`], optionally supplying `boolean_getter_strategy`.
+fn run_macro_strategy(
+    project_dir: &Path,
+    file: &Path,
+    target_type: &str,
+    boolean_getter_strategy: Option<&str>,
+) -> String {
     let def = MacroRegistry::get(None, "builtin.java.lombok")
         .expect("registry get must not error")
         .expect("builtin.java.lombok must be registered");
@@ -39,6 +49,9 @@ fn run_macro(project_dir: &Path, file: &Path, target_type: &str) -> String {
     let mut inputs = serde_json::Map::new();
     inputs.insert("file".into(), serde_json::json!(file.to_string_lossy()));
     inputs.insert("target_type".into(), serde_json::json!(target_type));
+    if let Some(strat) = boolean_getter_strategy {
+        inputs.insert("boolean_getter_strategy".into(), serde_json::json!(strat));
+    }
 
     let inv = MacroInvocation {
         macro_id: "builtin.java.lombok".into(),
@@ -96,6 +109,132 @@ fn macro_output(scenario: &str, type_name: &str, src: &str) -> Option<String> {
     let file = dir.path().join(format!("{type_name}.java"));
     std::fs::write(&file, src).unwrap();
     Some(run_macro(dir.path(), &file, type_name))
+}
+
+/// As [`macro_output`], with an explicit `boolean_getter_strategy`.
+fn macro_output_strategy(
+    scenario: &str,
+    type_name: &str,
+    src: &str,
+    strategy: &str,
+) -> Option<String> {
+    if !jar_ready() {
+        eprintln!("[lombok_golden] worker JAR unavailable — skipping '{scenario}'");
+        return None;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join(format!("{type_name}.java"));
+    std::fs::write(&file, src).unwrap();
+    Some(run_macro_strategy(dir.path(), &file, type_name, Some(strategy)))
+}
+
+/// A primitive `boolean` field with a hand-rolled `getActive()` — the generated
+/// accessor would be `isActive()`, so dropping `getActive()` is an API change.
+const BOOLEAN_MISMATCH_SRC: &str = "package com.example;\n\n\
+     public class Toggle {\n\
+     \x20   private boolean active;\n\n\
+     \x20   public boolean getActive() { return active; }\n\
+     }\n";
+
+#[test]
+fn macro_bulk_by_composition_over_directory() {
+    // Bulk/directory lombokify dissolves into "invoke the per-class macro once
+    // per discovered class" — the dissolution separates the per-class
+    // transformation (the macro) from iteration (orchestration). This proves
+    // that composition: a directory with two lombokifiable classes and one
+    // non-POJO. The POJOs are transformed; the non-POJO is a non-fatal no-op
+    // (lombokify's "leftover"), not an error.
+    if !jar_ready() {
+        eprintln!("[lombok_golden] worker JAR unavailable — skipping bulk composition");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pkg = dir.path().join("src/main/java/com/example");
+    std::fs::create_dir_all(&pkg).unwrap();
+
+    let pair = pkg.join("Pair.java");
+    std::fs::write(
+        &pair,
+        "package com.example;\n\npublic class Pair {\n\
+         \x20   private int a;\n\
+         \x20   public int getA() { return a; }\n}\n",
+    )
+    .unwrap();
+    let plain = pkg.join("Plain.java");
+    std::fs::write(
+        &plain,
+        "package com.example;\n\npublic class Plain {\n\
+         \x20   private String name;\n\
+         \x20   public String getName() { return name; }\n}\n",
+    )
+    .unwrap();
+    // A non-POJO: a method with real logic, no trivial accessors.
+    let svc = pkg.join("Service.java");
+    let svc_src = "package com.example;\n\npublic class Service {\n\
+         \x20   public int compute(int x) { return x * x + 1; }\n}\n";
+    std::fs::write(&svc, svc_src).unwrap();
+
+    // Caller-side iteration (what an orchestration loop / bulk runner does):
+    // invoke the per-class macro for each discovered (file, class).
+    let out_pair = run_macro(dir.path(), &pair, "Pair");
+    let out_plain = run_macro(dir.path(), &plain, "Plain");
+    let out_svc = run_macro(dir.path(), &svc, "Service");
+
+    assert!(out_pair.contains("@Getter") && !out_pair.contains("getA()"),
+        "Pair must be lombokified; got:\n{out_pair}");
+    assert!(out_plain.contains("@Getter") && !out_plain.contains("getName()"),
+        "Plain must be lombokified; got:\n{out_plain}");
+    // Leftover: the non-POJO is untouched (no-op), not an error.
+    assert_eq!(
+        out_svc, svc_src,
+        "non-POJO Service must be a non-fatal no-op (unchanged); got:\n{out_svc}"
+    );
+}
+
+#[test]
+fn macro_boolean_getter_skip_leaves_mismatch_untouched() {
+    // skip (default): getActive is excluded → no coverage → nothing happens.
+    let Some(out) = macro_output_strategy("bool_skip", "Toggle", BOOLEAN_MISMATCH_SRC, "skip")
+    else {
+        return;
+    };
+    assert!(!out.contains("@Getter"), "skip must not add @Getter; got:\n{out}");
+    assert!(out.contains("public boolean getActive()"), "getActive must remain; got:\n{out}");
+    assert!(!out.contains("lombok"), "no lombok import under skip; got:\n{out}");
+}
+
+#[test]
+fn macro_boolean_getter_bridge_delegates_to_generated() {
+    // bridge: @Getter generates isActive(); getActive() is kept but rewritten to
+    // delegate, so existing callers of getActive() still compile.
+    let Some(out) =
+        macro_output_strategy("bool_bridge", "Toggle", BOOLEAN_MISMATCH_SRC, "bridge")
+    else {
+        return;
+    };
+    assert!(out.contains("@Getter"), "bridge must add @Getter; got:\n{out}");
+    assert!(out.contains("import lombok.Getter;"), "bridge must add the import; got:\n{out}");
+    assert!(out.contains("public boolean getActive()"), "bridge keeps getActive(); got:\n{out}");
+    // The body now delegates to the generated accessor.
+    let normalized: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        normalized.contains("return isActive();"),
+        "bridge body must delegate to isActive(); got:\n{out}"
+    );
+}
+
+#[test]
+fn macro_boolean_getter_rename_drops_mismatch() {
+    // rename: @Getter generates isActive(); getActive() is dropped (callers
+    // accept the rename).
+    let Some(out) =
+        macro_output_strategy("bool_rename", "Toggle", BOOLEAN_MISMATCH_SRC, "rename")
+    else {
+        return;
+    };
+    assert!(out.contains("@Getter"), "rename must add @Getter; got:\n{out}");
+    assert!(out.contains("import lombok.Getter;"));
+    assert!(!out.contains("getActive"), "rename must drop getActive(); got:\n{out}");
 }
 
 #[test]
