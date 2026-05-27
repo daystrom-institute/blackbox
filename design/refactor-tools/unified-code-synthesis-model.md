@@ -399,8 +399,74 @@ No gap may mention `UI`, `VaadinSession`, `@Provides`, or Spring refusal as
 | `migrate_receiver.rs`, `split_provider.rs`, `replace_static_ref.rs` | **Generic DI-aware rewrites.** Keep as `delegate_refactor` targets. |
 | `leaf_plans.rs` `extract_java_interface`, `add_java_implements`, `java_lsp_organize_imports` | **Generic.** Keep; callable as backend/delegate ops. |
 | `vaadin_provider_bindings.rs` | **Dissolved → `builtin.java.vaadin.ensure_provider_bindings`.** Rust kind deleted after parity proof; no compat wrapper. Generic substrate gaps filled: `ProbeSpec::ProjectText` + `when`-guard on mutating ops. |
-| `vaadin_view_synthesis.rs`, `vaadin_*_extract.rs` | **Library policy.** → `builtin.java.vaadin` macros (route collision, access-policy) over generic emit/probe. |
-| `lombokify.rs` (`lombokify_java_class`) | **Dissolved → `builtin.java.lombok`.** Rust kind, `java-lombokify` atom, `sm-refactor-java-lombokify` memory, `pojo-modernize` workflow, and lombokify tests all deleted after parity proof; no compat wrapper. The generic `formal_parameters` helper was preserved (moved to `method_params`). Generic substrate added: `ForEach` fan-out, `DeleteMember` / `insert_class_annotation` / `insert_field_annotation` / `prune_unused_import` ops, and an `analyzeClass` structural probe. All Lombok policy (`@Data`/`@Value` collapse, annotation names, declines) is macro data. |
+| `vaadin_view_synthesis.rs`, `vaadin_component_extract.rs`, `vaadin_grid_extract.rs`, `vaadin_dialog_extract.rs`, `vaadin_navigation_helper.rs`, `vaadin_route_access.rs` | **Library policy (mutation).** → `builtin.java.vaadin` macros (route collision, access-policy) over generic emit/probe. Not yet dissolved. |
+| `vaadin_route_inventory.rs`, `vaadin_static_ui_audit.rs`, `vaadin_view_structure.rs` | **Library policy (analysis-only).** → `builtin.java.vaadin` probe macros, or stay as `code_nav` probes (see analysis-kind note below). Not yet dissolved. |
+| `jooq_analysis.rs` — 6 analysis kinds (`codegen_config_inventory`, `query_structure_analysis`, `dsl_context_audit`, `projection_mapping_analysis`, `raw_sql_fragment_audit`, `generated_record_boundary_analysis`) | **Library policy (analysis-only).** Pure read-only inventory/audit, tree-sitter + text scan, no LSP. → `builtin.java.jooq` probe macros over `ProbeSpec::ProjectText` + `code_query`. Not yet dissolved. |
+| `jooq_mutations.rs` — 9 dissolvable mutation kinds (`raw_sql_fragment_rewrite`, `extract_query_method`, `extract_query_object`, `synthesize_query_method`, `synthesize_dto_projection`, `condition_builder_extract`, `generated_record_boundary_rewrite`, `codegen_extension_apply`, + nesting-detection half of `transaction_boundary_normalize`) | **Library policy (mutation).** Operator-supplied names/types, tree-sitter insertion points, text-emit templates — no jOOQ-specific backend. → `builtin.java.jooq` macros over generic emit/rewrite/`delegate_refactor`/`insert_member`. Not yet dissolved. |
+| `jooq_mutations.rs` — `java_jooq_extract_repository` | **Recipe pack / operator-policy gap.** Already blocked in v1; needs DSLContext-scope, read/write, transaction-boundary, and public-API policy fields that are not expressible in current macro ontology. Classify as `recipe_pack` before any code. |
+| `jooq_mutations.rs` — `transaction_boundary_normalize` (policy half) | **Partial.** Nesting detection is generic; the flatten-vs-annotate / savepoint-preservation semantics are jOOQ tx-callback policy → macro data + operator opt-in flag, but record an ontology gap if a generic rewrite-rule template cannot carry it. |
+| `lombokify.rs` — `lombokify_java_class` | **Dissolved → `builtin.java.lombok`** (Phase 6). Rust kind, `java-lombokify` atom, `sm-refactor-java-lombokify` memory, `pojo-modernize` workflow, and lombokify tests all deleted after parity proof; no compat wrapper. The generic `formal_parameters` helper was preserved (moved to `method_params`). Generic substrate added: `ForEach` fan-out, `DeleteMember` / `insert_class_annotation` / `insert_field_annotation` / `prune_unused_import` ops, an `analyzeClass` structural probe, and inputs-schema defaults. All Lombok policy (`@Data`/`@Value` collapse, annotation names, boolean skip/bridge/rename, declines) is macro data. Parity proven on 12 scenarios. |
+
+### Remaining dissolution scope (the holes Phase 5 left)
+
+Phase 5 dissolved `vaadin_provider_bindings.rs`; Phase 6 dissolved
+`lombokify_java_class`. The disposition table above enumerates every
+framework-specific Rust kind still in the tree. Counts as of this revision:
+**9 Vaadin kinds and 17 jOOQ kinds remain** hard-coded as Rust plan kinds
+(Lombok is now dissolved). An earlier table understated this by omitting the
+entire jOOQ family and Lombok; that omission is corrected above.
+
+Run each through the genericity test (ladder step 1) before writing code:
+
+- **Vaadin analysis + extract/synthesize kinds** — same shape as the proven
+  `ensure_provider_bindings` migration (probe + guarded emit/rewrite). Lowest new
+  substrate risk; these are the natural Phase 7 batch.
+- **jOOQ analysis kinds (6)** — pure read-only inventory/audit. They map to probe
+  macros, but see the analysis-kind note below: a read-only "report" macro is a
+  different shape than a mutating macro that lowers to a `RefactorPlan`.
+- **jOOQ mutation kinds (9 dissolvable)** — operator-supplied names/types +
+  tree-sitter insertion + text-emit. No jOOQ-specific backend; `delegate_refactor`
+  + `insert_member` + `when`-guards cover them. `extract_repository` stays a
+  recipe-pack/operator-policy item; `transaction_boundary_normalize` is partial.
+- **Lombok (`lombokify_java_class`)** — **done (Phase 6).** Was the recommended
+  entry point: single kind, syntax-only, no LSP, transformations generic across
+  any annotation-codegen library (Immutables, AutoValue, MapStruct). It was not
+  zero-gap — the gaps below were filled first, then it dissolved cleanly.
+
+### Generic ontology gaps Lombok dissolution required *(filled in Phase 6)*
+
+These are framework-agnostic (no Lombok name appears in them); they were filled
+in the backend before expressing `lombokify` as macro data:
+
+1. **`insert_class_annotation`** — add an annotation to a type declaration
+   (class-level placement), with dedup against existing annotations. Today
+   `java.template.insert_member` only inserts *inside* the class body.
+2. **`insert_field_annotation`** — add an annotation immediately above a named
+   field (per-field placement), for the case where a class-level annotation does
+   not apply to all fields.
+3. **`ensure_import`** — add an import with dedup and existing-wildcard awareness,
+   and its inverse **`prune_unused_import`** (remove an import whose symbol is no
+   longer referenced after edits). `ProbeSpec::ProjectText` can *detect* import
+   presence today, but there is no generic emit op for managed import add/prune.
+
+Member **deletion** (drop a method/field byte-range with trailing-newline
+cleanup) is also required; confirm whether the slice/refactor layer already
+exposes a generic delete the macro lowering can target, or whether a
+`MacroOperation::Delete` is the minimal addition. The `@Data`/`@Value` collapse
+cascade and boolean-getter strategy (skip/bridge/rename) are expressible as
+bounded `when`-guards + an operator-supplied input — no new control flow beyond
+the existing predicate grammar.
+
+### Analysis-only kinds are a different macro shape (open question)
+
+The jOOQ and Vaadin *analysis/audit/inventory* kinds are read-only: they emit a
+structured report, not a `RefactorPlan`. The macro IR lowers to one
+`RefactorPlan` and `refactor::apply()` is mutation-shaped. A read-only macro that
+produces a JSON inventory either (a) lowers to an empty-edit plan with the report
+in a `record`/residue channel, or (b) does not belong in the macro layer at all
+and should stay a `code_nav` probe surface. Decide this before dissolving the six
+jOOQ analysis kinds — do not force read-only inventory through a mutation-shaped
+plan just to retire the Rust kind.
 
 ## Useful V1 — `java.add_service_boundary`
 
@@ -481,24 +547,30 @@ Phased so each phase is independently useful and testable.
 - **Phase 4 — probe bindings**: wire macro `probe` ops to code-nav syntactic and
   jdtls semantic tiers via the `CodeRefactorHandoff` seam; codify
   prefilter-then-resolve.
-- **Phase 5 — dissolution proof**: ship `builtin.java.guice` and
-  `builtin.java.vaadin` with at least one current Rust helper represented as
-  macro data; record ontology gaps; delete the old plan kind outright after the
-  parity proof — no compatibility wrapper.
-- **Phase 6 — Lombok dissolution** *(done)*: `lombokify_java_class` dissolved
-  into the `builtin.java.lombok` macro. This required completing the macro
-  ontology for variable-cardinality, member-level work: the `ForEach` fan-out
-  operation (the engine was previously loop-free), the generic leaf ops
-  `DeleteMember` / `insert_class_annotation` / `insert_field_annotation` /
-  `prune_unused_import`, and a generic `analyzeClass` structural probe (trivial
-  accessors, canonical constructors, builder equals/hashCode/toString, logger
-  field). Parity proven against the Rust kind on 8 scenarios (class-level/
-  per-field accessors, `@Data`/`@Value` collapse, `@Slf4j`, and the
-  conservative declines: custom hashCode seed, Javadoc getter, validation
-  setter), then the Rust kind + atom + memory + workflow + tests were deleted
-  with no compat wrapper. Confirms the doc's thesis: the gaps were
-  ontology-completeness gaps fillable generically, not reasons to keep
-  library-specific Rust.
+- **Phase 5 — dissolution proof** *(done, one instance)*: shipped
+  `builtin.java.vaadin.ensure_provider_bindings` (dissolving
+  `vaadin_provider_bindings.rs`), recorded the `ProbeSpec::ProjectText` +
+  op-`when`-guard gaps, deleted the old plan kind outright with no compat wrapper.
+  This proved the *method*; it did not migrate the rest of the surface. A
+  `builtin.java.guice` library was named here but not yet shipped.
+- **Phase 6 — Lombok dissolution** *(done)*: filled the generic ontology gaps —
+  `ForEach` fan-out (the engine was loop-free; the make-or-break gap),
+  `DeleteMember`, `insert_class_annotation`, `insert_field_annotation`,
+  `prune_unused_import`, a generic `analyzeClass` structural probe, and
+  inputs-schema defaults — then expressed `lombokify_java_class` as the
+  `builtin.java.lombok` macro (all Lombok policy as data, incl. `@Data`/`@Value`
+  collapse and boolean skip/bridge/rename). Parity proven against the Rust kind
+  on 12 scenarios; bulk dissolved into per-class macro invocation (orchestration,
+  not baked in). Rust kind + atom + memory + workflow + tests deleted, no compat
+  wrapper. Confirms the thesis: the obstacles were ontology-completeness gaps
+  fillable generically, not reasons to keep library-specific Rust.
+- **Phase 7 — Vaadin + jOOQ batches**: dissolve the remaining Vaadin
+  extract/synthesize kinds (probe + guarded emit/rewrite, same shape as Phase 5)
+  and the 9 dissolvable jOOQ mutation kinds; resolve the analysis-kind shape
+  question before the six jOOQ analysis kinds; ship `builtin.java.guice` (the
+  `extract_class.rs` `G7` wiring-mode enum → macro data). `extract_repository`
+  stays a recipe-pack item; `transaction_boundary_normalize` policy half pending
+  the rewrite-template gap.
 - **v1 macro**: implement `java.add_service_boundary` with fixtures proving
   boundary creation in a Guice project and refusal of the ambiguous cases.
 
