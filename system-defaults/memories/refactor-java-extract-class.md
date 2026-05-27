@@ -5,7 +5,7 @@ tags:
 ---
 +++
 title = "Java extract_java_class — composite class extraction, capture analysis, FIXME catalog"
-tags = ["refactor", "refactoring", "mechanization", "java", "extract", "extract_java_class", "extract_java_methods", "move_java_fields", "move_java_constant", "add_java_fields", "add_java_constructor", "add_java_delegate_field", "rewrite_java_calls_to_delegate", "tree-sitter", "bbox_refactor_plan", "bbox_refactor_apply", "capture-analysis", "captured_variables", "callback_externals", "wiring_mode", "source_delegate_wrappers", "propagate_class_annotations", "rewrite_remaining_accessors", "deep_analysis", "external_calls", "inherited_dependencies", "remaining_source_accessors", "remaining_source_constant_refs", "FIXME", "delegate", "validation_failed", "mutable_capture_with_write", "method_overload_ambiguous", "guice_field_inject"]
+tags = ["refactor", "refactoring", "mechanization", "java", "extract", "extract_java_class", "extract_java_methods", "move_java_fields", "move_java_constant", "add_java_fields", "add_java_constructor", "add_java_delegate_field", "rewrite_java_calls_to_delegate", "tree-sitter", "bbox_refactor_plan", "bbox_refactor_apply", "capture-analysis", "captured_variables", "callback_externals", "wiring_mode", "source_delegate_wrappers", "propagate_class_annotations", "rewrite_remaining_accessors", "deep_analysis", "external_calls", "inherited_dependencies", "remaining_source_accessors", "remaining_source_constant_refs", "FIXME", "delegate", "validation_failed", "mutable_capture_with_write", "method_overload_ambiguous", "wiring_strategy", "external_injection", "builtin.java.guice"]
 order = 13
 template = false
 +++
@@ -228,42 +228,43 @@ real; if your concern is on the list, the planner already handles it.
 
 ## Optional parameters on `extract_java_class`
 
-- **`wiring_mode`** — how the source class wires the new delegate field.
-  Values:
-  - `constructor_args` (default for plain-Java classes): `private final
-    <Target> <delegate>;` + `this.<delegate> = new <Target>(...)` in
-    the source's first constructor.
-  - `guice_field_inject`: emit `@Inject private <Target> <delegate>;`
-    on the source, skip ctor wiring entirely. The DI container
-    populates the delegate after construction. The target's
-    constructor also gets `@Inject` and `import javax.inject.Inject;`
-    so DI can construct it with its captured ctor params.
-  - `manual`: skip source-side wiring (no delegate field, no ctor
-    assignment). Operator wires in their own code.
+- **`wiring_mode`** — a framework-neutral `WiringSpec` object describing how
+  the source class obtains the new delegate field. The engine carries no
+  DI-library knowledge; injection annotations and imports are supplied as data.
+  Fields:
+  - `strategy`:
+    - `own_construction` (default): `private final <Target> <delegate>;` +
+      `this.<delegate> = new <Target>(...)` in the source's first constructor.
+    - `external_injection`: emit the delegate field with the caller-supplied
+      `delegate_field_annotations` + `delegate_field_modifiers` (no synthesized
+      `final`, no ctor wiring); an external owner (e.g. a DI container) populates
+      it after construction. The generated target constructor receives
+      `target_constructor_annotations` and the target gets the matching
+      `target_constructor_annotation_imports`.
+    - `none`: no source-side wiring (no delegate field, no ctor assignment).
+  - `delegate_field_annotations` / `delegate_field_modifiers` /
+    `delegate_field_annotation_imports` — source delegate-field data
+    (`external_injection` only).
+  - `target_constructor_annotations` / `target_constructor_annotation_imports`
+    — generated-target-constructor data (`external_injection` only).
 
-  **Auto-detect refusal.** When `wiring_mode` is unset AND the source
-  class has any `@Inject`-annotated field, the planner refuses with
-  `error.bad_input(code=guice_field_injection_detected)` — the
-  default `constructor_args` flow would capture null because injection
-  happens AFTER the constructor. Pass `wiring_mode` explicitly to
-  proceed.
+  **No DI auto-detect.** The engine does NOT inspect the source for `@Inject`
+  markers and does NOT second-guess `strategy`. Framework-specific safety — and
+  the Guice/JSR-330 `@Inject` + `javax.inject.Inject` data — lives in the
+  `builtin.java.guice` macro; use that macro for DI-managed extracts rather than
+  hand-building the WiringSpec. Choosing `own_construction` on a DI-managed
+  class will null-capture the delegate; that is the caller's responsibility.
 
-  **Import dedupe.** `@Inject` lives in two packages (`com.google.inject`
-  and `javax.inject`). The import-injection paths skip when the source
-  already imports either FQCN (same simple name) AND when a wildcard
-  import covers the SAME package as the new import (in which case the
-  explicit form is redundant). Foreign wildcards from unrelated packages
-  do NOT block import addition — the previous blanket skip silently
-  dropped legitimate imports on any source carrying `import java.util.*;`
-  or similar.
+  **Conservative source import.** `delegate_field_annotation_imports` are added
+  to the SOURCE conservatively: any non-static wildcard import suppresses the
+  explicit single-type add (a wildcard could already supply the simple name and
+  we cannot probe the classpath). `target_constructor_annotation_imports` use
+  the plain import helper on the TARGET.
 
-  **Guice mutable-capture suppression.** Under
-  `wiring_mode=guice_field_inject` the target also `@Inject`-constructs,
-  so its captured ctor params are freshly injected at construction time
-  and do NOT carry a stale snapshot of the source field. The
-  "mutable capture promoted to final ctor param" FIXME is
-  suppressed in that mode — it warns about a failure mode that doesn't
-  apply.
+  **Mutable-capture suppression.** Under `strategy=external_injection` the
+  target is container-constructed, so its captured ctor params are freshly
+  resolved (not stale source snapshots); the "mutable capture promoted to final
+  ctor param" FIXME is suppressed.
 
 - **`source_delegate_wrappers`** — when `true`, generate thin wrapper
   methods on the source for each moved public non-static method. Each

@@ -1221,8 +1221,9 @@ fn interpolate_value_strings(v: &Value, ctx: &expr::Context) -> Result<Value> {
 /// value (array or object) in `ctx`, returns `Some(resolved_value)`.
 /// Returns `None` for partial-template strings or when the resolved value is
 /// a scalar (scalars go through normal [`expr::interpolate`] path).
-/// If `s` is a sole `${path}` placeholder (no surrounding text, no nesting)
-/// that resolves in `ctx`, return the resolved JSON value VERBATIM, preserving
+/// If `s` is a sole `${path}` placeholder (ignoring surrounding whitespace; no
+/// other literal text, no nesting) that resolves in `ctx`, return the resolved
+/// JSON value VERBATIM, preserving
 /// its type. Returns `None` when `s` is not a whole placeholder or the path
 /// does not resolve, so the caller falls back to scalar string interpolation
 /// (which preserves the genuine-missing-path error for required inputs).
