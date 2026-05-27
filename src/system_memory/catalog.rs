@@ -287,7 +287,11 @@ mod tests {
     #[test]
     fn load_and_keep_default_order() {
         let catalog = fixture_default_catalog();
-        assert_eq!(catalog.memories.len(), 28);
+        // 28 .md files on disk minus the `system-memory-catalog.md` nav-map
+        // (explicitly ignored by the loader, see loader.rs IGNORED_FILES) = 27.
+        // Was 28 until Phase 6 (a5906c9f) deleted refactor-java-lombokify.md
+        // when lombok was dissolved; the count was not updated then.
+        assert_eq!(catalog.memories.len(), 27);
         assert_eq!(catalog.memories[0].id, "sm-agentic-opening-sequence");
         assert_eq!(catalog.memories[1].id, "sm-atoms");
     }
