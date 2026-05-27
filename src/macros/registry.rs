@@ -208,6 +208,10 @@ impl MacroRegistry {
                 "builtin.java.lombok",
                 include_str!("../../system-defaults/macros/builtin.java.lombok.json"),
             ),
+            (
+                "builtin.java.guice",
+                include_str!("../../system-defaults/macros/builtin.java.guice.json"),
+            ),
         ];
 
         let mut out = Vec::with_capacity(BUILTINS.len());

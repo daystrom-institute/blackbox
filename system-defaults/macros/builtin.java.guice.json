@@ -1,0 +1,77 @@
+{
+  "id": "builtin.java.guice",
+  "version": "1.0.0",
+  "language": "java",
+  "scope": "builtin",
+  "title": "Extract Java Class with Guice Field Injection",
+  "inputs_schema": {
+    "type": "object",
+    "required": ["source", "target", "module_name", "delegate_field", "item_names"],
+    "properties": {
+      "source": {
+        "type": "string",
+        "description": "Absolute path to the source .java file to extract from (operates on its first top-level class)."
+      },
+      "target": {
+        "type": "string",
+        "description": "Absolute path to the new target .java file to create."
+      },
+      "module_name": {
+        "type": "string",
+        "description": "Simple name of the extracted target class."
+      },
+      "delegate_field": {
+        "type": "string",
+        "description": "Name of the delegate field the source will hold to the new class. Emitted as `@Inject private <module_name> <delegate_field>;` (no constructor wiring)."
+      },
+      "item_names": {
+        "type": "array",
+        "items": {"type": "string"},
+        "description": "Method names to move into the target class."
+      },
+      "move_fields": {
+        "type": "array",
+        "items": {"type": "string"},
+        "default": [],
+        "description": "Field names to move into the target class."
+      }
+    },
+    "additionalProperties": false
+  },
+  "effects": [
+    "modifies_existing_type",
+    "changes_dependency_injection"
+  ],
+  "authority_gates": [],
+  "probes": [],
+  "refusals": [],
+  "operations": [
+    {
+      "kind": "delegate_refactor",
+      "refactor_kind": "extract_java_class",
+      "params": {
+        "source": "${inputs.source}",
+        "target": "${inputs.target}",
+        "module_name": "${inputs.module_name}",
+        "delegate_field": "${inputs.delegate_field}",
+        "item_names": ["${inputs.item_names}"],
+        "move_fields": ["${inputs.move_fields}"],
+        "deep_analysis": false,
+        "wiring_mode": {
+          "strategy": "external_injection",
+          "delegate_field_annotations": ["@Inject"],
+          "delegate_field_modifiers": ["private"],
+          "delegate_field_annotation_imports": ["javax.inject.Inject"],
+          "target_constructor_annotations": ["@Inject"],
+          "target_constructor_annotation_imports": ["javax.inject.Inject"]
+        }
+      }
+    },
+    {
+      "kind": "record",
+      "label": "guice_wiring_applied",
+      "body": "Extracted '${inputs.module_name}' with Guice field-injection wiring: the source delegate field '${inputs.delegate_field}' is annotated @Inject (no constructor wiring) and the generated target constructor is annotated @Inject. The DI container populates the delegate after construction. Verify the module bindings make '${inputs.module_name}' injectable."
+    }
+  ],
+  "validations": []
+}

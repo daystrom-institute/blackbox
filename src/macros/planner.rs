@@ -563,10 +563,23 @@ impl MacroPlanner {
                     refactor_kind,
                     params,
                 } => {
+                    // Interpolate `${inputs.*}` / probe references in the delegate
+                    // params before planning, so a macro can forward its own
+                    // inputs to the delegated refactor kind (e.g. builtin.java.guice
+                    // forwarding `source`/`target`/`module_name` to
+                    // extract_java_class). Mirrors the Emit/Rewrite interpolation.
+                    let params = interpolate_value_strings(params, &expr_ctx).map_err(|e| {
+                        anyhow!(
+                            "error.macro_invalid: DelegateRefactor params in macro '{}' \
+                             interpolation failed: {}",
+                            def.id,
+                            e
+                        )
+                    })?;
                     // plan_delegate enforces RX-V1 authority boundary (see fn doc).
                     let (rp, consumed_flags) = plan_delegate(
                         refactor_kind,
-                        params,
+                        &params,
                         &invocation.operator_opt_outs,
                         &invocation.project_dir,
                         ctx,
