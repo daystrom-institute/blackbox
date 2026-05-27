@@ -2315,42 +2315,36 @@ fn g13_extract_java_class_none_mode_strips_annotations() {
     );
 }
 
-// G7: source class with @Inject fields refuses by default — silent
-// null-capture is the dominant manual-fixup cost on Guice-managed
-// extracts. Operator must explicitly choose wiring_mode.
-#[test]
-fn g7_extract_java_class_refuses_when_inject_detected_without_wiring_mode() {
-    let dir = tempfile::tempdir().unwrap();
-    let pkg = dir.path().join("src/main/java/a");
-    fs::create_dir_all(&pkg).unwrap();
-    let source = pkg.join("Admin.java");
-    let target = pkg.join("Service.java");
-    fs::write(
-        &source,
-        "package a;\n\
-             import javax.inject.Inject;\n\
-             public class Admin {\n\
-            \x20   @Inject private Object dep;\n\
-            \x20   public Long save() { return 1L; }\n\
-             }\n",
-    )
-    .unwrap();
+// The "@Inject field detected → refuse" auto-detection was removed from the
+// engine when the Guice wiring policy was dissolved into the macro layer
+// (`builtin.java.guice`). The generic extract no longer inspects the source
+// for DI markers; the refusal now lives in the macro as a syntactic
+// field-annotation probe and is covered by the macro's own tests, not here.
 
-    let mut params = java_plan_params("extract_java_class", &source);
-    params.target = Some(path_string(&target));
-    params.module_name = Some("Service".to_string());
-    params.delegate_field = Some("service".to_string());
-    params.item_names = Some(vec!["save".to_string()]);
-    params.project_dir = Some(path_string(dir.path()));
-
-    let err = plan_extract_java_class(&params).unwrap_err().to_string();
-    assert!(
-        err.contains("guice_field_injection_detected"),
-        "expected guice_field_injection_detected error, got: {err}"
-    );
+/// The wiring spec the `builtin.java.guice` macro supplies for an
+/// external-injection (DI field-injected) extract. Defined here so these
+/// engine-level tests prove byte-parity with the dissolved Guice wiring
+/// policy using exactly the data the macro passes.
+fn guice_external_injection_spec() -> crate::refactor::WiringSpec {
+    crate::refactor::WiringSpec {
+        strategy: Some("external_injection".to_string()),
+        delegate_field_annotations: Some(vec!["@Inject".to_string()]),
+        delegate_field_modifiers: Some(vec!["private".to_string()]),
+        delegate_field_annotation_imports: Some(vec!["javax.inject.Inject".to_string()]),
+        target_constructor_annotations: Some(vec!["@Inject".to_string()]),
+        target_constructor_annotation_imports: Some(vec!["javax.inject.Inject".to_string()]),
+    }
 }
 
-// G7: wiring_mode=guice_field_inject emits `@Inject private Target
+/// The wiring spec for a "wire by hand" extract (no source-side wiring).
+fn manual_wiring_spec() -> crate::refactor::WiringSpec {
+    crate::refactor::WiringSpec {
+        strategy: Some("none".to_string()),
+        ..Default::default()
+    }
+}
+
+// external_injection (guice field-inject) emits `@Inject private Target
 // delegate;` on source, skips ctor wiring entirely.
 #[test]
 fn g7_wiring_mode_guice_field_inject_emits_inject_decl_skips_ctor_wiring() {
@@ -2376,7 +2370,7 @@ fn g7_wiring_mode_guice_field_inject_emits_inject_decl_skips_ctor_wiring() {
     params.delegate_field = Some("service".to_string());
     params.item_names = Some(vec!["save".to_string()]);
     params.project_dir = Some(path_string(dir.path()));
-    params.wiring_mode = Some("guice_field_inject".to_string());
+    params.wiring_mode = Some(guice_external_injection_spec());
 
     let plan: RefactorPlan =
         serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
@@ -2415,7 +2409,7 @@ fn g7_wiring_mode_manual_skips_all_source_wiring() {
     params.delegate_field = Some("service".to_string());
     params.item_names = Some(vec!["save".to_string()]);
     params.project_dir = Some(path_string(dir.path()));
-    params.wiring_mode = Some("manual".to_string());
+    params.wiring_mode = Some(manual_wiring_spec());
 
     let plan: RefactorPlan =
         serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
@@ -2728,7 +2722,7 @@ fn g7_guice_field_inject_suppresses_mutable_capture_fixmes() {
     params.delegate_field = Some("service".to_string());
     params.item_names = Some(vec!["useDep".to_string()]);
     params.project_dir = Some(path_string(dir.path()));
-    params.wiring_mode = Some("guice_field_inject".to_string());
+    params.wiring_mode = Some(guice_external_injection_spec());
     params.deep_analysis = Some(true);
 
     let plan: RefactorPlan =
@@ -6290,7 +6284,7 @@ fn g7_fu_inject_import_dedup_by_simple_name() {
     params.delegate_field = Some("service".to_string());
     params.item_names = Some(vec!["save".to_string()]);
     params.project_dir = Some(path_string(dir.path()));
-    params.wiring_mode = Some("guice_field_inject".to_string());
+    params.wiring_mode = Some(guice_external_injection_spec());
 
     let plan: RefactorPlan =
         serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
@@ -6336,7 +6330,7 @@ fn g7_fu_target_class_has_inject_ctor_and_import() {
     params.delegate_field = Some("service".to_string());
     params.item_names = Some(vec!["save".to_string()]);
     params.project_dir = Some(path_string(dir.path()));
-    params.wiring_mode = Some("guice_field_inject".to_string());
+    params.wiring_mode = Some(guice_external_injection_spec());
 
     let plan: RefactorPlan =
         serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();
@@ -6384,7 +6378,7 @@ fn g7_fu_v2_wildcard_import_blocks_javax_inject_addition() {
     params.delegate_field = Some("service".to_string());
     params.item_names = Some(vec!["save".to_string()]);
     params.project_dir = Some(path_string(dir.path()));
-    params.wiring_mode = Some("guice_field_inject".to_string());
+    params.wiring_mode = Some(guice_external_injection_spec());
 
     let plan: RefactorPlan =
         serde_json::from_str(&plan_extract_java_class(&params).unwrap()).unwrap();

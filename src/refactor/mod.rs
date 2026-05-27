@@ -515,25 +515,71 @@ pub struct RefactorPlanParams {
     /// handled by G19's class-qualified call auto-rewrite.
     #[serde(default)]
     pub source_delegate_wrappers: Option<bool>,
-    /// `extract_java_class`: how the source class wires the new
-    /// delegate field (G7). Values:
-    /// - `constructor_args` (default for plain-Java classes):
-    ///   `private final <Target> <delegate>;` + `this.<delegate> =
-    ///   new <Target>(...)` in the source's first constructor. Breaks
-    ///   silently on DI-managed classes because the source's `@Inject`
-    ///   fields are still `null` at constructor time.
-    /// - `guice_field_inject`: emit `@Inject private <Target>
-    ///   <delegate>;` on the source, skip ctor wiring entirely. The DI
-    ///   container populates the delegate after construction.
-    /// - `manual`: no source-side wiring (no delegate field decl, no
-    ///   ctor assignment). Operator wires the delegate by hand.
+    /// `extract_java_class`: how the source class obtains the new delegate
+    /// field, and (for external injection) the framework-neutral annotation
+    /// data to apply. The engine carries no DI-library knowledge — every
+    /// injection annotation and import is supplied as data here. See
+    /// [`WiringSpec`] for the strategy values and per-field semantics. When
+    /// unset, defaults to `own_construction` (the source builds the delegate
+    /// itself).
     ///
-    /// Auto-detect: when this parameter is unset and the source class
-    /// has any `@Inject`-annotated field, the planner refuses with
-    /// `error.bad_input(code=guice_field_injection_detected)` to
-    /// prevent the silent null-capture failure mode.
+    /// The engine does NOT inspect the source for injection markers or
+    /// second-guess the strategy; framework-specific safety (e.g. refusing
+    /// `own_construction` on a DI-managed class) lives in the macro layer
+    /// (`builtin.java.guice`), not here.
     #[serde(default)]
-    pub wiring_mode: Option<String>,
+    pub wiring_mode: Option<WiringSpec>,
+}
+
+/// `extract_java_class` delegate-wiring configuration. Framework-neutral: it
+/// describes *how* the source obtains the extracted delegate and what
+/// annotation/import data to apply, with no DI-library names baked into the
+/// engine. Library policy (which annotations, which imports, when to refuse)
+/// lives in the macro layer.
+#[derive(Debug, Default, Clone, Deserialize, schemars::JsonSchema)]
+pub struct WiringSpec {
+    /// Wiring strategy:
+    /// - `own_construction` (default): `private final <Target> <delegate>;`
+    ///   plus `this.<delegate> = new <Target>(...)` in the source's first
+    ///   constructor. The source builds the delegate itself.
+    /// - `external_injection`: emit the delegate field with the
+    ///   caller-supplied annotations/modifiers (no synthesized `final`, no
+    ///   ctor wiring); an external owner (a DI container, etc.) populates it
+    ///   after construction. Constructor-capture FIXMEs are suppressed because
+    ///   captures are container-resolved, not source-time snapshots.
+    /// - `none`: no source-side wiring (no delegate field decl, no ctor
+    ///   assignment). Operator wires the delegate by hand.
+    #[serde(default)]
+    pub strategy: Option<String>,
+    /// (`external_injection`) annotation source fragments placed on the source
+    /// delegate field, e.g. `["@Inject"]`. Raw Java annotation text.
+    #[serde(default)]
+    pub delegate_field_annotations: Option<Vec<String>>,
+    /// (`external_injection`) modifier fragments for the source delegate
+    /// field, e.g. `["private"]`. When unset the field carries no modifiers
+    /// beyond the annotations. (`own_construction` always uses `private final`
+    /// and ignores this.)
+    #[serde(default)]
+    pub delegate_field_modifiers: Option<Vec<String>>,
+    /// (`external_injection`) fully-qualified imports to add to the SOURCE
+    /// file so the delegate-field annotations resolve, e.g.
+    /// `["javax.inject.Inject"]`. Added conservatively: any non-static
+    /// wildcard import in the source suppresses the add (a wildcard could
+    /// already supply the simple name; we cannot probe the classpath).
+    #[serde(default)]
+    pub delegate_field_annotation_imports: Option<Vec<String>>,
+    /// (`external_injection`) annotation source fragments placed on the
+    /// generated target constructor, e.g. `["@Inject"]`. Applied only when a
+    /// parameterized target constructor is generated. May be empty for
+    /// frameworks that auto-wire a sole constructor.
+    #[serde(default)]
+    pub target_constructor_annotations: Option<Vec<String>>,
+    /// (`external_injection`) fully-qualified imports to add to the TARGET
+    /// file so the target-constructor annotations resolve, e.g.
+    /// `["javax.inject.Inject"]`. Added with the standard (non-conservative)
+    /// import helper, matching the legacy target-side behavior.
+    #[serde(default)]
+    pub target_constructor_annotation_imports: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

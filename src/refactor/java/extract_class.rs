@@ -34,40 +34,33 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         .collect::<HashSet<_>>();
     let captured_variables = captured_fields_for_methods(&parsed, &selected_methods);
 
-    // G7: wiring_mode resolution. The default `constructor_args` flow
-    // (current behavior) inserts `this.delegate = new Target(...)` into
-    // the source's first constructor. On DI-managed source classes
-    // (Guice/Spring @Inject fields), this captures `null` because
-    // injection happens AFTER the constructor. Auto-detect @Inject on
-    // any source field and refuse early when the operator hasn't
-    // explicitly chosen a wiring_mode — silent null-capture is the
-    // dominant manual fixup cost on planglobal swings.
-    let source_has_inject_fields = java_class_has_inject_field(class_node, &parsed.source);
-    let wiring_mode = match p.wiring_mode.as_deref() {
+    // Wiring strategy resolution. Framework-neutral: the engine emits the
+    // delegate-field / target-constructor shape the caller selected and adds
+    // the caller-supplied injection annotations as data. It does NOT inspect
+    // the source for DI markers or second-guess the choice — that policy
+    // (e.g. refusing `own_construction` on a DI-managed class) lives in the
+    // macro layer (`builtin.java.guice`), not in the engine.
+    let wiring = p.wiring_mode.clone().unwrap_or_default();
+    let wiring_strategy = match wiring.strategy.as_deref() {
         Some(m) => {
-            if !matches!(m, "constructor_args" | "guice_field_inject" | "manual") {
+            if !matches!(m, "own_construction" | "external_injection" | "none") {
                 bail!(
-                    "error.bad_input(code=invalid_wiring_mode): wiring_mode must be one of \
-                     `constructor_args`, `guice_field_inject`, `manual` (got `{m}`)"
+                    "error.bad_input(code=invalid_wiring_strategy): wiring_mode.strategy must be \
+                     one of `own_construction`, `external_injection`, `none` (got `{m}`)"
                 );
             }
             m.to_string()
         }
-        None => {
-            if source_has_inject_fields {
-                bail!(
-                    "error.bad_input(code=guice_field_injection_detected): the source class has \
-                     @Inject-annotated fields; the default `constructor_args` wiring would \
-                     capture null references because the DI container injects after the \
-                     constructor runs. Pass `wiring_mode` explicitly: \
-                     `guice_field_inject` to emit `@Inject private <Target> <delegate>;` and \
-                     skip ctor wiring; `manual` to skip source-side wiring entirely; or \
-                     `constructor_args` to acknowledge the captured-null risk explicitly."
-                );
-            }
-            "constructor_args".to_string()
-        }
+        None => "own_construction".to_string(),
     };
+    let external_injection = wiring_strategy == "external_injection";
+    let delegate_field_annotations = wiring.delegate_field_annotations.unwrap_or_default();
+    let delegate_field_modifiers = wiring.delegate_field_modifiers.unwrap_or_default();
+    let delegate_field_annotation_imports =
+        wiring.delegate_field_annotation_imports.unwrap_or_default();
+    let target_constructor_annotations = wiring.target_constructor_annotations.unwrap_or_default();
+    let target_constructor_annotation_imports =
+        wiring.target_constructor_annotation_imports.unwrap_or_default();
 
     // Mutable-capture-with-write refusal. A capture that is (a) non-final on
     // the source, (b) not listed in `move_fields`, and (c) WRITTEN inside any
@@ -255,23 +248,26 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
             true,
             None,
         )?;
-        // G7-FU: under guice_field_inject the source field-injects the
-        // delegate. Guice needs an `@Inject` constructor on the target
-        // to populate its captured ctor params. The annotation goes on
-        // the line immediately preceding `public <TargetClass>(...)`.
-        // We also need to inject the `javax.inject.Inject` import on
-        // the target; that's handled below when the source-side decl
-        // path emits it.
-        if p.wiring_mode.as_deref() == Some("guice_field_inject") {
+        // External-injection wiring may decorate the generated target
+        // constructor with caller-supplied annotations (e.g. `@Inject`) so an
+        // external owner constructs it. The annotation lines go immediately
+        // preceding `public <TargetClass>(...)`; matching imports are added to
+        // the target file below. Framework-neutral — the annotation text is
+        // macro data, not a hard-coded DI-library name.
+        if external_injection && !target_constructor_annotations.is_empty() {
             let needle = format!("public {target_class_name}(");
             if let Some(pos) = raw.find(&needle) {
                 let line_start = raw[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let mut out = String::with_capacity(raw.len() + 16);
-                out.push_str(&raw[..line_start]);
                 // Match the constructor's leading indent.
                 let indent: String = raw[line_start..pos].chars().collect();
-                out.push_str(&indent);
-                out.push_str("@Inject\n");
+                let mut out =
+                    String::with_capacity(raw.len() + 16 * target_constructor_annotations.len());
+                out.push_str(&raw[..line_start]);
+                for ann in &target_constructor_annotations {
+                    out.push_str(&indent);
+                    out.push_str(ann);
+                    out.push('\n');
+                }
                 out.push_str(&raw[line_start..]);
                 out
             } else {
@@ -388,11 +384,17 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         }
     }
 
-    // G7-FU: guice_field_inject mode added `@Inject` to the target's
-    // constructor — the target needs the `javax.inject.Inject` import
-    // so the annotation resolves.
-    if wiring_mode == "guice_field_inject" && !all_target_ctor_params.is_empty() {
-        target_content = java_inject_import(&target_content, "javax.inject.Inject");
+    // The target-constructor annotations (added above, only when a
+    // parameterized ctor is generated) need their imports on the target file.
+    // Plain (non-conservative) add — matches the legacy target-side behavior,
+    // which did not apply the source-side wildcard-skip on the target.
+    if external_injection
+        && !target_constructor_annotations.is_empty()
+        && !all_target_ctor_params.is_empty()
+    {
+        for fqcn in &target_constructor_annotation_imports {
+            target_content = java_inject_import(&target_content, fqcn);
+        }
     }
 
     // G13: propagate class-level annotations from source to target when
@@ -714,12 +716,14 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         // generated `private final <Type> <name>;` line so it travels with
         // the target file rather than getting buried in JSON.
         //
-        // Under wiring_mode=guice_field_inject the target also @Inject-
-        // constructs, so its captured ctor params are freshly resolved
-        // by the DI container at construction time and don't carry a
-        // stale snapshot of the source field. Suppress the FIXMEs in
-        // that mode — they're misleading noise.
-        let suppress_mutable_capture_fixmes = wiring_mode == "guice_field_inject";
+        // Under external_injection the delegate/target lifecycle is owned by
+        // an external party (a DI container, etc.): the target's captured ctor
+        // params are freshly resolved at construction time, not stale snapshots
+        // of source fields. Suppress the snapshot FIXMEs in that case — they're
+        // misleading noise. (Contract: external_injection means container-owned
+        // construction; own_construction is the only strategy that truly
+        // snapshots source state.)
+        let suppress_mutable_capture_fixmes = external_injection;
         if !suppress_mutable_capture_fixmes {
             for capture in &captured_variables {
                 if !capture.source_mutable {
@@ -1235,19 +1239,28 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
 
     let field_insert_at = java_class_body_insert_position(class_node, &parsed.source);
     let delegate_edit_idx = source_edits.len();
-    // G7: source-side delegate field declaration varies by wiring_mode.
-    // - constructor_args: `private final <Target> <delegate>;` (paired
-    //   with `this.delegate = new Target(...)` ctor wiring below).
-    // - guice_field_inject: `@Inject private <Target> <delegate>;`
-    //   (no `final`, no ctor wiring — DI container populates after
-    //   construction).
-    // - manual: skip the delegate field decl entirely. Operator wires
-    //   in their own code.
-    let delegate_decl = match wiring_mode.as_str() {
-        "guice_field_inject" => {
-            format!("\n    @Inject private {target_class_name} {delegate_field};")
+    // Source-side delegate field declaration varies by wiring strategy:
+    // - own_construction: `private final <Target> <delegate>;` (paired with
+    //   the `this.delegate = new Target(...)` ctor wiring below).
+    // - external_injection: caller-supplied annotations + modifiers, then
+    //   `<Target> <delegate>;` (no synthesized `final`, no ctor wiring — an
+    //   external owner populates it after construction).
+    // - none: skip the delegate field decl entirely. Operator wires by hand.
+    let delegate_decl = match wiring_strategy.as_str() {
+        "external_injection" => {
+            let mut decl = String::from("\n    ");
+            for ann in &delegate_field_annotations {
+                decl.push_str(ann);
+                decl.push(' ');
+            }
+            for modifier in &delegate_field_modifiers {
+                decl.push_str(modifier);
+                decl.push(' ');
+            }
+            decl.push_str(&format!("{target_class_name} {delegate_field};"));
+            decl
         }
-        "manual" => String::new(),
+        "none" => String::new(),
         _ => format!("\n    private final {target_class_name} {delegate_field};"),
     };
     source_edits.push(TextEdit {
@@ -1255,25 +1268,12 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
         byte_end: field_insert_at,
         replacement: delegate_decl,
     });
-    // G7: guice_field_inject mode needs the @Inject import on the source.
-    if wiring_mode == "guice_field_inject" {
-        // G7-FU-v2: any non-static wildcard import in the source blocks the
-        // explicit `javax.inject.Inject` add. The wildcard could plausibly
-        // already supply an `Inject` binding (Guice's `com.google.inject.*`
-        // is the canonical case); adding an explicit single-type import
-        // would silently flip which `Inject` resolves bare. We can't probe
-        // the classpath, so any wildcard => conservative skip.
-        let source_has_wildcard_import = parsed.source.lines().any(|line| {
-            let t = line.trim();
-            t.starts_with("import ")
-                && !t.starts_with("import static ")
-                && t.trim_end_matches(';').trim_end().ends_with(".*")
-        });
-        if !source_has_wildcard_import {
-            // Prefer javax.inject.Inject as the more portable choice; if the
-            // source already imports com.google.inject.Inject, the existing
-            // import is unchanged and the new edit is idempotent.
-            if let Some(edit) = java_source_import_edit(&parsed.source, "javax.inject.Inject") {
+    // External-injection delegate-field annotations need their imports on the
+    // source file. Added conservatively (see `java_conservative_import_edit`):
+    // any non-static wildcard import suppresses the explicit single-type add.
+    if external_injection {
+        for fqcn in &delegate_field_annotation_imports {
+            if let Some(edit) = java_conservative_import_edit(&parsed.source, fqcn) {
                 source_edits.push(edit);
             }
         }
@@ -1314,10 +1314,10 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     // that introduce `<delegate_field>.<getter>()` reads earlier in the
     // same ctor body — the wiring must come before any such read).
     let mut wiring_state: Option<WiringInsertState> = None;
-    // G7: guice_field_inject and manual modes skip ctor wiring entirely.
-    // The delegate is populated by the DI container (or by the operator)
-    // — no `this.delegate = new Target(...)` assignment.
-    let skip_ctor_wiring = wiring_mode == "guice_field_inject" || wiring_mode == "manual";
+    // external_injection and none skip ctor wiring entirely — the delegate is
+    // populated by an external owner (or the operator), not by a source-side
+    // `this.delegate = new Target(...)` assignment.
+    let skip_ctor_wiring = external_injection || wiring_strategy == "none";
     if skip_ctor_wiring {
         // No ctor wiring to insert. wiring_state stays None so the
         // post-process accessor topo-sort treats this case as "no
@@ -1825,37 +1825,23 @@ fn target_content_references_identifier(text: &str, ident: &str) -> bool {
     false
 }
 
-/// G7: return true when any field on the class declaration carries an
-/// `@Inject` annotation (com.google.inject.Inject or javax.inject.Inject).
-/// Matched by simple name only — the actual import is irrelevant for the
-/// auto-detect, both packages route through the same DI container
-/// semantics.
-fn java_class_has_inject_field(class_node: Node<'_>, source: &str) -> bool {
-    let Some(body) = class_node.child_by_field_name("body") else {
-        return false;
-    };
-    let mut bc = body.walk();
-    for child in body.named_children(&mut bc) {
-        if child.kind() != "field_declaration" {
-            continue;
-        }
-        let mut cc = child.walk();
-        for sub in child.children(&mut cc) {
-            if sub.kind() != "modifiers" {
-                continue;
-            }
-            let mut mc = sub.walk();
-            for modifier in sub.children(&mut mc) {
-                if !matches!(modifier.kind(), "marker_annotation" | "annotation") {
-                    continue;
-                }
-                if let Ok(text) = modifier.utf8_text(source.as_bytes()) {
-                    if text.trim_start_matches('@').starts_with("Inject") {
-                        return true;
-                    }
-                }
-            }
-        }
+/// Add `fqcn` as a single-type import on `source`, conservatively: if the
+/// source has ANY non-static wildcard import, skip the add and return `None`.
+///
+/// Framework-neutral import hygiene. A wildcard import could already supply the
+/// fqcn's simple name; adding an explicit single-type import would silently
+/// change which symbol resolves bare. We cannot probe the classpath, so we
+/// decline rather than risk it. Used for injected annotation imports whose
+/// simple name (e.g. `Inject`) is commonly wildcard-exported by DI libraries.
+fn java_conservative_import_edit(source: &str, fqcn: &str) -> Option<TextEdit> {
+    let has_wildcard = source.lines().any(|line| {
+        let t = line.trim();
+        t.starts_with("import ")
+            && !t.starts_with("import static ")
+            && t.trim_end_matches(';').trim_end().ends_with(".*")
+    });
+    if has_wildcard {
+        return None;
     }
-    false
+    java_source_import_edit(source, fqcn)
 }
