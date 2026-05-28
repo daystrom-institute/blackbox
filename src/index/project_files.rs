@@ -238,6 +238,43 @@ pub(crate) fn resolve_current_chunk_entity(
     }))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ProjectFileAction {
+    /// mtime+size+materialization version all match — leave as-is.
+    Skip,
+    /// mtime+size match but the stored version is unknown (pre-field entry):
+    /// stamp the current version without re-chunking.
+    AdoptVersion,
+    /// New file, changed content, or a known-different materialization version
+    /// (a real indexer/chunker/parser bump) — must re-chunk.
+    Reindex,
+}
+
+/// Decide what to do with a scanned project file given its previously indexed
+/// metadata. The version dimension forces a re-chunk after an
+/// indexer/chunker/parser bump even when the file is byte-for-byte unchanged,
+/// while an unknown stored version is adopted rather than re-chunked so that
+/// introducing the field never triggers a full re-chunk of an already-current
+/// corpus.
+fn classify_project_file(
+    prev: Option<&FileMeta>,
+    mtime: u64,
+    size: u64,
+    mat_version: &str,
+) -> ProjectFileAction {
+    let Some(prev) = prev else {
+        return ProjectFileAction::Reindex;
+    };
+    if prev.mtime != mtime || prev.size != size {
+        return ProjectFileAction::Reindex;
+    }
+    match prev.mat_version.as_deref() {
+        Some(v) if v == mat_version => ProjectFileAction::Skip,
+        None => ProjectFileAction::AdoptVersion,
+        Some(_) => ProjectFileAction::Reindex,
+    }
+}
+
 fn index_project(
     project: &ProjectRecord,
     root: &Path,
@@ -250,14 +287,45 @@ fn index_project(
     let mut project_edges = Vec::new();
     scan_project_files(root, &mut files)?;
     let snapshot_id = ref_snapshot_id(project, root, &files, commit_sha.as_deref());
+    let mat_version = crate::snapshot::current_materialization_version();
+    // On-disk text-file set for this project, captured before `files` is moved.
+    // Used to detect tracked-file deletions (in meta, absent on disk) so their
+    // derived edges are purged rather than lingering in the materialized graph.
+    let current_paths: std::collections::HashSet<String> =
+        files.iter().map(|(p, _, _)| p.clone()).collect();
     for (path_str, mtime, size) in files {
-        if let Some(prev) = ctx.meta.get(path_str.as_str()) {
-            if prev.mtime == mtime && prev.size == size {
+        match classify_project_file(ctx.meta.get(path_str.as_str()), mtime, size, &mat_version) {
+            ProjectFileAction::Skip => {
                 ctx.stats.skipped += 1;
                 continue;
             }
-            ctx.writer
-                .delete_term(Term::from_field_text(ctx.f.file_path, &path_str));
+            ProjectFileAction::AdoptVersion => {
+                // Identical content (mtime+size) but the stored materialization
+                // version is unknown (entry predates this field). Stamp the
+                // current version WITHOUT re-chunking: the deployed
+                // indexer/chunker/parser is what produced these edges, so a
+                // re-chunk would only reproduce byte-identical edges. Persisting
+                // the stamp means a genuine *future* version bump records a
+                // different version and falls through to Reindex. (To force a
+                // true full re-chunk after a suspected past untracked bump, bump
+                // INDEX_SCHEMA_VERSION or clear _meta.json.)
+                ctx.meta.insert(
+                    path_str,
+                    FileMeta {
+                        mtime,
+                        size,
+                        mat_version: Some(mat_version.clone()),
+                    },
+                );
+                ctx.stats.skipped += 1;
+                continue;
+            }
+            ProjectFileAction::Reindex => {
+                if ctx.meta.contains_key(path_str.as_str()) {
+                    ctx.writer
+                        .delete_term(Term::from_field_text(ctx.f.file_path, &path_str));
+                }
+            }
         }
 
         let path = PathBuf::from(&path_str);
@@ -298,6 +366,10 @@ fn index_project(
         });
     }
 
+    // Captured before `pending` is consumed below. Combined with the git
+    // commit count after history indexing, this is the per-project signal that
+    // lets `snapshot_after_reindex` skip re-materializing byte-identical edges.
+    let files_changed = !pending.is_empty();
     let symbol_table = build_symbol_table(&pending, snapshot_id.as_deref());
     let mut current_chunk_targets = HashMap::new();
     for file in pending {
@@ -335,6 +407,7 @@ fn index_project(
             FileMeta {
                 mtime: file.mtime,
                 size: file.size,
+                mat_version: Some(mat_version.clone()),
             },
         );
         ctx.stats.indexed_files += 1;
@@ -387,7 +460,37 @@ fn index_project(
             }
         }
     }
-    snapshot_after_reindex(project, root, ctx.edges_dir)?;
+    // Purge derived edges for tracked files that were deleted (or are no longer
+    // indexable) this pass: present in meta under `root` but absent from the
+    // current on-disk scan. The Tantivy docs are purged separately by the
+    // reindex deletion sweep; without this, the file's file-anchored edges
+    // (NEXT_SECTION / DEFINED_IN / CONTAINS_SYMBOL) survive in the materialized
+    // graph. Matched by rel_path_hash, mirroring the incremental-replace
+    // granularity; symbol→symbol edges (CALLS/USES_TYPE) carry no file ref and
+    // age out with the snapshot id rather than being purged here.
+    let deleted_rel_hashes: std::collections::HashSet<String> = ctx
+        .meta
+        .keys()
+        .filter(|key| !current_paths.contains(key.as_str()))
+        .filter_map(|key| {
+            let rel = Path::new(key).strip_prefix(root).ok()?;
+            Some(short_hash(rel.to_string_lossy().as_bytes()))
+        })
+        .collect();
+    let deletions_purged = if deleted_rel_hashes.is_empty() {
+        0
+    } else {
+        crate::edge_index::purge_managed_edges_for_path_hashes(
+            ctx.edges_dir,
+            "project",
+            &project.project_id,
+            &deleted_rel_hashes,
+        )?
+    };
+
+    let materialization_changed =
+        files_changed || git_stats.indexed_commits > 0 || deletions_purged > 0;
+    snapshot_after_reindex(project, root, ctx.edges_dir, materialization_changed)?;
     Ok(())
 }
 
@@ -799,7 +902,72 @@ fn short_hash(bytes: &[u8]) -> String {
     hex::encode(&digest[..4])
 }
 
-fn snapshot_after_reindex(project: &ProjectRecord, root: &Path, edges_dir: &Path) -> Result<()> {
+/// Returns true iff the on-disk materialization for `project_id` already
+/// reflects the current HEAD, indexer/chunker version, and worktree dirty state
+/// — i.e. re-running `switch_to_*` would reproduce byte-identical edges and only
+/// churn mtimes. Any inconsistency (cold start, version bump, branch switch,
+/// dirty↔clean drift, GC'd active path) returns false so we materialize as today.
+///
+/// Gates on the `ManifestIndex` (the loader authority via
+/// `active_materialized_paths`), not `WorkspaceManifest`, whose `dirty`/
+/// `dirty_fingerprint` fields have no runtime reader and may drift on
+/// metadata-only changes (`git add`, same-HEAD branch relabel).
+fn materialization_is_current(
+    edges_dir: &Path,
+    project_id: &str,
+    repo_id: &str,
+    head_sha: &str,
+    worktree_dirty: bool,
+) -> bool {
+    let Ok(idx) = crate::manifest::ManifestIndex::load(edges_dir) else {
+        // No manifest-index yet (cold start / never materialized) ⇒ materialize.
+        return false;
+    };
+    let Some(entry) = idx.workspaces.get(project_id) else {
+        return false;
+    };
+
+    // Version-aware expected snapshot for the current HEAD. `clean_snapshot_id`
+    // folds INDEXER_VERSION/CHUNKER_VERSION, so a version bump with unchanged
+    // mtimes yields a different id ⇒ mismatch ⇒ not skipped.
+    let expected_snap = crate::snapshot::clean_snapshot_id(repo_id, project_id, head_sha);
+    let expected_snap_rel = crate::snapshot::active_snapshot_rel(project_id, &expected_snap);
+    if entry.active_snapshot.as_deref() != Some(expected_snap_rel.as_str()) {
+        return false;
+    }
+
+    // Dirty-state consistency across three sources: current worktree, the
+    // ManifestIndex overlay pointer, and the overlay dir on disk. Any
+    // disagreement forces re-materialization (e.g. a clean checkout that left a
+    // stale overlay, which `switch_to_clean_snapshot` must clear).
+    let overlay_rel = crate::snapshot::dirty_overlay_rel(project_id);
+    let overlay_in_manifest = entry.dirty_overlay.as_deref() == Some(overlay_rel.as_str());
+    let overlay_on_disk = crate::snapshot::dirty_overlay_dir(edges_dir, project_id).is_dir();
+    if worktree_dirty {
+        if !overlay_in_manifest || !overlay_on_disk {
+            return false;
+        }
+    } else {
+        if entry.dirty_overlay.is_some() || overlay_on_disk {
+            return false;
+        }
+        // Clean ⇒ the active snapshot dir is what the loader reads; it must
+        // exist. `active_materialized_paths` silently drops missing dirs, so a
+        // GC between passes would lose this project from the graph if we skipped.
+        if !crate::snapshot::snapshot_dir(edges_dir, project_id, &expected_snap).is_dir() {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn snapshot_after_reindex(
+    project: &ProjectRecord,
+    root: &Path,
+    edges_dir: &Path,
+    materialization_changed: bool,
+) -> Result<()> {
     let Some(repo_id) = project.repo_id.as_deref() else {
         return Ok(());
     };
@@ -807,6 +975,28 @@ fn snapshot_after_reindex(project: &ProjectRecord, root: &Path, edges_dir: &Path
         return Ok(());
     };
     let branch = crate::git::current_branch(root);
+    let worktree_dirty = crate::git::is_worktree_dirty(root);
+
+    // Writer-side materialization idempotency. Re-running `switch_to_*` rewrites
+    // the dirty overlay via temp-dir + atomic rename, which stamps fresh mtimes
+    // on `dirty-current/*.jsonl`. The edge-index rebuild watcher sums sidecar
+    // mtimes, so a byte-identical re-materialization still trips a full 18-21s
+    // EdgeIndex rebuild. When this pass changed nothing for the project and the
+    // on-disk materialization already matches the current head/version/worktree
+    // state, skip it. Correctness rests on: derived overlay/snapshot edge content
+    // is a deterministic function of (head_sha, changed-file set + contents). No
+    // re-chunked file (empty `pending`) and no indexed commit ⇒ identical edges.
+    if !materialization_changed
+        && materialization_is_current(
+            edges_dir,
+            &project.project_id,
+            repo_id,
+            &head_sha,
+            worktree_dirty,
+        )
+    {
+        return Ok(());
+    }
 
     let project_edges =
         crate::edge_index::read_managed_derived_edges(edges_dir, "project", &project.project_id)?;
@@ -836,7 +1026,7 @@ fn snapshot_after_reindex(project: &ProjectRecord, root: &Path, edges_dir: &Path
         })
         .collect();
 
-    if crate::git::is_worktree_dirty(root) {
+    if worktree_dirty {
         let fp = crate::git::dirty_fingerprint(root).unwrap_or_default();
         crate::snapshot::switch_to_dirty_overlay(
             edges_dir,
@@ -1150,5 +1340,215 @@ mod tests {
                 _ => None,
             })
             .unwrap_or_default()
+    }
+
+    // --- materialization idempotency guard (issue #2 follow-up) ---
+    //
+    // These exercise `materialization_is_current`, the decision behind skipping a
+    // no-op `snapshot_after_reindex`. Skipping when it returns true is what keeps
+    // a byte-identical re-materialization from re-stamping overlay mtimes and
+    // tripping the edge-index rebuild watcher; the "force" cases guard against
+    // skipping when the on-disk graph would actually go stale.
+
+    const MAT_REPO: &str = "repo-mat";
+    const MAT_PROJ: &str = "proj-mat";
+    const MAT_HEAD: &str = "abc123def456";
+
+    fn mat_edge(id: &str, target: &str) -> crate::edge_index::Edge {
+        crate::edge_index::Edge {
+            source: EntityRef::Knowledge { id: id.into() },
+            kind: "DESCRIBES".into(),
+            target: EntityRef::Knowledge { id: target.into() },
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+            metadata: Default::default(),
+        }
+    }
+
+    fn seed_clean(edges_dir: &Path) {
+        crate::snapshot::switch_to_clean_snapshot(
+            edges_dir,
+            MAT_PROJ,
+            MAT_REPO,
+            Some("main"),
+            MAT_HEAD,
+            vec![mat_edge("k1", "k2")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    }
+
+    fn seed_dirty(edges_dir: &Path) {
+        crate::snapshot::switch_to_dirty_overlay(
+            edges_dir,
+            MAT_PROJ,
+            MAT_REPO,
+            Some("main"),
+            MAT_HEAD,
+            "fp-dirty",
+            vec![mat_edge("k_dirty", "k2")],
+            vec![],
+            vec![],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn classify_project_file_covers_skip_adopt_reindex() {
+        let v = crate::snapshot::current_materialization_version();
+        let current = FileMeta {
+            mtime: 100,
+            size: 200,
+            mat_version: Some(v.clone()),
+        };
+        // Fully current → skip.
+        assert_eq!(
+            classify_project_file(Some(&current), 100, 200, &v),
+            ProjectFileAction::Skip
+        );
+        // mtime or size drift → reindex.
+        assert_eq!(
+            classify_project_file(Some(&current), 101, 200, &v),
+            ProjectFileAction::Reindex
+        );
+        assert_eq!(
+            classify_project_file(Some(&current), 100, 201, &v),
+            ProjectFileAction::Reindex
+        );
+        // Known-different version with identical content → reindex (real bump).
+        let stale = FileMeta {
+            mtime: 100,
+            size: 200,
+            mat_version: Some("older-version".into()),
+        };
+        assert_eq!(
+            classify_project_file(Some(&stale), 100, 200, &v),
+            ProjectFileAction::Reindex
+        );
+        // Unknown stored version with identical content → adopt, NOT reindex.
+        // This is what keeps introducing the field from forcing a full re-chunk.
+        let legacy = FileMeta {
+            mtime: 100,
+            size: 200,
+            mat_version: None,
+        };
+        assert_eq!(
+            classify_project_file(Some(&legacy), 100, 200, &v),
+            ProjectFileAction::AdoptVersion
+        );
+        // Unknown version but content drift → reindex (content wins).
+        assert_eq!(
+            classify_project_file(Some(&legacy), 101, 200, &v),
+            ProjectFileAction::Reindex
+        );
+        // Never-seen file → reindex.
+        assert_eq!(
+            classify_project_file(None, 100, 200, &v),
+            ProjectFileAction::Reindex
+        );
+    }
+
+    #[test]
+    fn materialization_cold_start_forces_rematerialize() {
+        let dir = tempfile::tempdir().unwrap();
+        // No manifest-index on disk yet (never materialized).
+        assert!(!materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            MAT_HEAD,
+            false
+        ));
+    }
+
+    #[test]
+    fn materialization_clean_steady_state_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_clean(dir.path());
+        assert!(materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            MAT_HEAD,
+            false
+        ));
+    }
+
+    #[test]
+    fn materialization_dirty_steady_state_skips() {
+        let dir = tempfile::tempdir().unwrap();
+        seed_dirty(dir.path());
+        assert!(materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            MAT_HEAD,
+            true
+        ));
+    }
+
+    #[test]
+    fn materialization_head_or_version_change_forces_rematerialize() {
+        // A different HEAD — and equivalently an INDEXER/CHUNKER_VERSION bump,
+        // since both feed the hashed snapshot_id — must re-materialize even when
+        // file mtimes are unchanged.
+        let dir = tempfile::tempdir().unwrap();
+        seed_clean(dir.path());
+        assert!(!materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            "deadbeefcafe",
+            false
+        ));
+    }
+
+    #[test]
+    fn materialization_clean_with_stale_overlay_forces_rematerialize() {
+        // Worktree is clean now but a dirty overlay is still active; the clean
+        // switch must run to clear it, so skipping would leave the stale overlay.
+        let dir = tempfile::tempdir().unwrap();
+        seed_dirty(dir.path());
+        assert!(crate::snapshot::dirty_overlay_dir(dir.path(), MAT_PROJ).is_dir());
+        assert!(!materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            MAT_HEAD,
+            false
+        ));
+    }
+
+    #[test]
+    fn materialization_dirty_without_overlay_forces_rematerialize() {
+        // Worktree just went dirty but only a clean snapshot is materialized.
+        let dir = tempfile::tempdir().unwrap();
+        seed_clean(dir.path());
+        assert!(!materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            MAT_HEAD,
+            true
+        ));
+    }
+
+    #[test]
+    fn materialization_missing_active_snapshot_dir_forces_rematerialize() {
+        // Manifest still references a snapshot dir that has been GC'd off disk.
+        // active_materialized_paths drops missing dirs silently, so re-materialize.
+        let dir = tempfile::tempdir().unwrap();
+        seed_clean(dir.path());
+        let snap_id = crate::snapshot::clean_snapshot_id(MAT_REPO, MAT_PROJ, MAT_HEAD);
+        let snap = crate::snapshot::snapshot_dir(dir.path(), MAT_PROJ, &snap_id);
+        std::fs::remove_dir_all(&snap).unwrap();
+        assert!(!materialization_is_current(
+            dir.path(),
+            MAT_PROJ,
+            MAT_REPO,
+            MAT_HEAD,
+            false
+        ));
     }
 }

@@ -20,6 +20,14 @@ const SCHEMA_VERSION_FILE: &str = "schema_version.txt";
 pub(super) struct FileMeta {
     pub(super) mtime: u64,
     pub(super) size: u64,
+    /// Materialization version under which this file's derived edges were last
+    /// produced (project files only; `None` for transcripts/store docs and for
+    /// entries written before this field existed). When it differs from
+    /// `snapshot::current_materialization_version()` the project indexer must
+    /// re-chunk even if mtime/size are unchanged, so a chunker/indexer/parser
+    /// version bump never leaves stale edges in a freshly-keyed snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) mat_version: Option<String>,
 }
 
 /// Field handles extracted for sharing with the background reindex thread.

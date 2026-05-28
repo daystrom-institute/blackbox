@@ -18,6 +18,21 @@ const INDEXER_VERSION: &str = "project-index-v1";
 const CHUNKER_VERSION: &str = "chunker-v1";
 const DIRTY_OVERLAY_DIRNAME: &str = "dirty-current";
 
+/// Combined version stamp that gates per-file re-chunk in the project indexer.
+/// `clean_snapshot_id` folds INDEXER_VERSION/CHUNKER_VERSION, so a bump produces
+/// a new snapshot id; if the mtime/size skip let unchanged files ride, the new
+/// snapshot would be materialized from edges derived under the *old* version.
+/// Storing this per file and re-chunking on mismatch closes that gap. The entity
+/// parser version is included because it changes the derived edge entity refs.
+pub fn current_materialization_version() -> String {
+    format!(
+        "{}+{}+{}",
+        INDEXER_VERSION,
+        CHUNKER_VERSION,
+        crate::entity_ref::PARSER_VERSION
+    )
+}
+
 pub fn clean_snapshot_id(repo_id: &str, project_id: &str, head_sha: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(repo_id.as_bytes());
@@ -53,6 +68,19 @@ pub fn dirty_overlay_dir(edges_dir: &Path, project_id: &str) -> PathBuf {
         .join("workspace")
         .join(project_id)
         .join(DIRTY_OVERLAY_DIRNAME)
+}
+
+/// ManifestIndex-relative path (under `materialized/`) for a project's active
+/// clean snapshot. Single source of truth for the rel-path the manifest stores
+/// so callers comparing against the manifest don't re-spell the layout.
+pub fn active_snapshot_rel(project_id: &str, snapshot_id: &str) -> String {
+    format!("workspace/{}/snapshots/{}", project_id, snapshot_id)
+}
+
+/// ManifestIndex-relative path (under `materialized/`) for a project's dirty
+/// overlay. Mirrors the value written by `switch_to_dirty_overlay`.
+pub fn dirty_overlay_rel(project_id: &str) -> String {
+    format!("workspace/{}/{}", project_id, DIRTY_OVERLAY_DIRNAME)
 }
 
 pub fn write_snapshot_files(
@@ -329,10 +357,7 @@ pub fn switch_to_dirty_overlay(
         true,
         Some(dirty_fingerprint),
         &snap_id,
-        Some(&format!(
-            "workspace/{}/{}",
-            project_id, DIRTY_OVERLAY_DIRNAME
-        )),
+        Some(&dirty_overlay_rel(project_id)),
     )?;
 
     Ok(())
@@ -368,7 +393,7 @@ fn update_manifest_for_snapshot(
 
     let mut idx = ManifestIndex::load(edges_dir).unwrap_or_else(|_| ManifestIndex::new());
 
-    let snap_rel = format!("workspace/{}/snapshots/{}", project_id, snapshot_id);
+    let snap_rel = active_snapshot_rel(project_id, snapshot_id);
     idx.upsert_workspace(
         project_id,
         WorkspaceIndexEntry {

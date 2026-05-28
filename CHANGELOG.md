@@ -43,6 +43,26 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Edge-index rebuild watcher no longer spins on a dirty worktree. The per-pass
+  reindex re-materialized each project's dirty overlay unconditionally (atomic
+  rename → fresh mtimes), so the watcher saw byte-identical sidecar "changes"
+  and rebuilt the full EdgeIndex (~20s over a multi-GB corpus) every pass,
+  pegging CPU and inflating RSS. Materialization is now skipped when a pass
+  changed nothing for the project and the on-disk snapshot/overlay already
+  matches the current HEAD, indexer/chunker version, and worktree dirty state.
+  Fixes #2; incorporates the `*.write-tmp` temp-dir skip from #3 (thanks
+  @benstpierre for the report and original fix).
+- Watcher signature now folds in the manifest-index, so a branch switch that
+  flips the active snapshot pointer between already-materialized snapshots
+  (changing no `.jsonl` mtime) is detected instead of silently serving a stale
+  graph.
+- Tracked-file deletions now purge the deleted file's derived edges from the
+  materialized graph (previously only the Tantivy docs were removed).
+- A chunker/indexer/parser version bump now forces affected project files to
+  re-chunk even when their mtime/size are unchanged, so snapshots are never
+  keyed off stale-version edges. Introducing the per-file version stamp adopts
+  unknown (pre-existing) versions without a full re-chunk.
+
 ### Removed
 
 ## 0.0.1 - 2026-05-14

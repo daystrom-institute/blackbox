@@ -1483,6 +1483,17 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
                 continue;
             };
             if meta.is_dir() {
+                // Skip in-progress materialization temp dirs (`*.write-tmp`):
+                // the overlay/snapshot writer builds the new files there before
+                // an atomic rename, so counting them makes the watcher observe
+                // mid-write churn and rebuild against a half-written overlay.
+                // (Original fix by @benstpierre in PR #3, incorporated here.)
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext == "write-tmp")
+                {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
@@ -1499,6 +1510,24 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
                 .unwrap_or_default();
             sig.modified_nanos = sig.modified_nanos.wrapping_add(modified);
         }
+    }
+    // Fold in the manifest-index, which records *which* snapshot/overlay is
+    // active per workspace. A branch switch flips the active pointer between two
+    // already-materialized snapshots without changing any `.jsonl` mtime, so the
+    // recursive scan above is blind to it and the in-memory graph would go
+    // stale. The materialization writer rewrites this file exactly when the
+    // active workspace graph changes (writer-side idempotency guard), making its
+    // mtime/len a precise active-pointer change signal. It is `.json`, so the
+    // scan above skipped it — no double counting.
+    if let Ok(meta) = std::fs::metadata(crate::manifest::manifest_index_path(edges_dir)) {
+        sig.bytes = sig.bytes.saturating_add(meta.len());
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        sig.modified_nanos = sig.modified_nanos.wrapping_add(modified);
     }
     sig
 }
@@ -2401,6 +2430,63 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[test]
+    fn edge_sidecar_signature_ignores_write_tmp_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let mat = edges_dir.join("materialized/workspace/p");
+        std::fs::create_dir_all(&mat).unwrap();
+        std::fs::write(mat.join("dirty-current/project.jsonl"), "x").unwrap_or(());
+        std::fs::create_dir_all(mat.join("dirty-current")).unwrap();
+        std::fs::write(mat.join("dirty-current/project.jsonl"), "committed").unwrap();
+        let base = edge_sidecar_signature(edges_dir);
+
+        // An in-progress temp dir's jsonl must not move the signature.
+        std::fs::create_dir_all(mat.join("dirty-current.write-tmp")).unwrap();
+        std::fs::write(
+            mat.join("dirty-current.write-tmp/project.jsonl"),
+            "half-written-overlay",
+        )
+        .unwrap();
+        assert_eq!(
+            base,
+            edge_sidecar_signature(edges_dir),
+            "*.write-tmp jsonl must not affect the signature"
+        );
+    }
+
+    #[test]
+    fn edge_sidecar_signature_tracks_manifest_index_active_pointers() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let mi = crate::manifest::manifest_index_path(edges_dir);
+        std::fs::create_dir_all(mi.parent().unwrap()).unwrap();
+
+        // Baseline: no manifest-index present.
+        let sig0 = edge_sidecar_signature(edges_dir);
+
+        std::fs::write(&mi, br#"{"version":1,"workspaces":{}}"#).unwrap();
+        let sig1 = edge_sidecar_signature(edges_dir);
+        assert_ne!(
+            sig0, sig1,
+            "manifest-index presence must register in the signature"
+        );
+
+        // A different active-pointer set — e.g. a branch switch flipping
+        // active_snapshot between two already-materialized snapshots — changes
+        // no `.jsonl` mtime, so only the manifest-index fold catches it.
+        std::fs::write(
+            &mi,
+            br#"{"version":1,"workspaces":{"p":{"manifest":"m","active_snapshot":"workspace/p/snapshots/head-x"}}}"#,
+        )
+        .unwrap();
+        let sig2 = edge_sidecar_signature(edges_dir);
+        assert_ne!(
+            sig1, sig2,
+            "active-pointer change must change the signature even with no .jsonl change"
+        );
     }
 
     #[tokio::test]

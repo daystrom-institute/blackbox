@@ -594,7 +594,14 @@ fn index_adapter_location(
         }
     }
 
-    meta.insert(path_str, FileMeta { mtime, size });
+    meta.insert(
+        path_str,
+        FileMeta {
+            mtime,
+            size,
+            mat_version: None,
+        },
+    );
     *indexed_files += 1;
     if commit_progress && (*indexed_files).is_multiple_of(500) {
         tracing::info!("Indexed {} files ({} docs)...", indexed_files, indexed_docs);

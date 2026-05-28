@@ -1432,6 +1432,41 @@ pub(crate) fn replace_materialized_edges_incremental(
     replace_project_edges(edges_dir, namespace, project_id, &merged)
 }
 
+/// Drop managed derived edges whose source or target is a project file in
+/// `stale_hashes` (rel_path_hash). Used to purge a deleted file's file-anchored
+/// edges, which the mtime/size incremental path never revisits once the file is
+/// gone from disk. Returns the number of edges removed. Granularity matches
+/// `edge_touches_any_path_hash` (the incremental-replace key), so symbol→symbol
+/// edges carrying no project-file ref are not removed here.
+pub(crate) fn purge_managed_edges_for_path_hashes(
+    edges_dir: &Path,
+    namespace: &str,
+    project_id: &str,
+    stale_hashes: &HashSet<String>,
+) -> Result<usize> {
+    if stale_hashes.is_empty() {
+        return Ok(0);
+    }
+    let existing = read_managed_derived_edges(edges_dir, namespace, project_id)?;
+    let before = existing.len();
+    let retained: Vec<crate::chunker::Edge> = existing
+        .into_iter()
+        .filter(|e| !edge_touches_any_path_hash(e, stale_hashes))
+        .map(|e| crate::chunker::Edge {
+            source: e.source,
+            kind: e.kind,
+            target: e.target,
+            provenance: e.provenance,
+            confidence: e.confidence,
+        })
+        .collect();
+    let purged = before.saturating_sub(retained.len());
+    if purged > 0 {
+        replace_project_edges(edges_dir, namespace, project_id, &retained)?;
+    }
+    Ok(purged)
+}
+
 pub(crate) fn merge_materialized_edges(
     edges_dir: &Path,
     namespace: &str,
@@ -1761,6 +1796,80 @@ mod tests {
 
         assert_eq!(index.forward_edges(&source).len(), 1);
         assert_eq!(index.reverse_edges(&target).len(), 1);
+    }
+
+    #[test]
+    fn purge_managed_edges_removes_only_deleted_file_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let edges_dir = dir.path();
+        let proj = "projpurge";
+
+        let keep_file = EntityRef::ProjectFile {
+            project_id: proj.into(),
+            rel_path_hash: "keephash".into(),
+            chunk_hash: "a".repeat(64),
+            occurrence_idx: 0,
+        };
+        let del_file = EntityRef::ProjectFile {
+            project_id: proj.into(),
+            rel_path_hash: "delhash".into(),
+            chunk_hash: "b".repeat(64),
+            occurrence_idx: 0,
+        };
+        let sym_a = EntityRef::SymbolV2 {
+            project_id: proj.into(),
+            snapshot_id: "snap".into(),
+            qualified_name: "pkg.A".into(),
+            defn_hash: "c".repeat(64),
+        };
+        let sym_b = EntityRef::SymbolV2 {
+            project_id: proj.into(),
+            snapshot_id: "snap".into(),
+            qualified_name: "pkg.B".into(),
+            defn_hash: "d".repeat(64),
+        };
+        let mk = |s: EntityRef, k: &str, t: EntityRef| crate::chunker::Edge {
+            source: s,
+            kind: k.into(),
+            target: t,
+            provenance: EdgeProvenance::Derived,
+            confidence: EdgeConfidence::Exact,
+        };
+        let edges = vec![
+            mk(keep_file.clone(), "NEXT_SECTION", keep_file.clone()),
+            mk(del_file.clone(), "NEXT_SECTION", del_file.clone()),
+            // symbol→symbol edge: carries no project-file ref, so it is retained.
+            mk(sym_a.clone(), "CALLS", sym_b.clone()),
+        ];
+        replace_project_edges(edges_dir, "project", proj, &edges).unwrap();
+
+        let mut stale = HashSet::new();
+        stale.insert("delhash".to_string());
+        let purged =
+            purge_managed_edges_for_path_hashes(edges_dir, "project", proj, &stale).unwrap();
+        assert_eq!(purged, 1, "only the deleted file's edge is removed");
+
+        let remaining = read_managed_derived_edges(edges_dir, "project", proj).unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            remaining.iter().any(|e| e.source == keep_file),
+            "kept file's edge retained"
+        );
+        assert!(
+            remaining.iter().any(|e| e.source == sym_a),
+            "symbol→symbol edge retained (no file ref)"
+        );
+        assert!(
+            !remaining.iter().any(|e| e.source == del_file),
+            "deleted file's edge purged"
+        );
+
+        // Empty stale set is a no-op.
+        assert_eq!(
+            purge_managed_edges_for_path_hashes(edges_dir, "project", proj, &HashSet::new())
+                .unwrap(),
+            0
+        );
     }
 
     #[test]
