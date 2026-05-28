@@ -1483,6 +1483,9 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
                 continue;
             };
             if meta.is_dir() {
+                if is_edge_sidecar_temp_dir(&path) {
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
@@ -1501,6 +1504,12 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
         }
     }
     sig
+}
+
+fn is_edge_sidecar_temp_dir(path: &std::path::Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(".write-tmp"))
 }
 
 /// Watcher thread that rebuilds the EdgeIndex when edge sidecars change.
@@ -2429,6 +2438,28 @@ mod tests {
 
         assert!(err.contains("too large"), "got: {err}");
     }
+
+    #[test]
+    fn edge_sidecar_signature_ignores_write_tmp_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let edges_dir = tmp.path();
+
+        let active_dir = edges_dir.join("materialized/workspace/p1/dirty-current");
+        std::fs::create_dir_all(&active_dir).unwrap();
+        std::fs::write(active_dir.join("project.jsonl"), b"{\"active\":true}\n").unwrap();
+
+        let tmp_dir = edges_dir.join("materialized/workspace/p1/dirty-current.write-tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("project.jsonl"), b"{\"tmp\":true}\n").unwrap();
+
+        let signature_with_tmp = edge_sidecar_signature(edges_dir);
+        std::fs::remove_dir_all(&tmp_dir).unwrap();
+        let signature_without_tmp = edge_sidecar_signature(edges_dir);
+
+        assert_eq!(signature_with_tmp, signature_without_tmp);
+        assert_eq!(signature_without_tmp.files, 1);
+    }
+
     #[test]
     fn orchestrate_status_resolves_arc_id_to_arc_thread_id() {
         let tmp = tempfile::tempdir().unwrap();
