@@ -132,6 +132,7 @@ pub(crate) fn reindex_threads_store_standalone(
         FileMeta {
             mtime,
             size: file_meta.len(),
+            mat_version: None,
         },
     );
     Ok(threads.all().len() as u64)

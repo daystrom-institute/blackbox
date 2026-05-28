@@ -115,6 +115,7 @@ fn file_meta(path: &Path) -> Option<FileMeta> {
     Some(FileMeta {
         mtime,
         size: meta.len(),
+        mat_version: None,
     })
 }
 

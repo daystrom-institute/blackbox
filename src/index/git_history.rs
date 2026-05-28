@@ -74,6 +74,7 @@ pub(super) fn index_git_history_for_project(
             FileMeta {
                 mtime: 0,
                 size: crate::git::head_fingerprint(root).unwrap_or_default(),
+                mat_version: None,
             },
         );
         return Ok(GitIndexStats::default());
@@ -93,6 +94,7 @@ pub(super) fn index_git_history_for_project(
             FileMeta {
                 mtime: 0,
                 size: crate::git::head_fingerprint(root).unwrap_or_default(),
+                mat_version: None,
             },
         );
         return Ok(GitIndexStats::default());
@@ -141,6 +143,7 @@ pub(super) fn index_git_history_for_project(
         FileMeta {
             mtime: 0,
             size: crate::git::head_fingerprint(root).unwrap_or_default(),
+            mat_version: None,
         },
     );
     Ok(stats)
