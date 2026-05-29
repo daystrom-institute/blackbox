@@ -26,9 +26,12 @@ agentic work.
 
 ## Harness Tool Surface
 
+- [**bro-harness Design Map** (start here — dependency graph + build order)](bro-harness.md)
 - [bro-harness Tool Surface — Ideal Built-in Subset](bro-harness-tool-surface.md)
 - [bro-harness Clipboard (clip_* registers)](bro-harness-clipboard.md)
 - [bro-harness Tool Chaining (the ref ABI)](bro-harness-tool-chaining.md)
+- [bro-harness Hooks & Nudges (ambient-meta seam)](bro-harness-hooks.md)
+- [bro-harness Neuralyze (rewind + carry a message)](bro-harness-neuralyze.md)
 
 ## Workflow Execution
 
