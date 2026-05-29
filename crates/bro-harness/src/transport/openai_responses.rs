@@ -215,8 +215,20 @@ impl OpenAiResponsesTransport {
             }
         }
 
-        // Echo the model's output items back into the buffer for continuity.
-        self.input.extend(output_items.iter().cloned());
+        // Echo the model's output items back into the buffer for continuity —
+        // EXCEPT reasoning items. With `store:false` (required by the ChatGPT
+        // backend) reasoning items (`rs_…`) are not persisted server-side, so
+        // replaying one by reference on the next turn 404s ("Item with id …
+        // not found"). Dropping them costs cross-turn reasoning continuity but
+        // keeps multi-turn (tool-calling) requests valid. To preserve it later,
+        // request `include:["reasoning.encrypted_content"]` and replay only
+        // items carrying `encrypted_content`.
+        self.input.extend(
+            output_items
+                .iter()
+                .filter(|item| item["type"].as_str() != Some("reasoning"))
+                .cloned(),
+        );
 
         let mut text = String::new();
         let mut tool_calls = Vec::new();
