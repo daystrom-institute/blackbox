@@ -1432,30 +1432,47 @@ pub(crate) fn rebuild_edge_index_from_shared(
     include_tantivy_projection: bool,
 ) {
     let edges_dir = edge_index::edges_dir_from_bro_store(&state.store_dir);
-    let idx = state.idx.read();
-    let kb = state.kb.read();
-    let threads = state.threads.read();
-    let notes = state.notes.read();
-    let task_store = state.task_store.read();
-    let registered_project_ids = state
-        .projects
-        .read()
-        .list()
-        .into_iter()
-        .map(|project| project.project_id)
-        .collect();
-    let rebuilt = edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
-        index: &idx,
-        knowledge: &kb,
-        threads: &threads,
-        notes: &notes,
-        task_store: &task_store,
-        roadmap: &state.roadmap.read(),
-        edges_dir,
-        registered_project_ids: Some(registered_project_ids),
-        include_tantivy_projection,
-        include_observed: true,
-    });
+    // Compute the rebuilt index while holding the store read-locks, then drop
+    // ALL of them before acquiring `edge_index.write()`. Holding idx.read()/
+    // kb.read()/etc. across the edge_index.write() acquisition is a deadlock
+    // hazard:
+    //   A (this rebuild)        holds idx.read, wants edge_index.write
+    //   R (auto-reindex commit) wants idx.write -> queues behind A; a queued
+    //                           writer then blocks new idx *readers* (parking_lot
+    //                           is fair, so readers don't starve the writer)
+    //   D (a graph tool, e.g.   holds edge_index.read (live arg), wants idx.read
+    //      bbox_blame)          -> blocked behind R
+    // => A waits on D's edge_index.read, D waits on R's queued idx.write, R waits
+    //    on A's idx.read. Cycle. Acquiring edge_index.write() with no store locks
+    //    held removes A from the cycle entirely.
+    let rebuilt = {
+        let idx = state.idx.read();
+        let kb = state.kb.read();
+        let threads = state.threads.read();
+        let notes = state.notes.read();
+        let task_store = state.task_store.read();
+        let roadmap = state.roadmap.read();
+        let registered_project_ids = state
+            .projects
+            .read()
+            .list()
+            .into_iter()
+            .map(|project| project.project_id)
+            .collect();
+        edge_index::EdgeIndex::rebuild(&edge_index::EdgeStoreRefs {
+            index: &idx,
+            knowledge: &kb,
+            threads: &threads,
+            notes: &notes,
+            task_store: &task_store,
+            roadmap: &roadmap,
+            edges_dir,
+            registered_project_ids: Some(registered_project_ids),
+            include_tantivy_projection,
+            include_observed: true,
+        })
+        // all store read-guards drop here
+    };
     *state.edge_index.write() = rebuilt;
 }
 
@@ -2430,6 +2447,59 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[test]
+    fn rebuild_releases_store_locks_before_taking_edge_index_write() {
+        // Regression for the rebuild/reindex/blame deadlock: rebuild must not
+        // hold idx.read()/kb.read() while acquiring edge_index.write(). We hold
+        // edge_index.read() to force the rebuild to park on edge_index.write(),
+        // then prove idx and kb are still acquirable during that wait. Pre-fix
+        // the rebuild held idx.read across the write acquisition, so idx.write()
+        // would never succeed here (the deadlock window).
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(tmp.path()));
+
+        // Hold a reader on edge_index so the rebuild's final write blocks.
+        let held = state.edge_index.read();
+
+        let st = state.clone();
+        let handle = std::thread::spawn(move || {
+            rebuild_edge_index_from_shared(&st, false);
+        });
+
+        // Let the rebuild acquire its store read-locks, finish computing
+        // (trivial on an empty test corpus), and PARK on edge_index.write()
+        // (blocked because `held` is alive). It cannot return until we drop
+        // `held`, so after this settle it is definitively waiting on the write.
+        // No early break — we must observe the steady state, not the
+        // pre-acquisition race (an early break is what made the first cut of
+        // this test pass against the buggy code).
+        std::thread::sleep(Duration::from_millis(400));
+
+        // The rebuild must still be parked (it can't complete until we release).
+        assert!(
+            !handle.is_finished(),
+            "precondition: rebuild should be blocked on edge_index.write()"
+        );
+        // Fixed code dropped the store read-guards before acquiring the write,
+        // so idx/kb are free now. Buggy code holds idx.read()/kb.read() while
+        // parked here, so these would be None.
+        assert!(
+            state.idx.try_write().is_some(),
+            "idx.write() must be free while rebuild waits on edge_index.write()"
+        );
+        assert!(
+            state.kb.try_write().is_some(),
+            "kb.write() must be free while rebuild waits on edge_index.write()"
+        );
+
+        // Let the rebuild finish.
+        drop(held);
+        handle.join().unwrap();
     }
 
     #[test]

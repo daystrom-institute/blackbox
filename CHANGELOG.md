@@ -62,6 +62,14 @@ out explicitly under `Changed` or `Removed`.
   re-chunk even when their mtime/size are unchanged, so snapshots are never
   keyed off stale-version edges. Introducing the per-file version stamp adopts
   unknown (pre-existing) versions without a full re-chunk.
+- Edge-index rebuild no longer holds the store read-locks (`idx`/`kb`/`threads`/
+  `notes`/`task_store`/`roadmap`) while acquiring `edge_index.write()`. Holding
+  them across the write created a three-party deadlock (rebuild holds `idx.read`
+  wanting `edge_index.write`; the auto-reindex commit queues `idx.write`;
+  `bbox_blame` holds `edge_index.read` wanting `idx.read`), which could wedge
+  the daemon — every tool taking `kb.write` (e.g. `bbox_knowledge`) blocked
+  indefinitely. The rebuilt index is now computed under the read-locks, which
+  are dropped before the `edge_index.write()` swap.
 
 ### Removed
 
