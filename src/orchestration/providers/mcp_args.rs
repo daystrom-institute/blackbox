@@ -231,13 +231,25 @@ impl Provider {
                     args.push(expanded_allow.join(" "));
                 }
             }
-            // Harness providers do tool gating via their own deferral/pin
-            // layer (BRO_HARNESS_PIN_TOOLS), not vendor-CLI filter flags — and
-            // the harness CLI rejects --allowedTools, so emit nothing here.
-            Provider::Inception
-            | Provider::Glm
-            | Provider::Deepseek
-            | Provider::Brodex => {}
+            // Harness providers take a comma-separated, fully-qualified
+            // allow/deny list (`mcp__<server>__<tool>`) that the harness
+            // enforces in-registry — its own flag names, since it doesn't
+            // accept claude's --allowedTools. This is the client permission
+            // plane (recursion guard + brofile + per-dispatch); surface is
+            // separate and server-side via the MCP URL.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+                let deny = expand_filter_patterns(&filters.disallow);
+                if !deny.is_empty() {
+                    args.push("--deny-tools".into());
+                    args.push(deny.join(","));
+                }
+                let allow = expand_filter_patterns(&filters.allow);
+                if !allow.is_empty() {
+                    args.push("--allow-tools".into());
+                    args.push(allow.join(","));
+                }
+            }
+            Provider::Inception => {}
             Provider::Copilot => {
                 for p in expand_filter_patterns(&filters.disallow) {
                     args.push(format!(

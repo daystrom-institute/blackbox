@@ -710,6 +710,26 @@ fn test_claude_filter_disallow_args_expands_blackbox_globs() {
 }
 
 #[test]
+fn test_harness_filter_emits_deny_tools_comma_joined() {
+    // Harness providers (glm/deepseek/brodex) get the recursion guard +
+    // per-dispatch deny as a comma-joined --deny-tools list the harness
+    // enforces in-registry. This is the client permission plane, not surface.
+    let filters = McpFilters {
+        disallow: vec!["mcp__blackbox__bro_*".into()],
+        allow: vec![],
+    };
+    for provider in [Provider::Glm, Provider::Deepseek, Provider::Brodex] {
+        let args = provider.build_filter_args(&filters);
+        let i = args.iter().position(|a| a == "--deny-tools").expect("--deny-tools present");
+        let csv = &args[i + 1];
+        assert!(csv.contains("mcp__blackbox__bro_exec"), "{provider}: {csv}");
+        assert!(csv.contains(','), "comma-joined: {csv}");
+        // Never claude's space-joined flag (harness CLI rejects it).
+        assert!(!args.iter().any(|a| a == "--disallowedTools"), "{provider}");
+    }
+}
+
+#[test]
 fn test_copilot_filter_repeats_flag_expanded() {
     let filters = McpFilters {
         disallow: vec!["mcp__blackbox__.bro_*".into(), "shell(git push)".into()],

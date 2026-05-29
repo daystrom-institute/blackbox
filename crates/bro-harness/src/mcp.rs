@@ -23,8 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// Parse `--mcp-config` (`{"mcpServers":{name:{"type":"http","url":...}}}`),
-/// connect to each server, and return its tools wrapped as `Tool` impls.
-pub async fn load_mcp_tools(mcp_config: Option<&str>) -> Vec<Arc<dyn Tool>> {
+/// connect to each server, list its tools, and return those admitted by
+/// `filter`. Denied tools are dropped here so they never enter the registry —
+/// not listed to the model, not loadable via tool_search, not dispatchable.
+pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Vec<Arc<dyn Tool>> {
     let Some(cfg) = mcp_config else {
         return Vec::new();
     };
@@ -38,17 +40,74 @@ pub async fn load_mcp_tools(mcp_config: Option<&str>) -> Vec<Arc<dyn Tool>> {
 
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for (name, url) in servers {
-        match list_server_tools(&url).await {
+        match list_server_tools(&name, &url).await {
             Ok(listed) => {
-                tracing::info!(server = %name, count = listed.len(), "MCP tools loaded");
+                let total = listed.len();
+                let mut admitted = 0;
                 for t in listed {
-                    tools.push(Arc::new(t));
+                    // Qualified name the daemon's filter patterns match against.
+                    let qualified = format!("mcp__{name}__{}", t.name);
+                    if filter.permits(&qualified) {
+                        admitted += 1;
+                        tools.push(Arc::new(t));
+                    }
                 }
+                tracing::info!(
+                    server = %name,
+                    admitted,
+                    denied = total - admitted,
+                    "MCP tools loaded"
+                );
             }
             Err(e) => tracing::warn!(server = %name, "MCP tool listing failed: {e:#}"),
         }
     }
     tools
+}
+
+/// Client-side allow/deny over MCP tools — the permission plane (recursion
+/// guard + brofile + per-dispatch), distinct from server-side surface. Built
+/// from the daemon's `--deny-tools`/`--allow-tools` flags. Patterns are
+/// fully-qualified `mcp__<server>__<tool>` names, exact or trailing-`*`.
+#[derive(Default)]
+pub struct ToolFilter {
+    deny: Vec<String>,
+    allow: Vec<String>,
+}
+
+impl ToolFilter {
+    pub fn from_csv(deny: Option<&str>, allow: Option<&str>) -> Self {
+        fn split(s: Option<&str>) -> Vec<String> {
+            s.into_iter()
+                .flat_map(|v| v.split(','))
+                .map(|p| p.trim().to_string())
+                .filter(|p| !p.is_empty())
+                .collect()
+        }
+        Self {
+            deny: split(deny),
+            allow: split(allow),
+        }
+    }
+
+    /// A qualified tool name is permitted unless it matches a deny pattern, or
+    /// (when allow is non-empty) fails to match any allow pattern. Deny wins.
+    pub fn permits(&self, qualified: &str) -> bool {
+        if self.deny.iter().any(|p| pattern_matches(p, qualified)) {
+            return false;
+        }
+        if !self.allow.is_empty() && !self.allow.iter().any(|p| pattern_matches(p, qualified)) {
+            return false;
+        }
+        true
+    }
+}
+
+fn pattern_matches(pattern: &str, name: &str) -> bool {
+    match pattern.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name == pattern,
+    }
 }
 
 fn parse_servers(cfg: &str) -> anyhow::Result<Vec<(String, String)>> {
@@ -64,7 +123,7 @@ fn parse_servers(cfg: &str) -> anyhow::Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-async fn list_server_tools(url: &str) -> anyhow::Result<Vec<McpTool>> {
+async fn list_server_tools(_server: &str, url: &str) -> anyhow::Result<Vec<McpTool>> {
     let transport = StreamableHttpClientTransport::from_uri(url.to_string());
     let client = ().serve(transport).await?;
     let listed = client.list_all_tools().await;
@@ -154,4 +213,40 @@ fn collect_text(content: &[Content]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_filter_deny_blocks_recursion_guard_patterns() {
+        // What the daemon's recursion guard emits for a harness provider.
+        let f = ToolFilter::from_csv(
+            Some("mcp__blackbox__bro_exec,mcp__blackbox__bro_resume,mcp__blackbox__bro_*"),
+            None,
+        );
+        assert!(!f.permits("mcp__blackbox__bro_exec"));
+        assert!(!f.permits("mcp__blackbox__bro_resume"));
+        assert!(!f.permits("mcp__blackbox__bro_cancel")); // matched by bro_*
+        // Pinned/allowed tools survive.
+        assert!(f.permits("mcp__blackbox__bbox_slice_read"));
+        assert!(f.permits("mcp__blackbox__bbox_stats"));
+        // Built-in (non-MCP-qualified) names are never matched by these.
+        assert!(f.permits("file_read"));
+    }
+
+    #[test]
+    fn tool_filter_allowlist_is_exclusive() {
+        let f = ToolFilter::from_csv(None, Some("mcp__blackbox__bbox_*"));
+        assert!(f.permits("mcp__blackbox__bbox_stats"));
+        assert!(!f.permits("mcp__blackbox__bro_status")); // not in allow
+    }
+
+    #[test]
+    fn tool_filter_empty_permits_all() {
+        let f = ToolFilter::from_csv(None, None);
+        assert!(f.permits("mcp__blackbox__bro_exec"));
+        assert!(f.permits("anything"));
+    }
 }

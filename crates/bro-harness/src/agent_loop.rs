@@ -78,7 +78,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         http: reqwest::Client::new(),
     };
     let builtins = builtin_tools();
-    let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref()).await;
+    // Client-side allow/deny (recursion guard + brofile + per-dispatch),
+    // distinct from server-side surface. Denied MCP tools are dropped at load.
+    let tool_filter = mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
+    let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
     let reg = Registry::new(builtins, mcp_tools, &PinPolicy::from_env());
 
     let base_opts = TurnOpts {

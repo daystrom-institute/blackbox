@@ -44,6 +44,21 @@ pub struct Cli {
     #[arg(long = "mcp-config")]
     pub mcp_config: Option<String>,
 
+    /// Comma-separated client-side DENY patterns for MCP tools, as
+    /// fully-qualified `mcp__<server>__<tool>` names (exact or trailing-`*`
+    /// prefix). This is the allow/deny permission plane — the daemon's
+    /// recursion guard + brofile + per-dispatch disallow — NOT surface
+    /// (surface is server-side, via the URL). Matching MCP tools are excluded
+    /// entirely: not listed, not tool_search-loadable, refused if called.
+    #[arg(long = "deny-tools")]
+    pub deny_tools: Option<String>,
+
+    /// Comma-separated client-side ALLOW patterns (same form). When non-empty,
+    /// only matching MCP tools are admitted. Built-in harness tools are never
+    /// subject to either list.
+    #[arg(long = "allow-tools")]
+    pub allow_tools: Option<String>,
+
     // --- accepted, no-op (we always stream NDJSON; safety is the denylist) ---
     #[arg(long = "verbose", default_value_t = false)]
     pub verbose: bool,
