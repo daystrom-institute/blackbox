@@ -18,6 +18,7 @@
 //! wire array includes their full schemas. Client tools are dispatched
 //! in-process; the registry holds everything.
 
+use crate::mcp::ToolFilter;
 use crate::transport::ToolSpec;
 use async_trait::async_trait;
 use bro_tools::{Tool, ToolCx, ToolResult};
@@ -75,10 +76,27 @@ pub struct Registry {
 impl Registry {
     /// Built-ins default `Eager`, MCP tools default `Deferred`; `pin` elevates
     /// matching names (from either origin) to `Pinned`. A `tool_search`
-    /// meta-tool is always added as `Pinned`.
-    pub fn new(builtins: Vec<Arc<dyn Tool>>, mcp: Vec<Arc<dyn Tool>>, pin: &PinPolicy) -> Self {
+    /// meta-tool is added as `Pinned` unless explicitly denied.
+    ///
+    /// `filter` gates **built-ins** by their bare name (`shell_run`, `git_*`,
+    /// …) — the same allow/deny plane that filters MCP tools, applied uniformly
+    /// so a profile can deny a built-in family. (MCP tools arrive already
+    /// filtered by their fully-qualified name in `load_mcp_tools`, where the
+    /// `mcp__server__tool` name exists; here their `.name()` is bare, so they
+    /// are not re-filtered.) `tool_search` honors an explicit deny but ignores
+    /// allow-list exclusion, so a narrow allow-list doesn't strand a bro that
+    /// needs to load deferred tools.
+    pub fn new(
+        builtins: Vec<Arc<dyn Tool>>,
+        mcp: Vec<Arc<dyn Tool>>,
+        pin: &PinPolicy,
+        filter: &ToolFilter,
+    ) -> Self {
         let mut tools: HashMap<String, Entry> = HashMap::new();
         for t in builtins {
+            if !filter.permits(t.name()) {
+                continue;
+            }
             let tier = if pin.matches(t.name()) {
                 Tier::Pinned
             } else {
@@ -98,29 +116,34 @@ impl Registry {
 
         let activated = Arc::new(Mutex::new(HashSet::new()));
 
-        // Snapshot the deferred catalog for the search tool.
-        let catalog: Arc<Vec<DeferredEntry>> = Arc::new(
-            tools
-                .values()
-                .filter(|e| e.tier == Tier::Deferred)
-                .map(|e| DeferredEntry {
-                    name: e.tool.name().to_string(),
-                    description: e.tool.description().to_string(),
-                    schema: e.tool.input_schema(),
-                })
-                .collect(),
-        );
-        let search: Arc<dyn Tool> = Arc::new(ToolSearchTool {
-            catalog,
-            activated: activated.clone(),
-        });
-        tools.insert(
-            TOOL_SEARCH.to_string(),
-            Entry {
-                tool: search,
-                tier: Tier::Pinned,
-            },
-        );
+        // tool_search is added unless explicitly denied. It ignores allow-list
+        // exclusion (decision b): a narrow allow-list still gets search so it
+        // can load the deferred tools it allowed.
+        if !filter.denied(TOOL_SEARCH) {
+            // Snapshot the deferred catalog for the search tool.
+            let catalog: Arc<Vec<DeferredEntry>> = Arc::new(
+                tools
+                    .values()
+                    .filter(|e| e.tier == Tier::Deferred)
+                    .map(|e| DeferredEntry {
+                        name: e.tool.name().to_string(),
+                        description: e.tool.description().to_string(),
+                        schema: e.tool.input_schema(),
+                    })
+                    .collect(),
+            );
+            let search: Arc<dyn Tool> = Arc::new(ToolSearchTool {
+                catalog,
+                activated: activated.clone(),
+            });
+            tools.insert(
+                TOOL_SEARCH.to_string(),
+                Entry {
+                    tool: search,
+                    tier: Tier::Pinned,
+                },
+            );
+        }
 
         Self { tools, activated }
     }
@@ -338,7 +361,7 @@ mod tests {
             mk("bbox_slice_read", "read a slice"),
             mk("bbox_stats", "corpus stats"),
         ];
-        let reg = Registry::new(builtins, mcp, &pin);
+        let reg = Registry::new(builtins, mcp, &pin, &ToolFilter::default());
 
         // Pinned = slice tool + tool_search; Eager = file_read; both in wire.
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
@@ -354,5 +377,86 @@ mod tests {
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"bbox_stats".to_string()));
         assert!(!reg.manifest().iter().any(|(n, _)| n == "bbox_stats"));
+    }
+
+    /// Helper: collect every tool name the registry would expose — wire (pinned
+    /// + eager + activated) plus the deferred manifest. A denied tool appears in
+    /// neither.
+    fn all_known(reg: &Registry) -> Vec<String> {
+        let mut v: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
+        v.extend(reg.manifest().into_iter().map(|(n, _)| n));
+        v
+    }
+
+    #[test]
+    fn filter_denies_builtins_by_bare_name() {
+        let pin = PinPolicy { patterns: vec![] };
+        let builtins = vec![
+            mk("file_read", "read"),
+            mk("shell_run", "shell"),
+            mk("git_ro_status", "git status"),
+            mk("git_local_commit", "commit"),
+        ];
+        // Deny the shell + the git write family by glob; keep git read.
+        let filter = ToolFilter::from_csv(Some("shell_*,git_local_*"), None);
+        let reg = Registry::new(builtins, vec![], &pin, &filter);
+        let known = all_known(&reg);
+
+        assert!(known.contains(&"file_read".to_string()), "kept: {known:?}");
+        assert!(known.contains(&"git_ro_status".to_string()), "kept: {known:?}");
+        assert!(!known.contains(&"shell_run".to_string()), "denied: {known:?}");
+        assert!(
+            !known.contains(&"git_local_commit".to_string()),
+            "denied: {known:?}"
+        );
+    }
+
+    #[test]
+    fn allowlist_is_exclusive_over_builtins() {
+        let pin = PinPolicy { patterns: vec![] };
+        let builtins = vec![
+            mk("file_read", "read"),
+            mk("file_edit", "edit"),
+            mk("shell_run", "shell"),
+        ];
+        // Explore-style: only read tools admitted.
+        let filter = ToolFilter::from_csv(None, Some("file_read"));
+        let reg = Registry::new(builtins, vec![], &pin, &filter);
+        let known = all_known(&reg);
+
+        assert!(known.contains(&"file_read".to_string()), "{known:?}");
+        assert!(!known.contains(&"file_edit".to_string()), "{known:?}");
+        assert!(!known.contains(&"shell_run".to_string()), "{known:?}");
+        // tool_search survives an exclusive allow-list (decision b).
+        assert!(known.contains(&TOOL_SEARCH.to_string()), "{known:?}");
+    }
+
+    #[test]
+    fn tool_search_survives_allowlist_but_dies_on_explicit_deny() {
+        let pin = PinPolicy { patterns: vec![] };
+
+        // Narrow allow-list that does NOT name tool_search → it still appears.
+        let kept = Registry::new(
+            vec![mk("file_read", "read")],
+            vec![],
+            &pin,
+            &ToolFilter::from_csv(None, Some("file_read")),
+        );
+        assert!(
+            all_known(&kept).contains(&TOOL_SEARCH.to_string()),
+            "tool_search must survive an allow-list it isn't named in"
+        );
+
+        // Explicit deny → tool_search is gone.
+        let gone = Registry::new(
+            vec![mk("file_read", "read")],
+            vec![],
+            &pin,
+            &ToolFilter::from_csv(Some("tool_search"), None),
+        );
+        assert!(
+            !all_known(&gone).contains(&TOOL_SEARCH.to_string()),
+            "explicit deny must remove tool_search"
+        );
     }
 }

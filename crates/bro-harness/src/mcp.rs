@@ -65,10 +65,14 @@ pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Ve
     tools
 }
 
-/// Client-side allow/deny over MCP tools — the permission plane (recursion
-/// guard + brofile + per-dispatch), distinct from server-side surface. Built
-/// from the daemon's `--deny-tools`/`--allow-tools` flags. Patterns are
-/// fully-qualified `mcp__<server>__<tool>` names, exact or trailing-`*`.
+/// Client-side allow/deny over the whole tool surface — the permission plane
+/// (recursion guard + brofile + per-dispatch), distinct from server-side
+/// surface. Built from the daemon's `--deny-tools`/`--allow-tools` flags.
+/// Patterns are exact names or a trailing-`*` prefix glob, matched against the
+/// MCP tools' fully-qualified `mcp__<server>__<tool>` names AND built-in tools'
+/// bare names (`shell_run`, `git_*`, …). This is the final lever when nudges
+/// aren't enough: force MCP pathways, deny a dumb drone `shell_*`, stop an
+/// Explore agent from `file_edit`, etc.
 #[derive(Default)]
 pub struct ToolFilter {
     deny: Vec<String>,
@@ -90,13 +94,20 @@ impl ToolFilter {
         }
     }
 
-    /// A qualified tool name is permitted unless it matches a deny pattern, or
-    /// (when allow is non-empty) fails to match any allow pattern. Deny wins.
-    pub fn permits(&self, qualified: &str) -> bool {
-        if self.deny.iter().any(|p| pattern_matches(p, qualified)) {
+    /// True if `name` matches an explicit deny pattern. Deny-only check, used
+    /// for tools that should ignore the allow-list exclusion but still honor a
+    /// targeted deny (e.g. `tool_search`).
+    pub fn denied(&self, name: &str) -> bool {
+        self.deny.iter().any(|p| pattern_matches(p, name))
+    }
+
+    /// A tool name is permitted unless it matches a deny pattern, or (when allow
+    /// is non-empty) fails to match any allow pattern. Deny wins.
+    pub fn permits(&self, name: &str) -> bool {
+        if self.denied(name) {
             return false;
         }
-        if !self.allow.is_empty() && !self.allow.iter().any(|p| pattern_matches(p, qualified)) {
+        if !self.allow.is_empty() && !self.allow.iter().any(|p| pattern_matches(p, name)) {
             return false;
         }
         true

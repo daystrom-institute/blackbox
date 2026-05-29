@@ -105,10 +105,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
     let builtins = builtin_tools();
     // Client-side allow/deny (recursion guard + brofile + per-dispatch),
-    // distinct from server-side surface. Denied MCP tools are dropped at load.
+    // distinct from server-side surface. The same filter gates MCP tools (by
+    // qualified name, dropped at load) and built-ins (by bare name, in the
+    // registry) — the final lever to force MCP pathways or deny a built-in
+    // family like `shell_*` / `git_*` / `file_edit`.
     let tool_filter = mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
     let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
-    let reg = Registry::new(builtins, mcp_tools, &PinPolicy::from_env());
+    let reg = Registry::new(builtins, mcp_tools, &PinPolicy::from_env(), &tool_filter);
 
     let base_opts = TurnOpts {
         model,
