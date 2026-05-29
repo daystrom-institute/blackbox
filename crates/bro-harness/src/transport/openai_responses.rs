@@ -96,44 +96,7 @@ impl Transport for OpenAiResponsesTransport {
     }
 
     async fn run_turn(&mut self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Result<TurnOutput> {
-        let mut tool_defs: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.schema,
-                    "strict": false,
-                })
-            })
-            .collect();
-        if opts.web_search {
-            tool_defs.push(json!({"type": "web_search"}));
-        }
-
-        let mut body = json!({
-            "model": opts.model,
-            "input": self.input,
-            "tool_choice": "auto",
-            "parallel_tool_calls": false,
-            "stream": true,
-            "store": false,
-        });
-        // The ChatGPT backend rejects an empty/missing `instructions` field
-        // ("Instructions are required"); always send a non-empty value.
-        let instructions = opts
-            .system
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .unwrap_or("You are a helpful coding assistant operating non-interactively.");
-        body["instructions"] = json!(instructions);
-        if !tool_defs.is_empty() {
-            body["tools"] = json!(tool_defs);
-        }
-        if let Some(e) = &opts.effort {
-            body["reasoning"] = json!({"effort": normalize_effort(e)});
-        }
+        let body = self.build_body(tools, opts);
 
         let resp = super::http::send_with_retry("openai-responses", || {
             let mut rb = self
@@ -177,6 +140,62 @@ impl Transport for OpenAiResponsesTransport {
 }
 
 impl OpenAiResponsesTransport {
+    /// Build the Responses request body (pure; no I/O), so the system split
+    /// (stable `instructions` + trailing volatile `developer` item that is
+    /// never persisted into self.input) is unit-testable.
+    fn build_body(&self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Value {
+        let mut tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.schema,
+                    "strict": false,
+                })
+            })
+            .collect();
+        if opts.web_search {
+            tool_defs.push(json!({"type": "web_search"}));
+        }
+
+        // The cache-stable prefix goes in `instructions` (cached via
+        // prompt_cache_key); the volatile tail (manifest/nudges) rides as a
+        // trailing `developer` input item, appended per-request only so it
+        // never persists into self.input and can't disturb the cached prefix.
+        let mut input = self.input.clone();
+        if let Some(volatile) = opts.system.volatile_text() {
+            input.push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": volatile}],
+            }));
+        }
+        let mut body = json!({
+            "model": opts.model,
+            "input": input,
+            "tool_choice": "auto",
+            "parallel_tool_calls": false,
+            "stream": true,
+            "store": false,
+        });
+        // The ChatGPT backend rejects an empty/missing `instructions` field
+        // ("Instructions are required"); always send a non-empty value.
+        let instructions = opts
+            .system
+            .stable_text()
+            .unwrap_or("You are a helpful coding assistant operating non-interactively.");
+        body["instructions"] = json!(instructions);
+        if !tool_defs.is_empty() {
+            body["tools"] = json!(tool_defs);
+        }
+        if let Some(e) = &opts.effort {
+            body["reasoning"] = json!({"effort": normalize_effort(e)});
+        }
+        body
+    }
+
     /// Parse the SSE body: accumulate completed output items, append them to
     /// the input buffer (so the next turn carries context), and normalize.
     fn parse_sse(&mut self, sse: &str) -> Result<TurnOutput> {
@@ -283,5 +302,56 @@ fn normalize_effort(e: &str) -> &str {
         "low" => "low",
         "high" | "max" => "high",
         _ => "medium",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::SystemPrompt;
+
+    fn transport() -> OpenAiResponsesTransport {
+        OpenAiResponsesTransport {
+            http: reqwest::Client::new(),
+            endpoint: "http://x".into(),
+            auth: Auth::ApiKey("k".into()),
+            input: vec![json!({
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": "hi"}],
+            })],
+        }
+    }
+    fn opts(system: SystemPrompt) -> TurnOpts {
+        TurnOpts { model: "m".into(), max_tokens: 16, system, effort: None, web_search: false }
+    }
+
+    #[test]
+    fn stable_is_instructions_volatile_is_trailing_developer_item() {
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("MANIFEST".into()) }),
+        );
+        // Stable → cached instructions.
+        assert_eq!(body["instructions"], "BASE");
+        // Volatile → trailing developer item, appended after the conversation.
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[1]["content"][0]["text"], "MANIFEST");
+        // Volatile never persisted into self.input.
+        assert_eq!(transport().input.len(), 1);
+    }
+
+    #[test]
+    fn empty_stable_falls_back_to_nonempty_instructions() {
+        // The ChatGPT backend rejects empty instructions; the fallback must hold
+        // even when only a volatile tail is present.
+        let body = transport()
+            .build_body(&[], &opts(SystemPrompt { stable: None, volatile: Some("V".into()) }));
+        assert!(!body["instructions"].as_str().unwrap().is_empty());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["role"], "developer");
     }
 }

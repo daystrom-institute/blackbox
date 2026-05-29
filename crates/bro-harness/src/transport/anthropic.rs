@@ -46,6 +46,56 @@ impl AnthropicTransport {
             messages: Vec::new(),
         })
     }
+
+    /// Build the Messages request body (pure; no I/O), so the wire shape —
+    /// notably the system-block cache-control placement — is unit-testable.
+    fn build_body(&self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Value {
+        let mut tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "name": t.name,
+                    "description": t.description,
+                    "input_schema": t.schema,
+                })
+            })
+            .collect();
+        if opts.web_search {
+            // Server-side; provider executes it and returns results inline.
+            tool_defs.push(json!({
+                "type": "web_search_20250305", "name": "web_search", "max_uses": 5,
+            }));
+        }
+
+        let mut body = json!({
+            "model": opts.model,
+            "max_tokens": opts.max_tokens,
+            "messages": self.messages,
+            "stream": false,
+        });
+        // System is up to two blocks: a cache-stable prefix (carries the
+        // ephemeral cache breakpoint) and a volatile tail (manifest/nudges,
+        // never cached, so a changing tail can't invalidate the cached prefix).
+        let mut system_blocks: Vec<Value> = Vec::new();
+        if let Some(stable) = opts.system.stable_text() {
+            system_blocks.push(json!({
+                "type": "text", "text": stable, "cache_control": {"type": "ephemeral"},
+            }));
+        }
+        if let Some(volatile) = opts.system.volatile_text() {
+            system_blocks.push(json!({ "type": "text", "text": volatile }));
+        }
+        if !system_blocks.is_empty() {
+            body["system"] = json!(system_blocks);
+        }
+        if !tool_defs.is_empty() {
+            body["tools"] = json!(tool_defs);
+        }
+        if let Some(t) = effort_to_thinking(opts.effort.as_deref()) {
+            body["thinking"] = t;
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -77,40 +127,7 @@ impl Transport for AnthropicTransport {
     }
 
     async fn run_turn(&mut self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Result<TurnOutput> {
-        let mut tool_defs: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "name": t.name,
-                    "description": t.description,
-                    "input_schema": t.schema,
-                })
-            })
-            .collect();
-        if opts.web_search {
-            // Server-side; provider executes it and returns results inline.
-            tool_defs.push(json!({
-                "type": "web_search_20250305", "name": "web_search", "max_uses": 5,
-            }));
-        }
-
-        let mut body = json!({
-            "model": opts.model,
-            "max_tokens": opts.max_tokens,
-            "messages": self.messages,
-            "stream": false,
-        });
-        if let Some(sys) = &opts.system {
-            body["system"] = json!([{
-                "type": "text", "text": sys, "cache_control": {"type": "ephemeral"},
-            }]);
-        }
-        if !tool_defs.is_empty() {
-            body["tools"] = json!(tool_defs);
-        }
-        if let Some(t) = effort_to_thinking(opts.effort.as_deref()) {
-            body["thinking"] = t;
-        }
+        let body = self.build_body(tools, opts);
 
         let url = format!("{}/v1/messages", self.base_url);
         let resp = super::http::send_with_retry("anthropic/messages", || {
@@ -197,4 +214,66 @@ fn effort_to_thinking(effort: Option<&str>) -> Option<Value> {
         _ => return None,
     };
     Some(json!({"type": "enabled", "budget_tokens": budget}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::SystemPrompt;
+
+    fn transport() -> AnthropicTransport {
+        AnthropicTransport {
+            http: reqwest::Client::new(),
+            base_url: "http://x".into(),
+            auth: Auth::Bearer("t".into()),
+            version: "2023-06-01".into(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+        }
+    }
+    fn opts(system: SystemPrompt) -> TurnOpts {
+        TurnOpts { model: "m".into(), max_tokens: 16, system, effort: None, web_search: false }
+    }
+
+    #[test]
+    fn split_system_caches_stable_only() {
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("MANIFEST".into()) }),
+        );
+        let sys = body["system"].as_array().expect("system array");
+        assert_eq!(sys.len(), 2);
+        // Block 0: stable, with the cache breakpoint.
+        assert_eq!(sys[0]["text"], "BASE");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        // Block 1: volatile, NEVER cached — a changing tail can't bust the prefix.
+        assert_eq!(sys[1]["text"], "MANIFEST");
+        assert!(sys[1].get("cache_control").is_none(), "volatile must not carry cache_control");
+        // Volatile never leaks into the persisted conversation.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stable_only_is_one_cached_block() {
+        let body = transport()
+            .build_body(&[], &opts(SystemPrompt { stable: Some("BASE".into()), volatile: None }));
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn volatile_only_is_one_uncached_block() {
+        let body = transport()
+            .build_body(&[], &opts(SystemPrompt { stable: None, volatile: Some("V".into()) }));
+        let sys = body["system"].as_array().unwrap();
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["text"], "V");
+        assert!(sys[0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn empty_system_is_omitted() {
+        let body = transport().build_body(&[], &opts(SystemPrompt::default()));
+        assert!(body.get("system").is_none());
+    }
 }

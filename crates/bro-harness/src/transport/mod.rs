@@ -89,6 +89,34 @@ pub struct ToolSpec {
     pub schema: Value,
 }
 
+/// The system prompt, split into a cache-stable prefix and a volatile tail.
+///
+/// `stable` (the daemon-supplied system text + the pinned-tools section) does
+/// not change across a session, so it carries the prompt-cache breakpoint.
+/// `volatile` (the deferred-tool manifest, and later ambient nudges) is
+/// recomposed every turn and is never cached — placing it after the breakpoint
+/// keeps a changing tail from invalidating the cached prefix. Each transport
+/// renders the split natively (Anthropic: two `system` blocks, cache_control on
+/// the first; OpenAI Chat: leading system message + trailing system message;
+/// Responses: `instructions` + trailing `developer` input item). See
+/// design/orchestration/bro-harness-hooks.md §1.
+#[derive(Debug, Default, Clone)]
+pub struct SystemPrompt {
+    pub stable: Option<String>,
+    pub volatile: Option<String>,
+}
+
+impl SystemPrompt {
+    /// Non-empty stable text, if any.
+    pub fn stable_text(&self) -> Option<&str> {
+        self.stable.as_deref().filter(|s| !s.is_empty())
+    }
+    /// Non-empty volatile text, if any.
+    pub fn volatile_text(&self) -> Option<&str> {
+        self.volatile.as_deref().filter(|s| !s.is_empty())
+    }
+}
+
 /// Per-turn knobs. `web_search` requests the transport's *server-side* search
 /// tool when it has one (Anthropic `web_search_20250305`, Responses
 /// `web_search`); transports without one ignore it.
@@ -96,7 +124,7 @@ pub struct ToolSpec {
 pub struct TurnOpts {
     pub model: String,
     pub max_tokens: u32,
-    pub system: Option<String>,
+    pub system: SystemPrompt,
     pub effort: Option<String>,
     pub web_search: bool,
 }

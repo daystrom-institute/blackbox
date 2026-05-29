@@ -19,7 +19,7 @@ use crate::emit::Emitter;
 use crate::registry::{PinPolicy, Registry};
 use crate::session::{SaveState, SessionStore};
 use crate::mcp;
-use crate::transport::{self, StopReason, TransportKind, TurnOpts, Usage};
+use crate::transport::{self, StopReason, SystemPrompt, TransportKind, TurnOpts, Usage};
 use anyhow::{Context, Result};
 use bro_tools::{SafetyPolicy, ToolCx, builtin_tools};
 use std::io::Read;
@@ -106,7 +106,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     let base_opts = TurnOpts {
         model,
         max_tokens,
-        system: None, // composed per-turn from `system` + tiered tool sections
+        // Composed per-turn from `system` + tiered tool sections, split into a
+        // cache-stable prefix and a volatile tail (see compose_system).
+        system: SystemPrompt::default(),
         effort: cli.effort.clone(),
         web_search,
     };
@@ -127,7 +129,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         // deferred tools, and the manifest shrinks correspondingly.
         let tool_specs = reg.wire_specs();
         let opts = TurnOpts {
-            system: Some(compose_system(system.as_deref(), &reg)),
+            system: compose_system(system.as_deref(), &reg),
             ..base_opts.clone()
         };
         let out = tx.run_turn(&tool_specs, &opts).await?;
@@ -173,41 +175,53 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
-/// Compose the effective system prompt: the caller's system text, then a
-/// prominent always-available (Pinned) section, then the names-only manifest
-/// of deferred tools with an instruction to load them via tool_search.
-fn compose_system(base: Option<&str>, reg: &Registry) -> String {
-    let mut s = base.unwrap_or("").to_string();
+/// Compose the effective system prompt as a cache-stable prefix plus a
+/// volatile tail.
+///
+/// - **stable** = the caller's system text + the prominent always-available
+///   (Pinned) section. Neither changes across a session, so the transport puts
+///   the prompt-cache breakpoint here.
+/// - **volatile** = the names-only manifest of deferred tools (it shrinks as
+///   `tool_search` activates tools) with the instruction to load them. Kept
+///   after the breakpoint so a changing tail never invalidates the cached
+///   prefix. This is also where ambient nudges will land
+///   (design/orchestration/bro-harness-hooks.md §1).
+fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
+    let mut stable = base.unwrap_or("").to_string();
 
     let pinned = reg.pinned();
     if !pinned.is_empty() {
-        if !s.is_empty() {
-            s.push_str("\n\n");
+        if !stable.is_empty() {
+            stable.push_str("\n\n");
         }
-        s.push_str(
+        stable.push_str(
             "## Always-available tools\n\
              These are loaded and ready — prefer them for their purpose; do not search for them. \
              `tool_search` loads anything else on demand.\n",
         );
         for (name, desc) in pinned {
-            s.push_str(&format!("- `{name}` — {desc}\n"));
+            stable.push_str(&format!("- `{name}` — {desc}\n"));
         }
     }
 
+    let mut volatile = String::new();
     let manifest = reg.manifest();
     if !manifest.is_empty() {
-        s.push_str(&format!(
-            "\n## Additional tools ({} available, not yet loaded)\n\
+        volatile.push_str(&format!(
+            "## Additional tools ({} available, not yet loaded)\n\
              Call `tool_search(\"<keywords>\")` (or `tool_search(\"select:name1,name2\")`) to load \
              any of these before using them:\n",
             manifest.len()
         ));
         for (name, desc) in manifest {
-            s.push_str(&format!("- {name}: {desc}\n"));
+            volatile.push_str(&format!("- {name}: {desc}\n"));
         }
     }
 
-    s
+    SystemPrompt {
+        stable: (!stable.is_empty()).then_some(stable),
+        volatile: (!volatile.is_empty()).then_some(volatile),
+    }
 }
 
 fn resolve_prompt(cli: &Cli) -> Result<String> {

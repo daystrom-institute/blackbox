@@ -36,6 +36,51 @@ impl OpenAiChatTransport {
             messages: Vec::new(),
         })
     }
+
+    /// Build the Chat Completions request body (pure; no I/O), so the system
+    /// split (leading stable + trailing volatile, neither persisted) is
+    /// unit-testable.
+    fn build_body(&self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Value {
+        let tool_defs: Vec<Value> = tools
+            .iter()
+            .map(|t| {
+                json!({
+                    "type": "function",
+                    "function": {
+                        "name": t.name,
+                        "description": t.description,
+                        "parameters": t.schema,
+                    }
+                })
+            })
+            .collect();
+
+        // System prompt is split: the cache-stable prefix is the leading system
+        // message (so the prefix stays byte-identical and the endpoint's
+        // automatic prefix cache holds); the volatile tail (manifest/nudges) is
+        // a *trailing* system message after the conversation. Both are
+        // per-request only (not stored in self.messages), so resume/edit stays
+        // cheap and the volatile tail never persists into history.
+        let mut msgs: Vec<Value> = Vec::with_capacity(self.messages.len() + 2);
+        if let Some(stable) = opts.system.stable_text() {
+            msgs.push(json!({"role": "system", "content": stable}));
+        }
+        msgs.extend(self.messages.iter().cloned());
+        if let Some(volatile) = opts.system.volatile_text() {
+            msgs.push(json!({"role": "system", "content": volatile}));
+        }
+
+        let mut body = json!({
+            "model": opts.model,
+            "messages": msgs,
+            "max_tokens": opts.max_tokens,
+        });
+        if !tool_defs.is_empty() {
+            body["tools"] = json!(tool_defs);
+            body["tool_choice"] = json!("auto");
+        }
+        body
+    }
 }
 
 #[async_trait]
@@ -59,37 +104,7 @@ impl Transport for OpenAiChatTransport {
     }
 
     async fn run_turn(&mut self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Result<TurnOutput> {
-        let tool_defs: Vec<Value> = tools
-            .iter()
-            .map(|t| {
-                json!({
-                    "type": "function",
-                    "function": {
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.schema,
-                    }
-                })
-            })
-            .collect();
-
-        // System prompt is a leading system message (prepend once per request,
-        // not stored, so resume/edit of system is cheap).
-        let mut msgs: Vec<Value> = Vec::with_capacity(self.messages.len() + 1);
-        if let Some(sys) = &opts.system {
-            msgs.push(json!({"role": "system", "content": sys}));
-        }
-        msgs.extend(self.messages.iter().cloned());
-
-        let mut body = json!({
-            "model": opts.model,
-            "messages": msgs,
-            "max_tokens": opts.max_tokens,
-        });
-        if !tool_defs.is_empty() {
-            body["tools"] = json!(tool_defs);
-            body["tool_choice"] = json!("auto");
-        }
+        let body = self.build_body(tools, opts);
 
         let url = format!("{}/chat/completions", self.base_url);
         let resp = super::http::send_with_retry("openai-chat/completions", || {
@@ -157,5 +172,52 @@ impl Transport for OpenAiChatTransport {
         if let Some(arr) = snapshot.as_array() {
             self.messages = arr.clone();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::SystemPrompt;
+
+    fn transport() -> OpenAiChatTransport {
+        OpenAiChatTransport {
+            http: reqwest::Client::new(),
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            messages: vec![json!({"role": "user", "content": "hi"})],
+        }
+    }
+    fn opts(system: SystemPrompt) -> TurnOpts {
+        TurnOpts { model: "m".into(), max_tokens: 16, system, effort: None, web_search: false }
+    }
+
+    #[test]
+    fn stable_leads_volatile_trails_conversation() {
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("MANIFEST".into()) }),
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        // [ system(stable), user(hi), system(volatile) ] — stable stays the
+        // byte-stable prefix; volatile rides the tail.
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "BASE");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["role"], "system");
+        assert_eq!(msgs[2]["content"], "MANIFEST");
+        // Neither system message was persisted into the buffer.
+        assert_eq!(transport().messages.len(), 1);
+    }
+
+    #[test]
+    fn no_volatile_means_no_trailing_system() {
+        let body = transport()
+            .build_body(&[], &opts(SystemPrompt { stable: Some("BASE".into()), volatile: None }));
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["content"], "BASE");
+        assert_eq!(msgs[1]["role"], "user");
     }
 }
