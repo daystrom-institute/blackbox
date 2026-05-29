@@ -34,7 +34,6 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) allow_recursion: bool,
     pub(crate) allow_tools: Option<Vec<String>>,
     pub(crate) disallow_tools: Option<Vec<String>>,
-    pub(crate) surface: Option<String>,
     pub(crate) allocation_request: Option<orchestration::allocator::RuntimeRequest>,
     pub(crate) project_dir_for_lease: Option<String>,
     pub(crate) ambient_bro_name: Option<String>,
@@ -172,8 +171,7 @@ fn exec_params_runtime_request(
     } else if exec_params_have_runtime(p) {
         request.durable = true;
     }
-    if p.surface.is_some()
-        || p.allow_tools.as_ref().is_some_and(|v| !v.is_empty())
+    if p.allow_tools.as_ref().is_some_and(|v| !v.is_empty())
         || p.disallow_tools.as_ref().is_some_and(|v| !v.is_empty())
         || p.coerce_workspace == Some(true)
     {
@@ -202,7 +200,6 @@ fn allocator_status_runtime_request(
         allow_recursion: None,
         allow_tools: None,
         disallow_tools: None,
-        surface: None,
         coerce_workspace: None,
         tier: p.tier.clone(),
         tier_ladder: p.tier_ladder.clone(),
@@ -344,8 +341,6 @@ impl BlackboxServer {
             request.allow_recursion,
             &task_id,
             extra.as_ref(),
-            request.surface.as_deref(),
-            &self.state.packets.read(),
         )
         .map_err(|e| e.to_string())?;
         args.extend(dispatch_filters.args);
@@ -472,7 +467,6 @@ impl BlackboxServer {
             allow_recursion,
             allow_tools: p.allow_tools.clone(),
             disallow_tools: p.disallow_tools.clone(),
-            surface: p.surface.clone(),
             allocation_request,
             project_dir_for_lease: p.project_dir.clone(),
             ambient_bro_name: p.bro.clone(),
@@ -610,8 +604,6 @@ impl BlackboxServer {
             allow_recursion,
             &task_id,
             extra.as_ref(),
-            p.surface.as_deref(),
-            &self.state.packets.read(),
         ) {
             Ok(df) => df,
             Err(e) => return Self::err_text(&e),
@@ -1273,8 +1265,6 @@ impl BlackboxServer {
                         allow_recursion,
                         &task_id,
                         extra.as_ref(),
-                        None,
-                        &self.state.packets.read(),
                     ) {
                         Ok(df) => df,
                         Err(e) => return Self::err_text(&e),
@@ -1324,8 +1314,6 @@ impl BlackboxServer {
                     allow_recursion,
                     &task_id,
                     extra.as_ref(),
-                    None,
-                    &self.state.packets.read(),
                 ) {
                     Ok(df) => df,
                     Err(e) => return Self::err_text(&e),
@@ -1902,7 +1890,6 @@ mod tests {
             allow_recursion: None,
             allow_tools: None,
             disallow_tools: None,
-            surface: None,
             coerce_workspace: None,
             tier: None,
             tier_ladder: None,
@@ -1964,10 +1951,10 @@ mod tests {
     }
 
     #[test]
-    fn exec_params_runtime_request_derives_tool_use_from_tool_surface() {
+    fn exec_params_runtime_request_derives_tool_use_from_tool_filters() {
         let mut params = params();
         params.tier = Some("standard".into());
-        params.surface = Some("readonly".into());
+        params.disallow_tools = Some(vec!["mcp__blackbox__bro_*".into()]);
         let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
         assert!(
             request

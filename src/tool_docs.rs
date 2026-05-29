@@ -1761,16 +1761,6 @@ pub fn all_tool_names() -> Vec<&'static str> {
     TOOL_DOCS.iter().map(|d| d.name).collect()
 }
 
-/// All tool names from the static TOOL_DOCS catalog, with MCP prefix
-/// prepended. Used as the universe for pattern expansion in surface
-/// filter intersection.
-pub fn all_tool_names_prefixed() -> Vec<String> {
-    let prefix = blackbox_mcp_prefix();
-    TOOL_DOCS
-        .iter()
-        .map(|d| format!("{}{}", prefix, d.name))
-        .collect()
-}
 
 /// Prefixed bro_* tools blocked by the default recursion guard.
 /// `bro_report` is intentionally excluded: it is telemetry, not

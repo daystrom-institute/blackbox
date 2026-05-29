@@ -7,7 +7,6 @@ use crate::orchestration;
 use crate::orchestration as orch;
 use crate::orchestration::TaskStore;
 use crate::orchestration::providers::Provider;
-use crate::packets::Packets;
 
 // ---------------------------------------------------------------------------
 // Progress notifications — MCP progressToken plumbing for blocking waits
@@ -134,53 +133,12 @@ pub(crate) fn combine_dispatch_filters(
     }
 }
 
-/// Evaluate a tool surface against the packet store and return the
-/// resulting `McpFilters`. Returns `None` when surface is `None`
-/// (no surface filtering). Returns `Err` with a denial reason when
-/// the surface verdict is `Deny`.
-fn surface_to_filters(
-    surface: Option<&str>,
-    project_dir: Option<&str>,
-    packets: &Packets,
-) -> Result<Option<orchestration::mcp::McpFilters>, String> {
-    let Some(surface_name) = surface else {
-        return Ok(None);
-    };
-    let entity = crate::server::surface::build_surface_entity(surface_name, project_dir);
-    let decision = crate::server::surface::evaluate_tool_surface(packets, entity, project_dir);
-    match decision.verdict {
-        crate::server::surface::ToolSurfaceVerdict::Deny { reason } => {
-            Err(reason.unwrap_or_else(|| "surface denied".into()))
-        }
-        crate::server::surface::ToolSurfaceVerdict::ToolSurface {
-            allow, disallow, ..
-        } => {
-            let mut filters = orchestration::mcp::McpFilters::default();
-            for p in allow {
-                let normalized = orchestration::mcp::normalize_filter_pattern(&p);
-                if !filters.allow.iter().any(|q| q == &normalized) {
-                    filters.allow.push(normalized);
-                }
-            }
-            for p in disallow {
-                let normalized = orchestration::mcp::normalize_filter_pattern(&p);
-                if !filters.disallow.iter().any(|q| q == &normalized) {
-                    filters.disallow.push(normalized);
-                }
-            }
-            Ok(Some(filters))
-        }
-    }
-}
-
 pub(crate) fn resolve_dispatch_filters(
     provider: Provider,
     project_dir: Option<&str>,
     allow_recursion: bool,
     task_id: &str,
     extra: Option<&orchestration::mcp::McpFilters>,
-    surface: Option<&str>,
-    packets: &crate::packets::Packets,
 ) -> Result<DispatchFilters, String> {
     let global = orchestration::mcp::global_store_path()
         .and_then(|p| orchestration::mcp::McpStore::load(&p).ok())
@@ -195,21 +153,18 @@ pub(crate) fn resolve_dispatch_filters(
         /* include_default_guard */ !allow_recursion,
     );
 
-    // Surface layer: intersect allow (narrows), append disallow (additive).
-    // Inserted between recursion guard and per-dispatch `extra` so surface
-    // constrains what `extra` can reopen.
-    if let Some(surface_filters) = surface_to_filters(surface, project_dir, packets)? {
-        let universe = crate::tool_docs::all_tool_names_prefixed();
-        let universe_refs: Vec<&str> = universe.iter().map(|s| s.as_str()).collect();
-        eff.filters
-            .intersect_allow_from(&surface_filters, &universe_refs);
-    }
-
-    // Per-dispatch overlay merges last (after global, project, default
-    // guard, and surface) so callers can tighten or open the surface for
-    // a single invocation. Disallow patterns in `extra` add to the deny
-    // set; allow patterns add to the allow set. Recursion guard still
-    // wins because allow doesn't override disallow at provider level.
+    // Per-dispatch overlay merges last (after global, project, and the
+    // default recursion guard) so callers can tighten or open the filter set
+    // for a single invocation. Disallow patterns in `extra` add to the deny
+    // set; allow patterns add to the allow set. Recursion guard still wins
+    // because allow doesn't override disallow at provider level.
+    //
+    // NOTE: tool *surface* selection is intentionally NOT handled here. A
+    // surface is a server-side scope selected via the MCP URL `?surface=`
+    // query param; the daemon picks it and the MCP endpoint enforces which
+    // tools are even listed. This function is purely the client-side
+    // allow/deny (recursion guard + brofile + per-dispatch) plane — the two
+    // are orthogonal and must not be interleaved.
     if let Some(extra) = extra {
         eff.filters.merge_from(extra);
     }

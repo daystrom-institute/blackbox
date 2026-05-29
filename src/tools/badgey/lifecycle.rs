@@ -184,8 +184,6 @@ impl BlackboxServer {
             false,
             &task_id,
             Some(&filters),
-            None,
-            &self.state.packets.read(),
         )?;
         let effective_filters = dispatch_filters.filters.clone();
         args.extend(dispatch_filters.args);
@@ -619,8 +617,6 @@ impl BlackboxServer {
             false,
             &task_id,
             brofile_filters.as_ref(),
-            None,
-            &self.state.packets.read(),
         ) {
             Ok(df) => df,
             Err(e) => return Err(e),

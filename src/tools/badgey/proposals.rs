@@ -679,8 +679,6 @@ impl BlackboxServer {
             false,
             task_id,
             brofile_filters.as_ref(),
-            None,
-            &self.state.packets.read(),
         )?;
         args.extend(dispatch_filters.args);
         let task = orch::spawn_with_pre_minted_id(

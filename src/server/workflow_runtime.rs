@@ -127,7 +127,6 @@ impl BlackboxServer {
                     allow_recursion: false,
                     allow_tools: None,
                     disallow_tools: None,
-                    surface: None,
                     allocation_request: runtime,
                     project_dir_for_lease: project_dir.map(String::from),
                     ambient_bro_name: Some(brofile.to_string()),
@@ -197,8 +196,6 @@ impl BlackboxServer {
             false,
             &task_id,
             brofile_filters.as_ref(),
-            None,
-            &self.state.packets.read(),
         ) {
             Ok(df) => df,
             Err(e) => return Err(e),

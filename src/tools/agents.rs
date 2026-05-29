@@ -895,7 +895,6 @@ impl BlackboxServer {
                 allow_recursion: false,
                 allow_tools: None,
                 disallow_tools: None,
-                surface: None,
                 allocation_request: runtime,
                 project_dir_for_lease: p.project_dir.clone(),
                 ambient_bro_name: p.bro.clone(),

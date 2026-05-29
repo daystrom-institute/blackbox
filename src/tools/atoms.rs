@@ -616,8 +616,6 @@ impl BlackboxServer {
             false,
             &task_id_new,
             brofile_filters.as_ref(),
-            None,
-            &self.state.packets.read(),
         ) {
             Ok(df) => df,
             Err(e) => return Err(format!("dispatch filter resolution failed: {e}")),

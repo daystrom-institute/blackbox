@@ -34,11 +34,6 @@ pub(crate) struct ExecParams {
     /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
-    /// MCP tool surface name. When set, the dispatch evaluates the named
-    /// surface against the routing packet store and restricts the spawned
-    /// agent's tool catalog accordingly.
-    #[serde(default)]
-    pub(crate) surface: Option<String>,
     /// Override the brofile's `coerce_workspace` setting for this dispatch.
     /// When true, injects the workspace-tools appendix into the ambient
     /// prefix. When false or absent, defers to the brofile setting.
@@ -120,10 +115,6 @@ pub(crate) struct ResumeParams {
     /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
-    /// MCP tool surface name. When set, the resumed agent's tool catalog
-    /// is restricted according to the named surface's routing packet.
-    #[serde(default)]
-    pub(crate) surface: Option<String>,
     /// Override the brofile's `coerce_workspace` setting for this resume.
     /// When true, injects the workspace-tools appendix into the ambient
     /// prefix. When false or absent, defers to the brofile setting.
