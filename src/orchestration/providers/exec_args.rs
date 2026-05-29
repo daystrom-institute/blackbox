@@ -11,8 +11,12 @@ impl Provider {
 
     fn bin_with_env(&self) -> String {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
-                std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into())
+            Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
+            // GLM/DeepSeek/Brodex ride the custom harness instead of a vendor
+            // CLI; transport + credentials are selected via env (see
+            // brofile::resolve_provider_env).
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+                std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
             }
             Provider::Inception => {
                 std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
@@ -27,10 +31,13 @@ impl Provider {
 
     pub fn bin_with_config(&self, cfg: &ProviderConfig) -> String {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => cfg
+            Provider::Claude => cfg
                 .claude_bin
                 .clone()
                 .unwrap_or_else(|| self.bin_with_env()),
+            // Harness providers resolve via BRO_HARNESS_BIN (bin_with_env);
+            // no dedicated config override today.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => self.bin_with_env(),
             Provider::Inception => cfg
                 .opencode_bin
                 .clone()
@@ -183,7 +190,7 @@ impl Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
                 let mut args = vec![
                     "-p".into(),
                     prompt.into(),
@@ -316,7 +323,7 @@ impl Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
                 let mut args = vec![
                     "--resume".into(),
                     session_id.into(),

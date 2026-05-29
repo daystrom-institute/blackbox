@@ -463,6 +463,11 @@ fn default_opencode_env(
     env
 }
 
+/// Harness env for the Anthropic-transport providers (GLM, DeepSeek). These
+/// no longer run the `claude` CLI; they run `bro-harness`, which reads
+/// `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` from its own env. We lift
+/// those out of the operator's existing `~/.claude-{zai,ds}/settings.json`
+/// `env` block (the same credentials the CLI used) and select the transport.
 fn default_claude_compatible_env(
     provider: Provider,
     home_dir: &Path,
@@ -472,10 +477,22 @@ fn default_claude_compatible_env(
         Provider::Deepseek => ".claude-ds",
         _ => return None,
     };
-    Some(HashMap::from([(
-        "CLAUDE_CONFIG_DIR".to_string(),
-        home_dir.join(rel_path).to_string_lossy().into_owned(),
-    )]))
+    let mut env = HashMap::from([(
+        "BRO_HARNESS_TRANSPORT".to_string(),
+        "anthropic".to_string(),
+    )]);
+
+    let settings = home_dir.join(rel_path).join("settings.json");
+    if let Ok(body) = std::fs::read_to_string(&settings)
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
+    {
+        for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            if let Some(val) = v["env"][key].as_str() {
+                env.insert(key.to_string(), val.to_string());
+            }
+        }
+    }
+    Some(env)
 }
 
 fn normalized_account_suffix(name: &str) -> Option<String> {
@@ -519,7 +536,8 @@ fn synthesized_account_env_for_home(
 
     let (env_key, rel_path) = match provider {
         Provider::Claude => ("CLAUDE_CONFIG_DIR", format!(".claude{suffix}")),
-        Provider::Codex => ("CODEX_HOME", format!(".codex{suffix}")),
+        // Codex and Brodex both ride the Codex/ChatGPT config dir.
+        Provider::Codex | Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
         // `gh` respects GH_CONFIG_DIR; keep the same account suffix pattern.
         Provider::Copilot => ("GH_CONFIG_DIR", format!(".config/gh{suffix}")),
         Provider::Glm
@@ -563,6 +581,13 @@ fn resolve_provider_env_inner(
             .as_deref()
             .and_then(|home| default_claude_compatible_env(provider, home))
             .unwrap_or_default(),
+        // Brodex rides the harness on the OpenAI Responses transport against
+        // the Codex/ChatGPT backend; CODEX_HOME (for OAuth) is supplied by the
+        // account-env synthesis below, defaulting to ~/.codex in the harness.
+        Provider::Brodex => HashMap::from([(
+            "BRO_HARNESS_TRANSPORT".to_string(),
+            "openai-responses".to_string(),
+        )]),
         Provider::Inception => {
             default_opencode_env(provider, store_dir, model, suppress_instructions)
         }
@@ -1269,11 +1294,13 @@ mod tests {
             resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-zai"))
+        // GLM now rides bro-harness on the Anthropic transport, not the
+        // claude CLI; it selects the transport rather than CLAUDE_CONFIG_DIR.
+        assert_eq!(
+            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
+            Some("anthropic")
         );
+        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
     }
 
     #[test]
@@ -1488,11 +1515,27 @@ mod tests {
             resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
         assert!(!resolved.contains_key("OPENCODE_CONFIG"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-ds"))
+        // DeepSeek now rides bro-harness on the Anthropic transport.
+        assert_eq!(
+            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
+            Some("anthropic")
         );
+        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_brodex_selects_responses_transport() {
+        let store = temp_store();
+        let home = temp_store();
+        let resolved = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Brodex, None, None, store.path(), None).unwrap()
+        });
+        assert_eq!(
+            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
+            Some("openai-responses")
+        );
+        // No OPENAI_API_KEY → harness uses Codex ChatGPT OAuth from CODEX_HOME.
+        assert!(!resolved.contains_key("OPENAI_API_KEY"));
     }
 
     #[test]

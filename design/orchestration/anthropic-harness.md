@@ -14,8 +14,12 @@ brief: "A minimal headless coding agent that speaks provider APIs directly (Anth
 > **Status note.** Began as an Anthropic-only harness; now generalized to a
 > three-transport design behind a common `Transport` interface (the "AgentSDK
 > echo"). All three transports are implemented and verified live end-to-end
-> (2026-05-29) — see the *Transport interface* section. Daemon-side wiring is
-> still pending.
+> (2026-05-29). Daemon wiring is **done**: `glm`/`deepseek` resolve to
+> `bro-harness` on the Anthropic transport, and a new `brodex` provider rides
+> the OpenAI Responses transport (Codex/ChatGPT backend) while the existing
+> `codex` → codex-CLI path is preserved unchanged. Remaining: live in-daemon
+> dispatch validation (needs `bro-harness` installed / `BRO_HARNESS_BIN`),
+> optional SSE streaming, MCP pooling, wire-contract test.
 
 ## Problem
 

@@ -22,7 +22,7 @@ pub(super) fn models_for(provider: Provider) -> &'static [ModelInfo] {
         Provider::Glm => GLM_MODELS,
         Provider::Deepseek => DEEPSEEK_MODELS,
         Provider::Inception => INCEPTION_MODELS,
-        Provider::Codex => CODEX_MODELS,
+        Provider::Codex | Provider::Brodex => CODEX_MODELS,
         Provider::Copilot => COPILOT_MODELS,
         Provider::Vibe => VIBE_MODELS,
         Provider::Gemini => GEMINI_MODELS,
@@ -34,7 +34,7 @@ pub(super) fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
         Provider::Claude | Provider::Glm | Provider::Deepseek => CLAUDE_EFFORTS,
         Provider::Inception => OPENCODE_VARIANTS,
-        Provider::Codex => CODEX_EFFORTS,
+        Provider::Codex | Provider::Brodex => CODEX_EFFORTS,
         Provider::Copilot => COPILOT_EFFORTS,
         _ => &[],
     }

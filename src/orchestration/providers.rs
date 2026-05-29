@@ -53,6 +53,10 @@ pub enum Provider {
     Deepseek,
     Inception,
     Codex,
+    /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
+    /// transport) instead of the `codex` CLI. Distinct provider so the
+    /// existing `codex` → codex-CLI path is preserved unchanged.
+    Brodex,
     Copilot,
     Vibe,
     Gemini,
@@ -108,6 +112,7 @@ impl Provider {
         Provider::Deepseek,
         Provider::Inception,
         Provider::Codex,
+        Provider::Brodex,
         Provider::Copilot,
         Provider::Vibe,
         Provider::Gemini,
@@ -124,6 +129,11 @@ impl Provider {
         let v: &[Capability] = match self {
             Provider::Claude => &[StructuredOutput, Vision, LongContext, ToolUse, Resume],
             Provider::Codex => &[StructuredOutput, ToolUse, Resume],
+            // Codex/ChatGPT backend via bro-harness (Responses transport).
+            // Tool use + resume (transcript persistence). Structured output is
+            // not yet implemented in the harness, so it is intentionally
+            // absent (fail-closed per the RX-V capability invariants).
+            Provider::Brodex => &[ToolUse, Resume],
             Provider::Glm => &[ToolUse, Resume],
             Provider::Deepseek => &[ToolUse, Resume],
             Provider::Inception => &[ToolUse, Resume],
@@ -142,6 +152,7 @@ impl Provider {
             Provider::Deepseek => "deepseek",
             Provider::Inception => "inception",
             Provider::Codex => "codex",
+            Provider::Brodex => "brodex",
             Provider::Copilot => "copilot",
             Provider::Vibe => "vibe",
             Provider::Gemini => "gemini",
@@ -157,6 +168,7 @@ impl Provider {
                 | Provider::Deepseek
                 | Provider::Inception
                 | Provider::Codex
+                | Provider::Brodex
                 | Provider::Copilot
                 | Provider::Vibe
                 | Provider::Gemini
@@ -171,6 +183,7 @@ impl Provider {
                 | Provider::Deepseek
                 | Provider::Inception
                 | Provider::Codex
+                | Provider::Brodex
                 | Provider::Copilot
         )
     }

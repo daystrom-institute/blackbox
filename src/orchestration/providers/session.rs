@@ -449,9 +449,11 @@ impl Provider {
     /// can't be found locally.
     pub fn resolve_session_cwd(&self, session_id: &str) -> Option<std::path::PathBuf> {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
-                resolve_claude_session_cwd(session_id)
-            }
+            Provider::Claude => resolve_claude_session_cwd(session_id),
+            // Harness providers persist sessions in their own store
+            // (~/.bro-harness), not the claude projects dir; no cwd-aware
+            // discovery, so resume needs an explicit project_dir.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
             Provider::Inception => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),

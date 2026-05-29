@@ -614,16 +614,19 @@ fn test_mcp_add_args_shape_per_provider() {
     assert!(c.contains(&"blackbox".to_string()));
     assert!(c.contains(&u.to_string()));
 
-    let glm = Provider::Glm
-        .build_mcp_add_http_args("blackbox", u, &[])
-        .unwrap();
-    assert_eq!(&glm[..4], &["mcp", "add", "-s", "user"]);
-    assert!(glm.contains(&"--transport".to_string()));
-
-    let ds = Provider::Deepseek
-        .build_mcp_add_http_args("blackbox", u, &[])
-        .unwrap();
-    assert_eq!(&ds[..4], &["mcp", "add", "-s", "user"]);
+    // GLM/DeepSeek/Brodex ride bro-harness with transient inline --mcp-config;
+    // they have no vendor-CLI `mcp add` subcommand.
+    assert!(Provider::Glm.build_mcp_add_http_args("blackbox", u, &[]).is_none());
+    assert!(
+        Provider::Deepseek
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .is_none()
+    );
+    assert!(
+        Provider::Brodex
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .is_none()
+    );
 
     let co = Provider::Copilot
         .build_mcp_add_http_args("blackbox", u, &[])
@@ -928,7 +931,7 @@ fn test_build_mcp_add_http_args_full_threads_headers() {
 
 #[test]
 fn test_scoped_arg_builders_honor_scope_capability() {
-    // Claude-compatible providers + Gemini support both user and project.
+    // Claude + Gemini support both user and project vendor-CLI mcp add.
     assert!(
         Provider::Claude
             .build_mcp_add_http_args_scoped("x", "u", &[], "user")
@@ -939,15 +942,16 @@ fn test_scoped_arg_builders_honor_scope_capability() {
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
             .is_some()
     );
+    // GLM/DeepSeek now ride bro-harness — no vendor-CLI mcp add at any scope.
     assert!(
         Provider::Glm
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some()
+            .is_none()
     );
     assert!(
         Provider::Deepseek
-            .build_mcp_add_http_args_scoped("x", "u", &[], "project")
-            .is_some()
+            .build_mcp_add_http_args_scoped("x", "u", &[], "user")
+            .is_none()
     );
     assert!(
         Provider::Gemini

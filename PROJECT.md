@@ -140,9 +140,19 @@ The provider catalog is code-owned in `src/orchestration/providers.rs`. Do not
 copy full model inventories into `PROJECT.md`; they go stale. Keep this file to
 routing facts:
 
-- Claude, GLM, and DeepSeek dispatch through Claude Code transport.
+- Claude dispatches through the Claude Code CLI.
+- GLM, DeepSeek, and Brodex dispatch through `bro-harness` (the custom
+  provider harness, `crates/bro-harness`): GLM/DeepSeek on the Anthropic
+  transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
+  backend). The harness emits the Claude stream-json envelope, so it slots
+  into the existing dispatch seam. Needs `bro-harness` on PATH or
+  `BRO_HARNESS_BIN`; transport + credentials are selected via env in
+  `brofile::resolve_provider_env`. See
+  `design/orchestration/anthropic-harness.md`.
+- Codex dispatches through the codex CLI — a path distinct from Brodex
+  (`codex` → codex CLI; `brodex` → bro-harness/Responses), preserved unchanged.
 - Inception dispatches through OpenCode transport.
-- Codex, Copilot, Vibe, and Gemini each have provider-specific arg builders.
+- Copilot, Vibe, and Gemini each have provider-specific arg builders.
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 
 Dispatch-capable providers apply a mechanical recursion guard for recursive

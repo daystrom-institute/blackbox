@@ -35,7 +35,7 @@ impl Provider {
         scope: &str,
     ) -> Option<Vec<String>> {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+            Provider::Claude => {
                 let scope_flag = match scope {
                     "user" | "project" | "local" => scope,
                     _ => return None,
@@ -116,6 +116,9 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
+            // Harness providers (glm/deepseek/brodex) use transient inline
+            // --mcp-config injection, not vendor-CLI mcp add/remove/list.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
             Provider::Vibe | Provider::Workflow => None,
         }
     }
@@ -126,7 +129,7 @@ impl Provider {
 
     pub fn build_mcp_remove_args_scoped(&self, name: &str, scope: &str) -> Option<Vec<String>> {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+            Provider::Claude => {
                 let scope_flag = match scope {
                     "user" | "project" | "local" => scope,
                     _ => return None,
@@ -171,6 +174,9 @@ impl Provider {
                     name.into(),
                 ])
             }
+            // Harness providers (glm/deepseek/brodex) use transient inline
+            // --mcp-config injection, not vendor-CLI mcp add/remove/list.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
             Provider::Vibe | Provider::Workflow => None,
         }
     }
@@ -178,9 +184,7 @@ impl Provider {
     #[allow(dead_code)]
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
-                Some(vec!["mcp".into(), "list".into()])
-            }
+            Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
             Provider::Inception => None,
             Provider::Copilot => Some(vec![
                 "copilot".into(),
@@ -190,6 +194,9 @@ impl Provider {
             ]),
             Provider::Codex => Some(vec!["mcp".into(), "list".into()]),
             Provider::Gemini => Some(vec!["mcp".into(), "list".into()]),
+            // Harness providers (glm/deepseek/brodex) use transient inline
+            // --mcp-config injection, not vendor-CLI mcp add/remove/list.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
             Provider::Vibe | Provider::Workflow => None,
         }
     }
@@ -212,7 +219,7 @@ impl Provider {
         }
         let mut args = Vec::new();
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek => {
+            Provider::Claude => {
                 let expanded = expand_filter_patterns(&filters.disallow);
                 if !expanded.is_empty() {
                     args.push("--disallowedTools".into());
@@ -224,7 +231,13 @@ impl Provider {
                     args.push(expanded_allow.join(" "));
                 }
             }
-            Provider::Inception => {}
+            // Harness providers do tool gating via their own deferral/pin
+            // layer (BRO_HARNESS_PIN_TOOLS), not vendor-CLI filter flags — and
+            // the harness CLI rejects --allowedTools, so emit nothing here.
+            Provider::Inception
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Brodex => {}
             Provider::Copilot => {
                 for p in expand_filter_patterns(&filters.disallow) {
                     args.push(format!(
