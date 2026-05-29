@@ -451,6 +451,23 @@ both.
 - **In-process future**: because tools live in `crates/bro-tools` and are
   provider-agnostic, a later in-process executor can reuse them without
   touching the subprocess path.
+- **Output compaction (RTK) — deferred (2026-05-29).** Idea: bake
+  RTK-style (`rtk-ai/rtk`) token-saving output compaction into our tools at
+  the *output* layer (never the command layer), eliminating the hook's
+  command-rewrite mangling class by construction. Investigation found rtk's
+  per-command filtering is *coupled to execution* (`runner::run` +
+  large `cmds/*` modules, e.g. `git.rs` ~102KB), with no exposed
+  `filter(argv, captured) -> String` dispatch; rtk also only handles
+  recognized *single* commands, not arbitrary shell lines. So a clean
+  in-process lib needs a sizable refactor (high upstream-merge friction for a
+  vendored fork). Realistic path if revisited: vendor rtk as an in-tree fork
+  (`git subtree`, track upstream `develop`), mutate minimally
+  (`lib.rs` re-export + telemetry-off), and invoke it as a subprocess for
+  recognized single commands only (compound/piped → raw), always with a
+  `raw` bypass + full-output tee. The historical content-substitution
+  mangling (`HOME`→`n`) appears fixed in rtk 0.40.0; the command-rewrite
+  mangling is inherent to the *hook* and is avoided by direct argv
+  invocation. Deferred in favor of MCP client + remaining tool bodies.
 
 ## Validation plan
 
