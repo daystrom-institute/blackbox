@@ -2,16 +2,21 @@
 //! observe turn state and contribute *ambient meta* (nudges) steering the model
 //! toward the rich blackbox toolbox. Nudges never gate or remove tools.
 //!
-//! This is §2 of design/orchestration/bro-harness-hooks.md: the scaffold +
-//! ledger + the two delivery mechanisms + one trivial rule + adoption logging.
+//! See design/orchestration/bro-harness-hooks.md: the scaffold + gating ledger
+//! + the two delivery mechanisms + the shipped rule set.
+//!
+//! Adoption is deliberately *not* tracked here. Whether a nudge was adopted (or
+//! declined, with or without a gap note) is a retrospective query over the
+//! indexed tool-call transcript corpus — which already logs every call and
+//! contains the `<harness-note>` rider itself. See bro-harness-hooks.md §6.
 //!
 //! Shape (separation of concerns):
 //! - A [`Hook`] is a pure matcher: given turn state it returns [`Candidate`]s.
 //!   Hooks hold no state and never see the ledger, so their triggers are
 //!   trivially unit-testable.
 //! - The [`HookEngine`] owns the [`NudgeLedger`], applies the one-time / cooldown
-//!   gate, ranks, caps to **one nudge per turn**, records fired events for
-//!   adoption tracking, and hands back the [`Nudge`]s to deliver.
+//!   gate, ranks, caps to **one nudge per turn**, and hands back the [`Nudge`]s
+//!   to deliver.
 //! - The agent loop routes a [`Nudge`] by its [`Delivery`]: a `Rider` is appended
 //!   to an existing tool_result (persists, contextual → one-time signposts); a
 //!   `SystemTail` is dropped into the next turn's volatile (uncached) system
@@ -26,10 +31,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
-
-/// How long (in turns) after a nudge fires we still credit its target tools
-/// being called as "adoption".
-const ADOPTION_WINDOW_TURNS: u64 = 4;
 
 /// Appended to every delivered nudge — the adopt-or-explain half of the
 /// feedback loop. An agent that declines the steer should say *why* via a gap
@@ -69,8 +70,6 @@ pub struct Candidate {
     pub message: String,
     pub delivery: Delivery,
     pub kind: NudgeKind,
-    /// Tools we're steering toward; used for adoption tracking.
-    pub targets: Vec<String>,
     /// Higher wins when several candidates match the same turn.
     pub priority: u8,
 }
@@ -81,7 +80,6 @@ pub struct Nudge {
     pub rule_id: String,
     pub message: String,
     pub delivery: Delivery,
-    pub targets: Vec<String>,
 }
 
 impl Nudge {
@@ -92,27 +90,21 @@ impl Nudge {
     }
 }
 
-/// A fired-nudge record for the adoption feedback loop.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AdoptionEntry {
-    pub rule_id: String,
-    pub fired_turn: u64,
-    pub targets: Vec<String>,
-    /// A target tool was called within the adoption window after firing.
-    pub adopted: bool,
-}
-
-/// Persisted nudge state. Rides the session `side` cell (see `from_side` /
-/// `to_side`), so one-time signposts stay fired and cooldowns persist across
-/// `exec → resume`.
+/// Persisted nudge *gating* state. Rides the session `side` cell (see
+/// `from_side` / `to_side`), so one-time signposts stay fired and cooldowns
+/// persist across `exec → resume`.
+///
+/// Note: there is deliberately **no** adoption/telemetry record here. Whether a
+/// nudge was adopted — or declined, with or without a gap note — is a
+/// retrospective query over the indexed tool-call transcript corpus (which
+/// already logs every call and contains the `<harness-note>` rider itself), not
+/// per-session state the harness duplicates. See bro-harness-hooks.md §6.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct NudgeLedger {
     /// Signpost rule_ids that have already fired — never repeat.
     fired: HashSet<String>,
     /// Periodic rule_id -> turns remaining before it may fire again.
     cooldown: HashMap<String, u64>,
-    /// Fired events + whether the steered-toward tool was adopted.
-    log: Vec<AdoptionEntry>,
 }
 
 impl NudgeLedger {
@@ -144,33 +136,6 @@ impl NudgeLedger {
         for v in self.cooldown.values_mut() {
             *v = v.saturating_sub(1);
         }
-    }
-
-    fn record_fired(&mut self, n: &Nudge, turn: u64) {
-        self.log.push(AdoptionEntry {
-            rule_id: n.rule_id.clone(),
-            fired_turn: turn,
-            targets: n.targets.clone(),
-            adopted: false,
-        });
-    }
-
-    /// Credit adoption: a steered-toward tool was called this turn. Marks any
-    /// still-open fired entry whose targets include `tool` within the window.
-    fn observe_tool_call(&mut self, tool: &str, turn: u64) {
-        for e in self.log.iter_mut() {
-            if !e.adopted
-                && turn.saturating_sub(e.fired_turn) <= ADOPTION_WINDOW_TURNS
-                && e.targets.iter().any(|t| t == tool)
-            {
-                e.adopted = true;
-            }
-        }
-    }
-
-    /// (fired, adopted) counts — the headline adoption signal.
-    pub fn adoption_summary(&self) -> (usize, usize) {
-        (self.log.len(), self.log.iter().filter(|e| e.adopted).count())
     }
 }
 
@@ -222,41 +187,33 @@ impl HookEngine {
     pub fn to_side(&self) -> Value {
         self.ledger.to_side()
     }
-    pub fn adoption_summary(&self) -> (usize, usize) {
-        self.ledger.adoption_summary()
-    }
-
-    /// Credit a dispatched tool call toward any open fired nudges.
-    pub fn observe_tool_call(&mut self, tool: &str, turn: u64) {
-        self.ledger.observe_tool_call(tool, turn);
-    }
 
     /// Decrement cooldowns at the end of a turn.
     pub fn tick(&mut self) {
         self.ledger.tick();
     }
 
-    pub fn on_user_turn(&mut self, prompt: &str, turn: u64) -> Vec<Nudge> {
+    pub fn on_user_turn(&mut self, prompt: &str) -> Vec<Nudge> {
         let cands: Vec<Candidate> = self.hooks.iter().flat_map(|h| h.on_user_turn(prompt)).collect();
-        self.admit(cands, turn)
+        self.admit(cands)
     }
 
-    pub fn on_assistant_turn(&mut self, text: &str, calls: &[ToolCall], turn: u64) -> Vec<Nudge> {
+    pub fn on_assistant_turn(&mut self, text: &str, calls: &[ToolCall]) -> Vec<Nudge> {
         let cands: Vec<Candidate> =
             self.hooks.iter().flat_map(|h| h.on_assistant_turn(text, calls)).collect();
-        self.admit(cands, turn)
+        self.admit(cands)
     }
 
-    pub fn on_tool_result(&mut self, call: &ToolCall, result: &ToolResult, turn: u64) -> Vec<Nudge> {
+    pub fn on_tool_result(&mut self, call: &ToolCall, result: &ToolResult) -> Vec<Nudge> {
         let cands: Vec<Candidate> =
             self.hooks.iter().flat_map(|h| h.on_tool_result(call, result)).collect();
-        self.admit(cands, turn)
+        self.admit(cands)
     }
 
     /// Gate → rank → cap-to-one. Returns the single highest-priority candidate
     /// that passes its ledger gate (one nudge per turn; the rest are dropped
-    /// this turn). Records the fired nudge for adoption tracking.
-    fn admit(&mut self, mut cands: Vec<Candidate>, turn: u64) -> Vec<Nudge> {
+    /// this turn).
+    fn admit(&mut self, mut cands: Vec<Candidate>) -> Vec<Nudge> {
         // Deterministic ranking: priority desc, then rule_id for stable ties.
         cands.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.rule_id.cmp(&b.rule_id)));
         for c in cands {
@@ -269,9 +226,7 @@ impl HookEngine {
                     rule_id: c.rule_id,
                     message: format!("{}{GAP_NOTE_DIRECTIVE}", c.message),
                     delivery: c.delivery,
-                    targets: c.targets,
                 };
-                self.ledger.record_fired(&n, turn);
                 tracing::info!(rule = %n.rule_id, ?n.delivery, "nudge fired");
                 return vec![n];
             }
@@ -294,7 +249,7 @@ impl ShellGrepHook {
         // Look past leading env assignments / `time` etc. only minimally: take
         // the first bare word. Conservative on purpose — false positives are
         // worse than misses for a nudge.
-        let first = command.trim_start().split_whitespace().next().unwrap_or("");
+        let first = command.split_whitespace().next().unwrap_or("");
         // Strip a leading path (e.g. /usr/bin/grep) to the basename.
         let base = first.rsplit('/').next().unwrap_or(first);
         matches!(base, "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" | "find")
@@ -318,7 +273,6 @@ impl Hook for ShellGrepHook {
                 .into(),
             delivery: Delivery::Rider,
             kind: NudgeKind::Periodic { cooldown: 6 },
-            targets: vec!["bbox_code_query".into(), "bbox_hybrid_search".into()],
             priority: 10,
         }]
     }
@@ -397,7 +351,6 @@ impl Hook for CopyPasteHook {
                         .into(),
                     delivery: Delivery::Rider,
                     kind: NudgeKind::Periodic { cooldown: 8 },
-                    targets: vec!["bbox_slice_copy".into(), "bbox_slice_move".into()],
                     priority: 20,
                 }]
             }
@@ -440,7 +393,6 @@ impl RefactorSignpostHook {
                 .into(),
             delivery: Delivery::SystemTail,
             kind: NudgeKind::Signpost,
-            targets: vec!["bbox_knowledge".into(), "bbox_refactor_plan".into()],
             priority: 8,
         }]
     }
@@ -485,7 +437,6 @@ impl Hook for HedgedConventionHook {
                 .into(),
             delivery: Delivery::SystemTail,
             kind: NudgeKind::Periodic { cooldown: 10 },
-            targets: vec!["bbox_knowledge".into(), "bbox_hybrid_search".into()],
             priority: 5,
         }]
     }
@@ -531,7 +482,6 @@ mod tests {
                     message: "m".into(),
                     delivery: Delivery::SystemTail,
                     kind: NudgeKind::Signpost,
-                    targets: vec![],
                     priority: self.1,
                 }]
             }
@@ -541,15 +491,15 @@ mod tests {
             NudgeLedger::default(),
         );
         // Two candidates, capped to one — the higher priority wins.
-        let first = eng.on_user_turn("hi", 0);
+        let first = eng.on_user_turn("hi");
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].rule_id, "high");
-        // Signpost already fired; next turn "high" is gated out, "low" wins.
-        let second = eng.on_user_turn("hi", 1);
+        // Signpost already fired; next call "high" is gated out, "low" wins.
+        let second = eng.on_user_turn("hi");
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].rule_id, "low");
         // Both fired once now → nothing left.
-        assert!(eng.on_user_turn("hi", 2).is_empty());
+        assert!(eng.on_user_turn("hi").is_empty());
     }
 
     #[test]
@@ -564,54 +514,17 @@ mod tests {
     }
 
     #[test]
-    fn adoption_credits_target_within_window() {
-        let mut l = NudgeLedger::default();
-        let n = Nudge {
-            rule_id: "r".into(),
-            message: "m".into(),
-            delivery: Delivery::Rider,
-            targets: vec!["bbox_code_query".into()],
-        };
-        l.record_fired(&n, 0);
-        assert_eq!(l.adoption_summary(), (1, 0));
-        // Unrelated tool, then the target within the window.
-        l.observe_tool_call("file_read", 1);
-        assert_eq!(l.adoption_summary(), (1, 0));
-        l.observe_tool_call("bbox_code_query", 2);
-        assert_eq!(l.adoption_summary(), (1, 1));
-    }
-
-    #[test]
-    fn adoption_ignores_target_after_window() {
-        let mut l = NudgeLedger::default();
-        let n = Nudge {
-            rule_id: "r".into(),
-            message: "m".into(),
-            delivery: Delivery::Rider,
-            targets: vec!["bbox_code_query".into()],
-        };
-        l.record_fired(&n, 0);
-        l.observe_tool_call("bbox_code_query", ADOPTION_WINDOW_TURNS + 1);
-        assert_eq!(l.adoption_summary(), (1, 0));
-    }
-
-    #[test]
-    fn ledger_round_trips_through_side() {
+    fn gating_state_round_trips_through_side() {
+        // Only gating state persists — fired-once set + cooldowns. (Adoption is
+        // a transcript query, not harness state; nothing to round-trip there.)
         let mut l = NudgeLedger::default();
         l.try_fire_once("a");
         l.try_fire_periodic("b", 3);
-        let n = Nudge {
-            rule_id: "a".into(),
-            message: "m".into(),
-            delivery: Delivery::Rider,
-            targets: vec!["t".into()],
-        };
-        l.record_fired(&n, 0);
-        let restored = NudgeLedger::from_side(&l.to_side());
+        let mut r = NudgeLedger::from_side(&l.to_side());
         // Fired-once dedup survives resume.
-        let mut r = restored;
         assert!(!r.try_fire_once("a"));
-        assert_eq!(r.adoption_summary(), (1, 0));
+        // Cooldown survives resume (still armed → won't re-fire).
+        assert!(!r.try_fire_periodic("b", 3));
     }
 
     // ── §3 rule tests ──────────────────────────────────────────────────
@@ -685,13 +598,13 @@ mod tests {
         impl Hook for Hi {
             fn on_assistant_turn(&self, _: &str, _: &[ToolCall]) -> Vec<Candidate> {
                 vec![
-                    Candidate { rule_id: "lex".into(), message: "m".into(), delivery: Delivery::SystemTail, kind: NudgeKind::Signpost, targets: vec![], priority: 8 },
-                    Candidate { rule_id: "beh".into(), message: "m".into(), delivery: Delivery::Rider, kind: NudgeKind::Signpost, targets: vec![], priority: 20 },
+                    Candidate { rule_id: "lex".into(), message: "m".into(), delivery: Delivery::SystemTail, kind: NudgeKind::Signpost, priority: 8 },
+                    Candidate { rule_id: "beh".into(), message: "m".into(), delivery: Delivery::Rider, kind: NudgeKind::Signpost, priority: 20 },
                 ]
             }
         }
         let mut eng = HookEngine::new(vec![Box::new(Hi)], NudgeLedger::default());
-        let out = eng.on_assistant_turn("t", &[], 1);
+        let out = eng.on_assistant_turn("t", &[]);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rule_id, "beh");
     }
@@ -701,7 +614,7 @@ mod tests {
         // Every delivered nudge — regardless of rule — gets the gap-note
         // directive appended once at the engine choke point.
         let mut eng = HookEngine::new(vec![Box::new(ShellGrepHook)], NudgeLedger::default());
-        let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result(), 1);
+        let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result());
         assert_eq!(out.len(), 1);
         let msg = &out[0].message;
         assert!(msg.contains("bbox_note"), "directive names the gap-note tool");

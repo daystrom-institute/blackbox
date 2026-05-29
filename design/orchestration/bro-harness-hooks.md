@@ -231,9 +231,12 @@ it back at save (`:66`, `:166`). The ledger rides the same path:
 NudgeLedger {
   fired:    Set<rule_id>,          // one-time signposts never repeat across exec→resume
   cooldown: Map<rule_id, turns_remaining>,  // periodic debounce
-  log:      Vec<{rule_id, fired_turn, target}>,  // adoption instrumentation (§6)
 }
 ```
+
+This is **gating state only** — what a rule needs to decide whether to fire
+again. There is deliberately no adoption/telemetry record here: whether a nudge
+was adopted is a transcript query (§6), not state the harness duplicates.
 
 Seed it next to `todos` at open; flush it next to `todos` at save. No session
 signature churn — `side` is exactly the "future durable side-cells don't churn
@@ -253,12 +256,26 @@ signal channel, not a progress log:
   the model to discard.
 - **Cooldown + fired-ledger.** Nothing repeats inside its window or across
   resume.
-- **Adoption instrumentation closes the loop.** Log `nudge_fired(rule, turn)`,
-  then check whether the steered-toward tool is called within K turns. This is
-  itself just another hook on the same points. It turns the operator's
-  hypothesis into a falsifiable, A/B-able claim: a rule whose target is adopted
-  after firing is earning its keep; a rule that gets one perfunctory call then
-  fallback (or no call) is noise and gets pruned. Surfaceable via `bro_report`.
+- **Adoption is a transcript query, not harness state.** This project *is* a
+  complete, indexed log of every tool call ever made (`transcripts/` normalizes
+  each event into `NormalizedTranscriptEvent{ tool_call }`; every dispatch is
+  bound to a `TranscriptLocation`). The nudge firing is in that same log — the
+  `<harness-note>` rider lives in the conversation transcript. So adoption is a
+  retrospective **query/projection over the corpus**, not a counter the harness
+  maintains. For each session where a rule fired (anchor on the rider text),
+  scan the subsequent `ToolUse` events and classify into three outcomes:
+  - a steered-toward tool is called → **adopted** (the tool earns its keep);
+  - a `bbox_note(kind="followup")` gap note appears → **declined with feedback**
+    (actionable signal — see the adopt-or-explain directive below);
+  - neither — another manual `shell_run` grep, another verbatim `file_write` →
+    **declined silently**, the "called the built-in but filed no gap note" case,
+    i.e. the WHY a rule isn't landing.
+  Aggregate across sessions → per-rule adopt / feedback / silent rates, run on
+  demand via the retrieval surface (`bbox_search` / `bbox_messages` / the graph).
+  This is what makes the operator's hypothesis falsifiable and A/B-able, with
+  **zero** duplicated telemetry in the harness. (An earlier draft proposed an
+  in-harness `(fired, adopted)` counter + `bro_report`; that was a redundant,
+  inferior re-implementation of the corpus and was removed.)
 - **Adopt-or-explain — the decline path is a gap note.** Every delivered nudge
   carries a shared directive: if the agent declines the steer *because the tool
   is deficient* (buggy, missing a capability, wrong-shaped), it should not
@@ -280,9 +297,10 @@ signal channel, not a progress log:
 1. **§1 system-prefix split.** Correctness fix; land independently.
    `compose_system → (static, volatile)`; transports render two segments;
    `cache_control` on the static segment only.
-2. **Hook scaffold + ledger.** The three hook points, `HookCtx`, the `nudges`
-   `side` cell, and the two delivery mechanisms — with **one** trivial rule and
-   adoption logging, to prove the plumbing and the feedback loop.
+2. **Hook scaffold + ledger.** The three hook points, the `nudges` `side` cell
+   (gating state only — fired-set + cooldowns), and the two delivery
+   mechanisms — with **one** trivial rule, to prove the plumbing. Adoption is
+   not instrumented in the harness; it is the transcript query of §6.
 3. **Nudger v1.** The 2-3 highest-quality behavioral rules + the refactor
    signpost, harness-shipped.
 4. **Catalog metadata channel.** Only after §6 shows adoption. Atom/SM/tool

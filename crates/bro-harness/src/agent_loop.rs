@@ -134,7 +134,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     // it is consumed (ephemeral, never accumulates). User-turn hooks can seed it
     // before the first model call.
     let mut tail_nudge: Option<String> = None;
-    for n in hooks.on_user_turn(&prompt, turns) {
+    for n in hooks.on_user_turn(&prompt) {
         if n.delivery == Delivery::SystemTail {
             tail_nudge = Some(n.message);
         }
@@ -165,7 +165,7 @@ pub async fn run(cli: Cli) -> Result<()> {
 
         // Assistant-turn hooks see the text + the calls about to run; their
         // system-tail nudges surface next turn.
-        for n in hooks.on_assistant_turn(&out.text, &out.tool_calls, turns) {
+        for n in hooks.on_assistant_turn(&out.text, &out.tool_calls) {
             if n.delivery == Delivery::SystemTail {
                 tail_nudge = Some(n.message);
             }
@@ -183,14 +183,12 @@ pub async fn run(cli: Cli) -> Result<()> {
         let mut results = Vec::with_capacity(out.tool_calls.len());
         for tc in out.tool_calls {
             tracing::info!(tool = %tc.name, "dispatch");
-            // Credit adoption: did the model reach for a steered-toward tool?
-            hooks.observe_tool_call(&tc.name, turns);
             let (content, is_error) =
                 reg.dispatch(&tc.name, tc.args.clone(), &cx).await.into_content();
             let mut result = transport::ToolResult { id: tc.id.clone(), content, is_error };
             // Tool-result hooks: riders attach to this result (contextual,
             // persisted); system-tail nudges surface next turn.
-            for n in hooks.on_tool_result(&tc, &result, turns) {
+            for n in hooks.on_tool_result(&tc, &result) {
                 match n.delivery {
                     Delivery::Rider => result.content.push_str(&n.rider_block()),
                     Delivery::SystemTail => tail_nudge = Some(n.message),
@@ -211,10 +209,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
     side["todos"] = todos.lock().map(|t| t.to_side()).unwrap_or(serde_json::Value::Null);
     side["nudges"] = hooks.to_side();
-    let (fired, adopted) = hooks.adoption_summary();
-    if fired > 0 {
-        tracing::info!(fired, adopted, "nudge adoption (cumulative)");
-    }
     store.save(&SaveState {
         transport: tx.name(),
         model: &base_opts.model,
