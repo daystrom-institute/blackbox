@@ -16,6 +16,7 @@
 
 use crate::cli::Cli;
 use crate::emit::Emitter;
+use crate::hooks::{Delivery, HookEngine, NudgeLedger};
 use crate::registry::{PinPolicy, Registry};
 use crate::session::{SaveState, SessionStore};
 use crate::mcp;
@@ -66,6 +67,12 @@ pub async fn run(cli: Cli) -> Result<()> {
     let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
         prior_side.get("todos").unwrap_or(&serde_json::Value::Null),
     )));
+    // Hook subsystem: loop-level, transport-agnostic. Its ledger rides `side`
+    // exactly like `todos`, so one-time signposts and cooldowns persist across
+    // resume. See design/orchestration/bro-harness-hooks.md §2.
+    let mut hooks = HookEngine::from_env(NudgeLedger::from_side(
+        prior_side.get("nudges").unwrap_or(&serde_json::Value::Null),
+    ));
     if let Some(r) = &store.restored {
         if r.transport != tx.name() {
             anyhow::bail!(
@@ -120,6 +127,16 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut final_text = String::new();
     let mut turns: u64 = 0;
 
+    // Volatile system-tail nudge to surface on the upcoming turn; cleared after
+    // it is consumed (ephemeral, never accumulates). User-turn hooks can seed it
+    // before the first model call.
+    let mut tail_nudge: Option<String> = None;
+    for n in hooks.on_user_turn(&prompt, turns) {
+        if n.delivery == Delivery::SystemTail {
+            tail_nudge = Some(n.message);
+        }
+    }
+
     loop {
         if turns >= max_turns {
             tracing::warn!(max_turns, "hit max turns; stopping");
@@ -128,13 +145,28 @@ pub async fn run(cli: Cli) -> Result<()> {
         // Rebuild each turn: the wire tool set grows as tool_search activates
         // deferred tools, and the manifest shrinks correspondingly.
         let tool_specs = reg.wire_specs();
-        let opts = TurnOpts {
-            system: compose_system(system.as_deref(), &reg),
-            ..base_opts.clone()
-        };
+        let mut sys = compose_system(system.as_deref(), &reg);
+        // Drop any pending nudge into the volatile (uncached) tail — never the
+        // stable prefix (§1), so it cannot bust the cache.
+        if let Some(t) = tail_nudge.take() {
+            let v = sys.volatile.get_or_insert_with(String::new);
+            if !v.is_empty() {
+                v.push('\n');
+            }
+            v.push_str(&t);
+        }
+        let opts = TurnOpts { system: sys, ..base_opts.clone() };
         let out = tx.run_turn(&tool_specs, &opts).await?;
         turns += 1;
         total_usage.add(&out.usage);
+
+        // Assistant-turn hooks see the text + the calls about to run; their
+        // system-tail nudges surface next turn.
+        for n in hooks.on_assistant_turn(&out.text, &out.tool_calls, turns) {
+            if n.delivery == Delivery::SystemTail {
+                tail_nudge = Some(n.message);
+            }
+        }
 
         if !out.text.is_empty() {
             emitter.assistant_text(&out.text);
@@ -148,14 +180,23 @@ pub async fn run(cli: Cli) -> Result<()> {
         let mut results = Vec::with_capacity(out.tool_calls.len());
         for tc in out.tool_calls {
             tracing::info!(tool = %tc.name, "dispatch");
-            let (content, is_error) = reg.dispatch(&tc.name, tc.args, &cx).await.into_content();
-            results.push(transport::ToolResult {
-                id: tc.id,
-                content,
-                is_error,
-            });
+            // Credit adoption: did the model reach for a steered-toward tool?
+            hooks.observe_tool_call(&tc.name, turns);
+            let (content, is_error) =
+                reg.dispatch(&tc.name, tc.args.clone(), &cx).await.into_content();
+            let mut result = transport::ToolResult { id: tc.id.clone(), content, is_error };
+            // Tool-result hooks: riders attach to this result (contextual,
+            // persisted); system-tail nudges surface next turn.
+            for n in hooks.on_tool_result(&tc, &result, turns) {
+                match n.delivery {
+                    Delivery::Rider => result.content.push_str(&n.rider_block()),
+                    Delivery::SystemTail => tail_nudge = Some(n.message),
+                }
+            }
+            results.push(result);
         }
         tx.push_tool_results(results);
+        hooks.tick();
     }
 
     emitter.result(&final_text, &total_usage, turns, None);
@@ -166,6 +207,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         _ => serde_json::json!({}),
     };
     side["todos"] = todos.lock().map(|t| t.to_side()).unwrap_or(serde_json::Value::Null);
+    side["nudges"] = hooks.to_side();
+    let (fired, adopted) = hooks.adoption_summary();
+    if fired > 0 {
+        tracing::info!(fired, adopted, "nudge adoption (cumulative)");
+    }
     store.save(&SaveState {
         transport: tx.name(),
         model: &base_opts.model,

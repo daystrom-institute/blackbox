@@ -11,6 +11,7 @@
 mod agent_loop;
 mod cli;
 mod emit;
+mod hooks;
 mod mcp;
 mod registry;
 mod session;
