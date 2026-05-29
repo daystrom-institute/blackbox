@@ -43,14 +43,19 @@ out explicitly under `Changed` or `Removed`.
   `file_write{from}` / `shell_run{stdin_from}` consume one instead of inlining
   bytes (the tool-chaining ref ABI, Stages 1–2; Stage 3 pending-ref Tasks
   deferred until an async producer exists). Composable register→register
-  transforms narrow/reshape a register server-side without the content entering
+  transforms narrow/reshape a source server-side without the content entering
   context, propagating kind so they chain (`transform → slice → paste`):
-  `clip_transform{from,jq}` runs a `jaq` (pure-Rust jq) program over a JSON
-  register (`.body` plucks a field, `map(.title)` reshapes), `clip_slice` takes
-  a sub-range (the register analog of `clip_yank`), and `clip_grep` filters
-  lines by regex. Register handles tolerate an optional `clip:` prefix
-  (`clip:a` ≡ `a`); `task:` is reserved for pending refs. `clip_*` are
-  pinned/always-available; tune via `BRO_HARNESS_PIN_TOOLS`.
+  `clip_transform{from|file,jq}` runs a `jaq` (pure-Rust jq) program over JSON
+  (`.body` plucks a field, `map(.title)` reshapes), `clip_slice` takes a
+  sub-range (the register analog of `clip_yank`), and `clip_grep` filters lines
+  by regex. Each reads its source from **either** a register (`from`) or a
+  worktree file (`file`) — the `file` source makes file→transform one call;
+  the result lands in a register (`into`, default `@` for a file source).
+  Register handles tolerate an optional `clip:` prefix (`clip:a` ≡ `a`);
+  `task:` is reserved for pending refs. The clipboard action verbs
+  (yank/paste/transform/slice/grep) + `bbox_slice_*` are pinned/always-available
+  and the utilities (set/list/peek/clear) stay callable but off the callout;
+  tune with `BRO_HARNESS_PIN_TOOLS`.
 - bro-harness hook subsystem and Nudger: an internal interception seam
   (user/assistant/tool-result hooks) that contributes ambient guidance steering
   the agent toward the richer blackbox toolbox, with a cache-stable/volatile

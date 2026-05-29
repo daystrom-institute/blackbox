@@ -734,32 +734,54 @@ impl Tool for ClipClear {
 }
 
 // ---------------------------------------------------------------------------
-// Composable register→register transforms (the ref ABI's selection family).
+// Composable transforms (the ref ABI's selection family).
 //
-// Each is `{ from, <selector>, into? }`, reads a register, narrows/reshapes it,
-// and writes the result to `into` (default `from`, in-place) — returning
+// Each reads a source — a register (`from`) OR a worktree file (`file`) —
+// narrows/reshapes it, and writes the result to a register (`into`), returning
 // metadata, never the content, and propagating kind so transforms chain
-// (transform → slice → paste, all server-side). All pure: no shell, no IO.
+// (transform → slice → paste, all server-side). All pure: no shell.
+//
+// The `file` source is the ergonomic crux: it makes `file → transform` a single
+// call (competitive with shelling `jq`), with the bonus that the result lands
+// in a chainable/durable register — which a shell pipeline does not give you.
 // ---------------------------------------------------------------------------
 
-/// Run a register→register transform: read `from`'s text, apply `f`, store the
-/// `(text, kind)` result under `into` (default `from`), return metadata.
-fn ref_transform(
+/// Resolve the source text + default destination for a transform. Exactly one
+/// of `from` (a register) / `file` (a worktree path) must be set. Default
+/// destination: the source register (in place) for `from`, or `@` for `file`.
+async fn resolve_xform_source(
     cx: &ToolCx,
-    from: &str,
-    into: Option<&str>,
-    f: impl FnOnce(&str) -> Result<(String, RefKind), String>,
+    from: Option<&str>,
+    file: Option<&str>,
+) -> Result<(String, String), String> {
+    match (from, file) {
+        (Some(_), Some(_)) => Err("provide `from` (a register) or `file` (a path), not both".into()),
+        (Some(reg), None) => {
+            let text = cx.clipboard.lock().unwrap().consume_text(reg)?;
+            Ok((text, normalize_register(reg).to_string()))
+        }
+        (None, Some(path)) => {
+            let p = resolve_in_root(&cx.root, path).map_err(|e| e.to_string())?;
+            let text = tokio::fs::read_to_string(&p)
+                .await
+                .map_err(|e| format!("read {path}: {e}"))?;
+            Ok((text, DEFAULT_REGISTER.to_string()))
+        }
+        (None, None) => Err("need a source: `from` (register) or `file` (path)".into()),
+    }
+}
+
+/// Store a transform result `(text, kind)` under `into`, returning metadata.
+fn finish_transform(
+    cx: &ToolCx,
+    into: &str,
+    result: Result<(String, RefKind), String>,
 ) -> ToolResult {
-    let into = into.unwrap_or(from);
-    let mut clip = cx.clipboard.lock().unwrap();
-    let src = match clip.consume_text(from) {
-        Ok(t) => t,
-        Err(e) => return ToolResult::Error(e),
-    };
-    let (text, kind) = match f(&src) {
+    let (text, kind) = match result {
         Ok(v) => v,
         Err(e) => return ToolResult::Error(e),
     };
+    let mut clip = cx.clipboard.lock().unwrap();
     let evicted = match clip.put_kinded(into, kind, text) {
         Ok(e) => e,
         Err(e) => return ToolResult::Error(e.to_string()),
@@ -798,12 +820,18 @@ fn render_jq_outputs(outs: Vec<Value>) -> (String, RefKind) {
 
 #[derive(Deserialize, JsonSchema)]
 struct ClipTransformInput {
-    /// Source register to read (handle; `clip:` prefix tolerated).
-    from: String,
+    /// Source register (handle; `clip:` tolerated). Provide `from` OR `file`.
+    #[serde(default)]
+    from: Option<String>,
+    /// Source file path in the worktree — one-call file→register transform.
+    /// Provide `file` OR `from`.
+    #[serde(default)]
+    file: Option<String>,
     /// jq program. `.body` plucks a field; `.items | map(.title)` reshapes.
-    /// The source register's text is parsed as JSON first.
+    /// The source text is parsed as JSON first.
     jq: String,
-    /// Destination register. Defaults to `from` (transform in place).
+    /// Destination register. Default: the source register for `from`, or `@`
+    /// for `file`.
     #[serde(default)]
     into: Option<String>,
 }
@@ -816,7 +844,7 @@ impl Tool for ClipTransform {
         "clip_transform"
     }
     fn description(&self) -> &str {
-        "Run a jq program over a clipboard register's JSON content, server-side — the data never enters your context. Use it to pull a field or reshape structured tool output (a captured API response, `gh api`, JSON logs) before pasting: `jq=\".body\"` plucks a field as prose, `jq=\".items | map(.title)\"` reshapes. Writes the result to `into` (default: in place) and returns metadata + preview. The source register must hold valid JSON."
+        "Run a jq program over JSON — from a clipboard register (`from`) OR straight from a worktree file (`file`) — server-side, so the data never enters your context. The one-call way to pull a field or reshape structured output (an API response, `gh api`, JSON logs): `jq=\".body\"` plucks a field as prose, `jq=\".comments | map(.author)\"` reshapes. PREFER this over shelling `jq` when you'll chain or reuse the result — the output lands in a register (`into`) you can clip_slice / clip_grep / clip_paste next, and survives across turns. Returns metadata + preview, not content."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ClipTransformInput>()
@@ -832,24 +860,35 @@ impl Tool for ClipTransform {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        ref_transform(cx, &args.from, args.into.as_deref(), |src| {
-            let v: Value = serde_json::from_str(src)
-                .map_err(|e| format!("register '{}' is not valid JSON: {e}", args.from))?;
+        let (src, default_into) =
+            match resolve_xform_source(cx, args.from.as_deref(), args.file.as_deref()).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Error(e),
+            };
+        let into = args.into.unwrap_or(default_into);
+        let result = (|| {
+            let v: Value =
+                serde_json::from_str(&src).map_err(|e| format!("source is not valid JSON: {e}"))?;
             let outs = crate::jq::run_jq(&args.jq, v).map_err(|e| e.to_string())?;
             Ok(render_jq_outputs(outs))
-        })
+        })();
+        finish_transform(cx, &into, result)
     }
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ClipSliceInput {
-    /// Source register to read (handle; `clip:` prefix tolerated).
-    from: String,
+    /// Source register (handle; `clip:` tolerated). Provide `from` OR `file`.
+    #[serde(default)]
+    from: Option<String>,
+    /// Source file path in the worktree. Provide `file` OR `from`.
+    #[serde(default)]
+    file: Option<String>,
     /// Range to keep: a `type` of `lines` | `markers` | `exact_text` | `bytes`
-    /// (same vocabulary as clip_yank / bbox_slice_read), applied to the
-    /// register's text.
+    /// (same vocabulary as clip_yank / bbox_slice_read).
     range: Value,
-    /// Destination register. Defaults to `from` (slice in place).
+    /// Destination register. Default: the source register for `from`, or `@`
+    /// for `file`.
     #[serde(default)]
     into: Option<String>,
 }
@@ -862,7 +901,7 @@ impl Tool for ClipSlice {
         "clip_slice"
     }
     fn description(&self) -> &str {
-        "Narrow a clipboard register to a sub-range of its text, server-side — the register analog of clip_yank (which reads a file). range selects by lines/markers/exact_text/bytes. Writes to `into` (default: in place); returns metadata + preview."
+        "Narrow text to a sub-range — from a clipboard register (`from`) or a worktree file (`file`) — server-side. range selects lines/markers/exact_text/bytes. The result lands in a register (`into`) you can clip_paste / chain; returns metadata + preview, not content. The chainable cousin of clip_yank."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ClipSliceInput>()
@@ -878,23 +917,34 @@ impl Tool for ClipSlice {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
+        let (src, default_into) =
+            match resolve_xform_source(cx, args.from.as_deref(), args.file.as_deref()).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Error(e),
+            };
+        let into = args.into.unwrap_or(default_into);
         let range = args.range;
-        ref_transform(cx, &args.from, args.into.as_deref(), |src| {
+        let result = (|| {
             let sel = slice_range_from_value(range).map_err(|e| format!("bad range: {e}"))?;
-            let slice = resolve_slice(src, &sel).map_err(|e| e.to_string())?;
+            let slice = resolve_slice(&src, &sel).map_err(|e| e.to_string())?;
             Ok((slice.text, RefKind::Text))
-        })
+        })();
+        finish_transform(cx, &into, result)
     }
 }
 
 #[derive(Deserialize, JsonSchema)]
 struct ClipGrepInput {
-    /// Source register to read (handle; `clip:` prefix tolerated).
-    from: String,
-    /// Regex; lines of the register matching it are kept (or dropped, if
-    /// `invert`).
+    /// Source register (handle; `clip:` tolerated). Provide `from` OR `file`.
+    #[serde(default)]
+    from: Option<String>,
+    /// Source file path in the worktree. Provide `file` OR `from`.
+    #[serde(default)]
+    file: Option<String>,
+    /// Regex; matching lines are kept (or dropped, if `invert`).
     pattern: String,
-    /// Destination register. Defaults to `from` (filter in place).
+    /// Destination register. Default: the source register for `from`, or `@`
+    /// for `file`.
     #[serde(default)]
     into: Option<String>,
     /// Case-insensitive matching. Default false.
@@ -913,7 +963,7 @@ impl Tool for ClipGrep {
         "clip_grep"
     }
     fn description(&self) -> &str {
-        "Keep only the lines of a clipboard register that match a regex (or drop them with invert), server-side — content_search over a register instead of files. Writes to `into` (default: in place); returns metadata + preview."
+        "Keep (or drop, with invert) the lines matching a regex — from a clipboard register (`from`) or a worktree file (`file`) — server-side. The result lands in a register (`into`) you can clip_paste / chain; returns metadata + preview, not content. content_search you can compose."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ClipGrepInput>()
@@ -929,15 +979,22 @@ impl Tool for ClipGrep {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
+        let (src, default_into) =
+            match resolve_xform_source(cx, args.from.as_deref(), args.file.as_deref()).await {
+                Ok(v) => v,
+                Err(e) => return ToolResult::Error(e),
+            };
+        let into = args.into.unwrap_or(default_into);
         let (pattern, ci, invert) = (args.pattern, args.case_insensitive, args.invert);
-        ref_transform(cx, &args.from, args.into.as_deref(), |src| {
+        let result = (|| {
             let re = regex::RegexBuilder::new(&pattern)
                 .case_insensitive(ci)
                 .build()
                 .map_err(|e| format!("bad regex: {e}"))?;
             let kept: Vec<&str> = src.lines().filter(|l| re.is_match(l) != invert).collect();
             Ok((kept.join("\n"), RefKind::Text))
-        })
+        })();
+        finish_transform(cx, &into, result)
     }
 }
 
@@ -1348,6 +1405,40 @@ mod tool_tests {
             cx.clipboard.lock().unwrap().get("s").unwrap().text,
             "l2\nl3\n"
         );
+    }
+
+    /// The ergonomic fix: clip_transform reads a FILE directly (one call,
+    /// no capture step), defaulting the result into `@`.
+    #[tokio::test]
+    async fn clip_transform_reads_file_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("api.json"),
+            r#"{"pr": 7, "comment": {"body": "ship it"}}"#,
+        )
+        .unwrap();
+        let cx = cx_at(dir.path());
+        // No `from`, no capture step — straight from the file into default `@`.
+        let v = json_of(
+            ClipTransform
+                .call(json!({"file": "api.json", "jq": ".comment.body"}), &cx)
+                .await,
+        );
+        assert_eq!(v["register"], "@");
+        assert!(v.get("text").is_none());
+        assert_eq!(cx.clipboard.lock().unwrap().get("@").unwrap().text, "ship it");
+    }
+
+    #[tokio::test]
+    async fn clip_transform_rejects_both_and_neither_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_at(dir.path());
+        let both = ClipTransform
+            .call(json!({"from": "a", "file": "x.json", "jq": "."}), &cx)
+            .await;
+        assert!(matches!(both, ToolResult::Error(e) if e.contains("not both")));
+        let neither = ClipTransform.call(json!({"jq": "."}), &cx).await;
+        assert!(matches!(neither, ToolResult::Error(e) if e.contains("need a source")));
     }
 
     fn json_of(r: ToolResult) -> Value {

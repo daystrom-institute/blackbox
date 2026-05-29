@@ -23,20 +23,28 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 >   `clip_paste{register}`. The `kind` tag is `RefKind` on `Register`
 >   (`Text|FileSlice|ToolResult|Json`); consumers refuse a non-text register via
 >   `Registers::consume_text`.
-> - **Composable transforms (ref→ref)** — `clip_transform{from,jq,into?}` (a
->   `jaq` program over a JSON register), `clip_slice{from,range,into?}` (the
->   `SliceRangeSelector` vocabulary applied to a register — the register analog
->   of `clip_yank`), and `clip_grep{from,pattern,into?}` (regex line filter).
->   Each reads a register, narrows/reshapes, and writes `into` (default `from`,
->   in place) via `clipboard::ref_transform`, returning metadata not content and
->   **propagating kind** so transforms chain (`transform → slice → paste`, all
->   server-side): a projection that yields an object stays `Json` for the next
->   hop, a string becomes `Text` (raw prose).
+> - **Composable transforms (ref→ref)** — `clip_transform{from|file,jq,into?}`
+>   (a `jaq` program over JSON), `clip_slice{from|file,range,into?}` (the
+>   `SliceRangeSelector` vocabulary — the register analog of `clip_yank`), and
+>   `clip_grep{from|file,pattern,into?}` (regex line filter). Each takes its
+>   source from **either** a register (`from`) **or** a worktree file (`file`) —
+>   the `file` source makes `file → transform` a single call (competitive with
+>   shelling `jq`) with the result landing in a chainable register. Shared
+>   resolution is `clipboard::resolve_xform_source` + `finish_transform`. `into`
+>   defaults to the source register (in place) for `from`, or `@` for `file`.
+>   Results **propagate kind** so transforms chain (`transform → slice → paste`,
+>   all server-side): a projection that yields an object stays `Json` for the
+>   next hop, a string becomes `Text` (raw prose).
 > - **Handle namespace** — register handles tolerate an optional `clip:` prefix
 >   (`clip:a` ≡ `a`), normalized at the `Registers` API
 >   (`clipboard::normalize_register`) wherever a register is named. `task:` is
 >   left literal — reserved for the pending-ref arm so it routes differently when
 >   Stage 3 lands rather than silently aliasing a clipboard register.
+> - **Pinning** — the clipboard ACTION verbs (`clip_yank`/`clip_paste`/
+>   `clip_transform`/`clip_slice`/`clip_grep`) plus `bbox_slice_*` are `Pinned`
+>   (prominent "always-available" callout); the utilities (`clip_set`/
+>   `clip_list`/`clip_peek`/`clip_clear`) are `Eager` — callable but off the
+>   callout. Override with `BRO_HARNESS_PIN_TOOLS`.
 > - **Stage 3 (pending refs = Task)** — not built; deferred until an in-harness
 >   async producer (background shell / sub-agent dispatch) exists.
 >
@@ -49,10 +57,13 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 > pure (no shell/IO) — strictly below `shell_run`. The line held is selection /
 > transform of *data already in a register*, never running code on paste.
 >
-> Remaining gaps (non-blocking): `RefKind` has no raw `Bytes` variant yet, and
+> Remaining gaps (non-blocking): `RefKind` has no raw `Bytes` variant yet;
 > `bbox_search` is an MCP/daemon surface so its `into` lives outside the
-> harness. Verified against `crates/bro-harness/src/{agent_loop.rs,registry.rs}`
-> and `crates/bro-tools/src/{tool.rs,clipboard.rs,jq.rs,workspace.rs,shell.rs,web.rs}`
+> harness; and `clip_transform` requires inspecting a JSON's shape to author the
+> selector (so an unknown structure is typically read first) — a cheap
+> structure/shape preview would close that, but is unbuilt. Verified against
+> `crates/bro-harness/src/{agent_loop.rs,registry.rs}` and
+> `crates/bro-tools/src/{tool.rs,clipboard.rs,jq.rs,workspace.rs,shell.rs,web.rs}`
 > on 2026-05-29.
 
 ## Problem
