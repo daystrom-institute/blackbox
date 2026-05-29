@@ -57,7 +57,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     };
 
     let kind = TransportKind::from_env();
-    let mut tx = transport::build_transport(kind)?;
+    let mut tx = transport::build_transport(kind).await?;
 
     let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
     if let Some(r) = &store.restored {

@@ -392,11 +392,19 @@ turn → identical Claude `result` envelope).
 | Caching | explicit `cache_control` | automatic (`prompt_cache_hit_tokens`) | automatic (`prompt_cache_key`, 24h) |
 
 Notes: the Responses ChatGPT backend **requires** `stream:true`,
-`store:false`, and a non-empty `instructions`. Token refresh for ChatGPT
-OAuth is the Codex CLI's job — the harness reads `auth.json` but does not
-implement refresh (a daemon-side concern). GLM returns a non-canonical
-`web_search_prime`/`tool_result` variant; DeepSeek returns canonical
-`web_search_tool_result` — the loose response parsing tolerates both.
+`store:false`, and a non-empty `instructions`. ChatGPT-OAuth token refresh is
+a **harness concern** (`transport/codex_auth.rs`), so the harness is
+self-sufficient without the daemon: it reads `$CODEX_HOME/auth.json`,
+refreshes the access token against `auth.openai.com/oauth/token`
+(`grant_type=refresh_token`, public client id) when within a skew window of
+expiry, and writes the rotated tokens back atomically under an advisory file
+lock — cooperatively with the Codex CLI (verified live 2026-05-29: access +
+refresh tokens both rotate and the new pair is persisted correctly).
+Endpoint/client/skew are env-overridable (`CODEX_OAUTH_TOKEN_URL`,
+`CODEX_OAUTH_CLIENT_ID`, `CODEX_OAUTH_REFRESH_SKEW_SECS`). GLM returns a
+non-canonical `web_search_prime`/`tool_result` variant; DeepSeek returns
+canonical `web_search_tool_result` — the loose response parsing tolerates
+both.
 
 ## Daemon-side changes (minimal)
 

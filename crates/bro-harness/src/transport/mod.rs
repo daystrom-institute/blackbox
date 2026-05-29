@@ -18,6 +18,7 @@
 //! never sees wire shapes. `snapshot`/`restore` persist it for `--resume`.
 
 pub mod anthropic;
+pub mod codex_auth;
 pub mod openai_chat;
 pub mod openai_responses;
 
@@ -147,13 +148,14 @@ impl TransportKind {
     }
 }
 
-/// Construct the configured transport from env.
-pub fn build_transport(kind: TransportKind) -> Result<Box<dyn Transport>> {
+/// Construct the configured transport from env. Async because the Responses
+/// transport may need an OAuth token refresh at construction.
+pub async fn build_transport(kind: TransportKind) -> Result<Box<dyn Transport>> {
     let tx: Box<dyn Transport> = match kind {
         TransportKind::Anthropic => Box::new(anthropic::AnthropicTransport::from_env()?),
         TransportKind::OpenAiChat => Box::new(openai_chat::OpenAiChatTransport::from_env()?),
         TransportKind::OpenAiResponses => {
-            Box::new(openai_responses::OpenAiResponsesTransport::from_env()?)
+            Box::new(openai_responses::OpenAiResponsesTransport::from_env().await?)
         }
     };
     Ok(tx)

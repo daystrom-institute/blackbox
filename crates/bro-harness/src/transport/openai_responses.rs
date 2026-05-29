@@ -38,7 +38,7 @@ enum Auth {
 }
 
 impl OpenAiResponsesTransport {
-    pub fn from_env() -> Result<Self> {
+    pub async fn from_env() -> Result<Self> {
         let http = reqwest::Client::new();
         if let Ok(key) = std::env::var("OPENAI_API_KEY") {
             let base = std::env::var("OPENAI_BASE_URL")
@@ -52,45 +52,23 @@ impl OpenAiResponsesTransport {
                 input: Vec::new(),
             });
         }
-        // Fall back to Codex ChatGPT OAuth.
-        let (access_token, account_id) = codex_chatgpt_auth()
-            .context("no OPENAI_API_KEY and could not load Codex ChatGPT auth")?;
+        // Codex ChatGPT OAuth: load (refreshing if near expiry, cooperatively
+        // with the Codex CLI via `~/.codex/auth.json`).
+        let auth = super::codex_auth::load_fresh(&http)
+            .await
+            .context("no OPENAI_API_KEY and could not load/refresh Codex ChatGPT auth")?;
         let endpoint = std::env::var("OPENAI_RESPONSES_URL")
             .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".to_string());
         Ok(Self {
             http,
             endpoint,
             auth: Auth::ChatGpt {
-                access_token,
-                account_id,
+                access_token: auth.access_token,
+                account_id: auth.account_id,
             },
             input: Vec::new(),
         })
     }
-}
-
-/// Read `~/.codex/auth.json` (or `$CODEX_HOME/auth.json`) for the ChatGPT
-/// access token + account id. NOTE: tokens expire; refresh is the Codex CLI's
-/// job — we do not implement the refresh flow here (a daemon-side concern).
-fn codex_chatgpt_auth() -> Result<(String, String)> {
-    let home = std::env::var("CODEX_HOME").unwrap_or_else(|_| {
-        dirs::home_dir()
-            .map(|h| h.join(".codex").to_string_lossy().into_owned())
-            .unwrap_or_default()
-    });
-    let path = std::path::Path::new(&home).join("auth.json");
-    let body = std::fs::read_to_string(&path)
-        .with_context(|| format!("read {}", path.display()))?;
-    let v: Value = serde_json::from_str(&body).context("parse auth.json")?;
-    let access = v["tokens"]["access_token"]
-        .as_str()
-        .context("auth.json missing tokens.access_token")?
-        .to_string();
-    let account = v["tokens"]["account_id"]
-        .as_str()
-        .context("auth.json missing tokens.account_id")?
-        .to_string();
-    Ok((access, account))
 }
 
 #[async_trait]
