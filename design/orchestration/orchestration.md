@@ -20,6 +20,10 @@ agentic work.
 - [Agent System - Implementation Skeleton](agents/agent-system-impl.md)
 - [Atom Capability Runtime](atoms/atom-capability-runtime.md)
 
+## Provider Transport
+
+- [Anthropic-shaped Custom Harness (bro-harness)](anthropic-harness.md)
+
 ## Workflow Execution
 
 - [Workflow Orchestration](workflows/workflow-orchestration.md)

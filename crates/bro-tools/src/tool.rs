@@ -1,0 +1,79 @@
+//! The `Tool` abstraction. Ported from daystrom's `McpToolDefinition` /
+//! `ToolResult`, Rust-native.
+
+use async_trait::async_trait;
+use serde_json::Value;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+/// Execution context handed to every tool call.
+#[derive(Clone)]
+pub struct ToolCx {
+    /// Worktree root — the cwd the harness was spawned in. All file/shell/git
+    /// operations are scoped to (and validated against) this root.
+    pub root: PathBuf,
+    /// Shared safety policy (command denylist + sensitive-file guard).
+    pub safety: Arc<crate::safety::SafetyPolicy>,
+    /// Shared HTTP client for web tools.
+    pub http: reqwest::Client,
+}
+
+/// Result of a tool call. Maps onto the content of an Anthropic
+/// `tool_result` block; `Error` sets `is_error: true`.
+#[derive(Debug, Clone)]
+pub enum ToolResult {
+    Text(String),
+    Json(Value),
+    Error(String),
+}
+
+impl ToolResult {
+    pub fn is_error(&self) -> bool {
+        matches!(self, ToolResult::Error(_))
+    }
+
+    /// Render to `(content_string, is_error)` for a `tool_result` block.
+    pub fn into_content(self) -> (String, bool) {
+        match self {
+            ToolResult::Text(t) => (t, false),
+            ToolResult::Json(v) => (
+                serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
+                false,
+            ),
+            ToolResult::Error(e) => (e, true),
+        }
+    }
+
+    /// Convenience for `anyhow`-returning tool bodies.
+    pub fn from_result<T: Into<Value>>(r: anyhow::Result<T>) -> ToolResult {
+        match r {
+            Ok(v) => ToolResult::Json(v.into()),
+            Err(e) => ToolResult::Error(format!("{e:#}")),
+        }
+    }
+}
+
+/// MCP-style safety hints surfaced to the model/harness.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ToolAnnotations {
+    pub read_only: bool,
+    pub destructive: bool,
+}
+
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    /// JSON Schema for the input object. Derive from a typed input with
+    /// [`schema_for`].
+    fn input_schema(&self) -> Value;
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult;
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations::default()
+    }
+}
+
+/// Derive a JSON Schema object for a typed tool input.
+pub fn schema_for<T: schemars::JsonSchema>() -> Value {
+    serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Null)
+}

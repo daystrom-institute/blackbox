@@ -1,0 +1,29 @@
+[package]
+name = "bro-harness"
+version = "0.0.1"
+edition = "2024"
+
+# The Anthropic-shaped headless coding agent. Spawned as a subprocess by the
+# daemon exactly like `claude`; speaks the Anthropic Messages API directly,
+# runs its own tool-calling loop, and emits the Claude stream-json envelope on
+# stdout. See design/orchestration/anthropic-harness.md.
+
+[[bin]]
+name = "bro-harness"
+path = "src/main.rs"
+
+[dependencies]
+bro-tools = { path = "../bro-tools" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
+futures-util = "0.3"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"

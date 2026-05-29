@@ -414,6 +414,42 @@ dependencies = [
 ]
 
 [[package]]
+name = "bro-harness"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bro-tools",
+ "clap",
+ "dirs",
+ "futures-util",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "bro-tools"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "ignore",
+ "regex",
+ "reqwest 0.12.28",
+ "schemars 0.8.22",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,3 +1,10 @@
+[workspace]
+# The root `blackbox` package is implicitly a member; these are the
+# Anthropic-harness crates (see design/orchestration/anthropic-harness.md).
+# They intentionally do NOT depend on the `blackbox` lib — the daemon↔harness
+# contract is the Claude stream-json envelope on stdout, not shared types.
+members = ["crates/bro-tools", "crates/bro-harness"]
+
 [package]
 name = "blackbox"
 version = "0.0.1"

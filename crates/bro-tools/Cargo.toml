@@ -1,0 +1,21 @@
+[package]
+name = "bro-tools"
+version = "0.0.1"
+edition = "2024"
+
+# Provider-agnostic tool implementations + the Tool abstraction for the
+# Anthropic harness. No Anthropic-specific code lives here; reusable by the
+# daemon or a future in-process executor.
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "0.8"
+async-trait = "0.1"
+anyhow = "1"
+tokio = { version = "1", features = ["process", "fs", "io-util", "rt", "macros", "time"] }
+regex = "1"
+reqwest = { version = "0.12", features = ["rustls-tls"], default-features = false }
+ignore = "0.4"
+walkdir = "2"
+tracing = "0.1"
