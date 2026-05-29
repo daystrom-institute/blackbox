@@ -31,6 +31,16 @@ use std::sync::Mutex;
 /// being called as "adoption".
 const ADOPTION_WINDOW_TURNS: u64 = 4;
 
+/// Appended to every delivered nudge — the adopt-or-explain half of the
+/// feedback loop. An agent that declines the steer should say *why* via a gap
+/// note, turning a silent fallback into actionable signal for refining the tool
+/// surface. Cross-cutting policy, so it's added once at delivery (not per rule).
+const GAP_NOTE_DIRECTIVE: &str = " — If this tool is the wrong fit because it's buggy, \
+    missing a capability, or wrong-shaped for the job, don't silently fall back: file a \
+    tool-surface gap note with `bbox_note(kind=\"followup\")` naming the tool and the gap. \
+    That feedback is used to fix bugs, expand capabilities, and refine these tools. If the \
+    nudge simply doesn't apply here, ignore it.";
+
 /// Where a nudge is delivered. The choice follows its lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
@@ -257,7 +267,7 @@ impl HookEngine {
             if pass {
                 let n = Nudge {
                     rule_id: c.rule_id,
-                    message: c.message,
+                    message: format!("{}{GAP_NOTE_DIRECTIVE}", c.message),
                     delivery: c.delivery,
                     targets: c.targets,
                 };
@@ -304,8 +314,7 @@ impl Hook for ShellGrepHook {
             rule_id: "shell-grep-to-code-search".into(),
             message: "You searched the repo with a shell tool. For indexed, \
                       gitignore-aware code/graph search prefer `bbox_code_query` or \
-                      `bbox_hybrid_search` (load via `tool_search` if not yet available). \
-                      If a one-off shell match was intended, disregard this."
+                      `bbox_hybrid_search` (load via `tool_search` if not yet available)."
                 .into(),
             delivery: Delivery::Rider,
             kind: NudgeKind::Periodic { cooldown: 6 },
@@ -384,8 +393,7 @@ impl Hook for CopyPasteHook {
                     message: "You wrote a verbatim copy of content you just read — that \
                               round-trips the bytes through context twice. `bbox_slice_copy` / \
                               `bbox_slice_move` perform the source→target move server-side \
-                              without inlining the content (sha-guarded, dry-runnable). If the \
-                              duplication was intentional, disregard."
+                              without inlining the content (sha-guarded, dry-runnable)."
                         .into(),
                     delivery: Delivery::Rider,
                     kind: NudgeKind::Periodic { cooldown: 8 },
@@ -428,7 +436,7 @@ impl RefactorSignpostHook {
             message: "This looks like structured refactor work. Check `sm-refactor` first via \
                       `bbox_knowledge` — the `bbox_refactor_*` / `bbox_slice_*` tools do guarded, \
                       semantics-aware structural edits (rename, move item, organize imports) that \
-                      beat hand-editing. If this isn't a refactor, disregard."
+                      beat hand-editing."
                 .into(),
             delivery: Delivery::SystemTail,
             kind: NudgeKind::Signpost,
@@ -473,8 +481,7 @@ impl Hook for HedgedConventionHook {
             rule_id: "hedged-convention".into(),
             message: "You're inferring a project convention rather than confirming it. \
                       `bbox_knowledge` (durable rules/decisions) and `bbox_hybrid_search` (the \
-                      indexed graph) likely hold the authoritative answer. If you've already \
-                      verified it, disregard."
+                      indexed graph) likely hold the authoritative answer."
                 .into(),
             delivery: Delivery::SystemTail,
             kind: NudgeKind::Periodic { cooldown: 10 },
@@ -687,5 +694,21 @@ mod tests {
         let out = eng.on_assistant_turn("t", &[], 1);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].rule_id, "beh");
+    }
+
+    #[test]
+    fn delivered_nudges_carry_adopt_or_explain_directive() {
+        // Every delivered nudge — regardless of rule — gets the gap-note
+        // directive appended once at the engine choke point.
+        let mut eng = HookEngine::new(vec![Box::new(ShellGrepHook)], NudgeLedger::default());
+        let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result(), 1);
+        assert_eq!(out.len(), 1);
+        let msg = &out[0].message;
+        assert!(msg.contains("bbox_note"), "directive names the gap-note tool");
+        assert!(msg.contains("gap note"), "directive frames it as a gap note");
+        // The rule's own body is still there ahead of the directive.
+        assert!(msg.contains("indexed"));
+        // And it's inside the rider envelope when delivered as a rider.
+        assert!(out[0].rider_block().contains("<harness-note>"));
     }
 }

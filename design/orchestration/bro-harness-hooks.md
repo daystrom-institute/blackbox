@@ -259,6 +259,21 @@ signal channel, not a progress log:
   hypothesis into a falsifiable, A/B-able claim: a rule whose target is adopted
   after firing is earning its keep; a rule that gets one perfunctory call then
   fallback (or no call) is noise and gets pruned. Surfaceable via `bro_report`.
+- **Adopt-or-explain — the decline path is a gap note.** Every delivered nudge
+  carries a shared directive: if the agent declines the steer *because the tool
+  is deficient* (buggy, missing a capability, wrong-shaped), it should not
+  silently fall back — it should file a tool-surface gap note via
+  `bbox_note(kind="followup")` naming the tool and the gap. This is the second
+  half of the loop: adoption proves a tool earns its keep; a gap note explains
+  *why a good-on-paper tool isn't being used*, which is the actionable signal
+  for fixing bugs, expanding capabilities, and reshaping surfaces. It directly
+  attacks the operator's observed failure mode — agents doing one perfunctory
+  call then reverting to built-ins — by converting that silent reversion into
+  feedback. The directive is cross-cutting policy, so it is appended **once at
+  the engine's delivery choke point** (not repeated per rule), and it replaces
+  the per-rule "if this doesn't apply, disregard" tails with a single
+  not-applicable escape hatch. Gap notes land in the standard substrate-gap
+  store and surface through `bbox_inbox` / `bbox_notes(kind="followup")`.
 
 ## Build order
 
