@@ -23,6 +23,10 @@ pub struct ToolCx {
     /// Live shell sessions (shell_run/shell_poll). In-memory, single-`run()`
     /// lifetime — holds running OS children, so it is NOT persisted to `side`.
     pub shell_sessions: Arc<std::sync::Mutex<crate::shell::ShellSessions>>,
+    /// Clipboard registers: named, server-held value cells the `clip_*` tools
+    /// produce/consume, and the substrate other tools chain through (the ref
+    /// ABI). Durable across `exec → resume` via the `side` cell, like `todos`.
+    pub clipboard: Arc<std::sync::Mutex<crate::clipboard::Registers>>,
 }
 
 /// Result of a tool call. Maps onto the content of an Anthropic

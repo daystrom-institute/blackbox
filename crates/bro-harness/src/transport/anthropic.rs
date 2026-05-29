@@ -123,7 +123,8 @@ impl Transport for AnthropicTransport {
                 })
             })
             .collect();
-        self.messages.push(json!({"role": "user", "content": blocks}));
+        self.messages
+            .push(json!({"role": "user", "content": blocks}));
     }
 
     async fn run_turn(&mut self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Result<TurnOutput> {
@@ -231,14 +232,23 @@ mod tests {
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
-        TurnOpts { model: "m".into(), max_tokens: 16, system, effort: None, web_search: false }
+        TurnOpts {
+            model: "m".into(),
+            max_tokens: 16,
+            system,
+            effort: None,
+            web_search: false,
+        }
     }
 
     #[test]
     fn split_system_caches_stable_only() {
         let body = transport().build_body(
             &[],
-            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("MANIFEST".into()) }),
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: Some("MANIFEST".into()),
+            }),
         );
         let sys = body["system"].as_array().expect("system array");
         assert_eq!(sys.len(), 2);
@@ -247,15 +257,23 @@ mod tests {
         assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
         // Block 1: volatile, NEVER cached — a changing tail can't bust the prefix.
         assert_eq!(sys[1]["text"], "MANIFEST");
-        assert!(sys[1].get("cache_control").is_none(), "volatile must not carry cache_control");
+        assert!(
+            sys[1].get("cache_control").is_none(),
+            "volatile must not carry cache_control"
+        );
         // Volatile never leaks into the persisted conversation.
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
     }
 
     #[test]
     fn stable_only_is_one_cached_block() {
-        let body = transport()
-            .build_body(&[], &opts(SystemPrompt { stable: Some("BASE".into()), volatile: None }));
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: None,
+            }),
+        );
         let sys = body["system"].as_array().unwrap();
         assert_eq!(sys.len(), 1);
         assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
@@ -263,8 +281,13 @@ mod tests {
 
     #[test]
     fn volatile_only_is_one_uncached_block() {
-        let body = transport()
-            .build_body(&[], &opts(SystemPrompt { stable: None, volatile: Some("V".into()) }));
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: None,
+                volatile: Some("V".into()),
+            }),
+        );
         let sys = body["system"].as_array().unwrap();
         assert_eq!(sys.len(), 1);
         assert_eq!(sys[0]["text"], "V");

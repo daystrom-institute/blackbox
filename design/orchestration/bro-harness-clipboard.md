@@ -3,6 +3,7 @@ title: "bro-harness clipboard (clip_* registers)"
 kind: design
 lifecycle: proposed
 corpus: blackbox-design
+lifecycle: partial
 topic:
   - orchestration
   - surfaces
@@ -11,7 +12,27 @@ brief: "A session-durable, snapshot register store for the bro-harness tool loop
 
 # bro-harness clipboard (`clip_*` registers)
 
-> **Status.** Proposed. Verified against code 2026-05-29:
+> **Status.** Partial — as-built 2026-05-29 in
+> `crates/bro-tools/src/clipboard.rs` (register store + the six `clip_*`
+> tools) and `crates/bro-tools/src/slice_core.rs` (the first-cut duplicated
+> selector vocabulary + resolver). Wired into `ToolCx`, `builtin_tools()`,
+> the `side` cell (`agent_loop.rs`), and pinned by default
+> (`registry.rs` `PinPolicy`). Deviations from this doc, all intentional:
+>
+> - **Persistence is already generic.** `session.rs` shipped `SaveState` + a
+>   transport-agnostic `side` cell before this work, so the "persistence
+>   integration steps 1–2" below (add a `clipboard` field, change `save`'s
+>   signature) were unnecessary — the store rides `side["clipboard"]` exactly
+>   like `todos`/`nudges`, with no signature churn.
+> - **`RefKind`** ships as `Text | FileSlice | ToolResult` (the third kind
+>   backs `shell_run{stdout_to}`); `Bytes`/`Json` remain reserved.
+> - **`clip_paste` safety** is a `confirm` dry-run gate + optional
+>   `expected_sha256` drift guard, not the full daemon `SliceApplyOptions`
+>   set — the daemon's project-registry / cross-worktree options have no
+>   analogue in the harness, where every path is already confined to
+>   `cx.root`.
+>
+> Original proposal verified against code 2026-05-29:
 > `crates/bro-tools/src/{tool.rs,workspace.rs,lib.rs}`,
 > `crates/bro-harness/src/{agent_loop.rs,session.rs,registry.rs}`,
 > and the daemon-side `src/slices.rs` / `src/tools/slices.rs`.

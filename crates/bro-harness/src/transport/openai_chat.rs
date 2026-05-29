@@ -189,14 +189,23 @@ mod tests {
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
-        TurnOpts { model: "m".into(), max_tokens: 16, system, effort: None, web_search: false }
+        TurnOpts {
+            model: "m".into(),
+            max_tokens: 16,
+            system,
+            effort: None,
+            web_search: false,
+        }
     }
 
     #[test]
     fn stable_leads_volatile_trails_conversation() {
         let body = transport().build_body(
             &[],
-            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("MANIFEST".into()) }),
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: Some("MANIFEST".into()),
+            }),
         );
         let msgs = body["messages"].as_array().unwrap();
         // [ system(stable), user(hi), system(volatile) ] — stable stays the
@@ -213,8 +222,13 @@ mod tests {
 
     #[test]
     fn no_volatile_means_no_trailing_system() {
-        let body = transport()
-            .build_body(&[], &opts(SystemPrompt { stable: Some("BASE".into()), volatile: None }));
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: None,
+            }),
+        );
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["content"], "BASE");

@@ -189,8 +189,8 @@ impl McpTool {
             Value::Object(m) => m,
             _ => serde_json::Map::new(),
         };
-        let params =
-            CallToolRequestParams::new(self.name.clone()).with_arguments(args.into_iter().collect());
+        let params = CallToolRequestParams::new(self.name.clone())
+            .with_arguments(args.into_iter().collect());
         let resp = client.call_tool(params).await;
         let mut client = client;
         let _ = client.close_with_timeout(Duration::from_secs(2)).await;

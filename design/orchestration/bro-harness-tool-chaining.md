@@ -1,7 +1,7 @@
 ---
 title: "bro-harness tool chaining (the ref ABI)"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - orchestration
@@ -11,10 +11,25 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 
 # bro-harness tool chaining (the ref ABI)
 
-> **Status.** Proposed. Frames the general primitive behind
-> [`bro-harness-clipboard.md`](./bro-harness-clipboard.md). Verified against
-> `crates/bro-harness/src/{agent_loop.rs,registry.rs}` and
-> `crates/bro-tools/src/tool.rs` on 2026-05-29.
+> **Status.** Partial. Frames the general primitive behind
+> [`bro-harness-clipboard.md`](./bro-harness-clipboard.md).
+>
+> - **Stage 1 (settled refs / clipboard)** — built; see the clipboard doc.
+> - **Stage 2 (settled refs, any tool)** — built 2026-05-29: producers
+>   `file_read{into}` and `shell_run{stdout_to}` deposit results into a register
+>   instead of returning them; consumers `file_write{from}` and
+>   `shell_run{stdin_from}` read a register instead of an inline arg. The
+>   `kind` tag is `RefKind` on `Register` (`Text|FileSlice|ToolResult`);
+>   consumers refuse a non-text register via `Registers::consume_text`. The
+>   register handle is the bare register name (`"@"`, `"a"`, …) — the
+>   `clip:`/`task:` namespaced handle space below is not yet a literal prefix in
+>   code, since only settled refs exist.
+> - **Stage 3 (pending refs = Task)** — not built; deferred until an in-harness
+>   async producer (background shell / sub-agent dispatch) exists.
+>
+> Verified against `crates/bro-harness/src/{agent_loop.rs,registry.rs}` and
+> `crates/bro-tools/src/{tool.rs,clipboard.rs,workspace.rs,shell.rs}` on
+> 2026-05-29.
 
 ## Problem
 

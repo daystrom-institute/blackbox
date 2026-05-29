@@ -32,11 +32,7 @@ pub struct ChatGptAuth {
 fn codex_home() -> PathBuf {
     std::env::var("CODEX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_default()
-                .join(".codex")
-        })
+        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".codex"))
 }
 
 /// Load auth, refreshing the access token if near expiry, and return the
@@ -61,7 +57,10 @@ pub async fn load_fresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
     result
 }
 
-async fn load_and_maybe_refresh(http: &reqwest::Client, auth_path: &std::path::Path) -> Result<ChatGptAuth> {
+async fn load_and_maybe_refresh(
+    http: &reqwest::Client,
+    auth_path: &std::path::Path,
+) -> Result<ChatGptAuth> {
     let body = std::fs::read_to_string(auth_path)
         .with_context(|| format!("read {}", auth_path.display()))?;
     let mut v: Value = serde_json::from_str(&body).context("parse auth.json")?;

@@ -36,8 +36,9 @@ pub enum Tier {
 }
 
 /// Which tools get elevated to `Pinned`. Patterns are exact names or a
-/// trailing-`*` prefix glob. Default elevates the slice tools; override with
-/// `BRO_HARNESS_PIN_TOOLS` (comma-separated).
+/// trailing-`*` prefix glob. Default elevates the slice tools and the clipboard
+/// (`clip_*`) so the context-copy-paste-avoiding surface is always visible;
+/// override with `BRO_HARNESS_PIN_TOOLS` (comma-separated).
 pub struct PinPolicy {
     patterns: Vec<String>,
 }
@@ -50,7 +51,7 @@ impl PinPolicy {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            Err(_) => vec!["bbox_slice_*".to_string()],
+            Err(_) => vec!["bbox_slice_*".to_string(), "clip_*".to_string()],
         };
         Self { patterns }
     }
@@ -221,7 +222,15 @@ impl Registry {
 fn short_desc(d: &str) -> String {
     let line = d.lines().next().unwrap_or("").trim();
     if line.len() > 100 {
-        format!("{}…", &line[..line.char_indices().take(100).last().map(|(i, _)| i).unwrap_or(line.len())])
+        format!(
+            "{}…",
+            &line[..line
+                .char_indices()
+                .take(100)
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(line.len())]
+        )
     } else {
         line.to_string()
     }
@@ -373,7 +382,10 @@ mod tests {
         assert!(reg.manifest().iter().any(|(n, _)| n == "bbox_stats"));
 
         // Activate it → now in wire, gone from manifest.
-        reg.activated.lock().unwrap().insert("bbox_stats".to_string());
+        reg.activated
+            .lock()
+            .unwrap()
+            .insert("bbox_stats".to_string());
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"bbox_stats".to_string()));
         assert!(!reg.manifest().iter().any(|(n, _)| n == "bbox_stats"));
@@ -381,7 +393,7 @@ mod tests {
 
     /// Helper: collect every tool name the registry would expose — wire (pinned
     /// + eager + activated) plus the deferred manifest. A denied tool appears in
-    /// neither.
+    ///   neither.
     fn all_known(reg: &Registry) -> Vec<String> {
         let mut v: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
         v.extend(reg.manifest().into_iter().map(|(n, _)| n));
@@ -403,8 +415,14 @@ mod tests {
         let known = all_known(&reg);
 
         assert!(known.contains(&"file_read".to_string()), "kept: {known:?}");
-        assert!(known.contains(&"git_ro_status".to_string()), "kept: {known:?}");
-        assert!(!known.contains(&"shell_run".to_string()), "denied: {known:?}");
+        assert!(
+            known.contains(&"git_ro_status".to_string()),
+            "kept: {known:?}"
+        );
+        assert!(
+            !known.contains(&"shell_run".to_string()),
+            "denied: {known:?}"
+        );
         assert!(
             !known.contains(&"git_local_commit".to_string()),
             "denied: {known:?}"

@@ -88,8 +88,11 @@ fn strip_html(html: &str) -> String {
     static TAG: OnceLock<Regex> = OnceLock::new();
     static WS: OnceLock<Regex> = OnceLock::new();
 
-    let no_script = re(r"(?is)<(script|style)[^>]*>.*?</\s*(script|style)\s*>", &SCRIPT)
-        .replace_all(html, " ");
+    let no_script = re(
+        r"(?is)<(script|style)[^>]*>.*?</\s*(script|style)\s*>",
+        &SCRIPT,
+    )
+    .replace_all(html, " ");
     let no_tags = re(r"(?s)<[^>]+>", &TAG).replace_all(&no_script, " ");
     let decoded = no_tags
         .replace("&nbsp;", " ")
@@ -98,7 +101,10 @@ fn strip_html(html: &str) -> String {
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
         .replace("&#39;", "'");
-    re(r"\s+", &WS).replace_all(&decoded, " ").trim().to_string()
+    re(r"\s+", &WS)
+        .replace_all(&decoded, " ")
+        .trim()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -107,8 +113,7 @@ mod tests {
 
     #[test]
     fn strips_tags_scripts_and_entities() {
-        let html =
-            "<html><head><style>x{}</style></head><body><p>Hello &amp; <b>world</b></p><script>evil()</script></body></html>";
+        let html = "<html><head><style>x{}</style></head><body><p>Hello &amp; <b>world</b></p><script>evil()</script></body></html>";
         assert_eq!(strip_html(html), "Hello & world");
     }
 }

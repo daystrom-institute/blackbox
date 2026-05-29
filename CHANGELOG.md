@@ -31,6 +31,18 @@ out explicitly under `Changed` or `Removed`.
 - bro-harness durable session side-state: a transport-agnostic `side` cell in
   the session store that survives `exec → resume`, backing a durable
   `todo_write` and the hook nudge ledger.
+- bro-harness clipboard + ref ABI (`crates/bro-tools`): session-durable `clip_*`
+  registers (`clip_yank`/`clip_paste`/`clip_set`/`clip_list`/`clip_peek`/
+  `clip_clear`) that move file slices between locations without the content ever
+  transiting the model context — yank/paste/list/set return hashes + counts + a
+  short preview, and only `clip_peek` egresses bounded content. Registers ride
+  the `side` cell (durable across `exec → resume`) and are byte/count-capped
+  with surfaced LRU eviction. The same register store is the chaining substrate:
+  `file_read{into}` and `shell_run{stdout_to}` produce a register instead of
+  returning output, and `file_write{from}` / `shell_run{stdin_from}` consume one
+  instead of inlining bytes (the tool-chaining ref ABI, Stages 1–2; Stage 3
+  pending-ref Tasks deferred until an async producer exists). `clip_*` are
+  pinned/always-available; tune via `BRO_HARNESS_PIN_TOOLS`.
 - bro-harness hook subsystem and Nudger: an internal interception seam
   (user/assistant/tool-result hooks) that contributes ambient guidance steering
   the agent toward the richer blackbox toolbox, with a cache-stable/volatile
@@ -71,6 +83,19 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Raw `bro_exec { provider }` (no tier/pin) against a `bro-harness`-backed
+  provider (`glm`, `deepseek`, `brodex`) no longer dies silently with exit 1
+  and zero events. The harness has no built-in default model (unlike the
+  `claude`/`codex` CLIs) and bails when none is passed; the allocator path
+  pre-filled a default but the raw path did not. `build_exec_args` now defaults
+  these providers to their catalog `.default` model at the single arg-building
+  chokepoint, so every dispatch path is covered.
+- Harness failure reasons are no longer lost. The dispatch process-waiter now
+  joins the stderr reader before snapshotting `inner.stderr`, so a fast
+  pre-stream bail no longer races the snapshot and reports an empty `error`. And
+  `bro_status` now surfaces a bounded `stderrTail` when a task failed or emitted
+  no events, so the diagnostic the operator needs is on the tool they already
+  call before declaring a bro dead.
 - Edge-index rebuild watcher no longer spins on a dirty worktree. The per-pass
   reindex re-materialized each project's dirty overlay unconditionally (atomic
   rename → fresh mtimes), so the watcher saw byte-identical sidecar "changes"

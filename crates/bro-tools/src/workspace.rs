@@ -87,6 +87,14 @@ struct FileReadInput {
     /// unambiguous. Default false.
     #[serde(default)]
     line_numbers: bool,
+    /// Ref ABI (chaining): when set, the read range is stored into this
+    /// clipboard register INSTEAD of being returned. The response carries
+    /// metadata (register, hashes, counts, preview_head) but not the content,
+    /// so a follow-up clip_paste / file_write{from} moves the bytes without
+    /// them ever entering your context. Ignores `line_numbers` (registers hold
+    /// raw text). See design/orchestration/bro-harness-tool-chaining.md.
+    #[serde(default)]
+    into: Option<String>,
 }
 
 pub struct FileRead;
@@ -128,9 +136,7 @@ impl Tool for FileRead {
         let start = args.start_line.unwrap_or(1).max(1);
         let end = args.end_line.unwrap_or(usize::MAX);
         if start > end {
-            return ToolResult::Error(format!(
-                "start_line {start} is after end_line {end}"
-            ));
+            return ToolResult::Error(format!("start_line {start} is after end_line {end}"));
         }
         let max_lines = args.max_lines.unwrap_or(FILE_READ_DEFAULT_MAX_LINES);
 
@@ -156,11 +162,41 @@ impl Tool for FileRead {
                 more_after_cap = true;
                 break;
             }
-            if args.line_numbers {
+            if args.line_numbers && args.into.is_none() {
                 collected.push(format!("{lineno}\t{line}"));
             } else {
                 collected.push(line);
             }
+        }
+
+        // Ref ABI: stash into a register instead of returning the content.
+        if let Some(register) = &args.into {
+            let text = collected.join("\n");
+            let range = format!(
+                "lines {}-{}",
+                start,
+                if end == usize::MAX {
+                    lineno
+                } else {
+                    end.min(lineno)
+                }
+            );
+            let provenance = crate::clipboard::Provenance {
+                path: args.file_path.clone(),
+                file_sha256: String::new(),
+                range,
+            };
+            let mut clip = cx.clipboard.lock().unwrap();
+            let evicted = match clip.put_slice(register, text, Some(provenance)) {
+                Ok(e) => e,
+                Err(e) => return ToolResult::Error(e.to_string()),
+            };
+            let mut meta = clip.meta_of(register).unwrap_or(Value::Null);
+            crate::clipboard::annotate_evicted(&mut meta, evicted);
+            if more_after_cap && let Some(obj) = meta.as_object_mut() {
+                obj.insert("truncated_at_max_lines".into(), json!(max_lines));
+            }
+            return ToolResult::Json(meta);
         }
 
         let mut out = collected.join("\n");
@@ -182,8 +218,14 @@ impl Tool for FileRead {
 struct FileWriteInput {
     /// Path to write, relative to the worktree root. Parent dirs are created.
     file_path: String,
-    /// Full new contents of the file.
-    content: String,
+    /// Full new contents of the file. Provide this OR `from`, not both.
+    #[serde(default)]
+    content: Option<String>,
+    /// Ref ABI (chaining): write the contents of this clipboard register
+    /// instead of inlining `content`, so the bytes never pass through your
+    /// context. See design/orchestration/bro-harness-tool-chaining.md.
+    #[serde(default)]
+    from: Option<String>,
 }
 
 pub struct FileWrite;
@@ -210,6 +252,18 @@ impl Tool for FileWrite {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
+        // Resolve the body from exactly one of `content` / `from`.
+        let content = match (args.content, &args.from) {
+            (Some(_), Some(_)) => {
+                return ToolResult::Error("provide content OR from, not both".into());
+            }
+            (Some(c), None) => c,
+            (None, Some(register)) => match cx.clipboard.lock().unwrap().consume_text(register) {
+                Ok(t) => t,
+                Err(e) => return ToolResult::Error(e),
+            },
+            (None, None) => return ToolResult::Error("file_write needs content or from".into()),
+        };
         let path = match resolve_in_root(&cx.root, &args.file_path) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
@@ -219,8 +273,8 @@ impl Tool for FileWrite {
         {
             return ToolResult::Error(format!("mkdir {}: {e}", parent.display()));
         }
-        match tokio::fs::write(&path, args.content.as_bytes()).await {
-            Ok(()) => ToolResult::Json(json!({"ok": true, "bytes": args.content.len()})),
+        match tokio::fs::write(&path, content.as_bytes()).await {
+            Ok(()) => ToolResult::Json(json!({"ok": true, "bytes": content.len()})),
             Err(e) => ToolResult::Error(format!("write {}: {e}", args.file_path)),
         }
     }
@@ -256,7 +310,8 @@ impl Tool for ListDir {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: ListDirInput = serde_json::from_value(input).unwrap_or(ListDirInput { path: None });
+        let args: ListDirInput =
+            serde_json::from_value(input).unwrap_or(ListDirInput { path: None });
         let dir = match resolve_in_root(&cx.root, args.path.as_deref().unwrap_or(".")) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
@@ -323,9 +378,24 @@ macro_rules! read_git_tool {
     };
 }
 
-read_git_tool!(GitStatus, "git_status", "Show `git status --short`.", &["status", "--short"]);
-read_git_tool!(GitLog, "git_log", "Show recent commits (`git log --oneline -20`).", &["log", "--oneline", "-20"]);
-read_git_tool!(GitDiff, "git_diff", "Show the unstaged working-tree diff.", &["diff"]);
+read_git_tool!(
+    GitStatus,
+    "git_status",
+    "Show `git status --short`.",
+    &["status", "--short"]
+);
+read_git_tool!(
+    GitLog,
+    "git_log",
+    "Show recent commits (`git log --oneline -20`).",
+    &["log", "--oneline", "-20"]
+);
+read_git_tool!(
+    GitDiff,
+    "git_diff",
+    "Show the unstaged working-tree diff.",
+    &["diff"]
+);
 
 #[derive(Deserialize, JsonSchema)]
 struct GitShowInput {
@@ -353,7 +423,8 @@ impl Tool for GitShow {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: GitShowInput = serde_json::from_value(input).unwrap_or(GitShowInput { rev: None });
+        let args: GitShowInput =
+            serde_json::from_value(input).unwrap_or(GitShowInput { rev: None });
         let rev = args.rev.unwrap_or_else(|| "HEAD".into());
         git(cx, &["show", &rev]).await
     }
@@ -481,7 +552,9 @@ impl Tool for FileEdit {
             body.replacen(&args.old_string, &args.new_string, 1)
         };
         match tokio::fs::write(&path, updated.as_bytes()).await {
-            Ok(()) => ToolResult::Json(json!({"ok": true, "replacements": count.min(if args.replace_all { count } else { 1 })})),
+            Ok(()) => ToolResult::Json(
+                json!({"ok": true, "replacements": count.min(if args.replace_all { count } else { 1 })}),
+            ),
             Err(e) => ToolResult::Error(format!("write {}: {e}", args.file_path)),
         }
     }
@@ -820,7 +893,12 @@ impl Tool for SmartRead {
                 outline.push(format!("{}: {}", i + 1, line.trim_end()));
             }
         }
-        let head: String = lines.iter().take(40).cloned().collect::<Vec<_>>().join("\n");
+        let head: String = lines
+            .iter()
+            .take(40)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
         let summary = format!(
             "[smart_read: {} lines — outlined (use file_read with start_line/end_line for detail)]\n\n\
              === head (lines 1-40) ===\n{head}\n\n\
@@ -867,6 +945,9 @@ mod tests {
             shell_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::shell::ShellSessions::default(),
             )),
+            clipboard: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::clipboard::Registers::default(),
+            )),
         }
     }
 
@@ -879,13 +960,19 @@ mod tests {
 
         // non-unique without replace_all → error
         let r = FileEdit
-            .call(json!({"file_path":"a.txt","old_string":"x = 1","new_string":"x = 9"}), &cx)
+            .call(
+                json!({"file_path":"a.txt","old_string":"x = 1","new_string":"x = 9"}),
+                &cx,
+            )
             .await;
         assert!(r.is_error(), "non-unique edit should fail: {r:?}");
 
         // unique edit succeeds
         let r = FileEdit
-            .call(json!({"file_path":"a.txt","old_string":"y = 2","new_string":"y = 5"}), &cx)
+            .call(
+                json!({"file_path":"a.txt","old_string":"y = 2","new_string":"y = 5"}),
+                &cx,
+            )
             .await;
         assert!(!r.is_error(), "unique edit should succeed: {r:?}");
         assert!(std::fs::read_to_string(&f).unwrap().contains("y = 5"));
@@ -909,7 +996,10 @@ mod tests {
 
         // explicit range
         let r = FileRead
-            .call(json!({"file_path":"big.txt","start_line":3,"end_line":5}), &cx)
+            .call(
+                json!({"file_path":"big.txt","start_line":3,"end_line":5}),
+                &cx,
+            )
             .await;
         match r {
             ToolResult::Text(t) => assert_eq!(t, "line3\nline4\nline5"),
@@ -960,7 +1050,10 @@ mod tests {
         match r {
             ToolResult::Text(t) => {
                 assert!(t.contains("a.rs") && !t.contains("b.rs"));
-                assert!(!t.contains(':'), "files mode should not emit line nums: {t}");
+                assert!(
+                    !t.contains(':'),
+                    "files mode should not emit line nums: {t}"
+                );
             }
             other => panic!("expected text, got {other:?}"),
         }
@@ -1059,7 +1152,10 @@ mod tests {
             ToolResult::Text(t) => {
                 let lines: Vec<&str> = t.lines().collect();
                 assert_eq!(lines[0], "aaa.rs", "capped slice is top-by-sort: {t}");
-                assert!(lines.len() == 2 && lines[1].contains("of 2 matches"), "marker: {t}");
+                assert!(
+                    lines.len() == 2 && lines[1].contains("of 2 matches"),
+                    "marker: {t}"
+                );
             }
             other => panic!("expected text, got {other:?}"),
         }

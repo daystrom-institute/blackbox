@@ -105,6 +105,35 @@ fn test_glm_and_deepseek_use_claude_print_args() {
 }
 
 #[test]
+fn harness_providers_default_model_when_none_supplied() {
+    // Raw dispatch (no opts / no model): harness-backed providers MUST still
+    // get a --model, or the harness bails with "no --model …" and exits 1
+    // before emitting anything. CLI-backed providers (claude) keep their own
+    // default and pass no --model.
+    for (provider, expected) in [
+        (Provider::Glm, "glm-5.1"),
+        (Provider::Deepseek, "deepseek-v4-pro"),
+    ] {
+        let args = provider.build_exec_args("hi", "", None, None);
+        assert!(
+            args.contains(&"--model".to_string()),
+            "{provider:?} raw dispatch must include --model"
+        );
+        assert!(
+            args.contains(&expected.to_string()),
+            "{provider:?} should default to catalog model {expected}, got {args:?}"
+        );
+    }
+    // Resume path too.
+    let resume = Provider::Glm.build_resume_args("sid", "go", None);
+    assert!(resume.contains(&"--model".to_string()));
+
+    // Claude is CLI-backed: no model is fine, no --model emitted.
+    let claude = Provider::Claude.build_exec_args("hi", "", None, None);
+    assert!(!claude.contains(&"--model".to_string()));
+}
+
+#[test]
 fn test_codex_exec_args_with_effort() {
     let opts = ExecOpts {
         model: Some("gpt-5.4".into()),

@@ -59,17 +59,50 @@ fn denylist() -> &'static [(Regex, &'static str)] {
     static PATTERNS: OnceLock<Vec<(Regex, &'static str)>> = OnceLock::new();
     PATTERNS.get_or_init(|| {
         let raw: &[(&str, &str)] = &[
-            (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/\s*$", "rm -rf / (root wipe)"),
-            (r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/\s", "rm -rf on an absolute root path"),
-            (r"\bgit\s+reset\s+--hard\b", "git reset --hard discards uncommitted work (may not be yours)"),
-            (r"\bgit\s+clean\s+-[a-zA-Z]*f", "git clean -f discards untracked files (may not be yours)"),
-            (r"\bgit\s+checkout\s+\.\s*$", "git checkout . discards working-tree changes"),
-            (r"\bgit\s+checkout\s+--\s+\.", "git checkout -- . discards working-tree changes"),
-            (r"\bpkill\b", "pkill is too broad; kill a specific known PID instead"),
-            (r"\bkillall\b", "killall is too broad; kill a specific known PID instead"),
-            (r"\bfuser\s+-k", "fuser -k kills by resource; never blanket-kill"),
-            (r"lsof\s+-t.*\|\s*xargs\s+kill", "kill-by-port takes down unrelated processes"),
-            (r"kill\s+\$\(\s*lsof", "kill-by-port takes down unrelated processes"),
+            (
+                r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/\s*$",
+                "rm -rf / (root wipe)",
+            ),
+            (
+                r"rm\s+-[a-zA-Z]*r[a-zA-Z]*f[a-zA-Z]*\s+/\s",
+                "rm -rf on an absolute root path",
+            ),
+            (
+                r"\bgit\s+reset\s+--hard\b",
+                "git reset --hard discards uncommitted work (may not be yours)",
+            ),
+            (
+                r"\bgit\s+clean\s+-[a-zA-Z]*f",
+                "git clean -f discards untracked files (may not be yours)",
+            ),
+            (
+                r"\bgit\s+checkout\s+\.\s*$",
+                "git checkout . discards working-tree changes",
+            ),
+            (
+                r"\bgit\s+checkout\s+--\s+\.",
+                "git checkout -- . discards working-tree changes",
+            ),
+            (
+                r"\bpkill\b",
+                "pkill is too broad; kill a specific known PID instead",
+            ),
+            (
+                r"\bkillall\b",
+                "killall is too broad; kill a specific known PID instead",
+            ),
+            (
+                r"\bfuser\s+-k",
+                "fuser -k kills by resource; never blanket-kill",
+            ),
+            (
+                r"lsof\s+-t.*\|\s*xargs\s+kill",
+                "kill-by-port takes down unrelated processes",
+            ),
+            (
+                r"kill\s+\$\(\s*lsof",
+                "kill-by-port takes down unrelated processes",
+            ),
             (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "fork bomb"),
             (r"\bmkfs\.", "mkfs reformats a filesystem"),
             (r"dd\s+.*of=/dev/", "dd to a device node"),
@@ -151,10 +184,16 @@ mod tests {
             "home/.aws/credentials",
             "sa-service-account.json",
         ] {
-            assert!(p.is_sensitive_path(&PathBuf::from(path)), "should flag: {path}");
+            assert!(
+                p.is_sensitive_path(&PathBuf::from(path)),
+                "should flag: {path}"
+            );
         }
         for path in ["src/main.rs", "README.md", "Cargo.toml"] {
-            assert!(!p.is_sensitive_path(&PathBuf::from(path)), "should pass: {path}");
+            assert!(
+                !p.is_sensitive_path(&PathBuf::from(path)),
+                "should pass: {path}"
+            );
         }
     }
 }

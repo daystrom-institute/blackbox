@@ -45,7 +45,11 @@ fn err_retryable(e: &reqwest::Error) -> bool {
 }
 
 fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
-    let v = resp.headers().get(reqwest::header::RETRY_AFTER)?.to_str().ok()?;
+    let v = resp
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?;
     v.trim().parse::<u64>().ok().map(Duration::from_secs)
 }
 
@@ -70,7 +74,10 @@ where
                 }
                 let wait = retry_after(&resp).unwrap_or_else(|| backoff(attempt));
                 tracing::warn!(
-                    label, attempt, status = status.as_u16(), wait_ms = wait.as_millis() as u64,
+                    label,
+                    attempt,
+                    status = status.as_u16(),
+                    wait_ms = wait.as_millis() as u64,
                     "transient HTTP status; retrying"
                 );
                 tokio::time::sleep(wait).await;

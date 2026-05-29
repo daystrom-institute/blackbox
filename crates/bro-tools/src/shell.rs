@@ -197,7 +197,10 @@ async fn drain_final(session: &mut ShellSession, max_tokens: usize) -> (String, 
             let _ = h.await;
         }
     };
-    if tokio::time::timeout(READER_DRAIN_GRACE, join_all).await.is_err() {
+    if tokio::time::timeout(READER_DRAIN_GRACE, join_all)
+        .await
+        .is_err()
+    {
         for a in aborts {
             a.abort();
         }
@@ -236,6 +239,42 @@ fn terminal_json(exit_code: Option<i32>, stdout: String, stderr: String, timed_o
     })
 }
 
+/// Build a terminal `shell_run` result, routing stdout into a clipboard
+/// register when `stdout_to` is set (the ref ABI producer path) instead of
+/// returning it inline. stderr always stays inline so failures are visible.
+fn terminal_result(
+    cx: &ToolCx,
+    stdout_to: Option<&str>,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+    timed_out: bool,
+) -> ToolResult {
+    let Some(register) = stdout_to else {
+        return ToolResult::Json(terminal_json(exit_code, stdout, stderr, timed_out));
+    };
+    let byte_len = stdout.len();
+    let mut clip = cx.clipboard.lock().unwrap();
+    let evicted = match clip.put_tool_result(register, stdout) {
+        Ok(e) => e,
+        Err(e) => return ToolResult::Error(e.to_string()),
+    };
+    let sha = clip
+        .meta_of(register)
+        .and_then(|m| m.get("slice_sha256").cloned());
+    let mut out = json!({
+        "exit_code": exit_code,
+        "stdout_register": register,
+        "stdout_bytes": byte_len,
+        "stdout_sha256": sha,
+        "stderr": stderr,
+        "running": false,
+        "timed_out": timed_out,
+    });
+    crate::clipboard::annotate_evicted(&mut out, evicted);
+    ToolResult::Json(out)
+}
+
 // ---------------------------------------------------------------------------
 // shell_run
 // ---------------------------------------------------------------------------
@@ -269,6 +308,18 @@ struct ShellRunInput {
     /// the command for things like `PORT`, `RUST_LOG`, etc.
     #[serde(default)]
     env: HashMap<String, String>,
+    /// Ref ABI (chaining): capture stdout into this clipboard register instead
+    /// of returning it, so large output never enters your context. The response
+    /// reports the register + byte count + sha; consume it with clip_paste /
+    /// file_write{from} / clip_peek. Only honored when the command finishes
+    /// within this call (not for yielded/background sessions). stderr is still
+    /// returned inline. See design/orchestration/bro-harness-tool-chaining.md.
+    #[serde(default)]
+    stdout_to: Option<String>,
+    /// Ref ABI (chaining): feed this clipboard register's content as stdin
+    /// (after any literal `stdin`), without it passing through your context.
+    #[serde(default)]
+    stdin_from: Option<String>,
 }
 
 pub struct ShellRun;
@@ -323,11 +374,22 @@ impl Tool for ShellRun {
         if let Some(e) = child.stderr.take() {
             readers.push(spawn_reader(e, stderr.clone()));
         }
+        // Ref ABI: resolve a stdin-feeding register before touching the child.
+        let stdin_from_data = match &args.stdin_from {
+            Some(reg) => match cx.clipboard.lock().unwrap().consume_text(reg) {
+                Ok(t) => Some(t),
+                Err(e) => return ToolResult::Error(e),
+            },
+            None => None,
+        };
         let mut stdin = child.stdin.take();
-        if let Some(data) = &args.stdin
-            && let Some(si) = stdin.as_mut()
-        {
-            let _ = si.write_all(data.as_bytes()).await;
+        if let Some(si) = stdin.as_mut() {
+            for data in [args.stdin.as_deref(), stdin_from_data.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                let _ = si.write_all(data.as_bytes()).await;
+            }
             let _ = si.flush().await;
         }
         // Drop the handle to send EOF when the command reads until end-of-input.
@@ -353,11 +415,11 @@ impl Tool for ShellRun {
         match drive(&mut session.child, yield_at, kill_at).await {
             Outcome::Exited(code) => {
                 let (so, se) = drain_final(&mut session, max_tokens).await;
-                ToolResult::Json(terminal_json(code, so, se, false))
+                terminal_result(cx, args.stdout_to.as_deref(), code, so, se, false)
             }
             Outcome::TimedOut => {
                 let (so, se) = drain_final(&mut session, max_tokens).await;
-                ToolResult::Json(terminal_json(None, so, se, true))
+                terminal_result(cx, args.stdout_to.as_deref(), None, so, se, true)
             }
             Outcome::Yielded => {
                 let (so, se) = snapshot(&session, max_tokens);
@@ -425,7 +487,13 @@ impl Tool for ShellPoll {
         let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
 
         // Take the session out so we never hold the lock across an await.
-        let mut session = match cx.shell_sessions.lock().unwrap().map.remove(&args.session_id) {
+        let mut session = match cx
+            .shell_sessions
+            .lock()
+            .unwrap()
+            .map
+            .remove(&args.session_id)
+        {
             Some(s) => s,
             None => {
                 return ToolResult::Error(format!(
@@ -519,7 +587,13 @@ impl Tool for ShellKill {
         };
         let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
 
-        let mut session = match cx.shell_sessions.lock().unwrap().map.remove(&args.session_id) {
+        let mut session = match cx
+            .shell_sessions
+            .lock()
+            .unwrap()
+            .map
+            .remove(&args.session_id)
+        {
             Some(s) => s,
             None => {
                 return ToolResult::Error(format!(
@@ -613,6 +687,7 @@ mod tests {
             http: reqwest::Client::new(),
             todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
+            clipboard: Arc::new(Mutex::new(crate::clipboard::Registers::default())),
         }
     }
 
@@ -762,7 +837,10 @@ mod tests {
         assert_eq!(k["killed"], true, "{k}");
         assert_eq!(k["running"], false, "{k}");
         assert_eq!(k["signal_sent"], "term", "{k}");
-        assert_eq!(k["escalated_to_sigkill"], false, "sleep dies on SIGTERM: {k}");
+        assert_eq!(
+            k["escalated_to_sigkill"], false,
+            "sleep dies on SIGTERM: {k}"
+        );
         // Session is gone afterward.
         assert!(c.shell_sessions.lock().unwrap().map.is_empty());
     }

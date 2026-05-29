@@ -9,13 +9,16 @@
 //! Nothing here knows about Anthropic, providers, or the stream-json wire
 //! format — those live in `bro-harness`.
 
+pub mod clipboard;
 pub mod safety;
 pub mod shell;
+pub mod slice_core;
 pub mod todo;
 pub mod tool;
 pub mod web;
 pub mod workspace;
 
+pub use clipboard::Registers;
 pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
@@ -50,5 +53,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(web::WebFetch),
         Arc::new(crate::todo::TodoWrite),
     ];
+    let mut tools = tools;
+    tools.extend(crate::clipboard::clip_tools());
     tools
 }

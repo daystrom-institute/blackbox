@@ -108,13 +108,13 @@ Ordered so each step unlocks the next and proves a pattern before it is reused.
 
 1. **[done]** Transport/loop, Tier A surface, shell quartet, `todo_write`,
    persistence spine, system-prompt split, note-contract softening.
-2. **Clipboard Stage 1** (`clip_*` on the `side` spine). Proves the register
-   pattern and is the first ref backing store; unblocks chaining.
+2. **[done]** Clipboard Stage 1 (`clip_*` on the `side` spine). Proves the
+   register pattern and is the first ref backing store; unblocks chaining.
 3. **Hooks Nudger v1** (scaffold + ledger on `side` + 2–3 behavioral rules +
    adoption logging). §1 is already built; this is the rest of the hooks doc.
-4. **Chaining Stage 2** (the `kind` tag + producer/consumer args —
-   `shell_run{stdout_to}`, `file_read{into}`, `clip_paste{from}`). Generalizes
-   the clipboard from file slices to any tool output.
+4. **[done]** Chaining Stage 2 (the `kind` tag + producer/consumer args —
+   `shell_run{stdout_to,stdin_from}`, `file_read{into}`, `file_write{from}`).
+   Generalizes the clipboard from file slices to any tool output.
 5. **Neuralyze**, in its own internal order: checkpoint substrate →
    context-only rewind (delivers the conversation-steering case) → file
    inverse-diff journal + `keep_files=false` → self-invocation + guards.

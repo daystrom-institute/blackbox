@@ -169,9 +169,7 @@ impl TransportKind {
             .as_str()
         {
             "openai-chat" | "openai_chat" | "chat" => TransportKind::OpenAiChat,
-            "openai-responses" | "openai_responses" | "responses" => {
-                TransportKind::OpenAiResponses
-            }
+            "openai-responses" | "openai_responses" | "responses" => TransportKind::OpenAiResponses,
             _ => TransportKind::Anthropic,
         }
     }

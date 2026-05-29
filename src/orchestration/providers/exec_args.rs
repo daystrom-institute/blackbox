@@ -173,6 +173,28 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
     }
 }
 
+/// Providers that dispatch through `bro-harness` have NO built-in default
+/// model — unlike the `claude`/`codex` CLIs, the harness bails with
+/// `no --model …` when none is passed. The allocator path fills a model, but
+/// raw `bro_exec { provider }` (no tier/pin) does not, so a model-less harness
+/// dispatch dies silently with exit 1 and zero events. Default to the catalog
+/// `.default` model here, at the single arg-building chokepoint, so every
+/// caller is covered. Returns None for CLI-backed providers, which have their
+/// own defaults.
+fn harness_default_model(provider: Provider) -> Option<String> {
+    if !matches!(
+        provider,
+        Provider::Glm | Provider::Deepseek | Provider::Brodex
+    ) {
+        return None;
+    }
+    provider
+        .models()
+        .iter()
+        .find(|m| m.default)
+        .map(|m| m.id.to_string())
+}
+
 impl Provider {
     pub fn build_exec_args(
         &self,
@@ -183,7 +205,8 @@ impl Provider {
     ) -> Vec<String> {
         let model = opts
             .and_then(|o| o.model.as_deref())
-            .map(|m| normalize_model_for_provider(*self, m));
+            .map(|m| normalize_model_for_provider(*self, m))
+            .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
@@ -316,7 +339,8 @@ impl Provider {
     ) -> Vec<String> {
         let model = opts
             .and_then(|o| o.model.as_deref())
-            .map(|m| normalize_model_for_provider(*self, m));
+            .map(|m| normalize_model_for_provider(*self, m))
+            .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)

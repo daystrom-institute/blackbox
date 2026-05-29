@@ -17,9 +17,9 @@
 use crate::cli::Cli;
 use crate::emit::Emitter;
 use crate::hooks::{Delivery, HookEngine, NudgeLedger};
+use crate::mcp;
 use crate::registry::{PinPolicy, Registry};
 use crate::session::{SaveState, SessionStore};
-use crate::mcp;
 use crate::transport::{self, StopReason, SystemPrompt, TransportKind, TurnOpts, Usage};
 use anyhow::{Context, Result};
 use bro_tools::{SafetyPolicy, ToolCx, builtin_tools};
@@ -67,6 +67,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
         prior_side.get("todos").unwrap_or(&serde_json::Value::Null),
     )));
+    // Clipboard registers ride `side` exactly like `todos`, so yanked slices
+    // survive `exec → resume`. See design/orchestration/bro-harness-clipboard.md.
+    let clipboard = Arc::new(std::sync::Mutex::new(bro_tools::Registers::from_side(
+        prior_side
+            .get("clipboard")
+            .unwrap_or(&serde_json::Value::Null),
+    )));
     // Hook subsystem: loop-level, transport-agnostic. Its ledger rides `side`
     // exactly like `todos`, so one-time signposts and cooldowns persist across
     // resume. See design/orchestration/bro-harness-hooks.md §2.
@@ -93,7 +100,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         .or(restored_model)
         .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
         .or_else(|| std::env::var("BRO_HARNESS_MODEL").ok())
-        .context("no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL")?;
+        .context(
+            "no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL",
+        )?;
 
     let cx = ToolCx {
         root: std::env::current_dir().context("cwd")?,
@@ -102,6 +111,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         todos: todos.clone(),
         // Live shell sessions: in-memory, this dispatch only (not persisted).
         shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
+        clipboard: clipboard.clone(),
     };
     let builtins = builtin_tools();
     // Client-side allow/deny (recursion guard + brofile + per-dispatch),
@@ -109,7 +119,8 @@ pub async fn run(cli: Cli) -> Result<()> {
     // qualified name, dropped at load) and built-ins (by bare name, in the
     // registry) — the final lever to force MCP pathways or deny a built-in
     // family like `shell_*` / `git_*` / `file_edit`.
-    let tool_filter = mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
+    let tool_filter =
+        mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
     let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
     let reg = Registry::new(builtins, mcp_tools, &PinPolicy::from_env(), &tool_filter);
 
@@ -158,7 +169,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             v.push_str(&t);
         }
-        let opts = TurnOpts { system: sys, ..base_opts.clone() };
+        let opts = TurnOpts {
+            system: sys,
+            ..base_opts.clone()
+        };
         let out = tx.run_turn(&tool_specs, &opts).await?;
         turns += 1;
         total_usage.add(&out.usage);
@@ -183,9 +197,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         let mut results = Vec::with_capacity(out.tool_calls.len());
         for tc in out.tool_calls {
             tracing::info!(tool = %tc.name, "dispatch");
-            let (content, is_error) =
-                reg.dispatch(&tc.name, tc.args.clone(), &cx).await.into_content();
-            let mut result = transport::ToolResult { id: tc.id.clone(), content, is_error };
+            let (content, is_error) = reg
+                .dispatch(&tc.name, tc.args.clone(), &cx)
+                .await
+                .into_content();
+            let mut result = transport::ToolResult {
+                id: tc.id.clone(),
+                content,
+                is_error,
+            };
             // Tool-result hooks: riders attach to this result (contextual,
             // persisted); system-tail nudges surface next turn.
             for n in hooks.on_tool_result(&tc, &result) {
@@ -207,8 +227,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         serde_json::Value::Object(m) => serde_json::Value::Object(m),
         _ => serde_json::json!({}),
     };
-    side["todos"] = todos.lock().map(|t| t.to_side()).unwrap_or(serde_json::Value::Null);
+    side["todos"] = todos
+        .lock()
+        .map(|t| t.to_side())
+        .unwrap_or(serde_json::Value::Null);
     side["nudges"] = hooks.to_side();
+    side["clipboard"] = clipboard
+        .lock()
+        .map(|c| c.to_side())
+        .unwrap_or(serde_json::Value::Null);
     store.save(&SaveState {
         transport: tx.name(),
         model: &base_opts.model,

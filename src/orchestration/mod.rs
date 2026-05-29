@@ -1565,8 +1565,12 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         });
     }
 
-    // Spawn stderr reader
+    // Spawn stderr reader. Signals completion via oneshot so the waiter can
+    // join it before snapshotting `inner.stderr` — without this, a fast fatal
+    // exit (e.g. the harness bailing before any stdout) races the snapshot and
+    // the task's `error` comes back empty, hiding the failure reason.
     let task_ref_err = task.clone();
+    let (stderr_done_tx, stderr_done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let reader = tokio::io::BufReader::new(stderr_handle);
         let mut lines = reader.lines();
@@ -1575,11 +1579,13 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             inner.stderr.push_str(&line);
             inner.stderr.push('\n');
         }
+        let _ = stderr_done_tx.send(());
     });
 
-    // Spawn process waiter — waits for BOTH the process exit AND stdout reader
+    // Spawn process waiter — waits for the process exit AND both readers
     // to finish before marking the task terminal. This ensures results are
-    // fully parsed before waiters are notified.
+    // fully parsed (stdout) and the failure reason is captured (stderr) before
+    // waiters are notified.
     let task_ref_wait = task.clone();
     let task_id_wait = id.clone();
     let tail_tx_wait = tail_tx;
@@ -1589,6 +1595,9 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         // Wait for stdout reader to finish before processing results —
         // ensures all events/results are parsed before we mark terminal.
         let _ = stdout_done_rx.await;
+        // Join the stderr reader too, so `error_snippet` reflects the real
+        // failure message rather than an empty (still-draining) buffer.
+        let _ = stderr_done_rx.await;
         let code = status.ok().and_then(|s| s.code());
 
         // Post-hoc vibe session discovery. Run unconditionally when
@@ -2017,6 +2026,24 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
         let start = inner.events.len().saturating_sub(tail);
         obj["recentEvents"] = Value::Array(inner.events[start..].to_vec());
     }
+    // Surface the captured stderr tail when the task failed or emitted no
+    // stream events — otherwise a pre-stream bail (e.g. the harness exiting
+    // before any stdout) shows only exitCode:1 with no reason. Bounded so a
+    // chatty stderr can't flood the response.
+    if (inner.status == TaskStatus::Failed || event_count == 0) && !inner.stderr.trim().is_empty() {
+        const MAX: usize = 2000;
+        let s = inner.stderr.trim_end();
+        let tail_str = if s.len() > MAX {
+            let mut start = s.len() - MAX;
+            while start < s.len() && !s.is_char_boundary(start) {
+                start += 1;
+            }
+            format!("…{}", &s[start..])
+        } else {
+            s.to_string()
+        };
+        obj["stderrTail"] = Value::from(tail_str);
+    }
     obj
 }
 
@@ -2075,6 +2102,67 @@ mod tests {
         assert!(TaskStatus::Completed.is_terminal());
         assert!(TaskStatus::Failed.is_terminal());
         assert!(TaskStatus::Cancelled.is_terminal());
+    }
+
+    fn task_with(status: TaskStatus, stderr: &str, events: Vec<Value>) -> Task {
+        Task {
+            inner: Mutex::new(TaskInner {
+                id: "t".into(),
+                provider: Provider::Glm,
+                session_id: "s".into(),
+                events,
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: stderr.into(),
+                status,
+                started_at: now_ms(),
+                completed_at: Some(now_ms()),
+                exit_code: Some(1),
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                supervision: SupervisionState::default(),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn status_surfaces_stderr_tail_on_silent_failure() {
+        // The bug this guards: a harness that bails before any stdout left
+        // bro_status showing exit 1 / 0 events with no reason.
+        let failed = task_with(
+            TaskStatus::Failed,
+            "harness error: no --model, no resumed session model, …",
+            vec![],
+        );
+        let json = task_status_json(&failed, 0);
+        assert_eq!(json["eventCount"], 0);
+        assert!(
+            json["stderrTail"]
+                .as_str()
+                .unwrap()
+                .contains("no --model"),
+            "failed task must surface the stderr reason, got {json}"
+        );
+    }
+
+    #[test]
+    fn status_omits_stderr_tail_on_clean_success() {
+        let ok = task_with(
+            TaskStatus::Completed,
+            "",
+            vec![serde_json::json!({"type": "system"})],
+        );
+        let json = task_status_json(&ok, 0);
+        assert!(json.get("stderrTail").is_none());
     }
 
     #[test]

@@ -34,7 +34,10 @@ enum Auth {
     /// Standard OpenAI: `Authorization: Bearer <key>`.
     ApiKey(String),
     /// ChatGPT backend: bearer access token + account id.
-    ChatGpt { access_token: String, account_id: String },
+    ChatGpt {
+        access_token: String,
+        account_id: String,
+    },
 }
 
 impl OpenAiResponsesTransport {
@@ -322,14 +325,23 @@ mod tests {
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
-        TurnOpts { model: "m".into(), max_tokens: 16, system, effort: None, web_search: false }
+        TurnOpts {
+            model: "m".into(),
+            max_tokens: 16,
+            system,
+            effort: None,
+            web_search: false,
+        }
     }
 
     #[test]
     fn stable_is_instructions_volatile_is_trailing_developer_item() {
         let body = transport().build_body(
             &[],
-            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("MANIFEST".into()) }),
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: Some("MANIFEST".into()),
+            }),
         );
         // Stable → cached instructions.
         assert_eq!(body["instructions"], "BASE");
@@ -347,8 +359,13 @@ mod tests {
     fn empty_stable_falls_back_to_nonempty_instructions() {
         // The ChatGPT backend rejects empty instructions; the fallback must hold
         // even when only a volatile tail is present.
-        let body = transport()
-            .build_body(&[], &opts(SystemPrompt { stable: None, volatile: Some("V".into()) }));
+        let body = transport().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: None,
+                volatile: Some("V".into()),
+            }),
+        );
         assert!(!body["instructions"].as_str().unwrap().is_empty());
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);

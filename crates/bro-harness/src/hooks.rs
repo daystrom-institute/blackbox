@@ -194,19 +194,29 @@ impl HookEngine {
     }
 
     pub fn on_user_turn(&mut self, prompt: &str) -> Vec<Nudge> {
-        let cands: Vec<Candidate> = self.hooks.iter().flat_map(|h| h.on_user_turn(prompt)).collect();
+        let cands: Vec<Candidate> = self
+            .hooks
+            .iter()
+            .flat_map(|h| h.on_user_turn(prompt))
+            .collect();
         self.admit(cands)
     }
 
     pub fn on_assistant_turn(&mut self, text: &str, calls: &[ToolCall]) -> Vec<Nudge> {
-        let cands: Vec<Candidate> =
-            self.hooks.iter().flat_map(|h| h.on_assistant_turn(text, calls)).collect();
+        let cands: Vec<Candidate> = self
+            .hooks
+            .iter()
+            .flat_map(|h| h.on_assistant_turn(text, calls))
+            .collect();
         self.admit(cands)
     }
 
     pub fn on_tool_result(&mut self, call: &ToolCall, result: &ToolResult) -> Vec<Nudge> {
-        let cands: Vec<Candidate> =
-            self.hooks.iter().flat_map(|h| h.on_tool_result(call, result)).collect();
+        let cands: Vec<Candidate> = self
+            .hooks
+            .iter()
+            .flat_map(|h| h.on_tool_result(call, result))
+            .collect();
         self.admit(cands)
     }
 
@@ -215,11 +225,17 @@ impl HookEngine {
     /// this turn).
     fn admit(&mut self, mut cands: Vec<Candidate>) -> Vec<Nudge> {
         // Deterministic ranking: priority desc, then rule_id for stable ties.
-        cands.sort_by(|a, b| b.priority.cmp(&a.priority).then_with(|| a.rule_id.cmp(&b.rule_id)));
+        cands.sort_by(|a, b| {
+            b.priority
+                .cmp(&a.priority)
+                .then_with(|| a.rule_id.cmp(&b.rule_id))
+        });
         for c in cands {
             let pass = match c.kind {
                 NudgeKind::Signpost => self.ledger.try_fire_once(&c.rule_id),
-                NudgeKind::Periodic { cooldown } => self.ledger.try_fire_periodic(&c.rule_id, cooldown),
+                NudgeKind::Periodic { cooldown } => {
+                    self.ledger.try_fire_periodic(&c.rule_id, cooldown)
+                }
             };
             if pass {
                 let n = Nudge {
@@ -252,7 +268,10 @@ impl ShellGrepHook {
         let first = command.split_whitespace().next().unwrap_or("");
         // Strip a leading path (e.g. /usr/bin/grep) to the basename.
         let base = first.rsplit('/').next().unwrap_or(first);
-        matches!(base, "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" | "find")
+        matches!(
+            base,
+            "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" | "find"
+        )
     }
 }
 
@@ -261,7 +280,11 @@ impl Hook for ShellGrepHook {
         if call.name != "shell_run" {
             return Vec::new();
         }
-        let command = call.args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+        let command = call
+            .args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if !Self::is_manual_search(command) {
             return Vec::new();
         }
@@ -332,13 +355,21 @@ impl Hook for CopyPasteHook {
                 if nw.len() < MIN_PASTE_OVERLAP {
                     return Vec::new();
                 }
-                let hit = self.reads.lock().map(|q| {
-                    q.iter().any(|r| {
-                        let nr = normalize_ws(r);
-                        let (short, long) = if nw.len() <= nr.len() { (&nw, &nr) } else { (&nr, &nw) };
-                        short.len() >= MIN_PASTE_OVERLAP && long.contains(short.as_str())
+                let hit = self
+                    .reads
+                    .lock()
+                    .map(|q| {
+                        q.iter().any(|r| {
+                            let nr = normalize_ws(r);
+                            let (short, long) = if nw.len() <= nr.len() {
+                                (&nw, &nr)
+                            } else {
+                                (&nr, &nw)
+                            };
+                            short.len() >= MIN_PASTE_OVERLAP && long.contains(short.as_str())
+                        })
                     })
-                }).unwrap_or(false);
+                    .unwrap_or(false);
                 if !hit {
                     return Vec::new();
                 }
@@ -448,20 +479,40 @@ mod tests {
     use serde_json::json;
 
     fn shell_call(command: &str) -> ToolCall {
-        ToolCall { id: "1".into(), name: "shell_run".into(), args: json!({ "command": command }) }
+        ToolCall {
+            id: "1".into(),
+            name: "shell_run".into(),
+            args: json!({ "command": command }),
+        }
     }
     fn ok_result() -> ToolResult {
-        ToolResult { id: "1".into(), content: "out".into(), is_error: false }
+        ToolResult {
+            id: "1".into(),
+            content: "out".into(),
+            is_error: false,
+        }
     }
 
     #[test]
     fn shell_grep_hook_triggers_on_search_tools() {
         let h = ShellGrepHook;
-        for cmd in ["grep -r foo .", "rg foo", "find . -name '*.rs'", "/usr/bin/grep x"] {
-            assert_eq!(h.on_tool_result(&shell_call(cmd), &ok_result()).len(), 1, "{cmd}");
+        for cmd in [
+            "grep -r foo .",
+            "rg foo",
+            "find . -name '*.rs'",
+            "/usr/bin/grep x",
+        ] {
+            assert_eq!(
+                h.on_tool_result(&shell_call(cmd), &ok_result()).len(),
+                1,
+                "{cmd}"
+            );
         }
         for cmd in ["cargo build", "ls -la", "echo grep"] {
-            assert!(h.on_tool_result(&shell_call(cmd), &ok_result()).is_empty(), "{cmd}");
+            assert!(
+                h.on_tool_result(&shell_call(cmd), &ok_result()).is_empty(),
+                "{cmd}"
+            );
         }
     }
 
@@ -530,13 +581,25 @@ mod tests {
     // ── §3 rule tests ──────────────────────────────────────────────────
 
     fn read_result(content: &str) -> ToolResult {
-        ToolResult { id: "r".into(), content: content.into(), is_error: false }
+        ToolResult {
+            id: "r".into(),
+            content: content.into(),
+            is_error: false,
+        }
     }
     fn write_call(tool: &str, field: &str, text: &str) -> ToolCall {
-        ToolCall { id: "w".into(), name: tool.into(), args: json!({ field: text }) }
+        ToolCall {
+            id: "w".into(),
+            name: tool.into(),
+            args: json!({ field: text }),
+        }
     }
     fn read_call(tool: &str) -> ToolCall {
-        ToolCall { id: "rd".into(), name: tool.into(), args: json!({ "file_path": "f" }) }
+        ToolCall {
+            id: "rd".into(),
+            name: tool.into(),
+            args: json!({ "file_path": "f" }),
+        }
     }
 
     #[test]
@@ -547,9 +610,15 @@ mod tests {
                      // end of the parser entrypoint, copied wholesale";
         let h = CopyPasteHook::default();
         // Read it (producer) — no nudge yet.
-        assert!(h.on_tool_result(&read_call("file_read"), &read_result(chunk)).is_empty());
+        assert!(
+            h.on_tool_result(&read_call("file_read"), &read_result(chunk))
+                .is_empty()
+        );
         // Write the same content elsewhere (consumer) — nudge fires.
-        let fired = h.on_tool_result(&write_call("file_write", "content", chunk), &read_result("ok"));
+        let fired = h.on_tool_result(
+            &write_call("file_write", "content", chunk),
+            &read_result("ok"),
+        );
         assert_eq!(fired.len(), 1);
         assert_eq!(fired[0].rule_id, "copy-paste-to-slice");
         assert_eq!(fired[0].delivery, Delivery::Rider);
@@ -558,19 +627,37 @@ mod tests {
     #[test]
     fn copy_paste_ignores_short_or_novel_writes() {
         let h = CopyPasteHook::default();
-        h.on_tool_result(&read_call("file_read"), &read_result("some long original file body that is read"));
+        h.on_tool_result(
+            &read_call("file_read"),
+            &read_result("some long original file body that is read"),
+        );
         // Short write — under the overlap floor.
-        assert!(h.on_tool_result(&write_call("file_edit", "new_string", "x = 1"), &read_result("ok")).is_empty());
+        assert!(
+            h.on_tool_result(
+                &write_call("file_edit", "new_string", "x = 1"),
+                &read_result("ok")
+            )
+            .is_empty()
+        );
         // Long but novel write — not a reproduction of anything read.
         let novel = "completely unrelated content authored fresh, ".repeat(6);
-        assert!(h.on_tool_result(&write_call("file_write", "content", &novel), &read_result("ok")).is_empty());
+        assert!(
+            h.on_tool_result(
+                &write_call("file_write", "content", &novel),
+                &read_result("ok")
+            )
+            .is_empty()
+        );
     }
 
     #[test]
     fn refactor_signpost_matches_user_or_assistant_text() {
         let h = RefactorSignpostHook;
         assert_eq!(h.on_user_turn("please refactor the auth module").len(), 1);
-        assert_eq!(h.on_assistant_turn("I'll extract method here", &[]).len(), 1);
+        assert_eq!(
+            h.on_assistant_turn("I'll extract method here", &[]).len(),
+            1
+        );
         assert!(h.on_user_turn("add a new endpoint").is_empty());
         // It's a signpost (one-time semantics enforced by the engine ledger).
         assert_eq!(h.on_user_turn("rework this").len(), 0); // "rework" not a cue
@@ -583,9 +670,18 @@ mod tests {
     #[test]
     fn hedged_convention_matches_hedges_only() {
         let h = HedgedConventionHook;
-        assert_eq!(h.on_assistant_turn("I think we use tokio here", &[]).len(), 1);
-        assert!(h.on_assistant_turn("We use tokio, confirmed via bbox_knowledge", &[]).is_empty());
-        assert_eq!(h.on_assistant_turn("this PROBABLY USES serde", &[]).len(), 1); // case-insensitive
+        assert_eq!(
+            h.on_assistant_turn("I think we use tokio here", &[]).len(),
+            1
+        );
+        assert!(
+            h.on_assistant_turn("We use tokio, confirmed via bbox_knowledge", &[])
+                .is_empty()
+        );
+        assert_eq!(
+            h.on_assistant_turn("this PROBABLY USES serde", &[]).len(),
+            1
+        ); // case-insensitive
     }
 
     #[test]
@@ -598,8 +694,20 @@ mod tests {
         impl Hook for Hi {
             fn on_assistant_turn(&self, _: &str, _: &[ToolCall]) -> Vec<Candidate> {
                 vec![
-                    Candidate { rule_id: "lex".into(), message: "m".into(), delivery: Delivery::SystemTail, kind: NudgeKind::Signpost, priority: 8 },
-                    Candidate { rule_id: "beh".into(), message: "m".into(), delivery: Delivery::Rider, kind: NudgeKind::Signpost, priority: 20 },
+                    Candidate {
+                        rule_id: "lex".into(),
+                        message: "m".into(),
+                        delivery: Delivery::SystemTail,
+                        kind: NudgeKind::Signpost,
+                        priority: 8,
+                    },
+                    Candidate {
+                        rule_id: "beh".into(),
+                        message: "m".into(),
+                        delivery: Delivery::Rider,
+                        kind: NudgeKind::Signpost,
+                        priority: 20,
+                    },
                 ]
             }
         }
@@ -617,8 +725,14 @@ mod tests {
         let out = eng.on_tool_result(&shell_call("grep -r x ."), &ok_result());
         assert_eq!(out.len(), 1);
         let msg = &out[0].message;
-        assert!(msg.contains("bbox_note"), "directive names the gap-note tool");
-        assert!(msg.contains("gap note"), "directive frames it as a gap note");
+        assert!(
+            msg.contains("bbox_note"),
+            "directive names the gap-note tool"
+        );
+        assert!(
+            msg.contains("gap note"),
+            "directive frames it as a gap note"
+        );
         // The rule's own body is still there ahead of the directive.
         assert!(msg.contains("indexed"));
         // And it's inside the rider envelope when delivered as a rider.

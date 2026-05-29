@@ -151,6 +151,7 @@ mod tests {
             http: reqwest::Client::new(),
             todos: Arc::new(Mutex::new(TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
+            clipboard: Arc::new(Mutex::new(crate::clipboard::Registers::default())),
         }
     }
 
