@@ -135,25 +135,29 @@ impl Transport for OpenAiResponsesTransport {
             body["reasoning"] = json!({"effort": normalize_effort(e)});
         }
 
-        let mut rb = self
-            .http
-            .post(&self.endpoint)
-            .header("content-type", "application/json")
-            .header("accept", "text/event-stream");
-        rb = match &self.auth {
-            Auth::ApiKey(k) => rb.header("authorization", format!("Bearer {k}")),
-            Auth::ChatGpt {
-                access_token,
-                account_id,
-            } => rb
-                .header("authorization", format!("Bearer {access_token}"))
-                .header("chatgpt-account-id", account_id.clone())
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("originator", "codex_cli_rs")
-                .header("session_id", uuid::Uuid::new_v4().to_string()),
-        };
-
-        let resp = rb.json(&body).send().await.context("responses request")?;
+        let resp = super::http::send_with_retry("openai-responses", || {
+            let mut rb = self
+                .http
+                .post(&self.endpoint)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .timeout(super::http::request_timeout());
+            rb = match &self.auth {
+                Auth::ApiKey(k) => rb.header("authorization", format!("Bearer {k}")),
+                Auth::ChatGpt {
+                    access_token,
+                    account_id,
+                } => rb
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .header("chatgpt-account-id", account_id.clone())
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "codex_cli_rs")
+                    .header("session_id", uuid::Uuid::new_v4().to_string()),
+            };
+            rb.json(&body).send()
+        })
+        .await
+        .context("responses request")?;
         let status = resp.status();
         let sse = resp.text().await.context("read responses body")?;
         if !status.is_success() {

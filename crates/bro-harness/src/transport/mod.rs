@@ -19,6 +19,7 @@
 
 pub mod anthropic;
 pub mod codex_auth;
+pub mod http;
 pub mod openai_chat;
 pub mod openai_responses;
 

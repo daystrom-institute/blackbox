@@ -113,17 +113,21 @@ impl Transport for AnthropicTransport {
         }
 
         let url = format!("{}/v1/messages", self.base_url);
-        let mut rb = self
-            .http
-            .post(&url)
-            .header("content-type", "application/json")
-            .header("anthropic-version", &self.version);
-        rb = match &self.auth {
-            Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
-            Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
-        };
-
-        let resp = rb.json(&body).send().await.context("messages request")?;
+        let resp = super::http::send_with_retry("anthropic/messages", || {
+            let mut rb = self
+                .http
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("anthropic-version", &self.version)
+                .timeout(super::http::request_timeout());
+            rb = match &self.auth {
+                Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
+                Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
+            };
+            rb.json(&body).send()
+        })
+        .await
+        .context("messages request")?;
         let status = resp.status();
         let text = resp.text().await.context("read messages body")?;
         if !status.is_success() {
