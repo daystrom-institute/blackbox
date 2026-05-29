@@ -147,6 +147,16 @@ pub struct Registers {
     clock: u64,
 }
 
+/// Canonicalize a register handle. A bare name (`"@"`, `"a"`) and its
+/// `clip:`-prefixed form (`"clip:@"`, `"clip:a"`) address the same register, so
+/// the model can use either spelling in any `register`/`into`/`from`/`stdout_to`
+/// param. Other prefixes are left intact — notably `task:`, reserved for the
+/// pending-ref (async Task) arm of the ref ABI, so those route differently when
+/// Stage 3 lands rather than silently aliasing a clipboard register.
+pub fn normalize_register(raw: &str) -> &str {
+    raw.strip_prefix("clip:").unwrap_or(raw)
+}
+
 impl Registers {
     /// Restore from the `side["clipboard"]` blob. Tolerant: absent/garbage →
     /// empty, so old session files and partial blobs resume cleanly.
@@ -215,6 +225,7 @@ impl Registers {
         provenance: Option<Provenance>,
         append: bool,
     ) -> anyhow::Result<Vec<String>> {
+        let name = normalize_register(name);
         let combined = if append {
             match self.map.get(name) {
                 Some(prev) => format!("{}{}", prev.text, text),
@@ -247,6 +258,7 @@ impl Registers {
 
     /// Read a register and refresh its LRU stamp.
     fn touch_get(&mut self, name: &str) -> Option<&Register> {
+        let name = normalize_register(name);
         let stamp = self.next_clock();
         if let Some(r) = self.map.get_mut(name) {
             r.touched = stamp;
@@ -256,7 +268,12 @@ impl Registers {
     }
 
     fn get(&self, name: &str) -> Option<&Register> {
-        self.map.get(name)
+        self.map.get(normalize_register(name))
+    }
+
+    /// Drop a register by name (handle-normalized). Returns whether it existed.
+    pub fn remove(&mut self, name: &str) -> bool {
+        self.map.remove(normalize_register(name)).is_some()
     }
 
     // --- ref ABI: the chaining surface other tools (file_read{into},
@@ -278,13 +295,17 @@ impl Registers {
     }
 
     /// Metadata view of a register (hashes/counts/preview), never the content.
+    /// Displays the canonical (bare) name regardless of how the handle was
+    /// spelled, so responses are consistent.
     pub fn meta_of(&self, name: &str) -> Option<Value> {
+        let name = normalize_register(name);
         self.map.get(name).map(|r| r.meta(name))
     }
 
     /// Read a text register for a consuming tool (file_write{from},
     /// shell_run{stdin_from}). Touches LRU; errors if absent or non-text.
     pub fn consume_text(&mut self, name: &str) -> Result<String, String> {
+        let name = normalize_register(name);
         match self.touch_get(name) {
             Some(r) if r.kind.is_text() => Ok(r.text.clone()),
             Some(_) => Err(format!(
@@ -375,7 +396,7 @@ impl Tool for ClipYank {
             Ok(e) => e,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
-        let mut out = clip.get(&register).unwrap().meta(&register);
+        let mut out = clip.meta_of(&register).unwrap();
         annotate_evicted(&mut out, evicted);
         ToolResult::Json(out)
     }
@@ -423,7 +444,7 @@ impl Tool for ClipSet {
             Ok(e) => e,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
-        let mut out = clip.get(&register).unwrap().meta(&register);
+        let mut out = clip.meta_of(&register).unwrap();
         annotate_evicted(&mut out, evicted);
         ToolResult::Json(out)
     }
@@ -684,7 +705,7 @@ impl Tool for ClipClear {
             serde_json::from_value(input).unwrap_or(ClipClearInput { register: None });
         let mut clip = cx.clipboard.lock().unwrap();
         let cleared = match args.register {
-            Some(name) => clip.map.remove(&name).map(|_| 1).unwrap_or(0),
+            Some(name) => usize::from(clip.remove(&name)),
             None => {
                 let n = clip.map.len();
                 clip.map.clear();
@@ -693,6 +714,26 @@ impl Tool for ClipClear {
         };
         ToolResult::Json(json!({ "cleared": cleared }))
     }
+}
+
+/// Deposit a producer tool's output into a register (`RefKind::ToolResult`) and
+/// return a metadata `ToolResult` — hashes/counts/preview, never the content.
+/// The shared `into` register-producer path for tools whose output is bulky
+/// enough to chain rather than read (web_fetch, content_search, …). Handle is
+/// normalized (`clip:` tolerated) by the `Registers` API.
+pub fn deposit_tool_result(
+    clipboard: &std::sync::Mutex<Registers>,
+    register: &str,
+    text: String,
+) -> ToolResult {
+    let mut clip = clipboard.lock().unwrap();
+    let evicted = match clip.put_tool_result(register, text) {
+        Ok(e) => e,
+        Err(e) => return ToolResult::Error(e.to_string()),
+    };
+    let mut meta = clip.meta_of(register).unwrap_or(Value::Null);
+    annotate_evicted(&mut meta, evicted);
+    ToolResult::Json(meta)
 }
 
 /// Surface evicted register names on a producer's response — never drop them
@@ -811,6 +852,30 @@ mod tests {
         put_text(&mut regs, "@", "payload");
         assert_eq!(regs.consume_text("@").unwrap(), "payload");
         assert!(regs.consume_text("missing").unwrap_err().contains("empty"));
+    }
+
+    #[test]
+    fn clip_prefix_aliases_bare_register() {
+        assert_eq!(normalize_register("clip:x"), "x");
+        assert_eq!(normalize_register("clip:@"), "@");
+        // task: is reserved for pending refs — left literal, never aliased.
+        assert_eq!(normalize_register("task:abc"), "task:abc");
+        assert_eq!(normalize_register("a"), "a");
+
+        let mut regs = Registers::default();
+        put_text(&mut regs, "a", "payload");
+        // Read/consume/meta all resolve the prefixed handle to the same slot.
+        assert_eq!(regs.get("clip:a").unwrap().text, "payload");
+        assert_eq!(regs.consume_text("clip:a").unwrap(), "payload");
+        assert_eq!(regs.meta_of("clip:a").unwrap()["register"], "a");
+        // Writing via the prefixed handle hits the same slot — no duplicate.
+        regs.put("clip:a", RefKind::Text, "new".into(), None, false)
+            .unwrap();
+        assert_eq!(regs.map.len(), 1);
+        assert_eq!(regs.get("a").unwrap().text, "new");
+        // Clearing via the prefixed handle removes the bare slot.
+        assert!(regs.remove("clip:a"));
+        assert!(regs.get("a").is_none());
     }
 }
 
@@ -950,6 +1015,32 @@ mod tool_tests {
             cx.clipboard.lock().unwrap().get("s").unwrap().text,
             "captured-output"
         );
+    }
+
+    /// content_search{into} deposits the match set into a register and returns
+    /// metadata, not matches — and exercises clip: handle normalization e2e.
+    #[tokio::test]
+    async fn content_search_into_register_with_clip_prefix() {
+        use crate::workspace::ContentSearch;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.txt"),
+            "needle here\nother\nneedle again\n",
+        )
+        .unwrap();
+        let cx = cx_at(dir.path());
+        let r = ContentSearch
+            .call(json!({"pattern": "needle", "into": "clip:m"}), &cx)
+            .await;
+        let v = json_of(r);
+        // clip: prefix normalized to the bare canonical name.
+        assert_eq!(v["register"], "m");
+        assert!(
+            v.get("text").is_none(),
+            "into must not return matches inline"
+        );
+        let stored = cx.clipboard.lock().unwrap().get("m").unwrap().text.clone();
+        assert!(stored.contains("needle here") && stored.contains("needle again"));
     }
 
     fn json_of(r: ToolResult) -> Value {

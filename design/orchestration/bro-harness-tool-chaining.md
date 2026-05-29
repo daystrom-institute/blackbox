@@ -15,21 +15,28 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 > [`bro-harness-clipboard.md`](./bro-harness-clipboard.md).
 >
 > - **Stage 1 (settled refs / clipboard)** — built; see the clipboard doc.
-> - **Stage 2 (settled refs, any tool)** — built 2026-05-29: producers
->   `file_read{into}` and `shell_run{stdout_to}` deposit results into a register
->   instead of returning them; consumers `file_write{from}` and
->   `shell_run{stdin_from}` read a register instead of an inline arg. The
->   `kind` tag is `RefKind` on `Register` (`Text|FileSlice|ToolResult`);
->   consumers refuse a non-text register via `Registers::consume_text`. The
->   register handle is the bare register name (`"@"`, `"a"`, …) — the
->   `clip:`/`task:` namespaced handle space below is not yet a literal prefix in
->   code, since only settled refs exist.
+> - **Stage 2 (settled refs, any tool)** — built. Producers deposit a result
+>   into a register instead of returning it: `file_read{into}`,
+>   `shell_run{stdout_to}`, `web_fetch{into}`, `content_search{into}`. Consumers
+>   read a register instead of an inline arg: `file_write{from}`,
+>   `shell_run{stdin_from}`, `clip_paste{register}`. The `kind` tag is `RefKind`
+>   on `Register` (`Text|FileSlice|ToolResult`); consumers refuse a non-text
+>   register via `Registers::consume_text`. The shared deposit path is
+>   `clipboard::deposit_tool_result`.
+> - **Handle namespace** — register handles tolerate an optional `clip:` prefix
+>   (`clip:a` ≡ `a`), normalized at the `Registers` API
+>   (`clipboard::normalize_register`) wherever a register is named. `task:` is
+>   left literal — reserved for the pending-ref arm so it routes differently when
+>   Stage 3 lands rather than silently aliasing a clipboard register.
 > - **Stage 3 (pending refs = Task)** — not built; deferred until an in-harness
 >   async producer (background shell / sub-agent dispatch) exists.
 >
-> Verified against `crates/bro-harness/src/{agent_loop.rs,registry.rs}` and
-> `crates/bro-tools/src/{tool.rs,clipboard.rs,workspace.rs,shell.rs}` on
-> 2026-05-29.
+> Remaining Stage-2 gaps (non-blocking): `RefKind` is text-only
+> (`Bytes`/`Json` reserved), and `bbox_search` is an MCP/daemon surface so its
+> `into` lives outside the harness. Verified against
+> `crates/bro-harness/src/{agent_loop.rs,registry.rs}` and
+> `crates/bro-tools/src/{tool.rs,clipboard.rs,workspace.rs,shell.rs,web.rs}`
+> on 2026-05-29.
 
 ## Problem
 

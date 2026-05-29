@@ -24,6 +24,13 @@ struct WebFetchInput {
     url: String,
     /// Max characters of extracted text to return (default 8000, clamped 500..=20000).
     max_chars: Option<usize>,
+    /// Ref ABI (chaining): when set, the FULL extracted text is stored into this
+    /// clipboard register instead of being returned, so a large page never costs
+    /// context tokens — `max_chars` is then ignored (the register cap bounds it).
+    /// The response carries metadata + preview; consume it with clip_paste /
+    /// file_write{from} / clip_peek. See design/orchestration/bro-harness-tool-chaining.md.
+    #[serde(default)]
+    into: Option<String>,
 }
 
 pub struct WebFetch;
@@ -72,6 +79,10 @@ impl Tool for WebFetch {
             Err(e) => return ToolResult::Error(format!("fetch {}: {e}", args.url)),
         };
         let text = strip_html(&body);
+        // Ref ABI: stash the full text into a register instead of returning it.
+        if let Some(register) = &args.into {
+            return crate::clipboard::deposit_tool_result(&cx.clipboard, register, text);
+        }
         let out: String = text.chars().take(max_chars).collect();
         ToolResult::Text(out)
     }

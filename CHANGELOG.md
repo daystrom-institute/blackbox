@@ -38,11 +38,13 @@ out explicitly under `Changed` or `Removed`.
   short preview, and only `clip_peek` egresses bounded content. Registers ride
   the `side` cell (durable across `exec → resume`) and are byte/count-capped
   with surfaced LRU eviction. The same register store is the chaining substrate:
-  `file_read{into}` and `shell_run{stdout_to}` produce a register instead of
-  returning output, and `file_write{from}` / `shell_run{stdin_from}` consume one
-  instead of inlining bytes (the tool-chaining ref ABI, Stages 1–2; Stage 3
-  pending-ref Tasks deferred until an async producer exists). `clip_*` are
-  pinned/always-available; tune via `BRO_HARNESS_PIN_TOOLS`.
+  `file_read{into}`, `shell_run{stdout_to}`, `web_fetch{into}`, and
+  `content_search{into}` produce a register instead of returning output, and
+  `file_write{from}` / `shell_run{stdin_from}` consume one instead of inlining
+  bytes (the tool-chaining ref ABI, Stages 1–2; Stage 3 pending-ref Tasks
+  deferred until an async producer exists). Register handles tolerate an
+  optional `clip:` prefix (`clip:a` ≡ `a`); `task:` is reserved for pending
+  refs. `clip_*` are pinned/always-available; tune via `BRO_HARNESS_PIN_TOOLS`.
 - bro-harness hook subsystem and Nudger: an internal interception seam
   (user/assistant/tool-result hooks) that contributes ambient guidance steering
   the agent toward the richer blackbox toolbox, with a cache-stable/volatile

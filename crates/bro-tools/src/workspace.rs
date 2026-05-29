@@ -597,6 +597,13 @@ struct ContentSearchInput {
     /// Case-insensitive matching (like ripgrep `-i`). Default false.
     #[serde(default)]
     case_insensitive: bool,
+    /// Ref ABI (chaining): when set, the result is stored into this clipboard
+    /// register instead of being returned, so a large match set never costs
+    /// context tokens. The response carries metadata + preview; consume it with
+    /// clip_paste / file_write{from} / clip_peek. See
+    /// design/orchestration/bro-harness-tool-chaining.md.
+    #[serde(default)]
+    into: Option<String>,
 }
 
 pub struct ContentSearch;
@@ -721,7 +728,12 @@ impl Tool for ContentSearch {
                 "[total: {total_matches} matches across {matched_files} files]"
             ));
         }
-        ToolResult::Text(hits.join("\n"))
+        let output = hits.join("\n");
+        // Ref ABI: stash the match set into a register instead of returning it.
+        if let Some(register) = &args.into {
+            return crate::clipboard::deposit_tool_result(&cx.clipboard, register, output);
+        }
+        ToolResult::Text(output)
     }
 }
 
