@@ -24,7 +24,8 @@
 use crate::transport::{ToolCall, ToolResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Mutex;
 
 /// How long (in turns) after a nudge fires we still credit its target tools
 /// being called as "adoption".
@@ -45,9 +46,7 @@ pub enum Delivery {
 /// One-time vs recurring, with the ledger gate that implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NudgeKind {
-    /// Fires at most once per session (deduped via the fired ledger). Part of
-    /// the rule API; §2's single shipped rule is `Periodic`, §3 rules use this.
-    #[allow(dead_code)]
+    /// Fires at most once per session (deduped via the fired ledger).
     Signpost,
     /// May re-fire after `cooldown` turns elapse.
     Periodic { cooldown: u64 },
@@ -198,7 +197,12 @@ impl HookEngine {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let hooks: Vec<Box<dyn Hook>> = if enabled {
-            vec![Box::new(ShellGrepHook)]
+            vec![
+                Box::new(CopyPasteHook::default()),
+                Box::new(ShellGrepHook),
+                Box::new(RefactorSignpostHook),
+                Box::new(HedgedConventionHook),
+            ]
         } else {
             Vec::new()
         };
@@ -307,6 +311,175 @@ impl Hook for ShellGrepHook {
             kind: NudgeKind::Periodic { cooldown: 6 },
             targets: vec!["bbox_code_query".into(), "bbox_hybrid_search".into()],
             priority: 10,
+        }]
+    }
+}
+
+/// Collapse runs of whitespace to single spaces — so a verbatim paste still
+/// matches across reflowed indentation / line endings.
+fn normalize_ws(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Behavioral copy-paste detector: the model read content, then wrote a
+/// *verbatim* copy of it somewhere else — the bytes round-trip through context
+/// twice. Steer toward the server-side structural move. Verbatim containment
+/// above a length floor is deliberately conservative: low false-positive, and
+/// it only flags the exact "context-copy-paste" the slice tools eliminate.
+///
+/// Stateful: remembers recent read outputs for this dispatch (interior
+/// mutability; not persisted — a per-dispatch heuristic).
+#[derive(Default)]
+struct CopyPasteHook {
+    reads: Mutex<VecDeque<String>>,
+}
+
+/// Min normalized-char overlap to call a write a paste of a read.
+const MIN_PASTE_OVERLAP: usize = 120;
+/// How many recent reads to remember, and the per-entry byte cap.
+const COPY_PASTE_RECENT_READS: usize = 8;
+const COPY_PASTE_ENTRY_CAP: usize = 16 * 1024;
+
+impl Hook for CopyPasteHook {
+    fn on_tool_result(&self, call: &ToolCall, result: &ToolResult) -> Vec<Candidate> {
+        match call.name.as_str() {
+            // Producers: remember what was read.
+            "file_read" | "smart_read" => {
+                if !result.is_error {
+                    let mut text = result.content.clone();
+                    text.truncate(COPY_PASTE_ENTRY_CAP);
+                    if let Ok(mut q) = self.reads.lock() {
+                        q.push_back(text);
+                        while q.len() > COPY_PASTE_RECENT_READS {
+                            q.pop_front();
+                        }
+                    }
+                }
+                Vec::new()
+            }
+            // Consumers: did the written text reproduce a recent read verbatim?
+            "file_write" | "file_edit" => {
+                let written = call
+                    .args
+                    .get("content")
+                    .or_else(|| call.args.get("new_string"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let nw = normalize_ws(written);
+                if nw.len() < MIN_PASTE_OVERLAP {
+                    return Vec::new();
+                }
+                let hit = self.reads.lock().map(|q| {
+                    q.iter().any(|r| {
+                        let nr = normalize_ws(r);
+                        let (short, long) = if nw.len() <= nr.len() { (&nw, &nr) } else { (&nr, &nw) };
+                        short.len() >= MIN_PASTE_OVERLAP && long.contains(short.as_str())
+                    })
+                }).unwrap_or(false);
+                if !hit {
+                    return Vec::new();
+                }
+                vec![Candidate {
+                    rule_id: "copy-paste-to-slice".into(),
+                    message: "You wrote a verbatim copy of content you just read — that \
+                              round-trips the bytes through context twice. `bbox_slice_copy` / \
+                              `bbox_slice_move` perform the source→target move server-side \
+                              without inlining the content (sha-guarded, dry-runnable). If the \
+                              duplication was intentional, disregard."
+                        .into(),
+                    delivery: Delivery::Rider,
+                    kind: NudgeKind::Periodic { cooldown: 8 },
+                    targets: vec!["bbox_slice_copy".into(), "bbox_slice_move".into()],
+                    priority: 20,
+                }]
+            }
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Lexical signpost: the work looks like a structured refactor — point at the
+/// refactor runbook + guarded refactor surface, once per session. Fires from
+/// either the user ask or the assistant's own framing.
+struct RefactorSignpostHook;
+
+const REFACTOR_CUES: &[&str] = &[
+    "refactor",
+    "rename across",
+    "rename the function",
+    "rename the method",
+    "extract function",
+    "extract method",
+    "move it to a module",
+    "move to a new module",
+    "organize imports",
+    "change the signature",
+    "pull this into",
+];
+
+impl RefactorSignpostHook {
+    fn match_text(&self, t: &str) -> Vec<Candidate> {
+        let lc = t.to_ascii_lowercase();
+        if !REFACTOR_CUES.iter().any(|c| lc.contains(c)) {
+            return Vec::new();
+        }
+        vec![Candidate {
+            rule_id: "refactor-signpost".into(),
+            message: "This looks like structured refactor work. Check `sm-refactor` first via \
+                      `bbox_knowledge` — the `bbox_refactor_*` / `bbox_slice_*` tools do guarded, \
+                      semantics-aware structural edits (rename, move item, organize imports) that \
+                      beat hand-editing. If this isn't a refactor, disregard."
+                .into(),
+            delivery: Delivery::SystemTail,
+            kind: NudgeKind::Signpost,
+            targets: vec!["bbox_knowledge".into(), "bbox_refactor_plan".into()],
+            priority: 8,
+        }]
+    }
+}
+
+impl Hook for RefactorSignpostHook {
+    fn on_user_turn(&self, prompt: &str) -> Vec<Candidate> {
+        self.match_text(prompt)
+    }
+    fn on_assistant_turn(&self, text: &str, _calls: &[ToolCall]) -> Vec<Candidate> {
+        self.match_text(text)
+    }
+}
+
+/// Lexical: the assistant is *inferring* a project convention instead of
+/// confirming it ("I think we use…"). Nudge toward the authoritative stores.
+/// Lowest priority and periodic — lexical hedging is the noisiest signal, so it
+/// yields to behavioral rules and self-throttles.
+struct HedgedConventionHook;
+
+const HEDGE_CUES: &[&str] = &[
+    "i think we use",
+    "i believe we use",
+    "probably uses",
+    "i assume the convention",
+    "likely the convention",
+    "i'm guessing the",
+    "presumably the project",
+];
+
+impl Hook for HedgedConventionHook {
+    fn on_assistant_turn(&self, text: &str, _calls: &[ToolCall]) -> Vec<Candidate> {
+        let lc = text.to_ascii_lowercase();
+        if !HEDGE_CUES.iter().any(|c| lc.contains(c)) {
+            return Vec::new();
+        }
+        vec![Candidate {
+            rule_id: "hedged-convention".into(),
+            message: "You're inferring a project convention rather than confirming it. \
+                      `bbox_knowledge` (durable rules/decisions) and `bbox_hybrid_search` (the \
+                      indexed graph) likely hold the authoritative answer. If you've already \
+                      verified it, disregard."
+                .into(),
+            delivery: Delivery::SystemTail,
+            kind: NudgeKind::Periodic { cooldown: 10 },
+            targets: vec!["bbox_knowledge".into(), "bbox_hybrid_search".into()],
+            priority: 5,
         }]
     }
 }
@@ -432,5 +605,87 @@ mod tests {
         let mut r = restored;
         assert!(!r.try_fire_once("a"));
         assert_eq!(r.adoption_summary(), (1, 0));
+    }
+
+    // ── §3 rule tests ──────────────────────────────────────────────────
+
+    fn read_result(content: &str) -> ToolResult {
+        ToolResult { id: "r".into(), content: content.into(), is_error: false }
+    }
+    fn write_call(tool: &str, field: &str, text: &str) -> ToolCall {
+        ToolCall { id: "w".into(), name: tool.into(), args: json!({ field: text }) }
+    }
+    fn read_call(tool: &str) -> ToolCall {
+        ToolCall { id: "rd".into(), name: tool.into(), args: json!({ "file_path": "f" }) }
+    }
+
+    #[test]
+    fn copy_paste_fires_on_verbatim_reproduction() {
+        // A chunk well over the overlap floor, read then written verbatim.
+        let chunk = "fn parse(input: &str) -> Result<Ast> { let tokens = lex(input)?; \
+                     let mut p = Parser::new(tokens); p.parse_program().map_err(Into::into) } \
+                     // end of the parser entrypoint, copied wholesale";
+        let h = CopyPasteHook::default();
+        // Read it (producer) — no nudge yet.
+        assert!(h.on_tool_result(&read_call("file_read"), &read_result(chunk)).is_empty());
+        // Write the same content elsewhere (consumer) — nudge fires.
+        let fired = h.on_tool_result(&write_call("file_write", "content", chunk), &read_result("ok"));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule_id, "copy-paste-to-slice");
+        assert_eq!(fired[0].delivery, Delivery::Rider);
+    }
+
+    #[test]
+    fn copy_paste_ignores_short_or_novel_writes() {
+        let h = CopyPasteHook::default();
+        h.on_tool_result(&read_call("file_read"), &read_result("some long original file body that is read"));
+        // Short write — under the overlap floor.
+        assert!(h.on_tool_result(&write_call("file_edit", "new_string", "x = 1"), &read_result("ok")).is_empty());
+        // Long but novel write — not a reproduction of anything read.
+        let novel = "completely unrelated content authored fresh, ".repeat(6);
+        assert!(h.on_tool_result(&write_call("file_write", "content", &novel), &read_result("ok")).is_empty());
+    }
+
+    #[test]
+    fn refactor_signpost_matches_user_or_assistant_text() {
+        let h = RefactorSignpostHook;
+        assert_eq!(h.on_user_turn("please refactor the auth module").len(), 1);
+        assert_eq!(h.on_assistant_turn("I'll extract method here", &[]).len(), 1);
+        assert!(h.on_user_turn("add a new endpoint").is_empty());
+        // It's a signpost (one-time semantics enforced by the engine ledger).
+        assert_eq!(h.on_user_turn("rework this").len(), 0); // "rework" not a cue
+        assert!(matches!(
+            h.on_user_turn("refactor x")[0].kind,
+            NudgeKind::Signpost
+        ));
+    }
+
+    #[test]
+    fn hedged_convention_matches_hedges_only() {
+        let h = HedgedConventionHook;
+        assert_eq!(h.on_assistant_turn("I think we use tokio here", &[]).len(), 1);
+        assert!(h.on_assistant_turn("We use tokio, confirmed via bbox_knowledge", &[]).is_empty());
+        assert_eq!(h.on_assistant_turn("this PROBABLY USES serde", &[]).len(), 1); // case-insensitive
+    }
+
+    #[test]
+    fn behavioral_outranks_lexical_when_both_match_a_turn() {
+        // copy-paste (priority 20) beats refactor signpost (8) under the
+        // one-per-turn cap. Drive both through the engine via tool_result —
+        // but lexical rules fire on assistant_turn, so verify ranking directly
+        // through admit by colliding two candidates on the same phase.
+        struct Hi;
+        impl Hook for Hi {
+            fn on_assistant_turn(&self, _: &str, _: &[ToolCall]) -> Vec<Candidate> {
+                vec![
+                    Candidate { rule_id: "lex".into(), message: "m".into(), delivery: Delivery::SystemTail, kind: NudgeKind::Signpost, targets: vec![], priority: 8 },
+                    Candidate { rule_id: "beh".into(), message: "m".into(), delivery: Delivery::Rider, kind: NudgeKind::Signpost, targets: vec![], priority: 20 },
+                ]
+            }
+        }
+        let mut eng = HookEngine::new(vec![Box::new(Hi)], NudgeLedger::default());
+        let out = eng.on_assistant_turn("t", &[], 1);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].rule_id, "beh");
     }
 }
