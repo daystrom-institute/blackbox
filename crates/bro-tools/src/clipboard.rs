@@ -46,8 +46,9 @@ const PREVIEW_LINES: usize = 3;
 const PREVIEW_MAX_BYTES: usize = 240;
 
 /// The content kind a register holds. The "typed" in "typed ref": a consumer
-/// can refuse a register whose kind it can't accept. All current kinds carry
-/// UTF-8 text; `Bytes`/`Json` are reserved for later non-text producers.
+/// can refuse a register whose kind it can't accept. All current kinds store
+/// UTF-8 text (`Json` holds its pretty-printed form); a raw `Bytes` kind is
+/// reserved for a later non-text producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RefKind {
@@ -57,16 +58,22 @@ pub enum RefKind {
     FileSlice,
     /// Captured stdout / generic tool output (`shell_run{stdout_to}`).
     ToolResult,
+    /// A JSON value (object/array) — pretty-printed in `text`, but tagged so a
+    /// downstream `clip_transform` parses it back without re-stringify
+    /// ambiguity. This is what lets `transform → transform → paste` chain: a
+    /// projection that yields an object stays typed-as-JSON for the next hop.
+    Json,
 }
 
 impl RefKind {
-    /// Every current kind is UTF-8 text, so every register is paste-able and
-    /// stdin-feedable. The method exists so non-text kinds added later refuse
-    /// text consumers instead of silently stringifying.
+    /// Every current kind stores UTF-8 text (a `Json` register holds its
+    /// pretty-printed form), so every register is paste-able and stdin-feedable.
+    /// The method exists so a non-text kind added later (e.g. raw `Bytes`)
+    /// refuses text consumers instead of silently stringifying.
     fn is_text(self) -> bool {
         matches!(
             self,
-            RefKind::Text | RefKind::FileSlice | RefKind::ToolResult
+            RefKind::Text | RefKind::FileSlice | RefKind::ToolResult | RefKind::Json
         )
     }
 }
@@ -292,6 +299,16 @@ impl Registers {
     /// Store captured tool output into a register (shell_run{stdout_to}).
     pub fn put_tool_result(&mut self, name: &str, text: String) -> anyhow::Result<Vec<String>> {
         self.put(name, RefKind::ToolResult, text, None, false)
+    }
+
+    /// Store a ref→ref transform result with an explicit (propagated) kind.
+    pub fn put_kinded(
+        &mut self,
+        name: &str,
+        kind: RefKind,
+        text: String,
+    ) -> anyhow::Result<Vec<String>> {
+        self.put(name, kind, text, None, false)
     }
 
     /// Metadata view of a register (hashes/counts/preview), never the content.
@@ -716,6 +733,214 @@ impl Tool for ClipClear {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Composable register→register transforms (the ref ABI's selection family).
+//
+// Each is `{ from, <selector>, into? }`, reads a register, narrows/reshapes it,
+// and writes the result to `into` (default `from`, in-place) — returning
+// metadata, never the content, and propagating kind so transforms chain
+// (transform → slice → paste, all server-side). All pure: no shell, no IO.
+// ---------------------------------------------------------------------------
+
+/// Run a register→register transform: read `from`'s text, apply `f`, store the
+/// `(text, kind)` result under `into` (default `from`), return metadata.
+fn ref_transform(
+    cx: &ToolCx,
+    from: &str,
+    into: Option<&str>,
+    f: impl FnOnce(&str) -> Result<(String, RefKind), String>,
+) -> ToolResult {
+    let into = into.unwrap_or(from);
+    let mut clip = cx.clipboard.lock().unwrap();
+    let src = match clip.consume_text(from) {
+        Ok(t) => t,
+        Err(e) => return ToolResult::Error(e),
+    };
+    let (text, kind) = match f(&src) {
+        Ok(v) => v,
+        Err(e) => return ToolResult::Error(e),
+    };
+    let evicted = match clip.put_kinded(into, kind, text) {
+        Ok(e) => e,
+        Err(e) => return ToolResult::Error(e.to_string()),
+    };
+    let mut meta = clip.meta_of(into).unwrap_or(Value::Null);
+    annotate_evicted(&mut meta, evicted);
+    ToolResult::Json(meta)
+}
+
+/// Render a jq output stream to `(text, kind)`. A single JSON string → its raw
+/// prose (kind Text), so `.body` pastes as prose; a single object/array →
+/// pretty JSON (kind Json) so it re-transforms cleanly; a stream → newline-
+/// joined renderings (kind Text).
+fn render_jq_outputs(outs: Vec<Value>) -> (String, RefKind) {
+    match outs.as_slice() {
+        [] => (String::new(), RefKind::Text),
+        [Value::String(s)] => (s.clone(), RefKind::Text),
+        [v @ (Value::Object(_) | Value::Array(_))] => (
+            serde_json::to_string_pretty(v).unwrap_or_default(),
+            RefKind::Json,
+        ),
+        [other] => (other.to_string(), RefKind::Text),
+        many => {
+            let joined = many
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => serde_json::to_string(other).unwrap_or_default(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (joined, RefKind::Text)
+        }
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ClipTransformInput {
+    /// Source register to read (handle; `clip:` prefix tolerated).
+    from: String,
+    /// jq program. `.body` plucks a field; `.items | map(.title)` reshapes.
+    /// The source register's text is parsed as JSON first.
+    jq: String,
+    /// Destination register. Defaults to `from` (transform in place).
+    #[serde(default)]
+    into: Option<String>,
+}
+
+pub struct ClipTransform;
+
+#[async_trait]
+impl Tool for ClipTransform {
+    fn name(&self) -> &str {
+        "clip_transform"
+    }
+    fn description(&self) -> &str {
+        "Run a jq program over a clipboard register's JSON content, server-side — the data never enters your context. Use it to pull a field or reshape structured tool output (a captured API response, `gh api`, JSON logs) before pasting: `jq=\".body\"` plucks a field as prose, `jq=\".items | map(.title)\"` reshapes. Writes the result to `into` (default: in place) and returns metadata + preview. The source register must hold valid JSON."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ClipTransformInput>()
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: ClipTransformInput = match serde_json::from_value(input) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        ref_transform(cx, &args.from, args.into.as_deref(), |src| {
+            let v: Value = serde_json::from_str(src)
+                .map_err(|e| format!("register '{}' is not valid JSON: {e}", args.from))?;
+            let outs = crate::jq::run_jq(&args.jq, v).map_err(|e| e.to_string())?;
+            Ok(render_jq_outputs(outs))
+        })
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ClipSliceInput {
+    /// Source register to read (handle; `clip:` prefix tolerated).
+    from: String,
+    /// Range to keep: a `type` of `lines` | `markers` | `exact_text` | `bytes`
+    /// (same vocabulary as clip_yank / bbox_slice_read), applied to the
+    /// register's text.
+    range: Value,
+    /// Destination register. Defaults to `from` (slice in place).
+    #[serde(default)]
+    into: Option<String>,
+}
+
+pub struct ClipSlice;
+
+#[async_trait]
+impl Tool for ClipSlice {
+    fn name(&self) -> &str {
+        "clip_slice"
+    }
+    fn description(&self) -> &str {
+        "Narrow a clipboard register to a sub-range of its text, server-side — the register analog of clip_yank (which reads a file). range selects by lines/markers/exact_text/bytes. Writes to `into` (default: in place); returns metadata + preview."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ClipSliceInput>()
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: ClipSliceInput = match serde_json::from_value(input) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        let range = args.range;
+        ref_transform(cx, &args.from, args.into.as_deref(), |src| {
+            let sel = slice_range_from_value(range).map_err(|e| format!("bad range: {e}"))?;
+            let slice = resolve_slice(src, &sel).map_err(|e| e.to_string())?;
+            Ok((slice.text, RefKind::Text))
+        })
+    }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct ClipGrepInput {
+    /// Source register to read (handle; `clip:` prefix tolerated).
+    from: String,
+    /// Regex; lines of the register matching it are kept (or dropped, if
+    /// `invert`).
+    pattern: String,
+    /// Destination register. Defaults to `from` (filter in place).
+    #[serde(default)]
+    into: Option<String>,
+    /// Case-insensitive matching. Default false.
+    #[serde(default)]
+    case_insensitive: bool,
+    /// Keep NON-matching lines instead (like `grep -v`). Default false.
+    #[serde(default)]
+    invert: bool,
+}
+
+pub struct ClipGrep;
+
+#[async_trait]
+impl Tool for ClipGrep {
+    fn name(&self) -> &str {
+        "clip_grep"
+    }
+    fn description(&self) -> &str {
+        "Keep only the lines of a clipboard register that match a regex (or drop them with invert), server-side — content_search over a register instead of files. Writes to `into` (default: in place); returns metadata + preview."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ClipGrepInput>()
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: ClipGrepInput = match serde_json::from_value(input) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        let (pattern, ci, invert) = (args.pattern, args.case_insensitive, args.invert);
+        ref_transform(cx, &args.from, args.into.as_deref(), |src| {
+            let re = regex::RegexBuilder::new(&pattern)
+                .case_insensitive(ci)
+                .build()
+                .map_err(|e| format!("bad regex: {e}"))?;
+            let kept: Vec<&str> = src.lines().filter(|l| re.is_match(l) != invert).collect();
+            Ok((kept.join("\n"), RefKind::Text))
+        })
+    }
+}
+
 /// Deposit a producer tool's output into a register (`RefKind::ToolResult`) and
 /// return a metadata `ToolResult` — hashes/counts/preview, never the content.
 /// The shared `into` register-producer path for tools whose output is bulky
@@ -760,6 +985,9 @@ pub fn clip_tools() -> Vec<std::sync::Arc<dyn Tool>> {
         Arc::new(ClipList),
         Arc::new(ClipPeek),
         Arc::new(ClipClear),
+        Arc::new(ClipTransform),
+        Arc::new(ClipSlice),
+        Arc::new(ClipGrep),
     ]
 }
 
@@ -1041,6 +1269,85 @@ mod tool_tests {
         );
         let stored = cx.clipboard.lock().unwrap().get("m").unwrap().text.clone();
         assert!(stored.contains("needle here") && stored.contains("needle again"));
+    }
+
+    /// The composable payoff: seed JSON → transform (field-pluck, kind Text;
+    /// array, kind Json) → re-transform the Json register → grep — all
+    /// server-side, content never returned. Exercises kind propagation + chain.
+    #[tokio::test]
+    async fn transform_grep_compose_with_kind_propagation() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_at(dir.path());
+        let seed = json!({
+            "comment": {"body": "line1\nKEEP me\nline3"},
+            "items": [{"t": "a"}, {"t": "b"}]
+        })
+        .to_string();
+        ClipSet
+            .call(json!({"register": "j", "text": seed}), &cx)
+            .await;
+
+        // Pull a string field → kind Text, raw prose.
+        let b = json_of(
+            ClipTransform
+                .call(
+                    json!({"from": "j", "jq": ".comment.body", "into": "b"}),
+                    &cx,
+                )
+                .await,
+        );
+        assert_eq!(b["register"], "b");
+        assert_eq!(b["kind"], "text");
+
+        // Filter that register's lines in place.
+        ClipGrep
+            .call(json!({"from": "b", "pattern": "KEEP"}), &cx)
+            .await;
+        assert_eq!(
+            cx.clipboard.lock().unwrap().get("b").unwrap().text,
+            "KEEP me"
+        );
+
+        // Project an array → kind Json (so it re-transforms cleanly)…
+        let arr = json_of(
+            ClipTransform
+                .call(json!({"from": "j", "jq": ".items", "into": "arr"}), &cx)
+                .await,
+        );
+        assert_eq!(arr["kind"], "json");
+        // …then chain another transform off the Json register.
+        ClipTransform
+            .call(
+                json!({"from": "arr", "jq": ".[1].t", "into": "second"}),
+                &cx,
+            )
+            .await;
+        assert_eq!(
+            cx.clipboard.lock().unwrap().get("second").unwrap().text,
+            "b"
+        );
+    }
+
+    #[tokio::test]
+    async fn clip_slice_narrows_a_register() {
+        let dir = tempfile::tempdir().unwrap();
+        let cx = cx_at(dir.path());
+        ClipSet
+            .call(json!({"register": "t", "text": "l1\nl2\nl3\nl4"}), &cx)
+            .await;
+        let v = json_of(
+            ClipSlice
+                .call(
+                    json!({"from": "t", "range": {"type": "lines", "start_line": 2, "end_line": 3}, "into": "s"}),
+                    &cx,
+                )
+                .await,
+        );
+        assert!(v.get("text").is_none(), "slice must not return content");
+        assert_eq!(
+            cx.clipboard.lock().unwrap().get("s").unwrap().text,
+            "l2\nl3\n"
+        );
     }
 
     fn json_of(r: ToolResult) -> Value {

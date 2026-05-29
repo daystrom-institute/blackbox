@@ -17,12 +17,21 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 > - **Stage 1 (settled refs / clipboard)** — built; see the clipboard doc.
 > - **Stage 2 (settled refs, any tool)** — built. Producers deposit a result
 >   into a register instead of returning it: `file_read{into}`,
->   `shell_run{stdout_to}`, `web_fetch{into}`, `content_search{into}`. Consumers
->   read a register instead of an inline arg: `file_write{from}`,
->   `shell_run{stdin_from}`, `clip_paste{register}`. The `kind` tag is `RefKind`
->   on `Register` (`Text|FileSlice|ToolResult`); consumers refuse a non-text
->   register via `Registers::consume_text`. The shared deposit path is
->   `clipboard::deposit_tool_result`.
+>   `shell_run{stdout_to}`, `web_fetch{into}`, `content_search{into}` (shared
+>   path `clipboard::deposit_tool_result`). Consumers read a register instead of
+>   an inline arg: `file_write{from}`, `shell_run{stdin_from}`,
+>   `clip_paste{register}`. The `kind` tag is `RefKind` on `Register`
+>   (`Text|FileSlice|ToolResult|Json`); consumers refuse a non-text register via
+>   `Registers::consume_text`.
+> - **Composable transforms (ref→ref)** — `clip_transform{from,jq,into?}` (a
+>   `jaq` program over a JSON register), `clip_slice{from,range,into?}` (the
+>   `SliceRangeSelector` vocabulary applied to a register — the register analog
+>   of `clip_yank`), and `clip_grep{from,pattern,into?}` (regex line filter).
+>   Each reads a register, narrows/reshapes, and writes `into` (default `from`,
+>   in place) via `clipboard::ref_transform`, returning metadata not content and
+>   **propagating kind** so transforms chain (`transform → slice → paste`, all
+>   server-side): a projection that yields an object stays `Json` for the next
+>   hop, a string becomes `Text` (raw prose).
 > - **Handle namespace** — register handles tolerate an optional `clip:` prefix
 >   (`clip:a` ≡ `a`), normalized at the `Registers` API
 >   (`clipboard::normalize_register`) wherever a register is named. `task:` is
@@ -31,11 +40,19 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 > - **Stage 3 (pending refs = Task)** — not built; deferred until an in-harness
 >   async producer (background shell / sub-agent dispatch) exists.
 >
-> Remaining Stage-2 gaps (non-blocking): `RefKind` is text-only
-> (`Bytes`/`Json` reserved), and `bbox_search` is an MCP/daemon surface so its
-> `into` lives outside the harness. Verified against
-> `crates/bro-harness/src/{agent_loop.rs,registry.rs}` and
-> `crates/bro-tools/src/{tool.rs,clipboard.rs,workspace.rs,shell.rs,web.rs}`
+> **On transforms vs the "no DSL" non-goal.** The §Non-goals line rejects "a
+> general dataflow DSL — the harness does not plan or optimize a graph"; it does
+> *not* reject composition. The model invoking orthogonal ref→ref ops one call
+> at a time is exactly the endorsed "model wires refs one tool call at a time."
+> `clip_transform` (full jq, not a bespoke field-selector subset) is in-scope:
+> it produces a *new* ref, so `clip_paste` stays byte-faithful, and `jaq` is
+> pure (no shell/IO) — strictly below `shell_run`. The line held is selection /
+> transform of *data already in a register*, never running code on paste.
+>
+> Remaining gaps (non-blocking): `RefKind` has no raw `Bytes` variant yet, and
+> `bbox_search` is an MCP/daemon surface so its `into` lives outside the
+> harness. Verified against `crates/bro-harness/src/{agent_loop.rs,registry.rs}`
+> and `crates/bro-tools/src/{tool.rs,clipboard.rs,jq.rs,workspace.rs,shell.rs,web.rs}`
 > on 2026-05-29.
 
 ## Problem

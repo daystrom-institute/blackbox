@@ -10,6 +10,7 @@
 //! format — those live in `bro-harness`.
 
 pub mod clipboard;
+pub mod jq;
 pub mod safety;
 pub mod shell;
 pub mod slice_core;
