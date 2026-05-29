@@ -15,6 +15,10 @@ pub struct SessionStore {
 
 pub struct Restored {
     pub transport: String,
+    /// Model used when the session was created. On resume the daemon does not
+    /// re-pass --model (it's implied by the session), so the harness falls
+    /// back to this persisted value.
+    pub model: Option<String>,
     pub snapshot: Value,
 }
 
@@ -41,6 +45,7 @@ impl SessionStore {
                     let v: Value = serde_json::from_str(&s).context("parse resumed session")?;
                     Some(Restored {
                         transport: v["transport"].as_str().unwrap_or_default().to_string(),
+                        model: v["model"].as_str().map(str::to_string),
                         snapshot: v["snapshot"].clone(),
                     })
                 }
@@ -65,9 +70,10 @@ impl SessionStore {
         })
     }
 
-    pub fn save(&self, transport: &str, snapshot: Value) -> Result<()> {
+    pub fn save(&self, transport: &str, model: &str, snapshot: Value) -> Result<()> {
         let body = serde_json::to_string(&json!({
             "transport": transport,
+            "model": model,
             "snapshot": snapshot,
         }))
         .context("serialize session")?;

@@ -257,6 +257,49 @@ fn test_parse_claude_result_event() {
 }
 
 #[test]
+fn test_harness_stream_json_envelope_roundtrips_through_parser() {
+    // Wire contract: the exact NDJSON envelope bro-harness emits (emit.rs)
+    // for a harness provider (glm/deepseek/brodex) must parse correctly via
+    // the daemon's Claude event parser. If either side drifts, this fails.
+    let sid = "harness-session-1";
+    let lines = vec![
+        serde_json::json!({"type": "system", "subtype": "init", "session_id": sid}),
+        serde_json::json!({
+            "type": "assistant",
+            "session_id": sid,
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "brodex-via-harness-ok"}],
+                "session_id": sid,
+            },
+        }),
+        serde_json::json!({
+            "type": "result",
+            "subtype": "success",
+            "session_id": sid,
+            "result": "brodex-via-harness-ok",
+            "num_turns": 2,
+            "usage": {"input_tokens": 1559, "output_tokens": 69},
+        }),
+    ];
+    let mut sink = EventSink {
+        last_assistant_message: None,
+        usage: None,
+        cost_usd: None,
+        num_turns: None,
+        session_id: None,
+    };
+    for evt in &lines {
+        Provider::Brodex.parse_event(evt, &mut sink);
+    }
+    assert_eq!(sink.session_id.as_deref(), Some(sid));
+    assert_eq!(sink.last_assistant_message.as_deref(), Some("brodex-via-harness-ok"));
+    assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 1559);
+    assert_eq!(sink.usage.as_ref().unwrap().output_tokens, 69);
+    assert_eq!(sink.num_turns, Some(2));
+}
+
+#[test]
 fn test_parse_claude_streaming_accumulates_text_across_blocks_and_turns() {
     // Tool-using turns interleave text blocks and tool_use blocks;
     // multi-turn loops emit text on more than one assistant message.

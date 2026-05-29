@@ -38,12 +38,6 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     let prompt = resolve_prompt(&cli)?;
-    let model = cli
-        .model
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
-        .or_else(|| std::env::var("BRO_HARNESS_MODEL").ok())
-        .context("no --model and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL")?;
     let max_tokens = env_u32("BRO_HARNESS_MAX_TOKENS").unwrap_or(DEFAULT_MAX_TOKENS);
     let max_turns = env_u64("BRO_HARNESS_MAX_TURNS").unwrap_or(DEFAULT_MAX_TURNS);
     let web_search = std::env::var("BRO_HARNESS_WEB_SEARCH")
@@ -60,6 +54,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut tx = transport::build_transport(kind).await?;
 
     let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
+    let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
     if let Some(r) = &store.restored {
         if r.transport != tx.name() {
             anyhow::bail!(
@@ -71,6 +66,16 @@ pub async fn run(cli: Cli) -> Result<()> {
         tx.restore(r.snapshot.clone());
     }
     tx.push_user_text(&prompt);
+
+    // On resume the daemon doesn't re-pass --model (it's implied by the
+    // session), so fall back to the model persisted with the session.
+    let model = cli
+        .model
+        .clone()
+        .or(restored_model)
+        .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
+        .or_else(|| std::env::var("BRO_HARNESS_MODEL").ok())
+        .context("no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL")?;
 
     let cx = ToolCx {
         root: std::env::current_dir().context("cwd")?,
@@ -138,7 +143,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     emitter.result(&final_text, &total_usage, turns, None);
-    store.save(tx.name(), tx.snapshot())?;
+    store.save(tx.name(), &base_opts.model, tx.snapshot())?;
     Ok(())
 }
 
