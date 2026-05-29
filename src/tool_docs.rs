@@ -82,7 +82,7 @@ impl ToolCategory {
                 "Track non-dispatchable work that spans sessions (investigations, QC walks, debugging, refinement loops). Lighter than the full dispatch pipeline, heavier than memory. Use `kind=work_item` for orchestrator-led propose→execute→review→refine loops."
             }
             Self::Notes => {
-                "Structured side channel for observations emitted during delegated work. Executors call `bbox_note` throughout bro/task/workflow/atom dispatches; orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. The *done* kind with a one-line acceptance summary is the highest-leverage signal for dispatched executors; direct operator-side MCP lookups, status probes, cancellations, note resolutions, and timing reports do not require a done note."
+                "Structured side channel for *notable* observations surfaced during delegated work — orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when a caller (atom, workflow, or an explicit completion contract) asks for a structured sign-off — it is not required on every dispatch."
             }
             Self::Inbox => {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
@@ -655,7 +655,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
-        when_to_use: "Dispatched executors emit high-signal notes during bro/task/workflow/atom work; orchestrators mostly read them. Emit `done` before returning when you are running as a dispatched executor launched through `bro_*`, `bro_agent_dispatch`, workflow actors, atom invocations, or team broadcasts. Do not emit `done` for direct operator-side MCP lookups, inbox/status probes, cancellations, note resolutions, or timing reports. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. For substrate gaps that other projects could plausibly hit too, use the `blackbox.gap_note.v1` JSON envelope inside `kind=\"followup\"`; do not invent a `bbox_gap` tool. See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "Emit a note only when you have a *notable* signal worth surfacing to an orchestrator — a `dispute`, `surprise`, `blocked`, `learned` fact, or actionable `followup`. Silence is the correct default: this is a side channel, not a per-call progress log, so most dispatches should emit nothing. A `kind=done` sign-off is opt-in — emit it when a caller (atom, workflow, team broadcast, or an explicit completion contract) asks for one, not on every dispatch. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. For substrate gaps that other projects could plausibly hit too, use the `blackbox.gap_note.v1` JSON envelope inside `kind=\"followup\"`; do not invent a `bbox_gap` tool. See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(
             r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
         ),
@@ -1691,10 +1691,13 @@ broader recall.
 - **Orchestrator** — dispatches, reviews, reads `bbox_inbox`, resolves notes, \
 and records durable commitments.
 - **Executor** — when running as a dispatched bro/task/workflow/atom actor, \
-does the work, emits sparse high-signal `bbox_note` entries, and emits \
-`kind=done` before returning. Direct operator-side MCP lookups, status probes, \
-cancellations, note resolutions, and timing reports are controller actions and \
-do not require `done`.
+does the work and returns its result. `bbox_note` is available for *notable* \
+observations worth surfacing to the orchestrator (`dispute`, `surprise`, \
+`blocked`, `learned`, actionable `followup`) — it is not a per-dispatch ritual, \
+so stay silent when nothing is notable. A caller that needs a structured \
+sign-off (an atom, workflow, or explicit completion contract) may require a \
+`kind=done` note on top of this default; absent that instruction, a done note \
+is optional.
 
 ## Ambient scope block
 

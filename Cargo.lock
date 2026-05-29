@@ -444,6 +444,7 @@ dependencies = [
  "async-trait",
  "globset",
  "ignore",
+ "libc",
  "regex",
  "reqwest 0.12.28",
  "schemars 0.8.22",

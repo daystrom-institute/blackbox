@@ -506,47 +506,36 @@ list where you wanted a generalizer). Fidelity 1.0 on training \
 alone doesn't rule out the gap; if the mechanism won't generalize \
 to unseen vocabulary, that's the signal the log wants.";
 
-/// Default per-dispatch contract requiring a structured completion
-/// signal before the agent returns. Observed empirically: without
-/// this, agents competently complete tasks via prose but never emit
-/// `bbox_note(kind="done")` on their own, even when global docs
-/// describe the protocol and they can articulate it back. The
-/// contract converts soft doc guidance into a per-turn requirement.
+/// Default per-dispatch contract. Deliberately quiet: `bbox_note` is a
+/// signal channel for *notable* observations, NOT a per-dispatch ritual, so
+/// the baseline neither requires a `done` note nor demands a note per finding.
+/// Callers that genuinely need a guaranteed structured sign-off (atoms,
+/// workflows, badgey, review arcs) layer a stricter contract on top of this.
+/// The only hard part retained is the task_id/scope correlation guidance —
+/// when a note *is* emitted it must carry the right keys to land.
 pub const DEFAULT_COMPLETION_CONTRACT: &str = "\
-REQUIRED — before returning your final answer, emit bbox_note records:\n\
+If something genuinely notable came up during the work, surface it with a \
+`bbox_note` call so the orchestrator doesn't have to re-read \
+your transcript. This is a signal channel, not a progress log — if nothing was \
+notable, emit nothing. Use the kind that fits:\n\
+   • `surprise` — you expected X and found Y.\n\
+   • `dispute` — the brief is wrong or contradicts what you found.\n\
+   • `blocked` — you could not proceed and why.\n\
+   • `followup` — concrete out-of-scope work you noticed (record only; do not \
+do it).\n\
+   • `assumption` — an ambiguity-resolving judgment a reviewer should know about.\n\
+   • `learned` — a reusable project-local fact worth keeping.\n\
+A `kind=done` note with a specific one-line acceptance summary (\"verified X \
+already handles Y\"; not \"task complete\") is worth emitting when a concise \
+result would help the orchestrator act — but it is optional unless this \
+dispatch's instructions require one.\n\
 \n\
-1. Emit a SEPARATE `mcp__blackbox__bbox_note` call for each distinct \
-finding that arose during the work. Do NOT consolidate multiple findings \
-into one body. Use the right kind for each:\n\
-   • `surprise` — concrete instance where you expected X and found Y \
-(e.g., \"expected the escape fn to handle control chars, found it only \
-escapes backslash+quote\"). Emit one per surprise.\n\
-   • `followup` — concrete out-of-scope work you noticed but did not do \
-(e.g., \"add roundtrip TOML parse test for format_toml_string_array\"). \
-One per followup. Do NOT do the work — just record.\n\
-   • `assumption` — ambiguity-resolving judgment you made to proceed \
-(e.g., \"brief said `blackbox` server but repo has multiple; assumed the \
-one in src/orchestration/\"). One per assumption.\n\
-   • `learned` — project-local convention you discovered in situ (e.g., \
-\"repo uses `bb:managed-start` markers, not editable outside\").\n\
-   • `blocked`, `dispute` — as applicable.\n\
-Consolidating multiple findings into one body is only correct when they \
-are genuinely one idea. If your prose response has bullet points of \
-findings, those are almost always separate notes.\n\
-\n\
-2. Finally, emit a `done` note with a one-line summary. Not generic \
-phrases like \"task complete\" — something concrete like \"verified X \
-already handles Y\" or \"audited Z; 3 concerns flagged via separate \
-notes\".\n\
-\n\
-Every call MUST include:\n\
-  task_id=<copy `task:` from [scope] above EXACTLY — do NOT paste any \
-other value (not project path, not prose, not \"pending\") into this field>\n\
+When you do emit a note, include the correlation keys so it lands:\n\
+  task_id=<copy `task:` from [scope] above EXACTLY — not the project path, not \
+prose, not \"pending\">\n\
   project=<`project` from [scope], if present>\n\
   bro=<`bro` from [scope], if present>\n\
-  session_id=<`session` from [scope], if present>\n\
-The task_id is the primary correlation key and the orchestrator uses it \
-to find your notes.";
+  session_id=<`session` from [scope], if present>";
 
 /// Workspace-tools appendix injected when `AmbientContext::coerce_workspace`
 /// is true. Teaches agents to prefer workspace-scoped tool surfaces over

@@ -1,0 +1,842 @@
+//! Long-running shell support: `shell_run` (spawn + cooperative yield),
+//! `shell_poll` (drain / feed / await an existing session), and `shell_kill`
+//! (signal + reap a session).
+//!
+//! Model mirrors Codex's `exec_command` / `write_stdin`: a command that
+//! finishes within `yield_time_ms` returns its full result inline; one that
+//! doesn't returns a `session_id` + partial output, and `shell_poll` resumes
+//! draining it (and may feed more stdin). This is the cooperative middle path
+//! between block-forever and a full background task registry — no wake
+//! machinery, synchronous from the agent loop's view. See
+//! design/orchestration/bro-harness-tool-surface.md.
+//!
+//! Sessions are in-memory and live only within a single harness `run()` (across
+//! the LLM turns of one dispatch, NOT across exec → resume): a live OS child
+//! can't be serialized into the persisted `side` cell. Children are spawned
+//! `kill_on_drop`, so abandoned sessions die when the `ToolCx` drops.
+
+use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
+use async_trait::async_trait;
+use schemars::JsonSchema;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, ChildStdin};
+use tokio::task::JoinHandle;
+use tokio::time::{Instant, sleep_until};
+
+/// Per-stream in-memory buffer cap. Beyond this, output is counted-and-dropped
+/// rather than retained, so a runaway producer can't exhaust memory.
+const MAX_BUF_BYTES: usize = 8 * 1024 * 1024;
+/// Default returned-output budget (~40 KB at a 4-bytes/token heuristic).
+const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+/// Max concurrently-retained (still-running) sessions per dispatch. A blocking
+/// command never counts; only yielded sessions are retained. Prevents a loop
+/// from accumulating unbounded live children.
+const MAX_LIVE_SESSIONS: usize = 32;
+/// Grace window for readers to flush final bytes after a child exits, before we
+/// abort them. Bounds the case where a grandchild inherited the pipe and holds
+/// it open past the direct child's exit (which would otherwise hang forever).
+const READER_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// A drained-into output buffer with an overflow counter.
+#[derive(Default)]
+struct OutBuf {
+    bytes: Vec<u8>,
+    dropped: usize,
+}
+
+impl OutBuf {
+    fn push(&mut self, chunk: &[u8]) {
+        let room = MAX_BUF_BYTES.saturating_sub(self.bytes.len());
+        if chunk.len() <= room {
+            self.bytes.extend_from_slice(chunk);
+        } else {
+            self.bytes.extend_from_slice(&chunk[..room]);
+            self.dropped += chunk.len() - room;
+        }
+    }
+    /// Drain accumulated output as lossy UTF-8; returns (text, dropped) and
+    /// resets both.
+    fn take(&mut self) -> (String, usize) {
+        let s = String::from_utf8_lossy(&self.bytes).into_owned();
+        let dropped = self.dropped;
+        self.bytes.clear();
+        self.dropped = 0;
+        (s, dropped)
+    }
+}
+
+/// One live child plus the background readers draining its pipes.
+struct ShellSession {
+    child: Child,
+    /// `Some` while stdin is open for feeding; `None` once closed (EOF sent).
+    stdin: Option<ChildStdin>,
+    stdout: Arc<Mutex<OutBuf>>,
+    stderr: Arc<Mutex<OutBuf>>,
+    readers: Vec<JoinHandle<()>>,
+    /// Absolute hard-kill deadline carried from the originating `shell_run`'s
+    /// `timeout_ms`, so polls honor the same ceiling.
+    kill_at: Option<Instant>,
+    /// The command line, retained so `shell_list` can identify orphanable
+    /// sessions whose id was lost.
+    command: String,
+    /// When the session was spawned, for an elapsed readout in `shell_list`.
+    started: Instant,
+}
+
+/// Session table hung off `ToolCx`. In-memory, single-`run()` lifetime.
+#[derive(Default)]
+pub struct ShellSessions {
+    map: HashMap<String, ShellSession>,
+    counter: u64,
+}
+
+impl ShellSessions {
+    /// Insert a retained session, or hand it back (boxed; the session is large)
+    /// if at the live cap so the caller can kill it and surface an error.
+    fn insert(&mut self, s: ShellSession) -> Result<String, Box<ShellSession>> {
+        if self.map.len() >= MAX_LIVE_SESSIONS {
+            return Err(Box::new(s));
+        }
+        self.counter += 1;
+        let id = format!("sh-{}", self.counter);
+        self.map.insert(id.clone(), s);
+        Ok(id)
+    }
+}
+
+enum Outcome {
+    Exited(Option<i32>),
+    Yielded,
+    TimedOut,
+}
+
+/// Drive a child until it exits, the yield deadline elapses, or the hard-kill
+/// deadline elapses (in which case it is killed). Holds no lock.
+async fn drive(child: &mut Child, yield_at: Option<Instant>, kill_at: Option<Instant>) -> Outcome {
+    let far = Instant::now() + Duration::from_secs(31_536_000);
+    let y = yield_at.unwrap_or(far);
+    let k = kill_at.unwrap_or(far);
+    tokio::select! {
+        s = child.wait() => Outcome::Exited(s.ok().and_then(|st| st.code())),
+        _ = sleep_until(y), if yield_at.is_some() => Outcome::Yielded,
+        _ = sleep_until(k), if kill_at.is_some() => {
+            let _ = child.kill().await;
+            Outcome::TimedOut
+        }
+    }
+}
+
+fn spawn_reader<R>(mut r: R, buf: Arc<Mutex<OutBuf>>) -> JoinHandle<()>
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match r.read(&mut chunk).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.lock().unwrap().push(&chunk[..n]),
+            }
+        }
+    })
+}
+
+/// Keep the last `budget` bytes (errors trail in shell output), adjusted to a
+/// char boundary. Returns (tail, bytes_dropped_from_head).
+fn cap_tail(s: &str, budget: usize) -> (String, usize) {
+    if s.len() <= budget {
+        return (s.to_string(), 0);
+    }
+    let mut start = s.len() - budget;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    (s[start..].to_string(), start)
+}
+
+fn render(raw: String, dropped: usize, max_tokens: usize) -> String {
+    let budget = max_tokens.saturating_mul(4).max(1);
+    let (body, head_trunc) = cap_tail(&raw, budget);
+    let mut prefix = String::new();
+    if head_trunc > 0 {
+        prefix.push_str(&format!("[... {head_trunc} earlier bytes truncated]\n"));
+    }
+    if dropped > 0 {
+        prefix.push_str(&format!("[... {dropped} bytes dropped at buffer cap]\n"));
+    }
+    format!("{prefix}{body}")
+}
+
+/// Snapshot both buffers (draining them) and render with the token budget.
+fn snapshot(session: &ShellSession, max_tokens: usize) -> (String, String) {
+    let (so, so_drop) = session.stdout.lock().unwrap().take();
+    let (se, se_drop) = session.stderr.lock().unwrap().take();
+    (
+        render(so, so_drop, max_tokens),
+        render(se, se_drop, max_tokens),
+    )
+}
+
+/// After a child has exited (or been killed) give its readers a bounded grace
+/// window to flush remaining bytes, then ABORT stragglers and drain.
+///
+/// The bound is load-bearing: when a command backgrounds a process that
+/// inherited the stdout/stderr pipe (`cmd &`), the direct child exits but the
+/// pipe stays open, so a reader awaiting EOF would block forever. We abort it
+/// instead of hanging the agent loop.
+async fn drain_final(session: &mut ShellSession, max_tokens: usize) -> (String, String) {
+    let readers = std::mem::take(&mut session.readers);
+    let aborts: Vec<_> = readers.iter().map(|h| h.abort_handle()).collect();
+    let join_all = async move {
+        for h in readers {
+            let _ = h.await;
+        }
+    };
+    if tokio::time::timeout(READER_DRAIN_GRACE, join_all).await.is_err() {
+        for a in aborts {
+            a.abort();
+        }
+    }
+    snapshot(session, max_tokens)
+}
+
+/// Map a signal name to (libc signal, canonical name). Unknown → SIGTERM.
+fn signal_for(name: Option<&str>) -> (i32, &'static str) {
+    match name {
+        Some("kill") => (libc::SIGKILL, "kill"),
+        Some("int") => (libc::SIGINT, "int"),
+        _ => (libc::SIGTERM, "term"),
+    }
+}
+
+/// Send `sig` to a session's child (no-op if already reaped).
+fn signal_child(session: &ShellSession, sig: i32) {
+    if let Some(pid) = session.child.id() {
+        // SAFETY: kill(2) with a real pid and a constant signal; ESRCH on an
+        // already-dead pid is harmless.
+        unsafe {
+            libc::kill(pid as i32, sig);
+        }
+    }
+}
+
+/// Build the terminal JSON for an exited/timed-out/killed session.
+fn terminal_json(exit_code: Option<i32>, stdout: String, stderr: String, timed_out: bool) -> Value {
+    json!({
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "running": false,
+        "timed_out": timed_out,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// shell_run
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+struct ShellRunInput {
+    /// The shell command line to execute (run via `bash -lc`).
+    command: String,
+    /// Working subdirectory relative to the worktree root.
+    cwd: Option<String>,
+    /// Hard-kill deadline in milliseconds. When set, the process is killed if
+    /// it runs longer than this (honored across subsequent shell_poll calls).
+    timeout_ms: Option<u64>,
+    /// Cooperative yield in milliseconds. When set and the command hasn't
+    /// finished by then, returns partial output plus a `session_id` (the
+    /// process keeps running); resume with shell_poll. When omitted, blocks
+    /// until the command finishes (or timeout_ms).
+    yield_time_ms: Option<u64>,
+    /// Cap on returned stdout/stderr, in approximate tokens (~4 bytes each;
+    /// default 10000). The TAIL is kept so trailing errors survive.
+    max_output_tokens: Option<usize>,
+    /// Initial stdin written to the process. The stream stays open for
+    /// shell_poll to feed more, unless close_stdin is set.
+    stdin: Option<String>,
+    /// Close (EOF) the stdin stream after writing `stdin`. Required for
+    /// commands that read until EOF (e.g. `cat`, `sort`) to terminate.
+    #[serde(default)]
+    close_stdin: bool,
+    /// Extra environment variables for the process, merged onto the inherited
+    /// environment (these win on conflict). Cleaner than inlining `FOO=bar` in
+    /// the command for things like `PORT`, `RUST_LOG`, etc.
+    #[serde(default)]
+    env: HashMap<String, String>,
+}
+
+pub struct ShellRun;
+
+#[async_trait]
+impl Tool for ShellRun {
+    fn name(&self) -> &str {
+        "shell_run"
+    }
+    fn description(&self) -> &str {
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Blocks until completion by default; set yield_time_ms to get a session_id back for a still-running command and resume with shell_poll. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ShellRunInput>()
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: ShellRunInput = match serde_json::from_value(input) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        if let Some(reason) = cx.safety.deny_command(&args.command) {
+            return ToolResult::Error(format!("refused: {reason}"));
+        }
+        let cwd =
+            match crate::workspace::resolve_in_root(&cx.root, args.cwd.as_deref().unwrap_or(".")) {
+                Ok(p) => p,
+                Err(e) => return ToolResult::Error(e.to_string()),
+            };
+        let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.args(["-lc", &args.command])
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        for (k, v) in &args.env {
+            cmd.env(k, v);
+        }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return ToolResult::Error(format!("spawn failed: {e}")),
+        };
+
+        let stdout = Arc::new(Mutex::new(OutBuf::default()));
+        let stderr = Arc::new(Mutex::new(OutBuf::default()));
+        let mut readers = Vec::new();
+        if let Some(o) = child.stdout.take() {
+            readers.push(spawn_reader(o, stdout.clone()));
+        }
+        if let Some(e) = child.stderr.take() {
+            readers.push(spawn_reader(e, stderr.clone()));
+        }
+        let mut stdin = child.stdin.take();
+        if let Some(data) = &args.stdin
+            && let Some(si) = stdin.as_mut()
+        {
+            let _ = si.write_all(data.as_bytes()).await;
+            let _ = si.flush().await;
+        }
+        // Drop the handle to send EOF when the command reads until end-of-input.
+        if args.close_stdin {
+            stdin = None;
+        }
+
+        let now = Instant::now();
+        let yield_at = args.yield_time_ms.map(|ms| now + Duration::from_millis(ms));
+        let kill_at = args.timeout_ms.map(|ms| now + Duration::from_millis(ms));
+
+        let mut session = ShellSession {
+            child,
+            stdin,
+            stdout,
+            stderr,
+            readers,
+            kill_at,
+            command: args.command.clone(),
+            started: now,
+        };
+
+        match drive(&mut session.child, yield_at, kill_at).await {
+            Outcome::Exited(code) => {
+                let (so, se) = drain_final(&mut session, max_tokens).await;
+                ToolResult::Json(terminal_json(code, so, se, false))
+            }
+            Outcome::TimedOut => {
+                let (so, se) = drain_final(&mut session, max_tokens).await;
+                ToolResult::Json(terminal_json(None, so, se, true))
+            }
+            Outcome::Yielded => {
+                let (so, se) = snapshot(&session, max_tokens);
+                match cx.shell_sessions.lock().unwrap().insert(session) {
+                    Ok(id) => ToolResult::Json(json!({
+                        "exit_code": Value::Null, "stdout": so, "stderr": se,
+                        "running": true, "timed_out": false, "session_id": id,
+                    })),
+                    Err(mut overflow) => {
+                        let _ = overflow.child.start_kill();
+                        ToolResult::Error(format!(
+                            "too many live shell sessions ({MAX_LIVE_SESSIONS}); \
+                             poll or shell_kill an existing one before starting another"
+                        ))
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// shell_poll
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+struct ShellPollInput {
+    /// Session id from a prior shell_run that returned running=true.
+    session_id: String,
+    /// Optional stdin to feed before draining.
+    stdin: Option<String>,
+    /// Close (EOF) the stdin stream after writing `stdin`.
+    #[serde(default)]
+    close_stdin: bool,
+    /// Optional signal to send before draining: "int" (SIGINT, like Ctrl-C),
+    /// "term" (SIGTERM), or "kill" (SIGKILL). Lets you ask a server/watcher to
+    /// stop and then drain its shutdown output in the same call. Unlike
+    /// shell_kill, the session stays alive if the process ignores the signal,
+    /// so you can poll again or escalate.
+    signal: Option<String>,
+    /// Cooperative yield in ms before returning if still running (default 5000).
+    yield_time_ms: Option<u64>,
+    /// Output token budget for this drain (default 10000).
+    max_output_tokens: Option<usize>,
+}
+
+pub struct ShellPoll;
+
+#[async_trait]
+impl Tool for ShellPoll {
+    fn name(&self) -> &str {
+        "shell_poll"
+    }
+    fn description(&self) -> &str {
+        "Resume a running shell session from shell_run: drain new stdout/stderr, optionally feed stdin (set close_stdin to send EOF) or send a teardown signal (signal=int|term|kill, e.g. Ctrl-C a dev server then drain its shutdown output in one call), and wait up to yield_time_ms for it to finish. Returns {exit_code, stdout, stderr, running, timed_out}; exit_code is null while running. When running=false the session is closed; if the process ignores the signal the session stays alive for a follow-up poll. The originating timeout_ms still applies."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ShellPollInput>()
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: ShellPollInput = match serde_json::from_value(input) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+
+        // Take the session out so we never hold the lock across an await.
+        let mut session = match cx.shell_sessions.lock().unwrap().map.remove(&args.session_id) {
+            Some(s) => s,
+            None => {
+                return ToolResult::Error(format!(
+                    "no such shell session: {} (it may have already exited)",
+                    args.session_id
+                ));
+            }
+        };
+
+        if let Some(data) = &args.stdin
+            && let Some(si) = session.stdin.as_mut()
+        {
+            let _ = si.write_all(data.as_bytes()).await;
+            let _ = si.flush().await;
+        }
+        if args.close_stdin {
+            session.stdin = None;
+        }
+        // Optional teardown signal: ask the process to stop, then fall through
+        // to draining. If it exits within the yield window the session closes;
+        // if it ignores the signal it survives for a follow-up poll/kill.
+        if let Some(name) = args.signal.as_deref() {
+            let (sig, _) = signal_for(Some(name));
+            signal_child(&session, sig);
+        }
+
+        let yield_at =
+            Some(Instant::now() + Duration::from_millis(args.yield_time_ms.unwrap_or(5000)));
+        match drive(&mut session.child, yield_at, session.kill_at).await {
+            Outcome::Exited(code) => {
+                let (so, se) = drain_final(&mut session, max_tokens).await;
+                ToolResult::Json(terminal_json(code, so, se, false))
+            }
+            Outcome::TimedOut => {
+                let (so, se) = drain_final(&mut session, max_tokens).await;
+                ToolResult::Json(terminal_json(None, so, se, true))
+            }
+            Outcome::Yielded => {
+                let (so, se) = snapshot(&session, max_tokens);
+                // Re-insert directly (we already own the slot; can't overflow).
+                cx.shell_sessions
+                    .lock()
+                    .unwrap()
+                    .map
+                    .insert(args.session_id.clone(), session);
+                ToolResult::Json(json!({
+                    "exit_code": Value::Null, "stdout": so, "stderr": se,
+                    "running": true, "timed_out": false, "session_id": args.session_id,
+                }))
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// shell_kill
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+struct ShellKillInput {
+    /// Session id to terminate.
+    session_id: String,
+    /// Signal to send first: "term" (SIGTERM, default, graceful), "int"
+    /// (SIGINT), or "kill" (SIGKILL, immediate). If the process hasn't exited
+    /// within grace_ms, it is force-killed (SIGKILL).
+    signal: Option<String>,
+    /// Grace window in ms to wait for exit after the signal before
+    /// force-killing (default 2000).
+    grace_ms: Option<u64>,
+    /// Output token budget for the final drain (default 10000).
+    max_output_tokens: Option<usize>,
+}
+
+pub struct ShellKill;
+
+#[async_trait]
+impl Tool for ShellKill {
+    fn name(&self) -> &str {
+        "shell_kill"
+    }
+    fn description(&self) -> &str {
+        "Terminate a running shell session. Sends signal (term|int|kill, default term), waits up to grace_ms for graceful exit, then force-kills. Drains and returns final {exit_code, stdout, stderr, running:false, killed}. Use this to stop a dev server or watch process you started with shell_run + yield_time_ms."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ShellKillInput>()
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: ShellKillInput = match serde_json::from_value(input) {
+            Ok(a) => a,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
+
+        let mut session = match cx.shell_sessions.lock().unwrap().map.remove(&args.session_id) {
+            Some(s) => s,
+            None => {
+                return ToolResult::Error(format!(
+                    "no such shell session: {} (it may have already exited)",
+                    args.session_id
+                ));
+            }
+        };
+
+        let (sig, sig_name) = signal_for(args.signal.as_deref());
+        signal_child(&session, sig);
+
+        // Wait for graceful exit up to grace_ms; drive escalates to SIGKILL via
+        // its kill_at branch if the process ignores the first signal.
+        let grace = Duration::from_millis(args.grace_ms.unwrap_or(2000));
+        let kill_at = Some(Instant::now() + grace);
+        let outcome = drive(&mut session.child, None, kill_at).await;
+        let (so, se) = drain_final(&mut session, max_tokens).await;
+        // `escalated_to_sigkill` means the requested signal was ignored and we
+        // had to force-kill after grace — NOT merely "SIGKILL was requested".
+        let (exit_code, escalated) = match outcome {
+            Outcome::Exited(code) => (code, false),
+            Outcome::TimedOut => (None, true),
+            Outcome::Yielded => (None, false), // unreachable (no yield_at)
+        };
+        ToolResult::Json(json!({
+            "exit_code": exit_code,
+            "stdout": so,
+            "stderr": se,
+            "running": false,
+            "killed": true,
+            "signal_sent": sig_name,
+            "escalated_to_sigkill": escalated,
+        }))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// shell_list
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize, JsonSchema)]
+struct ShellListInput {}
+
+pub struct ShellList;
+
+#[async_trait]
+impl Tool for ShellList {
+    fn name(&self) -> &str {
+        "shell_list"
+    }
+    fn description(&self) -> &str {
+        "List the live (still-running) shell sessions for this dispatch: their session_id, the command, and how long they've been running. Use this to recover a session_id you lost, or to find orphaned long-running processes to shell_poll or shell_kill."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<ShellListInput>()
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+    async fn call(&self, _input: Value, cx: &ToolCx) -> ToolResult {
+        let now = Instant::now();
+        let guard = cx.shell_sessions.lock().unwrap();
+        let mut sessions: Vec<Value> = guard
+            .map
+            .iter()
+            .map(|(id, s)| {
+                json!({
+                    "session_id": id,
+                    "command": s.command,
+                    "elapsed_secs": now.saturating_duration_since(s.started).as_secs(),
+                })
+            })
+            .collect();
+        sessions.sort_by(|a, b| a["session_id"].as_str().cmp(&b["session_id"].as_str()));
+        ToolResult::Json(json!({ "sessions": sessions, "count": sessions.len() }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cx() -> ToolCx {
+        ToolCx {
+            root: std::env::temp_dir(),
+            safety: Arc::new(crate::safety::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
+            shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
+        }
+    }
+
+    fn as_json(r: ToolResult) -> Value {
+        match r {
+            ToolResult::Json(v) => v,
+            other => panic!("expected json, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_command_completes() {
+        let v = as_json(ShellRun.call(json!({"command": "echo hi"}), &cx()).await);
+        assert_eq!(v["exit_code"], 0);
+        assert_eq!(v["running"], false);
+        assert_eq!(v["timed_out"], false, "timed_out always present");
+        assert!(v["session_id"].is_null(), "no session for a finished cmd");
+        assert_eq!(v["stdout"], "hi\n");
+    }
+
+    #[tokio::test]
+    async fn timeout_kills_runaway() {
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 5", "timeout_ms": 200}), &cx())
+                .await,
+        );
+        assert_eq!(v["running"], false);
+        assert_eq!(v["timed_out"], true);
+        assert!(v["exit_code"].is_null(), "killed → no exit code");
+    }
+
+    #[tokio::test]
+    async fn yields_then_poll_completes() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "sleep 1; echo done", "yield_time_ms": 50}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(v["running"], true, "slow cmd should yield: {v}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let p = as_json(
+            ShellPoll
+                .call(json!({"session_id": sid, "yield_time_ms": 3000}), &c)
+                .await,
+        );
+        assert_eq!(p["running"], false, "should have finished: {p}");
+        assert_eq!(p["exit_code"], 0);
+        assert!(
+            p["stdout"].as_str().unwrap().contains("done"),
+            "final output: {p}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdin_is_fed() {
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "read x; echo got=$x", "stdin": "hello\n"}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(v["exit_code"], 0, "{v}");
+        assert!(v["stdout"].as_str().unwrap().contains("got=hello"), "{v}");
+    }
+
+    #[tokio::test]
+    async fn close_stdin_lets_read_until_eof_finish() {
+        // `cat` reads until EOF; without close_stdin it would hang past the
+        // yield and become a session. With close_stdin it completes inline.
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "cat", "stdin": "abc\n", "close_stdin": true,
+                           "yield_time_ms": 2000}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(v["running"], false, "EOF should let cat exit: {v}");
+        assert_eq!(v["exit_code"], 0);
+        assert_eq!(v["stdout"], "abc\n");
+    }
+
+    #[tokio::test]
+    async fn max_output_tokens_caps_tail() {
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "for i in $(seq 1 1000); do echo line$i; done",
+                           "max_output_tokens": 5}),
+                    &cx(),
+                )
+                .await,
+        );
+        let out = v["stdout"].as_str().unwrap();
+        assert!(out.contains("earlier bytes truncated"), "marker: {out}");
+        assert!(out.contains("line1000"), "tail kept: {out}");
+        assert!(!out.contains("line1\n"), "head dropped: {out}");
+    }
+
+    #[tokio::test]
+    async fn backgrounded_pipe_holder_does_not_hang() {
+        // The direct child exits immediately but leaves a process holding the
+        // stdout pipe open. drain_final must NOT block on the reader; the
+        // bounded grace + abort keeps this fast. Guard with an outer timeout so
+        // a regression fails loudly instead of hanging the suite.
+        let c = cx();
+        let fut = ShellRun.call(
+            json!({"command": "sleep 30 & echo started", "yield_time_ms": 4000}),
+            &c,
+        );
+        // The command finishes (echo + bash exits) well under the yield, but the
+        // backgrounded sleep holds the pipe. Bound to READER_DRAIN_GRACE + slack.
+        let v = as_json(
+            tokio::time::timeout(Duration::from_secs(6), fut)
+                .await
+                .expect("drain_final hung on a backgrounded pipe holder"),
+        );
+        assert_eq!(v["running"], false, "bash itself exited: {v}");
+        assert!(v["stdout"].as_str().unwrap().contains("started"), "{v}");
+    }
+
+    #[tokio::test]
+    async fn shell_kill_terminates_session() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 60", "yield_time_ms": 50}), &c)
+                .await,
+        );
+        assert_eq!(v["running"], true, "{v}");
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let k = as_json(
+            ShellKill
+                .call(json!({"session_id": sid, "signal": "term"}), &c)
+                .await,
+        );
+        assert_eq!(k["killed"], true, "{k}");
+        assert_eq!(k["running"], false, "{k}");
+        assert_eq!(k["signal_sent"], "term", "{k}");
+        assert_eq!(k["escalated_to_sigkill"], false, "sleep dies on SIGTERM: {k}");
+        // Session is gone afterward.
+        assert!(c.shell_sessions.lock().unwrap().map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_poll_signal_stops_and_drains_in_one_call() {
+        // A process that traps SIGTERM-ish but dies on SIGINT; simplest: plain
+        // `sleep` dies on SIGINT. Start it, then poll with signal=int and a
+        // window long enough to observe the exit — one call stops + drains.
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 60", "yield_time_ms": 50}), &c)
+                .await,
+        );
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let p = as_json(
+            ShellPoll
+                .call(
+                    json!({"session_id": sid, "signal": "int", "yield_time_ms": 3000}),
+                    &c,
+                )
+                .await,
+        );
+        assert_eq!(p["running"], false, "SIGINT should stop sleep: {p}");
+        // Session closed after it exited.
+        assert!(c.shell_sessions.lock().unwrap().map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shell_list_reports_and_recovers_sessions() {
+        let c = cx();
+        // No live sessions initially.
+        let empty = as_json(ShellList.call(json!({}), &c).await);
+        assert_eq!(empty["count"], 0, "{empty}");
+
+        // Start one that yields.
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "sleep 30", "yield_time_ms": 50}), &c)
+                .await,
+        );
+        let sid = v["session_id"].as_str().unwrap().to_string();
+
+        let listed = as_json(ShellList.call(json!({}), &c).await);
+        assert_eq!(listed["count"], 1, "{listed}");
+        assert_eq!(listed["sessions"][0]["session_id"], sid, "{listed}");
+        assert_eq!(listed["sessions"][0]["command"], "sleep 30", "{listed}");
+
+        // Recover via the listed id and kill it.
+        let _ = ShellKill.call(json!({"session_id": sid}), &c).await;
+        let after = as_json(ShellList.call(json!({}), &c).await);
+        assert_eq!(after["count"], 0, "killed session gone: {after}");
+    }
+
+    #[tokio::test]
+    async fn env_vars_are_injected() {
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "echo port=$PORT", "env": {"PORT": "3000"}}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(v["exit_code"], 0, "{v}");
+        assert!(v["stdout"].as_str().unwrap().contains("port=3000"), "{v}");
+    }
+
+    #[tokio::test]
+    async fn unknown_session_errors() {
+        let r = ShellPoll.call(json!({"session_id": "sh-999"}), &cx()).await;
+        assert!(r.is_error());
+        let r = ShellKill.call(json!({"session_id": "sh-999"}), &cx()).await;
+        assert!(r.is_error());
+    }
+}

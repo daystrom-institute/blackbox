@@ -10,11 +10,15 @@
 //! format — those live in `bro-harness`.
 
 pub mod safety;
+pub mod shell;
+pub mod todo;
 pub mod tool;
 pub mod web;
 pub mod workspace;
 
 pub use safety::SafetyPolicy;
+pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
+pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
 pub use tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 
 use std::sync::Arc;
@@ -34,13 +38,17 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(ListDir),
         Arc::new(ContentSearch),
         Arc::new(Glob),
-        Arc::new(ShellRun),
+        Arc::new(crate::shell::ShellRun),
+        Arc::new(crate::shell::ShellPoll),
+        Arc::new(crate::shell::ShellKill),
+        Arc::new(crate::shell::ShellList),
         Arc::new(GitStatus),
         Arc::new(GitLog),
         Arc::new(GitDiff),
         Arc::new(GitShow),
         Arc::new(GitCommit),
         Arc::new(web::WebFetch),
+        Arc::new(crate::todo::TodoWrite),
     ];
     tools
 }

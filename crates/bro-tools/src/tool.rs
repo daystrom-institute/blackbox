@@ -16,6 +16,13 @@ pub struct ToolCx {
     pub safety: Arc<crate::safety::SafetyPolicy>,
     /// Shared HTTP client for web tools.
     pub http: reqwest::Client,
+    /// Durable, loop-level todo list. Seeded from the persisted session `side`
+    /// cell at start, flushed back at turn end, so it survives `exec → resume`.
+    /// Shared behind `Arc<Mutex<_>>` like the registry's cross-turn state.
+    pub todos: Arc<std::sync::Mutex<crate::todo::TodoList>>,
+    /// Live shell sessions (shell_run/shell_poll). In-memory, single-`run()`
+    /// lifetime — holds running OS children, so it is NOT persisted to `side`.
+    pub shell_sessions: Arc<std::sync::Mutex<crate::shell::ShellSessions>>,
 }
 
 /// Result of a tool call. Maps onto the content of an Anthropic

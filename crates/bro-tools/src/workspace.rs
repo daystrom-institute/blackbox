@@ -16,8 +16,9 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 /// Resolve a caller-supplied path against the worktree root and refuse
-/// escapes (`..`, absolute paths outside root, symlink traversal).
-fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+/// escapes (`..`, absolute paths outside root, symlink traversal). Shared with
+/// the `shell` module so shell `cwd` resolution uses the same confinement.
+pub(crate) fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
     let joined = if Path::new(rel).is_absolute() {
         PathBuf::from(rel)
     } else {
@@ -65,6 +66,10 @@ fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
 // file_read
 // ---------------------------------------------------------------------------
 
+/// Default cap on lines returned by a single `file_read` when no explicit
+/// `max_lines` is given. Keeps an unbounded read from flooding context.
+const FILE_READ_DEFAULT_MAX_LINES: usize = 2000;
+
 #[derive(Deserialize, JsonSchema)]
 struct FileReadInput {
     /// Path to the file, relative to the worktree root.
@@ -73,6 +78,15 @@ struct FileReadInput {
     start_line: Option<usize>,
     /// 1-based end line (inclusive). Omit to read to EOF.
     end_line: Option<usize>,
+    /// Cap on the number of lines returned (default 2000). The read stops once
+    /// this many in-range lines have been collected; a truncation marker is
+    /// appended so the caller knows there is more.
+    max_lines: Option<usize>,
+    /// When true, prefix each returned line with its 1-based file line number
+    /// (`<n>\t<text>`, cat -n style), so line ranges in follow-up edits are
+    /// unambiguous. Default false.
+    #[serde(default)]
+    line_numbers: bool,
 }
 
 pub struct FileRead;
@@ -83,7 +97,7 @@ impl Tool for FileRead {
         "file_read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 text file in the worktree. Optionally restrict to a 1-based [start_line, end_line] range."
+        "Read a UTF-8 text file in the worktree. Optionally restrict to a 1-based [start_line, end_line] range. Returns at most max_lines lines (default 2000); the read stops early at the range/cap rather than loading the whole file. Set line_numbers=true to prefix each line with its 1-based number."
     }
     fn input_schema(&self) -> Value {
         schema_for::<FileReadInput>()
@@ -95,6 +109,8 @@ impl Tool for FileRead {
         }
     }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        use tokio::io::AsyncBufReadExt;
+
         let args: FileReadInput = match serde_json::from_value(input) {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
@@ -103,24 +119,58 @@ impl Tool for FileRead {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
-        let body = match tokio::fs::read_to_string(&path).await {
-            Ok(b) => b,
+        let file = match tokio::fs::File::open(&path).await {
+            Ok(f) => f,
             Err(e) => return ToolResult::Error(format!("read {}: {e}", args.file_path)),
         };
-        let sliced = match (args.start_line, args.end_line) {
-            (None, None) => body,
-            (s, e) => {
-                let start = s.unwrap_or(1).saturating_sub(1);
-                let end = e.unwrap_or(usize::MAX);
-                body.lines()
-                    .enumerate()
-                    .filter(|(i, _)| *i >= start && *i < end)
-                    .map(|(_, l)| l)
-                    .collect::<Vec<_>>()
-                    .join("\n")
+
+        // 1-based inclusive [start, end]; line numbers are 1-based here.
+        let start = args.start_line.unwrap_or(1).max(1);
+        let end = args.end_line.unwrap_or(usize::MAX);
+        if start > end {
+            return ToolResult::Error(format!(
+                "start_line {start} is after end_line {end}"
+            ));
+        }
+        let max_lines = args.max_lines.unwrap_or(FILE_READ_DEFAULT_MAX_LINES);
+
+        let mut reader = tokio::io::BufReader::new(file).lines();
+        let mut collected: Vec<String> = Vec::new();
+        let mut lineno = 0usize;
+        let mut more_after_cap = false;
+        loop {
+            let line = match reader.next_line().await {
+                Ok(Some(l)) => l,
+                Ok(None) => break,
+                Err(e) => return ToolResult::Error(format!("read {}: {e}", args.file_path)),
+            };
+            lineno += 1;
+            if lineno < start {
+                continue;
             }
-        };
-        ToolResult::Text(sliced)
+            if lineno > end {
+                break;
+            }
+            if collected.len() == max_lines {
+                // There is at least one more in-range line we are not returning.
+                more_after_cap = true;
+                break;
+            }
+            if args.line_numbers {
+                collected.push(format!("{lineno}\t{line}"));
+            } else {
+                collected.push(line);
+            }
+        }
+
+        let mut out = collected.join("\n");
+        if more_after_cap {
+            let next = start + max_lines;
+            out.push_str(&format!(
+                "\n[truncated at max_lines={max_lines}; continue with start_line={next}]"
+            ));
+        }
+        ToolResult::Text(out)
     }
 }
 
@@ -224,59 +274,6 @@ impl Tool for ListDir {
             }));
         }
         ToolResult::Json(json!({ "entries": entries }))
-    }
-}
-
-// ---------------------------------------------------------------------------
-// shell_run
-// ---------------------------------------------------------------------------
-
-#[derive(Deserialize, JsonSchema)]
-struct ShellRunInput {
-    /// The shell command line to execute (run via `bash -lc`).
-    command: String,
-    /// Working subdirectory relative to the worktree root.
-    cwd: Option<String>,
-}
-
-pub struct ShellRun;
-
-#[async_trait]
-impl Tool for ShellRun {
-    fn name(&self) -> &str {
-        "shell_run"
-    }
-    fn description(&self) -> &str {
-        "Run a shell command in the worktree and return stdout/stderr/exit code. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
-    }
-    fn input_schema(&self) -> Value {
-        schema_for::<ShellRunInput>()
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: ShellRunInput = match serde_json::from_value(input) {
-            Ok(a) => a,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
-        };
-        if let Some(reason) = cx.safety.deny_command(&args.command) {
-            return ToolResult::Error(format!("refused: {reason}"));
-        }
-        let cwd = match resolve_in_root(&cx.root, args.cwd.as_deref().unwrap_or(".")) {
-            Ok(p) => p,
-            Err(e) => return ToolResult::Error(e.to_string()),
-        };
-        let out = tokio::process::Command::new("bash")
-            .args(["-lc", &args.command])
-            .current_dir(&cwd)
-            .output()
-            .await;
-        match out {
-            Ok(o) => ToolResult::Json(json!({
-                "exit_code": o.status.code(),
-                "stdout": String::from_utf8_lossy(&o.stdout),
-                "stderr": String::from_utf8_lossy(&o.stderr),
-            })),
-            Err(e) => ToolResult::Error(format!("spawn failed: {e}")),
-        }
     }
 }
 
@@ -494,6 +491,18 @@ impl Tool for FileEdit {
 // content_search (ripgrep-style; gitignore-aware)
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum SearchMode {
+    /// `relpath:line:text` for every matching line (default).
+    #[default]
+    Content,
+    /// One line per file that contains at least one match.
+    Files,
+    /// `relpath:count` per matching file, plus a total.
+    Count,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct ContentSearchInput {
     /// Regular expression to search for.
@@ -502,8 +511,19 @@ struct ContentSearchInput {
     path: Option<String>,
     /// Optional glob to restrict files by name (e.g. "*.rs").
     glob: Option<String>,
-    /// Max matching lines to return (default 200).
+    /// Max results to return (default 200). Counts matching lines in `content`
+    /// mode, matching files in `files`/`count` mode.
     max_results: Option<usize>,
+    /// Output shape: `content` (relpath:line:text), `files` (matching paths),
+    /// or `count` (per-file match counts). Defaults to `content`.
+    #[serde(default)]
+    mode: SearchMode,
+    /// In `content` mode, also emit this many context lines before and after
+    /// each match (like ripgrep `-C`). Ignored in other modes. Default 0.
+    context_lines: Option<usize>,
+    /// Case-insensitive matching (like ripgrep `-i`). Default false.
+    #[serde(default)]
+    case_insensitive: bool,
 }
 
 pub struct ContentSearch;
@@ -514,7 +534,7 @@ impl Tool for ContentSearch {
         "content_search"
     }
     fn description(&self) -> &str {
-        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob."
+        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, and case_insensitive."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ContentSearchInput>()
@@ -530,7 +550,10 @@ impl Tool for ContentSearch {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let re = match Regex::new(&args.pattern) {
+        let re = match regex::RegexBuilder::new(&args.pattern)
+            .case_insensitive(args.case_insensitive)
+            .build()
+        {
             Ok(r) => r,
             Err(e) => return ToolResult::Error(format!("bad regex: {e}")),
         };
@@ -546,8 +569,12 @@ impl Tool for ContentSearch {
             Err(e) => return ToolResult::Error(e.to_string()),
         };
         let cap = args.max_results.unwrap_or(200).min(5000);
+        let ctx = args.context_lines.unwrap_or(0).min(50);
 
         let mut hits: Vec<String> = Vec::new();
+        // `files`/`count` modes count files; `content` counts lines.
+        let mut total_matches = 0usize;
+        let mut matched_files = 0usize;
         'walk: for entry in WalkBuilder::new(&base).build().flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
@@ -562,22 +589,66 @@ impl Tool for ContentSearch {
             let Some(text) = read_text_capped(p, 2_000_000) else {
                 continue;
             };
-            let rel = p.strip_prefix(&cx.root).unwrap_or(p).display();
-            for (i, line) in text.lines().enumerate() {
-                if re.is_match(line) {
-                    hits.push(format!("{rel}:{}:{}", i + 1, line));
-                    if hits.len() >= cap {
-                        hits.push(format!("[truncated at {cap} matches]"));
-                        break 'walk;
+            let rel = p.strip_prefix(&cx.root).unwrap_or(p).display().to_string();
+            let lines: Vec<&str> = text.lines().collect();
+
+            match args.mode {
+                SearchMode::Files => {
+                    if lines.iter().any(|l| re.is_match(l)) {
+                        hits.push(rel);
+                        if hits.len() >= cap {
+                            hits.push(format!("[truncated at {cap} files]"));
+                            break 'walk;
+                        }
+                    }
+                }
+                SearchMode::Count => {
+                    let n = lines.iter().filter(|l| re.is_match(l)).count();
+                    if n > 0 {
+                        total_matches += n;
+                        matched_files += 1;
+                        hits.push(format!("{rel}:{n}"));
+                        if hits.len() >= cap {
+                            hits.push(format!("[truncated at {cap} files]"));
+                            break 'walk;
+                        }
+                    }
+                }
+                SearchMode::Content => {
+                    for (i, line) in lines.iter().enumerate() {
+                        if re.is_match(line) {
+                            if ctx > 0 {
+                                let lo = i.saturating_sub(ctx);
+                                let hi = (i + ctx).min(lines.len().saturating_sub(1));
+                                for (j, ctx_line) in lines[lo..=hi].iter().enumerate() {
+                                    let n = lo + j + 1;
+                                    let sep = if lo + j == i { ':' } else { '-' };
+                                    hits.push(format!("{rel}:{n}{sep}{ctx_line}"));
+                                }
+                                hits.push("--".into());
+                            } else {
+                                hits.push(format!("{rel}:{}:{}", i + 1, line));
+                            }
+                            total_matches += 1;
+                            if total_matches >= cap {
+                                hits.push(format!("[truncated at {cap} matches]"));
+                                break 'walk;
+                            }
+                        }
                     }
                 }
             }
         }
-        ToolResult::Text(if hits.is_empty() {
-            "no matches".into()
-        } else {
-            hits.join("\n")
-        })
+
+        if hits.is_empty() {
+            return ToolResult::Text("no matches".into());
+        }
+        if args.mode == SearchMode::Count {
+            hits.push(format!(
+                "[total: {total_matches} matches across {matched_files} files]"
+            ));
+        }
+        ToolResult::Text(hits.join("\n"))
     }
 }
 
@@ -585,13 +656,33 @@ impl Tool for ContentSearch {
 // glob
 // ---------------------------------------------------------------------------
 
+#[derive(Deserialize, JsonSchema, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+enum GlobSort {
+    /// Most-recently-modified first (default) — matches "recently edited" use.
+    #[default]
+    Mtime,
+    /// Lexicographic path order.
+    Name,
+}
+
 #[derive(Deserialize, JsonSchema)]
 struct GlobInput {
     /// Glob pattern relative to the base dir (e.g. "**/*.rs", "src/*.toml").
     pattern: String,
     /// Base dir relative to root (default root).
     path: Option<String>,
+    /// Result ordering: `mtime` (most recent first, default) or `name`.
+    #[serde(default)]
+    sort: GlobSort,
+    /// Max paths to return after sorting (default 1000). A truncation marker is
+    /// appended when more matched, so a capped result is never silent.
+    max_results: Option<usize>,
 }
+
+/// Hard ceiling on matches collected before sort/cap — a memory backstop
+/// independent of the user-facing `max_results`.
+const GLOB_SCAN_CEILING: usize = 20_000;
 
 pub struct Glob;
 
@@ -601,7 +692,7 @@ impl Tool for Glob {
         "glob"
     }
     fn description(&self) -> &str {
-        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths."
+        "Find files matching a glob pattern under the worktree (respects .gitignore). Returns relative paths, capped at max_results (default 1000) with a truncation marker. NOTE: results are sorted by modification time (newest first) by DEFAULT; pass sort=\"name\" for lexicographic order."
     }
     fn input_schema(&self) -> Value {
         schema_for::<GlobInput>()
@@ -625,7 +716,8 @@ impl Tool for Glob {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
-        let mut out: Vec<String> = Vec::new();
+        // Collect (relpath, mtime) so we can order before formatting.
+        let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
         for entry in WalkBuilder::new(&base).build().flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
@@ -633,18 +725,40 @@ impl Tool for Glob {
             let p = entry.path();
             let rel = p.strip_prefix(&base).unwrap_or(p);
             if matcher.is_match(rel) || matcher.is_match(p) {
-                out.push(p.strip_prefix(&cx.root).unwrap_or(p).display().to_string());
-                if out.len() >= 2000 {
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                out.push((
+                    p.strip_prefix(&cx.root).unwrap_or(p).display().to_string(),
+                    mtime,
+                ));
+                if out.len() >= GLOB_SCAN_CEILING {
                     break;
                 }
             }
         }
-        out.sort();
-        ToolResult::Text(if out.is_empty() {
-            "no files matched".into()
-        } else {
-            out.join("\n")
-        })
+        match args.sort {
+            // Most recent first; tie-break by path for determinism.
+            GlobSort::Mtime => out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0))),
+            GlobSort::Name => out.sort_by(|a, b| a.0.cmp(&b.0)),
+        }
+        if out.is_empty() {
+            return ToolResult::Text("no files matched".into());
+        }
+        // Cap AFTER sorting, so the returned slice is the true top-N by the
+        // chosen order (not an arbitrary walk-order prefix).
+        let cap = args.max_results.unwrap_or(1000);
+        let total = out.len();
+        let mut lines: Vec<String> = out.into_iter().take(cap).map(|(rel, _)| rel).collect();
+        if total > lines.len() {
+            lines.push(format!(
+                "[showing {} of {total} matches; raise max_results for more]",
+                lines.len()
+            ));
+        }
+        ToolResult::Text(lines.join("\n"))
     }
 }
 
@@ -749,6 +863,10 @@ mod tests {
             root: root.to_path_buf(),
             safety: std::sync::Arc::new(crate::safety::SafetyPolicy::new()),
             http: reqwest::Client::new(),
+            todos: std::sync::Arc::new(std::sync::Mutex::new(crate::todo::TodoList::default())),
+            shell_sessions: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::shell::ShellSessions::default(),
+            )),
         }
     }
 
@@ -779,6 +897,172 @@ mod tests {
         assert!(!r.is_error(), "replace_all should succeed: {r:?}");
         let body = std::fs::read_to_string(&f).unwrap();
         assert_eq!(body.matches("x = 0").count(), 2);
+    }
+
+    #[tokio::test]
+    async fn file_read_range_and_max_lines_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.txt");
+        let body: String = (1..=10).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(&f, body).unwrap();
+        let cx = cx_at(dir.path());
+
+        // explicit range
+        let r = FileRead
+            .call(json!({"file_path":"big.txt","start_line":3,"end_line":5}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => assert_eq!(t, "line3\nline4\nline5"),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // max_lines cap emits a truncation marker with a resumable start_line
+        let r = FileRead
+            .call(json!({"file_path":"big.txt","max_lines":4}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                assert!(t.starts_with("line1\nline2\nline3\nline4"), "got: {t}");
+                assert!(t.contains("max_lines=4"), "got: {t}");
+                assert!(t.contains("start_line=5"), "got: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // line_numbers prefixes the true 1-based file line number, even mid-range
+        let r = FileRead
+            .call(
+                json!({"file_path":"big.txt","start_line":3,"end_line":4,"line_numbers":true}),
+                &cx,
+            )
+            .await;
+        match r {
+            ToolResult::Text(t) => assert_eq!(t, "3\tline3\n4\tline4"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn content_search_modes_and_context() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.rs"),
+            "one\nhit here\nthree\nhit again\nfive\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("b.rs"), "nothing\n").unwrap();
+        let cx = cx_at(dir.path());
+
+        // files mode → just the path, once
+        let r = ContentSearch
+            .call(json!({"pattern":"hit","mode":"files"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                assert!(t.contains("a.rs") && !t.contains("b.rs"));
+                assert!(!t.contains(':'), "files mode should not emit line nums: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // count mode → per-file count + total
+        let r = ContentSearch
+            .call(json!({"pattern":"hit","mode":"count"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                assert!(t.contains("a.rs:2"), "got: {t}");
+                assert!(t.contains("total: 2 matches across 1 files"), "got: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // content mode with context_lines=1 brackets each hit with - separators
+        let r = ContentSearch
+            .call(json!({"pattern":"hit again","context_lines":1}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                assert!(t.contains("a.rs:3-three"), "before-context: {t}");
+                assert!(t.contains("a.rs:4:hit again"), "match line: {t}");
+                assert!(t.contains("a.rs:5-five"), "after-context: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // case_insensitive: uppercase pattern matches lowercase content
+        let r = ContentSearch
+            .call(
+                json!({"pattern":"HIT","mode":"files","case_insensitive":true}),
+                &cx,
+            )
+            .await;
+        match r {
+            ToolResult::Text(t) => assert!(t.contains("a.rs"), "case-insensitive: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+        // ...and does NOT match without the flag
+        let r = ContentSearch
+            .call(json!({"pattern":"HIT","mode":"files"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => assert_eq!(t, "no matches", "case-sensitive default: {t}"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_sorts_by_mtime_vs_name() {
+        // `aaa.rs` is lexically first but OLDER; `zzz.rs` is newer. This makes
+        // the two orderings disagree, so each assertion actually proves its sort.
+        let dir = tempfile::tempdir().unwrap();
+        let aaa = dir.path().join("aaa.rs");
+        let zzz = dir.path().join("zzz.rs");
+        std::fs::write(&aaa, "x\n").unwrap();
+        std::fs::write(&zzz, "y\n").unwrap();
+        let earlier = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&aaa)
+            .unwrap()
+            .set_modified(earlier)
+            .unwrap();
+        let cx = cx_at(dir.path());
+
+        // default mtime → newest (zzz) first
+        let r = Glob.call(json!({"pattern":"*.rs"}), &cx).await;
+        match r {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(lines, vec!["zzz.rs", "aaa.rs"], "mtime order: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // explicit name → lexicographic (aaa first)
+        let r = Glob
+            .call(json!({"pattern":"*.rs","sort":"name"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(lines, vec!["aaa.rs", "zzz.rs"], "name order: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        // max_results caps AFTER sort + emits a truncation marker
+        let r = Glob
+            .call(json!({"pattern":"*.rs","sort":"name","max_results":1}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => {
+                let lines: Vec<&str> = t.lines().collect();
+                assert_eq!(lines[0], "aaa.rs", "capped slice is top-by-sort: {t}");
+                assert!(lines.len() == 2 && lines[1].contains("of 2 matches"), "marker: {t}");
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -24,6 +24,12 @@ agentic work.
 
 - [Anthropic-shaped Custom Harness (bro-harness)](anthropic-harness.md)
 
+## Harness Tool Surface
+
+- [bro-harness Tool Surface — Ideal Built-in Subset](bro-harness-tool-surface.md)
+- [bro-harness Clipboard (clip_* registers)](bro-harness-clipboard.md)
+- [bro-harness Tool Chaining (the ref ABI)](bro-harness-tool-chaining.md)
+
 ## Workflow Execution
 
 - [Workflow Orchestration](workflows/workflow-orchestration.md)

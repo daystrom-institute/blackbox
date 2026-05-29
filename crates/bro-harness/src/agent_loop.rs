@@ -17,7 +17,7 @@
 use crate::cli::Cli;
 use crate::emit::Emitter;
 use crate::registry::{PinPolicy, Registry};
-use crate::session::SessionStore;
+use crate::session::{SaveState, SessionStore};
 use crate::mcp;
 use crate::transport::{self, StopReason, TransportKind, TurnOpts, Usage};
 use anyhow::{Context, Result};
@@ -55,6 +55,17 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
     let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
+    // Loop-level side cells restored from a prior turn. Each cell deserializes
+    // its own slot tolerantly (absent/garbage → empty), so old session files
+    // and partial blobs resume cleanly.
+    let prior_side = store
+        .restored
+        .as_ref()
+        .map(|r| r.side.clone())
+        .unwrap_or(serde_json::Value::Null);
+    let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
+        prior_side.get("todos").unwrap_or(&serde_json::Value::Null),
+    )));
     if let Some(r) = &store.restored {
         if r.transport != tx.name() {
             anyhow::bail!(
@@ -81,6 +92,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         root: std::env::current_dir().context("cwd")?,
         safety: Arc::new(SafetyPolicy::new()),
         http: reqwest::Client::new(),
+        todos: todos.clone(),
+        // Live shell sessions: in-memory, this dispatch only (not persisted).
+        shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
     };
     let builtins = builtin_tools();
     // Client-side allow/deny (recursion guard + brofile + per-dispatch),
@@ -143,7 +157,19 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     emitter.result(&final_text, &total_usage, turns, None);
-    store.save(tx.name(), &base_opts.model, tx.snapshot())?;
+    // Flush loop-level cells back into `side`. Each cell owns its slot; start
+    // from the prior blob so cells not yet wired here are preserved.
+    let mut side = match prior_side {
+        serde_json::Value::Object(m) => serde_json::Value::Object(m),
+        _ => serde_json::json!({}),
+    };
+    side["todos"] = todos.lock().map(|t| t.to_side()).unwrap_or(serde_json::Value::Null);
+    store.save(&SaveState {
+        transport: tx.name(),
+        model: &base_opts.model,
+        snapshot: tx.snapshot(),
+        side,
+    })?;
     Ok(())
 }
 
