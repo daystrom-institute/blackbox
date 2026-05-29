@@ -1361,22 +1361,49 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_prune",
-        description = "Drop terminal tasks from the store + persisted tasks.json."
+        description = "Drop terminal tasks from the store + persisted tasks.json; filter by status/provider/age, or pass task_ids to drop only specific tasks you created."
     )]
     pub(crate) fn bro_prune(&self, Parameters(p): Parameters<PruneParams>) -> CallToolResult {
-        let target_status = p.status.as_deref().unwrap_or("failed");
         let allowed = ["failed", "completed", "cancelled"];
-        if !allowed.contains(&target_status) {
-            return Self::err_text(&format!(
-                "status must be one of {:?} (got {:?}); running tasks are never pruned",
-                allowed, target_status,
-            ));
-        }
-        let parsed_status: orch::TaskStatus =
-            match serde_json::from_str(&format!("\"{target_status}\"")) {
-                Ok(s) => s,
-                Err(e) => return Self::err_text(&format!("status parse: {e}")),
-            };
+        // Validate an explicitly-supplied status; absence is meaningful
+        // (see effective_status below), so don't default it here.
+        let explicit_status: Option<orch::TaskStatus> = match p.status.as_deref() {
+            Some(s) => {
+                if !allowed.contains(&s) {
+                    return Self::err_text(&format!(
+                        "status must be one of {:?} (got {:?}); running tasks are never pruned",
+                        allowed, s,
+                    ));
+                }
+                match serde_json::from_str(&format!("\"{s}\"")) {
+                    Ok(st) => Some(st),
+                    Err(e) => return Self::err_text(&format!("status parse: {e}")),
+                }
+            }
+            None => None,
+        };
+
+        let task_id_set: Option<std::collections::HashSet<String>> = p
+            .task_ids
+            .as_ref()
+            .filter(|v| !v.is_empty())
+            .map(|v| v.iter().cloned().collect());
+
+        // Status resolution: an explicit status always wins; otherwise a
+        // task_ids list matches any terminal status (you named the exact
+        // tasks, so don't also make the caller guess their statuses); with
+        // neither, fall back to the legacy "failed"-only sweep.
+        let effective_status: Option<orch::TaskStatus> = match (explicit_status, &task_id_set) {
+            (Some(s), _) => Some(s),
+            (None, Some(_)) => None,
+            (None, None) => Some(orch::TaskStatus::Failed),
+        };
+        let status_label: String = match (p.status.as_deref(), &task_id_set) {
+            (Some(s), _) => s.to_string(),
+            (None, Some(_)) => "any-terminal".to_string(),
+            (None, None) => "failed".to_string(),
+        };
+
         let filter_provider = p
             .provider
             .as_deref()
@@ -1385,6 +1412,43 @@ impl BlackboxServer {
             .older_than_hours
             .map(|h| orch::now_ms().saturating_sub(h.saturating_mul(3600 * 1000)));
         let dry_run = p.dry_run.unwrap_or(false);
+
+        // Single source of truth for "is this task a prune match?" — used
+        // by the retro capture, the dry-run listing, and the live drop so
+        // the three can never diverge. Running tasks are never matched.
+        let matches_filter = |inner: &orch::TaskInner| -> bool {
+            if inner.status == orch::TaskStatus::Running {
+                return false;
+            }
+            if let Some(ref ids) = task_id_set {
+                if !ids.contains(&inner.id) {
+                    return false;
+                }
+            }
+            match effective_status {
+                Some(s) => {
+                    if inner.status != s {
+                        return false;
+                    }
+                }
+                None => {
+                    if !inner.status.is_terminal() {
+                        return false;
+                    }
+                }
+            }
+            if let Some(fp) = filter_provider {
+                if inner.provider != fp {
+                    return false;
+                }
+            }
+            if let Some(cutoff) = cutoff_ms {
+                if inner.started_at >= cutoff {
+                    return false;
+                }
+            }
+            true
+        };
 
         // Capture workload-retro targets BEFORE the drop: resume keys off
         // the on-disk session, but we read provider/session/cwd from the
@@ -1400,18 +1464,8 @@ impl BlackboxServer {
                 .iter()
                 .filter_map(|t| {
                     let inner = t.inner.lock();
-                    if inner.status != parsed_status {
+                    if !matches_filter(&inner) {
                         return None;
-                    }
-                    if let Some(fp) = filter_provider {
-                        if inner.provider != fp {
-                            return None;
-                        }
-                    }
-                    if let Some(cutoff) = cutoff_ms {
-                        if inner.started_at >= cutoff {
-                            return None;
-                        }
                     }
                     // Only sessions we can actually resume, with something
                     // to reflect on.
@@ -1442,45 +1496,16 @@ impl BlackboxServer {
                 .iter()
                 .filter_map(|t| {
                     let inner = t.inner.lock();
-                    if inner.status != parsed_status {
-                        return None;
-                    }
-                    if let Some(fp) = filter_provider {
-                        if inner.provider != fp {
-                            return None;
-                        }
-                    }
-                    if let Some(cutoff) = cutoff_ms {
-                        if inner.started_at >= cutoff {
-                            return None;
-                        }
-                    }
-                    Some(inner.id.clone())
+                    matches_filter(&inner).then(|| inner.id.clone())
                 })
                 .collect()
         } else {
             let mut store = self.state.task_store.write();
+            // retain_drop keeps tasks for which the predicate is true, so
+            // keep = NOT a prune match.
             let dropped = store.retain_drop(|t| {
                 let inner = t.inner.lock();
-                // Keep running tasks always.
-                if inner.status == orch::TaskStatus::Running {
-                    return true;
-                }
-                // Keep tasks that don't match the filter.
-                if inner.status != parsed_status {
-                    return true;
-                }
-                if let Some(fp) = filter_provider {
-                    if inner.provider != fp {
-                        return true;
-                    }
-                }
-                if let Some(cutoff) = cutoff_ms {
-                    if inner.started_at >= cutoff {
-                        return true;
-                    }
-                }
-                false
+                !matches_filter(&inner)
             });
             store.persist(&self.state.store_dir);
             dropped
@@ -1501,7 +1526,7 @@ impl BlackboxServer {
 
         let mut out = json!({
             "dryRun": dry_run,
-            "status": target_status,
+            "status": status_label,
             "pruned": dropped.len(),
             "taskIds": dropped,
         });
@@ -2015,6 +2040,103 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(&tmp.path().join("bro"))))
+    }
+
+    fn prune_params(task_ids: Option<Vec<String>>, status: Option<String>) -> PruneParams {
+        PruneParams {
+            status,
+            provider: None,
+            older_than_hours: None,
+            dry_run: None,
+            task_ids,
+            retro: None,
+            retro_min_turns: None,
+            retro_max: None,
+        }
+    }
+
+    fn seed_prune_store(server: &BlackboxServer) {
+        let mut store = server.state.task_store.write();
+        for (id, status) in [
+            ("keep-failed", orch::TaskStatus::Failed),
+            ("drop-me", orch::TaskStatus::Completed),
+            ("keep-other", orch::TaskStatus::Completed),
+            ("keep-running", orch::TaskStatus::Running),
+        ] {
+            store
+                .insert(id.into(), orch::test_task(id, status, Provider::Claude))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn prune_task_ids_drops_only_listed_terminal_tasks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_prune_store(&server);
+
+        // A completed task named explicitly — no status given, so the
+        // any-terminal rule applies and it matches despite the legacy
+        // default being "failed".
+        server.bro_prune(Parameters(prune_params(
+            Some(vec!["drop-me".into()]),
+            None,
+        )));
+
+        let store = server.state.task_store.read();
+        assert!(store.get("drop-me").is_none(), "listed task should be dropped");
+        assert!(store.get("keep-failed").is_some(), "unlisted task kept");
+        assert!(store.get("keep-other").is_some(), "unlisted task kept");
+    }
+
+    #[test]
+    fn prune_task_ids_never_drops_running_even_if_listed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_prune_store(&server);
+
+        server.bro_prune(Parameters(prune_params(
+            Some(vec!["keep-running".into(), "drop-me".into()]),
+            None,
+        )));
+
+        let store = server.state.task_store.read();
+        assert!(store.get("keep-running").is_some(), "running is never pruned");
+        assert!(store.get("drop-me").is_none(), "listed terminal task dropped");
+    }
+
+    #[test]
+    fn prune_task_ids_with_explicit_status_must_also_match_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_prune_store(&server);
+
+        // drop-me is Completed; an explicit status=failed must exclude it.
+        server.bro_prune(Parameters(prune_params(
+            Some(vec!["drop-me".into()]),
+            Some("failed".into()),
+        )));
+
+        let store = server.state.task_store.read();
+        assert!(
+            store.get("drop-me").is_some(),
+            "status=failed must not drop a completed task even when listed"
+        );
+    }
+
+    #[test]
+    fn prune_without_task_ids_keeps_legacy_failed_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        seed_prune_store(&server);
+
+        // No task_ids, no status → legacy behavior: only failed tasks drop.
+        server.bro_prune(Parameters(prune_params(None, None)));
+
+        let store = server.state.task_store.read();
+        assert!(store.get("keep-failed").is_none(), "failed default still drops failed");
+        assert!(store.get("drop-me").is_some(), "completed untouched by default sweep");
+        assert!(store.get("keep-other").is_some(), "completed untouched by default sweep");
     }
 
     fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {

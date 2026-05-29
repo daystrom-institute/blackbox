@@ -456,6 +456,13 @@ pub(crate) struct PruneParams {
     /// Defaults to false — bro_prune is the explicit pruning verb.
     #[serde(default)]
     pub(crate) dry_run: Option<bool>,
+    /// Restrict pruning to these exact task IDs. When set, only listed
+    /// terminal tasks are eligible — any terminal status unless `status`
+    /// is also given — and the other filters still apply. Lets you drop
+    /// specific tasks you created without a status-wide sweep of the
+    /// shared store. Non-terminal (running) and unlisted tasks are kept.
+    #[serde(default)]
+    pub(crate) task_ids: Option<Vec<String>>,
     /// Opt-in workload retrospective: before dropping each terminal task,
     /// resume its own session with a (non-compelling) reflection prompt
     /// asking what blackbox-substrate tooling/guidance/workflow friction it

@@ -165,6 +165,40 @@ impl Task {
     }
 }
 
+/// Test-only Task constructor for store/prune unit tests. Private fields
+/// (`child_id`) keep callers outside this module from building Tasks, so
+/// this gated helper is the seam tests use to populate a TaskStore.
+#[cfg(test)]
+pub(crate) fn test_task(id: &str, status: TaskStatus, provider: Provider) -> Arc<Task> {
+    Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id: id.into(),
+            provider,
+            session_id: format!("sess-{id}"),
+            events: vec![],
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: Some(3),
+            stderr: String::new(),
+            status,
+            started_at: now_ms(),
+            completed_at: Some(now_ms()),
+            exit_code: Some(0),
+            cwd: None,
+            bro_label: None,
+            agent_label: None,
+            report: None,
+            recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
+            supervision: SupervisionState::default(),
+        }),
+        notify: Arc::new(Notify::new()),
+        child_id: Mutex::new(None),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Task Store
 // ---------------------------------------------------------------------------
