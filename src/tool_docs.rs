@@ -963,8 +963,15 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bro_prune",
         category: ToolCategory::Orchestration,
         summary: "Drop terminal tasks from the store + persisted tasks.json.",
-        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard or bbox_inbox. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched.",
-        example: Some(r#"bro_prune(status="failed", provider="gemini")"#),
+        when_to_use: "Stale failed/completed/cancelled tasks are cluttering bro_dashboard or bbox_inbox. Cleanup is part of external orchestration hygiene, but prune only terminal tasks and prefer filters that match work you created. Defaults to status=failed. Filter by provider or older_than_hours; use dry_run=true to preview. Running tasks are never touched. Pass retro=true to fire a fire-and-forget workload retrospective on each pruned task before it's dropped (see bro_retro); tune with retro_min_turns / retro_max.",
+        example: Some(r#"bro_prune(status="completed", retro=true)"#),
+    },
+    ToolDoc {
+        name: "bro_retro",
+        category: ToolCategory::Orchestration,
+        summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files blackbox.gap_note.v1 followups only if something's worth surfacing. Does not delete the task.",
+        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_/work_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file blackbox.gap_note.v1 followups (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
+        example: Some(r#"bro_retro(task_id="…")"#),
     },
     ToolDoc {
         name: "bro_providers",

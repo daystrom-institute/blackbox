@@ -456,6 +456,30 @@ pub(crate) struct PruneParams {
     /// Defaults to false — bro_prune is the explicit pruning verb.
     #[serde(default)]
     pub(crate) dry_run: Option<bool>,
+    /// Opt-in workload retrospective: before dropping each terminal task,
+    /// resume its own session with a (non-compelling) reflection prompt
+    /// asking what blackbox-substrate tooling/guidance/workflow friction it
+    /// hit. The bro self-files `blackbox.gap_note.v1` followups only if it
+    /// has something worth surfacing. Fire-and-forget; ignored on dry_run.
+    /// Default false.
+    #[serde(default)]
+    pub(crate) retro: Option<bool>,
+    /// Skip retro probes for trivial tasks with fewer than this many turns
+    /// (nothing to reflect on). Default 2. Only meaningful with retro=true.
+    #[serde(default)]
+    pub(crate) retro_min_turns: Option<u64>,
+    /// Cap on how many retro probes a single prune may spawn. Excess
+    /// candidates are reported as skipped, not silently dropped. Default 10.
+    #[serde(default)]
+    pub(crate) retro_max: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct RetroParams {
+    /// Terminal (or any resumable) task to ask for a workload retrospective.
+    /// Resumes that task's own provider session with the reflection prompt;
+    /// does not delete the task. Decouples "reflect" from "prune".
+    pub(crate) task_id: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

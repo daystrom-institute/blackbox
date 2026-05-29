@@ -1386,6 +1386,54 @@ impl BlackboxServer {
             .map(|h| orch::now_ms().saturating_sub(h.saturating_mul(3600 * 1000)));
         let dry_run = p.dry_run.unwrap_or(false);
 
+        // Capture workload-retro targets BEFORE the drop: resume keys off
+        // the on-disk session, but we read provider/session/cwd from the
+        // in-memory task records that retain_drop is about to remove.
+        let retro_enabled = p.retro.unwrap_or(false) && !dry_run;
+        let retro_min_turns = p.retro_min_turns.unwrap_or(2);
+        let retro_max = p.retro_max.unwrap_or(10);
+        let mut retro_targets: Vec<(Provider, String, Option<String>)> = if retro_enabled {
+            self.state
+                .task_store
+                .read()
+                .all_tasks()
+                .iter()
+                .filter_map(|t| {
+                    let inner = t.inner.lock();
+                    if inner.status != parsed_status {
+                        return None;
+                    }
+                    if let Some(fp) = filter_provider {
+                        if inner.provider != fp {
+                            return None;
+                        }
+                    }
+                    if let Some(cutoff) = cutoff_ms {
+                        if inner.started_at >= cutoff {
+                            return None;
+                        }
+                    }
+                    // Only sessions we can actually resume, with something
+                    // to reflect on.
+                    if !inner.provider.supports_resume() {
+                        return None;
+                    }
+                    if inner.session_id.is_empty() || inner.session_id == "pending" {
+                        return None;
+                    }
+                    if inner.num_turns.unwrap_or(0) < retro_min_turns {
+                        return None;
+                    }
+                    Some((inner.provider, inner.session_id.clone(), inner.cwd.clone()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let retro_candidate_total = retro_targets.len();
+        let retro_capped = retro_candidate_total > retro_max;
+        retro_targets.truncate(retro_max);
+
         let dropped: Vec<String> = if dry_run {
             self.state
                 .task_store
@@ -1438,12 +1486,120 @@ impl BlackboxServer {
             dropped
         };
 
-        Self::ok_json(&json!({
+        // Fire-and-forget the retro probes now that the tasks are gone.
+        // spawn_workload_retro is non-blocking (launches the provider
+        // process + tail reader and returns); a skip just means that
+        // session wasn't resumable at spawn time.
+        let mut retros_queued = 0usize;
+        let mut retros_skipped = 0usize;
+        for (provider, session_id, cwd) in retro_targets {
+            match self.spawn_workload_retro(provider, &session_id, cwd) {
+                Ok(_) => retros_queued += 1,
+                Err(_) => retros_skipped += 1,
+            }
+        }
+
+        let mut out = json!({
             "dryRun": dry_run,
             "status": target_status,
             "pruned": dropped.len(),
             "taskIds": dropped,
-        }))
+        });
+        if retro_enabled {
+            out["retrosQueued"] = json!(retros_queued);
+            out["retrosSkipped"] = json!(retros_skipped);
+            // No silent caps: surface when candidates exceeded the cap.
+            if retro_capped {
+                out["retrosCapped"] = json!({
+                    "candidates": retro_candidate_total,
+                    "max": retro_max,
+                });
+            }
+        }
+        Self::ok_json(&out)
+    }
+
+    #[tool(
+        name = "bro_retro",
+        description = "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files blackbox.gap_note.v1 followups only if something's worth surfacing. Does not delete the task."
+    )]
+    pub(crate) fn bro_retro(&self, Parameters(p): Parameters<RetroParams>) -> CallToolResult {
+        let (provider, session_id, cwd) = match self.state.task_store.read().get(&p.task_id) {
+            Some(task) => {
+                let inner = task.inner.lock();
+                (inner.provider, inner.session_id.clone(), inner.cwd.clone())
+            }
+            None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
+        };
+        if session_id.is_empty() || session_id == "pending" {
+            return Self::err_text(&format!(
+                "task {} has no resumable session id yet",
+                p.task_id
+            ));
+        }
+        match self.spawn_workload_retro(provider, &session_id, cwd) {
+            Ok(retro_task_id) => Self::ok_json(&json!({
+                "retroTaskId": retro_task_id,
+                "sessionId": session_id,
+                "status": "running",
+            })),
+            Err(e) => Self::err_text(&e),
+        }
+    }
+
+    /// Spawn a fire-and-forget workload-retro probe: resume the bro's own
+    /// session with the fixed reflection prompt, recursion firmly denied.
+    /// Returns the probe's new task_id, or an Err string the caller counts
+    /// as a skip (provider can't resume, session gone, lease contended).
+    fn spawn_workload_retro(
+        &self,
+        provider: Provider,
+        session_id: &str,
+        cwd: Option<String>,
+    ) -> Result<String, String> {
+        if !provider.supports_resume() {
+            return Err(format!("{provider} does not support resume"));
+        }
+        // Resolve cwd from the session's own recorded origin (mirrors
+        // bro_resume) so the probe runs where the work happened.
+        let cwd = match provider.resolve_session_cwd(session_id) {
+            Some(p) => Some(p.to_string_lossy().into_owned()),
+            None => cwd,
+        };
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let resume_lease = try_acquire_resume_lease(
+            &self.state.task_store,
+            self.state.resume_leases.as_ref(),
+            provider,
+            session_id,
+        )?;
+        let prompt = orch::workload_retro_prompt(session_id, cwd.as_deref());
+        let mut args = provider.build_resume_args(session_id, &prompt, None);
+        // Retro probes never orchestrate — keep the mechanical recursion
+        // guard on so a probe can't fan out (or re-trigger prune-retro).
+        let dispatch_filters =
+            match resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, None) {
+                Ok(df) => df,
+                Err(e) => return Err(e),
+            };
+        args.extend(dispatch_filters.args);
+        let task = orch::spawn_task(
+            task_id.clone(),
+            provider,
+            args,
+            session_id.to_string(),
+            cwd,
+            None,
+            self.state.store_dir.clone(),
+            self.state.task_store.clone(),
+            self.state.tail_tx.clone(),
+            Some("workload-retro".to_string()),
+            None,
+            Some(self.state.system_events.clone()),
+        );
+        cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
+        release_resume_lease_when_done(task, resume_lease);
+        Ok(task_id)
     }
 
     #[tool(

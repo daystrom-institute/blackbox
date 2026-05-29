@@ -782,6 +782,35 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn workload_retro_prompt_names_only_valid_gap_kinds() {
+        // The retro probe (orchestration::WORKLOAD_RETRO_PROMPT) instructs
+        // bros to file gap notes with a specific gap_kind. Those tokens
+        // must stay in sync with the validator's GAP_NOTE_KINDS — a
+        // mismatch makes every retro bbox_note call fail validation. This
+        // guard fails loudly if either side drifts.
+        let prompt = crate::orchestration::WORKLOAD_RETRO_PROMPT;
+        for kind in [
+            "mcp_surface",
+            "tooling",
+            "workflow",
+            "agent",
+            "docs_runbook",
+            "refactor_primitive",
+            "ontology",
+            "eval_coverage",
+        ] {
+            assert!(
+                prompt.contains(kind),
+                "retro prompt no longer names gap_kind {kind:?}"
+            );
+            assert!(
+                GAP_NOTE_KINDS.contains(&kind),
+                "retro prompt names gap_kind {kind:?} that is not in GAP_NOTE_KINDS"
+            );
+        }
+    }
+
     fn mk_store() -> (tempfile::TempDir, Notes) {
         let dir = tempdir().unwrap();
         let path = dir.path().join("notes.json");

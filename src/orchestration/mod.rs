@@ -557,6 +557,85 @@ used <standard_tool> as fallback\")` so the orchestrator can track coverage.\n\
 Do NOT implement `work_*` handlers yourself; they are provided by the host.\n\
 Do NOT add new workspace tool names under the `bbox_*` namespace.";
 
+/// The workload-retrospective probe prompt, injected as a fake user turn
+/// when a bro's own session is resumed by `bro_prune(retro=true)` or
+/// `bro_retro`. It invites — but never compels — a `blackbox.gap_note.v1`
+/// followup about friction with the *blackbox substrate itself*.
+///
+/// The wording is the policy: there is no rule engine deciding what's
+/// worth filing, so the prompt alone has to calibrate the bro's judgment
+/// without skewing it. Two failure modes it steers between:
+///   - **Compulsion** (a quota or "silence = incomplete" framing) →
+///     manufactured friction, inbox noise.
+///   - **Discouragement** ("only if it's a big deal") → real gaps go
+///     unreported.
+/// Levers: both file/don't-file outcomes are explicitly blameless; the
+/// bar is concreteness/utility, not count; all evaluative stakes are
+/// stripped; the anti-pattern is named out loud. A hard scope boundary
+/// keeps it to surfaces blackbox can actually change (its MCP tools,
+/// guidance, orchestration) and explicitly waves off the target repo,
+/// language toolchain, and external services — those would be noise.
+///
+/// Field names and the `gap_kind` enum are pinned to `notes.rs`
+/// gap-note validation; a malformed body would fail `bbox_note`.
+/// Deliberately NOT routed through `apply_ambient` — its recall /
+/// task-shape nudges miscue a reflection turn (see `workload_retro_prompt`).
+pub const WORKLOAD_RETRO_PROMPT: &str = "\
+Quick optional reflection — the task itself is done, nothing more is needed on it.\n\
+\n\
+While it's still fresh, thinking only about the blackbox tooling you worked \
+through — the bbox_/bro_/work_ MCP tools, the guidance and memories blackbox \
+gave you, the workflow or dispatch path it ran you through — did any of *that* \
+get in your way? Worth a mention if it comes to mind:\n\
+  • a bbox_/bro_/work_ tool you reached for that didn't exist, or one that \
+existed but fought you — missing parameter, awkward output, wrong shape;\n\
+  • something blackbox told you — a system memory, a rendered convention, a \
+runbook — that was missing, stale, or actively misleading;\n\
+  • a blackbox workflow or dispatch step that was clumsier than it should be.\n\
+\n\
+Scope matters: this channel is only for things blackbox itself can change — its \
+own tools, guidance, and orchestration. It is NOT for the project you were \
+working on, its compiler or language toolchain, or external services. If what \
+fought you was rustc, a flaky API, or a gap in the target repo's own docs — \
+that's real, but it's out of scope here, so skip it.\n\
+\n\
+If something concrete and in-scope stands out — something a future agent or the \
+operator would genuinely be glad blackbox knew — file one note per distinct gap \
+with bbox_note(kind=\"followup\"), body a blackbox.gap_note.v1 JSON object:\n\
+  • type: \"blackbox.gap_note.v1\"  (required)\n\
+  • title: one-line summary  (required)\n\
+  • gap_kind: one of mcp_surface, tooling, workflow, agent, docs_runbook, \
+refactor_primitive, ontology, eval_coverage  (required) — mcp_surface for a \
+missing/awkward bbox_/bro_/work_ tool, docs_runbook for missing/stale guidance \
+or memory, workflow for dispatch/orchestration friction;\n\
+  • domain: the blackbox subsystem it touches, e.g. orchestration, knowledge, \
+transcripts, refactor  (required)\n\
+  • wanted_capability: what you wished existed, concretely  (required)\n\
+  • optional but helpful: missing_primitive; impact (low|medium|high|critical); \
+notes; dedupe_key as \"<gap_kind>/<domain>/<slug>\" so duplicates from other \
+runs collapse, e.g. \"mcp_surface/transcripts/regex-search\".\n\
+Keep each note specific enough to act on.\n\
+\n\
+If nothing in-scope stands out, that's a completely normal way for a run to \
+end — just say so in a line and file nothing. No quota, no expectation; a quiet \
+run is a good run. File only when you'd genuinely want someone to see it, and \
+please don't manufacture friction just to have something to say.";
+
+/// Build the workload-retro probe prompt with a minimal `[scope]` block so
+/// any gap note the bro files carries the session/project correlation keys
+/// and lands in `bbox_inbox` attributed correctly. Deliberately bypasses
+/// `apply_ambient`: the recall directive and task-shape (packet) nudge it
+/// injects would miscue a reflection turn, and the retro prompt already
+/// names the exact `bbox_note` call it wants.
+pub fn workload_retro_prompt(session_id: &str, project: Option<&str>) -> String {
+    let mut scope = format!("[scope] session:{session_id}");
+    if let Some(p) = project {
+        scope.push_str(" · project:");
+        scope.push_str(p);
+    }
+    format!("{scope}\n\n{WORKLOAD_RETRO_PROMPT}")
+}
+
 /// Pre-bound context the daemon has at dispatch time but the executor
 /// would otherwise have to infer by reaching back through the prompt.
 /// Emitting these into the prefix lets notes, thread links, and work-
@@ -2163,6 +2242,39 @@ mod tests {
         );
         let json = task_status_json(&ok, 0);
         assert!(json.get("stderrTail").is_none());
+    }
+
+    #[test]
+    fn workload_retro_prompt_emits_scope_block() {
+        let with_project = workload_retro_prompt("sess-123", Some("/repo/x"));
+        assert!(with_project.starts_with("[scope] session:sess-123 · project:/repo/x\n\n"));
+        assert!(with_project.contains("blackbox.gap_note.v1"));
+        // The body is the canonical prompt, unmodified.
+        assert!(with_project.ends_with(WORKLOAD_RETRO_PROMPT));
+
+        // Project is optional — omit it cleanly rather than leaking an
+        // empty segment.
+        let no_project = workload_retro_prompt("sess-123", None);
+        assert!(no_project.starts_with("[scope] session:sess-123\n\n"));
+        assert!(!no_project.contains("project:"));
+    }
+
+    #[test]
+    fn workload_retro_prompt_keeps_the_no_compulsion_balance() {
+        // These phrases are load-bearing: they're what stop the probe from
+        // manufacturing friction to satisfy a perceived quota. If a future
+        // edit drops them, the balance is gone — fail loudly.
+        for phrase in [
+            "completely normal way for a run to end",
+            "a quiet run is a good run",
+            "don't manufacture friction",
+            "file nothing",
+        ] {
+            assert!(
+                WORKLOAD_RETRO_PROMPT.contains(phrase),
+                "retro prompt lost the anti-compulsion phrase: {phrase:?}"
+            );
+        }
     }
 
     #[test]
