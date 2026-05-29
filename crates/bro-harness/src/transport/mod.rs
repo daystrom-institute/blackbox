@@ -28,16 +28,27 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 /// Normalized usage. Each transport maps its native counters into this.
+///
+/// `input_tokens` is **fresh** (cache-exclusive) prompt input; cache reads and
+/// cache writes are tracked separately so the emitted Anthropic-native
+/// `stream-json` envelope round-trips through the daemon's claude parser with
+/// consistent cache semantics. Transports whose native counter is
+/// cache-inclusive (OpenAI `prompt_tokens` / Responses `input_tokens`) must
+/// subtract the cached subset before populating `input_tokens`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    pub cached_input_tokens: u64,
+    pub cache_creation_input_tokens: u64,
 }
 
 impl Usage {
     pub fn add(&mut self, other: &Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.cached_input_tokens += other.cached_input_tokens;
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens;
     }
 }
 

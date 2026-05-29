@@ -2050,10 +2050,19 @@ pub fn task_result_json(task: &Task) -> Value {
     }
     if inner.status == TaskStatus::Completed || inner.status == TaskStatus::Failed {
         if let Some(ref u) = inner.usage {
-            obj["usage"] = serde_json::json!({
+            // `input_tokens` is fresh (cache-exclusive). Surface the cache
+            // breakdown only when present so cache-free providers stay terse.
+            let mut usage = serde_json::json!({
                 "input_tokens": u.input_tokens,
                 "output_tokens": u.output_tokens,
             });
+            if u.cached_input_tokens > 0 || u.cache_creation_input_tokens > 0 {
+                usage["cached_input_tokens"] = Value::from(u.cached_input_tokens);
+                usage["cache_creation_input_tokens"] =
+                    Value::from(u.cache_creation_input_tokens);
+                usage["total_input_tokens"] = Value::from(u.total_input_tokens());
+            }
+            obj["usage"] = usage;
         }
         if let Some(cost) = inner.cost_usd {
             obj["costUsd"] = Value::from(cost);
@@ -2831,6 +2840,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 100,
                     output_tokens: 50,
+                    ..Default::default()
                 }),
                 cost_usd: Some(0.05),
                 num_turns: Some(3),
@@ -2911,6 +2921,7 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 10,
                 output_tokens: 5,
+                ..Default::default()
             }),
             cost_usd: Some(0.01),
             num_turns: Some(1),
@@ -2982,6 +2993,7 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: 12,
                 output_tokens: 8,
+                ..Default::default()
             }),
             cost_usd: Some(0.02),
             num_turns: Some(2),

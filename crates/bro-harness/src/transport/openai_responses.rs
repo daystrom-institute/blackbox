@@ -226,9 +226,18 @@ impl OpenAiResponsesTransport {
                 }
                 "response.completed" | "response.incomplete" => {
                     let r = &ev["response"];
+                    // OpenAI Responses `input_tokens` is cache-INCLUSIVE; the
+                    // cached subset lives in `input_tokens_details.cached_tokens`.
+                    // Subtract it so `input_tokens` stays fresh.
+                    let total_input = r["usage"]["input_tokens"].as_u64().unwrap_or(0);
+                    let cached = r["usage"]["input_tokens_details"]["cached_tokens"]
+                        .as_u64()
+                        .unwrap_or(0);
                     usage = Usage {
-                        input_tokens: r["usage"]["input_tokens"].as_u64().unwrap_or(0),
+                        input_tokens: total_input.saturating_sub(cached),
                         output_tokens: r["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                        cached_input_tokens: cached,
+                        cache_creation_input_tokens: 0,
                     };
                     if r["status"].as_str() == Some("incomplete") {
                         stop = StopReason::Length;

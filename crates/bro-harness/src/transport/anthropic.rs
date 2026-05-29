@@ -184,9 +184,15 @@ impl Transport for AnthropicTransport {
             Some(other) => StopReason::Other(other.to_string()),
             None => StopReason::Done,
         };
+        // Anthropic's `input_tokens` is already fresh (cache-exclusive); cache
+        // reads/writes are reported in their own counters.
         let usage = Usage {
             input_tokens: v["usage"]["input_tokens"].as_u64().unwrap_or(0),
             output_tokens: v["usage"]["output_tokens"].as_u64().unwrap_or(0),
+            cached_input_tokens: v["usage"]["cache_read_input_tokens"].as_u64().unwrap_or(0),
+            cache_creation_input_tokens: v["usage"]["cache_creation_input_tokens"]
+                .as_u64()
+                .unwrap_or(0),
         };
 
         Ok(TurnOutput {

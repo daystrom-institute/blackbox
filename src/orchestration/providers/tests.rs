@@ -551,8 +551,97 @@ fn test_parse_codex_turn_completed_event() {
         session_id: None,
     };
     Provider::Codex.parse_event(&evt, &mut sink);
-    assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 200);
-    assert_eq!(sink.usage.as_ref().unwrap().output_tokens, 80);
+    let u = sink.usage.as_ref().unwrap();
+    // No cached field present → all 200 are fresh.
+    assert_eq!(u.input_tokens, 200);
+    assert_eq!(u.output_tokens, 80);
+    assert_eq!(u.cached_input_tokens, 0);
+}
+
+#[test]
+fn test_parse_codex_usage_splits_cached_from_cumulative_input() {
+    // Codex `input_tokens` is cumulative AND cache-INCLUSIVE. The cached
+    // subset must be split out so the headline `input_tokens` reflects fresh
+    // load only — otherwise a cache-heavy session overstates real input by
+    // orders of magnitude (the exact defect this fix targets).
+    let evt = serde_json::json!({
+        "type": "turn.completed",
+        "usage": { "input_tokens": 67910, "cached_input_tokens": 6912, "output_tokens": 489 }
+    });
+    let mut sink = EventSink {
+        last_assistant_message: None,
+        usage: None,
+        cost_usd: None,
+        num_turns: None,
+        session_id: None,
+    };
+    Provider::Codex.parse_event(&evt, &mut sink);
+    let u = sink.usage.as_ref().unwrap();
+    assert_eq!(u.input_tokens, 67910 - 6912, "fresh input excludes cache");
+    assert_eq!(u.cached_input_tokens, 6912);
+    assert_eq!(u.output_tokens, 489);
+    // The cache-inclusive grand total round-trips back to codex's headline.
+    assert_eq!(u.total_input_tokens(), 67910);
+}
+
+#[test]
+fn test_parse_claude_usage_captures_cache_breakdown() {
+    // Anthropic `input_tokens` is already fresh; cache reads/writes ride in
+    // their own counters and must be captured, not dropped.
+    let evt = serde_json::json!({
+        "type": "result",
+        "result": "ok",
+        "usage": {
+            "input_tokens": 1200,
+            "output_tokens": 300,
+            "cache_read_input_tokens": 50000,
+            "cache_creation_input_tokens": 800
+        },
+    });
+    let mut sink = EventSink {
+        last_assistant_message: None,
+        usage: None,
+        cost_usd: None,
+        num_turns: None,
+        session_id: None,
+    };
+    Provider::Claude.parse_event(&evt, &mut sink);
+    let u = sink.usage.as_ref().unwrap();
+    assert_eq!(u.input_tokens, 1200, "claude input stays fresh");
+    assert_eq!(u.cached_input_tokens, 50000);
+    assert_eq!(u.cache_creation_input_tokens, 800);
+    assert_eq!(u.total_input_tokens(), 1200 + 50000 + 800);
+}
+
+#[test]
+fn test_harness_cache_fields_roundtrip_through_claude_parser() {
+    // bro-harness emits the Anthropic-native usage shape; the daemon's claude
+    // parser (which handles glm/deepseek/brodex) must capture the cache
+    // breakdown identically to a real Claude CLI run.
+    let evt = serde_json::json!({
+        "type": "result",
+        "subtype": "success",
+        "session_id": "harness-1",
+        "result": "done",
+        "num_turns": 4,
+        "usage": {
+            "input_tokens": 900,
+            "output_tokens": 120,
+            "cache_read_input_tokens": 30000,
+            "cache_creation_input_tokens": 0
+        },
+    });
+    let mut sink = EventSink {
+        last_assistant_message: None,
+        usage: None,
+        cost_usd: None,
+        num_turns: None,
+        session_id: None,
+    };
+    Provider::Glm.parse_event(&evt, &mut sink);
+    let u = sink.usage.as_ref().unwrap();
+    assert_eq!(u.input_tokens, 900);
+    assert_eq!(u.cached_input_tokens, 30000);
 }
 
 #[test]
@@ -592,6 +681,35 @@ fn test_parse_copilot_result_event() {
     Provider::Copilot.parse_event(&evt, &mut sink);
     assert_eq!(sink.session_id.as_deref(), Some("copilot-sid"));
     assert_eq!(sink.num_turns, Some(5));
+}
+
+#[test]
+fn test_parse_copilot_reads_tokens_when_present_not_hardcoded_zero() {
+    // Copilot usually omits token counters, but when it does surface them we
+    // must read them rather than blindly reporting 0 (the previous defect).
+    let evt = serde_json::json!({
+        "type": "result",
+        "sessionId": "copilot-sid",
+        "usage": {
+            "premiumRequests": 2,
+            "inputTokens": 1234,
+            "outputTokens": 56,
+            "cachedInputTokens": 1000
+        }
+    });
+    let mut sink = EventSink {
+        last_assistant_message: None,
+        usage: None,
+        cost_usd: None,
+        num_turns: None,
+        session_id: None,
+    };
+    Provider::Copilot.parse_event(&evt, &mut sink);
+    let u = sink.usage.as_ref().unwrap();
+    assert_eq!(u.input_tokens, 1234);
+    assert_eq!(u.output_tokens, 56);
+    assert_eq!(u.cached_input_tokens, 1000);
+    assert_eq!(sink.num_turns, Some(2));
 }
 
 #[test]

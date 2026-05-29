@@ -12,10 +12,44 @@ pub struct EventSink {
     pub session_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Normalized per-task token usage.
+///
+/// Token-counter semantics differ wildly across provider wire formats, so we
+/// normalize every provider into one convention here:
+///
+/// * `input_tokens` is **fresh** (cache-exclusive) prompt input — the tokens
+///   the model actually had to process anew this session. This is what should
+///   drive load/burn signals; reporting cache-inclusive input as the headline
+///   overstates real work (a long codex session can read millions of cached
+///   tokens it never reprocessed).
+/// * `cached_input_tokens` is the cache-read portion (tokens served from the
+///   provider's prompt cache).
+/// * `cache_creation_input_tokens` is the cache-write portion (tokens written
+///   into the cache this turn; Anthropic bills these separately).
+///
+/// Total prompt input (what some providers, e.g. codex/OpenAI, report as their
+/// headline `input_tokens`) is therefore
+/// `input_tokens + cached_input_tokens + cache_creation_input_tokens`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Cache-read input tokens (served from prompt cache, not reprocessed).
+    #[serde(default)]
+    pub cached_input_tokens: u64,
+    /// Cache-creation input tokens (written into the prompt cache this turn).
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+}
+
+impl Usage {
+    /// Total prompt input including cache reads + cache creation. This is the
+    /// cache-inclusive figure codex/OpenAI report as their headline input.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+    }
 }
 
 impl Provider {
@@ -125,6 +159,10 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
             }
         }
         if let Some(usage) = evt["usage"].as_object() {
+            // Anthropic's `input_tokens` is already fresh (cache-exclusive);
+            // cache reads/writes are reported separately. This matches our
+            // normalized convention directly. Harness providers (glm/deepseek/
+            // brodex) emit the same Anthropic-native shape via bro-harness.
             sink.usage = Some(Usage {
                 input_tokens: usage
                     .get("input_tokens")
@@ -132,6 +170,14 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
                     .unwrap_or(0),
                 output_tokens: usage
                     .get("output_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cached_input_tokens: usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                cache_creation_input_tokens: usage
+                    .get("cache_creation_input_tokens")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0),
             });
@@ -193,12 +239,18 @@ pub fn parse_opencode_export(raw: &str, sink: &mut EventSink) {
         sink.last_assistant_message = Some(text_parts.join("\n"));
     }
 
-    let input_tokens = last_assistant["info"]["tokens"]["input"].as_u64();
-    let output_tokens = last_assistant["info"]["tokens"]["output"].as_u64();
+    let tokens = &last_assistant["info"]["tokens"];
+    let input_tokens = tokens["input"].as_u64();
+    let output_tokens = tokens["output"].as_u64();
     if let (Some(input_tokens), Some(output_tokens)) = (input_tokens, output_tokens) {
+        // OpenCode reports cache reads/writes under `tokens.cache.{read,write}`
+        // and keeps `tokens.input` fresh (cache-exclusive), so it already
+        // matches our convention.
         sink.usage = Some(Usage {
             input_tokens,
             output_tokens,
+            cached_input_tokens: tokens["cache"]["read"].as_u64().unwrap_or(0),
+            cache_creation_input_tokens: tokens["cache"]["write"].as_u64().unwrap_or(0),
         });
     }
 
@@ -218,15 +270,28 @@ fn parse_codex_event(evt: &Value, sink: &mut EventSink) {
         }
         "turn.completed" => {
             if let Some(usage) = evt["usage"].as_object() {
+                // Codex reports cumulative-per-session, cache-INCLUSIVE input:
+                // `input_tokens` already contains `cached_input_tokens`. Split
+                // it so our `input_tokens` stays fresh (cache-exclusive) like
+                // every other provider; otherwise a cache-heavy session
+                // overstates real input load by orders of magnitude.
+                let total_input = usage
+                    .get("input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let cached = usage
+                    .get("cached_input_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
                 sink.usage = Some(Usage {
-                    input_tokens: usage
-                        .get("input_tokens")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    input_tokens: total_input.saturating_sub(cached),
                     output_tokens: usage
                         .get("output_tokens")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0),
+                    cached_input_tokens: cached,
+                    // Codex does not separately report cache-creation tokens.
+                    cache_creation_input_tokens: 0,
                 });
             }
         }
@@ -261,9 +326,26 @@ fn parse_copilot_event(evt: &Value, sink: &mut EventSink) {
                 sink.session_id = Some(sid.to_string());
             }
             if let Some(usage) = evt["usage"].as_object() {
+                // Copilot bills in premium requests, not tokens, and usually
+                // omits token counters entirely. Read them when present
+                // (camelCase, matching `premiumRequests`, with snake_case
+                // fallback) instead of blindly hardcoding 0 — a silent 0
+                // masks real usage whenever the CLI does surface tokens.
+                let pick = |camel: &str, snake: &str| -> u64 {
+                    usage
+                        .get(camel)
+                        .or_else(|| usage.get(snake))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                };
                 sink.usage = Some(Usage {
-                    input_tokens: 0,
-                    output_tokens: 0,
+                    input_tokens: pick("inputTokens", "input_tokens"),
+                    output_tokens: pick("outputTokens", "output_tokens"),
+                    cached_input_tokens: pick("cachedInputTokens", "cached_input_tokens"),
+                    cache_creation_input_tokens: pick(
+                        "cacheCreationInputTokens",
+                        "cache_creation_input_tokens",
+                    ),
                 });
                 sink.num_turns = usage.get("premiumRequests").and_then(|v| v.as_u64());
             }
@@ -297,9 +379,16 @@ fn parse_gemini_event(evt: &Value, sink: &mut EventSink) {
         && let Some(first_model) = models.values().next()
         && let Some(tokens) = first_model.get("tokens")
     {
+        // Gemini's `input` mirrors `promptTokenCount`, which is cache-INCLUSIVE
+        // (`cached` ⊆ `input`). Subtract the cached subset so `input_tokens`
+        // stays fresh. When `cached` is absent this is a no-op.
+        let total_input = tokens["input"].as_u64().unwrap_or(0);
+        let cached = tokens["cached"].as_u64().unwrap_or(0);
         sink.usage = Some(Usage {
-            input_tokens: tokens["input"].as_u64().unwrap_or(0),
+            input_tokens: total_input.saturating_sub(cached),
             output_tokens: tokens["candidates"].as_u64().unwrap_or(0),
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: 0,
         });
     }
 }

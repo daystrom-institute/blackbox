@@ -96,6 +96,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Fixed
 
+- Bro token-usage reporting now accounts for prompt-cache tokens and is
+  consistent across providers. Previously `Usage` carried only
+  `{input_tokens, output_tokens}` with per-provider semantics that disagreed
+  under one field name: codex reported cumulative, cache-INCLUSIVE input (so a
+  cache-heavy session overstated real input load by orders of magnitude — one
+  review run reported 7.7M input tokens of which 97% were cache reads), claude
+  dropped its cache-read counter entirely, and copilot hardcoded input to 0.
+  `Usage` now carries `cached_input_tokens` and `cache_creation_input_tokens`,
+  `input_tokens` is normalized to **fresh** (cache-exclusive) input across every
+  provider (claude, codex, copilot, gemini, opencode, and the glm/deepseek/
+  brodex harness path), and rollups surface the cache breakdown plus the
+  cache-inclusive grand total. Token-burn supervision now keys off fresh input
+  so a long cached session no longer trips false alerts. `bro-harness` emits the
+  Anthropic-native cache counters so harness providers report identically to a
+  real Claude CLI run.
 - Raw `bro_exec { provider }` (no tier/pin) against a `bro-harness`-backed
   provider (`glm`, `deepseek`, `brodex`) no longer dies silently with exit 1
   and zero events. The harness has no built-in default model (unlike the

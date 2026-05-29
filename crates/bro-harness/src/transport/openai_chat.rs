@@ -152,9 +152,18 @@ impl Transport for OpenAiChatTransport {
             Some(other) => StopReason::Other(other.to_string()),
             None => StopReason::Done,
         };
+        // OpenAI Chat `prompt_tokens` is cache-INCLUSIVE; the cached subset is
+        // in `prompt_tokens_details.cached_tokens`. Subtract it so
+        // `input_tokens` stays fresh (cache-exclusive).
+        let total_input = v["usage"]["prompt_tokens"].as_u64().unwrap_or(0);
+        let cached = v["usage"]["prompt_tokens_details"]["cached_tokens"]
+            .as_u64()
+            .unwrap_or(0);
         let usage = Usage {
-            input_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+            input_tokens: total_input.saturating_sub(cached),
             output_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+            cached_input_tokens: cached,
+            cache_creation_input_tokens: 0,
         };
 
         Ok(TurnOutput {

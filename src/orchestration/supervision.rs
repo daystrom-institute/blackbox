@@ -105,10 +105,17 @@ pub struct SupervisionState {
     pub last_event_at_ms: Option<u64>,
     #[serde(default)]
     pub compaction_times_ms: VecDeque<u64>,
+    /// Fresh (cache-exclusive) input tokens; see [`crate::orchestration::providers::Usage`].
     #[serde(default)]
     pub total_input_tokens: u64,
     #[serde(default)]
     pub total_output_tokens: u64,
+    /// Cache-read input tokens served from the provider's prompt cache.
+    #[serde(default)]
+    pub total_cached_input_tokens: u64,
+    /// Cache-creation input tokens written into the prompt cache.
+    #[serde(default)]
+    pub total_cache_creation_input_tokens: u64,
     #[serde(default)]
     pub token_baseline: Option<u64>,
     #[serde(default)]
@@ -282,8 +289,17 @@ impl SupervisionState {
             "event_count": self.event_count,
             "loop_hash_max": self.max_loop_count(),
             "loop_hash_max_tool": self.loop_hash_max_tool(),
+            // `total_input_tokens` is fresh (cache-exclusive) input — the real
+            // new-work signal. The cache breakdown and the cache-inclusive
+            // grand total are surfaced alongside so consumers can see both.
             "total_input_tokens": self.total_input_tokens,
             "total_output_tokens": self.total_output_tokens,
+            "total_cached_input_tokens": self.total_cached_input_tokens,
+            "total_cache_creation_input_tokens": self.total_cache_creation_input_tokens,
+            "total_input_tokens_with_cache": self
+                .total_input_tokens
+                .saturating_add(self.total_cached_input_tokens)
+                .saturating_add(self.total_cache_creation_input_tokens),
             "token_baseline": self.token_baseline,
         });
 
@@ -352,11 +368,20 @@ impl SupervisionState {
 
     fn observe_usage(&mut self, sink: &EventSink) {
         if let Some(usage) = &sink.usage {
+            // Providers report either cumulative-per-session (codex) or
+            // final-result (claude) figures; taking the running max is correct
+            // for both. Each counter is tracked independently.
             if usage.input_tokens > self.total_input_tokens {
                 self.total_input_tokens = usage.input_tokens;
             }
             if usage.output_tokens > self.total_output_tokens {
                 self.total_output_tokens = usage.output_tokens;
+            }
+            if usage.cached_input_tokens > self.total_cached_input_tokens {
+                self.total_cached_input_tokens = usage.cached_input_tokens;
+            }
+            if usage.cache_creation_input_tokens > self.total_cache_creation_input_tokens {
+                self.total_cache_creation_input_tokens = usage.cache_creation_input_tokens;
             }
         }
     }
@@ -510,6 +535,8 @@ impl Default for SupervisionState {
             compaction_times_ms: VecDeque::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
+            total_cached_input_tokens: 0,
+            total_cache_creation_input_tokens: 0,
             token_baseline: None,
             alerts: Vec::new(),
             last_alert_at_ms: BTreeMap::new(),
@@ -726,6 +753,7 @@ mod tests {
             usage: Some(Usage {
                 input_tokens: input,
                 output_tokens: output,
+                ..Default::default()
             }),
             cost_usd: None,
             num_turns: None,
@@ -941,6 +969,33 @@ mod tests {
                 && matches!(alert.severity, AlertSeverity::Red)
         });
         assert!(red_burn);
+    }
+
+    #[test]
+    fn snapshot_surfaces_cache_breakdown_and_burn_uses_fresh_input() {
+        let mut state = SupervisionState::default();
+        let sink = EventSink {
+            last_assistant_message: None,
+            usage: Some(Usage {
+                input_tokens: 1200,
+                output_tokens: 300,
+                cached_input_tokens: 50000,
+                cache_creation_input_tokens: 800,
+            }),
+            cost_usd: None,
+            num_turns: None,
+            session_id: None,
+        };
+        state.observe_event(&serde_json::json!({"note": "n"}), &sink, 1_000);
+
+        let snap = state.snapshot(1_100);
+        assert_eq!(snap["total_input_tokens"], 1200, "fresh input is the headline");
+        assert_eq!(snap["total_cached_input_tokens"], 50000);
+        assert_eq!(snap["total_cache_creation_input_tokens"], 800);
+        assert_eq!(
+            snap["total_input_tokens_with_cache"], 1200 + 50000 + 800,
+            "cache-inclusive grand total is surfaced alongside"
+        );
     }
 
     #[test]

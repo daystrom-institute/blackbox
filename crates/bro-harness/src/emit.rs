@@ -52,6 +52,10 @@ impl Emitter {
 
     /// Terminal `result` event with usage/turns/cost.
     pub fn result(&self, text: &str, usage: &Usage, num_turns: u64, cost_usd: Option<f64>) {
+        // Emit the Anthropic-native usage shape (fresh `input_tokens` plus
+        // `cache_read_input_tokens` / `cache_creation_input_tokens`) so the
+        // daemon's claude parser captures the cache breakdown identically to a
+        // real Claude CLI run.
         let mut v = json!({
             "type": "result",
             "subtype": "success",
@@ -61,6 +65,8 @@ impl Emitter {
             "usage": {
                 "input_tokens": usage.input_tokens,
                 "output_tokens": usage.output_tokens,
+                "cache_read_input_tokens": usage.cached_input_tokens,
+                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
             },
         });
         if let Some(c) = cost_usd {
