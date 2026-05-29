@@ -10,6 +10,34 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bro-harness` custom provider harness (`crates/bro-harness`,
+  `crates/bro-tools`): a headless coding agent that speaks provider APIs
+  directly behind one `Transport` interface (Anthropic Messages, OpenAI
+  Responses, OpenAI Chat), runs its own tool-calling loop, and emits the Claude
+  stream-json envelope so it slots into the existing dispatch seam. GLM and
+  DeepSeek now route through it on the Anthropic transport, and a new `brodex`
+  provider rides the OpenAI Responses (Codex/ChatGPT) backend; the existing
+  `codex` CLI path is unchanged. Includes ChatGPT-OAuth token refresh,
+  HTTP retry/backoff/timeout, client-side deferred tooling with a pinned-tier
+  carve-out (`tool_search`), and client-side allow/deny recursion-guard
+  enforcement.
+- bro-harness built-in tool surface (`crates/bro-tools`): file read (line-range
+  + token cap + optional line numbers), content search (content/files/count
+  modes, context lines, case-insensitive), glob (mtime/name sort + result cap),
+  edit/write/list, a shell lifecycle quartet (`shell_run`/`shell_poll`/
+  `shell_kill`/`shell_list` with cooperative yield-poll, timeouts, stdin/EOF,
+  signals, env, and bounded output), git read tools + guarded commit, web fetch,
+  and `smart_read`.
+- bro-harness durable session side-state: a transport-agnostic `side` cell in
+  the session store that survives `exec → resume`, backing a durable
+  `todo_write` and the hook nudge ledger.
+- bro-harness hook subsystem and Nudger: an internal interception seam
+  (user/assistant/tool-result hooks) that contributes ambient guidance steering
+  the agent toward the richer blackbox toolbox, with a cache-stable/volatile
+  system-prompt split and adopt-or-explain gap-note instrumentation.
+- bro-harness design corpus under `design/orchestration/`: a cluster map plus
+  tool-surface, clipboard, tool-chaining, hooks, and neuralyze (rewind +
+  carry-a-message) designs.
 - Vaadin Java refactor toolsuite. Adds read-only view structure, static
   UI/session audit, and route inventory analysis; conservative component,
   grid, dialog, navigation-helper, view-synthesis, and route-access plan
