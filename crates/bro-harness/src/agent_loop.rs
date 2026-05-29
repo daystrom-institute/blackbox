@@ -16,7 +16,7 @@
 
 use crate::cli::Cli;
 use crate::emit::Emitter;
-use crate::registry::Registry;
+use crate::registry::{PinPolicy, Registry};
 use crate::session::SessionStore;
 use crate::mcp;
 use crate::transport::{self, StopReason, TransportKind, TurnOpts, Usage};
@@ -77,15 +77,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         safety: Arc::new(SafetyPolicy::new()),
         http: reqwest::Client::new(),
     };
-    let mut tools = builtin_tools();
-    tools.extend(mcp::load_mcp_tools(cli.mcp_config.as_deref()).await);
-    let reg = Registry::new(tools);
-    let tool_specs = reg.tool_specs();
+    let builtins = builtin_tools();
+    let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref()).await;
+    let reg = Registry::new(builtins, mcp_tools, &PinPolicy::from_env());
 
-    let opts = TurnOpts {
+    let base_opts = TurnOpts {
         model,
         max_tokens,
-        system,
+        system: None, // composed per-turn from `system` + tiered tool sections
         effort: cli.effort.clone(),
         web_search,
     };
@@ -102,6 +101,13 @@ pub async fn run(cli: Cli) -> Result<()> {
             tracing::warn!(max_turns, "hit max turns; stopping");
             break;
         }
+        // Rebuild each turn: the wire tool set grows as tool_search activates
+        // deferred tools, and the manifest shrinks correspondingly.
+        let tool_specs = reg.wire_specs();
+        let opts = TurnOpts {
+            system: Some(compose_system(system.as_deref(), &reg)),
+            ..base_opts.clone()
+        };
         let out = tx.run_turn(&tool_specs, &opts).await?;
         turns += 1;
         total_usage.add(&out.usage);
@@ -131,6 +137,43 @@ pub async fn run(cli: Cli) -> Result<()> {
     emitter.result(&final_text, &total_usage, turns, None);
     store.save(tx.name(), tx.snapshot())?;
     Ok(())
+}
+
+/// Compose the effective system prompt: the caller's system text, then a
+/// prominent always-available (Pinned) section, then the names-only manifest
+/// of deferred tools with an instruction to load them via tool_search.
+fn compose_system(base: Option<&str>, reg: &Registry) -> String {
+    let mut s = base.unwrap_or("").to_string();
+
+    let pinned = reg.pinned();
+    if !pinned.is_empty() {
+        if !s.is_empty() {
+            s.push_str("\n\n");
+        }
+        s.push_str(
+            "## Always-available tools\n\
+             These are loaded and ready — prefer them for their purpose; do not search for them. \
+             `tool_search` loads anything else on demand.\n",
+        );
+        for (name, desc) in pinned {
+            s.push_str(&format!("- `{name}` — {desc}\n"));
+        }
+    }
+
+    let manifest = reg.manifest();
+    if !manifest.is_empty() {
+        s.push_str(&format!(
+            "\n## Additional tools ({} available, not yet loaded)\n\
+             Call `tool_search(\"<keywords>\")` (or `tool_search(\"select:name1,name2\")`) to load \
+             any of these before using them:\n",
+            manifest.len()
+        ));
+        for (name, desc) in manifest {
+            s.push_str(&format!("- {name}: {desc}\n"));
+        }
+    }
+
+    s
 }
 
 fn resolve_prompt(cli: &Cli) -> Result<String> {

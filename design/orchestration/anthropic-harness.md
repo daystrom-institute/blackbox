@@ -406,6 +406,39 @@ non-canonical `web_search_prime`/`tool_result` variant; DeepSeek returns
 canonical `web_search_tool_result` — the loose response parsing tolerates
 both.
 
+## Deferred tooling & tiering (our own Tool Search)
+
+Claude Code's Tool Search (`defer_loading` + `tool_search_tool_*` server
+tools) is an Anthropic-API server-side feature — unavailable on
+GLM/DeepSeek/OpenAI endpoints. To get uniform behaviour across every
+transport, the harness implements deferral **client-side** in the registry
+(`registry.rs`). Three tiers:
+
+- **Pinned** — always first in the wire `tools` array AND surfaced in a
+  prominent system-prompt section. Set by `PinPolicy` (default
+  `bbox_slice_*`, override `BRO_HARNESS_PIN_TOOLS`), plus `tool_search`.
+  Elevates tools *by name regardless of origin* — the motivating case is
+  pinning the HTTP-registered `bbox_slice_*` MCP tools so they're never
+  deferred ("always visible or it doesn't get called"). No native port — the
+  slice tools stay MCP; we just change their tier.
+- **Eager** — always in the wire array; the core built-ins.
+- **Deferred** — not in the wire array; advertised as a names+one-line
+  manifest in the system prompt. All MCP tools default here.
+
+`tool_search(query)` is a Pinned meta-tool: keyword match (or
+`select:a,b`) over the deferred catalog → inserts hits into a shared
+`activated` set → the next turn's wire array includes their full schemas.
+The loop rebuilds the wire set + recomposes the system prompt each turn, so
+activation is incremental and the manifest shrinks as tools load. Transports
+are unchanged — they already render `tools` + `system` per turn.
+
+Verified live (2026-05-29, GLM + blackbox MCP, 126 tools): the model
+`tool_search`'d for stats, loaded `bbox_stats`, called it, and answered —
+total input dropped from **47,152** (all-eager) to **16,885** tokens despite
+the extra search turn. Further trimming (names-only manifest, or manifest
+only on turn 1) is available if needed. This supersedes the static-allowlist
+idea: every tool stays reachable, only used ones cost a full schema.
+
 ## Daemon-side changes (minimal)
 
 1. **Bin resolution** (`providers/exec_args.rs`): GLM/DeepSeek resolve to the
