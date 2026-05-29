@@ -1,7 +1,7 @@
 ---
 title: "bro-harness hooks & nudges (the ambient-meta seam)"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - orchestration
@@ -11,10 +11,13 @@ brief: "An internal, harness-owned interception subsystem for the bro-harness ag
 
 # bro-harness hooks & nudges (the ambient-meta seam)
 
-> **Status.** Proposed. Verified against code 2026-05-29:
-> `crates/bro-harness/src/{agent_loop.rs,registry.rs,session.rs,transport/anthropic.rs}`.
-> Prerequisite §1 (system-prefix split) is a correctness fix worth landing on
-> its own, independent of nudges.
+> **Status — partial (implemented).** Built and merged: §1 (system-prompt
+> cache split), §2 (hook scaffold + gating ledger), §3 (four shipped rules),
+> and the adopt-or-explain gap-note directive. **Not built:** §4 catalog-metadata
+> channel (gated on adoption data). This doc is reconciled to the as-built code
+> in `crates/bro-harness/src/{hooks.rs,agent_loop.rs,transport/*}`; where an
+> earlier draft's sketch differed from what shipped, the §2/§3 text below has
+> been corrected to match the code, not the original proposal.
 
 ## Problem
 
@@ -135,38 +138,62 @@ that a `file_write`/`file_edit` `new_string` contains a substring of a prior
 triggers like this are **far** lower false-positive than lexical ones and are
 the spine of the Nudger (§4).
 
-A hook is small:
+**As-built shape (`hooks.rs`).** An earlier draft proposed one
+`evaluate(&mut HookCtx)` with the ledger passed into the hook. What shipped is
+cleaner and is the authoritative shape: a hook is a **pure, stateless matcher**
+with one method per phase, returning *candidate* nudges. It never sees the
+ledger. The `HookEngine` owns the ledger and applies the gate/rank/cap policy
+centrally (so triggers are trivially unit-testable in isolation):
 
 ```rust
-pub struct HookCtx<'a> {
-    pub turn: u64,
-    pub user_prompt: &'a str,
-    pub assistant_text: &'a str,
-    pub tool_calls: &'a [ToolCall],
-    pub last_result: Option<(&'a ToolCall, &'a ToolResult)>, // on_tool_result only
-    pub ledger: &'a mut NudgeLedger,                         // persisted in `side`
+pub trait Hook: Send + Sync {
+    fn on_user_turn(&self, _prompt: &str) -> Vec<Candidate> { Vec::new() }
+    fn on_assistant_turn(&self, _text: &str, _calls: &[ToolCall]) -> Vec<Candidate> { Vec::new() }
+    fn on_tool_result(&self, _call: &ToolCall, _result: &ToolResult) -> Vec<Candidate> { Vec::new() }
 }
 
-pub trait Hook: Send + Sync {
-    fn evaluate(&self, cx: &mut HookCtx) -> Vec<Nudge>;
-}
+// A Candidate is { rule_id, message, delivery, kind, priority }.
+// The engine: collects candidates from every hook for the phase →
+//   admit(): rank by priority (desc), apply the ledger gate
+//   (Signpost: try_fire_once; Periodic: cooldown), cap to ONE per phase,
+//   append the shared GAP_NOTE_DIRECTIVE → returns Vec<Nudge>.
+// HookEngine::tick() is the turn-boundary hook (decrements cooldowns).
 ```
+
+A behavioral matcher that needs cross-call memory (the copy-paste detector
+remembering recent reads) holds its own interior-mutable state inside the hook
+struct; the *ledger* stays gating-only.
 
 ## §3 — Delivery mechanisms (the persistence trade)
 
-A `Nudge` is delivered by one of two mechanisms, and the choice is dictated by
-its lifetime — which resolves the token-accumulation worry cleanly:
+**Delivery (`Delivery`) and recurrence (`NudgeKind`) are independent axes** — a
+rule picks each. (An earlier draft coupled them 1:1, rider=signpost /
+tail=periodic; the as-built rules do not, so that coupling is corrected here.)
 
-| Mechanism | Where it lands | Lifetime | Use for |
+`Delivery` — *where the nudge lands*, chosen by its persistence need:
+
+| Mechanism | Where it lands | Lifetime |
+|---|---|---|
+| **`Rider`** | appended to an existing `tool_result`'s content (`<harness-note>…</harness-note>`) | **persists** in the transport snapshot; round-trips. Best when the nudge is contextual to a specific action just taken. |
+| **`SystemTail`** | §1 block 2 (Anthropic system tail / OpenAI trailing developer msg) | **ephemeral** — recomposed each turn; never accumulates. Best for ambient reminders not tied to one action. |
+
+`NudgeKind` — *how often it may fire*, enforced by the ledger gate:
+`Signpost` (once per session) or `Periodic { cooldown }`.
+
+The as-built rules show the axes are orthogonal:
+
+| Rule | Delivery | Kind | Phase |
 |---|---|---|---|
-| **Tool-result rider** | appended to an existing `tool_result`'s content (`<harness-note>…</harness-note>`) | **persists** in the transport snapshot; round-trips forever | **one-time signposts** — one line, once, adjacent to the triggering action |
-| **Volatile system tail** | §1 block 2 (Anthropic system tail / OpenAI trailing developer msg) | **ephemeral** — recomposed each turn; appears while the condition holds, vanishes otherwise | **periodic / ambient reminders** — never accumulates |
+| `copy-paste-to-slice` | `Rider` | `Periodic{8}` | tool_result |
+| `shell-grep-to-code-search` | `Rider` | `Periodic{6}` | tool_result |
+| `refactor-signpost` | `SystemTail` | `Signpost` | user/assistant turn |
+| `hedged-convention` | `SystemTail` | `Periodic{10}` | assistant turn |
 
-So the two nudge *categories* map to two *delivery mechanisms*, and the
-persistence semantics fall out for free: a periodic reminder delivered as a
-rider would pile up in history; delivered as a volatile tail it is replaced each
-turn. A one-time signpost delivered as a rider is contextual and then becomes
-cheap history.
+Note a `Rider` is `Periodic` here, not `Signpost` — a recurring rider is fine
+because each lands on a *different* tool_result (it does not pile up on one), and
+the cooldown bounds the rate. The original worry — a periodic reminder
+*accumulating* — only applies to a nudge that would otherwise repeat in the same
+place; `SystemTail` solves that for the ambient ones.
 
 Synthetic developer/system turns (a third, OpenAI-only mechanism) stay in
 reserve. We do not need them, and on Anthropic the only mid-array option is a
@@ -195,7 +222,7 @@ ordered by trigger quality:
 
 | Trigger (behavioral unless noted) | Steer toward |
 |---|---|
-| `file_read` output substring reappears in a later `file_write`/`file_edit` | `clip_*` / `bbox_slice_*` (server-side move, no context round-trip) |
+| `file_read` output substring reappears in a later `file_write`/`file_edit` | `bbox_slice_*` (server-side move, no context round-trip). *As shipped, `copy-paste-to-slice` targets `bbox_slice_copy`/`bbox_slice_move` only — `clip_*` is designed but unbuilt, so the rule does not yet point at it.* |
 | `shell_run` running `grep`/`rg`/`find` over the repo tree | `bbox_hybrid_search` / `bbox_code_query` / code_nav |
 | repeated `bro_status` polling, or sequential `bro_exec` calls | `bro_when_all` / `bro_when_any` / `bro_orchestrate_run` |
 | N structurally-similar `file_edit` diffs across files | `bbox_refactor_plan` / a refactor atom |
