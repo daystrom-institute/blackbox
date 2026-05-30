@@ -14,6 +14,7 @@ mod cli;
 mod compaction;
 mod emit;
 mod hooks;
+mod lsp_baselines;
 mod report;
 mod mcp;
 mod project_doc;

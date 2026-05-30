@@ -273,10 +273,30 @@ impl Tool for FileWrite {
         {
             return ToolResult::Error(format!("mkdir {}: {e}", parent.display()));
         }
+        // Capture the pre-image BEFORE the write so the post-write edit event
+        // carries both ends. A missing file (fresh write) → empty pre-image.
+        let pre_image = tokio::fs::read(&path).await.unwrap_or_default();
         match tokio::fs::write(&path, content.as_bytes()).await {
-            Ok(()) => ToolResult::Json(json!({"ok": true, "bytes": content.len()})),
+            Ok(()) => {
+                record_edit(cx, &path, &pre_image, content.as_bytes());
+                ToolResult::Json(json!({"ok": true, "bytes": content.len()}))
+            }
             Err(e) => ToolResult::Error(format!("write {}: {e}", args.file_path)),
         }
+    }
+}
+
+/// Push an `EditEvent` onto `cx.edits` after a successful file mutation.
+/// Lock-poisoning is swallowed (logged), since the diagnostics substrate must
+/// never fail a successful filesystem mutation.
+fn record_edit(cx: &ToolCx, path: &Path, pre: &[u8], post: &[u8]) {
+    match cx.edits.lock() {
+        Ok(mut sink) => sink.push(crate::edits::EditEvent::from_bytes(
+            path.to_path_buf(),
+            pre,
+            post,
+        )),
+        Err(_) => tracing::warn!("edits sink poisoned; dropping {} edit event", path.display()),
     }
 }
 
@@ -552,9 +572,12 @@ impl Tool for FileEdit {
             body.replacen(&args.old_string, &args.new_string, 1)
         };
         match tokio::fs::write(&path, updated.as_bytes()).await {
-            Ok(()) => ToolResult::Json(
-                json!({"ok": true, "replacements": count.min(if args.replace_all { count } else { 1 })}),
-            ),
+            Ok(()) => {
+                record_edit(cx, &path, body.as_bytes(), updated.as_bytes());
+                ToolResult::Json(
+                    json!({"ok": true, "replacements": count.min(if args.replace_all { count } else { 1 })}),
+                )
+            }
             Err(e) => ToolResult::Error(format!("write {}: {e}", args.file_path)),
         }
     }
@@ -960,6 +983,7 @@ mod tests {
             clipboard: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::clipboard::Registers::default(),
             )),
+            edits: std::sync::Arc::new(std::sync::Mutex::new(crate::edits::EditSink::default())),
         }
     }
 
@@ -1196,5 +1220,79 @@ mod tests {
             ToolResult::Text(t) => assert!(t.contains("alpha.rs") && !t.contains("beta.md")),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn file_write_and_edit_record_edit_events() {
+        use crate::slice_core::sha256_hex;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Canonicalize the tempdir root — macOS reports /var/folders but
+        // canonicalizes to /private/var/folders, and our absolute paths come
+        // back through normalize_lexical without that prefix. Comparing
+        // against the canonical root keeps macOS and Linux honest.
+        let root = dir.path().canonicalize().unwrap();
+        let cx = cx_at(&root);
+
+        // 1) Fresh file_write: empty pre-image, post-image matches content.
+        let new_body = "first contents\n";
+        let r = FileWrite
+            .call(
+                json!({"file_path": "fresh.txt", "content": new_body}),
+                &cx,
+            )
+            .await;
+        assert!(!r.is_error(), "{r:?}");
+
+        // 2) file_edit on top of that file: pre-image is the prior write.
+        let r = FileEdit
+            .call(
+                json!({"file_path": "fresh.txt", "old_string": "first", "new_string": "second"}),
+                &cx,
+            )
+            .await;
+        assert!(!r.is_error(), "{r:?}");
+
+        // 3) file_write that overwrites an existing file: pre-image carries
+        //    the previous bytes.
+        let overwrite = "third contents\n";
+        let r = FileWrite
+            .call(
+                json!({"file_path": "fresh.txt", "content": overwrite}),
+                &cx,
+            )
+            .await;
+        assert!(!r.is_error(), "{r:?}");
+
+        let events = cx.edits.lock().unwrap().drain();
+        assert_eq!(events.len(), 3, "expected one event per mutation: {events:?}");
+
+        let expected_path = root.join("fresh.txt");
+        let empty_sha = sha256_hex(b"");
+        let first_sha = sha256_hex(new_body.as_bytes());
+        let edited_body = "second contents\n";
+        let edited_sha = sha256_hex(edited_body.as_bytes());
+        let overwrite_sha = sha256_hex(overwrite.as_bytes());
+
+        // (a) fresh file_write
+        assert_eq!(events[0].path, expected_path);
+        assert!(events[0].pre_image.is_empty(), "fresh write: empty pre-image");
+        assert_eq!(events[0].pre_sha256, empty_sha);
+        assert_eq!(events[0].post_sha256, first_sha);
+
+        // (b) file_edit
+        assert_eq!(events[1].path, expected_path);
+        assert_eq!(events[1].pre_image, new_body.as_bytes());
+        assert_eq!(events[1].pre_sha256, first_sha);
+        assert_eq!(events[1].post_sha256, edited_sha);
+
+        // (c) overwriting file_write
+        assert_eq!(events[2].path, expected_path);
+        assert_eq!(events[2].pre_image, edited_body.as_bytes());
+        assert_eq!(events[2].pre_sha256, edited_sha);
+        assert_eq!(events[2].post_sha256, overwrite_sha);
+
+        // drain() resets the sink.
+        assert!(cx.edits.lock().unwrap().is_empty());
     }
 }

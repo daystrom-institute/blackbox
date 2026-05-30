@@ -18,6 +18,7 @@
 use crate::cli::Cli;
 use crate::emit::Emitter;
 use crate::hooks::{Delivery, HookEngine, NudgeLedger};
+use crate::lsp_baselines::LspBaselines;
 use crate::mcp;
 use crate::registry::{PinPolicy, Registry};
 use crate::session::{SaveState, SessionStore};
@@ -185,6 +186,11 @@ struct Session {
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
     clipboard: Arc<std::sync::Mutex<bro_tools::Registers>>,
+    /// Cross-turn diagnostics baselines: per-file `{sha256, version,
+    /// diagnostics}` snapshots from the most recent analyzer pass, so a
+    /// future differ can surface only NEW/CHANGED findings on the next edit.
+    /// Seeded from `side["lsp_baselines"]` on build; flushed in `persist()`.
+    lsp_baselines: Arc<std::sync::Mutex<LspBaselines>>,
     // Mutable accumulators carried across user turns.
     total_usage: Usage,
     turns: u64,
@@ -241,6 +247,9 @@ impl Session {
         let hooks = HookEngine::from_env(NudgeLedger::from_side(
             prior_side.get("nudges").unwrap_or(&Value::Null),
         ));
+        let lsp_baselines = Arc::new(std::sync::Mutex::new(LspBaselines::from_side(
+            prior_side.get("lsp_baselines").unwrap_or(&Value::Null),
+        )));
         if let Some(r) = &store.restored {
             if r.transport != tx.name() {
                 anyhow::bail!(
@@ -264,6 +273,7 @@ impl Session {
                 "no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL",
             )?;
 
+        let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
         let cx = ToolCx {
             root: std::env::current_dir().context("cwd")?,
             safety: Arc::new(SafetyPolicy::new()),
@@ -271,6 +281,7 @@ impl Session {
             todos: todos.clone(),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             clipboard: clipboard.clone(),
+            edits: edits.clone(),
         };
         // The builtin `report` tool is harness-owned (it emits the cockpit's
         // status signal on the stream) and holds its own emitter handle. It is
@@ -320,6 +331,7 @@ impl Session {
             prior_side,
             todos,
             clipboard,
+            lsp_baselines,
             total_usage: Usage::default(),
             turns: 0,
             last_prompt_tokens: 0,
@@ -553,6 +565,11 @@ impl Session {
             .clipboard
             .lock()
             .map(|c| c.to_side())
+            .unwrap_or(Value::Null);
+        side["lsp_baselines"] = self
+            .lsp_baselines
+            .lock()
+            .map(|b| b.to_side())
             .unwrap_or(Value::Null);
         self.store.save(&SaveState {
             transport: self.tx.name(),
@@ -832,6 +849,7 @@ mod tests {
             todos: todos.clone(),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             clipboard: clipboard.clone(),
+            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
         };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -861,6 +879,7 @@ mod tests {
             prior_side: Value::Null,
             todos,
             clipboard,
+            lsp_baselines: Arc::new(Mutex::new(LspBaselines::default())),
             total_usage: Usage::default(),
             turns: 0,
             last_prompt_tokens: 0,
