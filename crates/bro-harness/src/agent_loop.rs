@@ -26,7 +26,7 @@ use crate::transport::{self, StopReason, SystemPrompt, Transport, TransportKind,
 use anyhow::{Context, Result};
 use bro_tools::{SafetyPolicy, ToolCx, builtin_tools};
 use serde_json::{Value, json};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Read as _;
 use std::sync::Arc;
 use tokio::io::AsyncBufReadExt as _;
@@ -99,7 +99,11 @@ async fn session_loop(
             Some(p) => p,
             None => match input_rx.recv().await {
                 Some(Input::User(p)) => p,
-                Some(Input::Control { subtype, req_id, raw }) => {
+                Some(Input::Control {
+                    subtype,
+                    req_id,
+                    raw,
+                }) => {
                     // Control while idle: apply any mutation, ack success.
                     session.apply_control(&subtype, &raw);
                     ctrl_emitter.control_response_success(req_id.as_deref());
@@ -190,7 +194,12 @@ struct Session {
     /// diagnostics}` snapshots from the most recent analyzer pass, so a
     /// future differ can surface only NEW/CHANGED findings on the next edit.
     /// Seeded from `side["lsp_baselines"]` on build; flushed in `persist()`.
-    lsp_baselines: Arc<std::sync::Mutex<LspBaselines>>,
+    lsp_baselines: LspBaselines,
+    /// Loop-lived LSP pool and open-document handles. The pool keeps warm
+    /// language-server sessions across edits; the document map lets the spine
+    /// apply didChange instead of reopening files on every mutation.
+    lsp_pool: bro_lsp::SessionPool,
+    lsp_documents: BTreeMap<String, bro_lsp::OpenDocument>,
     // Mutable accumulators carried across user turns.
     total_usage: Usage,
     turns: u64,
@@ -247,9 +256,8 @@ impl Session {
         let hooks = HookEngine::from_env(NudgeLedger::from_side(
             prior_side.get("nudges").unwrap_or(&Value::Null),
         ));
-        let lsp_baselines = Arc::new(std::sync::Mutex::new(LspBaselines::from_side(
-            prior_side.get("lsp_baselines").unwrap_or(&Value::Null),
-        )));
+        let lsp_baselines =
+            LspBaselines::from_side(prior_side.get("lsp_baselines").unwrap_or(&Value::Null));
         if let Some(r) = &store.restored {
             if r.transport != tx.name() {
                 anyhow::bail!(
@@ -332,6 +340,8 @@ impl Session {
             todos,
             clipboard,
             lsp_baselines,
+            lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
+            lsp_documents: BTreeMap::new(),
             total_usage: Usage::default(),
             turns: 0,
             last_prompt_tokens: 0,
@@ -350,11 +360,11 @@ impl Session {
             && let Some(m) = raw["model"]
                 .as_str()
                 .or_else(|| raw["request"]["model"].as_str())
-            {
-                self.base_opts.model = m.to_string();
-                self.compact_threshold = self.compaction.threshold(m);
-                tracing::info!(model = m, "set_model");
-            }
+        {
+            self.base_opts.model = m.to_string();
+            self.compact_threshold = self.compaction.threshold(m);
+            tracing::info!(model = m, "set_model");
+        }
         // set_max_thinking_tokens / others are accepted (acked) but not yet
         // wired to a runtime knob; they no-op rather than error.
     }
@@ -512,6 +522,32 @@ impl Session {
                             content,
                             is_error,
                         };
+                        let edits = self
+                            .cx
+                            .edits
+                            .lock()
+                            .map(|mut edits| edits.drain())
+                            .unwrap_or_default();
+                        if !edits.is_empty() {
+                            match crate::diagnostics::engine::check_edits(
+                                &edits,
+                                &mut self.lsp_baselines,
+                                &mut self.lsp_documents,
+                                &self.lsp_pool,
+                                &self.cx.root,
+                            )
+                            .await
+                            {
+                                Ok(diffs) => {
+                                    if let Some(rider) = crate::diagnostics::render::build_rider(&diffs) {
+                                        result.content.push_str(&rider);
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!("window-0 diagnostics failed: {err:#}");
+                                }
+                            }
+                        }
                         for n in self.hooks.on_tool_result(tc, &result) {
                             match n.delivery {
                                 Delivery::Rider => result.content.push_str(&n.rider_block()),
@@ -566,11 +602,7 @@ impl Session {
             .lock()
             .map(|c| c.to_side())
             .unwrap_or(Value::Null);
-        side["lsp_baselines"] = self
-            .lsp_baselines
-            .lock()
-            .map(|b| b.to_side())
-            .unwrap_or(Value::Null);
+        side["lsp_baselines"] = self.lsp_baselines.to_side();
         self.store.save(&SaveState {
             transport: self.tx.name(),
             model: &self.base_opts.model,
@@ -786,7 +818,11 @@ mod tests {
             "mock"
         }
         fn push_user_text(&mut self, text: &str) {
-            self.shared.pushed_users.lock().unwrap().push(text.to_string());
+            self.shared
+                .pushed_users
+                .lock()
+                .unwrap()
+                .push(text.to_string());
         }
         fn push_tool_results(&mut self, _results: Vec<transport::ToolResult>) {}
         async fn run_turn(
@@ -858,7 +894,12 @@ mod tests {
         let id = format!("bh-test-{}-{}", std::process::id(), nanos);
         let session = Session {
             tx: Box::new(mock),
-            reg: Registry::new(vec![], vec![], &PinPolicy::from_env(), &mcp::ToolFilter::default()),
+            reg: Registry::new(
+                vec![],
+                vec![],
+                &PinPolicy::from_env(),
+                &mcp::ToolFilter::default(),
+            ),
             cx,
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
             emitter: Emitter::new("test".into()),
@@ -879,7 +920,9 @@ mod tests {
             prior_side: Value::Null,
             todos,
             clipboard,
-            lsp_baselines: Arc::new(Mutex::new(LspBaselines::default())),
+            lsp_baselines: LspBaselines::default(),
+            lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
+            lsp_documents: BTreeMap::new(),
             total_usage: Usage::default(),
             turns: 0,
             last_prompt_tokens: 0,
