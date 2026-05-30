@@ -115,12 +115,10 @@ struct Agent {
 /// Snapshot of a task's live fields, read under one lock per draw.
 struct AgentView {
     state: FleetState,
-    summary: String,
     model: Option<String>,
     cwd: Option<String>,
     cost: Option<f64>,
     turns: Option<u64>,
-    session_id: String,
     started_at: u64,
     stderr_tail: Option<String>,
 }
@@ -142,12 +140,6 @@ impl Agent {
             TaskStatus::Completed => FleetState::Idle,
             TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
         };
-        let summary = snap
-            .report_message
-            .clone()
-            .or_else(|| snap.last_assistant_message.clone())
-            .map(|s| first_line(&s))
-            .unwrap_or_default();
         let stderr_tail = if matches!(state, FleetState::Interrupted) && !snap.stderr.is_empty() {
             Some(last_line(&snap.stderr))
         } else {
@@ -155,12 +147,10 @@ impl Agent {
         };
         AgentView {
             state,
-            summary,
             model: snap.model,
             cwd: snap.cwd,
             cost: snap.cost_usd,
             turns: snap.num_turns,
-            session_id: snap.session_id,
             started_at: snap.started_at,
             stderr_tail,
         }
@@ -201,6 +191,9 @@ struct App {
     input: String,
     /// Single-agent input-history recall cursor (§5.3); None = live edit.
     history_cursor: Option<usize>,
+    /// When set, the composer is renaming this agent (Ctrl+R from the roster);
+    /// Enter commits, Esc cancels.
+    rename_target: Option<usize>,
 
     /// 0 = pinned to bottom; >0 = N rows above bottom (single-agent view).
     scroll_from_bottom: usize,
@@ -232,6 +225,7 @@ impl App {
             launch_cwd,
             input: String::new(),
             history_cursor: None,
+            rename_target: None,
             scroll_from_bottom: 0,
             cached_total_lines: 0,
             status: None,
@@ -391,6 +385,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.quit = true;
         return;
     }
+    // Ctrl+R renames the selected roster agent (§5).
+    if ctrl && key.code == KeyCode::Char('r') {
+        start_rename(app);
+        return;
+    }
     // `tab` is the always-available provider cycle, even with a non-empty
     // composer (§5.1).
     if key.code == KeyCode::Tab {
@@ -398,20 +397,27 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
 
-    // Empty-composer gate: arrows navigate only when the composer is empty;
-    // once there's text they belong to editing/scroll (§5.1).
-    let gate = app.input.is_empty();
+    // Empty-composer gate: arrows navigate only when the composer is empty —
+    // except the history-mode carveout, where ↑/↓ keep cycling recalled input
+    // in the single-agent view even with text present (§5.1, §5.3).
+    let in_history_mode = app.zone == Zone::SingleAgent && app.history_cursor.is_some();
+    let nav = app.input.is_empty() || in_history_mode;
+    let zoom = app.input.is_empty();
 
     match key.code {
-        // Esc interrupts the running turn in the single-agent view (§1.1);
-        // elsewhere it quits. Ctrl+Q/Ctrl+C always quit (handled above).
+        // Esc cancels a pending rename, else interrupts the running turn in the
+        // single-agent view (§1.1), else quits. Ctrl+Q/Ctrl+C always quit.
+        KeyCode::Esc if app.rename_target.is_some() => {
+            app.rename_target = None;
+            app.input.clear();
+        }
         KeyCode::Esc if app.zone == Zone::SingleAgent => interrupt_selected(app),
         KeyCode::Esc => app.quit = true,
 
-        KeyCode::Left if gate => zoom_left(app),
-        KeyCode::Right if gate => zoom_right(app),
-        KeyCode::Up if gate => vertical(app, -1),
-        KeyCode::Down if gate => vertical(app, 1),
+        KeyCode::Left if zoom => zoom_left(app),
+        KeyCode::Right if zoom => zoom_right(app),
+        KeyCode::Up if nav => vertical(app, -1),
+        KeyCode::Down if nav => vertical(app, 1),
 
         // Scroll the single-agent transcript when there's text in the composer
         // (arrows are claimed by editing, so scroll rides Ctrl).
@@ -434,21 +440,62 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.history_cursor = None;
             }
         }
-        KeyCode::Char(c) => app.input.push(c),
+        // Typing exits history-recall mode (you're now editing the line).
+        KeyCode::Char(c) => {
+            app.input.push(c);
+            app.history_cursor = None;
+        }
 
         _ => {}
     }
 }
 
-/// Enter: dispatch (no agent context) or steer (agent focused).
+/// Begin renaming the selected roster agent: prefill the composer with the
+/// current name; Enter commits, Esc cancels (§5).
+fn start_rename(app: &mut App) {
+    if app.zone == Zone::ProviderSelector {
+        return;
+    }
+    let Some(idx) = app.selected_agent() else {
+        return;
+    };
+    app.rename_target = Some(idx);
+    app.input = app.agents[idx].name.clone();
+    app.set_status("rename: edit + Enter (Esc cancels)", Duration::from_secs(4));
+}
+
+/// Enter: commit a rename, run a TUI-local slash command, dispatch, or steer.
 fn submit(app: &mut App) {
+    // Commit a pending Ctrl+R rename (roster).
+    if let Some(idx) = app.rename_target.take() {
+        let new = app.input.trim();
+        if !new.is_empty() {
+            app.agents[idx].name = truncate(new, NAME_LEN);
+        }
+        app.input.clear();
+        return;
+    }
     if app.input.trim().is_empty() {
         return;
     }
     match app.zone {
-        // Single-agent view: typing steers that session — a user-turn into the
-        // live bidirectional session (queues at the next turn boundary, §1.1).
-        Zone::SingleAgent => steer_selected(app),
+        // Single-agent view: `/rename <name>` is TUI-local; everything else
+        // (including `/compact`) steers the live session — a user-turn into the
+        // bidirectional session (queues at the next turn boundary, §1.1).
+        Zone::SingleAgent => {
+            if let Some(name) = app.input.trim().strip_prefix("/rename ") {
+                let name = name.trim().to_string();
+                if let Some(idx) = app.selected_agent() {
+                    if !name.is_empty() {
+                        app.agents[idx].name = truncate(&name, NAME_LEN);
+                    }
+                }
+                app.input.clear();
+                app.set_status("renamed", Duration::from_secs(2));
+            } else {
+                steer_selected(app);
+            }
+        }
         // Roster / provider-selector: dispatch a new entrypoint agent. Enter
         // stays on the roster — you watch it surface in its bucket (§5).
         Zone::Roster | Zone::ProviderSelector => app.dispatch_current_input(),
@@ -596,12 +643,38 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let (views, order) = app.ordered_agents();
     draw_title(f, chunks[0], app, &views);
+    // Per-agent stats ride under the composer (not at the top of the
+    // scrollback), in the single-agent view.
+    let composer_stats = if app.zone == Zone::SingleAgent {
+        order
+            .get(app.roster_selected)
+            .map(|&idx| agent_stats_line(&app.agents[idx], &views[idx]))
+    } else {
+        None
+    };
     match app.zone {
         Zone::SingleAgent => draw_single_agent(f, chunks[1], app, &views),
         _ => draw_roster_body(f, chunks[1], app, &views, &order),
     }
-    draw_composer(f, chunks[2], app);
+    draw_composer(f, chunks[2], app, composer_stats.as_deref());
     draw_help(f, chunks[3], app);
+}
+
+/// One-line per-agent stats for the composer's bottom border (§ feedback:
+/// stats belong under the text entry, not atop the transcript).
+fn agent_stats_line(a: &Agent, v: &AgentView) -> String {
+    let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
+    let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
+    let model = v.model.clone().unwrap_or_else(|| "—".into());
+    let cwd = v.cwd.clone().unwrap_or_else(|| "—".into());
+    format!(
+        " {} · {} · {} · {} turns · cwd {} ",
+        provider_tag(a.provider),
+        model,
+        cost,
+        turns,
+        cwd
+    )
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
@@ -650,6 +723,7 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
     let mut items: Vec<ListItem<'static>> = Vec::new();
     let mut flat_selected: Option<usize> = None;
     let mut seen_in_order = 0usize;
+    let mut first_bucket = true;
 
     for bucket in FleetState::BUCKETS {
         let in_bucket: Vec<usize> = order
@@ -660,6 +734,11 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
         if in_bucket.is_empty() {
             continue;
         }
+        // One blank row between buckets.
+        if !first_bucket {
+            items.push(ListItem::new(Line::from("")));
+        }
+        first_bucket = false;
         let (glyph, color) = bucket.glyph();
         let collapsed = app.collapsed.contains(&bucket);
         let caret = if collapsed { "▸" } else { "▾" };
@@ -723,30 +802,23 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
 
 fn agent_list_item(a: &Agent, v: &AgentView, glyph: &str, color: Color) -> ListItem<'static> {
     let tag = provider_tag(a.provider);
-    let alert_suffix = ""; // [loop|stall|burn] — follow-on with supervision reuse
-    let mut spans = vec![
+    // Row = glyph · provider · name · age. The name is the initial user turn
+    // (until renamed) — no truncated assistant-line summary (it was clutter).
+    let spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
             format!("{tag:<4}"),
             Style::default().fg(provider_color(a.provider)),
         ),
         Span::styled(
-            format!("{:<16}", truncate(&a.name, 16)),
+            truncate(&a.name, 52),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(" "),
         Span::styled(
-            truncate(&v.summary, 14),
+            format!("  {}", age(v.started_at)),
             Style::default().fg(Color::DarkGray),
         ),
     ];
-    if !alert_suffix.is_empty() {
-        spans.push(Span::styled(alert_suffix, Style::default().fg(Color::Red)));
-    }
-    spans.push(Span::styled(
-        format!(" {}", age(v.started_at)),
-        Style::default().fg(Color::DarkGray),
-    ));
     ListItem::new(Line::from(spans))
 }
 
@@ -791,33 +863,23 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     let a = &app.agents[idx];
     let (glyph, _) = v.state.glyph();
 
-    // Identity (glyph · name · state) lives in the block title; the body opens
-    // with a single dim metadata line — no name repeat, no separate header
-    // stack.
-    let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
-    let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
-    let model = v.model.clone().unwrap_or_else(|| "—".into());
-    let cwd = v.cwd.clone().unwrap_or_else(|| "—".into());
-    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
-        format!(
-            "{} · {} · {} · {} turns · cwd {} · sess {}",
-            provider_tag(a.provider),
-            model,
-            cost,
-            turns,
-            cwd,
-            short_id(&v.session_id),
-        ),
-        Style::default().fg(Color::DarkGray),
-    ))];
+    // Identity in the block title; per-agent stats under the composer. The body
+    // opens straight into the transcript (only a failure tail leads, when the
+    // agent is interrupted).
+    let width = area.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(err) = &v.stderr_tail {
         lines.push(Line::from(Span::styled(
             format!("✗ {}", truncate(err, 100)),
             Style::default().fg(Color::Red),
         )));
+        lines.push(Line::from(""));
     }
-    lines.push(Line::from(""));
-    lines.extend(render_transcript(&a.task.transcript(), initial_prompt(a)));
+    lines.extend(render_transcript(
+        &a.task.transcript(),
+        initial_prompt(a),
+        width,
+    ));
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let total = para.line_count(area.width.saturating_sub(2));
@@ -862,7 +924,11 @@ fn initial_prompt(a: &Agent) -> &str {
 
 /// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
 /// temporal order, structure carried by markers + color rather than folding.
-fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line<'static>> {
+fn render_transcript(
+    items: &[TranscriptItem],
+    initial_prompt: &str,
+    width: usize,
+) -> Vec<Line<'static>> {
     /// Soft caps for non-harness providers (the harness already spills oversized
     /// results, §2.3); a render-side backstop so one huge block can't dominate.
     const ARG_MAX_LINES: usize = 15;
@@ -940,14 +1006,15 @@ fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            TranscriptItem::TurnFooter {
-                num_turns,
-                cost_usd,
-            } => {
-                let turns = num_turns.map(|t| format!("turn {t}")).unwrap_or_default();
-                let cost = cost_usd.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
+            TranscriptItem::TurnFooter { .. } => {
+                // A single tight horizontal rule between turns — no "turn N ·
+                // $cost" text (those stats live under the composer now). Replace
+                // the preceding blank with the rule so it stays one line tall.
+                if matches!(lines.last(), Some(l) if line_is_blank(l)) {
+                    lines.pop();
+                }
                 lines.push(Line::from(Span::styled(
-                    format!("  — {turns}{cost} —"),
+                    "─".repeat(width.max(1)),
                     Style::default().fg(Color::DarkGray),
                 )));
             }
@@ -959,6 +1026,12 @@ fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line
         }
     }
     lines
+}
+
+/// True for a visually empty transcript line (the spacer we insert between
+/// items) — used to keep the turn rule tight.
+fn line_is_blank(l: &Line<'static>) -> bool {
+    l.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
 /// Show a tool's result body verbosely? Change-making and opaque tools
@@ -1018,15 +1091,29 @@ fn monospace_block(text: &str, max: usize, color: Color) -> Vec<Line<'static>> {
     out
 }
 
-fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
-    let (title, color) = match app.zone {
-        Zone::SingleAgent => (" steer (Enter=send · Ctrl+J=newline) ", Color::Yellow),
-        _ => (" dispatch (Enter=spawn · Ctrl+J=newline · Tab=provider) ", Color::Green),
+fn draw_composer(f: &mut Frame, area: Rect, app: &App, bottom_stats: Option<&str>) {
+    let (title, color) = if app.rename_target.is_some() {
+        (" rename (Enter=save · Esc=cancel) ", Color::Magenta)
+    } else {
+        match app.zone {
+            Zone::SingleAgent => (" steer (Enter=send · Ctrl+J=newline · /rename) ", Color::Yellow),
+            _ => (
+                " dispatch (Enter=spawn · Ctrl+J=newline · Tab=provider · Ctrl+R=rename) ",
+                Color::Green,
+            ),
+        }
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color))
         .title(Span::styled(title, Style::default().fg(color)));
+    // Per-agent stats ride on the bottom border, under the text entry.
+    if let Some(stats) = bottom_stats {
+        block = block.title_bottom(Line::from(Span::styled(
+            stats.to_string(),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1097,10 +1184,6 @@ fn first_line(s: &str) -> String {
 
 fn last_line(s: &str) -> String {
     s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string()
-}
-
-fn short_id(id: &str) -> String {
-    id.chars().take(8).collect()
 }
 
 fn age(started_ms: u64) -> String {
