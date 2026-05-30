@@ -1,19 +1,14 @@
 {
-  "name": "drone-probe",
+  "name": "drone-fast4",
   "members": [
-    {
-      "brofile": "drone-probe-vibe-high",
-      "alias": "vibe",
-      "count": 1
-    },
     {
       "brofile": "drone-probe-claude-sonnet-medium",
       "alias": "claude",
       "count": 1
     },
     {
-      "brofile": "drone-probe-codex-spark",
-      "alias": "codex",
+      "brofile": "drone-probe-deepseek-flash",
+      "alias": "deepseek",
       "count": 1
     },
     {
@@ -22,8 +17,8 @@
       "count": 1
     },
     {
-      "brofile": "drone-probe-deepseek-flash",
-      "alias": "deepseek",
+      "brofile": "drone-probe-codex-spark",
+      "alias": "codex",
       "count": 1
     }
   ]
