@@ -1,7 +1,7 @@
 ---
 title: "Fleet TUI — multi-provider agent cockpit"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - orchestration
@@ -11,7 +11,14 @@ brief: "A new top-level bro-client TUI: a human cockpit for dispatching and live
 
 # Fleet TUI — multi-provider agent cockpit
 
-> **Status.** Design / scoping. No build order.
+> **Status.** Partial. The **entire harness-side substrate is implemented** in
+> `crates/bro-harness` (2026-05-29, on `main`): SSE streaming across all three
+> transports, model-keyed compaction, the bidirectional session + control
+> protocol (interrupt / steer / `/compact`), the builtin `report` tool, and
+> bounded tool results — with mock-transport integration tests for the session
+> loop. What remains is the **daemon-drive seam** (§7.2, §7.6) and the entire
+> **client side** (`FleetOrchestrator` §7.7 + the TUI §7.11–16). Implemented
+> substrate items are marked ✅ in §7.
 >
 > **Grounding.** Every claim is cited `file:line`. Blackbox claims cite this
 > repo. The bidirectional transport flags are **verified live against the
@@ -396,16 +403,30 @@ Substrate:
 1. **bro-harness bidirectional stream-json** — persistent session +
    `control_request`/`control_response` + `interrupt` + `/compact`/
    `compact_boundary`. Today one-shot (`agent_loop.rs:34,154`). **Keystone (§2).**
+   ✅ **Implemented** — `agent_loop.rs` `Session` / `session_loop` (one-shot is the
+   degenerate case), `--input-format stream-json` reads NDJSON user turns +
+   control_requests over stdin; interrupt cancels at await points with buffer
+   reconciliation; steers queue to the turn boundary; `/compact` slash command;
+   `emit.rs` control_response / replay_user / init `slash_commands`. SSE streaming
+   added to all three transports (sink seam in `transport/mod.rs`). Mock-transport
+   integration tests cover the loop.
 2. **Drive Claude in `--input-format stream-json`** — blackbox dispatches it
    one-shot today (`exec_args.rs:218`); use the CLI's existing bidirectional mode.
 3. **Builtin `report` tool, fleet-pinned** (§2.2) — Waiting/summary signal on the
-   stream; `registry.rs` builtin; not `bro_report`.
+   stream; `registry.rs` builtin; not `bro_report`. ✅ **Implemented** —
+   `report.rs` (`ReportTool` holds its own `Emitter`, emits a `report` line);
+   registered always, pinned in fleet mode via `PinPolicy::also_pin`.
 4. **Compaction machinery in bro-harness** (§2.4) — summarize older turns →
    replace prefix → `compact_boundary`, so the harness can react to `/compact`. It
    has none today (only discard-truncation). Net-new; Claude gets this for free.
+   ✅ **Implemented** — `compaction.rs` ((provider,model)-keyed thresholds via the
+   model id), `Transport::compact` per transport (pairing-safe prefix swap),
+   auto-trigger on window occupancy + manual `/compact`.
 5. **Bounded tool results (cap + spill + dump machinery)** (§2.3) — uniform
    harness-loop rule: result > N kB → spill full payload to a dump path, inline a
-   head + rider. Net-new; general harness win.
+   head + rider. Net-new; general harness win. ✅ **Implemented** — `bound.rs`
+   (`BRO_HARNESS_TOOL_RESULT_CAP_KB`, default 16; dumps under
+   `$BRO_HOME/harness-dumps`), applied to every tool result in the dispatch loop.
 6. **In-process spawn keeps child stdin open/writable** (`mod.rs:1304` closes it
    after the prompt).
 7. **`FleetOrchestrator` façade** in the lib owning `TaskStore`/tail/`store_dir`.
