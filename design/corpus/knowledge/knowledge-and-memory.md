@@ -17,6 +17,7 @@ context.
 ## Docs
 
 - [Knowledge Store](knowledge-store.md)
+- [Repo-Owned Project State](repo-owned-project-state.md)
 - [Note-backed Gap Log](note-backed-gap-log.md)
 - [Note-backed Gap Log - Implementation Plan](note-backed-gap-log-impl.md)
 - [System Memories Runtime Loading](system-memories-runtime-loading.md)
