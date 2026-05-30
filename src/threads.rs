@@ -211,6 +211,74 @@ impl ThreadStore {
     }
 }
 
+// ── Repo-owned thread records ──────────────────────────────────────
+//
+// A live thread is operational exhaust — high-churn, session/bro-bound — and
+// stays in the host-local store. But once a thread is promoted or resolved it
+// becomes a durable record of past activity that belongs with the code it
+// explains, so we snapshot a scrubbed summary into the owning repo's
+// `.bbox/record/<id>.json` (committed, travels with the checkout). Only the
+// settled record travels; the churny live state never does.
+
+/// Durable, committed snapshot of a settled thread. Deliberately omits the
+/// identity-bearing live fields (sessions, edges, origin, handoff doc) — the
+/// record is a portable summary, not a copy of host state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadRecord {
+    pub id: String,
+    pub topic: String,
+    pub status: ThreadStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ThreadKind>,
+    /// Graph entity ref this thread produced (set when promoted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub promoted_to: Option<String>,
+    /// Scrubbed investigation summary.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+    pub created_at: String,
+    pub resolved_at: String,
+}
+
+/// Replace the absolute home path with `~` so a committed record carries no
+/// host-specific path. Split out from the home lookup so it is hermetically
+/// testable without reading the real `$HOME`.
+fn scrub_host_identity_with(s: &str, home: Option<&Path>) -> String {
+    match home {
+        Some(h) if !h.as_os_str().is_empty() => s.replace(h.to_string_lossy().as_ref(), "~"),
+        _ => s.to_string(),
+    }
+}
+
+/// Snapshot a settled thread into its owning repo's `.bbox/record/`. No-op when
+/// the thread isn't project-scoped or its repo isn't present on this host.
+fn write_thread_record(thread: &Thread) -> Result<()> {
+    if thread.project.trim().is_empty() {
+        return Ok(());
+    }
+    let project_dir = Path::new(&thread.project);
+    if !project_dir.is_dir() {
+        return Ok(());
+    }
+    let dir = project_dir.join(".bbox").join("record");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    let home = dirs::home_dir();
+    let scrub = |s: &str| scrub_host_identity_with(s, home.as_deref());
+    let record = ThreadRecord {
+        id: thread.id.clone(),
+        topic: scrub(&thread.topic),
+        status: thread.status.clone(),
+        kind: thread.kind,
+        promoted_to: thread.promoted_to.clone(),
+        notes: thread.notes.iter().map(|n| scrub(n)).collect(),
+        created_at: thread.created_at.clone(),
+        resolved_at: thread.resolved_at.clone().unwrap_or_default(),
+    };
+    let path = dir.join(format!("{}.json", thread.id));
+    crate::json_store::atomic_write_json_locked(&path, &record)
+}
+
 // ── Store operations ───────────────────────────────────────────────
 
 pub struct Threads {
@@ -680,6 +748,9 @@ impl Threads {
         let thread_for_embed = thread.clone();
 
         self.save()?;
+        if let Err(e) = write_thread_record(&thread_for_embed) {
+            tracing::warn!("thread record write for {id}: {e:#}");
+        }
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(ThreadMutation {
@@ -717,6 +788,9 @@ impl Threads {
         let thread_for_embed = thread.clone();
 
         self.save()?;
+        if let Err(e) = write_thread_record(&thread_for_embed) {
+            tracing::warn!("thread record write for {id}: {e:#}");
+        }
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
         Ok(ThreadMutation {
@@ -991,6 +1065,130 @@ impl Threads {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn params(action: &str) -> ThreadParams {
+        ThreadParams {
+            action: action.into(),
+            topic: None,
+            project: None,
+            name: None,
+            id: None,
+            session_id: None,
+            provider: None,
+            session_name: None,
+            handoff_doc: None,
+            note: None,
+            target: None,
+            target_type: None,
+            edge: None,
+            promoted_to: None,
+            kind: None,
+            origin: None,
+        }
+    }
+
+    fn open_thread_id(threads: &mut Threads, topic: &str, project: &str) -> String {
+        let created = threads
+            .thread(&ThreadParams {
+                topic: Some(topic.into()),
+                project: Some(project.into()),
+                ..params("open")
+            })
+            .unwrap();
+        created.split_whitespace().nth(2).unwrap().to_string()
+    }
+
+    #[test]
+    fn resolve_writes_scrubbed_record_to_repo_bbox() {
+        let dir = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+
+        let id = open_thread_id(
+            &mut threads,
+            "audit the dispatch path",
+            &repo_root.to_string_lossy(),
+        );
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                note: Some("found the bug in resolve_provider_pool".into()),
+                ..params("resolve")
+            })
+            .unwrap();
+
+        let record_path = repo_root
+            .join(".bbox")
+            .join("record")
+            .join(format!("{id}.json"));
+        assert!(
+            record_path.exists(),
+            "settled thread should snapshot to {}",
+            record_path.display()
+        );
+        let rec: ThreadRecord =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(rec.status, ThreadStatus::Resolved);
+        assert_eq!(rec.topic, "audit the dispatch path");
+        assert!(
+            rec.notes.iter().any(|n| n.contains("resolve_provider_pool")),
+            "investigation note should be recorded: {:?}",
+            rec.notes
+        );
+    }
+
+    #[test]
+    fn promote_writes_record_with_graph_ref() {
+        let dir = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+
+        let id = open_thread_id(&mut threads, "triad convergence", &repo_root.to_string_lossy());
+        threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                promoted_to: Some("knowledge:abc12345".into()),
+                ..params("promote")
+            })
+            .unwrap();
+
+        let record_path = repo_root
+            .join(".bbox")
+            .join("record")
+            .join(format!("{id}.json"));
+        let rec: ThreadRecord =
+            serde_json::from_str(&fs::read_to_string(&record_path).unwrap()).unwrap();
+        assert_eq!(rec.status, ThreadStatus::Promoted);
+        assert_eq!(rec.promoted_to.as_deref(), Some("knowledge:abc12345"));
+    }
+
+    #[test]
+    fn thread_record_scrub_replaces_home_with_tilde() {
+        assert_eq!(
+            scrub_host_identity_with("/Users/me/repos/x said hi", Some(Path::new("/Users/me"))),
+            "~/repos/x said hi"
+        );
+        // No home to anchor on → text is left untouched.
+        assert_eq!(scrub_host_identity_with("/Users/me/x", None), "/Users/me/x");
+    }
+
+    #[test]
+    fn resolve_writes_no_record_when_repo_absent() {
+        // A thread whose owning repo isn't present on this host must not panic
+        // or create stray directories — the record simply isn't written.
+        let dir = tempdir().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        let id = open_thread_id(&mut threads, "x", "/nonexistent/repo/path");
+        threads
+            .thread(&ThreadParams {
+                id: Some(id),
+                ..params("resolve")
+            })
+            .unwrap();
+        assert!(!Path::new("/nonexistent/repo/path").exists());
+    }
 
     fn set_last_activity(store_path: &Path, thread_id: &str, last_activity: &str) {
         let raw = fs::read_to_string(store_path).unwrap();
