@@ -1,0 +1,21 @@
+{
+  "id": "e87292b0",
+  "title": "Deep docs belong in system memories",
+  "content": "In transcript-search/blackbox, deep tool and workflow documentation must stay out of always-rendered provider memory. Use scoped/deferred surfaces and code-owned system memories for role-specific or cold docs. When adding a new tool category, do not trim unrelated hot docs or raise the prompt-size budget to compensate; put the tool behind the appropriate surface/deferred memory boundary unless it is genuinely hot-path guidance.",
+  "cluster": "Render Hygiene",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-04T16:35:09Z",
+  "updated_at": "2026-05-13T20:45:51Z",
+  "recall_count": 118,
+  "last_recalled": "2026-05-29T21:16:45Z"
+}

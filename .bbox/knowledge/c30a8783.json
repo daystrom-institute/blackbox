@@ -1,0 +1,21 @@
+{
+  "id": "c30a8783",
+  "title": "Pidgin daemon terminates at typed rewrite kernel, not symbol table",
+  "content": "Sigil-ese pidgin architecture converges on a typed rewrite kernel (theorem-compressing compiler with dialect skins) — NOT a symbol table. Messages are programs. Daemon normalizes on receive. Dialect drift is per-speaker surface; deep semantics is category-theoretic and lossless. Daystrom's epistemology graph IS the theorem prover — Consideration(invariant)=axiom, Decision=conclusion, supersedes=belief-revision. Pidgin glyphs resolving to graph vertex URIs = unbounded compression via graph-walk hydration.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "supersedes": "873df97f",
+  "rationale": "Three independent frontier models (Claude/Codex/Gemini) converged on this exact architecture with different vocabularies (rewrite kernel / theory packets / combinator registry) in one ultrathink dispatch. Orthogonal convergence across model families is the strongest signal of session. Supported empirically by: E4 (blind render works — proves rosetta stone sufficient), E6 (rule-level compression emerges spontaneously in frontier models — Claude did it unprompted), E7 (frontier models can design AND critique AND cross-translate full language specs). The daystrom graph already provides axiom storage; we were building a parallel structure instead of recognizing the existing one.",
+  "source": "user",
+  "created_at": "2026-04-19T20:00:52Z",
+  "updated_at": "2026-04-19T20:34:27Z",
+  "recall_count": 0
+}

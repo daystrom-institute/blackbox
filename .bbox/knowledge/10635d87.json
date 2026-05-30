@@ -1,0 +1,20 @@
+{
+  "id": "10635d87",
+  "title": "prod-voyage-smoke-2026-05-06",
+  "content": "prod blackboxd voyage embed pipeline smoke test 2026-05-06: drop-in voyage-key.conf landed; verifying knowledge route fires",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-06T09:04:48Z",
+  "updated_at": "2026-05-06T09:04:48Z",
+  "recall_count": 16,
+  "last_recalled": "2026-05-29T20:11:03Z"
+}

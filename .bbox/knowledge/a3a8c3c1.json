@@ -1,0 +1,20 @@
+{
+  "id": "a3a8c3c1",
+  "title": "Pharo self-heal pattern: provenance + routed exception repair",
+  "content": "Self-healing loop for Pharo live images with agent-authored code:\n\n1. **Provenance on every install.** Every LTCompileMethodOp>>apply records {class, selector, patch_id, bro_id, session_id, provider, recorded_at} into LTProvenance registry. Keyed on 'Class>>#selector'. The LTPatch>>apply wraps op iteration with a class-side `current` so each op can resolve its owning patch (which carries `provenance: 'bro#N'` or 'dlg-K/turn-M/provider').\n\n2. **Hook: OupsDebuggerSystem>>#handleDebugRequest:.** This is the universal funnel for all unhandled exceptions in Pharo 12. Wrap by (a) stashing original as `originalHandleDebugRequest:`, (b) installing a new `handleDebugRequest:` that fires your healer then calls `self originalHandleDebugRequest: aDebugRequest`. Retains normal debugger; adds the parallel fix dispatch.\n\n3. **Dual-route healing.** On exception, extract diagnostic {exc_class, message, class, selector, method_source}. Look up provenance for that method:\n   - If recorded AND session_id present → `bro_resume` the ORIGINATING bro with \"your patch ... just raised this exception, here's current source, diagnose and fix\" — the agent who wrote it now sees its downstream failure with their original context + intent intact. Much richer signal than a cold-start bro.\n   - Else → anonymous bro with full cold diagnostic.\n   Both paths return an LTPatch. Same judge-packet gate for both: structural checks (has CompileMethod op, matches class+selector of failing method, non-empty source, has ^ return, has 'self').\n\n4. **Guards that matter:**\n   - Per-(class,selector) retry budget: max 3 heals per rolling hour via LTProvenance countAttempt:/budgetOk:. Stops loop-bombs.\n   - Re-entry: `busy` flag on the healer prevents concurrent heal dispatches.\n   - Package allowlist: `LargeTalk-*` + LT-prefixed classes only. Never touch Kernel/Morphic/System code via auto-heal.\n   - autoApply toggle defaults false — proposals queue in `lastProposals` for manual review. Auto-apply is the full autonomy mode for when the judge-packet is trusted.\n\n5. **Patch-target gate:** before applying a heal proposal, verify the patch's CompileMethod op targets the SAME class+selector that threw. Agents sometimes hallucinate different selectors; this rejects them cleanly.\n\nInsight that unlocks the design (credit: user): \"when an exception occurs, it needs to route one of two ways — to an anonymous bro that has no context, OR back to the bro that originated the change.\" The second path is the pedagogical one. The agent gets feedback on its own mistake with full intent preserved. Every method carries its authoring context so downstream failures can route backward along that chain.\n\nSee r-provenance-healer.st in largetalk-spike for the full installation file.\n\nTags: pharo, self-heal, provenance, exception-routing, originator-resume, bro_resume, LTExceptionHealer, LTProvenance, OupsDebuggerSystem, largetalk-spike",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-04-21T03:23:28Z",
+  "updated_at": "2026-05-14T14:51:26Z",
+  "recall_count": 113,
+  "last_recalled": "2026-05-14T14:51:17Z"
+}

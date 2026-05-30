@@ -1,0 +1,19 @@
+{
+  "id": "75f36cc7",
+  "title": "No automatic provider MCP config rewrites",
+  "content": "In blackbox, daemon startup must not rewrite provider-owned MCP configuration files. Persistent provider MCP registration may change Claude/Codex/Copilot/Gemini/Vibe configs only as the direct result of an explicit user/tool action such as `bro_mcp add`, `bro_mcp remove`, or `bro_mcp sync`; dispatch-time injection may use transient args/env without mutating those configs.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-13T18:14:10Z",
+  "updated_at": "2026-05-13T18:14:42Z",
+  "recall_count": 0
+}

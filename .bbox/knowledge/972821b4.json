@@ -1,0 +1,21 @@
+{
+  "id": "972821b4",
+  "title": "Ask Before Mutating Shared Services",
+  "content": "Before restarting, stopping, reloading, replacing, or otherwise mutating shared services or containers that active agents may depend on, first perform a read-only scope check and get explicit operator approval for the named service/container. Applies to blackbox.service, Forgejo, runners, Docker Compose stacks, and other coordination infrastructure.",
+  "cluster": "Shared Infrastructure Safety",
+  "variants": {},
+  "category": "workflow",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-13T20:22:49Z",
+  "updated_at": "2026-05-13T20:22:49Z",
+  "recall_count": 8,
+  "last_recalled": "2026-05-25T17:07:21Z"
+}

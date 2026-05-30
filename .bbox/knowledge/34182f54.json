@@ -1,0 +1,19 @@
+{
+  "id": "34182f54",
+  "title": "BLACKBOX.md lives at ~/.blackbox/, not ~/.claude-shared/; opencode wired via instructions config field",
+  "content": "**BLACKBOX.md lives at `~/.blackbox/BLACKBOX.md`, never `~/.claude-shared/`**\n\nProvider-neutral global memory file (the file `bbox_render scope=global` produces with the agentic opening sequence + tool reference + standing orders) lives under `~/.blackbox/`. The historical location `~/.claude-shared/BLACKBOX.md` is wrong: `.claude-shared` is claude-specific multi-account state, and putting a provider-neutral file there meant opencode/glm/deepseek bros never looked at it (opencode's global-file lookup is `~/.config/opencode/AGENTS.md` + `~/.claude/CLAUDE.md`, never `.claude-shared`).\n\n- Path resolver: `crate::util::blackbox_global_common_md_path` in `src/util.rs` returns `~/.blackbox/BLACKBOX.md` (env override `BLACKBOX_GLOBAL_COMMON_MD`).\n- `src/render.rs::global_common_target_path` delegates to it.\n- `migrate_legacy_defaults` in `src/util.rs` moves any leftover `~/.claude-shared/BLACKBOX.md` → new path on daemon start, leaves a back-compat symlink at the old path so existing `@imports` in user-authored memory files keep resolving.\n- OpenCode's generated config (`build_opencode_config` in `src/orchestration/brofile.rs`) lists the file in its `instructions` config field — opencode does NOT follow Claude's `@import` syntax, so the file gets merged into the system prompt with header `Instructions from: <path>`. Verified: a glm-4.5-air probe with the field set quotes \"CORE RULE: agentic opening sequence\" verbatim from BLACKBOX.md.\n\nProvider memory files (`~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`) `@import` the new path. Future renders and migrations should keep the file at this location.\n\nTags: blackbox-md, render, opencode-instructions, provider-neutral-memory, .blackbox-dir, 2026-05-06",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-06T21:01:20Z",
+  "updated_at": "2026-05-06T21:02:26Z",
+  "recall_count": 0
+}

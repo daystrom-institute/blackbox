@@ -1,0 +1,21 @@
+{
+  "id": "873df97f",
+  "title": "Rule-level compression empirically validated; pidgin daemon commits to rule-packet IR + deterministic evaluator",
+  "content": "Rule-level compression in cross-model pidgins is empirically validated and achieves ~40-50x compression with unbounded generalization. The architecture commits to: (1) rule-packets as first-class IR with signature/generators/predicates/anomalies, (2) deterministic evaluator on receiver side (NOT an LLM — trivial logic suffices for rule application), (3) semantic merge at promotion time (not text concatenation — actual theory unification with compression gain), (4) self-audit primitive that applies packet back to observed data before propagation. Daystrom's epistemology graph holds the rule-packets; Consideration(invariant) becomes a first-class rule container. LLM cost is one sender-side extraction pass; subsequent receivers are mechanical.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "supersedes": "154fd624",
+  "rationale": "Full validation chain E8 Part 1 → Part 2g + E9. Claude produced axiomatic packet (102 tok) from 115 cells; achieved 15/15 extrapolation to novel role + novel resource. Codex produced alternative encoding with different abstractions (classes vs ranks); achieved 15/15 on same extrapolation. Gemini merged both into 60-tok unified packet, discovered a semantic regularity neither source made explicit ({private,billing}:3 grouping), strictly shorter than either source. Merged packet achieved 15/15 extrapolation AND 20/20 round-trip on original matrix cells including all 5 anomalies. Self-audit verified 115/115 visible cells. Every receiver-side computation was trivial logic a 20-line deterministic evaluator can reproduce; LLMs were not needed on the receive path. Compression ratio 40-50x vs raw matrix with strictly better extrapolation than raw-data inference baseline (which got 9/10 with 1 different error). This is the strongest empirical result of the session and independently corroborates the three-way convergent architecture from the prior ultrathink dispatch (Claude rewrite-kernel, Codex theory-packet-IR, Gemini JIT-combinator-registry — all pointing at the same deterministic-evaluator-plus-rule-IR shape).",
+  "source": "user",
+  "created_at": "2026-04-19T20:34:27Z",
+  "updated_at": "2026-04-19T20:37:30Z",
+  "recall_count": 0
+}

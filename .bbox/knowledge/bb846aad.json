@@ -1,0 +1,21 @@
+{
+  "id": "bb846aad",
+  "title": "Four-surface tool guidance model",
+  "content": "Tool-surface guidance is split into four surfaces: schema is the contract and must reject invalid inputs; `#[tool(description)]` is the chooser blurb for when to call a tool; `TOOL_DOCS` / managed tool reference is doctrine and detailed operating guidance; ambient scope blocks are per-dispatch nudges and must not carry canonical tool contracts.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "These surfaces serve different consumers and lifetimes. Mixing them causes drift, silent coercion, duplicated descriptions, and overloaded prompts. Separating contract, chooser, doctrine, and ambient guidance lets the repo tighten validation without bloating tool chooser text, gives one canonical place for durable operating guidance, and keeps per-dispatch ambient context narrow.",
+  "source": "user",
+  "created_at": "2026-04-18T20:01:26Z",
+  "updated_at": "2026-04-18T20:01:26Z",
+  "recall_count": 71,
+  "last_recalled": "2026-05-29T21:16:45Z"
+}

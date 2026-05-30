@@ -1,0 +1,21 @@
+{
+  "id": "6feb32d7",
+  "title": "Refactor plan-file slot policy (RX-F1b)",
+  "content": "Plan-file slot policy: `output_path` (planner write) and `bbox_refactor_apply(plan_path=…)` (applier read) both resolve exclusively under `$BLACKBOX_STATE_DIR/refactor/plans/`. Absolute paths and slot-escaping relative paths (e.g., `../../etc/passwd`) are rejected with `error.bad_input(code=plan_path_outside_slot)`. Sibling directories `refactor/diagnostics/` and `refactor/runs/` are reserved for future phases. Implemented in `src/refactor/plan_slot.rs` (RX-F1b).",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "RX-F1b taxonomy: Locking output_path and plan_path to a daemon-owned slot prevents operators from pointing the applier at hand-crafted JSON in arbitrary filesystem locations, closes the arbitrary write surface Codex round-1/4 flagged, and keeps the planner/applier symmetric — a plan written here can be applied; plan-shaped JSON outside the slot cannot.",
+  "source": "user",
+  "created_at": "2026-05-11T05:58:01Z",
+  "updated_at": "2026-05-11T05:58:01Z",
+  "recall_count": 39,
+  "last_recalled": "2026-05-25T17:13:28Z"
+}

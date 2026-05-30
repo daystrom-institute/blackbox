@@ -1,0 +1,19 @@
+{
+  "id": "d1e528df",
+  "title": "blackbox is bin-only for release test targeting",
+  "content": "`blackbox` is currently a bin-only crate (`[[bin]] blackboxd`, `[[bin]] bro`) with no `[lib]` target, so `cargo test --release --lib` fails with `no library targets found in package `blackbox``. For the unit tests living under `#[cfg(test)]` in `src/main.rs`, use `cargo test --release --bin blackboxd` (or `cargo test --bin blackboxd`) instead.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-04-22T02:41:22Z",
+  "updated_at": "2026-04-22T02:42:07Z",
+  "recall_count": 0
+}

@@ -1,0 +1,28 @@
+{
+  "id": "99e06da4",
+  "title": "LargeTalk Pharo spike — v0 working, loop closed",
+  "content": "2026-04-20 spike validated the \"live-image harness Claude can reshape\" concept end-to-end. Location: /home/invidious/repos/largetalk-spike/.\n\nSUBSTRATE: Pharo 12 (headless), 52MB image, ZnServer on 127.0.0.1:7270. Zero classpath, zero build step, single process. bootstrap.st installs 3 classes (LargeTalkMCP/LargeTalkMCPTool/LargeTalkCore) and registers 8 tools via &lt;mcpTool: 'name' description: 'desc'&gt; class-side pragmas. start-mcp.sh boots + blocks on Semaphore.\n\nPROVEN:\n1. MCP handshake (initialize/tools/list/tools/call) over plain JSON to pharo.\n2. Pragma-based tool discovery: scan all globals' class-side methodDicts for #mcpTool:description: pragma → auto-register.\n3. Install-mid-session: via image_compile tool, sent a new greet: method with &lt;mcpTool&gt; pragma → subsequent tools/list returned 9 tools including greet → tools/call greet executed the new method. ZERO daemon restart.\n4. Hot-patch: recompiled greet: with different body → next call returned new output. Method-dict swap on live server.\n5. Introspection available: image_eval exposed full Smalltalk (10,419 classes / 138,228 methods reachable); senders_of/implementors_of give graph-level traversal for free.\n\nARTIFACTS:\n- bootstrap.st: ~320 LOC Smalltalk installing the shim (uses Smalltalk globals at: #Name dynamic lookup to sidestep parse-time undeclared-variable errors for classes being created in the same eval)\n- demo.py: end-to-end reproducer (initialize → list → install → call → patch → call)\n- README.md: full writeup + wiring instructions for ~/.claude/.claude.json\n\nNOTES AND GOTCHAS FOUND:\n- Pharo 12 Opal compiler does parse-time variable checking, so a single do-it cannot both create a class AND compile into it by literal name. Workaround: use `Smalltalk globals at: #X` lookup.\n- Temp declarations `| ... |` must be at the top of a do-it before all statements.\n- NonInteractiveTranscript lacks #lf; use `String lf` as a character argument OR `Stdio stdout`.\n- `FileStream` is gone in Pharo 12; use `Stdio stdout` / `Stdio stderr`.\n- Subclass builder emits deprecation warnings (use #package: #tag: instead of the compound); cosmetic, not blocking.\n\nNEXT MOVES (not yet done):\n- Input schemas: currently all {type:object, properties:{}}. Extend pragma: &lt;mcpTool:description:schema:&gt; with a STON literal for JSON Schema.\n- doesNotUnderstand: synthesis loop: unknown selector → LLM proposes body → rule-packet gate → compile:classified: install → retry. This is the reflexivity payoff.\n- Port rule-packet AST (Predicate/AllPred/EqPred/ApplyPred) to Smalltalk classes with double-dispatch #evaluateOn:. Audit identity vs Rust evaluator on shared witness set. Tests whether authoring packets in a live image beats JSON-over-MCP.\n- Debugger-adapter: on Error in a tool invocation, suspend process, POST event over MCP, await a proceed/fix.\n- Session management, SSE transport (both deferred — plain JSON works for Claude Code's HTTP MCP client).\n\nTags: pharo, largetalk-spike, mcp-shim, live-image-harness, hot-patch-proven, pragma-discovery, daystrom-mk2-alternative, experiment-v0-done",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": true,
+  "links": [
+    {
+      "target": "knowledge:6bdb3fb7",
+      "kind": "supersedes",
+      "note": "v0 checkpoint superseded by full substrate marathon entry. All NEXT MOVES in 99e06da4 executed and documented in 6bdb3fb7.",
+      "confidence": "heuristic"
+    }
+  ],
+  "source": "user",
+  "created_at": "2026-04-21T01:29:18Z",
+  "updated_at": "2026-05-14T14:51:26Z",
+  "recall_count": 173,
+  "last_recalled": "2026-05-14T14:51:17Z"
+}

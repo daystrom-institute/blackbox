@@ -1,0 +1,21 @@
+{
+  "id": "faaa71ac",
+  "title": "RX-S1/S2a/S2b: state-extract trio implemented",
+  "content": "Three Rust refactor plan kinds are implemented and tested: `move_rust_struct_fields` (RX-S1, src/refactor/rust_move_fields.rs), `add_rust_delegate_field` (RX-S2a, src/refactor/rust_delegate_field.rs), and `update_rust_callers` (RX-S2b, src/refactor/rust_update_callers.rs). `rust_deep::is_copy_whitelist` is now `pub(crate)` for cross-module reuse. All three are unregistered with the PlanKind dispatcher (TODO stubs left); dispatcher wiring is a follow-up. Full suite passes (1285 tests).",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "RX-S1/S2a/S2b: state-extract trio + conservative caller rewrite consuming rust_deep Copy whitelist. S2b overlap detection guarantees non-overlapping FileEdit sets by treating entire call_expression byte ranges as outer rewrite units, pushing nested inner sites to overlapping_rewrite_sites. borrow_promotions are detected syntactically via &self receiver inspection (not type-level, which is a v1 limitation requiring post-apply cargo check).",
+  "source": "user",
+  "created_at": "2026-05-11T18:48:30Z",
+  "updated_at": "2026-05-11T18:48:30Z",
+  "recall_count": 20,
+  "last_recalled": "2026-05-29T20:11:03Z"
+}

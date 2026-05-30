@@ -1,0 +1,21 @@
+{
+  "id": "737ea886",
+  "title": "Do not expose mercury-edit-2",
+  "content": "For the Inception provider catalog in blackbox, expose `inception/mercury-2` as the tool-capable model and do not make `inception/mercury-edit-2` available. Manual OpenCode smoke showed `mercury-2` can execute MCP tools, while `mercury-edit-2` rejects OpenAI-style tool schemas.",
+  "cluster": "Provider Catalog",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-03T19:13:48Z",
+  "updated_at": "2026-05-03T19:13:48Z",
+  "recall_count": 58,
+  "last_recalled": "2026-05-29T15:02:33Z"
+}

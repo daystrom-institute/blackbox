@@ -1,0 +1,21 @@
+{
+  "id": "fdf7f59d",
+  "title": "Prod and dev services use distinct installed daemon paths",
+  "content": "`blackbox.service` and `blackbox-dev.service` must use different installed daemon binary paths. Prod runs `~/.local/bin/blackboxd`; dev runs `~/.local/bin/blackboxd-dev`. Both installed names may come from the same release build artifact, but the installed paths stay distinct so dev binary swaps and restarts do not mutate the prod service executable in place.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "rationale": "Using one shared installed path for both services defeats the point of an isolated dev daemon: every dev deploy implicitly changes prod's executable target. Separate installed names preserve service isolation while keeping the build process simple.",
+  "source": "user",
+  "created_at": "2026-04-20T19:17:20Z",
+  "updated_at": "2026-04-20T19:17:20Z",
+  "recall_count": 43,
+  "last_recalled": "2026-05-28T23:37:18Z"
+}

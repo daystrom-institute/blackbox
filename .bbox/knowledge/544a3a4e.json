@@ -1,0 +1,20 @@
+{
+  "id": "544a3a4e",
+  "title": "OpenAI gpt-5 family catalog conventions: (1) gpt-5.4 and lat...",
+  "content": "OpenAI gpt-5 family catalog conventions: (1) gpt-5.4 and later subsume the `-codex` suffix — there is no gpt-5.4-codex or gpt-5.5-codex; the flagship model is codex-optimized by default. Earlier generations (5.1, 5.2, 5.3) still have distinct `-codex` variants. (2) xhigh reasoning effort is supported on gpt-5.4, gpt-5.5, gpt-5.1-codex-max, and gpt-5.2-codex — not restricted to the codex-suffixed models. (3) The `codex exec -m <id>` error `\"<id> is not supported when using Codex with a ChatGPT account\"` is NOT proof that the model exists — OpenAI returns this for arbitrary unknown IDs when auth is ChatGPT-plan, so it cannot be used as existence verification. Confirmed 2026-04-23 during CODEX_MODELS update for gpt-5.5.</content>\n<parameter name=\"title\">gpt-5 family naming: codex subsumption + xhigh eligibility",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "source": "user",
+  "created_at": "2026-04-23T19:41:54Z",
+  "updated_at": "2026-04-23T19:41:54Z",
+  "recall_count": 48,
+  "last_recalled": "2026-05-28T23:37:37Z"
+}

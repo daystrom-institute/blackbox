@@ -1,0 +1,21 @@
+{
+  "id": "7b905420",
+  "title": "GLM provider is Claude-compatible alias",
+  "content": "The `glm` bro provider is Claude-compatible, not a separate protocol surface. It uses the Claude CLI transport and Claude model/effort surface, with a Z.AI-backed Claude config root (`.claude-zai`) selected via `CLAUDE_CONFIG_DIR`.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "supersedes": "e631f6d4",
+  "rationale": "Z.AI documents their Claude tool as a Claude Code setup with backend model mapping via Anthropic-compatible env/settings. Exposing a fake GLM-native CLI surface in bro orchestration would diverge from the harness users actually run. Keeping the surface Claude-shaped preserves working argv, session, MCP, and filter behavior while allowing Z.AI account routing behind the scenes.",
+  "source": "user",
+  "created_at": "2026-04-20T19:05:59Z",
+  "updated_at": "2026-04-20T19:12:12Z",
+  "recall_count": 0
+}

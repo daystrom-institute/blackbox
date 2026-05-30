@@ -1,0 +1,21 @@
+{
+  "id": "154fd624",
+  "title": "Blackbox gains rule-packet primitive — compressive compilation without typed-graph weight",
+  "content": "Blackbox (transcript-search) gains a new primitive: rule-packets as a first-class memory entity. Schema: {signature, generators, predicates, anomalies, flags, witness_examples, version, supersedes}. Storage alongside remember/learn/decide, with its own verb (proposed: bbox_packet or bbox_theory). Render pipeline extended to emit: (a) prose for humans, (b) sigil-ese/JSON for agents, (c) structured AST for a deterministic evaluator. The evaluator is a Rust module in transcript-search (not an LLM) — applies rules mechanically, returns predictions + fired-rule-citations + counter-terms on failed reduction. Self-audit primitive: bbox_packet_verify(packet, dataset) returns fidelity report. Merge primitive: bbox_packet_merge(A, B) produces unified packet with MDL compression check. Rule-packets compose via graph-walk: one packet's signature can reference another packet's predicates (layered theories).",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Empirical validation from E8 + E9 + E10 shows rule-packets produce 40-50x compression with unbounded generalization, merge cleanly across two independent encodings with compression gain (not loss), self-audit faithfully (115/115 on merged packet), and can self-flag corruption/noise when asked. This adds daystrom-graph-like semantic capability to blackbox WITHOUT adopting the typed-graph complexity. Blackbox stays \"daystrom lite\" while gaining the key architectural primitive (compressive compilation of observations into portable theories). The evaluator being a Rust module (not an LLM) is crucial — it's what makes this a cheap, deterministic infrastructure piece rather than an expensive LLM-in-the-loop. LLM cost is one-time rule-extraction; arbitrary downstream consumers apply the packet mechanically.",
+  "source": "user",
+  "created_at": "2026-04-19T20:37:30Z",
+  "updated_at": "2026-04-19T20:37:30Z",
+  "recall_count": 177,
+  "last_recalled": "2026-05-28T23:37:16Z"
+}

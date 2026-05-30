@@ -1,0 +1,20 @@
+{
+  "id": "576d4292",
+  "title": "IRC LAN service binds to 192.168.0.251",
+  "content": "For the planned LAN IRC bridge/couch-steering support in transcript-search, the LAN-facing IRC server must bind explicitly on 192.168.0.251, e.g. Docker port mapping `192.168.0.251:6667:6667`. The `bro-irc` bridge can still talk to blackboxd on localhost; the IRC service is the LAN-exposed surface.",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "source": "user",
+  "created_at": "2026-05-05T01:35:27Z",
+  "updated_at": "2026-05-05T01:35:27Z",
+  "recall_count": 39,
+  "last_recalled": "2026-05-29T15:02:33Z"
+}

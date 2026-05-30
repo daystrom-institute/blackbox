@@ -1,0 +1,20 @@
+{
+  "id": "101040d8",
+  "title": "IRC bridge bro output should be plain text",
+  "content": "For the planned LAN IRC bridge/couch-steering surface in transcript-search, IRC-directed bro prompts should use a dedicated per-turn block similar to council prompting but stricter: replies must be plain chat text, not Markdown. The prompt should explicitly ban headings, bullets, tables, fenced code blocks, Markdown links, blockquotes, and decorative formatting unless the user explicitly asks for code or a patch; keep output short enough for IRC readability.",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "source": "user",
+  "created_at": "2026-05-05T01:31:36Z",
+  "updated_at": "2026-05-05T01:31:36Z",
+  "recall_count": 44,
+  "last_recalled": "2026-05-29T15:02:33Z"
+}

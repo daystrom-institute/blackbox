@@ -1,0 +1,20 @@
+{
+  "id": "f18a2eda",
+  "title": "IRC bridge should use silence, not a no-op sentinel",
+  "content": "For the planned LAN IRC bridge/couch-steering surface in transcript-search, do not copy council's explicit `pass` sentinel into the IRC-facing prompt. Council needs a no-op token because queued fanout envelopes must resolve cleanly; IRC should preserve chat ergonomics. Prompt IRC-directed bros to answer only when useful, and have the bridge suppress empty/low-signal/no-op outputs rather than asking the bro to emit a visible sentinel.",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "source": "user",
+  "created_at": "2026-05-05T01:33:19Z",
+  "updated_at": "2026-05-05T01:33:19Z",
+  "recall_count": 39,
+  "last_recalled": "2026-05-29T15:02:33Z"
+}

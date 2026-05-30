@@ -1,0 +1,21 @@
+{
+  "id": "7b580244",
+  "title": "RX-F2b: continue_for_repair + obligation tracking + first_live_soft_fail_cursor rollback",
+  "content": "RefactorRunStep::Command now has `on_failure: Option<OnFailure>` with three variants: Required (default), Optional, ContinueForRepair. The new ContinueForRepair mode opens a repair Obligation on exit-code != 0 and continues the run. Each Obligation tracks ref_name, opened_at_step_idx, captured_count, and status (Open/Consumed/LeftOver). The first_live_soft_fail_cursor records the snapshot-list index at the START of the first soft-fail step; rollback on non-terminal-success restores all snapshots from that cursor onward. Consumed and LeftOver obligations remain live rollback anchors until terminal success — only reaching the end of the run without any subsequent failure releases them. `mark_obligation_consumed(ref_name, leftover_count)` is the hook for repair plan kinds (RX-C1) to call. ObligationReport is included in RefactorRunResponse. Test stubs `test_consume_obligation` and `test_leftover_obligation` are `#[cfg(test)]`-only plan kinds in the run loop.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "RX-F2b phase: extends the runner with repair-transaction semantics needed for the rust_compile_fix_round loop (RX-C1). ContinueForRepair prevents a soft-failed cargo check from becoming a quieter required=false — the run must commit successfully or roll back everything from the first soft-fail point forward.",
+  "source": "user",
+  "created_at": "2026-05-11T06:27:33Z",
+  "updated_at": "2026-05-11T06:27:33Z",
+  "recall_count": 42,
+  "last_recalled": "2026-05-29T20:11:03Z"
+}

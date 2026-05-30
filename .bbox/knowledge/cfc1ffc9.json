@@ -1,0 +1,20 @@
+{
+  "id": "cfc1ffc9",
+  "title": "Future agent instructions belong in PROJECT.md",
+  "content": "When leaving instructions for future agents in this repository, put the repo-operational guidance in PROJECT.md rather than only in ad hoc chat text or side documents. Detailed checklists may live in separate docs, but PROJECT.md should carry the concise rule and pointer.",
+  "cluster": "Project Documentation",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-14T22:30:02Z",
+  "updated_at": "2026-05-14T22:34:18Z",
+  "recall_count": 0
+}

@@ -1,0 +1,28 @@
+{
+  "id": "977cc3a3",
+  "title": "LargeTalk ↔ Pharo live-image spike path",
+  "content": "Cross-reference: the LargeTalk research agenda (daystrom-mk2/design/largetalk-research-agenda.md) can be EXPERIMENTALLY validated without building the Roslyn/ArcadeDB stack by riding an existing live-image substrate. Pharo/Squeak already ships every primitive LargeTalk WS-1..WS-4 proposes to build: SystemNavigation senders/implementors = the typed semantic graph edges; Behavior>>compile:classified: = the synthesizer; the compiler round-trip = the absorber; ClassBuilder hooks + method wrappers + announcements = gates.\n\nSister project that unlocks reflexivity: LinqLover/Squeak-SemanticText — ships `String>>#semanticAnswer`, `#semanticAsk:`, and `SemanticSqueakAgent>>#eval:` as live image extensions. LLM becomes callable as a primitive on any object; image can call LLM from method body; LLM can eval back into image. Fully bidirectional.\n\nProposed experiment path (discussed 2026-04-20 session):\n1. Headless Pharo 12 + ZnServer + MCP-over-HTTP shim (~400 LOC Smalltalk). Scan <mcpTool> pragma'd methods → tools/list. Expose #imageCompile:classified: / #imageEval: / #sendersOf: / #implementorsOf:. Wire debugger-adapter so on-error suspends, POSTs over MCP, awaits proceed.\n2. Port the rule-packet AST (Predicate/AllPred/EqPred/ApplyPred) to Smalltalk classes using double-dispatch for #evaluateOn:. Audit identity vs the Rust evaluator on a shared witness set.\n3. `doesNotUnderstand:` synthesis loop — unknown selector → LLM proposes body → rule-packet gate reviews → compile:classified: installs → retry. Measure whether method count converges (image settles) vs. spirals.\n\nSubstrate comparison matrix (for the Claude-reshapeable-harness need): Pharo wins on live method redef + image snapshot + LLM-in-image + doesNotUnderstand + debugger proceed + zero classpath pain. SBCL is technical equal on metaprogramming but no SemanticText equivalent. Clojure/JVM has ClassLoader friction. BEAM: module-level granularity only. Julia/Racket/Python: missing snapshot and/or reflexivity.\n\nWhy this matters for Daystrom: if the LargeTalk hypothesis holds in Pharo (token cost down, correction iterations down, methods converge rather than spiral), the C#/Roslyn path becomes \"port what Pharo taught us\" rather than \"build from scratch and hope.\" If it fails to converge in Pharo, we learn which invariants the Roslyn version needs from day one.\n\nTags: live-image, pharo, smalltalk, squeak, largetalk, reflexivity, harness, semantic-text, linqlover, doesNotUnderstand, rule-packets, daystrom-mk2, experiment-path, ultrathink-session-2026-04-20",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": true,
+  "links": [
+    {
+      "target": "knowledge:99e06da4",
+      "kind": "supersedes",
+      "note": "Pre-spike planning doc superseded by v0 completion milestone. Research agenda validation → working implementation.",
+      "confidence": "heuristic"
+    }
+  ],
+  "source": "user",
+  "created_at": "2026-04-21T01:12:03Z",
+  "updated_at": "2026-05-14T14:51:26Z",
+  "recall_count": 136,
+  "last_recalled": "2026-05-14T14:51:17Z"
+}

@@ -1,0 +1,22 @@
+{
+  "id": "e631f6d4",
+  "title": "GLM provider uses actual GLM catalog with Claude env remap",
+  "content": "The `glm` bro provider remains Claude-compatible at the CLI/protocol level, but its exposed brofile model catalog is the real GLM model set. Dispatch maps GLM model selection behind the scenes by setting `CLAUDE_CONFIG_DIR` to the Z.AI Claude config root and overriding `ANTHROPIC_DEFAULT_HAIKU_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, and `ANTHROPIC_DEFAULT_OPUS_MODEL` to the selected GLM model; when no brofile model is set, the provider default mapping is Haiku -> `glm-4.5-air`, Sonnet -> `glm-5-turbo`, Opus -> `glm-5.1`.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "supersedes": "2e1de541",
+  "rationale": "The Z.AI Claude tool is still the Claude CLI and expects Claude-shaped transport/model selection, but users want to reason about actual GLM backends and costs in brofiles. Exposing the real GLM catalog while remapping through Anthropic default-model env vars preserves the working Claude harness and gives truthful model selection at the orchestration layer.",
+  "source": "user",
+  "created_at": "2026-04-20T19:12:12Z",
+  "updated_at": "2026-04-20T20:05:37Z",
+  "recall_count": 5,
+  "last_recalled": "2026-04-20T20:04:27Z"
+}

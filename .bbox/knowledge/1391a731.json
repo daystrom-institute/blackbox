@@ -1,0 +1,21 @@
+{
+  "id": "1391a731",
+  "title": "Distinct Forgejo Identities For Agent Audit Trail",
+  "content": "For Forgejo-backed coordination, implementers and reviewers must use distinct external identities for auditability. Identity mappings should key at least by coordination instance, bro/role identity, provider, and model; per-dispatch metadata such as effort belongs on system events, audit comments, and performance records rather than multiplying durable external users.",
+  "cluster": "Forgejo Coordination Identity",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-13T20:31:59Z",
+  "updated_at": "2026-05-13T20:31:59Z",
+  "recall_count": 36,
+  "last_recalled": "2026-05-28T23:43:16Z"
+}

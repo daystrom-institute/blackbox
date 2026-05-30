@@ -1,0 +1,21 @@
+{
+  "id": "7ee3f895",
+  "title": "Rule-packet system validated: gap-to-primitive-to-adoption loop closes end-to-end",
+  "content": "Rule-packet primitives (bbox_compile/apply/audit + the phase-5 Apply composition + phase-6 StringContains/InRange/CountMatches + bbox_packet_gap + bbox_packet_events) are validated as a cross-provider inter-agent protocol for structured decision procedures. Scope: classification/ranking/triage/audit over entities with stated criteria. Anchor commits: 5548865 (phase 5 composition), 8bf522f (event log + gap tool), dd379a0 (discovery-layer fixes + ambient hints), 1a8e040 (CountMatches), 62d4c65 (prefix-inference error), f53cbdf (runbook prominence).\n\nValidation chain (E10–E16, ~5hr arc):\n- E10: 4/5 solo scenarios full adoption on Claude; S11 silent-bypass diagnosed as schema-not-loaded + recall-skipped\n- E11: TASK_SHAPE_HINT ambient + StringContains/InRange primitives landed; S11 re-run clean\n- E12: cross-provider S11 transfer clean on claude+codex+gemini; three refinements landed (predicate reference appendix, calibration comment, permissive JSON)\n- E13: Gemini cross-scenario on S3/S4/S5/S9 — 4/4 clean; Gemini shows weakest priors, reads error messages as documentation, has \"reuse not naming\" decomposition heuristic\n- E14: composition-depth stress test; all 3 providers decomposed spontaneously; Codex filed the first conceptual-limit gap post-refinement\n- E15: CountMatches promoted, prefix-inference error enriched, runbook raised\n- E16: validation sweep — 3/3 adopted CountMatches via runbook's paste-ready JSON snippet, zero prior-memory retrieval, rule count 7→3\n\nKey empirical findings:\n1. Ambient hint is the load-bearing discovery lever for pre-plan primitive awareness. Deferred-tool loading on Claude Code means agents form plans before ToolSearching; ambient text is the only pre-plan nudge.\n2. Provider efficacy varies — Claude reads hint as \"nudge\", Codex as \"maybe tip fuzzier tasks\", Gemini as \"mandatory\". Calibration is at the Claude-tolerance / Gemini-compliance joint.\n3. Paste-ready JSON in the runbook outperforms prose description. Three providers found CountMatches via the canonical snippet; none via prose.\n4. Compile-time error messages are underappreciated documentation — Gemini explicitly cites them as \"more immediate documentation layer than the appendix\".\n5. The gap-log → primitive-addition → natural-adoption cycle closed in ~4 hours with one Codex gap-log as the only signal. Empirically validated end-to-end.\n\nNot validated yet (reserved for future rounds): cross-session packet discovery (agents reusing prior packets, not just authoring fresh), mixed-provider orchestrator with shared packet_id, dogfooded packet use in real daystrom workflows (review-agents, compliance, risk surface). These are the open research directions — see thread opened post-this-decision.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "After five hours of iteration across 6 empirical rounds (E10-E16) with three MCP providers (claude/codex/gemini), the rule-packet primitive stack is validated as a working inter-agent protocol for structured decision procedures. Every significant adoption barrier identified was addressed via targeted intervention (ambient hints, documentation placement, new primitives, error-message enrichment, permissive JSON). The final round (E16) showed the gap→primitive→adoption loop closing cleanly: one gap-log drove a new primitive (CountMatches) that three providers discovered naturally on first attempt via the runbook's paste-ready JSON snippet, with 7-rule enumerated tallies collapsing to 3-rule CountMatches expressions. This commitment establishes the baseline — future work extends from here rather than revisits foundations.",
+  "source": "user",
+  "created_at": "2026-04-20T03:05:17Z",
+  "updated_at": "2026-04-20T03:05:17Z",
+  "recall_count": 245,
+  "last_recalled": "2026-05-29T21:16:45Z"
+}

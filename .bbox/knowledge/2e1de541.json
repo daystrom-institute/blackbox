@@ -1,0 +1,21 @@
+{
+  "id": "2e1de541",
+  "title": "Use OpenCode for Z.AI/GLM",
+  "content": "Use a native OpenCode provider for Z.AI/GLM routing and retire the Claude-backed fake glm provider path.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Direct OpenCode execution honors exact Z.AI Coding Plan model selection including zai-coding-plan/glm-5.1, while the Claude-compatible shim collapsed model selection to glm-5-turbo despite explicit overrides. Provider semantics should reflect the actual execution harness instead of pretending GLM is a standalone Claude provider.",
+  "source": "user",
+  "created_at": "2026-04-20T20:05:37Z",
+  "updated_at": "2026-04-20T20:05:37Z",
+  "recall_count": 26,
+  "last_recalled": "2026-05-28T23:43:16Z"
+}

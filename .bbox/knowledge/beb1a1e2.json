@@ -1,0 +1,21 @@
+{
+  "id": "beb1a1e2",
+  "title": "RX-F2a: capture=rustc_json plumbing in RefactorRunStep::Command",
+  "content": "RefactorRunStep::Command has an optional `capture: Option<CaptureSpec>` field. When `CaptureSpec::RustcJson`, the runner captures stdout of the command, parses it as line-delimited cargo `--message-format=json`, filters to `reason=compiler-message` entries, and surfaces a `CapturedDiagnosticsSummary` (count + severity_counts HashMap) on the step report. Non-JSON lines are silently skipped. RunCaptureContext stashes parsed diagnostics keyed by `\"last\"` for potential future use. No transaction semantics are changed.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "supersedes": "7b580244",
+  "rationale": "RX-F2a phase of the refactor expansion: enables agents to run `cargo build --message-format=json` as a validation step and receive structured diagnostic counts without parsing raw cargo output themselves.",
+  "source": "user",
+  "created_at": "2026-05-11T06:11:41Z",
+  "updated_at": "2026-05-11T06:27:33Z",
+  "recall_count": 0
+}

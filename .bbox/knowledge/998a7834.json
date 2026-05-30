@@ -1,0 +1,20 @@
+{
+  "id": "998a7834",
+  "title": "RX-V1: operator-authority opt-out invariant for refactor flags",
+  "content": "Operator-authority flags on Rust refactor plan kinds — `acknowledge_repr` (move_rust_struct_fields, RX-S1) and `acknowledge_public_api_change` (rewrite_rust_error_type RX-E1 and other public-surface kinds) — are operator authority, not agent discretion. Atomic agents from design/refactor-agents.md MAY pass these flags through from operator-supplied inputs but MUST NOT default them, MUST NOT infer them from context (\"delta looks small\" is not a reason), and MUST NOT set them silently after seeing a refusal. An atom that sets these flags on the operator's behalf is no longer atomic — it is a general executor with discretion. Plan responses carry an `operator_opt_outs_used` audit field listing flags actually consumed; this field lives on the durable RefactorPlan (not just the summary) so saved plans preserve the audit trail.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-11T05:14:03Z",
+  "updated_at": "2026-05-11T05:14:03Z",
+  "recall_count": 65,
+  "last_recalled": "2026-05-29T13:56:38Z"
+}

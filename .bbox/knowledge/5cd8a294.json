@@ -1,0 +1,20 @@
+{
+  "id": "5cd8a294",
+  "title": "RX-V2: bbox_refactor_run cargo-only command allowlist for atom dispatches",
+  "content": "For `bbox_refactor_run` invocations dispatched from atomic refactor agents (design/refactor-agents.md), command steps are restricted to a narrow cargo allowlist: `cargo check` (any args, including --message-format=json and feature flags), `cargo test` (any args), `cargo clippy` (any args), `cargo fmt` only when `touches` is explicitly declared, `cargo build` (allowed but typically wasteful). Any other command in an atom-dispatched run is a prompt-discipline violation; the atom should refuse to compose it. v1 enforcement is via atom prompt templates + brofile Bash/Write/Edit denial. v2 path: runner inspects `dispatch_origin` flag (set by bro_agent_dispatch) and enforces server-side. Mutating commands not in the allowlist must declare `touches` so the runner can snapshot/rollback; an atom-dispatched run with an undeclared-touches mutating command is unsupported.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-11T05:14:03Z",
+  "updated_at": "2026-05-11T05:14:03Z",
+  "recall_count": 66,
+  "last_recalled": "2026-05-29T20:11:03Z"
+}

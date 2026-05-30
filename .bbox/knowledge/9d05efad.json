@@ -1,0 +1,21 @@
+{
+  "id": "9d05efad",
+  "title": "Bro account dimension synthesizes provider env",
+  "content": "Brofile `account` names are a cross-provider dimension. Dispatch resolves provider-specific environment defaults from the brofile account name (Claude -> `CLAUDE_CONFIG_DIR`, Codex -> `CODEX_HOME`, Copilot -> `GH_CONFIG_DIR`) and then merges explicit account config overrides on top.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "The prior behavior stored an `account` field on brofiles but only worked when a separate raw env override existed in bro config. That made account selection invisible and inconsistent across providers. Synthesizing provider defaults from the account name makes brofile account selection first-class while preserving explicit overrides.",
+  "source": "user",
+  "created_at": "2026-04-20T19:05:59Z",
+  "updated_at": "2026-04-20T19:05:59Z",
+  "recall_count": 90,
+  "last_recalled": "2026-05-28T23:43:16Z"
+}

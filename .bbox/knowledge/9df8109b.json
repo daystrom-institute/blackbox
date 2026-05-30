@@ -1,0 +1,20 @@
+{
+  "id": "9df8109b",
+  "title": "RX-V3: RA-backed Rust refactor plan kinds fail closed on rust-analyzer unavailability",
+  "content": "The rust-analyzer-backed plan kinds `rust_lsp_rename`, `rust_organize_imports`, `rust_ra_move_item_to_module` (RX-R1), and `rust_ra_classify_callbacks` (RX-R2) require an active LspSessionManager. When rust-analyzer is unavailable (binary missing, init timeout, crashed mid-run), these plan kinds MUST fail closed with `error.lsp_unavailable` and the underlying cause. They MUST NOT silently downgrade to a syntax_only / indexed_hints approximation, because callers chose the LSP-backed kind specifically for semantic_status=lsp_verified. This is intentional asymmetry vs the Java side's documented tree-sitter fallback for rust_organize_imports — the Rust LSP-backed kinds in design/refactor-rust-expansion.md treat fallback as a silent semantic downgrade and refuse it.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-11T05:14:03Z",
+  "updated_at": "2026-05-11T05:14:03Z",
+  "recall_count": 52,
+  "last_recalled": "2026-05-28T23:37:16Z"
+}

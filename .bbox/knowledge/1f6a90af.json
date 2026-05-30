@@ -1,0 +1,21 @@
+{
+  "id": "1f6a90af",
+  "title": "RX-A2: FIXME marker grammar + blocked-plan apply refusal",
+  "content": "RX-A2 FIXME marker grammar and blocked-plan apply refusal are implemented. PlanStatus enum (Planned/Applied/Blocked/Errored), FixmeCount struct (plan_only/warning), and new_text: Option<String> on FileEdit are the canonical substrate. generate_fixme_markers(da: &DeepAnalysis) -> (String, usize) in rust_deep.rs emits one // FIXME(refactor-plan-only): <category> `<name>` — <desc>. resolutions: <hints>. line per finding (captured_self_field, unresolved_callback, captured_lifetime, inherited_generic). When deep_analysis finds ≥ 1 blocking finding, plan_status=Blocked, fixme_count.plan_only=N, and the target FileEdit.new_text holds the marker-prefixed preview. apply() refuses Blocked plans with a plan_blocked error before touching any file.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "RX-A2 task 49e4f125 completed. This decision supersedes c4f7f64c (RX-A1 substrate). The two-prefix FIXME grammar (refactor-plan-only for plan-only markers, refactor-warning reserved for RX-W1) is now frozen. Markers never reach disk — they live only in new_text preview on Blocked plans. Full suite at 1234/1234.",
+  "source": "user",
+  "created_at": "2026-05-11T07:48:42Z",
+  "updated_at": "2026-05-11T07:48:42Z",
+  "recall_count": 43,
+  "last_recalled": "2026-05-28T06:19:01Z"
+}

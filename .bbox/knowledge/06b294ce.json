@@ -1,0 +1,20 @@
+{
+  "id": "06b294ce",
+  "title": "Thread system wants graph edges",
+  "content": "Observation: blackbox threads are encoding relationships to other threads via prose in notes (e.g. \"spawned rlhf-countermeasures thread (thread-130aaf11)\" in bbox-cleanup's notes, \"Origin: bbox-cleanup thread (thread-597b1862)\" in rlhf-countermeasures notes). This is ad-hoc edge encoding that wants to be a proper graph relationship. Threads should support typed edges (spawned_from, promoted_to, related_to, blocked_by) as first-class data rather than relying on prose cross-references that only humans/LLMs can parse.",
+  "variants": {},
+  "category": "workflow",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "source": "user",
+  "created_at": "2026-04-15T07:37:35Z",
+  "updated_at": "2026-04-15T07:37:35Z",
+  "recall_count": 72,
+  "last_recalled": "2026-05-18T00:09:33Z"
+}

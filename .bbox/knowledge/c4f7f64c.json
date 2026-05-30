@@ -1,0 +1,21 @@
+{
+  "id": "c4f7f64c",
+  "title": "tree-sitter-rust 0.24.x: method calls are call_expression, not method_call_expression",
+  "content": "In tree-sitter-rust 0.24+, `method_call_expression` does not exist. All calls — both `obj.method()` and `Ty::assoc()` — are `call_expression(function=..., arguments=...)`. For `self.method()`, function is `field_expression(value=self, field=method_name)`. For `Self::method()`, function is `scoped_identifier`. Type-parameter children in `type_parameters` are `lifetime_parameter` (with `name` field returning the `lifetime` node) and `type_parameter` (with `name` and `bounds` fields), NOT the older `lifetime`/`type_identifier`/`constrained_type_parameter` kinds. Walk `self.FIELD.method()` by checking `call_expression → function(field_expression) → value(field_expression)` to detect the field being called on.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "supersedes": "1f6a90af",
+  "rationale": "Discovered while implementing RX-A1b/c/d deep analysis: all three test failures (interior_mutation_call, self.method callback detection, lifetime capture) traced to these grammar differences in tree-sitter-rust 0.24.2 vs earlier versions. Future sessions implementing tree-sitter Rust walkers must use call_expression with field_expression function detection instead of method_call_expression.",
+  "source": "user",
+  "created_at": "2026-05-11T07:18:35Z",
+  "updated_at": "2026-05-11T07:48:42Z",
+  "recall_count": 0
+}

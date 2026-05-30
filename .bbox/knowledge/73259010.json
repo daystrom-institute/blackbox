@@ -1,0 +1,20 @@
+{
+  "id": "73259010",
+  "title": "Sigil-ese pidgin: architecture and early probe",
+  "content": "Sigil-ese pidgin design principles developed 2026-04-19 in main session.\n\nLAYERED LEXICON MODEL (scope chain, innermost-wins):\n- Global layer: ~30 structural glyphs (⊢⊨∵∴⟦!⟧⟦?⟧¬≈↔Δ†Σ etc), semver'd, rarely changes\n- Project layer: repo-specific nouns in `.bro/lexicon.json`, versioned\n- Session layer: LLM-coined shorthand in turn-0 preamble for this specific dispatch\n- Emergent layer: mid-turn [+] X := meaning blocks, merged by daemon, subsequent turns inherit\n\nRENDER LAYERS (lossless to lossy):\n- Mechanical: deterministic glyph substitution (evidentiary)\n- LLM-assisted: rosetta stone + substitution + context → prose (interpretive)\n- LLM-interpretive: bare pidgin + rosetta → best-fit prose (emergent-safe)\n\nAUDIT SEMANTICS: transcript pins lexicon versions at write time; replay deterministic; mechanical trace is evidence, LLM render is interpretation.\n\nPROMOTION PIPELINE: emergent → session → project → global (same shape as bbox_remember → bbox_learn → bbox_decide, crystallizing over time).\n\nEARLY PROBE (2 rounds, Claude + Codex, ad-hoc):\n- Both complied with sigil-ese protocol\n- Converged on sandbox-plus-promotion-gate pattern (σ vs μ are the same concept)\n- Cross-provider glyph propagation worked: Codex adopted Claude's ρ in R2\n- Honest token accounting: cost MORE than NL in 2-turn experiment (~1291 vs ~860); amortization needs ~5-6 turns to break even at current legend cost\n- Actual architectural wins (separated): (1) long-tail transmission amortization, (2) density-per-wire-token is BORROWED from shared legend (not independent), (3) structural parseability is unconditional win\n\nKEY ACKNOWLEDGMENT: \"density comes with lexical expansion\" — compression is Shannon, requires a shared codebook, codebook must be paid for somewhere. Sigil-ese moves cost from transmission to infrastructure.",
+  "variants": {},
+  "category": "memory",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-04-19T19:38:09Z",
+  "updated_at": "2026-04-19T19:38:09Z",
+  "recall_count": 134,
+  "last_recalled": "2026-05-29T15:02:33Z"
+}

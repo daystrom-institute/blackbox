@@ -1,0 +1,21 @@
+{
+  "id": "f1fe0045",
+  "title": "work namespace restricted to atom workflow internals",
+  "content": "In transcript-search, `work_*` MCP tools are reserved for restricted agents operating inside atoms/workflows. Only add tools under `work_*` when the operator explicitly asks for an atom/workflow-internal surface; general MCP tool families should use `bbox_*` or a dedicated prefix cluster such as `macro_*` when large enough.",
+  "cluster": "MCP namespaces",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "superseded",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "supersedes": "5fa26d26",
+  "source": "user",
+  "created_at": "2026-05-25T14:56:36Z",
+  "updated_at": "2026-05-25T15:00:44Z",
+  "recall_count": 0
+}

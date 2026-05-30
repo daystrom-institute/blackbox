@@ -1,0 +1,19 @@
+{
+  "id": "95d6fc7b",
+  "title": "Reach for corpus-pathfinder subagent for codebase exploration",
+  "content": "For any exploration of this codebase — questions about where something is defined, what a module does, why a decision exists, who/when last changed a line, tracing a chain across files, or assessing impact of a change — dispatch the project-local `corpus-pathfinder` subagent (`.claude/agents/corpus-pathfinder.md`) instead of grepping the filesystem directly. It runs the agentic grounding loop (describe_schema → hybrid_search → inspect_entity → find_paths → bundle_evidence) against bbox's self-indexed graph and returns evidence-cited findings. Read-only by construction; never edits or mutates. Skip it for one-off code edits, single-file lookups by exact path, or when bbox MCP is unavailable.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "deleted",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-10T18:05:58Z",
+  "updated_at": "2026-05-10T18:10:29Z",
+  "recall_count": 0
+}
