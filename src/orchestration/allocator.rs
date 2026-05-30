@@ -1485,6 +1485,32 @@ pub fn provider_candidates_for_request(
 mod tests {
     use super::*;
 
+    struct EnvRestore {
+        prior: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvRestore {
+        fn capture(keys: &[&'static str]) -> Self {
+            Self {
+                prior: keys
+                    .iter()
+                    .map(|key| (*key, std::env::var_os(key)))
+                    .collect(),
+            }
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (key, value) in self.prior.drain(..) {
+                match value {
+                    Some(value) => unsafe { std::env::set_var(key, value) },
+                    None => unsafe { std::env::remove_var(key) },
+                }
+            }
+        }
+    }
+
     fn with_provider_bins<T>(f: impl FnOnce() -> T) -> T {
         let _guard = crate::util::test_env_lock();
         let keys = [
@@ -1494,24 +1520,15 @@ mod tests {
             "VIBE_BIN",
             "OPENCODE_BIN",
             "COPILOT_BIN",
+            "BRO_HARNESS_BIN",
         ];
-        let prior: Vec<_> = keys
-            .iter()
-            .map(|key| (*key, std::env::var_os(key)))
-            .collect();
+        let _restore = EnvRestore::capture(&keys);
         for key in keys {
             unsafe {
                 std::env::set_var(key, "sh");
             }
         }
-        let result = f();
-        for (key, value) in prior {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-        result
+        f()
     }
 
     #[test]
