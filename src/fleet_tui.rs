@@ -734,11 +734,47 @@ fn draw_roster_body(
 }
 
 fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], order: &[usize]) {
-    // Build interleaved header/agent rows in bucket order. Selection is by
-    // agent (roster_selected indexes `order`); we map it to the flat row.
-    let mut items: Vec<ListItem<'static>> = Vec::new();
+    // Full-width, borderless — the roster is the focus (the title bar and
+    // composer frame it). In provider-selector mode the selector to the left
+    // carries its own separator.
+    let inner = area;
+
+    if app.agents.is_empty() {
+        let hint = Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no agents yet — type a prompt below + Enter to dispatch one",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ]);
+        f.render_widget(hint, inner);
+        return;
+    }
+
+    // Fixed-width columns: glyph · provider · name (flex) · model · cost ·
+    // turns · started · last. `started` = session age; `last` = time since the
+    // last stream event.
+    let widths = [
+        Constraint::Length(1),
+        Constraint::Length(4),
+        Constraint::Min(16),
+        Constraint::Length(13),
+        Constraint::Length(8),
+        Constraint::Length(5),
+        Constraint::Length(7),
+        Constraint::Length(7),
+    ];
+    let header = Row::new([
+        "", "prov", "agent", "model", "cost", "turns", "started", "last",
+    ])
+    .style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut rows: Vec<Row<'static>> = Vec::new();
     let mut flat_selected: Option<usize> = None;
-    let mut seen_in_order = 0usize;
     let mut first_bucket = true;
 
     for bucket in FleetState::BUCKETS {
@@ -752,102 +788,59 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
         }
         // One blank row between buckets.
         if !first_bucket {
-            items.push(ListItem::new(Line::from("")));
+            rows.push(Row::new(Vec::<Cell>::new()));
         }
         first_bucket = false;
-        let (glyph, color) = bucket.glyph();
+
+        let (_, color) = bucket.glyph();
         let collapsed = app.collapsed.contains(&bucket);
         let caret = if collapsed { "▸" } else { "▾" };
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("{caret} {} ", bucket.label()), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("({})", in_bucket.len()), Style::default().fg(Color::DarkGray)),
-        ])));
+        // Section header — the bucket label sits in the (wide) name column.
+        rows.push(Row::new(vec![
+            Cell::from(""),
+            Cell::from(""),
+            Cell::from(format!("{caret} {} ({})", bucket.label(), in_bucket.len())).style(
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+        ]));
 
         if collapsed {
-            // still advance selection accounting for collapsed agents
-            seen_in_order += in_bucket.len();
             continue;
         }
         for i in in_bucket {
-            // position of this agent within `order` == its selection index
             let sel_idx = order.iter().position(|&o| o == i).unwrap_or(0);
             if sel_idx == app.roster_selected {
-                flat_selected = Some(items.len());
+                flat_selected = Some(rows.len());
             }
             let v = &views[i];
             let a = &app.agents[i];
-            items.push(agent_list_item(a, v, glyph, color, area.width as usize));
-            seen_in_order += 1;
+            let (glyph, gcolor) = v.state.glyph();
+            let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
+            let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
+            let model = v.model.clone().unwrap_or_else(|| "—".into());
+            let started = age(v.started_at);
+            let last = v.last_activity_ms.map(age).unwrap_or_else(|| started.clone());
+            rows.push(Row::new(vec![
+                Cell::from(glyph).style(Style::default().fg(gcolor)),
+                Cell::from(provider_tag(a.provider))
+                    .style(Style::default().fg(provider_color(a.provider))),
+                Cell::from(a.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+                Cell::from(truncate(&model, 13)).style(Style::default().fg(Color::Gray)),
+                Cell::from(cost).style(Style::default().fg(Color::Gray)),
+                Cell::from(turns).style(Style::default().fg(Color::Gray)),
+                Cell::from(started).style(Style::default().fg(Color::DarkGray)),
+                Cell::from(last).style(Style::default().fg(Color::DarkGray)),
+            ]));
         }
     }
-    let _ = seen_in_order;
 
-    let mut state = ListState::default();
+    let mut state = TableState::default();
     state.select(flat_selected);
-
-    // Full-width, borderless — the roster is the focus (the title bar and
-    // composer frame it). In provider-selector mode the selector to the left
-    // carries its own separator.
-    let inner = area;
-
-    if app.agents.is_empty() {
-        let hint = Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  no agents yet",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "  type a prompt below + Enter",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(Span::styled(
-                "  to dispatch one",
-                Style::default().fg(Color::DarkGray),
-            )),
-        ]);
-        f.render_widget(hint, inner);
-        return;
-    }
-
-    let list = List::new(items)
-        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol("");
-    f.render_stateful_widget(list, inner, &mut state);
-}
-
-fn agent_list_item(
-    a: &Agent,
-    v: &AgentView,
-    glyph: &str,
-    color: Color,
-    width: usize,
-) -> ListItem<'static> {
-    let tag = provider_tag(a.provider);
-    // Row = glyph · provider · name … (right-aligned) started Xm · last Ys.
-    // `started` = session age; `last` = time since the last stream event.
-    let started = age(v.started_at);
-    let last = v.last_activity_ms.map(age).unwrap_or_else(|| started.clone());
-    let timing = format!("start {started}  ·  last {last}");
-
-    // glyph(2) + provider(5). Cap the name so the timing has room on the right.
-    let fixed = 2 + 5;
-    let name_max = width.saturating_sub(fixed + timing.chars().count() + 2).max(8);
-    let name = truncate(&a.name, name_max);
-    let used = fixed + name.chars().count();
-    let pad = width.saturating_sub(used + timing.chars().count()).max(1);
-
-    let spans = vec![
-        Span::styled(format!("{glyph} "), Style::default().fg(color)),
-        Span::styled(
-            format!("{tag:<4} "),
-            Style::default().fg(provider_color(a.provider)),
-        ),
-        Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
-        Span::raw(" ".repeat(pad)),
-        Span::styled(timing, Style::default().fg(Color::DarkGray)),
-    ];
-    ListItem::new(Line::from(spans))
+    let table = Table::new(rows, widths)
+        .header(header)
+        .column_spacing(1)
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(table, inner, &mut state);
 }
 
 fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
