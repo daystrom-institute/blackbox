@@ -69,6 +69,18 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
     sync_tool_docs(&mut kb);
+    // Load each registered repo's committed .bbox/knowledge/ into the query
+    // surface (project durable knowledge is repo-owned; central holds globals).
+    {
+        let kb_roots: Vec<std::path::PathBuf> = projects_store
+            .list()
+            .into_iter()
+            .map(|r| std::path::PathBuf::from(r.canonical_path))
+            .collect();
+        if let Err(e) = kb.set_project_roots(kb_roots) {
+            tracing::warn!("kb project-root load at startup: {e:#}");
+        }
+    }
     load_system_memory_catalog(&cfg)?;
     configure_dispatch_mcp_env(&cfg);
     sweep_stale_gemini_policies();

@@ -65,7 +65,22 @@ pub(crate) fn reindex_knowledge_store_standalone(
         meta.remove(knowledge_path.to_string_lossy().as_ref());
         return Ok(0);
     }
-    let knowledge = Knowledge::open(knowledge_path)?;
+    let mut knowledge = Knowledge::open(knowledge_path)?;
+    // Project-scoped entries live in each repo's committed .bbox/knowledge/, not
+    // the central store, so a reindex that only read kb.json would silently drop
+    // them from search. Load the registered repos' roots (projects.json is a
+    // sibling of kb.json) so committed project knowledge is indexed too.
+    if let Some(store_dir) = knowledge_path.parent() {
+        let roots: Vec<std::path::PathBuf> =
+            crate::projects::ProjectRegistry::load_records(store_dir.join("projects.json"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| std::path::PathBuf::from(r.canonical_path))
+                .collect();
+        if let Err(e) = knowledge.set_project_roots(roots) {
+            tracing::warn!("kb reindex project-root load: {e:#}");
+        }
+    }
     let mut docs = 0;
     for entry in knowledge
         .all_entries()
@@ -211,6 +226,82 @@ mod tests {
         assert!(indexable_knowledge_entry(&entry));
         entry.status = Status::Deleted;
         assert!(!indexable_knowledge_entry(&entry));
+    }
+
+    #[test]
+    fn reindex_includes_committed_project_bbox_entries() {
+        use crate::knowledge::KnowledgeStore;
+        use tantivy::Index;
+
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+
+        // Committed project entry in the repo's .bbox/knowledge/ (project omitted).
+        let kb_dir = repo_root.join(".bbox").join("knowledge");
+        std::fs::create_dir_all(&kb_dir).unwrap();
+        let entry = KnowledgeEntry {
+            id: "proj0001".into(),
+            title: "repo convention".into(),
+            content: "REPO_OWNED_SEARCHABLE".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            providers: Vec::new(),
+            priority: Priority::Standard,
+            weight: 100,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "test".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        std::fs::write(
+            kb_dir.join("proj0001.json"),
+            serde_json::to_string(&entry).unwrap(),
+        )
+        .unwrap();
+
+        // Empty central store + a sibling projects.json registering the repo.
+        let kb_path = central.path().join("kb.json");
+        std::fs::write(
+            &kb_path,
+            serde_json::to_string(&KnowledgeStore {
+                version: 1,
+                entries: vec![],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        {
+            let mut reg =
+                crate::projects::ProjectRegistry::open(central.path().join("projects.json"))
+                    .unwrap();
+            reg.register_path(&repo_root).unwrap();
+        }
+
+        let (schema, fields) = crate::index::build_schema();
+        let index = Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        let mut meta = HashMap::new();
+        let docs =
+            reindex_knowledge_store_standalone(&kb_path, fields, &mut writer, &mut meta).unwrap();
+
+        assert_eq!(
+            docs, 1,
+            "the committed project .bbox/knowledge entry must be indexed even though central is empty"
+        );
     }
 
     fn first_text(doc: &TantivyDocument, field: tantivy::schema::Field) -> String {
