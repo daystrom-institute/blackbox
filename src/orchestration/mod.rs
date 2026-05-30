@@ -2139,7 +2139,7 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
 
 pub fn task_result_json(task: &Task) -> Value {
     populate_transcript_handle(task);
-    let mut inner = task.inner.lock();
+    let inner = task.inner.lock();
     let mut obj = serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,
@@ -2190,7 +2190,6 @@ pub fn task_result_json(task: &Task) -> Value {
         obj["transcriptCursor"] = serde_json::to_value(cursor).unwrap_or(Value::Null);
     }
     let supervision_now = inner.completed_at.unwrap_or_else(now_ms);
-    inner.supervision.observe_stall(supervision_now);
     obj["supervision"] = inner.supervision.snapshot_for_response(supervision_now);
     if inner.status == TaskStatus::Failed {
         if let Some(code) = inner.exit_code {
@@ -2273,7 +2272,7 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
 }
 
 pub fn timeout_snapshot_json(task: &Task) -> Value {
-    let mut inner = task.inner.lock();
+    let inner = task.inner.lock();
     let elapsed = format_elapsed(inner.started_at, None);
     let event_count = observed_event_count(&inner);
     let last_activity = inner.last_assistant_message.as_deref().map(|msg| {
@@ -2293,7 +2292,6 @@ pub fn timeout_snapshot_json(task: &Task) -> Value {
         "check_status"
     };
 
-    inner.supervision.observe_stall(now_ms());
     serde_json::json!({
         "taskId": inner.id,
         "provider": inner.provider,

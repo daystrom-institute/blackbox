@@ -405,10 +405,6 @@ impl BlackboxServer {
             elapsed_ms,
         ) = if let Some(task) = task {
             let now_ms = orchestration::now_ms();
-            {
-                let mut inner = task.inner.lock();
-                inner.supervision.observe_stall(now_ms);
-            }
             let mut task_status = orchestration::task_status_json(&task, event_limit);
             let inner = task.inner.lock();
             let elapsed_ms = now_ms.saturating_sub(inner.started_at);

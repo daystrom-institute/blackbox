@@ -111,8 +111,8 @@ These are the real seams that should shape the design.
 Implemented today:
 
 - `src/orchestration/supervision.rs` implements task-local mechanical
-  telemetry: loop, stall, compaction, token-burn alerts, recent hashes, and
-  response snapshots.
+  telemetry: loop, compaction, token-burn alerts, a neutral idle notice (no
+  longer a stall alert), recent hashes, and response snapshots.
 - `src/orchestration/mod.rs` feeds `SupervisionState` from streaming provider
   events and bulk parsed provider output, then surfaces `supervision` in task
   result/status/timeout JSON.

@@ -13,8 +13,12 @@ const DEFAULT_MAX_STORED_ALERTS: usize = 64;
 const DEFAULT_ALERT_COOLDOWN_MS: u64 = 60_000;
 const LOOP_AMBER_COUNT: u64 = 3;
 const LOOP_RED_COUNT: u64 = 6;
-const STALL_AMBER_MS: u64 = 180_000;
-const STALL_RED_MS: u64 = 360_000;
+// Idle is reported as a single neutral, configurable threshold — not a
+// two-tier amber/red alert. Inferring "productively busy vs. wedged" from
+// elapsed time is unrecoverable once an agent chains commands (a single
+// `build && test | tail` is one open tool call of unbounded duration), so we
+// stop classifying and just surface how long it has been since the last event.
+const STALL_NOTICE_MS: u64 = 180_000;
 const COMPACTION_AMBER_COUNT: u64 = 2;
 const COMPACTION_RED_COUNT: u64 = 4;
 const COMPACTION_WINDOW_MS: u64 = 300_000;
@@ -30,10 +34,11 @@ pub struct SupervisionConfig {
     pub loop_amber_count: u64,
     #[serde(default = "default_loop_red_count")]
     pub loop_red_count: u64,
-    #[serde(default = "default_stall_amber_ms")]
-    pub stall_amber_ms: u64,
-    #[serde(default = "default_stall_red_ms")]
-    pub stall_red_ms: u64,
+    /// Seconds-equivalent (ms) of inactivity after which the snapshot surfaces a
+    /// neutral idle notice. Informational only — it never flips supervision out
+    /// of green or pushes a severity-bearing alert.
+    #[serde(default = "default_stall_notice_ms")]
+    pub stall_notice_ms: u64,
     #[serde(default = "default_compaction_amber_count")]
     pub compaction_amber_count: u64,
     #[serde(default = "default_compaction_red_count")]
@@ -54,6 +59,9 @@ pub struct SupervisionConfig {
 #[serde(rename_all = "snake_case")]
 pub enum AlertKind {
     Loop,
+    /// Retained for backward-compatible deserialization of persisted task
+    /// state. No longer emitted: idle is now a neutral informational signal
+    /// (see `SupervisionState::snapshot`), not a severity-bearing alert.
     Stall,
     Compaction,
     TokenBurn,
@@ -103,6 +111,18 @@ pub struct SupervisionState {
     pub recent_hashes: VecDeque<ToolHashObservation>,
     #[serde(default)]
     pub last_event_at_ms: Option<u64>,
+    /// Tri-state view of whether a tool dispatch is currently in flight,
+    /// derived from the streaming event sequence:
+    /// - `Some(true)`  — the last observed event dispatched a tool whose result
+    ///   has not yet arrived (idle here means "blocked on a child process",
+    ///   the common false-alarm case);
+    /// - `Some(false)` — the last observed event was anything else (idle here
+    ///   means the model itself is quiet);
+    /// - `None`        — no streaming visibility at all. Bulk-output providers
+    ///   parse only at completion, so "is a tool running right now" is
+    ///   genuinely unknowable; we report unknown rather than fake a `false`.
+    #[serde(default)]
+    pub tool_running: Option<bool>,
     #[serde(default)]
     pub compaction_times_ms: VecDeque<u64>,
     /// Fresh (cache-exclusive) input tokens; see [`crate::orchestration::providers::Usage`].
@@ -131,8 +151,7 @@ impl Default for SupervisionConfig {
             max_recent_hashes: DEFAULT_MAX_RECENT_HASHES,
             loop_amber_count: LOOP_AMBER_COUNT,
             loop_red_count: LOOP_RED_COUNT,
-            stall_amber_ms: STALL_AMBER_MS,
-            stall_red_ms: STALL_RED_MS,
+            stall_notice_ms: STALL_NOTICE_MS,
             compaction_amber_count: COMPACTION_AMBER_COUNT,
             compaction_red_count: COMPACTION_RED_COUNT,
             compaction_window_ms: COMPACTION_WINDOW_MS,
@@ -155,7 +174,16 @@ impl SupervisionState {
 
         self.observe_usage(sink);
 
+        // A tool_use event arrives before the tool executes; the matching
+        // tool_result arrives after. So "this event dispatched a tool" flips
+        // tool_running on, and the next non-dispatch event (the result, or any
+        // assistant text) flips it back off. This is the one honest signal that
+        // separates "idle because a child process is running" from everything
+        // else — see the `tool_running` field.
+        let mut dispatched_tool = false;
+
         for (tool_name, input) in extract_tool_calls(event) {
+            dispatched_tool = true;
             let hashed = hash_tool_call(&tool_name, &input);
             self.recent_hashes.push_back(ToolHashObservation {
                 at_ms: now_ms,
@@ -194,6 +222,8 @@ impl SupervisionState {
                 );
             }
         }
+
+        self.tool_running = Some(dispatched_tool);
 
         if has_compaction_marker(event) {
             self.compaction_times_ms.push_back(now_ms);
@@ -252,35 +282,19 @@ impl SupervisionState {
         self.emit_token_burn_alert(now_ms);
     }
 
-    pub fn observe_stall(&mut self, now_ms: u64) {
-        if !self.enabled {
-            return;
-        }
-
-        let Some(last_ms) = self.last_event_at_ms else {
-            return;
-        };
+    /// Seconds of inactivity since the last observed event, but only once the
+    /// configured idle threshold has been crossed. Returns `None` while still
+    /// below threshold (or when no event has ever been observed). This is the
+    /// neutral replacement for the old amber/red stall alert: it reports a fact
+    /// ("no activity for N seconds") and asserts nothing about whether the agent
+    /// is wedged or simply blocked on a long-running child process.
+    fn idle_seconds(&self, now_ms: u64) -> Option<u64> {
+        let last_ms = self.last_event_at_ms?;
         let elapsed = now_ms.saturating_sub(last_ms);
-        if elapsed < config().stall_amber_ms {
-            return;
+        if elapsed < config().stall_notice_ms {
+            return None;
         }
-
-        let seconds = elapsed / 1000;
-        let (severity, threshold) = if elapsed >= config().stall_red_ms {
-            (AlertSeverity::Red, config().stall_red_ms / 1000)
-        } else {
-            (AlertSeverity::Amber, config().stall_amber_ms / 1000)
-        };
-
-        self.push_alert(
-            AlertKind::Stall,
-            severity,
-            format!("no task events for {seconds}s (threshold {threshold}s)"),
-            Some(seconds as f64),
-            None,
-            None,
-            now_ms,
-        );
+        Some(elapsed / 1000)
     }
 
     pub fn snapshot(&self, now_ms: u64) -> Value {
@@ -307,6 +321,22 @@ impl SupervisionState {
             .last_event_at_ms
             .map(|last| now_ms.saturating_sub(last) / 1000);
         obj["seconds_since_last_event"] = serde_json::to_value(seconds_since_last_event).unwrap();
+
+        // The one honest disambiguation: is a tool dispatch in flight right now?
+        // true/false for streaming providers, null when we have no mid-run
+        // visibility (bulk-output providers). Always present so consumers can
+        // rely on the key.
+        obj["tool_running"] = serde_json::to_value(self.tool_running).unwrap();
+
+        // Neutral idle notice: surfaced once past the configured threshold, with
+        // no severity. Orchestrators may threshold on it; the daemon does not
+        // treat it as the agent being wrong. The notice is labelled with the
+        // tool-running state so "idle" reads as "blocked on a tool" vs "model
+        // is quiet" vs "unknown" without any classification.
+        if let Some(idle) = self.idle_seconds(now_ms) {
+            obj["idle_seconds"] = Value::from(idle);
+            obj["idle_notice"] = Value::from(idle_notice(idle, self.tool_running));
+        }
 
         let compactions_in_window = self.compactions_within_window(now_ms);
         obj["compactions_in_window"] = Value::from(compactions_in_window);
@@ -340,27 +370,33 @@ impl SupervisionState {
         let alerts = self.recent_alerts();
         let loop_max = self.max_loop_count();
         let compactions = self.compactions_within_window(now_ms);
-        let stall_elapsed_ms = self
-            .last_event_at_ms
-            .map(|last| now_ms.saturating_sub(last))
-            .unwrap_or(0);
         let burn_is_green = token_burn_ratio(
             self.total_input_tokens + self.total_output_tokens,
             self.token_baseline,
         )
         .is_none_or(|r| r < cfg.token_burn_amber_ratio);
 
+        // Idle is deliberately absent from this check: long inactivity is a
+        // neutral fact, not a problem, so it must not flip a task out of green.
         let is_green = alerts.is_empty()
             && loop_max < cfg.loop_amber_count
-            && stall_elapsed_ms < cfg.stall_amber_ms
             && compactions < cfg.compaction_amber_count
             && burn_is_green;
 
         if is_green {
-            return serde_json::json!({
+            let mut obj = serde_json::json!({
                 "ok": true,
                 "event_count": self.event_count,
             });
+            // Still surface the idle fact alongside ok=true so an orchestrator
+            // that wants to threshold on it can, without the daemon asserting
+            // anything is wrong. `tool_running` rides along so the orchestrator
+            // can tell "blocked on a tool" from "model is quiet" itself.
+            if let Some(idle) = self.idle_seconds(now_ms) {
+                obj["idle_seconds"] = Value::from(idle);
+                obj["tool_running"] = serde_json::to_value(self.tool_running).unwrap();
+            }
+            return obj;
         }
 
         self.snapshot(now_ms)
@@ -532,6 +568,7 @@ impl Default for SupervisionState {
             event_count: 0,
             recent_hashes: VecDeque::new(),
             last_event_at_ms: None,
+            tool_running: None,
             compaction_times_ms: VecDeque::new(),
             total_input_tokens: 0,
             total_output_tokens: 0,
@@ -560,12 +597,8 @@ fn default_loop_red_count() -> u64 {
     LOOP_RED_COUNT
 }
 
-fn default_stall_amber_ms() -> u64 {
-    STALL_AMBER_MS
-}
-
-fn default_stall_red_ms() -> u64 {
-    STALL_RED_MS
+fn default_stall_notice_ms() -> u64 {
+    STALL_NOTICE_MS
 }
 
 fn default_compaction_amber_count() -> u64 {
@@ -734,6 +767,17 @@ fn has_compaction_marker(event: &Value) -> bool {
     })
 }
 
+/// Human-readable idle notice, labelled with the tool-running state. Reports a
+/// fact; never asserts the agent is wrong.
+fn idle_notice(idle_seconds: u64, tool_running: Option<bool>) -> String {
+    let qualifier = match tool_running {
+        Some(true) => " (tool running)",
+        Some(false) => " (no tool running)",
+        None => " (tool state unknown)",
+    };
+    format!("no activity for {idle_seconds}s{qualifier}")
+}
+
 fn token_burn_ratio(total_tokens: u64, baseline: Option<u64>) -> Option<f64> {
     let baseline = baseline?;
     if baseline == 0 {
@@ -778,6 +822,19 @@ mod tests {
                 "input": {
                     "file": "a.rs"
                 }
+            }
+        })
+    }
+
+    // An assistant text event carrying no tool_use — e.g. the tool_result turn
+    // or the model narrating. extract_tool_calls returns empty for it.
+    fn text_event() -> Value {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "content": [
+                    { "type": "text", "text": "thinking out loud" }
+                ]
             }
         })
     }
@@ -893,34 +950,103 @@ mod tests {
     }
 
     #[test]
-    fn stall_snapshot_reports_amber_and_red_by_wait_time() {
-        let mut state = SupervisionState::default();
+    fn idle_surfaces_as_neutral_notice_not_an_alert() {
+        let state = SupervisionState {
+            last_event_at_ms: Some(19_000),
+            ..Default::default()
+        };
+
+        // Past the notice threshold: snapshot reports the idle fact, but never
+        // as a severity-bearing alert.
         let now = 200_000;
-        state.last_event_at_ms = Some(19_000);
+        let snap = state.snapshot(now);
+        assert_eq!(snap["seconds_since_last_event"], 181);
+        assert_eq!(snap["idle_seconds"], 181);
+        // No events were observed (last_event_at_ms set directly), so the
+        // tool-running state is unknown and the notice says so.
+        assert_eq!(snap["idle_notice"], "no activity for 181s (tool state unknown)");
+        assert!(
+            snap["alerts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|alert| alert["kind"] != "stall"),
+            "idle must never produce a stall alert"
+        );
 
-        state.observe_stall(now);
-        let amber = state.snapshot(now);
-        assert_eq!(amber["seconds_since_last_event"], 181);
-        let amber_alert = amber["alerts"]
-            .as_array()
-            .and_then(|alerts| alerts.iter().find(|alert| alert["kind"] == "stall"))
-            .cloned();
-        assert!(amber_alert.is_some());
-        assert_eq!(amber_alert.unwrap()["severity"], "amber");
+        // Long idle is still just a larger number, not a red escalation.
+        let far = state.snapshot(420_000);
+        assert_eq!(far["idle_seconds"], 401);
+        assert!(far["alerts"].as_array().unwrap().is_empty());
+    }
 
-        state.observe_stall(420_000);
-        let red = state.snapshot(420_000);
-        let kind = red["alerts"]
-            .as_array()
-            .and_then(|alerts| {
-                alerts
-                    .iter()
-                    .find(|alert| alert["kind"] == "stall" && alert["severity"] == "red")
-            })
-            .cloned();
+    #[test]
+    fn idle_below_threshold_emits_no_notice() {
+        let state = SupervisionState {
+            last_event_at_ms: Some(0),
+            ..Default::default()
+        };
+        // stall_notice_ms is 180_000, so 170s elapsed is below threshold.
+        let snap = state.snapshot(170_000);
+        assert_eq!(snap["seconds_since_last_event"], 170);
+        assert!(snap.get("idle_seconds").is_none());
+        assert!(snap.get("idle_notice").is_none());
+    }
 
-        assert!(kind.is_some());
-        assert_eq!(kind.unwrap()["severity"], "red");
+    #[test]
+    fn tool_running_flips_with_dispatch_and_result() {
+        let mut state = SupervisionState::default();
+
+        // Fresh state: no streaming events seen yet → unknown.
+        assert_eq!(state.tool_running, None);
+
+        // A tool_use event: a dispatch is now in flight.
+        state.observe_event(&tool_call_event(), &sink_without_usage(), 1_000);
+        assert_eq!(state.tool_running, Some(true));
+
+        // Idle while the tool runs: the notice says so, and it never alerts.
+        let snap = state.snapshot(1_000 + STALL_NOTICE_MS + 5_000);
+        assert_eq!(snap["tool_running"], true);
+        assert_eq!(snap["idle_notice"], "no activity for 185s (tool running)");
+        assert!(snap["alerts"].as_array().unwrap().is_empty());
+
+        // The tool returns (a non-dispatch event): tool no longer running.
+        state.observe_event(&text_event(), &sink_without_usage(), 200_000);
+        assert_eq!(state.tool_running, Some(false));
+        let snap = state.snapshot(200_000 + STALL_NOTICE_MS + 10_000);
+        assert_eq!(snap["tool_running"], false);
+        assert_eq!(
+            snap["idle_notice"], "no activity for 190s (no tool running)",
+            "idle with no tool in flight reads as the model being quiet"
+        );
+    }
+
+    #[test]
+    fn bulk_only_provider_reports_tool_state_unknown() {
+        let mut state = SupervisionState::default();
+        // Bulk-output providers only ever feed observe_bulk_sink — no mid-run
+        // visibility, so tool_running stays unknown rather than faking false.
+        state.observe_bulk_sink(&sink_without_usage(), 1_000);
+        assert_eq!(state.tool_running, None);
+
+        let snap = state.snapshot(1_000 + STALL_NOTICE_MS + 1_000);
+        assert!(snap["tool_running"].is_null());
+        assert_eq!(
+            snap["idle_notice"], "no activity for 181s (tool state unknown)"
+        );
+    }
+
+    #[test]
+    fn green_response_carries_tool_running_when_idle() {
+        let mut state = SupervisionState::default();
+        state.observe_event(&tool_call_event(), &sink_without_usage(), 0);
+        // One tool_use is below the loop threshold → still green; long idle does
+        // not change that, but tool_running rides along so the orchestrator can
+        // tell "blocked on a tool" from "model is quiet".
+        let snap = state.snapshot_for_response(400_000);
+        assert_eq!(snap["ok"], true);
+        assert_eq!(snap["idle_seconds"], 400);
+        assert_eq!(snap["tool_running"], true);
     }
 
     #[test]
@@ -1139,9 +1265,9 @@ mod tests {
     fn alerts_force_full_snapshot() {
         let mut state = SupervisionState::default();
         state.push_alert(
-            AlertKind::Stall,
+            AlertKind::Loop,
             AlertSeverity::Amber,
-            "test stall".into(),
+            "test alert".into(),
             Some(200.0),
             None,
             None,
@@ -1188,23 +1314,24 @@ mod tests {
     }
 
     #[test]
-    fn stall_near_threshold_returns_full_snapshot() {
+    fn idle_stays_green_and_surfaces_idle_seconds() {
         let state = SupervisionState {
             last_event_at_ms: Some(0),
             ..Default::default()
         };
-        // stall_amber_ms is 180_000, so elapsed=170_000 is below threshold
-        // but stall_elapsed_ms (170_000) is checked against stall_amber_ms (180_000)
-        // which passes, so this should still be green
+        // Below the notice threshold: green, no idle field.
         let snap = state.snapshot_for_response(170_000);
-        assert_eq!(snap["ok"], true, "170s elapsed should still be green");
+        assert_eq!(snap["ok"], true, "170s elapsed should be green");
+        assert!(snap.get("idle_seconds").is_none());
 
-        // At exactly stall_amber_ms it should go full
-        let snap = state.snapshot_for_response(180_000);
-        assert!(
-            snap.get("ok").is_none(),
-            "at stall_amber_ms should force full snapshot"
+        // Past the threshold: still green (idle is neutral), but the idle fact
+        // is surfaced alongside ok=true for orchestrators that want it.
+        let snap = state.snapshot_for_response(400_000);
+        assert_eq!(
+            snap["ok"], true,
+            "long idle must not flip a task out of green"
         );
+        assert_eq!(snap["idle_seconds"], 400);
     }
 
     #[test]

@@ -180,9 +180,12 @@ signal:
 | AlertKind | Amber | Red |
 |---|---|---|
 | **loop** (consecutive identical tool/input hash) | 3 | 6 |
-| stall (since last event) | 180s | 360s |
 | compaction (markers / 300s) | 2 | 4 |
 | token_burn (ratio vs baseline) | 2.0× | 3.0× |
+
+Idle since last event is no longer an alert — it is a neutral `idle_seconds` /
+`idle_notice` fact surfaced past a single configurable threshold
+(`stall_notice_ms`, default 180s), with no severity.
 
 Crucially, supervision telemetry is deliberately **detect-and-surface only** — it
 "does not cancel, steer, or choose recovery" (that is documented non-scope; those

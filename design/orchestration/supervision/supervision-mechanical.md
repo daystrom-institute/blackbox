@@ -42,7 +42,9 @@ Those behaviors belong to optional orchestration above the telemetry layer.
 - `SupervisionConfig`
 - `SupervisionState`
 - `SupervisionAlert`
-- `AlertKind`: `loop`, `stall`, `compaction`, `token_burn`
+- `AlertKind`: `loop`, `compaction`, `token_burn` (the `stall` variant is
+  retained only for backward-compatible deserialization of persisted state; it
+  is no longer emitted)
 - `AlertSeverity`: `amber`, `red`
 
 Default thresholds:
@@ -50,9 +52,33 @@ Default thresholds:
 | Signal | Amber | Red |
 |---|---:|---:|
 | Consecutive identical tool/input hash | 3 | 6 |
-| Stall since last event | 180s | 360s |
 | Compaction markers in 300s window | 2 | 4 |
 | Token burn ratio versus seeded baseline | 2.0x | 3.0x |
+
+Idle is **not** an alert. Inferring "productively busy vs. wedged" from elapsed
+time is unrecoverable once an agent chains commands (`build && test | tail` is
+one open tool call of unbounded duration), so supervision does not classify it.
+Instead, a single configurable threshold (`stall_notice_ms`, default 180s)
+controls when the snapshot surfaces a neutral `idle_seconds` / `idle_notice`
+fact. It carries no severity, never appears in `alerts`, and never flips a task
+out of green.
+
+The one honest disambiguation the snapshot does make is `tool_running`, a
+tri-state derived from the event sequence (not a timing classifier):
+
+- `true` — the last observed event dispatched a tool whose result has not yet
+  arrived (idle here means "blocked on a child process");
+- `false` — the last observed event was anything else (idle here means the
+  model itself is quiet);
+- `null` — no streaming visibility. Bulk-output providers parse only at
+  completion, so "is a tool running right now" is unknowable; we report unknown
+  rather than fake a `false`.
+
+`tool_running` is always present in the full snapshot and rides alongside
+`ok=true` in the response-optimized snapshot whenever the idle notice fires, so
+an orchestrator can separate "blocked on a tool" from "model is quiet" without
+re-investigating. The `idle_notice` string is labelled with this state, e.g.
+`no activity for 185s (tool running)`.
 
 Alert cooldown is 60 seconds per kind/severity. Recent tool hashes and alerts
 are bounded.
@@ -65,11 +91,12 @@ are bounded.
   before `inner.supervision.observe_event(...)`
 - bulk-output providers parse at completion and call
   `inner.supervision.observe_bulk_sink(...)`
-- task result/status/timeout rendering calls `observe_stall(...)` before
-  writing the response snapshot
+- task result/status/timeout rendering reads the idle fact directly from
+  `last_event_at_ms` at snapshot time — no separate `observe_stall` pre-call
 
-This means supervision snapshots can show stall state even when no new provider
-event has arrived.
+This means supervision snapshots report idle duration even when no new provider
+event has arrived, computed from the last event timestamp rather than tracked as
+stateful alert.
 
 ## 4. Response shape
 
@@ -120,7 +147,9 @@ rather than relying on response-optimized task result JSON.
 - interleaved repeated tool calls not counting as a loop
 - duplicate tool shapes in one event counting once
 - alert cooldown
-- stall amber/red snapshots
+- neutral idle notice surfaced past threshold (never an alert, never breaks green)
+- `tool_running` tri-state: flips on tool dispatch, off on result, `null` for
+  bulk-only providers
 - token burn with and without baseline
 - old task-record serde defaults
 - response-optimized green snapshots
