@@ -92,6 +92,50 @@ impl OpenAiChatTransport {
         }
         body
     }
+
+    /// One-shot, non-streaming summarization over `transcript` for compaction.
+    /// Does NOT touch the conversation buffer — the caller swaps it afterward.
+    async fn summarize_text(
+        &self,
+        transcript: &str,
+        instruction: &str,
+        opts: &TurnOpts,
+    ) -> Result<String> {
+        let body = json!({
+            "model": opts.model,
+            "max_tokens": 2048,
+            "messages": [
+                {"role": "system", "content": "You summarize coding-agent conversations precisely and completely."},
+                {"role": "user", "content": format!("{transcript}\n\n---\n{instruction}")},
+            ],
+        });
+        let url = format!("{}/chat/completions", self.base_url);
+        let resp = super::http::send_with_retry("openai-chat/compact", || {
+            self.http
+                .post(&url)
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {}", self.api_key))
+                .timeout(super::http::request_timeout())
+                .json(&body)
+                .send()
+        })
+        .await
+        .context("chat compaction request")?;
+        let status = resp.status();
+        let text = resp.text().await.context("read summarize body")?;
+        if !status.is_success() {
+            anyhow::bail!("openai chat compact {status}: {text}");
+        }
+        let v: Value = serde_json::from_str(&text).context("parse summarize response")?;
+        let out = v["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if out.trim().is_empty() {
+            anyhow::bail!("compaction summary was empty");
+        }
+        Ok(out)
+    }
 }
 
 /// One in-progress tool call accumulated across `chat.completion.chunk` deltas
@@ -315,6 +359,69 @@ impl Transport for OpenAiChatTransport {
             self.messages = arr.clone();
         }
     }
+
+    async fn compact(
+        &mut self,
+        keep_tail: usize,
+        instruction: &str,
+        opts: &TurnOpts,
+    ) -> Result<Option<String>> {
+        let n = self.messages.len();
+        if n <= keep_tail + 1 {
+            return Ok(None);
+        }
+        let limit = n.saturating_sub(keep_tail);
+        let Some(split) = chat_split(&self.messages, limit) else {
+            return Ok(None);
+        };
+        let transcript = render_chat_transcript(&self.messages[..split]);
+        let summary = self.summarize_text(&transcript, instruction, opts).await?;
+        let mut rebuilt: Vec<Value> = Vec::with_capacity(n - split + 1);
+        rebuilt.push(json!({
+            "role": "user",
+            "content": format!("[Earlier conversation compacted to a summary]\n\n{summary}"),
+        }));
+        rebuilt.extend_from_slice(&self.messages[split..]);
+        self.messages = rebuilt;
+        Ok(Some(summary))
+    }
+}
+
+/// Largest split `≤ limit` whose kept tail begins on an `assistant` message, so
+/// no `tool` message is orphaned from the `tool_calls` that produced it. Returns
+/// `None` when no such boundary exists.
+fn chat_split(messages: &[Value], limit: usize) -> Option<usize> {
+    (1..limit)
+        .rev()
+        .find(|&i| messages[i]["role"].as_str() == Some("assistant"))
+}
+
+/// Render a slice of the chat buffer to a plain-text transcript for
+/// summarization. Tool results are truncated to keep the prompt bounded.
+fn render_chat_transcript(messages: &[Value]) -> String {
+    let mut s = String::new();
+    for m in messages {
+        let role = m["role"].as_str().unwrap_or("?");
+        s.push_str(&format!("\n## {role}\n"));
+        if let Some(t) = m["content"].as_str() {
+            if role == "tool" {
+                s.push_str(&super::truncate(t, 2000));
+            } else {
+                s.push_str(t);
+            }
+            s.push('\n');
+        }
+        if let Some(tcs) = m["tool_calls"].as_array() {
+            for tc in tcs {
+                s.push_str(&format!(
+                    "[tool_call {} {}]\n",
+                    tc["function"]["name"].as_str().unwrap_or(""),
+                    tc["function"]["arguments"].as_str().unwrap_or("")
+                ));
+            }
+        }
+    }
+    s
 }
 
 #[cfg(test)]
@@ -378,5 +485,20 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["content"], "BASE");
         assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn chat_split_keeps_tail_on_assistant() {
+        let msgs = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "tool_calls": [{"id": "a"}]}),
+            json!({"role": "tool", "tool_call_id": "a", "content": "r"}),
+            json!({"role": "assistant", "content": "done"}),
+        ];
+        // Within limit 3, the newest assistant boundary is index 1 (a `tool`
+        // start at 2 would orphan its call).
+        assert_eq!(chat_split(&msgs, 3), Some(1));
+        // No assistant before limit 1 → nothing safe to compact.
+        assert_eq!(chat_split(&msgs, 1), None);
     }
 }

@@ -208,6 +208,33 @@ impl Transport for OpenAiResponsesTransport {
             self.input = arr.clone();
         }
     }
+
+    async fn compact(
+        &mut self,
+        keep_tail: usize,
+        instruction: &str,
+        opts: &TurnOpts,
+    ) -> Result<Option<String>> {
+        let n = self.input.len();
+        if n <= keep_tail + 1 {
+            return Ok(None);
+        }
+        let limit = n.saturating_sub(keep_tail);
+        let Some(split) = responses_split(&self.input, limit) else {
+            return Ok(None);
+        };
+        let transcript = render_responses_transcript(&self.input[..split]);
+        let summary = self.summarize_text(&transcript, instruction, opts).await?;
+        let mut rebuilt: Vec<Value> = Vec::with_capacity(n - split + 1);
+        rebuilt.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": format!("[Earlier conversation compacted to a summary]\n\n{summary}")}],
+        }));
+        rebuilt.extend_from_slice(&self.input[split..]);
+        self.input = rebuilt;
+        Ok(Some(summary))
+    }
 }
 
 impl OpenAiResponsesTransport {
@@ -375,6 +402,137 @@ impl OpenAiResponsesTransport {
             usage,
         })
     }
+
+    /// One-shot summarization over `transcript` for compaction. Streams the
+    /// response and concatenates `output_text` deltas. Does NOT touch the input
+    /// buffer — the caller swaps it afterward.
+    async fn summarize_text(
+        &self,
+        transcript: &str,
+        instruction: &str,
+        opts: &TurnOpts,
+    ) -> Result<String> {
+        let body = json!({
+            "model": opts.model,
+            "input": [{
+                "type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": format!("{transcript}\n\n---\n{instruction}")}],
+            }],
+            "instructions": "You summarize coding-agent conversations precisely and completely.",
+            "stream": true,
+            "store": false,
+        });
+        let resp = super::http::send_with_retry("openai-responses/compact", || {
+            let mut rb = self
+                .http
+                .post(&self.endpoint)
+                .header("content-type", "application/json")
+                .header("accept", "text/event-stream")
+                .timeout(super::http::request_timeout());
+            rb = match &self.auth {
+                Auth::ApiKey(k) => rb.header("authorization", format!("Bearer {k}")),
+                Auth::ChatGpt {
+                    access_token,
+                    account_id,
+                } => rb
+                    .header("authorization", format!("Bearer {access_token}"))
+                    .header("chatgpt-account-id", account_id.clone())
+                    .header("OpenAI-Beta", "responses=experimental")
+                    .header("originator", "codex_cli_rs")
+                    .header("session_id", uuid::Uuid::new_v4().to_string()),
+            };
+            rb.json(&body).send()
+        })
+        .await
+        .context("responses compaction request")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let t = resp.text().await.unwrap_or_default();
+            anyhow::bail!("openai responses compact {status}: {t}");
+        }
+        let mut out = String::new();
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read responses compact chunk")?;
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=pos).collect();
+                let line = String::from_utf8_lossy(&raw);
+                let line = line.trim();
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                if ev["type"].as_str() == Some("response.output_text.delta")
+                    && let Some(t) = ev["delta"].as_str()
+                {
+                    out.push_str(t);
+                }
+            }
+        }
+        if out.trim().is_empty() {
+            anyhow::bail!("compaction summary was empty");
+        }
+        Ok(out)
+    }
+}
+
+/// Largest split `≤ limit` whose kept tail `[split..]` is a valid standalone
+/// Responses input — no `function_call_output` orphaned from the
+/// `function_call` (matched by `call_id`) it answers. `None` if none exists.
+fn responses_split(input: &[Value], limit: usize) -> Option<usize> {
+    (1..limit).rev().find(|&s| {
+        let tail = &input[s..];
+        let calls: std::collections::HashSet<&str> = tail
+            .iter()
+            .filter(|it| it["type"] == "function_call")
+            .filter_map(|it| it["call_id"].as_str())
+            .collect();
+        !tail.iter().any(|it| {
+            it["type"] == "function_call_output"
+                && it["call_id"].as_str().is_some_and(|c| !calls.contains(c))
+        })
+    })
+}
+
+/// Render a slice of the Responses input buffer to a plain-text transcript for
+/// summarization. Tool outputs are truncated to keep the prompt bounded.
+fn render_responses_transcript(items: &[Value]) -> String {
+    let mut s = String::new();
+    for it in items {
+        match it["type"].as_str().unwrap_or("") {
+            "message" => {
+                let role = it["role"].as_str().unwrap_or("?");
+                s.push_str(&format!("\n## {role}\n"));
+                if let Some(parts) = it["content"].as_array() {
+                    for p in parts {
+                        if let Some(t) = p["text"].as_str() {
+                            s.push_str(t);
+                        }
+                    }
+                }
+                s.push('\n');
+            }
+            "function_call" => s.push_str(&format!(
+                "\n## assistant\n[tool_call {} {}]\n",
+                it["name"].as_str().unwrap_or(""),
+                it["arguments"].as_str().unwrap_or("")
+            )),
+            "function_call_output" => s.push_str(&format!(
+                "\n## tool\n[tool_result {}]\n",
+                super::truncate(it["output"].as_str().unwrap_or(""), 2000)
+            )),
+            _ => {}
+        }
+    }
+    s
 }
 
 fn normalize_effort(e: &str) -> &str {
@@ -447,5 +605,20 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);
         assert_eq!(input[1]["role"], "developer");
+    }
+
+    #[test]
+    fn responses_split_avoids_orphan_tool_output() {
+        let input = vec![
+            json!({"type": "message", "role": "user", "content": []}),
+            json!({"type": "function_call", "call_id": "a", "name": "f", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "a", "output": "r"}),
+            json!({"type": "message", "role": "assistant", "content": []}),
+        ];
+        // split=2 would orphan function_call_output(a) (its call at index 1 is
+        // discarded); split=1 keeps the call/output pair together.
+        assert_eq!(responses_split(&input, 3), Some(1));
+        // Cutting only the final item is never offered (limit 1 → empty range).
+        assert_eq!(responses_split(&input, 1), None);
     }
 }

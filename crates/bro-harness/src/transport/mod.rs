@@ -247,3 +247,14 @@ pub async fn build_transport(kind: TransportKind) -> Result<Box<dyn Transport>> 
     };
     Ok(tx)
 }
+
+/// Char-bounded truncation for transcripts fed to the compaction summarizer, so
+/// a huge tool result can't blow up the summarization prompt. Shared by the
+/// transports' `render_*_transcript` helpers.
+pub(super) fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+    format!("{}… [truncated]", &s[..end])
+}
