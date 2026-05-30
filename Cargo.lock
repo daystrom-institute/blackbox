@@ -437,6 +437,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "bro-lsp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "lsp-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "bro-tools"
 version = "0.0.1"
 dependencies = [

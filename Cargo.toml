@@ -3,7 +3,7 @@
 # Anthropic-harness crates (see design/orchestration/anthropic-harness.md).
 # They intentionally do NOT depend on the `blackbox` lib — the daemon↔harness
 # contract is the Claude stream-json envelope on stdout, not shared types.
-members = ["crates/bro-tools", "crates/bro-harness"]
+members = ["crates/bro-tools", "crates/bro-harness", "crates/bro-lsp"]
 
 [package]
 name = "blackbox"
