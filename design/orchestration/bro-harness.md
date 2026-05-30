@@ -32,6 +32,7 @@ each linked doc is the authority for its own area. Keep coarse status here
 | [bro-harness-tool-chaining](bro-harness-tool-chaining.md) | the ref ABI; settled refs (clipboard) vs pending refs (Task) | **partial** — Stage 1+2 built (producers/consumers); Stage 3 (pending refs = Task) designed |
 | [bro-harness-hooks](bro-harness-hooks.md) | internal hook seam + Nudger (steer toward the rich toolbox) | **partial** — §1 split + Nudger v1 built (engine, ledger, 4 rules); broader rules + adoption instrumentation remain |
 | [bro-harness-neuralyze](bro-harness-neuralyze.md) | rewind context/files to a checkpoint + carry one message | designed |
+| [bro-harness-diagnostics](bro-harness-diagnostics.md) | window-0 synchronous analyzer feedback on edits (LSP transport + per-language classification adapter; ownership-transfer truth gate) | designed |
 
 ## What is built (committed)
 
@@ -95,6 +96,12 @@ each linked doc is the authority for its own area. Keep coarse status here
   adopted, declined, or ignored).
 - **Neuralyze** — auto-per-turn checkpoint substrate, context rewind, the file
   inverse-diff journal, self-invocation guards. Nothing built.
+- **Diagnostics (window-0)** — synchronous per-mutation analyzer feedback on the
+  edit loop. Reuses the `side` spine (baseline), the `bound.rs` rider, and the
+  daemon's `LspSessionManager` (which already drains `publishDiagnostics` but
+  discards the payload). Net-new: diagnostic extraction, `didChange`
+  document-sync, pull diagnostics, the per-language classification adapter, a
+  `bbox_code_diagnostics` unary tool, and the ownership-transfer truth gate.
 
 ## Dependency graph
 
