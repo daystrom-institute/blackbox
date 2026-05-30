@@ -1,0 +1,19 @@
+{
+  "id": "08b73f41",
+  "title": "Rust test isolation invariants (tempdir canonicalization + real-HOME isolation)",
+  "content": "Rust test isolation invariants (this repo, surfaced on macOS aarch64). Two conventions every new test must follow, learned while taking `cargo test --lib` to 0 failures:\n\n1. Canonicalize tempdir roots before path assertions. `tempfile::tempdir().path()` is `/var/folders/...` on macOS but code-under-test canonicalizes to `/private/var/folders/...`; raw-path `starts_with`/`contains`/equality asserts then silently miss (Linux hides it — `/var` is already canonical). At the top of the test do `let root = dir.path().canonicalize().unwrap();` and derive expected paths from `root`. ~147 test files use tempdirs, so this is an easy latent regression to reintroduce.\n\n2. Isolate to per-test tempdirs; never touch real `$HOME`/XDG/prod state. Tests that read/write `~/.config/blackbox`, `~/.local/state/blackbox`, `~/.claude*`, the real tantivy index, or the prod daemon on 127.0.0.1:7264 collide across parallel agents/worktrees. Use `SharedState::for_test(tempdir)` (`src/server/state.rs`). Any test mutating process env must also hold `crate::util::test_env_lock()` (non-reentrant — don't double-take it via a helper that already locks).",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-30T19:46:21Z",
+  "updated_at": "2026-05-30T19:46:21Z",
+  "recall_count": 0
+}
