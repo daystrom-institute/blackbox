@@ -549,21 +549,17 @@ impl FleetOrchestrator {
             effort: None,
             provider_defaults: None,
         };
-        let mut args = spec.provider.build_exec_args(
+        let args = spec.provider.build_exec_args(
             &spec.prompt,
             &session_id,
             spec.cwd.as_deref(),
             Some(&opts),
         );
 
+        // The initial `-p <prompt>` from build_exec_args becomes the first user
+        // turn; bidi providers add the input-format flags in launch_interactive
+        // and ride subsequent turns/controls on the open stdin.
         let bidi = provider_supports_bidi(spec.provider);
-        if bidi {
-            // The initial `-p <prompt>` from build_exec_args becomes the first
-            // user turn; subsequent turns/controls ride the open stdin.
-            args.push("--input-format".into());
-            args.push("stream-json".into());
-            args.push("--replay-user-messages".into());
-        }
 
         // Resolve transport env (ANTHROPIC_BASE_URL + credentials for the
         // harness providers; selects Anthropic vs Responses transport). Without
@@ -753,6 +749,25 @@ mod tests {
         assert!(orch.tasks().is_empty());
         // subscribe must yield a live receiver without a prior dispatch.
         let _rx = orch.subscribe();
+    }
+
+    #[test]
+    fn build_exec_args_omits_input_format() {
+        // launch_interactive owns adding `--input-format`; build_exec_args must
+        // NOT, or bidi dispatch doubles the flag and the harness rejects it
+        // ("cannot be used multiple times"). Guards that regression.
+        for p in [
+            Provider::Claude,
+            Provider::Glm,
+            Provider::Deepseek,
+            Provider::Brodex,
+        ] {
+            let args = p.build_exec_args("hi", "sess", None, None);
+            assert!(
+                !args.iter().any(|a| a == "--input-format"),
+                "{p} build_exec_args must not add --input-format"
+            );
+        }
     }
 
     #[test]
