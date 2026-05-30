@@ -19,6 +19,8 @@ mod auto_digest;
 mod eval_score;
 mod external;
 mod json_ops;
+mod pathology_common;
+mod perf_pathology;
 mod schema_migration;
 mod system_events;
 #[cfg(test)]
@@ -33,6 +35,7 @@ use serde_json::Value;
 
 use super::context::{ArcContext, VarsSchema, resolve_arg_value};
 use arch_pathology::{exec_normalize_arch_pathology_atom_requests, exec_write_arch_pathology_plan};
+use perf_pathology::{exec_normalize_perf_pathology_atom_requests, exec_write_perf_pathology_plan};
 use auto_digest::{
     exec_aggregate_auto_edge_votes, exec_append_knowledge_link, exec_apply_entry,
     exec_extract_candidate_pairs, exec_log_reject, exec_read_session, exec_surface_to_inbox,
@@ -88,10 +91,18 @@ pub enum OpKind {
     /// dispatching them. LLM survey output sometimes stringifies nested
     /// `survey_json` objects; atom schemas require structured objects.
     NormalizeArchPathologyAtomRequests,
+    /// Perf-pathology sibling of `NormalizeArchPathologyAtomRequests`: normalize
+    /// performance-pathology survey atom requests (perf inherit-keys carry
+    /// `hot_paths` / `baseline_refs`) before dispatch.
+    NormalizePerfPathologyAtomRequests,
     Shell,
     /// Write an Architecture Pathology correction plan markdown file under
     /// `<project>/design/refactor/plans/<slug>.md` from reviewed plan JSON.
     WriteArchPathologyPlan,
+    /// Write a Performance Pathology correction plan markdown file under
+    /// `<project>/design/refactor/perf/plans/<slug>.md` from reviewed plan JSON
+    /// (`kind: performance-correction-plan`, `PP-*` acceptance criteria).
+    WritePerfPathologyPlan,
     WorktreeCreate,
     WorktreeRemove,
     SetMeta,
@@ -266,9 +277,15 @@ pub async fn execute_op_with_hub(
         OpKind::NormalizeArchPathologyAtomRequests => {
             exec_normalize_arch_pathology_atom_requests(&rendered_args, hook.into_var.as_deref())
         }
+        OpKind::NormalizePerfPathologyAtomRequests => {
+            exec_normalize_perf_pathology_atom_requests(&rendered_args, hook.into_var.as_deref())
+        }
         OpKind::Shell => exec_shell(&rendered_args, hook.into_var.as_deref(), ctx).await,
         OpKind::WriteArchPathologyPlan => {
             exec_write_arch_pathology_plan(&rendered_args, hook.into_var.as_deref())
+        }
+        OpKind::WritePerfPathologyPlan => {
+            exec_write_perf_pathology_plan(&rendered_args, hook.into_var.as_deref())
         }
         OpKind::WorktreeCreate => exec_worktree_create(&rendered_args, ctx).await,
         OpKind::WorktreeRemove => exec_worktree_remove(&rendered_args, ctx).await,

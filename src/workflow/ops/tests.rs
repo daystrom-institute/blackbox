@@ -165,6 +165,134 @@ async fn write_arch_pathology_plan_can_emit_rust_sections() {
 }
 
 #[tokio::test]
+async fn normalize_perf_pathology_atom_requests_inherits_perf_keys() {
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::NormalizePerfPathologyAtomRequests,
+        args: json!({
+            "allowed_atoms": ["atom:perf-n-plus-one-fetch@v1"],
+            "requests": [
+                {
+                    "atom_ref": "atom:perf-n-plus-one-fetch@v1",
+                    "args": {
+                        "survey_json": "{\"focus\":\"order creation\"}",
+                        "hot_paths": "src/orders/create.rs"
+                    }
+                }
+            ],
+            "defaults": {
+                "project_dir": "/repo",
+                "scope_filter": ".",
+                "hot_paths": [],
+                "operator_hints": ["profile shows 47 queries"],
+                "baseline_refs": ["design/refactor/perf/baselines/orders.txt"],
+                "survey_json": {"survey_summary": "fallback"},
+                "target_context_window": 10000,
+                "whiteboard_id": "perf-board"
+            }
+        }),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: Some("atom_requests".into()),
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    match effect {
+        OpEffect::SetVar { key, value } => {
+            assert_eq!(key, "atom_requests");
+            assert_eq!(
+                value[0]["atom_ref"],
+                "atom:perf-n-plus-one-fetch@v1"
+            );
+            // survey_json string is structure-coerced
+            assert_eq!(value[0]["args"]["survey_json"]["focus"], "order creation");
+            // single-string hot_paths is array-normalized
+            assert_eq!(
+                value[0]["args"]["hot_paths"],
+                json!(["src/orders/create.rs"])
+            );
+            // perf-only inherit keys fill from defaults
+            assert_eq!(
+                value[0]["args"]["baseline_refs"],
+                json!(["design/refactor/perf/baselines/orders.txt"])
+            );
+            assert_eq!(value[0]["args"]["project_dir"], "/repo");
+        }
+        _ => panic!("expected SetVar"),
+    }
+}
+
+#[tokio::test]
+async fn normalize_perf_pathology_atom_requests_rejects_unknown_atom() {
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::NormalizePerfPathologyAtomRequests,
+        args: json!({
+            "requests": [
+                { "atom_ref": "atom:rust-architecture-impl-role-coherence@v1", "args": {} }
+            ],
+            "defaults": { "project_dir": "/repo" }
+        }),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: Some("atom_requests".into()),
+    };
+    let err = execute_op(&hook, &ctx, None).await.unwrap_err();
+    assert!(err.to_string().contains("unsupported atom_ref"));
+}
+
+#[tokio::test]
+async fn write_perf_pathology_plan_emits_perf_path_and_frontmatter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let project_dir = tmp.path().to_string_lossy().to_string();
+    let ctx = ArcContext::new(ArcMeta::default());
+    let hook = HookOp {
+        op: OpKind::WritePerfPathologyPlan,
+        args: json!({
+            "project_dir": project_dir,
+            "slug": "Order Creation N+1",
+            "scope": "src/orders/create.rs",
+            "baseline_commit": "deadbeef",
+            "target_context_window": 12000,
+            "plan": {
+                "title": "Performance Correction Plan: order creation",
+                "brief": "Batch the per-row product fetch.",
+                "diagnosis_summary": "Order creation issues per-row product fetches.",
+                "evidence": "Query log shows 47 SELECTs per request.",
+                "remediation_plan": "Eager-load products in one query.",
+                "acceptance_criteria": [
+                    {"id": "PP-2", "criterion_text": "Query count drops from 47 to no more than 3."}
+                ],
+                "deferred": "Index tuning deferred."
+            }
+        }),
+        when: None,
+        on_failure: OnFailure::Halt,
+        into_var: Some("write_result".into()),
+    };
+    let effect = execute_op(&hook, &ctx, None).await.unwrap();
+    let (rel_path, abs_path) = match effect {
+        OpEffect::SetVar { key, value } => {
+            assert_eq!(key, "write_result");
+            (
+                value["plan_path"].as_str().unwrap().to_string(),
+                value["absolute_plan_path"].as_str().unwrap().to_string(),
+            )
+        }
+        _ => panic!("expected SetVar"),
+    };
+    assert_eq!(rel_path, "design/refactor/perf/plans/order-creation-n-1.md");
+    let body = std::fs::read_to_string(abs_path).unwrap();
+    assert!(body.contains("kind: performance-correction-plan"));
+    assert!(body.contains("  - performance"));
+    assert!(body.contains("generated_by: perf-pathology"));
+    // explicit criterion id is preserved
+    assert!(body.contains("- PP-2: Query count drops from 47 to no more than 3."));
+    assert!(body.contains(
+        "\"phase_doc_path\": \"design/refactor/perf/plans/order-creation-n-1.md\""
+    ));
+}
+
+#[tokio::test]
 async fn find_first_returns_match() {
     let ctx = ArcContext::new(ArcMeta::default());
     let hook = HookOp {
