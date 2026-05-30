@@ -21,10 +21,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use tokio::sync::broadcast;
+use serde_json::Value;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
 use super::providers::ExecOpts;
-use super::{Task, TaskStore, spawn_task};
+use super::{Task, TaskStore, spawn_task, spawn_task_interactive};
 
 // Re-export the consumer-facing types so the `bro fleet` cockpit depends only
 // on `blackbox::fleet::*` and never reaches into the crate-private
@@ -65,14 +67,63 @@ impl DispatchSpec {
 /// Opaque handle to a dispatched entrypoint agent. Wraps the live task; the
 /// cockpit holds these (it owns exactly what it spawned) and reads state
 /// through [`AgentHandle::snapshot`] without touching crate-private internals.
+///
+/// For bidi-capable providers the handle also holds the child's writable stdin
+/// (behind an async mutex so `&self` steer calls serialize), the channel for
+/// driving the persistent session per fleet-tui.md §1.
 #[derive(Clone)]
 pub struct AgentHandle {
     task: Arc<Task>,
+    stdin: Option<Arc<AsyncMutex<tokio::process::ChildStdin>>>,
 }
 
 impl AgentHandle {
     pub fn id(&self) -> String {
         self.task.id()
+    }
+
+    /// True when this agent runs a persistent bidirectional session and can be
+    /// steered (user-turns / control_requests). False for one-shot providers
+    /// (Codex et al., §2.1) — steering those is unsupported.
+    pub fn can_steer(&self) -> bool {
+        self.stdin.is_some()
+    }
+
+    /// Write one NDJSON control-plane line to the session's stdin.
+    async fn write_line(&self, line: String) -> anyhow::Result<()> {
+        let Some(stdin) = &self.stdin else {
+            anyhow::bail!("agent is not an interactive session — cannot steer");
+        };
+        let mut guard = stdin.lock().await;
+        guard.write_all(line.as_bytes()).await?;
+        guard.write_all(b"\n").await?;
+        guard.flush().await?;
+        Ok(())
+    }
+
+    /// Send a user-turn message (a steer / reply) into the live session (§1.1).
+    /// Queues at the agent's next turn boundary if a turn is in flight.
+    pub async fn send_user_turn(&self, text: &str) -> anyhow::Result<()> {
+        self.write_line(user_turn_ndjson(text)).await
+    }
+
+    /// `control_request{interrupt}` — cancel the running turn (§1.1, `Esc`).
+    pub async fn interrupt(&self) -> anyhow::Result<()> {
+        self.write_line(control_ndjson("interrupt", serde_json::Map::new()))
+            .await
+    }
+
+    /// `control_request{set_model}` — switch the model for subsequent turns.
+    pub async fn set_model(&self, model: &str) -> anyhow::Result<()> {
+        let mut extra = serde_json::Map::new();
+        extra.insert("model".into(), Value::String(model.to_string()));
+        self.write_line(control_ndjson("set_model", extra)).await
+    }
+
+    /// `/compact` — an in-stream slash command delivered as a user turn; the
+    /// agent emits a `compact_boundary` in response (§1.1, §2.4).
+    pub async fn compact(&self) -> anyhow::Result<()> {
+        self.send_user_turn("/compact").await
     }
 
     /// Point-in-time copy of the agent's live state, read under one lock.
@@ -169,7 +220,7 @@ impl FleetOrchestrator {
             .read()
             .all_tasks()
             .into_iter()
-            .map(|task| AgentHandle { task })
+            .map(|task| AgentHandle { task, stdin: None })
             .collect()
     }
 
@@ -177,10 +228,12 @@ impl FleetOrchestrator {
         &self.store_dir
     }
 
-    /// Spawn a new top-level entrypoint agent. v1 reuses the one-shot
-    /// `build_exec_args` path; the persistent bidirectional session (keystone,
-    /// §2) replaces the arg construction here once the harness/CLI seam lands.
-    /// Returns an [`AgentHandle`] — the cockpit holds it to read state.
+    /// Spawn a new top-level entrypoint agent. Bidi-capable providers (Claude,
+    /// GLM, DeepSeek, Brodex) launch a **persistent bidirectional session**
+    /// (`--input-format stream-json --replay-user-messages`, keystone §2) with
+    /// stdin kept open for steering; other providers fall back to one-shot
+    /// dispatch (no steering, §2.1). Returns an [`AgentHandle`] — the cockpit
+    /// holds it to read state and drive the session.
     pub fn dispatch(&self, spec: DispatchSpec) -> AgentHandle {
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -190,32 +243,96 @@ impl FleetOrchestrator {
             effort: None,
             provider_defaults: None,
         };
-        let args = spec.provider.build_exec_args(
+        let mut args = spec.provider.build_exec_args(
             &spec.prompt,
             &session_id,
             spec.cwd.as_deref(),
             Some(&opts),
         );
 
-        let task = spawn_task(
-            task_id,
-            spec.provider,
-            args,
-            session_id,
-            spec.cwd,
-            spec.env_overrides,
-            self.store_dir.clone(),
-            self.task_store.clone(),
-            self.tail_tx.clone(),
-            // Fleet agents are entrypoint agents, not bros — no team/brofile
-            // label and no `bro_report` surface (design §2.2). bro_label stays
-            // None; the cockpit names rows from the initial prompt (§5).
-            None,
-            None,
-            None,
-        );
-        AgentHandle { task }
+        let bidi = provider_supports_bidi(spec.provider);
+        if bidi {
+            // The initial `-p <prompt>` from build_exec_args becomes the first
+            // user turn; subsequent turns/controls ride the open stdin.
+            args.push("--input-format".into());
+            args.push("stream-json".into());
+            args.push("--replay-user-messages".into());
+        }
+
+        // Fleet agents are entrypoint agents, not bros — no team/brofile label
+        // and no `bro_report` surface (§2.2). bro_label stays None; the cockpit
+        // names rows from the initial prompt (§5).
+        if bidi {
+            let spawned = spawn_task_interactive(
+                task_id,
+                spec.provider,
+                args,
+                session_id,
+                spec.cwd,
+                spec.env_overrides,
+                self.store_dir.clone(),
+                self.task_store.clone(),
+                self.tail_tx.clone(),
+                None,
+                None,
+                None,
+            );
+            AgentHandle {
+                task: spawned.task,
+                stdin: spawned.stdin.map(|s| Arc::new(AsyncMutex::new(s))),
+            }
+        } else {
+            let task = spawn_task(
+                task_id,
+                spec.provider,
+                args,
+                session_id,
+                spec.cwd,
+                spec.env_overrides,
+                self.store_dir.clone(),
+                self.task_store.clone(),
+                self.tail_tx.clone(),
+                None,
+                None,
+                None,
+            );
+            AgentHandle { task, stdin: None }
+        }
     }
+}
+
+/// Providers that speak the persistent bidirectional stream-json control
+/// protocol: Claude (CLI bidi mode) and the bro-harness providers GLM /
+/// DeepSeek / Brodex (§2). Others are one-shot only.
+fn provider_supports_bidi(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex
+    )
+}
+
+/// One NDJSON user-turn message for the harness/Claude input stream
+/// (`{"type":"user","message":{"role":"user","content":"…"}}`).
+fn user_turn_ndjson(text: &str) -> String {
+    serde_json::json!({
+        "type": "user",
+        "message": { "role": "user", "content": text },
+    })
+    .to_string()
+}
+
+/// One NDJSON `control_request` line with a fresh `request_id`. `extra` carries
+/// subtype-specific fields (e.g. `model` for `set_model`).
+fn control_ndjson(subtype: &str, extra: serde_json::Map<String, Value>) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("type".into(), Value::String("control_request".into()));
+    obj.insert(
+        "request_id".into(),
+        Value::String(uuid::Uuid::new_v4().to_string()),
+    );
+    obj.insert("subtype".into(), Value::String(subtype.into()));
+    obj.extend(extra);
+    Value::Object(obj).to_string()
 }
 
 #[cfg(test)]
@@ -228,6 +345,47 @@ mod tests {
         assert!(orch.tasks().is_empty());
         // subscribe must yield a live receiver without a prior dispatch.
         let _rx = orch.subscribe();
+    }
+
+    #[test]
+    fn bidi_capability_gate() {
+        for p in [
+            Provider::Claude,
+            Provider::Glm,
+            Provider::Deepseek,
+            Provider::Brodex,
+        ] {
+            assert!(provider_supports_bidi(p), "{p} should be bidi-capable");
+        }
+        for p in [Provider::Codex, Provider::Gemini, Provider::Inception] {
+            assert!(!provider_supports_bidi(p), "{p} should be one-shot");
+        }
+    }
+
+    #[test]
+    fn user_turn_ndjson_shape() {
+        let line = user_turn_ndjson("hi there");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        assert_eq!(v["message"]["content"], "hi there");
+        assert!(!line.contains('\n'), "NDJSON line must be single-line");
+    }
+
+    #[test]
+    fn control_ndjson_shape() {
+        let interrupt = control_ndjson("interrupt", serde_json::Map::new());
+        let v: Value = serde_json::from_str(&interrupt).unwrap();
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["subtype"], "interrupt");
+        assert!(v["request_id"].as_str().is_some_and(|s| !s.is_empty()));
+
+        let mut extra = serde_json::Map::new();
+        extra.insert("model".into(), Value::String("opus".into()));
+        let set_model = control_ndjson("set_model", extra);
+        let v: Value = serde_json::from_str(&set_model).unwrap();
+        assert_eq!(v["subtype"], "set_model");
+        assert_eq!(v["model"], "opus");
     }
 
     #[test]

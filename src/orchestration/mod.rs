@@ -867,6 +867,20 @@ pub struct SpawnTaskParams {
     /// are observation-only: emit failures are logged but do not affect
     /// task dispatch.
     pub system_events: Option<crate::system_events::SharedEventHub>,
+    /// Persistent bidirectional session mode (fleet-tui.md item 6). When true,
+    /// child stdin is piped and kept **open and writable** after spawn (returned
+    /// on [`SpawnedTask::stdin`]) instead of being closed after the one-shot
+    /// prompt, so the caller can drive successive user-turns and
+    /// `control_request`s. One-shot dispatch leaves this false.
+    pub interactive: bool,
+}
+
+/// Result of a spawn: the tracked task plus, in `interactive` mode, the writable
+/// child stdin for driving a persistent bidirectional session. `stdin` is `None`
+/// in one-shot mode (closed after the prompt) and on spawn failure.
+pub struct SpawnedTask {
+    pub task: Arc<Task>,
+    pub stdin: Option<tokio::process::ChildStdin>,
 }
 
 pub fn spawn_with_pre_minted_id(
@@ -874,7 +888,7 @@ pub fn spawn_with_pre_minted_id(
     params: SpawnTaskParams,
 ) -> Result<Arc<Task>, BroSpawnError> {
     params.task_store.write().reserve_id(&task_id)?;
-    Ok(spawn_task_reserved(task_id, params))
+    Ok(spawn_task_reserved(task_id, params).task)
 }
 
 fn failed_duplicate_task(
@@ -1210,6 +1224,72 @@ pub fn spawn_task(
         bro_label,
         agent_label,
         system_events,
+        interactive: false,
+    };
+
+    spawn_task_reserved(task_id, params).task
+}
+
+/// Spawn a task in **persistent bidirectional mode** (fleet-tui.md item 6): the
+/// child's stdin is kept open and writable so the caller can drive successive
+/// user-turns and `control_request`s over the stream-json control protocol. The
+/// returned [`SpawnedTask`] carries that writable stdin. Reuses the full
+/// one-shot spawn machinery (env hygiene, login-shell bin resolution,
+/// stream-json reader, persistence registration, supervision); the only
+/// difference is that stdin stays open.
+///
+/// Args should already include `--input-format stream-json` (and typically
+/// `--replay-user-messages`); the initial `-p <prompt>` becomes the first user
+/// turn, subsequent turns/controls are written to the returned stdin.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_task_interactive(
+    task_id: String,
+    provider: Provider,
+    args: Vec<String>,
+    session_id: String,
+    cwd: Option<String>,
+    env_overrides: Option<HashMap<String, String>>,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    bro_label: Option<String>,
+    agent_label: Option<String>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) -> SpawnedTask {
+    if let Err(err) = task_store.write().reserve_id(&task_id) {
+        if let Some(existing) = task_store.read().get(&task_id) {
+            return SpawnedTask {
+                task: existing,
+                stdin: None,
+            };
+        }
+        return SpawnedTask {
+            task: failed_duplicate_task(
+                task_id,
+                provider,
+                session_id,
+                cwd,
+                bro_label,
+                agent_label,
+                err.to_string(),
+            ),
+            stdin: None,
+        };
+    }
+
+    let params = SpawnTaskParams {
+        provider,
+        args,
+        session_id,
+        cwd,
+        env_overrides,
+        store_dir,
+        task_store,
+        tail_tx,
+        bro_label,
+        agent_label,
+        system_events,
+        interactive: true,
     };
 
     spawn_task_reserved(task_id, params)
@@ -1262,7 +1342,7 @@ fn claude_family_option_takes_value(arg: &str) -> bool {
     )
 }
 
-fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
+fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask {
     let SpawnTaskParams {
         provider,
         args,
@@ -1275,6 +1355,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         bro_label,
         agent_label,
         system_events,
+        interactive,
     } = params;
     let id = task_id;
 
@@ -1302,10 +1383,17 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
     };
     let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
     let mut args = args;
-    let stdin_payload = move_large_prompt_arg_to_stdin(provider, &mut args);
+    // Interactive sessions keep the prompt in `-p` (first user turn) and drive
+    // later turns over stdin, so no large-prompt move; one-shot mode may still
+    // spill an oversized prompt to stdin.
+    let stdin_payload = if interactive {
+        None
+    } else {
+        move_large_prompt_arg_to_stdin(provider, &mut args)
+    };
     let mut cmd = Command::new(&bin);
     cmd.args(&args)
-        .stdin(if stdin_payload.is_some() {
+        .stdin(if interactive || stdin_payload.is_some() {
             std::process::Stdio::piped()
         } else {
             std::process::Stdio::null()
@@ -1363,18 +1451,26 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
             let _ = task_store.write().insert_reserved(id, task.clone());
             task_store.read().persist(&store_dir);
             task.notify.notify_waiters();
-            return task;
+            return SpawnedTask { task, stdin: None };
         }
     };
 
     let pid = child.id();
-    if let Some(payload) = stdin_payload {
-        if let Some(mut stdin) = child.stdin.take() {
-            tokio::spawn(async move {
-                let _ = stdin.write_all(payload.as_bytes()).await;
-            });
+    // Interactive mode: keep stdin open and writable for the caller to drive the
+    // persistent session. One-shot mode: write the spilled prompt then drop the
+    // handle (closing stdin) as before.
+    let interactive_stdin = if interactive {
+        child.stdin.take()
+    } else {
+        if let Some(payload) = stdin_payload {
+            if let Some(mut stdin) = child.stdin.take() {
+                tokio::spawn(async move {
+                    let _ = stdin.write_all(payload.as_bytes()).await;
+                });
+            }
         }
-    }
+        None
+    };
     let task = Arc::new(Task {
         inner: Mutex::new(TaskInner {
             id: id.clone(),
@@ -1408,7 +1504,10 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         let failed =
             failed_duplicate_task(id, provider, session_id, cwd, None, None, err.to_string());
         failed.notify.notify_waiters();
-        return failed;
+        return SpawnedTask {
+            task: failed,
+            stdin: None,
+        };
     }
 
     // Emit tail event
@@ -1851,7 +1950,10 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> Arc<Task> {
         task_ref_wait.notify.notify_waiters();
     });
 
-    task
+    SpawnedTask {
+        task,
+        stdin: interactive_stdin,
+    }
 }
 
 async fn export_opencode_session(
@@ -2514,6 +2616,7 @@ mod tests {
                 bro_label: None,
                 agent_label: None,
                 system_events: None,
+                interactive: false,
             },
         )
         .unwrap();
