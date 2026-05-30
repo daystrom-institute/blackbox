@@ -30,6 +30,13 @@ pub mod render;
 /// The spine produces one of these per edited file. `new` holds RAW diagnostics
 /// (presentation owns classification); `fixed`/`carried` are counts the rider
 /// can mention so a clean result reads as a *scoped* claim, not "all good".
+///
+/// No `Scope` field by design (MVP — see note-b59cadc5). At the instant/error
+/// tier the scope is a fixed implicit "(this crate, default cfg, as rust-analyzer
+/// sees it)", so an explicit `[pkg, features]` stamp adds little and would bake in
+/// pkg/features detection prematurely. Add a `Scope` here when the check/truth
+/// tier lands config-sensitive lints (`candidate`/`deferred` confidence) — that is
+/// where scope becomes load-bearing.
 #[derive(Debug, Clone)]
 pub struct DiffResult {
     /// Worktree-relative path of the edited file.
