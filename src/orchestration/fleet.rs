@@ -121,6 +121,16 @@ impl AgentHandle {
         self.stdin.is_some()
     }
 
+    /// A clone of this handle with the live stdin dropped — used after the
+    /// session is stopped, so the cockpit treats it as non-live (a later steer
+    /// resumes it rather than writing to a dead pipe).
+    pub fn without_stdin(&self) -> AgentHandle {
+        AgentHandle {
+            task: self.task.clone(),
+            stdin: None,
+        }
+    }
+
     /// Write one NDJSON control-plane line to the session's stdin.
     async fn write_line(&self, line: String) -> anyhow::Result<()> {
         let Some(stdin) = &self.stdin else {
@@ -637,12 +647,19 @@ impl FleetOrchestrator {
     }
 
     /// Drop a task from the store (used after a resume supersedes the old
-    /// Interrupted task, so a reload doesn't show a stale duplicate).
+    /// Interrupted task, or on Ctrl+X delete, so a reload doesn't show it). The
+    /// underlying provider session jsonl survives on disk regardless (§5).
     pub fn forget(&self, task_id: &str) {
         self.task_store
             .write()
             .retain_drop(|t| t.id() != task_id);
         self.persist();
+    }
+
+    /// Stop a running session (Ctrl+X): SIGTERM the child and mark it Cancelled
+    /// (→ Interrupted). The provider session survives on disk for resume.
+    pub fn stop(&self, handle: &AgentHandle) -> Result<(), String> {
+        super::cancel_task(&handle.task, &self.task_store, &self.store_dir)
     }
 
     /// Spawn a persistent bidirectional session from already-built provider args

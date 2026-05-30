@@ -417,6 +417,12 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         start_rename(app);
         return;
     }
+    // Ctrl+X: stop a live agent (→ Interrupted), or delete an already-stopped
+    // one from the roster (Claude-agents idiom, §5).
+    if ctrl && key.code == KeyCode::Char('x') {
+        stop_or_delete_selected(app);
+        return;
+    }
     // `tab` is the always-available provider cycle, even with a non-empty
     // composer (§5.1).
     if key.code == KeyCode::Tab {
@@ -474,6 +480,43 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
 
         _ => {}
+    }
+}
+
+/// Ctrl+X on the selected agent: a live one is stopped (→ Interrupted); an
+/// already-Interrupted one is deleted from the roster. The provider session
+/// survives on disk either way (§5).
+fn stop_or_delete_selected(app: &mut App) {
+    let Some(idx) = app.selected_agent() else {
+        return;
+    };
+    // A live session (process Running, regardless of Active/Idle/Waiting) is
+    // stopped; any terminal one (Completed / Failed / Cancelled, incl. reloaded
+    // Interrupted) is deleted.
+    if app.agents[idx].task.snapshot().status == TaskStatus::Running {
+        // Stop: SIGTERM the child → Interrupted. Drop our stdin so the row is
+        // treated as non-live (a later steer resumes it).
+        match app.orch.stop(&app.agents[idx].task) {
+            Ok(()) => {
+                app.agents[idx].task = app.agents[idx].task.without_stdin();
+                app.set_status("stopped — Ctrl+X again to delete", Duration::from_secs(3));
+            }
+            Err(e) => app.set_status(format!("stop: {e}"), Duration::from_secs(4)),
+        }
+    } else {
+        // Delete: forget the cockpit's task record + drop the row. The provider
+        // session jsonl persists for a future resume.
+        let id = app.agents[idx].task.id();
+        app.orch.forget(&id);
+        app.agents.remove(idx);
+        let n = app.agents.len();
+        if n == 0 || app.roster_selected >= n {
+            app.roster_selected = n.saturating_sub(1);
+        }
+        if app.zone == Zone::SingleAgent {
+            app.zone = Zone::Roster;
+        }
+        app.set_status("deleted from roster (session kept on disk)", Duration::from_secs(3));
     }
 }
 
@@ -1197,8 +1240,8 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, stats: Option<&str>) {
     }
     let nav = match app.zone {
         Zone::ProviderSelector => "↑/↓ provider  →/Tab confirm",
-        Zone::Roster => "↑/↓ agent  → open  ← provider  Ctrl+R rename",
-        Zone::SingleAgent => "← roster  Esc interrupt  ↑/↓ history",
+        Zone::Roster => "↑/↓ agent  → open  ← provider  Ctrl+R rename  Ctrl+X stop/del",
+        Zone::SingleAgent => "← roster  Esc interrupt  Ctrl+X stop/del  ↑/↓ history",
     };
     spans.push(Span::styled(
         format!("{nav}  ·  Ctrl+Q quit"),
