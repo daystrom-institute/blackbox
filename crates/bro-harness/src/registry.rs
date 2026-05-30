@@ -75,6 +75,12 @@ impl PinPolicy {
             None => name == p,
         })
     }
+
+    /// Add a name (or trailing-`*` glob) to the pin set. Used to pin the fleet
+    /// `report` tool only in bidirectional mode.
+    pub fn also_pin(&mut self, name: &str) {
+        self.patterns.push(name.to_string());
+    }
 }
 
 struct Entry {

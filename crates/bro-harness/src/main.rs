@@ -9,10 +9,12 @@
 //! there. All diagnostics go to stderr.
 
 mod agent_loop;
+mod bound;
 mod cli;
 mod compaction;
 mod emit;
 mod hooks;
+mod report;
 mod mcp;
 mod registry;
 mod session;

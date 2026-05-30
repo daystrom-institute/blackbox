@@ -155,6 +155,20 @@ impl Emitter {
         }));
     }
 
+    /// The builtin `report` tool's status/needs signal — drives the cockpit's
+    /// Waiting bucket and row summary (fleet-tui.md §2.2). Distinct from the
+    /// daemon's `bro_report`; the daemon's claude parser ignores `report` lines.
+    pub fn report(&self, message: &str, needs_input: bool) {
+        self.write_line(json!({
+            "type": "report",
+            "session_id": self.session_id,
+            "report": {
+                "message": message,
+                "needs_input": needs_input,
+            },
+        }));
+    }
+
     /// Terminal `result` event with usage/turns/cost.
     pub fn result(&self, text: &str, usage: &Usage, num_turns: u64, cost_usd: Option<f64>) {
         // Emit the Anthropic-native usage shape (fresh `input_tokens` plus

@@ -166,6 +166,9 @@ struct Session {
     max_turns: u64,
     compaction: crate::compaction::CompactionPolicy,
     compact_threshold: Option<u64>,
+    /// Tool-result spill threshold in bytes (0 ⇒ disabled) and the dump dir.
+    tool_result_cap: usize,
+    dump_dir: std::path::PathBuf,
     store: SessionStore,
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
@@ -250,11 +253,22 @@ impl Session {
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             clipboard: clipboard.clone(),
         };
-        let builtins = builtin_tools();
+        // The builtin `report` tool is harness-owned (it emits the cockpit's
+        // status signal on the stream) and holds its own emitter handle. It is
+        // registered always but only pinned in fleet (bidirectional) mode.
+        let fleet = cli.input_format.as_deref() == Some("stream-json");
+        let mut builtins = builtin_tools();
+        builtins.push(Arc::new(crate::report::ReportTool::new(Emitter::new(
+            store.id.clone(),
+        ))));
         let tool_filter =
             mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
         let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
-        let reg = Registry::new(builtins, mcp_tools, &PinPolicy::from_env(), &tool_filter);
+        let mut pin = PinPolicy::from_env();
+        if fleet {
+            pin.also_pin(crate::report::REPORT_TOOL);
+        }
+        let reg = Registry::new(builtins, mcp_tools, &pin, &tool_filter);
 
         let base_opts = TurnOpts {
             model,
@@ -267,6 +281,8 @@ impl Session {
         let emitter = Emitter::new(store.id.clone());
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
+        let tool_result_cap = crate::bound::cap_bytes();
+        let dump_dir = crate::bound::dump_dir();
 
         Ok(Self {
             tx,
@@ -279,6 +295,8 @@ impl Session {
             max_turns,
             compaction,
             compact_threshold,
+            tool_result_cap,
+            dump_dir,
             store,
             prior_side,
             todos,
@@ -449,6 +467,15 @@ impl Session {
                     _ = cancel.changed() => { interrupted = true; break 'dispatch; }
                     res = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx) => {
                         let (content, is_error) = res.into_content();
+                        // Spill an oversized result to disk and inline a head +
+                        // rider, uniformly across builtin and MCP tools (§2.3).
+                        let content = crate::bound::bound_tool_result(
+                            &tc.name,
+                            content,
+                            self.tool_result_cap,
+                            &self.dump_dir,
+                            &tc.id,
+                        );
                         let mut result = transport::ToolResult {
                             id: tc.id.clone(),
                             content,
