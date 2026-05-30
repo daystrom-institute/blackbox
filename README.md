@@ -194,80 +194,82 @@ Rewrite the provider instruction files from the canonical store so every agent s
 bbox_render(scope: "both", project: "/home/you/repos/my-app")
 ```
 
-- **`scope=global`** - patches `~/.claude-shared/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including RTK `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
-- **`scope=project`** - writes `<repo>/{CLAUDE,AGENTS,GEMINI}.md` with **only** project-scope entries + verbatim `PROJECT.md` content. Global entries aren't duplicated per project.
+- **`scope=global`** - writes the canonical shared doc to `~/.blackbox/BLACKBOX.md` and patches a small managed region (an `@.../BLACKBOX.md` import pointer plus any global provider-specific entries) into each provider's global memory file — `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md` — between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. User-authored content outside the markers (including RTK `@imports`) is preserved. Originals snapshot to `~/.local/state/blackbox/backups/<ISO-ts>/` before every write.
+- **`scope=project`** - writes `<repo>/{CLAUDE,AGENTS,GEMINI}.md` from the project's durable knowledge + verbatim `PROJECT.md` content. Global entries aren't duplicated per project. Project knowledge is **repo-owned**: it lives in committed `<repo>/.bbox/knowledge/` (see [Project knowledge is repo-owned](#project-knowledge-is-repo-owned)), so the render is a deterministic function of the committed tree — identical on every checkout.
 - **`scope=both`** - both. Useful on first install or for a forced re-sync.
 
-From this point on: `bbox_learn` / `bbox_remember` to add or update, `bbox_render` to push changes out to provider files, `bbox_absorb` to pull external edits back in. See [Knowledge lifecycle](#knowledge-lifecycle) below for the full loop.
+From this point on: `bbox_learn` / `bbox_decide` / `bbox_remember` to add or update, `bbox_render` to push changes out to provider files. Render is **unidirectional** (store → files); to capture content you hand-authored directly in an instruction file, use `bbox_bootstrap` (`bbox_absorb` is now a compatibility no-op). See [Knowledge lifecycle](#knowledge-lifecycle) below for the full loop.
 
 ### 6. Migrate hand-authored content (one-time, per scope)
 
-> **Critical**: pre-existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content is **not deleted** by `bbox_bootstrap` or `bbox_render`. Without explicit migration, the same rules end up in the file **twice** - once as your original prose, once again rendered inside the bbox managed region. Agents read both and get confused.
+> **Critical**: pre-existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content is **not deleted** by `bbox_bootstrap` or `bbox_render`. Without explicit migration, the same rules can end up in the file **twice** - once as your original prose, once again rendered inside the bbox managed region. Agents read both and get confused.
 
-The migration loop is the same for global and project scope:
+The flow is **unidirectional** (store → files). To capture content you wrote by hand, import it into the store with `bbox_bootstrap`, then render. (`bbox_absorb` is a compatibility no-op; there is no reverse sync from rendered files back into the store.)
 
 1. **Inspect** what bbox would write (dry-run):
    ```
    bbox_render(scope: "global",  dry_run: true)
    bbox_render(scope: "project", project: "/home/you/repos/my-app", dry_run: true)
    ```
-2. **Absorb** any hand-authored content you want to keep into the store (creates `Imported` entries):
-   - **Global**: `bbox_absorb(scope: "global")` reads ONLY the managed region between `<!-- bb:managed-start -->` / `<!-- bb:managed-end -->` markers. Content outside the markers (RTK steerage, your own notes) is left alone.
-   - **Project**: `bbox_absorb(project: "/home/you/repos/my-app")` reads the WHOLE rendered file (project files are entirely bbox-rendered).
-3. **Review + approve** the imports:
+2. **Import** hand-authored content with `bbox_bootstrap` (creates entries):
    ```
-   bbox_review(action: "list")               # see imports
-   bbox_review(action: "approve", id: "…")   # promote each one to verified
+   bbox_bootstrap(project: "/home/you/repos/my-app")
    ```
-4. **Prune** the original hand-authored content from the file:
-   - **Global** files: delete content **inside** the managed region that's now also stored in bbox; leave RTK `@imports` and your own notes outside the markers untouched.
-   - **Project** files (`<repo>/CLAUDE.md` etc.): if you want everything bbox-managed, delete the entire file's contents - `bbox_render scope=project` will recreate it from the store. If you want a hybrid, leave the section above the managed region.
-5. **Render** to confirm a clean output:
+3. **Review + approve** the imports, then **render** to confirm clean output:
    ```
+   bbox_review(action: "list")
+   bbox_review(action: "approve", id: "…")
    bbox_render(scope: "both", project: "/home/you/repos/my-app")
    ```
 
-After step 5 the rendered file should match the bbox managed region with no duplicates. Subsequent edits go through `bbox_learn` / `bbox_remember` (write) and `bbox_render` (publish); `bbox_absorb` is for catching out-of-band edits made directly in the rendered file.
+Subsequent edits go through `bbox_learn` / `bbox_decide` / `bbox_remember` (write) and `bbox_render` (publish).
+
+### Project knowledge is repo-owned
+
+Project-scoped durable knowledge (`bbox_learn` / `bbox_decide` / `bbox_remember` with `scope=project`) is owned by the **repo it describes**, not the host. Each entry is one file under `<repo>/.bbox/knowledge/<id>.json`, committed to git, so it travels with the checkout and reproduces identically on every machine. The committed file omits the absolute project path (location encodes scope); the central store holds only global entries. The daemon loads a registered repo's `.bbox/knowledge/` into its query surface, indexes it for search, and renders `<repo>/{CLAUDE,AGENTS,GEMINI}.md` from it.
+
+- A project becomes repo-owned once its `.bbox/knowledge/` directory exists — created by a clone that already carries it, by `bbox_project_init`, or by `bbox_project_eject`. Until then, project-scoped writes stay in the central store, so simply running the daemon never bulk-migrates every registered repo.
+- **Migrate an existing project** (entries created before the cutover live in the central store): preview with `bbox_project_eject(project: "/home/you/repos/my-app", dry_run: true)`, then run it without `dry_run` to write the entries into `.bbox/knowledge/` and drop the central copies. **Commit the resulting `.bbox/knowledge/` files** to publish them.
+- **Second machine**: clone the repo (with its committed `.bbox/knowledge/`), register it, and render reproduces the same project instruction files — no clobber, nothing to reconcile.
+- Settled investigations follow the same principle: promoting or resolving a thread writes a scrubbed durable record to committed `<repo>/.bbox/record/`. Live threads, side-channel notes, and pins stay host-local (operational exhaust), so they never churn the repo or leak per-host identity.
 
 ---
 
 ## Knowledge lifecycle
 
-Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) as *rendered outputs* of a single canonical store - not as sources of truth. This lets every agent on the host see consistent content, lets you edit in any file and have it reconciled, and keeps provider-specific quirks (Copilot's greedy reading, Gemini's unsupported global memory) handled in one place.
+Blackbox treats your provider instruction files (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`) as *rendered outputs* of the knowledge store - not as sources of truth. This lets every agent on the host see consistent content and keeps provider-specific quirks (Copilot's greedy reading, Gemini's unsupported global memory) handled in one place. The flow is **one-way**: you write entries, render projects them into files. Hand edits to a rendered file are not synced back (`bbox_absorb` is a no-op) — import hand-authored content with `bbox_bootstrap` instead.
 
 ```
-  edit from a CLI               edit in a rendered file
-        │                                 │
-   bbox_learn /                     bbox_absorb
-   bbox_remember                    (diff-based)
-        │                                 │
-        ▼                                 ▼
+   bbox_learn / bbox_decide / bbox_remember
+                    │
+                    ▼
    ┌───────────────────────────────────────────────┐
-   │     blackbox-knowledge.json (canonical)       │
-   │  entries tagged scope, category, provider,    │
-   │  verified, decay, timestamps                  │
+   │  global entries  →  host store (kb.json)      │
+   │  project entries →  <repo>/.bbox/knowledge/   │  (committed; travels with the repo)
    └───────────────────────────────────────────────┘
-                        │
-                   bbox_render
-                        │
-        ┌───────────────┼────────────────┐
-        ▼               ▼                ▼
-   CLAUDE.md        AGENTS.md        GEMINI.md
+                    │
+               bbox_render   (one-way)
+                    │
+        ┌───────────┼────────────────┐
+        ▼           ▼                ▼
+   CLAUDE.md    AGENTS.md        GEMINI.md      (+ ~/.blackbox/BLACKBOX.md for global)
 ```
 
 | Tool | When to use |
 |---|---|
 | **`bbox_bootstrap`** | New repo - scan existing instruction files and import as entries. Run once per repo. |
-| **`bbox_learn`** | Add or update an entry. Entry will be rendered into provider markdown on next `bbox_render`. |
-| **`bbox_remember`** | Store an on-demand fact. **NOT rendered** into markdown - searchable via `bbox_knowledge` only. |
+| **`bbox_learn`** | Add or update a rendered entry. Project scope → committed `<repo>/.bbox/knowledge/`; global → host store. |
+| **`bbox_decide`** | Record a durable commitment with rationale. Same scope routing as `bbox_learn`. |
+| **`bbox_remember`** | Store an on-demand fact. **NOT rendered** into markdown - searchable via `bbox_knowledge` only. Same scope routing. |
 | **`bbox_knowledge`** | List / search entries with category / scope / provider filters. |
-| **`bbox_render`** | Emit the canonical store back to provider instruction files (global / project / both). |
-| **`bbox_absorb`** | Detect external edits to rendered files and import them as unverified entries. `scope=project` (default) reads the whole `<repo>/{CLAUDE,AGENTS,GEMINI}.md`; `scope=global` reads only the managed region of `~/.claude-shared/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md`. |
-| **`bbox_review`** | Approve or reject unverified entries (from bootstrap or absorb). |
+| **`bbox_render`** | Project the store into provider files. Global → `~/.blackbox/BLACKBOX.md` + managed regions in `~/.claude/CLAUDE.md` / `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md`; project → `<repo>/{CLAUDE,AGENTS,GEMINI}.md` from `.bbox/knowledge/` + `PROJECT.md`. One-way. |
+| **`bbox_project_eject`** | Migrate a project's central-store entries into committed `<repo>/.bbox/knowledge/` (with `dry_run`). Opts the project into repo-ownership. |
+| **`bbox_absorb`** | Compatibility no-op. There is no reverse sync from rendered files into the store; use `bbox_bootstrap` to import hand-authored content. |
+| **`bbox_review`** | Approve or reject unverified entries (from bootstrap). |
 | **`bbox_forget`** | Remove or supersede an entry. |
 | **`bbox_lint`** | Health check: contradictions, stale entries, duplicates. |
 
-`bbox_render` is the write step; without it, changes stay in the store and don't reach your agents. `bbox_absorb` is the inverse - handy after you've edited a `CLAUDE.md` directly and want the change captured before a later render overwrites it.
+`bbox_render` is the write step; without it, changes stay in the store and don't reach your agents. The store → files flow is one-way: to capture content edited directly in a rendered file, re-import it with `bbox_bootstrap`.
 
 ---
 
@@ -404,8 +406,9 @@ See [Knowledge lifecycle](#knowledge-lifecycle) for the narrative - quick refere
 | `bbox_learn` | Add / update a knowledge entry. Rendered into provider markdown on next `bbox_render`. |
 | `bbox_remember` | Store a fact for on-demand recall only - NOT rendered into markdown. |
 | `bbox_knowledge` | List / search knowledge entries with category / scope / provider filters. |
-| `bbox_render` | Render entries → CLAUDE.md / AGENTS.md / GEMINI.md (steerage → memory → PROJECT.md). |
-| `bbox_absorb` | Detect external edits to rendered files and import them as unverified entries. |
+| `bbox_render` | Render entries → CLAUDE.md / AGENTS.md / GEMINI.md (steerage → memory → PROJECT.md). One-way; project entries come from committed `<repo>/.bbox/knowledge/`. |
+| `bbox_project_eject` | Migrate a project's central-store knowledge into committed `<repo>/.bbox/knowledge/` (with `dry_run`). |
+| `bbox_absorb` | Compatibility no-op (no reverse sync; use `bbox_bootstrap` to import hand-authored files). |
 | `bbox_review` | Review unverified entries - list, approve, reject. |
 | `bbox_forget` | Remove or supersede an entry. |
 | `bbox_lint` | Health check: contradictions, stale entries, duplicates. |

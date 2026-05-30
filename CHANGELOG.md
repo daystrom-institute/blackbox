@@ -91,8 +91,43 @@ out explicitly under `Changed` or `Removed`.
 - EX-V6 round-trip preservation skeleton (`src/refactor/elixir/roundtrip.rs`)
   wired into every writable Elixir plan kind to enforce parse-clean
   output before the plan returns.
+- Repo-owned project knowledge. Project-scoped durable knowledge
+  (`bbox_learn` / `bbox_decide` / `bbox_remember` with `scope=project`) now
+  persists one file per entry under the owning repo's
+  `.bbox/knowledge/<id>.json` and travels with the checkout, instead of living
+  only in the host's central store keyed on an absolute path that does not
+  survive a different machine, checkout location, or `$HOME`. The committed file
+  omits the `project` field — location encodes scope — so it reproduces
+  identically on any clone. The daemon loads each registered repo's
+  `.bbox/knowledge/` into the query surface at startup and on
+  register/rename/unregister, indexes those entries into search, and enqueues
+  their embeddings. `bbox_render scope=project` derives deterministically from
+  the committed `.bbox/`, which closes the second-machine trap where rendering
+  from an empty-for-this-host store would overwrite committed instruction files
+  with a near-empty stub. A project becomes repo-owned only once its
+  `.bbox/knowledge/` directory exists (created by a clone that carries it, by
+  `bbox_project_init`, or by `bbox_project_eject`), so deploying the daemon
+  never bulk-migrates every registered repo at boot.
+- `bbox_project_eject`: migrate a registered project's existing central-store
+  knowledge entries into its committed `.bbox/knowledge/` (one file per entry,
+  absolute path scrubbed), with a `dry_run` preview. Opts the project into
+  repo-ownership.
+- Thread activity→record seam. Promoting or resolving a thread now snapshots a
+  scrubbed durable summary into the owning repo's committed
+  `.bbox/record/<id>.json` (absolute host paths reduced to `~`; session/bro/task
+  identity and live-state fields omitted), and the reindex makes those records
+  searchable on a clone where the host-local thread store does not carry them.
+  Live threads, side-channel notes, and pins remain host-local operational
+  exhaust by design.
 
 ### Changed
+
+- Project provider files (`<repo>/{CLAUDE,AGENTS,GEMINI}.md`) and project-scoped
+  knowledge are now a one-way projection of the committed `.bbox/`, not a
+  bidirectional sync. The system of record for project durable knowledge is the
+  repo; the daemon is a derived index over it. `bbox_absorb` remains a
+  compatibility no-op — recover hand-authored instruction content with
+  `bbox_bootstrap`, then render unidirectionally from the store.
 
 ### Fixed
 
