@@ -671,6 +671,16 @@ fn repo_kb_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bbox").join("knowledge")
 }
 
+/// A project is "repo-owned" once its `.bbox/knowledge/` directory exists —
+/// created by a clone that carries it, by `bbox_project_init`, or by
+/// `bbox_project_eject`. Only then does `save` route the project's entries into
+/// the repo. This makes migration deliberate and per-project: a plain global
+/// save (e.g. the boot-time tool-reference sync) must NOT silently rewrite
+/// every registered repo's working tree just because the dirs happen to exist.
+fn project_is_repo_owned(project_dir: &Path) -> bool {
+    repo_kb_dir(project_dir).is_dir()
+}
+
 /// Load every project-scoped entry committed under `<project_dir>/.bbox/knowledge/`,
 /// stamping each with `project = project_dir` (the field is absent on disk).
 fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
@@ -783,7 +793,11 @@ impl Knowledge {
         let mut by_project: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
         for e in &self.store.entries {
             match e.project.as_deref() {
-                Some(dir) if !dir.is_empty() && Path::new(dir).is_dir() => {
+                // Route to the repo only for projects that are already
+                // repo-owned. A project-scoped entry for a not-yet-migrated
+                // project stays in central until an explicit eject/init opts it
+                // in — so deploying never bulk-migrates every repo at boot.
+                Some(dir) if !dir.is_empty() && project_is_repo_owned(Path::new(dir)) => {
                     by_project.entry(PathBuf::from(dir)).or_default().push(e);
                 }
                 _ => central.entries.push(e.clone()),
@@ -876,14 +890,20 @@ impl Knowledge {
     }
 
     /// Migrate a project's entries out of the central store into the owning
-    /// repo's `.bbox/knowledge/`. With scope routing in place this is just a
-    /// reload+save: the central entries load into memory, then `save` writes
-    /// them to repo files and drops them from central. Returns the count moved.
+    /// repo's `.bbox/knowledge/`, opting the project into repo-ownership. The
+    /// `.bbox/knowledge/` dir is created first (this is what flips the
+    /// `project_is_repo_owned` gate), then `save` routes the project's entries
+    /// there and drops them from central. Idempotent. Returns the count moved.
     pub fn eject_project_to_repo(&mut self, project_dir: &str) -> Result<usize> {
         let path = self.store_path.clone();
         crate::json_store::with_store_lock(&path, || {
             self.reload()?;
             let count = self.count_project_entries(project_dir);
+            // Create .bbox/knowledge/ up front so the project is repo-owned and
+            // `save` routes its entries there (even when there are zero to move,
+            // this marks the project repo-owned for future writes).
+            fs::create_dir_all(repo_kb_dir(Path::new(project_dir)))
+                .with_context(|| format!("creating .bbox/knowledge under {project_dir}"))?;
             self.save()?;
             Ok(count)
         })
@@ -2955,6 +2975,10 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         let proj = repo_root.to_string_lossy().to_string();
         let kb_path = central.path().join("kb.json");
 
+        // Mark the project repo-owned (as a clone/init/eject would) so writes
+        // route into the repo rather than central.
+        std::fs::create_dir_all(repo_root.join(".bbox").join("knowledge")).unwrap();
+
         let mut kb = Knowledge::open(&kb_path).unwrap();
         kb.set_project_roots(vec![repo_root.clone()]).unwrap();
         let id = kb
@@ -3009,6 +3033,69 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .expect("entry should reload from repo .bbox/knowledge/");
         assert_eq!(loaded.project.as_deref(), Some(proj.as_str()));
         assert_eq!(loaded.scope, Scope::Project);
+    }
+
+    #[test]
+    fn project_entry_stays_central_until_project_is_repo_owned() {
+        // The footgun guard: a project-scoped write for a project that has not
+        // been ejected/init'd (no .bbox/knowledge) must NOT auto-migrate to the
+        // repo on save — otherwise deploying the new binary would silently
+        // rewrite every registered repo's working tree at boot. Migration is
+        // deliberate: only eject/init opts a project into repo-ownership.
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let proj = repo_root.to_string_lossy().to_string();
+        let kb_path = central.path().join("kb.json");
+
+        // No .bbox/knowledge: project is NOT repo-owned.
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        kb.set_project_roots(vec![repo_root.clone()]).unwrap();
+        let id = kb
+            .learn_result(
+                &LearnParams {
+                    content: "stays in central until ejected".into(),
+                    category: "convention".into(),
+                    format: None,
+                    title: Some("legacy project rule".into()),
+                    scope: Some("project".into()),
+                    project: Some(proj.clone()),
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: None,
+                    id: None,
+                },
+                false,
+            )
+            .unwrap()
+            .id;
+
+        assert!(
+            !repo_root.join(".bbox").join("knowledge").exists(),
+            "must not create repo .bbox/knowledge for a non-repo-owned project"
+        );
+        assert!(
+            std::fs::read_to_string(&kb_path).unwrap().contains(&id),
+            "entry must stay in central until the project is repo-owned"
+        );
+
+        // Eject opts the project in and migrates the entry.
+        let moved = kb.eject_project_to_repo(&proj).unwrap();
+        assert_eq!(moved, 1);
+        assert!(
+            repo_root
+                .join(".bbox")
+                .join("knowledge")
+                .join(format!("{id}.json"))
+                .exists(),
+            "eject should write the entry into the repo"
+        );
+        assert!(
+            !std::fs::read_to_string(&kb_path).unwrap().contains(&id),
+            "entry should leave central after eject"
+        );
     }
 
     #[test]

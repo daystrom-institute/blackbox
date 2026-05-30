@@ -100,6 +100,9 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
         bbox_dir.join("teams"),
         bbox_dir.join("agents"),
         bbox_dir.join("local"),
+        // Marks the project repo-owned for durable knowledge: project-scoped
+        // bbox_learn/decide land here and travel with the checkout.
+        bbox_dir.join("knowledge"),
     ];
     for dir in &dirs {
         let path = dir.as_path();
