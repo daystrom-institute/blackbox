@@ -27,6 +27,12 @@ pub struct ToolCx {
     /// produce/consume, and the substrate other tools chain through (the ref
     /// ABI). Durable across `exec → resume` via the `side` cell, like `todos`.
     pub clipboard: Arc<std::sync::Mutex<crate::clipboard::Registers>>,
+    /// Per-turn capture of file mutations: file-mutating tools push an
+    /// [`crate::edits::EditEvent`] (pre-image + pre/post sha256 + path) here
+    /// at mutation time, and the edit loop drains the sink after each
+    /// dispatch to feed window-0 diagnostics. Ephemeral — never persisted to
+    /// `side`.
+    pub edits: Arc<std::sync::Mutex<crate::edits::EditSink>>,
 }
 
 /// Result of a tool call. Maps onto the content of an Anthropic

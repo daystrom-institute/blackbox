@@ -10,6 +10,7 @@
 //! format — those live in `bro-harness`.
 
 pub mod clipboard;
+pub mod edits;
 pub mod jq;
 pub mod safety;
 pub mod shell;
@@ -20,6 +21,7 @@ pub mod web;
 pub mod workspace;
 
 pub use clipboard::Registers;
+pub use edits::{EditEvent, EditSink};
 pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};

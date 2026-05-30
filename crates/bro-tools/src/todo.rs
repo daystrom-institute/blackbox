@@ -152,6 +152,7 @@ mod tests {
             todos: Arc::new(Mutex::new(TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
             clipboard: Arc::new(Mutex::new(crate::clipboard::Registers::default())),
+            edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
         }
     }
 
