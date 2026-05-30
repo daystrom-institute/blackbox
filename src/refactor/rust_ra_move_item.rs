@@ -319,6 +319,7 @@ mod tests {
 
     #[test]
     fn lsp_unavailable_is_reported_as_error() {
+        let _env = crate::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("src.rs");
         let target = dir.path().join("target.rs");

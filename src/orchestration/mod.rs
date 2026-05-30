@@ -2319,6 +2319,10 @@ fn observed_event_count(inner: &TaskInner) -> usize {
 
 #[cfg(test)]
 mod tests {
+    // Async env-mutating tests hold the std `test_env_lock` across `.await` on
+    // purpose (env must stay set while the awaited code reads it); #[tokio::test]
+    // is single-threaded so this can't deadlock the runtime.
+    #![allow(clippy::await_holding_lock)]
     use super::*;
 
     #[test]
@@ -2595,6 +2599,7 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_with_pre_minted_id_tracks_known_id() {
+        let _env = crate::util::test_env_lock();
         let prior_bin = std::env::var("CODEX_BIN").ok();
         unsafe {
             std::env::set_var("CODEX_BIN", "/bin/true");

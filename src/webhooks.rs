@@ -274,6 +274,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_signature_verifies_no_prefix() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::set_var("WEBHOOK_TEST_SECRET", "hunter2");
         }
@@ -299,6 +300,7 @@ mod tests {
 
     #[test]
     fn hmac_sha256_signature_verifies_with_prefix() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::set_var("WEBHOOK_TEST_SECRET2", "hunter3");
         }

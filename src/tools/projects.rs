@@ -415,6 +415,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let dir_path = dir.path().join("project");
         std::fs::create_dir_all(&dir_path).unwrap();
+        // macOS tempdir lives under /var (symlink to /private/var); init_project_path
+        // canonicalizes, so derive expected paths from the canonical root too.
+        let dir_path = dir_path.canonicalize().unwrap();
         let result = init_project_path(&dir_path, false).unwrap();
         let cfg_path = dir_path.join(".bbox").join("config.toml");
         let mcp_path = dir_path.join(".bbox").join("mcp.json");
@@ -441,6 +444,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let dir_path = dir.path().join("project");
         std::fs::create_dir_all(&dir_path).unwrap();
+        // macOS tempdir lives under /var (symlink to /private/var); init_project_path
+        // canonicalizes, so derive expected paths from the canonical root too.
+        let dir_path = dir_path.canonicalize().unwrap();
         let cfg_path = dir_path.join(".bbox").join("config.toml");
         init_project_path(&dir_path, false).unwrap();
         std::fs::write(&cfg_path, "# tweaked").unwrap();
@@ -465,6 +471,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let dir_path = dir.path().join("project");
         std::fs::create_dir_all(&dir_path).unwrap();
+        // macOS tempdir lives under /var (symlink to /private/var); init_project_path
+        // canonicalizes, so derive expected paths from the canonical root too.
+        let dir_path = dir_path.canonicalize().unwrap();
         init_project_path(&dir_path, false).unwrap();
 
         let cfg_path = dir_path.join(".bbox").join("config.toml");

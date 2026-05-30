@@ -1612,7 +1612,13 @@ mod tests {
 
         let result = CodeNavProbeRunner::resolve_contained_file(&project_dir, "src/Foo.java");
         assert!(result.is_ok(), "expected Ok for valid contained file");
-        assert!(result.unwrap().starts_with(dir.path()));
+        // resolve_contained_file canonicalizes; on macOS the tempdir's /var path
+        // canonicalizes to /private/var, so compare against the canonical root.
+        assert!(
+            result
+                .unwrap()
+                .starts_with(dir.path().canonicalize().unwrap())
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1778,7 +1784,10 @@ mod tests {
         use crate::code_nav::semantic::WorkspaceSymbolItem;
 
         let dir = tempfile::tempdir().expect("tempdir");
-        let project_dir = dir.path().to_path_buf();
+        // Canonicalize: annotate_symbol canonicalizes the symbol path, and macOS
+        // tempdirs live under /var (→ /private/var), so the project root must be
+        // canonical for the project_local containment check to match.
+        let project_dir = dir.path().canonicalize().unwrap();
 
         // Create a real file for the local symbol.
         let local_file = dir.path().join("Foo.java");

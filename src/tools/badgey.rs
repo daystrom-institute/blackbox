@@ -498,6 +498,10 @@ impl BlackboxServer {
 
 #[cfg(test)]
 mod tests {
+    // Async env-mutating tests hold the std `test_env_lock` across `.await` on
+    // purpose (env must stay set while the awaited code reads it); #[tokio::test]
+    // is single-threaded so this can't deadlock the runtime.
+    #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::orchestration::providers::Provider;
     use crate::server::state::SharedState;
@@ -567,6 +571,7 @@ mod tests {
     }
     #[tokio::test]
     async fn badgey_lifecycle_tools_write_thread_events() {
+        let _env = crate::util::test_env_lock();
         let _env_guard = codex_bin_test_guard().await;
         let prior_bin = std::env::var("CODEX_BIN").ok();
         let tmp = tempfile::tempdir().unwrap();
@@ -629,6 +634,7 @@ mod tests {
 
     #[tokio::test]
     async fn badgey_agent_dispatch_routes_through_wrapper_adapter() {
+        let _env = crate::util::test_env_lock();
         let _env_guard = codex_bin_test_guard().await;
         let prior_bin = std::env::var("CODEX_BIN").ok();
         let tmp = tempfile::tempdir().unwrap();

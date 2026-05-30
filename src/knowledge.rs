@@ -2490,6 +2490,7 @@ mod tests {
 
     #[test]
     fn absorb_global_extracts_only_managed_region() {
+        let _env = crate::util::test_env_lock();
         let _env_guard = global_env_lock();
         let (_t, mut kb) = mk_kb();
         // Stand up a fake claude global memory file. Use the env override
@@ -2641,6 +2642,7 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
     #[test]
     fn absorb_global_no_managed_region_is_noop() {
+        let _env = crate::util::test_env_lock();
         let _env_guard = global_env_lock();
         let (_t, mut kb) = mk_kb();
         let tmpdir = tempfile::tempdir().unwrap();

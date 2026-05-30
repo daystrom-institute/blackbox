@@ -117,10 +117,15 @@ mod tests {
 
     #[test]
     fn slot_respects_env_override() {
+        // NB: with_state_dir already holds crate::util::test_env_lock(); do not
+        // re-acquire here — the lock is non-reentrant and would deadlock.
         let tmp = tempfile::tempdir().unwrap();
+        // ensure_plan_slot canonicalizes the state dir; on macOS the tempdir's
+        // /var path canonicalizes to /private/var, so compare against canonical.
+        let tmp_canon = tmp.path().canonicalize().unwrap();
         with_state_dir(tmp.path(), || {
             let slot = ensure_plan_slot().unwrap();
-            assert!(slot.starts_with(tmp.path()));
+            assert!(slot.starts_with(&tmp_canon));
             assert!(slot.ends_with("refactor/plans"));
             assert!(slot.exists());
         });

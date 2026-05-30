@@ -2003,6 +2003,7 @@ mod tests {
 
     #[test]
     fn test_hmac_no_secret_returns_none() {
+        let _env = blackbox::util::test_env_lock();
         // Ensure the env var is unset
         unsafe {
             std::env::remove_var("BRO_TEST_NO_SECRET");
@@ -2013,6 +2014,7 @@ mod tests {
 
     #[test]
     fn test_hmac_secret_empty_returns_none() {
+        let _env = blackbox::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_EMPTY_SECRET", "");
         }
@@ -2022,6 +2024,7 @@ mod tests {
 
     #[test]
     fn test_hmac_produces_valid_hex() {
+        let _env = blackbox::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_HMAC_SECRET", "hunter2");
         }
@@ -2043,6 +2046,7 @@ mod tests {
 
     #[test]
     fn test_hmac_different_bodies_produce_different_sigs() {
+        let _env = blackbox::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_HMAC_DIFF", "secret");
         }
@@ -2347,6 +2351,7 @@ mod tests {
 
     #[test]
     fn test_hmac_same_input_same_output() {
+        let _env = blackbox::util::test_env_lock();
         unsafe {
             std::env::set_var("BRO_TEST_DET", "secret");
         }

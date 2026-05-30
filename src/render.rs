@@ -383,6 +383,7 @@ mod tests {
 
     #[test]
     fn test_apply_patch_preserves_surrounding_content_and_backs_up() {
+        let _env = crate::util::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let backup_dir = dir.path().join("backups");
         unsafe {

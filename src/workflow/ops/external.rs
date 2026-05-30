@@ -229,6 +229,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_header_value_with_env_fallback() {
+        let _env = crate::util::test_env_lock();
         // Use the env var fallback (BLACKBOX_SECRET_TEST_HTTP_TOKEN).
         // SAFETY: single-threaded test context; no other threads access this var.
         unsafe { std::env::set_var("BLACKBOX_SECRET_TEST_HTTP_TOKEN", "tok-abc123") };
@@ -264,6 +265,7 @@ mod tests {
 
     #[test]
     fn resolve_secret_header_value_bare_secret_ref() {
+        let _env = crate::util::test_env_lock();
         // SAFETY: single-threaded test context; no other threads access this var.
         unsafe { std::env::set_var("BLACKBOX_SECRET_BARE_TOKEN", "raw-value") };
         let result = resolve_secret_header_value("secret:bare-token").unwrap();

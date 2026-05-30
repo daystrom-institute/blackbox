@@ -1350,10 +1350,12 @@ port = 7300
             env::remove_var("BLACKBOX_CONFIG");
         }
 
-        // Create malformed config file
-        let config_dir = home.join(".config").join("blackbox");
-        std::fs::create_dir_all(&config_dir).unwrap();
-        let config_path = config_dir.join("config.toml");
+        // Create malformed config at the platform's real default config path.
+        // macOS `dirs::config_dir()` is ~/Library/Application Support (NOT
+        // ~/.config) and ignores XDG_CONFIG_HOME, so derive the path instead of
+        // hardcoding ~/.config — otherwise load() never sees the file on macOS.
+        let config_path = default_config_path().expect("default config path");
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, "this is not valid toml [[[").unwrap();
 
         let result = load();

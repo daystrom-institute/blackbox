@@ -371,6 +371,7 @@ mod tests {
 
     #[test]
     fn render_env_string_substitutes_present_var() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::set_var("POLLER_TEST_TOKEN", "abc123");
         }
@@ -382,6 +383,7 @@ mod tests {
 
     #[test]
     fn render_env_string_leaves_missing_verbatim() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::remove_var("POLLER_TEST_NOT_SET");
         }
@@ -393,6 +395,7 @@ mod tests {
 
     #[test]
     fn render_env_string_supports_multiple_substitutions() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::set_var("PT_BASE", "http://x:8080");
         }

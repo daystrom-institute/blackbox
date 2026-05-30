@@ -7,15 +7,94 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";
 
-// Not `#[cfg(test)]` gated: the bin crate's test modules reference
-// `crate::util::test_env_lock` through the lib re-export, and that path
-// only resolves when the lib is compiled with this symbol present even
-// in non-test builds (cargo test --bin builds the lib as a normal dep).
-// Cost: one OnceLock'd Mutex in the binary; never touched in production.
+// Not `#[cfg(test)]` gated: binary crates (e.g. `bro-slack`, `src/slack_bridge.rs`)
+// reference this from their own test modules as `blackbox::util::test_env_lock`,
+// which only resolves when the symbol is compiled into the lib even in non-test
+// builds (cargo test --bin builds the lib as a normal dep). Lib modules use
+// `crate::util::test_env_lock`. Cost: one Mutex in the binary; never touched in
+// production.
 static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Serializes every test that mutates process-global environment.
+///
+/// Rust runs tests multi-threaded, and `std::env::set_var`/`remove_var` mutate
+/// shared process state, so any two env-touching tests can corrupt each other
+/// unless they take this lock. INVARIANT: a test that calls `set_var`/`remove_var`
+/// (directly or via [`TestEnvGuard`]) MUST hold this lock for the whole mutation
+/// window. Poison-tolerant on purpose: a panicking env test must not cascade into
+/// every later env test failing with a poisoned-mutex panic.
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_ENV_LOCK.lock().unwrap()
+    TEST_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII guard for env-mutating tests: holds [`test_env_lock`] AND restores every
+/// touched variable to its prior value on drop. Prefer this over hand-rolled
+/// save/restore blocks — it can't leak a variable into the next test even on
+/// panic.
+///
+/// ```ignore
+/// let mut env = TestEnvGuard::new();
+/// env.set("BLACKBOX_STATE_DIR", tmp.path());
+/// env.remove("BRO_HOME");
+/// // ... assertions ...
+/// // original environment restored when `env` drops
+/// ```
+#[cfg(test)]
+pub struct TestEnvGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    saved: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+}
+
+#[cfg(test)]
+impl TestEnvGuard {
+    pub fn new() -> Self {
+        Self {
+            _lock: test_env_lock(),
+            saved: Vec::new(),
+        }
+    }
+
+    /// Set `key=value`, remembering the prior value for restoration.
+    pub fn set<K: AsRef<std::ffi::OsStr>, V: AsRef<std::ffi::OsStr>>(&mut self, key: K, value: V) {
+        self.remember(key.as_ref());
+        // Safe: the lock guarantees no other thread mutates env concurrently.
+        unsafe { std::env::set_var(key, value) };
+    }
+
+    /// Remove `key`, remembering the prior value for restoration.
+    pub fn remove<K: AsRef<std::ffi::OsStr>>(&mut self, key: K) {
+        self.remember(key.as_ref());
+        unsafe { std::env::remove_var(key) };
+    }
+
+    fn remember(&mut self, key: &std::ffi::OsStr) {
+        // Only snapshot the first touch of each key so the original (pre-guard)
+        // value is what gets restored.
+        if !self.saved.iter().any(|(k, _)| k == key) {
+            self.saved.push((key.to_os_string(), std::env::var_os(key)));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Default for TestEnvGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestEnvGuard {
+    fn drop(&mut self) {
+        for (key, prior) in self.saved.drain(..).rev() {
+            match prior {
+                Some(value) => unsafe { std::env::set_var(&key, value) },
+                None => unsafe { std::env::remove_var(&key) },
+            }
+        }
+    }
 }
 
 /// ISO-8601 UTC timestamp with second precision and a trailing `Z`.

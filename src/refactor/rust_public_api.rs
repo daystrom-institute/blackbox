@@ -574,7 +574,9 @@ mod tests {
 
     #[test]
     fn analyze_public_api_touches_pub_fn_as_breaking_or_warning() -> Result<()> {
-        let source = PathBuf::from("/home/invidious/repos/transcript-search");
+        // The crate root at compile time — portable across machines/worktrees,
+        // and guaranteed to contain src/refactor/mod.rs.
+        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let changes = vec![ProposedChangeRef {
             file: PathBuf::from("src/refactor/mod.rs"),
             item_name: "status".to_string(),

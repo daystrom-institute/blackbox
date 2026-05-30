@@ -319,6 +319,7 @@ mod tests {
 
     #[test]
     fn env_expansion_handles_braced_form() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::set_var("MCP_TEST_VAR", "abc123");
         }
@@ -327,6 +328,7 @@ mod tests {
 
     #[test]
     fn env_expansion_handles_unbraced_form() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::set_var("MCP_TEST_VAR2", "xyz");
         }
@@ -335,6 +337,7 @@ mod tests {
 
     #[test]
     fn env_expansion_leaves_missing_verbatim() {
+        let _env = crate::util::test_env_lock();
         unsafe {
             std::env::remove_var("MCP_TEST_NOT_SET_42");
         }

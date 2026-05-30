@@ -986,7 +986,9 @@ mod tests {
         assert_eq!(v["total_usages"].as_u64().unwrap(), 1);
         assert_eq!(v["usage_summary_by_name"]["Symbol"].as_u64().unwrap(), 1);
         let plan_path = std::path::Path::new(v["plan_path"].as_str().unwrap());
-        assert!(plan_path.starts_with(state_dir.path()));
+        // plan_path is canonical; state_dir tempdir is under /var → /private/var
+        // on macOS, so compare against the canonical root.
+        assert!(plan_path.starts_with(state_dir.path().canonicalize().unwrap()));
         let on_disk = parse_response(&fs::read_to_string(plan_path).unwrap());
         assert!(
             on_disk.get("usages").is_some(),

@@ -219,6 +219,10 @@ pub(crate) async fn dispatch_routing_verdict_direct(
 
 #[cfg(test)]
 mod tests {
+    // Async env-mutating tests hold the std `test_env_lock` across `.await` on
+    // purpose (env must stay set while the awaited code reads it); #[tokio::test]
+    // is single-threaded so this can't deadlock the runtime.
+    #![allow(clippy::await_holding_lock)]
     use super::*;
     use crate::server::state::BlackboxServer;
     use crate::slack_proposal_links;
@@ -229,6 +233,7 @@ mod tests {
     }
     #[tokio::test]
     async fn proposal_approved_hook_bumps_link_version() {
+        let _env = crate::util::test_env_lock();
         // Verifies the dispatch_verdict signal hook resolves a Slack
         // message back to its SlackProposalLink and bumps the version
         // on `proposal-approved`. The HTTP ack post is short-circuited
@@ -274,6 +279,7 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_clarify_hook_does_not_bump_version() {
+        let _env = crate::util::test_env_lock();
         // Clarify hook resolves the message back to its link and
         // (will eventually) post a stub reply, but does NOT bump the
         // link version — version is reserved for chat.update of the
@@ -315,6 +321,7 @@ mod tests {
 
     #[tokio::test]
     async fn proposal_signal_hook_no_op_for_unknown_thread_ts() {
+        let _env = crate::util::test_env_lock();
         // No SlackProposalLink for the correlated thread_ts → hook is
         // a silent no-op. Any other in-thread reply or reaction in
         // the workspace should NOT cause stub acks.

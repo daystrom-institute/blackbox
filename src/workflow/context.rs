@@ -530,6 +530,7 @@ mod tests {
 
     #[test]
     fn render_template_resolves_env_head() {
+        let _env = crate::util::test_env_lock();
         let c = ctx();
         unsafe {
             std::env::set_var("CTX_TEST_HEAD", "hello");
@@ -549,6 +550,7 @@ mod tests {
 
     #[test]
     fn resolve_arg_value_multi_interpolation_renders_as_string() {
+        let _env = crate::util::test_env_lock();
         // The bug: a URL with two interpolations starts with `${` and
         // ends with `}` but is NOT a single whole-string template.
         // Must render as text via the templater, not parsed as one
