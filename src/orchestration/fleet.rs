@@ -129,13 +129,23 @@ impl AgentHandle {
     /// Point-in-time copy of the agent's live state, read under one lock.
     pub fn snapshot(&self) -> TaskSnapshot {
         let inner = self.task.inner.lock();
+        // Walk the raw stream-json buffer for harness-envelope state the daemon
+        // parser doesn't surface: turn-in-flight (between `result` boundaries)
+        // and the builtin `report` tool's needs-input signal (§2.2). The daemon
+        // parser ignores `report` lines, so the cockpit derives them here.
+        let stream = derive_stream_state(&inner.events);
         TaskSnapshot {
             status: inner.status,
             provider: inner.provider,
             session_id: inner.session_id.clone(),
             last_assistant_message: inner.last_assistant_message.clone(),
-            report_message: inner.report.as_ref().map(|r| r.message.clone()),
-            report_needs: inner.report.as_ref().and_then(|r| r.needs.clone()),
+            // Prefer the harness `report` line; fall back to the daemon BroReport
+            // (populated only for bro_exec-style tasks, never fleet agents).
+            report_message: stream
+                .report_message
+                .or_else(|| inner.report.as_ref().map(|r| r.message.clone())),
+            needs_input: stream.needs_input,
+            turn_active: stream.turn_active,
             cost_usd: inner.cost_usd,
             num_turns: inner.num_turns,
             started_at: inner.started_at,
@@ -154,14 +164,65 @@ pub struct TaskSnapshot {
     pub provider: Provider,
     pub session_id: String,
     pub last_assistant_message: Option<String>,
+    /// Latest status line from the harness `report` tool (or daemon BroReport).
     pub report_message: Option<String>,
-    pub report_needs: Option<String>,
+    /// The latest `report` flagged needs-input — drives the Waiting bucket (§2.2).
+    pub needs_input: bool,
+    /// A turn is in flight (events streaming past the last `result` boundary) —
+    /// distinguishes Active from Idle while the process stays Running (§5).
+    pub turn_active: bool,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
     pub started_at: u64,
     pub cwd: Option<String>,
     pub stderr: String,
     pub model: Option<String>,
+}
+
+/// Harness-envelope state derived from the raw stream-json buffer.
+struct StreamState {
+    turn_active: bool,
+    needs_input: bool,
+    report_message: Option<String>,
+}
+
+/// Walk the stream-json events chronologically to recover state the daemon
+/// parser doesn't track: whether a turn is in flight (toggled by `result`
+/// boundaries) and the latest builtin `report` signal (§2.2). `report` lines
+/// ride the harness stdout but the daemon's claude parser ignores them, so the
+/// cockpit reads them here.
+fn derive_stream_state(events: &[serde_json::Value]) -> StreamState {
+    let mut turn_active = false;
+    let mut needs_input = false;
+    let mut report_message = None;
+    for e in events {
+        match e.get("type").and_then(|t| t.as_str()) {
+            // A `result` closes the current turn → Idle until the next turn.
+            Some("result") => turn_active = false,
+            // Assistant output / tool traffic means a turn is running. (`user`
+            // covers both a steer and a tool_result echo; either implies the
+            // model is mid-turn.)
+            Some("assistant") | Some("stream_event") | Some("user") => turn_active = true,
+            // The builtin report tool's status/needs signal.
+            Some("report") => {
+                let r = &e["report"];
+                report_message = r
+                    .get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string());
+                needs_input = r
+                    .get("needs_input")
+                    .and_then(|n| n.as_bool())
+                    .unwrap_or(false);
+            }
+            _ => {}
+        }
+    }
+    StreamState {
+        turn_active,
+        needs_input,
+        report_message,
+    }
 }
 
 /// Best-effort model id from an `init`/assistant event in the stream-json buffer.
@@ -259,6 +320,19 @@ impl FleetOrchestrator {
             args.push("--replay-user-messages".into());
         }
 
+        // Resolve transport env (ANTHROPIC_BASE_URL + credentials for the
+        // harness providers; selects Anthropic vs Responses transport). Without
+        // this the bro-harness child fails at Session::build. Mirrors the daemon
+        // dispatch path; user-supplied overrides win on conflict.
+        let resolved_env = super::brofile::resolve_provider_env(
+            spec.provider,
+            None,
+            spec.model.as_deref(),
+            &self.store_dir,
+            None,
+        );
+        let env_overrides = merge_env(resolved_env, spec.env_overrides);
+
         // Fleet agents are entrypoint agents, not bros — no team/brofile label
         // and no `bro_report` surface (§2.2). bro_label stays None; the cockpit
         // names rows from the initial prompt (§5).
@@ -269,7 +343,7 @@ impl FleetOrchestrator {
                 args,
                 session_id,
                 spec.cwd,
-                spec.env_overrides,
+                env_overrides,
                 self.store_dir.clone(),
                 self.task_store.clone(),
                 self.tail_tx.clone(),
@@ -288,7 +362,7 @@ impl FleetOrchestrator {
                 args,
                 session_id,
                 spec.cwd,
-                spec.env_overrides,
+                env_overrides,
                 self.store_dir.clone(),
                 self.task_store.clone(),
                 self.tail_tx.clone(),
@@ -297,6 +371,22 @@ impl FleetOrchestrator {
                 None,
             );
             AgentHandle { task, stdin: None }
+        }
+    }
+}
+
+/// Merge resolved transport env (base) with caller-supplied overrides (win on
+/// conflict). Returns `None` only when both are empty.
+fn merge_env(
+    base: Option<HashMap<String, String>>,
+    overrides: Option<HashMap<String, String>>,
+) -> Option<HashMap<String, String>> {
+    match (base, overrides) {
+        (None, None) => None,
+        (Some(m), None) | (None, Some(m)) => Some(m),
+        (Some(mut b), Some(o)) => {
+            b.extend(o);
+            Some(b)
         }
     }
 }
@@ -386,6 +476,35 @@ mod tests {
         let v: Value = serde_json::from_str(&set_model).unwrap();
         assert_eq!(v["subtype"], "set_model");
         assert_eq!(v["model"], "opus");
+    }
+
+    #[test]
+    fn stream_state_tracks_turn_and_report() {
+        let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+
+        // Mid-turn: assistant streaming, no result yet.
+        let s = derive_stream_state(&[
+            ev(r#"{"type":"system","subtype":"init"}"#),
+            ev(r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#),
+        ]);
+        assert!(s.turn_active);
+        assert!(!s.needs_input);
+
+        // Turn closed by a result → idle.
+        let s = derive_stream_state(&[
+            ev(r#"{"type":"assistant","message":{"content":[]}}"#),
+            ev(r#"{"type":"result","subtype":"success"}"#),
+        ]);
+        assert!(!s.turn_active);
+
+        // report needs_input while idle → Waiting signal.
+        let s = derive_stream_state(&[
+            ev(r#"{"type":"report","report":{"message":"blocked on creds","needs_input":true}}"#),
+            ev(r#"{"type":"result","subtype":"success"}"#),
+        ]);
+        assert!(!s.turn_active);
+        assert!(s.needs_input);
+        assert_eq!(s.report_message.as_deref(), Some("blocked on creds"));
     }
 
     #[test]

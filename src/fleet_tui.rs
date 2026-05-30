@@ -130,16 +130,17 @@ struct AgentView {
 impl Agent {
     fn view(&self) -> AgentView {
         let snap = self.task.snapshot();
-        let needs = snap.report_needs.is_some();
         let state = match snap.status {
-            // Alerting (supervision loop/stall/burn) is a follow-on; until the
-            // detection logic is reused in-process, Running maps to Active or
-            // Waiting only.
-            TaskStatus::Running if needs => FleetState::Waiting,
-            TaskStatus::Running => FleetState::Active,
-            // One-shot completion rests at Idle (an entrypoint agent never
-            // self-completes; §5 "No Done"). In the bidi world this is the
-            // turn-finished resting state.
+            // While the process stays Running (the steady state for a persistent
+            // bidi session), the live distinction comes from the event stream:
+            // a turn in flight is Active; finished-but-blocked is Waiting;
+            // finished-and-free is Idle. Alerting (supervision loop/stall/burn)
+            // is a follow-on, not yet derived.
+            TaskStatus::Running if snap.turn_active => FleetState::Active,
+            TaskStatus::Running if snap.needs_input => FleetState::Waiting,
+            TaskStatus::Running => FleetState::Idle,
+            // Process exit: a one-shot agent or a closed session rests at Idle
+            // (an entrypoint agent never self-completes; §5 "No Done").
             TaskStatus::Completed => FleetState::Idle,
             TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
         };
@@ -211,10 +212,18 @@ struct App {
     status: Option<String>,
     status_until: Option<Instant>,
     quit: bool,
+
+    /// Runtime handle for firing the async steer/interrupt calls (AgentHandle
+    /// methods are async; the TUI loop is sync) off the blocking loop.
+    rt: tokio::runtime::Handle,
 }
 
 impl App {
-    fn new(orch: Arc<FleetOrchestrator>, launch_cwd: Option<String>) -> Self {
+    fn new(
+        orch: Arc<FleetOrchestrator>,
+        launch_cwd: Option<String>,
+        rt: tokio::runtime::Handle,
+    ) -> Self {
         Self {
             orch,
             agents: Vec::new(),
@@ -231,6 +240,7 @@ impl App {
             status: None,
             status_until: None,
             quit: false,
+            rt,
         }
     }
 
@@ -304,7 +314,7 @@ fn bucket_rank(state: FleetState) -> usize {
 
 pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_config()?);
-    let mut app = App::new(orch.clone(), cwd);
+    let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
 
     // Forward tail events into the sync TUI loop (mirrors council_tui's SSE
     // fan-in). State is derived by polling the task Arcs each tick; tail events
@@ -397,6 +407,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let gate = app.input.is_empty();
 
     match key.code {
+        // Esc interrupts the running turn in the single-agent view (§1.1);
+        // elsewhere it quits. Ctrl+Q/Ctrl+C always quit (handled above).
+        KeyCode::Esc if app.zone == Zone::SingleAgent => interrupt_selected(app),
         KeyCode::Esc => app.quit = true,
 
         KeyCode::Left if gate => zoom_left(app),
@@ -431,25 +444,63 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-/// Enter: dispatch (no agent context) or steer (agent selected/focused).
+/// Enter: dispatch (no agent context) or steer (agent focused).
 fn submit(app: &mut App) {
     if app.input.trim().is_empty() {
         return;
     }
     match app.zone {
-        // In the single-agent view (or with an agent selected) typing steers
-        // that session. Steering rides the bidirectional session, which is not
-        // wired yet — stub with a status note rather than silently dropping.
-        Zone::SingleAgent => {
-            app.set_status(
-                "steering needs the bidirectional session (pending harness); not sent",
-                Duration::from_secs(5),
-            );
-        }
+        // Single-agent view: typing steers that session — a user-turn into the
+        // live bidirectional session (queues at the next turn boundary, §1.1).
+        Zone::SingleAgent => steer_selected(app),
         // Roster / provider-selector: dispatch a new entrypoint agent. Enter
         // stays on the roster — you watch it surface in its bucket (§5).
         Zone::Roster | Zone::ProviderSelector => app.dispatch_current_input(),
     }
+}
+
+/// Send the composer text as a user-turn into the focused agent's live session.
+fn steer_selected(app: &mut App) {
+    let Some(idx) = app.selected_agent() else {
+        return;
+    };
+    let handle = app.agents[idx].task.clone();
+    if !handle.can_steer() {
+        app.set_status(
+            "this provider runs one-shot — can't be steered (§2.1)",
+            Duration::from_secs(4),
+        );
+        return;
+    }
+    let text = std::mem::take(&mut app.input);
+    app.history_cursor = None;
+    app.agents[idx].input_history.push(text.clone());
+    // AgentHandle::send_user_turn is async; fire it on the runtime. Errors are
+    // surfaced only as a best-effort log — the loop stays responsive.
+    app.rt.spawn(async move {
+        if let Err(e) = handle.send_user_turn(&text).await {
+            tracing::warn!("fleet steer failed: {e:#}");
+        }
+    });
+    app.set_status("steer sent", Duration::from_secs(2));
+}
+
+/// `Esc` in the single-agent view: interrupt the running turn (§1.1). If a
+/// steer is queued it dequeues at the harness; interrupt-and-redirect.
+fn interrupt_selected(app: &mut App) {
+    let Some(idx) = app.selected_agent() else {
+        return;
+    };
+    let handle = app.agents[idx].task.clone();
+    if !handle.can_steer() {
+        return;
+    }
+    app.rt.spawn(async move {
+        if let Err(e) = handle.interrupt().await {
+            tracing::warn!("fleet interrupt failed: {e:#}");
+        }
+    });
+    app.set_status("interrupt sent", Duration::from_secs(2));
 }
 
 fn zoom_left(app: &mut App) {
@@ -888,7 +939,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let nav = match app.zone {
         Zone::ProviderSelector => "↑/↓ provider  →/Tab confirm",
         Zone::Roster => "↑/↓ agent  → open  ← provider  Tab provider",
-        Zone::SingleAgent => "← roster  ↑/↓ history  PgUp/PgDn scroll",
+        Zone::SingleAgent => "Enter steer  Esc interrupt  ← roster  ↑/↓ history  PgUp/PgDn scroll",
     };
     let mut spans = vec![Span::styled(
         format!("{nav}  ·  Ctrl+Q quit"),
