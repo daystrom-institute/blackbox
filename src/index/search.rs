@@ -1438,6 +1438,7 @@ impl TranscriptIndex {
 
         let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
             &self.config.knowledge_path,
+            &self.config.projects_path,
             f,
             &mut writer,
             &mut meta,

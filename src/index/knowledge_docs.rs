@@ -56,6 +56,7 @@ pub(crate) fn indexable_knowledge_entry(entry: &KnowledgeEntry) -> bool {
 
 pub(crate) fn reindex_knowledge_store_standalone(
     knowledge_path: &Path,
+    projects_path: &Path,
     fields: FieldHandles,
     writer: &mut IndexWriter,
     meta: &mut HashMap<String, FileMeta>,
@@ -68,18 +69,15 @@ pub(crate) fn reindex_knowledge_store_standalone(
     let mut knowledge = Knowledge::open(knowledge_path)?;
     // Project-scoped entries live in each repo's committed .bbox/knowledge/, not
     // the central store, so a reindex that only read kb.json would silently drop
-    // them from search. Load the registered repos' roots (projects.json is a
-    // sibling of kb.json) so committed project knowledge is indexed too.
-    if let Some(store_dir) = knowledge_path.parent() {
-        let roots: Vec<std::path::PathBuf> =
-            crate::projects::ProjectRegistry::load_records(store_dir.join("projects.json"))
-                .unwrap_or_default()
-                .into_iter()
-                .map(|r| std::path::PathBuf::from(r.canonical_path))
-                .collect();
-        if let Err(e) = knowledge.set_project_roots(roots) {
-            tracing::warn!("kb reindex project-root load: {e:#}");
-        }
+    // them from search. Load the registered repos' roots so committed project
+    // knowledge is indexed too.
+    let roots: Vec<std::path::PathBuf> = crate::projects::ProjectRegistry::load_records(projects_path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| std::path::PathBuf::from(r.canonical_path))
+        .collect();
+    if let Err(e) = knowledge.set_project_roots(roots) {
+        tracing::warn!("kb reindex project-root load: {e:#}");
     }
     let mut docs = 0;
     for entry in knowledge
@@ -284,10 +282,9 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+        let projects_path = central.path().join("projects.json");
         {
-            let mut reg =
-                crate::projects::ProjectRegistry::open(central.path().join("projects.json"))
-                    .unwrap();
+            let mut reg = crate::projects::ProjectRegistry::open(&projects_path).unwrap();
             reg.register_path(&repo_root).unwrap();
         }
 
@@ -296,7 +293,8 @@ mod tests {
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         let mut meta = HashMap::new();
         let docs =
-            reindex_knowledge_store_standalone(&kb_path, fields, &mut writer, &mut meta).unwrap();
+            reindex_knowledge_store_standalone(&kb_path, &projects_path, fields, &mut writer, &mut meta)
+                .unwrap();
 
         assert_eq!(
             docs, 1,

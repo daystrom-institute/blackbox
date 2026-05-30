@@ -298,6 +298,7 @@ fn try_background_reindex(
     let stores_phase = Instant::now();
     let knowledge_docs = knowledge_docs::reindex_knowledge_store_standalone(
         &config.knowledge_path,
+        &config.projects_path,
         fields,
         &mut writer,
         &mut meta,
