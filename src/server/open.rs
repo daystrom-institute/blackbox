@@ -68,9 +68,11 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
 
     let mut kb = Knowledge::open(&kb_path)?;
     tracing::info!("Knowledge store: {}", kb_path.display());
-    sync_tool_docs(&mut kb);
     // Load each registered repo's committed .bbox/knowledge/ into the query
-    // surface (project durable knowledge is repo-owned; central holds globals).
+    // surface BEFORE any save. This must precede sync_tool_docs (which writes
+    // the tool-reference entry and triggers save()): a save with the repo's
+    // entries not yet loaded would treat the in-memory set as authoritative and
+    // purge the committed .bbox/knowledge files for a repo-owned project.
     {
         let kb_roots: Vec<std::path::PathBuf> = projects_store
             .list()
@@ -81,6 +83,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
             tracing::warn!("kb project-root load at startup: {e:#}");
         }
     }
+    sync_tool_docs(&mut kb);
     load_system_memory_catalog(&cfg)?;
     configure_dispatch_mcp_env(&cfg);
     sweep_stale_gemini_policies();

@@ -706,22 +706,33 @@ fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
 }
 
 /// Persist `entries` (all owned by `project_dir`) one file per entry under
-/// `<project_dir>/.bbox/knowledge/`, with the `project` field cleared. Purges
-/// any committed file whose id is no longer present, so a removed entry deletes
-/// its file (generation/purge semantics).
-fn persist_repo_kb_entries(project_dir: &Path, entries: &[&KnowledgeEntry]) -> Result<()> {
+/// `<project_dir>/.bbox/knowledge/`, with the `project` field cleared.
+///
+/// `purge` enables generation semantics: committed files whose id is no longer
+/// present are deleted (so a removed entry deletes its file). Purge is only
+/// safe when the caller's in-memory set is AUTHORITATIVE for this project —
+/// i.e. the repo's entries were loaded (the project is in `project_roots`).
+/// Purging against an incomplete view would delete committed entries that were
+/// never loaded; callers pass `purge=false` in that case (additive write only).
+fn persist_repo_kb_entries(
+    project_dir: &Path,
+    entries: &[&KnowledgeEntry],
+    purge: bool,
+) -> Result<()> {
     let dir = repo_kb_dir(project_dir);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
-    let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
-    for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = de?.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("json") {
-            continue;
-        }
-        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            if !keep.contains(stem) {
-                let _ = fs::remove_file(&path);
+    if purge {
+        let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = de?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !keep.contains(stem) {
+                    let _ = fs::remove_file(&path);
+                }
             }
         }
     }
@@ -804,8 +815,14 @@ impl Knowledge {
             }
         }
         crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        // Purge only for projects whose repo entries we actually loaded (root is
+        // tracked) — otherwise our in-memory set is not authoritative and
+        // purging would delete committed entries that were never loaded.
+        let loaded: std::collections::HashSet<&Path> =
+            self.project_roots.iter().map(|p| p.as_path()).collect();
         for (dir, entries) in &by_project {
-            persist_repo_kb_entries(dir, entries)?;
+            let purge = loaded.contains(dir.as_path());
+            persist_repo_kb_entries(dir, entries, purge)?;
         }
         Ok(())
     }
@@ -3095,6 +3112,66 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(
             !std::fs::read_to_string(&kb_path).unwrap().contains(&id),
             "entry should leave central after eject"
+        );
+    }
+
+    #[test]
+    fn save_without_loaded_roots_does_not_purge_committed_repo_files() {
+        // Regression (caught dogfooding on prod): a save() that happens before
+        // a repo-owned project's committed entries are loaded (roots not set)
+        // must NOT purge those files. The in-memory set is not authoritative, so
+        // generation/purge is disabled for projects whose root wasn't loaded.
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let proj = repo_root.to_string_lossy().to_string();
+        let kb_dir = repo_root.join(".bbox").join("knowledge");
+        std::fs::create_dir_all(&kb_dir).unwrap();
+
+        // A committed entry already in the repo (e.g. from a clone) — the
+        // project is therefore repo-owned. Project field omitted on disk.
+        std::fs::write(
+            kb_dir.join("committed.json"),
+            r#"{"id":"committed","title":"c","content":"COMMITTED_SURVIVES","category":"convention","scope":"project","priority":"standard","weight":100,"status":"active","approval":"user_confirmed","render":true,"decay":true,"source":"user","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","recall_count":0}"#,
+        )
+        .unwrap();
+
+        // Central carries a DIFFERENT project entry for the same repo, as if a
+        // pre-load save is about to happen with roots NOT yet set.
+        let kb_path = central.path().join("kb.json");
+        std::fs::write(
+            &kb_path,
+            format!(
+                r#"{{"version":1,"entries":[{{"id":"central1","title":"x","content":"y","category":"convention","scope":"project","project":"{proj}","priority":"standard","weight":100,"status":"active","approval":"user_confirmed","render":true,"decay":true,"source":"user","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z","recall_count":0}}]}}"#
+            ),
+        )
+        .unwrap();
+
+        // Open WITHOUT set_project_roots: committed.json is not loaded.
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        // A global write triggers save() while roots are unset.
+        kb.learn_result(
+            &LearnParams {
+                content: "global".into(),
+                category: "memory".into(),
+                format: None,
+                title: Some("g".into()),
+                scope: Some("global".into()),
+                project: None,
+                providers: None,
+                priority: None,
+                weight: None,
+                expires_at: None,
+                cluster: None,
+                id: None,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(
+            kb_dir.join("committed.json").exists(),
+            "committed repo file must survive a save with unloaded roots"
         );
     }
 
