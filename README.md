@@ -531,6 +531,7 @@ Auto-detection works out of the box for most setups. Override via environment va
 | `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; useful for dev instances that must not touch prod memory files |
 | `BLACKBOX_BACKUP_DIR` | `~/.local/state/blackbox/backups` | Managed-region backup root for `bbox_render(scope=global)` |
 | `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` / `VIBE_BIN` | from `$PATH` | Override provider binary paths |
+| `BLACKBOX_RUST_ANALYZER_BIN` (also `BRO_LSP_RUST_ANALYZER_BIN` / `BRO_RUST_ANALYZER_BIN`) | `rust-analyzer` from `$PATH` | rust-analyzer binary for window-0 harness diagnostics - see *Window-0 diagnostics* below |
 | `RUST_LOG` | `blackbox=info` | Tracing filter |
 
 ### Auto-detection
@@ -550,6 +551,29 @@ Override account roots via a systemd unit drop-in:
 Environment=TRANSCRIPT_SEARCH_ROOTS=personal=%h/.claude,work=%h/.claude-work
 ```
 Then `systemctl --user daemon-reload && systemctl --user restart blackbox`.
+
+### Window-0 diagnostics (rust-analyzer)
+
+The `bro-harness` agent runs **window-0 diagnostics** - after each Rust file edit
+it pulls rust-analyzer and rides a diagnostics summary onto that edit's tool
+result, synchronously, so the agent sees what its edit produced before acting
+again. This needs **`rust-analyzer` reachable by the dispatched harness process**.
+
+The catch: a dispatched harness inherits the *daemon's* environment, and
+`~/.cargo/bin` (where rustup installs rust-analyzer) is often **not** on the
+daemon's PATH. Make it reachable one of two ways:
+
+```bash
+# A) symlink it onto the PATH dir the binaries already live on
+ln -sf "$(rustup which rust-analyzer)" ~/.local/bin/rust-analyzer
+
+# B) or pin it explicitly in the daemon environment (systemd drop-in)
+#    Environment=BLACKBOX_RUST_ANALYZER_BIN=%h/.rustup/toolchains/<toolchain>/bin/rust-analyzer
+```
+
+If rust-analyzer is not found, window-0 **fails closed**: the diagnostics step is
+skipped (logged at `warn`), no rider is appended, and the agent loop is otherwise
+unaffected - you simply get no diagnostics. The feature is Rust-only today.
 
 ---
 
