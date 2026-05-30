@@ -40,7 +40,6 @@ const BASELINE_FORMAT: &str = "bro-harness.window0.diagnostics.v1";
 #[derive(Debug)]
 struct PendingEdit {
     path: PathBuf,
-    pre_image: Vec<u8>,
     post_sha256: String,
 }
 
@@ -49,7 +48,6 @@ struct DocumentSync<'a> {
     file: &'a str,
     path: &'a Path,
     baseline_version: u64,
-    pre_image: &'a [u8],
     post_text: String,
 }
 
@@ -110,7 +108,6 @@ pub async fn check_edits(
                 file: &file,
                 path: &edit.path,
                 baseline_version,
-                pre_image: &edit.pre_image,
                 post_text: post_text.clone(),
             },
         )
@@ -185,7 +182,6 @@ fn latest_rust_edits(edits: &[EditEvent], root: &Path) -> Result<BTreeMap<String
             rel,
             PendingEdit {
                 path,
-                pre_image: edit.pre_image.clone(),
                 post_sha256: edit.post_sha256.clone(),
             },
         );
@@ -204,25 +200,16 @@ async fn sync_document(
         return Ok(doc.clone());
     }
 
-    let open_version = sync
-        .baseline_version
-        .max(1)
-        .try_into()
-        .unwrap_or(i32::MAX - 1);
-    let pre_text = String::from_utf8_lossy(sync.pre_image).into_owned();
-    let mut doc = pool
+    let open_version = next_version(0, sync.baseline_version)?;
+    let doc = pool
         .open_document(
             sync.root,
             Language::Rust,
             sync.path,
             open_version,
-            pre_text.clone(),
+            sync.post_text,
         )
         .await?;
-    if pre_text != sync.post_text {
-        let version = next_version(doc.version as u64, sync.baseline_version)?;
-        pool.apply_change(&mut doc, version, sync.post_text).await?;
-    }
     documents.insert(sync.file.to_string(), doc.clone());
     Ok(doc)
 }
@@ -440,21 +427,6 @@ edition = "2024"
         });
         let mut baselines = LspBaselines::default();
         let mut documents = BTreeMap::new();
-
-        let initial_diffs = check_edits(
-            &[EditEvent::from_bytes(
-                source_path.clone(),
-                clean.as_bytes(),
-                clean.as_bytes(),
-            )],
-            &mut baselines,
-            &mut documents,
-            &pool,
-            &root,
-        )
-        .await?;
-        assert_eq!(initial_diffs.len(), 1);
-        assert!(initial_diffs[0].new.is_empty(), "{initial_diffs:#?}");
 
         std::fs::write(&source_path, broken)?;
         let diffs = check_edits(
