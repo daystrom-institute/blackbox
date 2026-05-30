@@ -4,9 +4,7 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use tree_sitter::Node;
-use tree_sitter_language_pack::{
-    ProcessConfig, ProcessResult, StructureItem, StructureKind, get_parser, process,
-};
+use tree_sitter_language_pack::{ProcessConfig, ProcessResult, StructureItem, StructureKind, process};
 
 use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 
@@ -135,23 +133,11 @@ pub(crate) fn ts_language_for_name(language: &str) -> Result<tree_sitter::Langua
 }
 
 pub(crate) fn parser_for_language(language: &str) -> Result<tree_sitter::Parser> {
-    if let Ok(parser) = get_parser(language) {
-        return Ok(parser);
-    }
+    let ts_language = ts_language_for_name(language)?;
     let mut parser = tree_sitter::Parser::new();
-    match language {
-        "rust" => parser.set_language(&tree_sitter_rust::LANGUAGE.into()),
-        "python" => parser.set_language(&tree_sitter_python::LANGUAGE.into()),
-        "csharp" => parser.set_language(&tree_sitter_c_sharp::LANGUAGE.into()),
-        "java" => parser.set_language(&tree_sitter_java::LANGUAGE.into()),
-        "go" => parser.set_language(&tree_sitter_go::LANGUAGE.into()),
-        "typescript" => parser.set_language(&tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()),
-        "javascript" => parser.set_language(&tree_sitter_javascript::LANGUAGE.into()),
-        "c" => parser.set_language(&tree_sitter_c::LANGUAGE.into()),
-        "cpp" => parser.set_language(&tree_sitter_cpp::LANGUAGE.into()),
-        _ => return Err(anyhow!("unsupported language {language}")),
-    }
-    .map_err(|err| anyhow!("failed to set {language} parser: {err}"))?;
+    parser
+        .set_language(&ts_language)
+        .map_err(|err| anyhow!("failed to set {language} parser: {err}"))?;
     Ok(parser)
 }
 

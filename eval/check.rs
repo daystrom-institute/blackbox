@@ -450,6 +450,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "data-dependent: resolves transcript:* expected refs against a populated \
+                transcript corpus on disk, which is absent in a fresh checkout. Run with \
+                `cargo test -- --ignored` against a real corpus."]
     fn all_30_manifests_have_resolvable_expected_refs() {
         let manifests = load_manifests().expect("all eval manifests parse");
         for manifest in &manifests {

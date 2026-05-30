@@ -56,7 +56,7 @@ Left for the operator (privileged op). Not required for jdtls or the daemon.
 **Symptom:** Tests build paths from `tempfile::tempdir().path()` (which on macOS is
 under `/var/folders/...`) and assert them against values the code under test has
 **canonicalized** (to `/private/var/folders/...`). `starts_with` / `contains` /
-exact-equality then miss. Linux CI hides this because `/var` is already canonical
+exact-equality then miss. Linux hides this because `/var` is already canonical
 there.
 
 **Confirmed instances:**
@@ -96,8 +96,12 @@ It is NOT an installable env-binary miss; it is a broken Cargo dependency.
   end").is_ok()` returns `Err` (valid Elixir produces parse-error nodes).
 - **`get_parser("toml")` / `get_language("elixir")` returns `Err` outright** →
   "unsupported language toml" / "unsupported language elixir":
-  - `refactor::tests::ensure_toml_table_*` (2) — `apply()` errors with
-    `unsupported language toml`.
+  - `ensure_toml_table*` (2, in `src/refactor/tests.rs:3608` — e.g.
+    `ensure_toml_table_adds_lib_table`) — `apply()` errors with
+    `unsupported language toml`. NOTE: these live at the crate-test root, **not**
+    under a `refactor::tests::` module. Filtering by `cargo test --lib
+    refactor::tests::ensure_toml_table` silently matches **zero** tests and looks
+    like a pass; use the bare filter `cargo test --lib ensure_toml_table`.
   - `code_nav::tests::test_code_query_uses_language_pack_for_mapped_languages` (1) —
     `unsupported language elixir`.
   - `code_nav::tests::code_refs_unsupported_language_typed_error_for_non_identifier_kind` (1, likely).
@@ -122,13 +126,142 @@ in the failing tests.
 
 **Next steps (own, validated effort — NOT done here; changing a core grammar dep
 affects every pack-loaded language):**
-- (a) Confirm whether these pass on Linux CI (would isolate to an
-  aarch64-darwin pack build vs a universal grammar/ABI break).
+- (a) ✅ **DONE — isolated to aarch64 (ARM64).** See the cross-env validation matrix
+  below. FAILS on aarch64-darwin AND aarch64-linux (Docker on this Mac); PASSES only
+  on x86_64-linux. Since aarch64-linux **also fails**, the failing axis is the
+  **architecture (aarch64)**, not the OS — "macOS-local" was wrong. Next root-cause
+  work is now scoped to why the pack fails to register grammars on aarch64 (§4b).
 - (b) Add a dedicated `tree-sitter-elixir` crate pinned to a tree-sitter-0.26-ABI
   release and route `"elixir"` through `parser_for_language`'s explicit match
   (same pattern as the other pinned grammars), instead of the RC language pack.
+  CAUTION: this was tried and reverted — it hung the whole-crate indexer test at
+  100% CPU (see §7). Not a blind pin.
 - (c) Or bump `tree-sitter-language-pack` off the `-rc` to a stable line and
   re-run the full grammar matrix.
+
+### Cross-env validation matrix (2026-05-30)
+
+The three rows below LOOK like an OS/arch signal but are actually a **parser-cache
+warmth** confound — see the root cause:
+
+| Environment | arch | OS | parser cache | `refactor::elixir` | `ensure_toml_table` | `code_nav` |
+|---|---|---|---|---|---|---|
+| macOS (this Mac)            | aarch64 | darwin | cold | **40 failed** / 13 pass | **2 failed** | **1 failed** |
+| Linux x86_64 (Manjaro 6.12) | x86_64  | linux  | **warm** | **53 pass**         | **2 pass**   | **1 pass**   |
+| Docker `rust:bookworm`      | aarch64 | linux  | cold | **40 failed** / 13 pass | **2 failed** | **1 failed** |
+
+**ROOT CAUSE (2026-05-30, confirmed from crate source + a live `curl` 404): a stale
+prerelease pin whose runtime parser-download manifest 404s. It is NEITHER OS- nor
+arch-specific.**
+
+- We pin `tree-sitter-language-pack = "1.8.0-rc.26"` (`Cargo.toml:57`), default
+  features → `download` + `dynamic-loading`. With `TSLP_LANGUAGES` unset, the pack's
+  build compiles **no grammars in** (generated `STATIC_LANGUAGES` and
+  `DYNAMIC_LANGUAGE_NAMES` are both empty). rust/python/java/go/ts/js/c/cpp/csharp
+  still work only because blackbox pins **separate** grammar crates for them
+  (`Cargo.toml:50-60`); **elixir/toml/erlang are sourced ONLY from the pack** and have
+  nothing built in.
+- At runtime `get_language("elixir")` misses the in-process registry and falls to the
+  download slow-path (`registry.rs:122-135`), which GETs
+  `…/releases/download/v1.8.0-rc.26/parsers.json` → **HTTP 404** (verified by curl).
+  No GitHub release with parser assets exists for this crates.io RC. The 404 happens
+  **before** the platform-key lookup (`download.rs` `platform_key()` correctly emits
+  `linux-aarch64` / `macos-arm64`), so the failure is **architecture-independent** —
+  aarch64 IS supported in code.
+- The matrix is confounded by cache state: the only PASSING row (x86_64 Manjaro) had a
+  **warm** cache at `~/.cache/tree-sitter-language-pack/v1.8.0-rc.26/libs/*.so` from a
+  prior provisioning. The Mac and Docker rows were **cold**. A *cold x86_64* box would
+  fail identically — the dead manifest is arch-blind.
+
+⚠️ **Two earlier verdicts in this section's history — "Darwin-specific", then
+"aarch64-specific" — were premature and are RETRACTED.** Each was written before the
+decisive evidence (the Docker run, then the source trace) came back. The source path +
+404 is ground truth: cold cache + dead `parsers.json` manifest for a stale RC.
+
+**FIX — CONFIRMED end-to-end on a COLD aarch64-linux cache (2026-05-30).** The
+download URL is `…/v{PACK_VERSION}/parsers.json`. Manifest probe (curl, after the
+GitHub signed-asset redirect):
+
+| pack version | `/v{ver}/parsers.json` |
+|---|---|
+| `1.8.0-rc.26` (what we pin) | **404** ← the bug |
+| `1.8.0` | **200** |
+| `1.8.1` | **200** |
+| `1.9.0-rc.1 / rc.10 / rc.17` | **200** |
+
+(My earlier note that 1.8.0/1.8.1 "also 404" was WRONG — they 200. Only the pinned
+rc.26 is dead.) Every live manifest covers aarch64: platform keys are
+`linux-aarch64, linux-x86_64, macos-arm64, macos-x86_64, windows-aarch64, windows-x86_64`.
+
+**Proven fix:** pin **`tree-sitter-language-pack = "=1.8.0"`** (exact — plain `"1.8.0"`
+resolves to 1.8.1 via caret, which breaks compile; see API note). On a fresh
+aarch64-linux Docker container (cold cache, runtime download active) the three groups
+**PASS in ~5s total**: elixir 53/0, toml 2/0, code_nav 1/0. No hang.
+
+⚠️ The earlier "bump unmasks the §7 hang" hypothesis is **RETRACTED** — the 75-min
+first attempt was `cp -a /src` copying the huge darwin `target/` into the container +
+slow colima, NOT a parse hang. The clean run (excluding `target/`) compiles and parses
+fine; `1.8.0` does not hang.
+
+**API constraint — why not just "latest":** `1.8.1` and `1.9.0-rc.17` have live
+manifests but are **NOT source-compatible**: `get_parser` now returns
+`tree_sitter_language_pack::Parser` instead of `tree_sitter::Parser`, so the current
+code fails to compile at `src/chunker/code.rs:139`
+(`expected tree_sitter::Parser, found tree_sitter_language_pack::Parser`). So:
+- **Zero-code-change fix (recommended now):** `= "1.8.0"` (stable, live manifest,
+  API-compatible, passes cold on aarch64).
+- **Forward/idiomatic fix:** bump to latest stable `1.8.1` (or the `1.9.0-rc` line) AND
+  adapt the `get_parser` call site(s) to the new `tree_sitter_language_pack::Parser`
+  type — small, localized change at `chunker/code.rs:139` (+ any sibling call sites).
+
+Provisioning note: default features (`download` + `dynamic-loading`) ARE enabled — we
+DO use runtime download + `~/.cache/tree-sitter-language-pack/v{ver}/libs/` caching.
+For a daemon, the more robust idiomatic alternative is a build-time static compile via
+`TSLP_LANGUAGES=elixir,toml,erlang` (no runtime network) — UNVERIFIED here (need to
+confirm the crates.io package ships parser C sources; build.rs compiles from a
+`parsers/` dir that may not be in the published package). The dedicated-grammar-crate
+pin (§4b/§7) stays off the table (it hung the indexer).
+
+Validation was run by a `codex` sidekick bro (the Claude Code CLI session had no LAN
+route, and Docker/brew install is heavy work better offloaded to a native env).
+
+⚠️ Process note: an earlier revision of this section asserted "Darwin-specific" — that
+was written *before* the Docker result came back and was wrong. The experiment
+existed precisely to settle this; trust the matrix, not the prior prose.
+
+### §4a. Validation options for the aarch64 theory  — ⚠️ SUPERSEDED
+
+> This section is kept for history but its premise is **obsolete**. The root cause is
+> NOT an arch issue (see the ROOT CAUSE block above): it's the dead `v1.8.0-rc.26`
+> download manifest, proven by pinning `=1.8.0` and passing cold on aarch64-linux. The
+> "is it Darwin or aarch64" framing below was answered by finding the real mechanism,
+> not by the OS/arch matrix. Disregard the experiment design here.
+
+Goal: get a **single-variable** comparison by holding everything constant except
+one axis. Two clean experiments would settle it:
+
+- **aarch64-Linux** (the decisive one): if the pack works on aarch64-Linux →
+  failure is **Darwin-specific** ("macOS-local" is the right label). If it fails
+  there too → it's an **aarch64 pack-build** problem and "macOS-local" is wrong.
+  Cheapest route: Docker. `docker run --rm -v "$PWD:/w" -w /w rust:1-bookworm
+  cargo test --lib refactor::elixir` on this Apple-silicon Mac runs an
+  **aarch64-linux** container natively (no emulation) — that is exactly the
+  missing cell. (Mount a clean checkout; expect a cold `cargo` compile.)
+- **x86_64-Darwin** (the other axis, harder): would isolate the arch on macOS, but
+  Apple dropped Intel Macs and Rosetta only translates userland x86 binaries, not
+  a different-arch toolchain target cleanly — not worth it. The aarch64-Linux
+  experiment alone is sufficient to disambiguate, because combined with the two
+  rows above it pins the responsible axis.
+
+Docker viability notes:
+- Docker Desktop on Apple silicon runs **arm64 (aarch64) Linux** containers by
+  default — so `rust:1` without `--platform` IS the aarch64-Linux test.
+- To ALSO get the x86_64-Linux confirmation locally (redundant with the bro run
+  but fully controlled at the *same commit*), add `--platform linux/amd64`; that
+  path uses qemu emulation (slow, but fine for a one-off).
+- Caveat: the indexer-hang failure mode in §7 is tree-sitter-cursor CPU spin — a
+  container inherits the same grammars, so if it's an aarch64 ABI break the
+  container reproduces it; if it's Darwin-only the container is green.
 
 ---
 
@@ -229,10 +362,15 @@ being env-specific — see below).
 
 **The remaining local failures are environment-specific, NOT code bugs:**
 
-- **§4 language-pack failures are macOS-LOCAL.** `tree-sitter-language-pack`
-  returns `Err` for every non-pinned grammar **on this host** (elixir/toml/erlang),
-  but it works on Linux CI — so these tests pass on CI and fail only here. They are
-  a local toolchain/env issue, not a defect in the shared code.
+- **§4 language-pack failures are aarch64 (ARM64)-SPECIFIC (confirmed 2026-05-30).**
+  `tree-sitter-language-pack` returns `Err` for every non-pinned grammar **on this
+  host** (elixir/toml/erlang), but the same code PASSES on x86_64-linux — not a
+  defect in the shared code. Pinned down across three environments (see §4 matrix):
+  fails on aarch64-darwin AND aarch64-linux (Docker), passes only on x86_64-linux.
+  Because the aarch64-linux container **also fails**, the responsible axis is the
+  **architecture (aarch64)**, NOT the OS. The original "macOS-LOCAL" wording was
+  wrong — the Mac is just one instance of an ARM64 host. Root cause is in the pack's
+  aarch64 grammar-registration path — see §4b for the next investigation step.
 
 - **Grammar-pin attempt was made and REVERTED.** I tried pinning dedicated
   `tree-sitter-elixir` / `tree-sitter-toml-ng` / `tree-sitter-erlang` crates and
@@ -253,7 +391,7 @@ being env-specific — see below).
   the test now hangs in **tantivy indexing threads** (`sample` shows
   `IndexWriter::add_indexing_worker` + merge threads all busy). Same code, different
   result ⇒ accumulated worktree/daemon/`target` state, not a regression. It passes
-  in a clean checkout / CI.
+  in a clean checkout.
 
 - **`eval_check::all_30_manifests`** needs a populated transcript corpus (a
   `transcript:<account>:<session>:…` ref doesn't resolve in a fresh checkout). Run
