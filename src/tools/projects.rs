@@ -202,8 +202,14 @@ impl BlackboxServer {
                 }
             }
             // Load this project's committed `.bbox/knowledge/` into the query
-            // surface (project-scoped durable knowledge is repo-owned).
+            // surface (project-scoped durable knowledge is repo-owned) and
+            // enqueue its embeds so a freshly-cloned repo is vector-searchable
+            // without a manual reembed.
             crate::server::routes::sync_kb_project_roots(&self.state);
+            crate::server::routes::enqueue_project_knowledge_embeds(
+                &self.state,
+                &record.canonical_path,
+            );
             // P1 backfill: retroactively emit observed tool-call edges for the
             // newly registered project by walking all prior transcripts. Runs
             // in a background thread so the registration response is immediate.
@@ -288,8 +294,10 @@ impl BlackboxServer {
                 let counts =
                     migrate_project_refs(&self.state, &old_project, &new_project, &response.record)?;
                 // Re-point kb roots at the new path now that migration has
-                // rewritten entries into the renamed repo's `.bbox/`.
+                // rewritten entries into the renamed repo's `.bbox/`, and
+                // re-enqueue embeds under the new path.
                 crate::server::routes::sync_kb_project_roots(&self.state);
+                crate::server::routes::enqueue_project_knowledge_embeds(&self.state, &new_project);
                 counts
             };
 
@@ -463,6 +471,66 @@ mod tests {
 
     fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())))
+    }
+
+    #[test]
+    fn register_loads_and_counts_committed_project_knowledge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".bbox").join("knowledge")).unwrap();
+        let repo = repo.canonicalize().unwrap();
+
+        // A committed project entry as it lands in git (project omitted on disk).
+        let entry = knowledge::KnowledgeEntry {
+            id: "r0000001".into(),
+            title: "repo rule".into(),
+            content: "committed convention".into(),
+            cluster: None,
+            variants: Default::default(),
+            category: knowledge::Category::Convention,
+            scope: knowledge::Scope::Project,
+            project: None,
+            providers: vec![],
+            priority: knowledge::Priority::Standard,
+            weight: 100,
+            status: knowledge::Status::Active,
+            approval: knowledge::Approval::UserConfirmed,
+            render: true,
+            decay: true,
+            review_at: None,
+            supersedes: None,
+            links: vec![],
+            rationale: None,
+            expires_at: None,
+            source: "user".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        std::fs::write(
+            repo.join(".bbox").join("knowledge").join("r0000001.json"),
+            serde_json::to_string(&entry).unwrap(),
+        )
+        .unwrap();
+
+        let server = test_server(&tmp);
+        let reg = server.bbox_project_register(Parameters(ProjectRegisterParams {
+            path: repo.to_string_lossy().into_owned(),
+        }));
+        assert_ne!(reg.is_error, Some(true));
+
+        // Register loaded the committed entry into the query surface...
+        assert!(
+            server.state.kb.read().entry("r0000001").is_some(),
+            "committed .bbox/knowledge entry should load on register"
+        );
+        // ...and it is counted for embed enqueue (vector coverage without reembed).
+        let enqueued = crate::server::routes::enqueue_project_knowledge_embeds(
+            &server.state,
+            &repo.to_string_lossy(),
+        );
+        assert_eq!(enqueued, 1);
     }
 
     #[test]

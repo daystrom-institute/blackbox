@@ -1744,6 +1744,30 @@ pub(crate) fn sync_kb_project_roots(state: &SharedState) {
     }
 }
 
+/// Enqueue embeddings for a project's loaded knowledge entries. The BM25
+/// reindex picks up committed `.bbox/knowledge/` automatically, but vector
+/// coverage is driven by enqueue, so a project registered from a clone would
+/// otherwise be invisible to vector search until a manual reembed. The embed
+/// worker dedupes by (entity_id, chunk_hash), so re-enqueuing already-embedded
+/// entries is a cheap no-op. Returns the number of entries enqueued.
+pub(crate) fn enqueue_project_knowledge_embeds(state: &SharedState, project_dir: &str) -> usize {
+    let kb = state.kb.read();
+    let mut enqueued = 0usize;
+    for entry in kb.all_entries().iter().filter(|e| {
+        e.project.as_deref() == Some(project_dir)
+            && matches!(
+                e.status,
+                crate::knowledge::Status::Active | crate::knowledge::Status::Superseded
+            )
+    }) {
+        let entity_id = crate::index::knowledge_entity_id(&entry.id);
+        let chunk_hash = crate::index::knowledge_chunk_hash(entry);
+        crate::embed_queue::enqueue_knowledge(entry, &entity_id, &chunk_hash);
+        enqueued += 1;
+    }
+    enqueued
+}
+
 pub(crate) fn migrate_project_refs(
     state: &Arc<SharedState>,
     old_project: &str,
