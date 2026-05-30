@@ -659,6 +659,72 @@ fn substring_match(query: &str, corpus: &SearchCorpus) -> Option<QueryMatch> {
     (out.score > 0.0).then_some(out)
 }
 
+// ── Repo-owned project knowledge persistence ──────────────────────
+//
+// Project-scoped durable knowledge belongs to the repo it describes: it lives
+// one file per entry under `<project_dir>/.bbox/knowledge/<id>.json` and
+// travels with the checkout. The on-disk file omits the `project` field —
+// location encodes scope, so nothing host-specific (an absolute path) is
+// committed and the entry reproduces identically on any machine.
+
+fn repo_kb_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".bbox").join("knowledge")
+}
+
+/// Load every project-scoped entry committed under `<project_dir>/.bbox/knowledge/`,
+/// stamping each with `project = project_dir` (the field is absent on disk).
+fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
+    let dir = repo_kb_dir(project_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let project = project_dir.to_string_lossy().to_string();
+    let mut out = Vec::new();
+    for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = de?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let raw =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let mut entry: KnowledgeEntry =
+            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        entry.project = Some(project.clone());
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// Persist `entries` (all owned by `project_dir`) one file per entry under
+/// `<project_dir>/.bbox/knowledge/`, with the `project` field cleared. Purges
+/// any committed file whose id is no longer present, so a removed entry deletes
+/// its file (generation/purge semantics).
+fn persist_repo_kb_entries(project_dir: &Path, entries: &[&KnowledgeEntry]) -> Result<()> {
+    let dir = repo_kb_dir(project_dir);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+    for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+        let path = de?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            if !keep.contains(stem) {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
+    for entry in entries {
+        let mut on_disk = (*entry).clone();
+        on_disk.project = None;
+        let path = dir.join(format!("{}.json", entry.id));
+        crate::json_store::atomic_write_json_locked(&path, &on_disk)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct KnowledgeStore {
     pub version: u32,
@@ -679,26 +745,55 @@ impl KnowledgeStore {
 pub struct Knowledge {
     store_path: PathBuf,
     store: KnowledgeStore,
+    /// Repos whose committed `.bbox/knowledge/` is loaded into the query
+    /// surface. Project-scoped durable knowledge is repo-owned (it travels
+    /// with the checkout); the central store holds only global entries. These
+    /// roots tell `reload` which repos to spool project entries from.
+    project_roots: Vec<PathBuf>,
 }
 
 impl Knowledge {
     pub fn open(store_path: &Path) -> Result<Self> {
-        let store = if store_path.exists() {
-            let raw = fs::read_to_string(store_path)
-                .with_context(|| format!("reading {}", store_path.display()))?;
-            serde_json::from_str(&raw)
-                .with_context(|| format!("parsing {}", store_path.display()))?
-        } else {
-            KnowledgeStore::new()
-        };
-        Ok(Self {
+        let mut k = Self {
             store_path: store_path.to_path_buf(),
-            store,
-        })
+            store: KnowledgeStore::new(),
+            project_roots: Vec::new(),
+        };
+        k.reload()?;
+        Ok(k)
+    }
+
+    /// Register the repos whose committed `.bbox/knowledge/` should load into
+    /// the query surface, then reload so their entries are immediately visible.
+    pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
+        self.project_roots = roots;
+        self.reload()
     }
 
     fn save(&self) -> Result<()> {
-        crate::json_store::atomic_write_json_locked(&self.store_path, &self.store)
+        // Persistence is split by scope. The central store owns only global
+        // (non-project) entries; project-scoped entries are persisted under
+        // their owning repo's `.bbox/knowledge/`, one file per entry. An entry
+        // whose owning repo isn't present on this host falls back to central so
+        // it is never dropped (it round-trips back to the repo once present).
+        let mut central = KnowledgeStore {
+            version: self.store.version,
+            entries: Vec::new(),
+        };
+        let mut by_project: HashMap<PathBuf, Vec<&KnowledgeEntry>> = HashMap::new();
+        for e in &self.store.entries {
+            match e.project.as_deref() {
+                Some(dir) if !dir.is_empty() && Path::new(dir).is_dir() => {
+                    by_project.entry(PathBuf::from(dir)).or_default().push(e);
+                }
+                _ => central.entries.push(e.clone()),
+            }
+        }
+        crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        for (dir, entries) in &by_project {
+            persist_repo_kb_entries(dir, entries)?;
+        }
+        Ok(())
     }
 
     pub fn reload(&mut self) -> Result<()> {
@@ -707,6 +802,25 @@ impl Knowledge {
                 .with_context(|| format!("reading {}", self.store_path.display()))?;
             self.store = serde_json::from_str(&raw)
                 .with_context(|| format!("parsing {}", self.store_path.display()))?;
+        }
+        self.load_project_entries()?;
+        Ok(())
+    }
+
+    /// Merge repo-owned project entries on top of central. Repo is authoritative
+    /// for project scope, so it wins on id collision — which also self-heals a
+    /// pre-migration central store that still carries project copies (they get
+    /// dropped from central on the next save).
+    fn load_project_entries(&mut self) -> Result<()> {
+        let roots = self.project_roots.clone();
+        for root in &roots {
+            for entry in load_repo_kb_entries(root)? {
+                if let Some(existing) = self.store.entries.iter_mut().find(|e| e.id == entry.id) {
+                    *existing = entry;
+                } else {
+                    self.store.entries.push(entry);
+                }
+            }
         }
         Ok(())
     }
@@ -2802,6 +2916,75 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             )
             .unwrap_err();
         assert!(e.to_string().contains("not found"));
+    }
+
+    #[test]
+    fn project_scope_entry_persists_to_repo_bbox_not_central() {
+        // A project-scoped entry is owned by its repo: it lands in the repo's
+        // .bbox/knowledge/ (not the central store), the committed file omits the
+        // absolute project path, and it reloads from there with project re-stamped.
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        // Canonicalize: macOS tempdirs are /var/... but is_dir()/equality must
+        // line up with the /private/var/... the code stamps and compares.
+        let repo_root = repo.path().canonicalize().unwrap();
+        let proj = repo_root.to_string_lossy().to_string();
+        let kb_path = central.path().join("kb.json");
+
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        kb.set_project_roots(vec![repo_root.clone()]).unwrap();
+        let id = kb
+            .learn_result(
+                &LearnParams {
+                    content: "always run cargo test --lib before pushing".into(),
+                    category: "convention".into(),
+                    format: None,
+                    title: Some("test before push".into()),
+                    scope: Some("project".into()),
+                    project: Some(proj.clone()),
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: None,
+                    id: None,
+                },
+                false,
+            )
+            .unwrap()
+            .id;
+
+        // Persisted one-file-per-entry under the repo, with project cleared.
+        let entry_file = repo_root
+            .join(".bbox")
+            .join("knowledge")
+            .join(format!("{id}.json"));
+        assert!(
+            entry_file.exists(),
+            "repo entry file should exist at {}",
+            entry_file.display()
+        );
+        let on_disk = std::fs::read_to_string(&entry_file).unwrap();
+        assert!(
+            !on_disk.contains("\"project\":"),
+            "committed file must not embed an absolute project path: {on_disk}"
+        );
+
+        // Central store does not carry the project entry.
+        let central_raw = std::fs::read_to_string(&kb_path).unwrap();
+        assert!(
+            !central_raw.contains(&id),
+            "central kb.json must not contain project entry {id}: {central_raw}"
+        );
+
+        // A fresh open over the same repo root re-loads it, project re-stamped.
+        let mut reopened = Knowledge::open(&kb_path).unwrap();
+        reopened.set_project_roots(vec![repo_root.clone()]).unwrap();
+        let loaded = reopened
+            .entry(&id)
+            .expect("entry should reload from repo .bbox/knowledge/");
+        assert_eq!(loaded.project.as_deref(), Some(proj.as_str()));
+        assert_eq!(loaded.scope, Scope::Project);
     }
 
     #[test]

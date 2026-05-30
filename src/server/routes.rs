@@ -1727,6 +1727,23 @@ pub(crate) fn project_ref_counts(state: &Arc<SharedState>, project: &str) -> any
     }))
 }
 
+/// Re-derive the knowledge store's project roots from the live registry so its
+/// committed `.bbox/knowledge/` entries are loaded into the query surface.
+/// Called whenever the set of registered projects changes (register, rename,
+/// unregister) and at daemon startup.
+pub(crate) fn sync_kb_project_roots(state: &SharedState) {
+    let roots: Vec<std::path::PathBuf> = state
+        .projects
+        .read()
+        .list()
+        .into_iter()
+        .map(|r| std::path::PathBuf::from(r.canonical_path))
+        .collect();
+    if let Err(e) = state.kb.write().set_project_roots(roots) {
+        tracing::warn!("kb project-root sync: {e:#}");
+    }
+}
+
 pub(crate) fn migrate_project_refs(
     state: &Arc<SharedState>,
     old_project: &str,

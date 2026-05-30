@@ -287,9 +287,20 @@ impl SharedState {
             store_dir.join("roadmap.json"),
         )
         .unwrap();
+        // Load committed `.bbox/knowledge/` for every registered project into
+        // the knowledge query surface at startup (project durable knowledge is
+        // repo-owned; the central store holds only global entries).
+        let mut kb = Knowledge::open(&store_dir.join("kb.json")).unwrap();
+        let kb_project_roots: Vec<std::path::PathBuf> =
+            ProjectRegistry::load_records(store_dir.join("projects.json"))
+                .unwrap_or_default()
+                .into_iter()
+                .map(|r| std::path::PathBuf::from(r.canonical_path))
+                .collect();
+        kb.set_project_roots(kb_project_roots).unwrap();
         SharedState {
             idx: RwLock::new(idx),
-            kb: RwLock::new(Knowledge::open(&store_dir.join("kb.json")).unwrap()),
+            kb: RwLock::new(kb),
             roadmap: RwLock::new(Roadmap::open(&store_dir.join("roadmap.json")).unwrap()),
             threads: RwLock::new(Threads::open(&store_dir.join("threads.json")).unwrap()),
             notes: RwLock::new(Notes::open(&store_dir.join("notes.json")).unwrap()),

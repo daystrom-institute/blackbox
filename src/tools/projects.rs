@@ -201,6 +201,9 @@ impl BlackboxServer {
                     }
                 }
             }
+            // Load this project's committed `.bbox/knowledge/` into the query
+            // surface (project-scoped durable knowledge is repo-owned).
+            crate::server::routes::sync_kb_project_roots(&self.state);
             // P1 backfill: retroactively emit observed tool-call edges for the
             // newly registered project by walking all prior transcripts. Runs
             // in a background thread so the registration response is immediate.
@@ -282,7 +285,12 @@ impl BlackboxServer {
             let counts = if response.dry_run {
                 project_ref_counts(&self.state, &old_project)?
             } else {
-                migrate_project_refs(&self.state, &old_project, &new_project, &response.record)?
+                let counts =
+                    migrate_project_refs(&self.state, &old_project, &new_project, &response.record)?;
+                // Re-point kb roots at the new path now that migration has
+                // rewritten entries into the renamed repo's `.bbox/`.
+                crate::server::routes::sync_kb_project_roots(&self.state);
+                counts
             };
 
             let reindex = if response.dry_run {
@@ -365,6 +373,10 @@ impl BlackboxServer {
             }
 
             let removed = self.state.projects.write().unregister_project(&p.project)?;
+
+            // Drop the unregistered project's repo from kb roots; its committed
+            // `.bbox/knowledge/` stays on disk and reloads on re-register.
+            crate::server::routes::sync_kb_project_roots(&self.state);
 
             // Rebuild EdgeIndex so edges that were keyed on the removed
             // project no longer surface in subsequent inspections.
