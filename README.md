@@ -25,7 +25,7 @@ mechanics, start at [`docs/internals.md`](docs/internals.md).
 
 ## Quick start
 
-Five steps. After step 5 every agent CLI on your host is talking to the same daemon, your existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content has been absorbed into one store, and the store is rendered back out to each provider in a consistent layered form.
+Five steps. After step 5 every agent CLI on your host is talking to the same daemon, your existing `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` content has been imported into one store, and the store is rendered back out to each provider in a consistent layered form.
 
 ### 1. Build and install the binaries
 
@@ -33,12 +33,24 @@ Five steps. After step 5 every agent CLI on your host is talking to the same dae
 git clone https://github.com/invidious9000/transcript-search.git
 cd transcript-search
 cargo build --release
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd
-install -m 755 target/release/blackboxd ~/.local/bin/blackboxd-dev
-install -m 755 target/release/bro       ~/.local/bin/bro
+install -m 755 target/release/blackboxd    ~/.local/bin/blackboxd
+install -m 755 target/release/blackboxd    ~/.local/bin/blackboxd-dev
+install -m 755 target/release/bro          ~/.local/bin/bro
+install -m 755 target/release/bro-harness  ~/.local/bin/bro-harness
 install -d ~/.local/share/blackbox/memories
 cp -a system-defaults/memories/. ~/.local/share/blackbox/memories/
 ```
+
+`bro-harness` is **required**, not optional: GLM / DeepSeek / Brodex providers
+dispatch through it, and `cargo test` exercises it (the allocator scoring tests
+expect it on `PATH` or `BRO_HARNESS_BIN`). Verify a complete install with:
+
+```bash
+for b in blackboxd blackboxd-dev bro bro-harness; do command -v "$b" || echo "MISSING: $b"; done
+```
+
+`~/.local/bin` is on `bro`'s resolution path by default (`BRO_EXTRA_PATH`), so a
+binary installed there resolves even if it isn't on your interactive shell PATH.
 
 ### 2. Run `blackboxd` as a systemd user service
 
@@ -54,6 +66,14 @@ Logs live in journald:
 ```bash
 journalctl --user -u blackbox -f
 ```
+
+**macOS (no systemd):** `blackboxd` is platform-agnostic — only the service
+wrapper differs. Run it under a launchd user agent (a `~/Library/LaunchAgents/<label>.plist`
+whose `ProgramArguments` invoke `~/.local/bin/blackboxd`, with `RunAtLoad` and
+`KeepAlive`), then `launchctl bootstrap gui/$(id -u) <plist>` to start and
+`launchctl kickstart -k gui/$(id -u)/<label>` to restart after an upgrade. Any
+process supervisor works; the daemon just needs to stay running and listen on
+`127.0.0.1:${BBOX_PORT:-7264}`.
 
 Migration note:
 On first start after the XDG-path change, `blackboxd` automatically moves legacy default stores from `~/.claude-shared/blackbox-{knowledge,threads,notes}.json`, `~/.claude-shared/transcript-index`, and `~/.bro/` into the new XDG defaults, but only when the corresponding new target does not already exist. Explicit env overrides disable that automatic migration for the overridden path.
@@ -146,7 +166,9 @@ provider-specific env var when the CLI supports one.
 
 The daemon listens on `127.0.0.1:7264/mcp` by default. Point every agent CLI at the same URL.
 
-**Claude Code** - `~/.claude*/.claude.json`:
+The URL accepts an optional `?surface=<name>` query param that scopes which tools are exposed. Omit it for the default surface, or append e.g. `?surface=ops` for an operator-focused toolset (`http://127.0.0.1:7264/mcp?surface=ops`). Run `bbox_mcp_surface` to list the available surfaces and what each includes.
+
+**Claude Code** - top-level `~/.claude.json` (the `mcpServers` key; some installs keep this under a `~/.claude*` config dir instead — edit whichever your CLI actually reads):
 ```json
 {
   "mcpServers": {
