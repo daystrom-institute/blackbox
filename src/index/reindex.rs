@@ -317,6 +317,13 @@ fn try_background_reindex(
         indexed_files += 1;
         indexed_docs += thread_docs;
     }
+    let record_docs = super::thread_docs::reindex_project_records_standalone(
+        &config.projects_path,
+        &config.threads_path,
+        fields,
+        &mut writer,
+    )?;
+    indexed_docs += record_docs;
     let roadmap_docs = super::roadmap_docs::reindex_roadmap_store_standalone(
         &config.roadmap_path,
         fields,

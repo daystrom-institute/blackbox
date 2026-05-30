@@ -279,6 +279,31 @@ fn write_thread_record(thread: &Thread) -> Result<()> {
     crate::json_store::atomic_write_json_locked(&path, &record)
 }
 
+/// Load every committed thread record under `<project_dir>/.bbox/record/`.
+/// These are durable snapshots of settled threads that travel with the repo;
+/// on a clone (where the live thread store doesn't carry them) they are the
+/// only trace of past investigations.
+pub(crate) fn load_repo_records(project_dir: &Path) -> Vec<ThreadRecord> {
+    let dir = project_dir.join(".bbox").join("record");
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for de in read.flatten() {
+        let path = de.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        match fs::read_to_string(&path).ok().and_then(|raw| {
+            serde_json::from_str::<ThreadRecord>(&raw).ok()
+        }) {
+            Some(record) => out.push(record),
+            None => tracing::warn!("skipping unreadable thread record {}", path.display()),
+        }
+    }
+    out
+}
+
 // ── Store operations ───────────────────────────────────────────────
 
 pub struct Threads {

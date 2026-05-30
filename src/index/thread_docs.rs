@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use anyhow::Result;
@@ -9,7 +9,8 @@ use tantivy::{Index, IndexWriter, TantivyDocument, Term};
 
 use super::{FieldHandles, FileMeta};
 use crate::entity_ref::EntityRef;
-use crate::threads::{Thread, Threads};
+use crate::projects::ProjectRegistry;
+use crate::threads::{Thread, ThreadRecord, Threads};
 
 fn thread_entity_id(thread_id: &str) -> String {
     EntityRef::Thread {
@@ -103,6 +104,110 @@ fn build_thread_doc(thread: &Thread, threads_path: &Path, f: FieldHandles) -> Ta
     doc.add_text(f.chunk_hash, content_hash(&content));
     doc.add_text(f.timestamp, &thread.last_activity);
     doc
+}
+
+fn record_content(record: &ThreadRecord, project_dir: &Path) -> String {
+    let mut fields = vec![
+        "entity: thread".to_string(),
+        format!("thread_id: {}", record.id),
+        format!("topic: {}", record.topic),
+        format!("project: {}", project_dir.display()),
+        format!("status: {}", record.status.as_ref()),
+    ];
+    if let Some(kind) = record.kind {
+        fields.push(format!("kind: {}", kind.as_ref()));
+    }
+    if let Some(promoted_to) = &record.promoted_to {
+        fields.push(format!("promoted_to: {promoted_to}"));
+    }
+    if !record.notes.is_empty() {
+        fields.push("inline_notes:".to_string());
+        for (idx, note) in record.notes.iter().enumerate() {
+            fields.push(format!("note {}:\n{}", idx + 1, note));
+        }
+    }
+    fields.join("\n")
+}
+
+fn build_record_doc(
+    record: &ThreadRecord,
+    project_dir: &Path,
+    record_path: &Path,
+    f: FieldHandles,
+) -> TantivyDocument {
+    let content = record_content(record, project_dir);
+    let mut doc = TantivyDocument::new();
+    // Indexed as a `thread` so a committed record is found exactly like the
+    // live thread it snapshots (same entity_id); on a clone it is the only copy.
+    doc.add_text(f.doc_type, "thread");
+    doc.add_text(f.parser_version, crate::entity_ref::PARSER_VERSION);
+    doc.add_text(f.content, &content);
+    doc.add_text(f.entity_id, thread_entity_id(&record.id));
+    doc.add_text(f.account, "blackbox");
+    doc.add_text(f.project, project_dir.to_string_lossy());
+    doc.add_text(f.role, "thread");
+    doc.add_text(f.file_path, record_path.to_string_lossy());
+    doc.add_text(
+        f.path_tokens,
+        format!(
+            "thread {} {} {}",
+            record.id,
+            record.topic,
+            project_dir.display()
+        ),
+    );
+    doc.add_text(f.chunk_kind, "thread");
+    doc.add_text(f.symbol, &record.topic);
+    doc.add_text(f.symbol_exact, &record.id);
+    doc.add_text(f.chunk_hash, content_hash(&content));
+    doc.add_text(f.timestamp, &record.resolved_at);
+    doc
+}
+
+/// Index committed `.bbox/record/` thread snapshots so resolved/promoted
+/// investigations are searchable on a clone where the live thread store doesn't
+/// carry them. Deduped against the live thread store by id — on the origin
+/// machine the live thread is already indexed, so its record is skipped.
+pub(crate) fn reindex_project_records_standalone(
+    projects_path: &Path,
+    threads_path: &Path,
+    f: FieldHandles,
+    writer: &mut IndexWriter,
+) -> Result<u64> {
+    let live_ids: HashSet<String> = if threads_path.exists() {
+        Threads::open(threads_path)?
+            .all()
+            .iter()
+            .map(|t| t.id.clone())
+            .collect()
+    } else {
+        HashSet::new()
+    };
+    let roots: Vec<PathBuf> = ProjectRegistry::load_records(projects_path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|r| PathBuf::from(r.canonical_path))
+        .collect();
+    let mut docs = 0u64;
+    for root in &roots {
+        for record in crate::threads::load_repo_records(root) {
+            if live_ids.contains(&record.id) {
+                continue;
+            }
+            let record_path = root
+                .join(".bbox")
+                .join("record")
+                .join(format!("{}.json", record.id));
+            // Delete-before-add keeps reindex idempotent per record file.
+            writer.delete_term(Term::from_field_text(
+                f.file_path,
+                record_path.to_string_lossy().as_ref(),
+            ));
+            writer.add_document(build_record_doc(&record, root, &record_path, f))?;
+            docs += 1;
+        }
+    }
+    Ok(docs)
 }
 
 pub(crate) fn reindex_threads_store_standalone(
@@ -218,5 +323,109 @@ mod tests {
         assert!(content.contains("handoff marker"));
         assert!(content.contains("inline note marker"));
         assert!(content.contains("relates_to -> thread:thread-def67890 edge note marker"));
+    }
+
+    fn make_record() -> ThreadRecord {
+        ThreadRecord {
+            id: "thread-rec00001".into(),
+            topic: "audit dispatch".into(),
+            status: ThreadStatus::Resolved,
+            kind: Some(ThreadKind::Investigation),
+            promoted_to: None,
+            notes: vec!["RECORD_NOTE_MARKER".into()],
+            created_at: "2026-01-01T00:00:00Z".into(),
+            resolved_at: "2026-01-02T00:00:00Z".into(),
+        }
+    }
+
+    fn write_committed_record(repo_root: &Path, record: &ThreadRecord) {
+        let rec_dir = repo_root.join(".bbox").join("record");
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        std::fs::write(
+            rec_dir.join(format!("{}.json", record.id)),
+            serde_json::to_string(record).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn register(projects_path: &Path, repo_root: &Path) {
+        let mut reg = ProjectRegistry::open(projects_path).unwrap();
+        reg.register_path(repo_root).unwrap();
+    }
+
+    #[test]
+    fn project_records_index_when_no_live_thread() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let record = make_record();
+        write_committed_record(&repo_root, &record);
+
+        let projects_path = central.path().join("projects.json");
+        register(&projects_path, &repo_root);
+        let threads_path = central.path().join("threads.json"); // absent → no live ids
+
+        let (schema, fields) = build_schema();
+        let index = tantivy::Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        let docs =
+            reindex_project_records_standalone(&projects_path, &threads_path, fields, &mut writer)
+                .unwrap();
+        assert_eq!(
+            docs, 1,
+            "committed record should index when no live thread carries it"
+        );
+    }
+
+    #[test]
+    fn project_records_skip_when_live_thread_present() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let record = make_record();
+        write_committed_record(&repo_root, &record);
+
+        let projects_path = central.path().join("projects.json");
+        register(&projects_path, &repo_root);
+
+        // Live thread store carries the same id (origin machine): record skipped.
+        let threads_path = central.path().join("threads.json");
+        let live = Thread {
+            id: record.id.clone(),
+            name: None,
+            topic: record.topic.clone(),
+            project: repo_root.to_string_lossy().into_owned(),
+            status: ThreadStatus::Resolved,
+            kind: None,
+            origin: None,
+            sessions: Vec::new(),
+            handoff_doc: None,
+            notes: Vec::new(),
+            edges: Vec::new(),
+            promoted_to: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_activity: "2026-01-02T00:00:00Z".into(),
+            resolved_at: Some("2026-01-02T00:00:00Z".into()),
+        };
+        std::fs::write(
+            &threads_path,
+            serde_json::to_string(&crate::threads::ThreadStore {
+                version: 1,
+                threads: vec![live],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let (schema, fields) = build_schema();
+        let index = tantivy::Index::create_in_ram(schema);
+        let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
+        let docs =
+            reindex_project_records_standalone(&projects_path, &threads_path, fields, &mut writer)
+                .unwrap();
+        assert_eq!(
+            docs, 0,
+            "record must be skipped when the live thread is already indexed"
+        );
     }
 }
