@@ -6,7 +6,7 @@ corpus: blackbox-design
 topic:
   - orchestration
   - surfaces
-brief: "Synchronous, per-mutation analyzer feedback for the bro-harness edit loop: a diagnostic for the state an edit produced rides that edit's tool result before the agent can act again (window=0). The organizing constraint is the agent's TRUST in the channel, not latency — stale or unconfirmable diagnostics bankrupt the channel (chase + alarm-fatigue), so the design trades latency and fussiness for precision. Affordable because the diagnostics that compound catastrophically (errors/types/borrow) are language-server-instant while the slow ones (lints) don't compound. Transport is LSP, consumed in-process: bro-harness owns its own warm session via shared-crate code and stays fully functional with the daemon down — never a runtime backchannel to blackbox. Per-language semantics live in a thin classification adapter whose size tracks the gap to a unified Roslyn-like toolchain. The truth tier is gated on ownership-transfer (commit / lane-handoff / merge), not agent phase."
+brief: "Synchronous, per-mutation analyzer feedback for the bro-harness edit loop: a diagnostic for the state an edit produced rides that edit's tool result before the agent can act again (window=0). The organizing constraint is the agent's TRUST in the channel, not latency — stale or unconfirmable diagnostics bankrupt the channel (chase + alarm-fatigue), so the design trades latency and fussiness for precision. Affordable because the diagnostics that compound catastrophically (errors/types/borrow) are language-server-instant while the slow ones (lints) don't compound. Transport is LSP, consumed in-process: bro-harness owns its own warm session via shared-crate code and stays fully functional with the daemon down — never a runtime backchannel to blackbox. Per-language semantics live in a thin classification adapter whose size tracks the gap to a unified Roslyn-like toolchain. The truth tier is not a harness concern at all: it is owned by whoever performs the ownership transfer (the orchestrator at collection, or an explicit solo act), because the harness — as the payload being transferred — cannot observe the boundary."
 ---
 
 # bro-harness diagnostics (window-0 analyzer feedback)
@@ -241,40 +241,69 @@ phase.** Trigger on facts that are mechanically true: does the touched crate
   vanishes by the next check, never surfaced). Errors are never delayed; lints eat
   at most one mutation-step of latency. Zero phase inference.
 
-## The truth tier: gated on ownership-transfer
+## The truth tier: owned by whoever performs the transfer, never the harness
 
 The expensive pass (`cargo check --all-features --all-targets`, clippy,
-`cargo-udeps` — the class-4 workspace-global diagnostics) cannot be window=0.
-Gate it on **the moment a unit of work crosses from private to shared**, which is
-topology-dependent and orchestration-owned — *not* time-debounce and *not* agent
-phase:
+`cargo-udeps` — the class-4 workspace-global diagnostics) cannot be window=0, and
+**it is not a harness responsibility at all.** This is the load-bearing
+correction: ownership-transfer is *intrinsically not harness-observable*, because
+the harness is the thing being transferred *from*. You can only observe a transfer
+if you perform or receive it; the harness is the payload, not either endpoint.
 
-| Boundary | Owner | Catches | Cannot catch |
-|---|---|---|---|
-| **Per-lane** (commit / drone handoff) | the agent, in its worktree | workspace-scope rot the lane created | conflicts with *other* lanes |
-| **Integration** (merge / collect) | the orchestrator | cross-lane semantic conflicts | — (this is the floor) |
+Concretely, the harness cannot locally know *which* boundary is the transfer:
 
-- **Solo session:** ownership-transfer is `git_commit` / the completion contract
-  firing / an explicit agent call to a `diagnostics_full(scope)` tool.
-- **Ensemble drone:** the handoff. The truth tier runs **in the drone's worktree
-  before it returns its result** — so smelly code is caught at handoff, not
-  deferred to integration where others have already built on it.
+- **A commit is not a transfer.** An agent commits constantly — WIP, checkpoints,
+  progress saves — and in a private worktree none of those share anything; nothing
+  is shared until the worktree is collected or merged. "A commit happened" carries
+  no information about whether *this* commit is the private→shared instant. Which
+  one is, is a fact about the orchestration topology (is this worktree about to be
+  collected?) that the harness does not hold.
+- **"End of dispatch" is the forbidden boundary renamed.** "Is this my final
+  turn?" is identical to "is the agent done?" — the exact unobservable cognitive
+  boundary the trigger model above refuses to infer. The loop runs until the model
+  stops; "stopped this turn" vs. "done with the task" is invisible from inside it.
+
+So the truth tier is **owned by the entity that performs the transfer**, which
+observes the boundary because it *is* the boundary:
+
+| Context | Who owns the truth tier | How it knows the boundary |
+|---|---|---|
+| **Ensemble** | the orchestrator | it created the drone's worktree and decides when to collect — running the check is part of *performing* collection |
+| **Solo** | the operator, or the agent by *explicit* act | a pre-push hook, a human run, or the agent **deliberately calling** `diagnostics_full(scope)` |
+
+- **Ensemble: the orchestrator runs it, not the drone.** A drone's worktree is just
+  a directory the orchestrator owns. At collection the orchestrator runs
+  `cargo check --all-features` against those files *itself*, in its own process,
+  before merging the lane. "Runs in the drone's worktree" means *against those
+  files*, not *executed by the drone process*. The drone runs nothing, knows no
+  boundary, and there is no harness→daemon call. Per-lane attribution is preserved
+  (the check is scoped to lane A's files) without the drone participating.
+- **Solo: an explicit act, never an inference.** The trigger is a pre-push hook,
+  the human, or the agent calling `diagnostics_full(scope)`. The agent-call case is
+  legitimate precisely because it is a *deliberate tool call surfaced as an
+  observable act* — the agent declaring "I am done," not the harness guessing it.
+  That distinction is the whole line between legal and illegal here.
+- **Self-correcting drone (optional).** If a drone should see its own truth-tier
+  results and fix them in-lane before returning, the check must run while its loop
+  is live — triggered by the agent's *explicit* `diagnostics_full` call or a
+  **daemon→harness "finalize" control signal**. Daemon→harness control is allowed
+  (the parent signals its child); a harness→daemon query is not. The harness still
+  never autonomously detects the boundary.
 - **Cross-lane conflict is integration-time-irreducible.** Drone A deletes a
   `pub fn` it proved unused *in its lane*; drone B in parallel started calling it.
   Both lanes individually pass; the conflict only exists after merge. No
-  feedback-latency policy can see a conflict that does not yet exist. The right
-  design makes the **orchestrator own the integration gate** (not deferring it to
-  CI or a human), and *names* this layer rather than pretending per-lane gating
-  covers it.
-- **Cost at fan-out:** per-lane truth gates are N parallel workspace-scope checks
-  — N × the hub-crate cost, contending for the workflow core budget. The
-  orchestrator must *schedule* them as part of fan-in, not assume every lane can
-  run `--all-features --all-targets` simultaneously.
-- **Idle prewarm is the only sanctioned async:** when the dirty set is stable for
-  K mutations, the truth pass may run in the background so it is warm at the gate
-  — but its result **must pass a staleness gate before injection** (drop if the
-  workspace moved). Async is allowed only as a prewarm, only with drop-stale,
-  never as the delivery path.
+  feedback-latency policy can see a conflict that does not yet exist — and this is
+  another reason the gate is orchestrator-owned: only the orchestrator sees all
+  lanes at once.
+- **Cost at fan-out:** truth gates are N parallel workspace-scope checks — N × the
+  hub-crate cost. The orchestrator *schedules* them as part of fan-in; it does not
+  assume every lane can run `--all-features --all-targets` simultaneously. This is
+  only schedulable by the orchestrator — the harness has no view of N.
+- **Idle prewarm is the only sanctioned async:** the orchestrator may run the truth
+  pass in the background when a worktree's dirty set is stable, so it is warm at
+  collection — but the result **must pass a staleness gate before use** (drop if the
+  worktree moved). Async is a prewarm only, with drop-stale, never the delivery
+  path.
 
 ## Cross-language integration: LSP transport + a thin classification adapter
 
@@ -347,11 +376,14 @@ Resolved by the dependency constraint above — the harness never depends on the
   a drone's worktree *is* its `project_root` — each harness process gets its own
   isolated warm session against its own tree. Isolation is by process, not by
   key-within-one-shared-pool.
-- **Truth tier is harness-local and partly non-LSP:** the ownership-transfer pass
-  (`cargo check --all-features --all-targets`, clippy, udeps for Rust) is
-  out-of-band process invocation the harness runs in its own worktree; for C# the
-  LSP server *is* the truth tier. Either way no daemon is involved. The provider
-  interface has an optional `truth_check(scope)` that may bypass LSP entirely.
+- **Truth tier is orchestrator-owned, not harness-local:** the ownership-transfer
+  pass (`cargo check --all-features --all-targets`, clippy, udeps for Rust) is run
+  by whoever *performs* the transfer — the orchestrator against the worktree's
+  files at collection, or an explicit solo act — never autonomously by the harness,
+  which cannot observe a boundary it is the payload of (see the truth-tier section).
+  The harness owns only window=0. `truth_check(scope)` is an orchestrator-invoked
+  entry point, optionally run in-lane via a daemon→harness finalize signal; for C#
+  the LSP server *is* the truth tier.
 - **The daemon's own MCP tool is orthogonal.** A daemon-side
   `bbox_code_diagnostics(file, version)` may exist for daemon-dispatched agents
   that are *not* bro-harness (e.g. a `claude`-CLI agent, which cannot host an
@@ -376,9 +408,13 @@ Resolved by the dependency constraint above — the harness never depends on the
   union of configs that could use the symbol, or refused.
 - **DX-6 (code-state triggers).** Errors surface instantly every mutation; lints
   surface only on compile-clean + ≥2-check persistence. No agent-phase inference.
-- **DX-7 (ownership-transfer truth gate).** The truth tier fires at private→shared
-  boundaries (commit / lane-handoff / merge), orchestrator-owned at integration;
-  cross-lane smell is acknowledged as integration-time-irreducible.
+- **DX-7 (truth tier is not a harness gate).** The expensive workspace-global pass
+  is owned by whoever *performs* the ownership transfer — the orchestrator (it
+  created the worktree and runs the check at collection) or an explicit solo act
+  (push hook / human / the agent's deliberate `diagnostics_full` call). The harness
+  owns only window=0; it never autonomously detects a transfer boundary, because as
+  the payload being transferred it cannot observe one. Cross-lane smell is
+  integration-time-irreducible and orchestrator-owned.
 - **DX-8 (LSP transport, adapter semantics).** Transport is LSP; per-language
   semantics live in a classification adapter whose size tracks the gap to a
   unified toolchain. Adding a language adds an adapter, not harness-core changes.
@@ -400,7 +436,7 @@ LspSessionManager (BUILT, daemon-local, nav-only) ──→ EXTRACT session core
                                          └─→ pull diagnostics where supported (net-new)
 classification adapter per Language (NET-NEW, in shared crate) ──→ universal envelope
 in-process diag call in harness file_edit/file_write (NET-NEW) ──→ window=0 rider (no daemon)
-truth_check(scope) per Language (NET-NEW, harness-local, partly non-LSP) ──→ ownership-transfer gate
+truth_check(scope) per Language (NET-NEW, ORCHESTRATOR-owned, partly non-LSP) ──→ run at collection against worktree files; harness never triggers it
 bbox_code_diagnostics daemon MCP tool (NET-NEW, ORTHOGONAL) ──→ daemon-side non-harness agents only
 supervision AlertKind::loop (BUILT) ──→ escalation signal (build-on-smell spiral)
 ```
@@ -412,9 +448,10 @@ the `side` spine, the `bound.rs` rider, the hooks injection seam.
 **Net-new:** the shared-crate extraction of the session core, diagnostic payload
 extraction, `didChange` document-sync, pull diagnostics, the per-language
 classification adapter, the diff-with-stable-identity differ, the harness's
-in-process window=0 diagnostics call, the per-language harness-local `truth_check`,
-and (orthogonal, optional) the daemon-side `bbox_code_diagnostics` MCP tool for
-non-harness agents.
+in-process window=0 diagnostics call, the per-language orchestrator-invoked
+`truth_check` (run against worktree files at collection; an optional daemon→harness
+finalize signal lets a drone self-correct in-lane), and (orthogonal, optional) the
+daemon-side `bbox_code_diagnostics` MCP tool for non-harness agents.
 
 ## Open questions
 
@@ -425,11 +462,12 @@ non-harness agents.
   own LSP consumers onto the shared crate (single implementation) or keep its
   current daemon-local copy (the shared crate is harness-facing only)? Single
   implementation is cleaner but couples a daemon refactor into this work.
-- **Streaming drones without a discrete handoff.** Ownership-transfer is
-  well-defined for commit / collect, but a long-lived drone that streams partial
-  results back has no single private→shared instant. Does the truth gate then
-  attach to each streamed checkpoint, or is per-lane fast-tier the only guarantee
-  until a final collect?
+- **Streaming drones without a discrete collect.** The orchestrator owns the truth
+  gate because it observes the moment it performs collection — but a long-lived
+  drone that streams partial results back gives the orchestrator no single
+  private→shared instant to gate on. Does the orchestrator then run the truth pass
+  against the worktree at each streamed checkpoint, or is the harness's per-lane
+  window=0 the only guarantee until a final collect?
 - **Pull-diagnostics support matrix.** `textDocument/diagnostic` (3.17) is the
   clean version-correlated primitive; servers vary. Where unsupported, the
   push+version-correlation fallback is more fragile — quantify which of

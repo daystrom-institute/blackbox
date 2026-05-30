@@ -105,8 +105,10 @@ each linked doc is the authority for its own area. Keep coarse status here
   (per the no-runtime-daemon-dependency convention below). Net-new: the
   shared-crate extraction, diagnostic extraction, `didChange` document-sync, pull
   diagnostics, the per-language classification adapter, the harness's in-process
-  window=0 call, the ownership-transfer truth gate, and — orthogonal — an optional
-  daemon-side `bbox_code_diagnostics` tool for non-harness agents.
+  window=0 call, the orchestrator-owned truth gate (the harness owns window=0 only;
+  the expensive workspace pass belongs to whoever performs ownership transfer), and
+  — orthogonal — an optional daemon-side `bbox_code_diagnostics` tool for
+  non-harness agents.
 
 ## Dependency graph
 
