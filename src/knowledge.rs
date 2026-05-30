@@ -2988,6 +2988,71 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     }
 
     #[test]
+    fn project_render_derives_from_committed_bbox_not_a_stub() {
+        // Second-machine scenario: the repo carries committed .bbox/knowledge
+        // but this host's central store is empty for the project. Render must
+        // reproduce the full content from .bbox — never collapse to a
+        // near-empty stub that would clobber the committed file (HIGH#2).
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+
+        // A committed entry as it lands in git: project field omitted on disk.
+        let kb_dir = repo_root.join(".bbox").join("knowledge");
+        std::fs::create_dir_all(&kb_dir).unwrap();
+        let entry = KnowledgeEntry {
+            id: "conv0001".into(),
+            title: "house rule".into(),
+            content: "PROJECT_CONVENTION_MARKER: always canonicalize tempdirs".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: None,
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            links: vec![],
+            rationale: None,
+            expires_at: None,
+            source: "user".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 0,
+            last_recalled: None,
+        };
+        std::fs::write(
+            kb_dir.join("conv0001.json"),
+            serde_json::to_string_pretty(&entry).unwrap(),
+        )
+        .unwrap();
+
+        // Fresh host: empty central store, project registered (roots synced).
+        let mut kb = Knowledge::open(&central.path().join("kb.json")).unwrap();
+        kb.set_project_roots(vec![repo_root.clone()]).unwrap();
+
+        let out = kb
+            .render(&RenderParams {
+                provider: Some("claude".into()),
+                project: Some(repo_root.to_string_lossy().into_owned()),
+                scope: Some("project".into()),
+                dry_run: Some(true),
+            })
+            .unwrap();
+
+        assert!(
+            out.contains("PROJECT_CONVENTION_MARKER"),
+            "render must reproduce committed .bbox content, not a stub: {out}"
+        );
+    }
+
+    #[test]
     fn learn_update_returns_diff_summary() {
         let (_t, mut kb) = mk_kb();
         push_entry(&mut kb, "diffid01", "orig title", "original body text");
