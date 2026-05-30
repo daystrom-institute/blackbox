@@ -130,8 +130,9 @@ ref ABI `kind` tag ──→ chaining Stage 2 ──→ chaining Stage 3 (Task)
 clipboard (Stage 1) ──→ chaining Stage 2 producer/consumer args
                         (clip_* is the first ref backing store)
 
-file inverse-diff journal (NOT built; reuse refactor::apply snapshot
-   + shell_run `touches`) ──→ neuralyze keep_files=false (file revert)
+file inverse-diff journal (NOT built; harness-local in bro-tools — pre-image at
+   mutation time in file_write/file_edit/shell_run `touches`; daemon refactor::apply
+   is prior art, not a runtime dep) ──→ neuralyze keep_files=false (file revert)
 
 checkpoint substrate (NOT built) ──→ neuralyze (all modes)
 

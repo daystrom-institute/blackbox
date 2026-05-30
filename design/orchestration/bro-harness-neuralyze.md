@@ -266,12 +266,20 @@ hooks-doc Nudger adoption log. Surfaceable via `bro_report`.
   changed.
 
 File revert requires the **inverse-diff journal** (record each mutating tool
-call's pre-image; `revert_to(watermark)` replays inverses). The
-`refactor::apply` / `SliceApplyOptions` plane already captures `original_sha256` +
-bytes for exactly this; `shell_run`'s declared-`touches` snapshot is the path to
-covering shell side effects (the gap Claude Code's rewind documents as
-unsupported). Context rewind alone is trivial — the harness owns the message vec
-(`tx.snapshot()`/`restore()`); the journal is the one substantial build.
+call's pre-image; `revert_to(watermark)` replays inverses). The journal is
+**harness-local**: pre-images are captured at mutation time inside the harness's
+own `file_write` / `file_edit` / `shell_run` tools (`bro-tools` `workspace.rs` /
+`shell.rs`), which already hold the original bytes, and `shell_run`'s
+declared-`touches` snapshot covers shell side effects (the gap Claude Code's
+rewind documents as unsupported). The daemon's `refactor::apply` /
+`SliceApplyOptions` plane (`src/refactor/**`, `src/slices.rs`) captures
+`original_sha256` + bytes for its own apply/rollback — but that is **prior art for
+the shape, not a runtime dependency**: neuralyze must not call into daemon
+`refactor` code (DX-9 / the no-runtime-daemon-dependency convention). If that
+snapshot primitive is worth sharing, it is extracted into a crate both link, never
+reached as a service. Context rewind alone is trivial — the harness owns the
+message vec (`tx.snapshot()`/`restore()`); the journal is the one substantial
+build.
 
 ## Persistence
 
