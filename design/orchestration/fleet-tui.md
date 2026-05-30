@@ -11,14 +11,22 @@ brief: "A new top-level bro-client TUI: a human cockpit for dispatching and live
 
 # Fleet TUI — multi-provider agent cockpit
 
-> **Status.** Partial. The **entire harness-side substrate is implemented** in
-> `crates/bro-harness` (2026-05-29, on `main`): SSE streaming across all three
-> transports, model-keyed compaction, the bidirectional session + control
+> **Status.** Partial — **the v1 cockpit is built and runnable** (`bro fleet`,
+> 2026-05-30, branch `feat/fleet-tui-cockpit`). The **entire harness-side
+> substrate** is implemented in `crates/bro-harness`: SSE streaming across all
+> three transports, model-keyed compaction, the bidirectional session + control
 > protocol (interrupt / steer / `/compact`), the builtin `report` tool, and
-> bounded tool results — with mock-transport integration tests for the session
-> loop. What remains is the **daemon-drive seam** (§7.2, §7.6) and the entire
-> **client side** (`FleetOrchestrator` §7.7 + the TUI §7.11–16). Implemented
-> substrate items are marked ✅ in §7.
+> bounded tool results — with mock-transport integration tests. The **client
+> side** is implemented: the daemon-drive seam (`spawn_task_interactive`, §7.2 /
+> §7.6), the `FleetOrchestrator` façade (§7.7), and the TUI (§7.11–16) —
+> dispatch, live steering, interrupt, `/compact`, the verbose transcript, the
+> table roster with state buckets + timing columns, the navigation model +
+> slash-command autocomplete, session persistence/reload, resume-on-steer, and
+> Ctrl+X stop/delete. What remains are the **follow-ons**: the `@project` cwd /
+> MCP config (§7.8), input-history persistence (§7.9), the allocator probe-core
+> extraction for provider-headroom v2 (§7.10), Alerting-bucket supervision reuse,
+> and `/resume` of a *deleted* session. Per-item status (✅ done · ◑ partial ·
+> ○ follow-on) is marked in §7.
 >
 > **Grounding.** Every claim is cited `file:line`. Blackbox claims cite this
 > repo. The bidirectional transport flags are **verified live against the
@@ -412,6 +420,10 @@ Substrate:
    integration tests cover the loop.
 2. **Drive Claude in `--input-format stream-json`** — blackbox dispatches it
    one-shot today (`exec_args.rs:218`); use the CLI's existing bidirectional mode.
+   ✅ **Implemented** — `FleetOrchestrator::launch_interactive` appends
+   `--input-format stream-json --replay-user-messages` for all bidi providers
+   (Claude/GLM/DeepSeek/Brodex); `build_exec_args` deliberately omits the flag
+   (guarded by a unit test) so it isn't doubled.
 3. **Builtin `report` tool, fleet-pinned** (§2.2) — Waiting/summary signal on the
    stream; `registry.rs` builtin; not `bro_report`. ✅ **Implemented** —
    `report.rs` (`ReportTool` holds its own `Emitter`, emits a `report` line);
@@ -428,31 +440,62 @@ Substrate:
    (`BRO_HARNESS_TOOL_RESULT_CAP_KB`, default 16; dumps under
    `$BRO_HOME/harness-dumps`), applied to every tool result in the dispatch loop.
 6. **In-process spawn keeps child stdin open/writable** (`mod.rs:1304` closes it
-   after the prompt).
+   after the prompt). ✅ **Implemented** — `spawn_task_interactive` /
+   `SpawnedTask` (an `interactive` flag on `SpawnTaskParams`); the writable
+   `ChildStdin` is returned to the caller instead of write-once-and-dropped.
+   One-shot dispatch is unchanged.
 7. **`FleetOrchestrator` façade** in the lib owning `TaskStore`/tail/`store_dir`.
+   ✅ **Implemented** — `orchestration/fleet.rs`, exposed as `blackbox::fleet`;
+   opaque `AgentHandle` + `TaskSnapshot` keep `Task`/`TaskInner` out of the
+   public API. Owns a **dedicated** `bro_home/fleet` store, loads/persists it
+   (session reload), and provides `dispatch` / `resume` / `stop` / `forget`.
 8. **TUI-local JSON config** (§5.2) — `@project` map (`keyword → absolute dir`) +
    typeahead, **and MCP server defs** injected via `--mcp-config`
    (`exec_args.rs:243`). Daemon-free; not the bbox project registry; no MCP mgmt
-   UI in v1.
+   UI in v1. ○ **Follow-on** — not built; v1 uses the launch cwd / `--cwd`.
 9. **Per-agent input-history store** (§5.3) — in-memory; optional persist to the
-   cockpit's `store_dir`.
+   cockpit's `store_dir`. ◑ **Partial** — in-memory recall implemented
+   (single-agent ↑/↓, down-to-clear); on-disk persistence not yet.
 10. **Extract the allocator probe core to a shared crate** (`ProbeStore`/
     `ProbeRecord` + `quota_capacity`, `allocator.rs:360,939,1286,1293`) for
     provider-selector v2. Cockpit links it, writes its **own** probe store from its
-    own dispatch rate-limit telemetry + on-demand probe — daemon-free. Follow-on.
+    own dispatch rate-limit telemetry + on-demand probe — daemon-free.
+    ○ **Follow-on** — not built; v1 selector text-cycles the provider list.
 
 Client (TUI):
 
 11. **Selectable grouped/collapsible roster list** component (none exists; §5).
+    ✅ **Implemented** — a ratatui `Table` (fixed-width columns + header):
+    glyph · provider · agent · model · cost · turns · started · last, grouped
+    into state buckets with blank-row separators; `TableState` selection.
 12. **Roster + detail layout**; detail = live stream-json transcript.
+    ✅ **Implemented** — roster is full-width/focus; the live transcript lives in
+    the single-agent view (`→`), not beside the roster (per UX feedback).
 13. **Navigation model + dual-mode composer** — zoom axis, empty-gate, history
-    mode, slash carveout (§5.1, §5.3).
+    mode, slash carveout (§5.1, §5.3). ✅ **Implemented** — zoom axis
+    (provider ⟷ roster ⟷ single-agent), empty-composer gate, history mode, and
+    a slash-command autocomplete menu (`/compact`, `/rename`; ↑/↓ + Tab).
 14. **Single-agent verbose transcript** (§5.4) — inline render of text/tool/
     result/thinking/steer; net-new live-stream→`transcripts/types.rs` parser.
+    ✅ **Implemented** — `parse_transcript` (fleet-owned `TranscriptItem`, not
+    the stored-transcript schema); markers + color; tool-result verbosity is
+    tool-aware (Edit/MCP show bodies; Bash/Read suppressed; errors always shown);
+    turn rules between user→assistant.
 15. **Provider-first-class presentation** (glyph/filter/group, capability badges,
-    cost; v1 selector text-cycle, v2 headroom §4).
+    cost; v1 selector text-cycle, v2 headroom §4). ◑ **Partial** — glyph / tag /
+    grouping / per-provider cost done; v1 text-cycle selector with a flashing
+    `next:` indicator. Capability badges + v2 headroom routing (§7.10) not built.
 16. **Fleet-state taxonomy + attention surface** (Alerting/Waiting/Idle/Active/
     Interrupted; manual `Ctrl+X`+`Ctrl+X` cleanup; `/resume` deleted sessions).
+    ◑ **Partial** — Waiting/Idle/Active/Interrupted derived from the stream
+    (turn-in-flight + `report` needs-input); `Ctrl+X` stop→delete implemented;
+    on-roster Interrupted sessions resume on steer. **Alerting**-bucket
+    supervision reuse and `/resume` of a *deleted* session are not built.
+
+Beyond the original list (implemented): **session persistence + reload** across
+cockpit restarts (dedicated `bro_home/fleet` store; crashed sessions return as
+recoverable/Interrupted), and **resume-on-steer** (`--resume <session_id>` swaps
+a live handle back in, dropping the stale task).
 
 Reused as-is (verified present): `spawn_task`/`TaskStore` (`mod.rs:1171,206`),
 stream-json parse path (`events.rs:62`), markdown helpers (`cli.rs:2087,2175,2233`),
