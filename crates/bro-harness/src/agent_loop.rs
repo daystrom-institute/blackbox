@@ -67,7 +67,7 @@ async fn run_session(cli: Cli) -> Result<()> {
     // The stdin reader runs as its own task so control messages (interrupt)
     // arrive while a turn is in flight. It owns a clone of the emitter purely to
     // honour `--replay-user-messages`.
-    let mut input_rx = spawn_stdin_reader(replay, Emitter::new(sid.clone()));
+    let input_rx = spawn_stdin_reader(replay, Emitter::new(sid.clone()));
     // A separate emitter for control responses emitted *during* a turn, when the
     // session's own emitter is borrowed by the running turn.
     let ctrl_emitter = Emitter::new(sid);
@@ -79,6 +79,20 @@ async fn run_session(cli: Cli) -> Result<()> {
         pending.push_back(p);
     }
 
+    session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    session.persist()?;
+    Ok(())
+}
+
+/// The core bidirectional loop, factored out of `run_session` so it can be
+/// driven by an injected input channel in tests (independent of real stdin /
+/// HTTP). Persistence is the caller's responsibility.
+async fn session_loop(
+    session: &mut Session,
+    mut input_rx: mpsc::UnboundedReceiver<Input>,
+    ctrl_emitter: &Emitter,
+    mut pending: VecDeque<String>,
+) -> Result<()> {
     loop {
         let prompt = match pending.pop_front() {
             Some(p) => p,
@@ -148,8 +162,6 @@ async fn run_session(cli: Cli) -> Result<()> {
             break;
         }
     }
-
-    session.persist()?;
     Ok(())
 }
 
@@ -714,5 +726,222 @@ mod tests {
 
         let empty = json!({"type": "user", "message": {"role": "user", "content": ""}});
         assert_eq!(extract_user_text(&empty), None);
+    }
+
+    // --- bidirectional session_loop integration (mock transport) ------------
+
+    use async_trait::async_trait;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
+
+    enum MockTurn {
+        /// Return text immediately (Done, no tool calls).
+        Text(String),
+        /// Await a gate that tests never release — to be cancelled by interrupt.
+        Block,
+    }
+
+    #[derive(Clone, Default)]
+    struct MockShared {
+        pushed_users: Arc<Mutex<Vec<String>>>,
+        started: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+        compact_calls: Arc<AtomicUsize>,
+    }
+
+    struct MockTransport {
+        shared: MockShared,
+        scripts: Arc<Mutex<VecDeque<MockTurn>>>,
+        gate: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl Transport for MockTransport {
+        fn name(&self) -> &'static str {
+            "mock"
+        }
+        fn push_user_text(&mut self, text: &str) {
+            self.shared.pushed_users.lock().unwrap().push(text.to_string());
+        }
+        fn push_tool_results(&mut self, _results: Vec<transport::ToolResult>) {}
+        async fn run_turn(
+            &mut self,
+            _tools: &[transport::ToolSpec],
+            _opts: &TurnOpts,
+            _sink: &dyn transport::TurnSink,
+        ) -> Result<transport::TurnOutput> {
+            self.shared.started.fetch_add(1, Ordering::SeqCst);
+            let script = self
+                .scripts
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(MockTurn::Text("ok".into()));
+            match script {
+                MockTurn::Block => {
+                    self.gate.notified().await;
+                    unreachable!("gate is never released in tests");
+                }
+                MockTurn::Text(t) => {
+                    self.shared.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(transport::TurnOutput {
+                        text: t,
+                        tool_calls: vec![],
+                        stop: StopReason::Done,
+                        usage: Usage::default(),
+                    })
+                }
+            }
+        }
+        fn snapshot(&self) -> Value {
+            json!([])
+        }
+        fn restore(&mut self, _snapshot: Value) {}
+        async fn compact(
+            &mut self,
+            _keep_tail: usize,
+            _instruction: &str,
+            _opts: &TurnOpts,
+        ) -> Result<Option<String>> {
+            self.shared.compact_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Some("summary".into()))
+        }
+    }
+
+    fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
+        let shared = MockShared::default();
+        let mock = MockTransport {
+            shared: shared.clone(),
+            scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
+            gate: Arc::new(Notify::new()),
+        };
+        let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
+        let clipboard = Arc::new(Mutex::new(bro_tools::Registers::default()));
+        let cx = ToolCx {
+            root: std::env::temp_dir(),
+            safety: Arc::new(SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: todos.clone(),
+            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            clipboard: clipboard.clone(),
+        };
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let id = format!("bh-test-{}-{}", std::process::id(), nanos);
+        let session = Session {
+            tx: Box::new(mock),
+            reg: Registry::new(vec![], vec![], &PinPolicy::from_env(), &mcp::ToolFilter::default()),
+            cx,
+            hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
+            emitter: Emitter::new("test".into()),
+            base_opts: TurnOpts {
+                model: "m".into(),
+                max_tokens: 8,
+                system: SystemPrompt::default(),
+                effort: None,
+                web_search: false,
+            },
+            system: None,
+            max_turns: 50,
+            compaction: crate::compaction::CompactionPolicy::from_env(),
+            compact_threshold: None,
+            tool_result_cap: 0,
+            dump_dir: std::env::temp_dir(),
+            store: SessionStore::open(Some(&id), None).unwrap(),
+            prior_side: Value::Null,
+            todos,
+            clipboard,
+            total_usage: Usage::default(),
+            turns: 0,
+            last_prompt_tokens: 0,
+            tail_nudge: None,
+        };
+        (session, shared)
+    }
+
+    #[tokio::test]
+    async fn session_loop_processes_turns_in_order() {
+        let (mut session, shared) =
+            mk_session(vec![MockTurn::Text("1".into()), MockTurn::Text("2".into())]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::User("alpha".into())).unwrap();
+        tx.send(Input::User("beta".into())).unwrap();
+        drop(tx); // EOF after both
+        let ctrl = Emitter::new("ctrl".into());
+        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+            .await
+            .unwrap();
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(users, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_in_flight_turn() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Block]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::User("go".into())).unwrap();
+        tx.send(Input::Control {
+            subtype: "interrupt".into(),
+            req_id: Some("r1".into()),
+            raw: json!({}),
+        })
+        .unwrap();
+        drop(tx);
+        let ctrl = Emitter::new("ctrl".into());
+        // Without cancellation the Block turn hangs forever; the timeout proves
+        // the interrupt unwound it and the loop drained to EOF.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session_loop(&mut session, rx, &ctrl, VecDeque::new()),
+        )
+        .await
+        .expect("session_loop must not hang on an interrupted turn")
+        .unwrap();
+        assert_eq!(shared.started.load(Ordering::SeqCst), 1, "turn started");
+        assert_eq!(
+            shared.completed.load(Ordering::SeqCst),
+            0,
+            "the blocked turn was cancelled, never completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn slash_compact_runs_compaction_not_a_turn() {
+        let (mut session, shared) = mk_session(vec![]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::User("/compact".into())).unwrap();
+        drop(tx);
+        let ctrl = Emitter::new("ctrl".into());
+        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+            .await
+            .unwrap();
+        assert_eq!(shared.compact_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            shared.started.load(Ordering::SeqCst),
+            0,
+            "/compact is a slash command, not a model turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_set_model_control_mutates_model() {
+        let (mut session, _shared) = mk_session(vec![]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::Control {
+            subtype: "set_model".into(),
+            req_id: Some("r".into()),
+            raw: json!({"type": "control_request", "subtype": "set_model", "model": "new-model"}),
+        })
+        .unwrap();
+        drop(tx);
+        let ctrl = Emitter::new("ctrl".into());
+        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+            .await
+            .unwrap();
+        assert_eq!(session.base_opts.model, "new-model");
     }
 }
