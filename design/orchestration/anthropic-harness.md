@@ -17,9 +17,18 @@ brief: "A minimal headless coding agent that speaks provider APIs directly (Anth
 > (2026-05-29). Daemon wiring is **done**: `glm`/`deepseek` resolve to
 > `bro-harness` on the Anthropic transport, and a new `brodex` provider rides
 > the OpenAI Responses transport (Codex/ChatGPT backend) while the existing
-> `codex` → codex-CLI path is preserved unchanged. Remaining: live in-daemon
-> dispatch validation (needs `bro-harness` installed / `BRO_HARNESS_BIN`),
-> optional SSE streaming, MCP pooling, wire-contract test.
+> `codex` → codex-CLI path is preserved unchanged.
+>
+> **Shipped since initial design** (now built, beyond the body below): SSE
+> streaming on all three transports; **model-keyed context-window compaction**
+> (`compaction.rs` — distinct from the deferred RTK *output* compaction in "Open
+> questions / later"); a persistent **bidirectional stream-json session +
+> control protocol** (`session.rs`, `agent_loop.rs` `session_loop`) with
+> mock-transport integration tests; the **report** builtin (`report.rs`,
+> fleet-pinned); and **bounded tool results** (`bound.rs`,
+> `BRO_HARNESS_TOOL_RESULT_CAP_KB`). Detail for the fleet-facing pieces lives in
+> `fleet-tui.md`. Remaining: live in-daemon dispatch validation (needs
+> `bro-harness` installed / `BRO_HARNESS_BIN`) and MCP pooling.
 
 ## Problem
 
@@ -153,10 +162,16 @@ stays byte-compatible.
   tool abstraction. No Anthropic-specific code. Reusable by the daemon and
   by future in-process paths.
   - `tool.rs` — `Tool` trait + `ToolResult` + JSON-schema derivation.
-  - `workspace/` — `file_read`, `smart_read`, `file_edit`, `file_write`,
-    `list_dir`, `shell_run`, `content_search` (grep), `glob`,
+  - `workspace.rs` — `file_read`, `smart_read`, `file_edit`, `file_write`,
+    `list_dir`, `content_search` (grep), `glob`,
     `git_status/log/diff/show/commit`. Ported from daystrom-mk2
     `Daystrom.Worker/Tools/`.
+  - `shell.rs` — the shell quartet (`shell_run`/`shell_poll`/`shell_kill`/
+    `shell_list`), Codex yield-poll model with session management.
+  - `clipboard.rs` + `slice_core.rs` — the `clip_*` register store (settled-ref
+    layer) and the selector vocabulary/resolver; `jq.rs` backs the
+    `clip_transform` `jq` program.
+  - `todo.rs` — `todo_write`, durable across `exec → resume` via the `side` cell.
   - `web/` — **`web_search` is a pass-through server-side tool, not a
     bundled client tool** (see verified note above): the harness forwards the
     `web_search_20250305` declaration upstream and relays the provider's
@@ -176,13 +191,25 @@ stays byte-compatible.
   - `transport/` — the `Transport` trait + normalized types (`mod.rs`) and
     the three impls: `anthropic.rs`, `openai_chat.rs`, `openai_responses.rs`.
     Each owns its wire encode/decode, HTTP, auth, and conversation buffer.
-  - `agent_loop.rs` — the transport-agnostic agent loop.
+  - `agent_loop.rs` — the transport-agnostic agent loop; also the bidirectional
+    `session_loop` (control-protocol request/response) when fed
+    `--input-format stream-json`.
   - `cli.rs` — argv parsing (Claude-compatible subset).
   - `emit.rs` — Claude `stream-json` event emitter (always, every transport).
-  - `session.rs` — transport-tagged snapshot persistence + `--resume`.
-  - `mcp.rs` — MCP client for the injected blackbox server (stub for now).
+  - `session.rs` — transport-tagged snapshot persistence + `--resume`, plus the
+    transport-agnostic `side` cell (clipboard/todos/nudges ride it).
+  - `compaction.rs` — model-keyed context-window compaction thresholds; manual
+    `/compact` + auto-trigger.
+  - `report.rs` — the `report` builtin (fleet cockpit signal; pinned in fleet
+    mode via `PinPolicy::also_pin`).
+  - `bound.rs` — bounded tool results (head + rider spill;
+    `BRO_HARNESS_TOOL_RESULT_CAP_KB`).
+  - `hooks.rs` — the hook seam + Nudger (engine, ledger on `side`, four rules);
+    see `bro-harness-hooks.md`.
+  - `mcp.rs` — MCP client for the injected blackbox server (allow/deny filter +
+    recursion-guard deny).
   - `registry.rs` — built-in `bro-tools` + MCP tools as normalized
-    `ToolSpec`s, with name-collision policy.
+    `ToolSpec`s, with name-collision policy and the pinned/eager/deferred tiers.
 
 Shared types (`Provider`, `EventSink`, the stream-json envelope structs)
 live in the `blackbox` lib and are imported by `bro-harness`; if that
@@ -488,7 +515,9 @@ idea: every tool stays reachable, only used ones cost a full schema.
 - **In-process future**: because tools live in `crates/bro-tools` and are
   provider-agnostic, a later in-process executor can reuse them without
   touching the subprocess path.
-- **Output compaction (RTK) — deferred (2026-05-29).** Idea: bake
+- **Output compaction (RTK) — deferred (2026-05-29).** Distinct from the
+  shipped model-keyed *context-window* compaction (`compaction.rs`); this item
+  is about per-command *output* token-saving. Idea: bake
   RTK-style (`rtk-ai/rtk`) token-saving output compaction into our tools at
   the *output* layer (never the command layer), eliminating the hook's
   command-rewrite mangling class by construction. Investigation found rtk's

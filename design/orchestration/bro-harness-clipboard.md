@@ -1,9 +1,8 @@
 ---
 title: "bro-harness clipboard (clip_* registers)"
 kind: design
-lifecycle: proposed
-corpus: blackbox-design
 lifecycle: partial
+corpus: blackbox-design
 topic:
   - orchestration
   - surfaces
@@ -12,12 +11,17 @@ brief: "A session-durable, snapshot register store for the bro-harness tool loop
 
 # bro-harness clipboard (`clip_*` registers)
 
-> **Status.** Partial — as-built 2026-05-29 in
-> `crates/bro-tools/src/clipboard.rs` (register store + the six `clip_*`
-> tools) and `crates/bro-tools/src/slice_core.rs` (the first-cut duplicated
-> selector vocabulary + resolver). Wired into `ToolCx`, `builtin_tools()`,
-> the `side` cell (`agent_loop.rs`), and pinned by default
-> (`registry.rs` `PinPolicy`). Deviations from this doc, all intentional:
+> **Status.** Partial — as-built (and since **expanded**) in
+> `crates/bro-tools/src/clipboard.rs` and
+> `crates/bro-tools/src/slice_core.rs` (the first-cut duplicated selector
+> vocabulary + resolver). The register store now backs **nine** `clip_*`
+> tools: the original six (`clip_yank`/`clip_set`/`clip_paste`/`clip_list`/
+> `clip_peek`/`clip_clear`) plus three composable transforms added later —
+> `clip_transform` (a `jq`/`jaq` program over a register or file, sourcing the
+> standalone `jq` arg here rather than a separate tool), `clip_slice`, and
+> `clip_grep`. Wired into `ToolCx`, `builtin_tools()`, the `side` cell
+> (`agent_loop.rs`), and pinned by default (`registry.rs` `PinPolicy`).
+> Deviations from this doc, all intentional:
 >
 > - **Persistence is already generic.** `session.rs` shipped `SaveState` + a
 >   transport-agnostic `side` cell before this work, so the "persistence

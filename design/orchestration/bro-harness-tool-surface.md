@@ -1,7 +1,7 @@
 ---
 title: "bro-harness tool surface — the ideal built-in subset"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - orchestration
@@ -11,7 +11,13 @@ brief: "Defines the target built-in tool subset for bro-harness, derived from th
 
 # bro-harness tool surface — the ideal built-in subset
 
-> **Status.** Proposed. bro-harness column verified against
+> **Status.** Partial — the "Adopt list" below has largely shipped. The
+> "What bro-harness has today" table is the **design-time baseline** (2026-05-29);
+> the gaps it notes as "No X" were the work this doc scoped, and most are now
+> built (the shell quartet, `file_read` caps/line-numbers, `content_search`
+> modes, `todo_write`, the `clip_*` family). See "Resolved decisions" and
+> "Adopt list" for what landed; per-call escalation remains spec-only. bro-harness
+> column originally verified against
 > `crates/bro-tools/src/{workspace.rs,web.rs,lib.rs}` and
 > `crates/bro-harness/src/registry.rs`. Codex column verified live via a Codex
 > dispatch reporting its own schema (2026-05-29). CC column from the Claude Code
@@ -24,21 +30,26 @@ choosing the best *shape* (args, modes) for each tool from across CC and Codex
 rather than copying either wholesale. This doc is the guardrail for what belongs
 in `builtin_tools()` and how each tool's arg surface should look.
 
-## What bro-harness has today (verified)
+## What bro-harness has today (design-time baseline, 2026-05-29)
 
-`crates/bro-tools/src/lib.rs::builtin_tools()` returns 14 tools; the registry
-also pins the daemon's `bbox_slice_*` (MCP) and adds the `tool_search` meta-tool.
+> This table captures the surface **as of the design**, to motivate the adopt
+> list. `builtin_tools()` now returns **27 tools** (18 base + the 9 `clip_*`),
+> not the 14 below; the "No X" limit notes annotated **[shipped]** were the gaps
+> this doc scoped and have since been filled. The registry also pins the daemon's
+> `bbox_slice_*` (MCP) and adds the `tool_search` meta-tool.
 
-| Tool | Args (verified) | Notes / limits |
+| Tool | Args (design-time) | Notes / limits |
 |---|---|---|
-| `file_read` | `file_path, start_line?, end_line?` | 1-based inclusive range. **No output cap; reads whole file then line-filters.** No multimodal. |
+| `file_read` | `file_path, start_line?, end_line?` | 1-based inclusive range. ~~No output cap~~ **[shipped]** now caps at `max_lines?=2000` and takes `line_numbers?`. No multimodal. |
 | `smart_read` | `file_path, max_full_lines?=400` | Small files whole; large files → definition outline + 40-line head. **No CC/Codex equivalent — bro is ahead.** |
 | `file_write` | `file_path, content` | Creates parent dirs; overwrite. |
 | `file_edit` | `file_path, old_string, new_string, replace_all?=false` | Unique-match-or-fail; rejects identical old/new. **Matches CC `Edit`.** |
 | `list_dir` | `path?` | Immediate entries. |
-| `content_search` | `pattern (regex), path?, glob?, max_results?=200 (cap 5000)` | gitignore-aware; returns `relpath:line:text`. **No output_mode / context-lines / count mode.** |
-| `glob` | `pattern, path?` | gitignore-aware; **alphabetical sort** (not mtime); cap 2000. |
-| `shell_run` | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. **No timeout / background / output cap / stdin / session.** |
+| `content_search` | `pattern (regex), path?, glob?, max_results?=200 (cap 5000)` | gitignore-aware; returns `relpath:line:text`. ~~No output_mode / context-lines / count~~ **[shipped]** now takes `mode` (content/files/count), `context_lines`, `case_insensitive`. |
+| `glob` | `pattern, path?` | gitignore-aware; **mtime sort by default** (`GlobSort::Mtime`), `name` opt-in; cap 2000. |
+| `shell_run` (+ `shell_poll`/`shell_kill`/`shell_list`) | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. ~~No timeout / background / stdin / session~~ **[shipped]** — the full quartet now exists (Codex yield-poll: `timeout_ms`, `yield_time_ms`, `max_output_tokens`, `stdin`, `close_stdin`, `env`, session cap). |
+| `todo_write` | `todos[]` | **[shipped]** durable across `exec → resume` via the `side` cell. |
+| `clip_*` (×9) | (see `clipboard.rs`) | **[shipped]** register store: `clip_yank/set/paste/list/peek/clear` + `clip_transform`/`clip_slice`/`clip_grep`. |
 | `git_status/log/diff` | — | `log` = `--oneline -20`. |
 | `git_show` | `rev?=HEAD` | |
 | `git_commit` | `message, paths[]` | Explicit paths only (no `git add .`); sensitive-file refusal. |
