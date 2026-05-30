@@ -1,7 +1,7 @@
 ---
 title: "Performance Pathology"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - refactor-tools
