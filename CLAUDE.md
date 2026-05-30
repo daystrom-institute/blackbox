@@ -3,6 +3,14 @@
 
 ## Conventions
 
+**Rust test isolation invariants (tempdir canonicalization + real-HOME isolation)**
+
+Rust test isolation invariants (this repo, surfaced on macOS aarch64). Two conventions every new test must follow, learned while taking `cargo test --lib` to 0 failures:
+
+1. Canonicalize tempdir roots before path assertions. `tempfile::tempdir().path()` is `/var/folders/...` on macOS but code-under-test canonicalizes to `/private/var/folders/...`; raw-path `starts_with`/`contains`/equality asserts then silently miss (Linux hides it — `/var` is already canonical). At the top of the test do `let root = dir.path().canonicalize().unwrap();` and derive expected paths from `root`. ~147 test files use tempdirs, so this is an easy latent regression to reintroduce.
+
+2. Isolate to per-test tempdirs; never touch real `$HOME`/XDG/prod state. Tests that read/write `~/.config/blackbox`, `~/.local/state/blackbox`, `~/.claude*`, the real tantivy index, or the prod daemon on 127.0.0.1:7264 collide across parallel agents/worktrees. Use `SharedState::for_test(tempdir)` (`src/server/state.rs`). Any test mutating process env must also hold `crate::util::test_env_lock()` (non-reentrant — don't double-take it via a helper that already locks).
+
 **bro-harness shares code with daemon, never runtime**
 
 bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share **code** via workspace crates (e.g. bro-tools), but bro-harness must never have a **runtime** dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it's going the wrong way. Corollary: shared capabilities the harness needs (e.g. LSP session management) are shared by extracting code into a workspace crate both link, not by the harness calling a daemon service.
