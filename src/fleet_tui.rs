@@ -186,6 +186,11 @@ struct App {
     provider_cursor: usize,
     /// Sticky-next provider — applies to the next dispatch only (§4).
     next_provider: Provider,
+    /// Flash the title-bar `next:` value (yellow) until this instant, after the
+    /// provider is cycled — instead of a duplicate status message.
+    provider_flash_until: Option<Instant>,
+    /// Selected completion in the slash-command menu (§5.1 slash carveout).
+    slash_cursor: usize,
     /// Buckets the user has collapsed.
     collapsed: HashSet<FleetState>,
 
@@ -224,6 +229,8 @@ impl App {
             roster_selected: 0,
             provider_cursor: 0,
             next_provider: Provider::Claude,
+            provider_flash_until: None,
+            slash_cursor: 0,
             collapsed: HashSet::new(),
             launch_cwd,
             input: String::new(),
@@ -241,6 +248,11 @@ impl App {
     fn set_status(&mut self, msg: impl Into<String>, ttl: Duration) {
         self.status = Some(msg.into());
         self.status_until = Some(Instant::now() + ttl);
+    }
+
+    /// Briefly highlight the title-bar `next:` provider after it's cycled.
+    fn flash_provider(&mut self) {
+        self.provider_flash_until = Some(Instant::now() + Duration::from_millis(1200));
     }
 
     fn maybe_clear_status(&mut self) {
@@ -309,6 +321,69 @@ fn bucket_rank(state: FleetState) -> usize {
         .iter()
         .position(|b| *b == state)
         .unwrap_or(usize::MAX)
+}
+
+// ── Slash-command autocomplete (§5.1 slash carveout) ─────────────────────────
+
+struct SlashCmd {
+    name: &'static str,
+    desc: &'static str,
+}
+
+/// Slash commands available in a given zone. Single-agent has the steering
+/// commands; the dispatch composer has none (a leading `/` is a literal prompt).
+fn zone_slash_commands(zone: Zone) -> &'static [SlashCmd] {
+    match zone {
+        Zone::SingleAgent => &[
+            SlashCmd {
+                name: "/compact",
+                desc: "summarize & compact the conversation",
+            },
+            SlashCmd {
+                name: "/rename",
+                desc: "rename this agent (TUI-local)",
+            },
+        ],
+        _ => &[],
+    }
+}
+
+/// Completions whose name has the current composer token as a prefix.
+fn filtered_slash(app: &App) -> Vec<&'static SlashCmd> {
+    zone_slash_commands(app.zone)
+        .iter()
+        .filter(|c| c.name.starts_with(app.input.as_str()))
+        .collect()
+}
+
+/// The slash menu is active while the composer holds a bare `/command` token
+/// (leading `/`, no space yet) with at least one match, and not mid-rename.
+fn slash_active(app: &App) -> bool {
+    app.input.starts_with('/')
+        && !app.input.contains(' ')
+        && app.rename_target.is_none()
+        && !filtered_slash(app).is_empty()
+}
+
+fn slash_move(app: &mut App, delta: isize) {
+    let n = filtered_slash(app).len();
+    if n == 0 {
+        return;
+    }
+    let cur = app.slash_cursor.min(n - 1) as isize;
+    app.slash_cursor = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+}
+
+/// Tab: complete the selected command into the composer (trailing space → ready
+/// for args, and exits slash mode).
+fn complete_slash(app: &mut App) {
+    let cmds = filtered_slash(app);
+    if cmds.is_empty() {
+        return;
+    }
+    let name = cmds[app.slash_cursor.min(cmds.len() - 1)].name;
+    app.input = format!("{name} ");
+    app.slash_cursor = 0;
 }
 
 // ── Entry point ─────────────────────────────────────────────────────────────
@@ -423,10 +498,15 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         stop_or_delete_selected(app);
         return;
     }
-    // `tab` is the always-available provider cycle, even with a non-empty
-    // composer (§5.1).
+    // Slash carveout: while the slash menu is up, Tab completes the selection
+    // and ↑/↓ cycle completions (§5.1). Otherwise Tab cycles the provider.
+    let slash = slash_active(app);
     if key.code == KeyCode::Tab {
-        cycle_provider(app, 1);
+        if slash {
+            complete_slash(app);
+        } else {
+            cycle_provider(app, 1);
+        }
         return;
     }
 
@@ -446,6 +526,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Esc if app.zone == Zone::SingleAgent => interrupt_selected(app),
         KeyCode::Esc => app.quit = true,
+
+        // Slash menu owns ↑/↓ while it's up.
+        KeyCode::Up if slash => slash_move(app, -1),
+        KeyCode::Down if slash => slash_move(app, 1),
 
         KeyCode::Left if zoom => zoom_left(app),
         KeyCode::Right if zoom => zoom_right(app),
@@ -469,14 +553,17 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         KeyCode::Backspace => {
             app.input.pop();
+            app.slash_cursor = 0;
             if app.input.is_empty() {
                 app.history_cursor = None;
             }
         }
-        // Typing exits history-recall mode (you're now editing the line).
+        // Typing exits history-recall mode (you're now editing the line) and
+        // resets the slash selection to the top match.
         KeyCode::Char(c) => {
             app.input.push(c);
             app.history_cursor = None;
+            app.slash_cursor = 0;
         }
 
         _ => {}
@@ -660,10 +747,7 @@ fn zoom_right(app: &mut App) {
         Zone::ProviderSelector => {
             // confirm sticky-next, return to roster
             app.next_provider = Provider::ALL[app.provider_cursor];
-            app.set_status(
-                format!("next dispatch → {}", app.next_provider),
-                Duration::from_secs(3),
-            );
+            app.flash_provider();
             app.zone = Zone::Roster;
         }
         Zone::Roster => {
@@ -701,10 +785,8 @@ fn cycle_provider(app: &mut App, delta: isize) {
     let cur = app.provider_cursor as isize;
     app.provider_cursor = (((cur + delta) % n + n) % n) as usize;
     app.next_provider = Provider::ALL[app.provider_cursor];
-    app.set_status(
-        format!("next dispatch → {}", app.next_provider),
-        Duration::from_secs(2),
-    );
+    // Flash the title-bar `next:` value instead of a duplicate status line.
+    app.flash_provider();
 }
 
 /// Readline-style input-history recall, single-agent view only (§5.3).
@@ -759,6 +841,54 @@ fn draw(f: &mut Frame, app: &mut App) {
     }
     draw_composer(f, chunks[2], app);
     draw_help(f, chunks[3], app, stats.as_deref());
+    // Slash-command menu overlays just above the composer when active (§5.1).
+    if slash_active(app) {
+        draw_slash_menu(f, chunks[2], app);
+    }
+}
+
+/// Popup list of slash completions, anchored above the composer.
+fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
+    let cmds = filtered_slash(app);
+    if cmds.is_empty() {
+        return;
+    }
+    let h = (cmds.len() as u16 + 2).min(8);
+    let w = 46.min(composer.width);
+    let y = composer.y.saturating_sub(h);
+    let area = Rect {
+        x: composer.x,
+        y,
+        width: w,
+        height: h,
+    };
+    let sel = app.slash_cursor.min(cmds.len() - 1);
+    let items: Vec<ListItem<'static>> = cmds
+        .iter()
+        .map(|c| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{:<10}", c.name),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(c.desc.to_string(), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(sel));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow))
+        .title(Span::styled(
+            " /commands — ↑/↓ · Tab completes ",
+            Style::default().fg(Color::Yellow),
+        ));
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner, &mut state);
 }
 
 /// One-line per-agent stats for the help row under the composer.
@@ -792,16 +922,23 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
     let active = views.iter().filter(|v| v.state == FleetState::Active).count();
     let waiting = views.iter().filter(|v| v.state == FleetState::Waiting).count();
     let spend: f64 = views.iter().filter_map(|v| v.cost).sum();
+    // The `next:` provider flashes yellow briefly when cycled (the only place it
+    // is shown — no duplicate status line).
+    let flashing = app
+        .provider_flash_until
+        .is_some_and(|t| Instant::now() < t);
+    let next_style = if flashing {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
     let line = Line::from(vec![
         Span::styled(
             "fleet",
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!(" · {active} active · {waiting} waiting · spend ${spend:.4}")),
-        Span::styled(
-            format!("   next: {}", app.next_provider),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(format!("   next: {}", app.next_provider), next_style),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
