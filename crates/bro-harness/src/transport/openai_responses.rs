@@ -20,6 +20,7 @@
 use super::{StopReason, Transport, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 pub struct OpenAiResponsesTransport {
@@ -102,7 +103,7 @@ impl Transport for OpenAiResponsesTransport {
         &mut self,
         tools: &[super::ToolSpec],
         opts: &TurnOpts,
-        _sink: &dyn super::TurnSink,
+        sink: &dyn super::TurnSink,
     ) -> Result<TurnOutput> {
         let body = self.build_body(tools, opts);
 
@@ -130,11 +131,73 @@ impl Transport for OpenAiResponsesTransport {
         .await
         .context("responses request")?;
         let status = resp.status();
-        let sse = resp.text().await.context("read responses body")?;
         if !status.is_success() {
+            let sse = resp.text().await.unwrap_or_default();
             anyhow::bail!("openai responses {status}: {sse}");
         }
-        self.parse_sse(&sse)
+
+        // Stream the SSE: forward text/reasoning deltas to the sink live (in
+        // Anthropic shape) while accumulating the full body, then hand it to the
+        // proven `parse_sse` for the authoritative item/usage reconstruction.
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut accum = String::new();
+        let mut text_started = false;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("read responses SSE chunk")?;
+            buf.extend_from_slice(&chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let raw: Vec<u8> = buf.drain(..=pos).collect();
+                let line_cow = String::from_utf8_lossy(&raw);
+                // Keep the full SSE text (with newline) for parse_sse.
+                accum.push_str(&line_cow);
+                let line = line_cow.trim();
+                let Some(data) = line.strip_prefix("data:") else {
+                    continue;
+                };
+                let data = data.trim();
+                if data.is_empty() || data == "[DONE]" {
+                    continue;
+                }
+                let Ok(ev) = serde_json::from_str::<Value>(data) else {
+                    continue;
+                };
+                match ev["type"].as_str().unwrap_or("") {
+                    "response.output_text.delta" => {
+                        if let Some(t) = ev["delta"].as_str()
+                            && !t.is_empty()
+                        {
+                            if !text_started {
+                                sink.stream_event(json!({
+                                    "type": "content_block_start",
+                                    "index": 0,
+                                    "content_block": {"type": "text", "text": ""},
+                                }));
+                                text_started = true;
+                            }
+                            sink.stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": t},
+                            }));
+                        }
+                    }
+                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        if let Some(t) = ev["delta"].as_str()
+                            && !t.is_empty()
+                        {
+                            sink.stream_event(json!({
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "thinking_delta", "thinking": t},
+                            }));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.parse_sse(&accum)
     }
 
     fn snapshot(&self) -> Value {
