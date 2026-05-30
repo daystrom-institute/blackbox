@@ -1603,10 +1603,7 @@ impl BlackboxServer {
         // Retro probes never orchestrate — keep the mechanical recursion
         // guard on so a probe can't fan out (or re-trigger prune-retro).
         let dispatch_filters =
-            match resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, None) {
-                Ok(df) => df,
-                Err(e) => return Err(e),
-            };
+            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, None)?;
         args.extend(dispatch_filters.args);
         let task = orch::spawn_task(
             task_id.clone(),

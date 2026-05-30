@@ -1170,7 +1170,7 @@ mod tests {
             name: Option<String>,
         }
 
-        let items = vec![
+        let items = [
             FakeSym { name: Some("AppModule".into()) },      // exact match → keep
             FakeSym { name: Some("AppModuleTest".into()) },  // superset → reject
             FakeSym { name: Some("configure".into()) },      // unrelated method in same file → reject

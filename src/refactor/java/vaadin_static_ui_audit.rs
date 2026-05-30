@@ -794,8 +794,7 @@ mod tests {
             ..Default::default()
         };
         let err = plan_java_vaadin_static_ui_context_audit(&params)
-            .err()
-            .expect("non-java must fail");
+            .expect_err("non-java must fail");
         let msg = format!("{err}");
         assert!(msg.contains("java"), "unexpected error: {msg}");
     }
