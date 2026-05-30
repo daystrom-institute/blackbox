@@ -1797,6 +1797,32 @@ fn validate_context_roots(
     }
 }
 
+// ── Helpers exposed for tool-layer tests ────────────────────────────────────
+
+/// Build a `RefactorApplyParams` for `macro_apply`.
+///
+/// Critical: `allow_dirty_worktree`, `allow_unregistered_paths`, and `force_path`
+/// are all `None` (= false in `refactor::apply`). `macro_apply` is an envelope
+/// over `refactor::apply` — it MUST NOT set bypass flags by default.
+pub(crate) fn build_macro_apply_params(
+    plan_value: Value,
+    confirm: Option<bool>,
+    cwd: Option<String>,
+) -> RefactorApplyParams {
+    RefactorApplyParams {
+        plan: plan_value,
+        plan_path: None,
+        confirm,
+        // NO bypass flags — all must remain None (= false in refactor::apply).
+        // The caller (operator) can re-run via bbox_refactor_apply if they need
+        // bypass flags; macro_apply does not expose them.
+        allow_dirty_worktree: None,
+        allow_unregistered_paths: None,
+        cwd,
+        force_path: None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3580,7 +3606,7 @@ mod tests {
         let v = json!({
             "count": 42,
             "active": false,
-            "ratio": 3.14,
+            "ratio": 2.5,
             "nothing": null,
             "arr": [1, 2, 3]
         });
@@ -3921,31 +3947,5 @@ mod tests {
             msg.contains("error.backend_unavailable"),
             "backend should be called when guard is true; expected backend_unavailable, got: {msg}"
         );
-    }
-}
-
-// ── Helpers exposed for tool-layer tests ────────────────────────────────────
-
-/// Build a `RefactorApplyParams` for `macro_apply`.
-///
-/// Critical: `allow_dirty_worktree`, `allow_unregistered_paths`, and `force_path`
-/// are all `None` (= false in `refactor::apply`). `macro_apply` is an envelope
-/// over `refactor::apply` — it MUST NOT set bypass flags by default.
-pub(crate) fn build_macro_apply_params(
-    plan_value: Value,
-    confirm: Option<bool>,
-    cwd: Option<String>,
-) -> RefactorApplyParams {
-    RefactorApplyParams {
-        plan: plan_value,
-        plan_path: None,
-        confirm,
-        // NO bypass flags — all must remain None (= false in refactor::apply).
-        // The caller (operator) can re-run via bbox_refactor_apply if they need
-        // bypass flags; macro_apply does not expose them.
-        allow_dirty_worktree: None,
-        allow_unregistered_paths: None,
-        cwd,
-        force_path: None,
     }
 }

@@ -490,10 +490,11 @@ mod tests {
     use std::fs;
 
     fn make_params(source: &Path) -> RefactorPlanParams {
-        let mut p = RefactorPlanParams::default();
-        p.kind = "extract_java_class_cohesive_clusters".to_string();
-        p.source = source.to_string_lossy().into_owned();
-        p
+        RefactorPlanParams {
+            kind: "extract_java_class_cohesive_clusters".to_string(),
+            source: source.to_string_lossy().into_owned(),
+            ..Default::default()
+        }
     }
 
     #[test]

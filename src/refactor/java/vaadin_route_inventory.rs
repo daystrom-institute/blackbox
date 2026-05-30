@@ -846,9 +846,11 @@ mod tests {
              @Route(\"solo\")\n\
              public class Solo {}\n",
         );
-        let mut params = RefactorPlanParams::default();
-        params.kind = KIND.to_string();
-        params.source = dir.path().join("Solo.java").to_string_lossy().into_owned();
+        let params = RefactorPlanParams {
+            kind: KIND.to_string(),
+            source: dir.path().join("Solo.java").to_string_lossy().into_owned(),
+            ..Default::default()
+        };
         let response =
             plan_java_vaadin_route_inventory(&params).expect("plan succeeds via source parent");
         let v: serde_json::Value = serde_json::from_str(&response).unwrap();

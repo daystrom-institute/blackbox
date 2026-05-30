@@ -290,7 +290,7 @@ fn truncate_for_hint(s: &str) -> String {
 // ===========================================================================
 
 pub(crate) fn plan_java_jooq_query_structure_analysis(p: &RefactorPlanParams) -> Result<String> {
-    let per_file = analyze_each_source(p, |src, parsed| analyze_query_structure_in(src, parsed))?;
+    let per_file = analyze_each_source(p, analyze_query_structure_in)?;
     let merged: Vec<serde_json::Value> = per_file
         .iter()
         .flat_map(|(src, findings)| {
@@ -570,7 +570,7 @@ fn count_raw_fragments(chain_text: &str) -> usize {
 // ===========================================================================
 
 pub(crate) fn plan_java_jooq_dsl_context_audit(p: &RefactorPlanParams) -> Result<String> {
-    let per_file = analyze_each_source(p, |src, parsed| audit_dsl_context_in(src, parsed))?;
+    let per_file = analyze_each_source(p, audit_dsl_context_in)?;
 
     let body = serde_json::json!({
         "status": "planned",
@@ -874,7 +874,7 @@ fn receiver_looks_like_provider(call: Node<'_>, source: &str) -> bool {
 
 pub(crate) fn plan_java_jooq_projection_mapping_analysis(p: &RefactorPlanParams) -> Result<String> {
     let per_file =
-        analyze_each_source(p, |src, parsed| analyze_projection_mapping_in(src, parsed))?;
+        analyze_each_source(p, analyze_projection_mapping_in)?;
     let body = serde_json::json!({
         "status": "planned",
         "kind": "java_jooq_projection_mapping_analysis",
@@ -967,11 +967,9 @@ fn receiver_text_of(node: Node<'_>, source: &str) -> Option<String> {
 fn mapping_first_argument_text(call: Node<'_>, source: &str) -> Option<String> {
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
-    for arg in args.named_children(&mut cursor) {
-        let t = arg.utf8_text(source.as_bytes()).ok()?.trim();
-        return Some(t.to_string());
-    }
-    None
+    let arg = args.named_children(&mut cursor).next()?;
+    let t = arg.utf8_text(source.as_bytes()).ok()?.trim();
+    Some(t.to_string())
 }
 
 fn enclosing_chain_text(node: Node<'_>, source: &str) -> String {
@@ -1041,7 +1039,7 @@ fn top_level_comma_count(text: &str) -> usize {
 // ===========================================================================
 
 pub(crate) fn plan_java_jooq_raw_sql_fragment_audit(p: &RefactorPlanParams) -> Result<String> {
-    let per_file = analyze_each_source(p, |src, parsed| audit_raw_sql_fragments_in(src, parsed))?;
+    let per_file = analyze_each_source(p, audit_raw_sql_fragments_in)?;
     let body = serde_json::json!({
         "status": "planned",
         "kind": "java_jooq_raw_sql_fragment_audit",
@@ -1122,13 +1120,11 @@ fn walk_raw_fragments(node: Node<'_>, source: &str, out: &mut Vec<RawFragmentFin
 fn first_string_argument(call: Node<'_>, source: &str) -> Option<String> {
     let args = call.child_by_field_name("arguments")?;
     let mut cursor = args.walk();
-    for arg in args.named_children(&mut cursor) {
-        if arg.kind() == "string_literal" {
-            let raw = arg.utf8_text(source.as_bytes()).ok()?.trim();
-            let trimmed = raw.trim_matches('"');
-            return Some(trimmed.to_string());
-        }
-        return None;
+    let arg = args.named_children(&mut cursor).next()?;
+    if arg.kind() == "string_literal" {
+        let raw = arg.utf8_text(source.as_bytes()).ok()?.trim();
+        let trimmed = raw.trim_matches('"');
+        return Some(trimmed.to_string());
     }
     None
 }

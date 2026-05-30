@@ -140,23 +140,24 @@ pub(crate) fn plan_java_vaadin_navigation_helper_extract(p: &RefactorPlanParams)
     let helper_source =
         render_helper_source(helper_package.as_deref(), module_name, &helper_methods);
 
-    let mut edits = Vec::new();
-    edits.push(FileEdit {
-        path: path_string(&source_path),
-        original_sha256: sha256_hex(parsed.source.as_bytes()),
-        edits: source_edits,
-        new_text: None,
-    });
-    edits.push(FileEdit {
-        path: path_string(&target_path),
-        original_sha256: sha256_hex(b""),
-        edits: vec![TextEdit {
-            byte_start: 0,
-            byte_end: 0,
-            replacement: helper_source,
-        }],
-        new_text: None,
-    });
+    let edits = vec![
+        FileEdit {
+            path: path_string(&source_path),
+            original_sha256: sha256_hex(parsed.source.as_bytes()),
+            edits: source_edits,
+            new_text: None,
+        },
+        FileEdit {
+            path: path_string(&target_path),
+            original_sha256: sha256_hex(b""),
+            edits: vec![TextEdit {
+                byte_start: 0,
+                byte_end: 0,
+                replacement: helper_source,
+            }],
+            new_text: None,
+        },
+    ];
 
     let validations = {
         let mut v = parse_validation_step_for_path(&source_path);
@@ -475,7 +476,7 @@ fn lifecycle_interfaces_in_source(source: &str) -> Vec<String> {
         // Take text until the next `{` or `;` (class body or stray).
         let tail = &source[after_idx..];
         let end = tail
-            .find(|c: char| c == '{' || c == ';')
+            .find(['{', ';'])
             .unwrap_or(tail.len());
         let clause = &tail[..end];
         for iface in NAV_LIFECYCLE_INTERFACES {

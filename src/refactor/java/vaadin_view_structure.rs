@@ -887,7 +887,7 @@ fn find_registration_assignment(line: &str, registration_fields: &[&str]) -> Opt
         .split_whitespace()
         .last()
         .unwrap_or(lhs);
-    if registration_fields.iter().any(|n| *n == candidate) {
+    if registration_fields.contains(&candidate) {
         return Some(candidate.to_string());
     }
     if lhs.contains("Registration") {
