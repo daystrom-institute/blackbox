@@ -280,17 +280,21 @@ impl App {
         if prompt.is_empty() {
             return;
         }
+        let name = truncate(&prompt, NAME_LEN);
         let mut spec = DispatchSpec::new(self.next_provider, prompt.clone());
         spec.cwd = self.launch_cwd.clone();
+        spec.name = Some(name.clone());
         let task = self.orch.dispatch(spec);
         let id = task.id();
         self.agents.push(Agent {
             task,
             provider: self.next_provider,
-            name: truncate(&prompt, NAME_LEN),
+            name,
             input_history: vec![prompt],
         });
         self.input.clear();
+        // Persist so the session is recoverable even before it terminates.
+        self.orch.persist();
         self.set_status(
             format!("dispatched {} agent {}", self.next_provider, &id[..8.min(id.len())]),
             Duration::from_secs(3),
@@ -312,6 +316,20 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
     let orch = Arc::new(FleetOrchestrator::from_config()?);
     let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
 
+    // Repopulate from prior fleet sessions persisted on disk (crashed/orphaned
+    // ones came back as recoverable → Interrupted). Reloaded agents have no live
+    // stdin, so they're viewable but not steerable until resumed.
+    for handle in orch.tasks() {
+        let snap = handle.snapshot();
+        let name = snap.name.clone().unwrap_or_else(|| "(session)".to_string());
+        app.agents.push(Agent {
+            task: handle,
+            provider: snap.provider,
+            name,
+            input_history: Vec::new(),
+        });
+    }
+
     // Forward tail events into the sync TUI loop (mirrors council_tui's SSE
     // fan-in). State is derived by polling the task Arcs each tick; tail events
     // drive status flashes and ensure prompt redraws on completion.
@@ -327,6 +345,8 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
 
     let result = run_tui(&mut app, rx);
     forward.abort();
+    // Persist on exit so this session set is here on the next launch.
+    orch.persist();
     result
 }
 

@@ -50,6 +50,9 @@ pub struct DispatchSpec {
     /// Extra env overrides for the child (e.g. MCP injection wiring). The
     /// cockpit's TUI-local config (§5.2) feeds this; `None` for a bare launch.
     pub env_overrides: Option<HashMap<String, String>>,
+    /// Display name persisted with the task (stored in `bro_label`) so it
+    /// survives a cockpit reload. Defaults to the initial prompt's head.
+    pub name: Option<String>,
 }
 
 impl DispatchSpec {
@@ -60,6 +63,7 @@ impl DispatchSpec {
             cwd: None,
             model: None,
             env_overrides: None,
+            name: None,
         }
     }
 }
@@ -156,6 +160,8 @@ impl AgentHandle {
             cwd: inner.cwd.clone(),
             stderr: inner.stderr.clone(),
             model: model_from_events(&inner.events),
+            // The cockpit's durable display name (stored in bro_label, §5).
+            name: inner.bro_label.clone(),
         }
     }
 
@@ -370,6 +376,8 @@ pub struct TaskSnapshot {
     pub cwd: Option<String>,
     pub stderr: String,
     pub model: Option<String>,
+    /// Durable display name (from `bro_label`) — survives a cockpit reload.
+    pub name: Option<String>,
 }
 
 /// Harness-envelope state derived from the raw stream-json buffer.
@@ -441,21 +449,37 @@ impl FleetOrchestrator {
     /// Construct over an explicit `store_dir`. Tests and embedders use this;
     /// the cockpit normally goes through [`FleetOrchestrator::from_config`].
     pub fn new(store_dir: PathBuf) -> Self {
+        Self::with_store(store_dir, TaskStore::new())
+    }
+
+    fn with_store(store_dir: PathBuf, store: TaskStore) -> Self {
         let (tail_tx, _rx) = broadcast::channel(1024);
         Self {
-            task_store: Arc::new(RwLock::new(TaskStore::new())),
+            task_store: Arc::new(RwLock::new(store)),
             tail_tx,
             store_dir,
         }
     }
 
-    /// Build from the resolved blackbox config, reusing the daemon's
-    /// orchestration `store_dir` (`paths.bro_home`) so persisted/resumable
-    /// sessions land in the same place the daemon would have written them —
-    /// without putting the daemon in the execution path.
+    /// Build from the resolved blackbox config. The cockpit owns a **dedicated**
+    /// store dir (`bro_home/fleet`), isolated from the daemon's own task store,
+    /// and **loads** any prior fleet sessions from it — crashed/orphaned
+    /// `Running` tasks come back as recoverable (Interrupted, §5). This is why
+    /// historical sessions survive a cockpit reload.
     pub fn from_config() -> anyhow::Result<Self> {
         let cfg = crate::config::load()?;
-        Ok(Self::new(cfg.paths.bro_home))
+        let store_dir = cfg.paths.bro_home.join("fleet");
+        // No age-based eviction: the cockpit's model is manual cleanup (§5), so
+        // historical sessions persist until explicitly deleted, not by TTL.
+        let store = TaskStore::load(&store_dir, u64::MAX);
+        Ok(Self::with_store(store_dir, store))
+    }
+
+    /// Flush the current task store to disk so a later cockpit launch can
+    /// reload these sessions. The cockpit calls this after each dispatch and on
+    /// quit (spawn_task only persists at task-terminal on its own).
+    pub fn persist(&self) {
+        self.task_store.read().persist(&self.store_dir);
     }
 
     /// Subscribe to the tail stream. Each call returns an independent receiver;
@@ -526,9 +550,14 @@ impl FleetOrchestrator {
         );
         let env_overrides = merge_env(resolved_env, spec.env_overrides);
 
-        // Fleet agents are entrypoint agents, not bros — no team/brofile label
-        // and no `bro_report` surface (§2.2). bro_label stays None; the cockpit
-        // names rows from the initial prompt (§5).
+        // Fleet agents are entrypoint agents, not bros, so `bro_label` carries no
+        // team/brofile meaning here — the cockpit reuses it as the durable
+        // display name (the initial prompt's head, or an explicit name) so the
+        // row survives a reload (§2.2, §5).
+        let label = spec
+            .name
+            .clone()
+            .or_else(|| Some(prompt_head(&spec.prompt)));
         if bidi {
             let spawned = spawn_task_interactive(
                 task_id,
@@ -540,7 +569,7 @@ impl FleetOrchestrator {
                 self.store_dir.clone(),
                 self.task_store.clone(),
                 self.tail_tx.clone(),
-                None,
+                label,
                 None,
                 None,
             );
@@ -559,13 +588,19 @@ impl FleetOrchestrator {
                 self.store_dir.clone(),
                 self.task_store.clone(),
                 self.tail_tx.clone(),
-                None,
+                label,
                 None,
                 None,
             );
             AgentHandle { task, stdin: None }
         }
     }
+}
+
+/// First line of the prompt, capped — the durable display name for a session.
+fn prompt_head(prompt: &str) -> String {
+    let line = prompt.lines().next().unwrap_or("").trim();
+    line.chars().take(60).collect()
 }
 
 /// Merge resolved transport env (base) with caller-supplied overrides (win on
