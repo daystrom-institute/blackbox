@@ -12,6 +12,7 @@ mod agent_loop;
 mod bound;
 mod cli;
 mod compaction;
+mod diagnostics;
 mod emit;
 mod hooks;
 mod lsp_baselines;
