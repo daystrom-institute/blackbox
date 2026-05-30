@@ -16,6 +16,7 @@ mod emit;
 mod hooks;
 mod report;
 mod mcp;
+mod project_doc;
 mod registry;
 mod session;
 mod transport;

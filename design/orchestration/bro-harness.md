@@ -67,6 +67,13 @@ each linked doc is the authority for its own area. Keep coarse status here
 - **System-prompt static/volatile split** — `compose_system → SystemPrompt`
   (cache-stable prefix + volatile tail); hooks-doc §1, a correctness fix in its
   own right and the delivery channel for volatile nudges.
+- **AGENTS.md overlay discovery** — `project_doc.rs`: tri-state
+  `--system-prompt` (non-empty = override; `""` = suppress; absent = discover).
+  When not overridden, the harness assembles its base system prompt the way
+  Codex does — global `$CODEX_HOME/AGENTS.md` (+ `AGENTS.override.md`) then repo
+  `AGENTS.md` walked git-root → cwd, project chain capped per
+  `project_doc_max_bytes` (`BRO_HARNESS_PROJECT_DOC_MAX_BYTES`). Provider-
+  agnostic `AGENTS.md`, not `CLAUDE.md`.
 - **Hooks Nudger v1** — `hooks.rs`: `HookEngine` + `NudgeLedger` + `Delivery`,
   with four shipped rules (`CopyPasteHook`, `ShellGrepHook`,
   `RefactorSignpostHook`, `HedgedConventionHook`) wired into all three loop hook

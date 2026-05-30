@@ -207,10 +207,17 @@ impl Session {
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
 
-        // Empty --system-prompt means "suppress" (provider-defaults mode).
+        // Three-state --system-prompt:
+        //   non-empty ⇒ explicit override, used verbatim;
+        //   ""        ⇒ explicit suppress (no system prompt) — Codex's
+        //               project_doc_max_bytes=0 / AGENTS-omitting overlay analog;
+        //   absent    ⇒ not overridden ⇒ Codex-style AGENTS.md overlay
+        //               (global $CODEX_HOME/AGENTS.md + repo AGENTS.md, project
+        //               scope). Falls back to None when no AGENTS docs exist.
         let system = match cli.system_prompt.as_deref() {
-            Some("") | None => None,
+            Some("") => None,
             Some(s) => Some(s.to_string()),
+            None => crate::project_doc::discover(),
         };
 
         let kind = TransportKind::from_env();

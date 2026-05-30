@@ -47,7 +47,10 @@ pub struct Cli {
     #[arg(long = "effort")]
     pub effort: Option<String>,
 
-    /// System prompt override. Empty string ⇒ suppress (provider-defaults).
+    /// System prompt. Non-empty ⇒ explicit override used verbatim. Empty string
+    /// ⇒ suppress (no system prompt). Absent ⇒ Codex-style AGENTS.md overlay
+    /// discovery (global `$CODEX_HOME/AGENTS.md` + repo `AGENTS.md`, project
+    /// scope); see `project_doc`.
     #[arg(long = "system-prompt")]
     pub system_prompt: Option<String>,
 
