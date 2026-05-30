@@ -1456,6 +1456,59 @@
         "bbox_note:done"
       ],
       "done_note_required": true
+    },
+    {
+      "atom": "perf-nested-iteration-complexity",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "perf-eager-materialization",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "perf-n-plus-one-fetch",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "perf-blocking-and-sequential-async",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "perf-unbounded-growth",
+      "expected_plan_sequence": [
+        "bbox_code_symbols",
+        "bbox_refactor_status",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
+    },
+    {
+      "atom": "perf-runtime-evidence-corroboration",
+      "expected_plan_sequence": [
+        "Read",
+        "bbox_note:done"
+      ],
+      "done_note_required": true
     }
   ]
 }

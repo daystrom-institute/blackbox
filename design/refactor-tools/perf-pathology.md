@@ -10,11 +10,41 @@ tags:
   - performance
   - pathology
 date: 2026-05-16
-status: "proposal, awaiting review"
+updated: 2026-05-30
+status: "partial — v0 shipped (perf-pathology workflow + 6 detector atoms + performance-pathologist brofile + plan-emission ops + operator docs)"
 brief: "Sibling to Architecture Pathology: scout performance smells, validate and cluster the evidence, then emit a reviewed performance correction plan for phase-decompose remediation."
 ---
 
 # Performance Pathology
+
+## Implementation status (2026-05-30)
+
+**Partial — v0 is shipped and installable.** Grounded against artifacts/code as
+of 2026-05-30:
+
+- Workflow `perf-pathology` —
+  `system-defaults/workflows/refactor/perf-pathology.json` (Setup → Survey →
+  FocusedAtoms → Review → SynthesizePlan → WritePlan; runtime-evidence vars
+  `hot_paths` / `baseline_refs`).
+- Brofile `performance-pathologist` —
+  `system-defaults/brofiles/refactor/performance-pathologist.json`.
+- Six v0 detector atoms covering the ten smells plus the runtime-evidence
+  cross-cut: `perf-nested-iteration-complexity`, `perf-eager-materialization`,
+  `perf-n-plus-one-fetch`, `perf-blocking-and-sequential-async`,
+  `perf-unbounded-growth`, `perf-runtime-evidence-corroboration` (under
+  `system-defaults/atoms/refactor/`).
+- Plan-emission ops `normalize_perf_pathology_atom_requests` and
+  `write_perf_pathology_plan` (`src/workflow/ops/perf_pathology.rs`,
+  sharing `pathology_common` with arch); plan path
+  `design/refactor/perf/plans/<slug>.md`, `kind: performance-correction-plan`,
+  `PP-*` criteria.
+- Operator runbook: `docs/perf-pathology-dispatch.md`.
+
+The smell catalog mapped to **6 grouped detector atoms** rather than one atom
+per smell (v0 chose cost-center families over a 1:1 ontology). Remaining: a live
+end-to-end run (kept at `partial` rather than archived for that reason), the
+per-tool runtime-evidence importers and perf-aware verification wrapper in
+§"Future work", and workload-aware detector ranking.
 
 Performance pathology is the performance-focused sibling of
 [Architecture Pathology](arch-pathology.md). It uses the same high-level shape:

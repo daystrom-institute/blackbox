@@ -29,6 +29,7 @@ The crate is `blackbox`. It produces four binaries:
 | [Workflow Engine](workflows.md) | Canonical reference for authoring and running workflows |
 | [Phase-Decomposer Dispatch](pd-dispatch.md) | Run large implementation docs through read-only or edit-capable PD-dispatch |
 | [Architecture Pathology Dispatch](pathology-dispatch.md) | Diagnose Java/Rust architecture pressure and emit correction plans for PD handoff |
+| [Performance Pathology Dispatch](perf-pathology-dispatch.md) | Diagnose performance debt from static smells + runtime evidence and emit correction plans for PD handoff |
 | [Reference Implementations](reference-implementations.md) | Narrative reference walks for Keystone, Sastquatch, and related demo arcs |
 | [Atoms](atoms.md) | Install, discover, invoke, resume, and bind reusable capabilities |
 | [Rule Packets](rule-packets.md) | Compile, audit, apply. First-match-wins classification. |

@@ -1035,6 +1035,54 @@
         "rust-architecture-transcript-anchored-pressure"
       ],
       "forbidden_atoms": []
+    },
+    {
+      "id": "find-perf-nested-iteration-complexity",
+      "query": "diagnose avoidable super-linear loop nesting over the same collection on a hot path",
+      "expected_atoms": [
+        "perf-nested-iteration-complexity"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-perf-eager-materialization",
+      "query": "diagnose a collection materialized before a filter or take boundary or a redundant serialization round-trip",
+      "expected_atoms": [
+        "perf-eager-materialization"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-perf-n-plus-one-fetch",
+      "query": "diagnose per-row database or rpc fetches in a loop that should be batched or eager loaded",
+      "expected_atoms": [
+        "perf-n-plus-one-fetch"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-perf-blocking-and-sequential-async",
+      "query": "diagnose blocking io in an async hot path or independent awaits run serially",
+      "expected_atoms": [
+        "perf-blocking-and-sequential-async"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-perf-unbounded-growth",
+      "query": "diagnose a cache queue or accumulator that grows without a bound or eviction",
+      "expected_atoms": [
+        "perf-unbounded-growth"
+      ],
+      "forbidden_atoms": []
+    },
+    {
+      "id": "find-perf-runtime-evidence-corroboration",
+      "query": "corroborate static performance candidates against profiles query logs or benchmarks",
+      "expected_atoms": [
+        "perf-runtime-evidence-corroboration"
+      ],
+      "forbidden_atoms": []
     }
   ],
   "anti_pattern_queries": [

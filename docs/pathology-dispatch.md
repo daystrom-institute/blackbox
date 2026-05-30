@@ -21,6 +21,10 @@ directly. Pathology is for semantic architecture judgments: role mismatch,
 responsibility ownership, lifecycle contract, context capture, public API or
 error-contract drift, and history-backed pressure.
 
+For performance debt (n+1 fetches, super-linear loops, eager materialization,
+blocking/serial async, unbounded growth) see the sibling lane in
+[Performance Pathology Dispatch](perf-pathology-dispatch.md).
+
 ## Install Artifacts
 
 Install or refresh the Java pathology artifacts before dispatching

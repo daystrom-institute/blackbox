@@ -2002,6 +2002,164 @@
         "whiteboard_id": ""
       },
       "expect_response_fields": ["status", "pathology_atom", "diagnosis_candidates", "evidence_refs", "remediation_slices", "acceptance_criteria"]
+    },
+    {
+      "id": "dispatch-perf-nested-iteration-complexity",
+      "atom": "perf-nested-iteration-complexity",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "hot_paths": [
+          "src/lib.rs"
+        ],
+        "operator_hints": [
+          "nested iteration over the same collection may be O(n^2) on a hot path"
+        ],
+        "baseline_refs": [],
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": [
+        "status",
+        "pathology_atom",
+        "diagnosis_candidates",
+        "evidence_refs",
+        "remediation_slices",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "id": "dispatch-perf-eager-materialization",
+      "atom": "perf-eager-materialization",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "hot_paths": [
+          "src/lib.rs"
+        ],
+        "operator_hints": [
+          "an intermediate collection is built then immediately filtered or truncated"
+        ],
+        "baseline_refs": [],
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": [
+        "status",
+        "pathology_atom",
+        "diagnosis_candidates",
+        "evidence_refs",
+        "remediation_slices",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "id": "dispatch-perf-n-plus-one-fetch",
+      "atom": "perf-n-plus-one-fetch",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "hot_paths": [
+          "src/lib.rs"
+        ],
+        "operator_hints": [
+          "a fetch runs per row in a loop where a batched call would do"
+        ],
+        "baseline_refs": [],
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": [
+        "status",
+        "pathology_atom",
+        "diagnosis_candidates",
+        "evidence_refs",
+        "remediation_slices",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "id": "dispatch-perf-blocking-and-sequential-async",
+      "atom": "perf-blocking-and-sequential-async",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "hot_paths": [
+          "src/lib.rs"
+        ],
+        "operator_hints": [
+          "blocking io or serial awaits on an async hot path"
+        ],
+        "baseline_refs": [],
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": [
+        "status",
+        "pathology_atom",
+        "diagnosis_candidates",
+        "evidence_refs",
+        "remediation_slices",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "id": "dispatch-perf-unbounded-growth",
+      "atom": "perf-unbounded-growth",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "hot_paths": [
+          "src/lib.rs"
+        ],
+        "operator_hints": [
+          "a cache or buffer grows without an eviction policy"
+        ],
+        "baseline_refs": [],
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": [
+        "status",
+        "pathology_atom",
+        "diagnosis_candidates",
+        "evidence_refs",
+        "remediation_slices",
+        "acceptance_criteria"
+      ]
+    },
+    {
+      "id": "dispatch-perf-runtime-evidence-corroboration",
+      "atom": "perf-runtime-evidence-corroboration",
+      "args": {
+        "project_dir": "${FIXTURE_RUST_PROJECT}",
+        "scope_filter": "src",
+        "hot_paths": [
+          "src/lib.rs"
+        ],
+        "operator_hints": [
+          "promote or refute static perf candidates using operator runtime evidence"
+        ],
+        "baseline_refs": [
+          "design/refactor/perf/baselines/example-querylog.txt"
+        ],
+        "survey_json": {},
+        "target_context_window": 10000,
+        "whiteboard_id": ""
+      },
+      "expect_response_fields": [
+        "status",
+        "pathology_atom",
+        "baseline",
+        "corroborated",
+        "refuted",
+        "deferred"
+      ]
     }
   ]
 }

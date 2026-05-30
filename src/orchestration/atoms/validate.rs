@@ -31,6 +31,7 @@ pub const RECOGNIZED_REFACTOR_PERSONAS: &[&str] = &[
     "java-architecture-pathologist",
     "csharp-refactor-persona",
     "elixir-refactor-persona",
+    "performance-pathologist",
 ];
 
 const REF_PREFIX_BROFILE: &str = "brofile:";
