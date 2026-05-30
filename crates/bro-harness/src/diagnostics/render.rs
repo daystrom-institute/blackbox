@@ -43,6 +43,12 @@ pub fn classify(diag: &Diagnostic, scope: &Scope) -> Enveloped {
     }
 }
 
+/// Stable opening marker for the window-0 rider. Because the rider is appended
+/// to a tool-result body, consumers that see that body (notably the `bro fleet`
+/// TUI) split the diagnostics block off by finding this marker. WIRE CONTRACT:
+/// keep in sync with the detector in `src/fleet_tui.rs`.
+pub const RIDER_MARKER: &str = "window-0 diagnostics:";
+
 /// Build the rider block, or `None` when nothing is new across `diffs`.
 pub fn build_rider(diffs: &[DiffResult]) -> Option<String> {
     let total_new: usize = diffs.iter().map(|d| d.new.len()).sum();
@@ -58,9 +64,11 @@ pub fn build_rider(diffs: &[DiffResult]) -> Option<String> {
         .count();
 
     let mut out = String::new();
+    out.push_str(RIDER_MARKER);
+    out.push(' ');
     let _ = write!(
         out,
-        "diagnostics: {total_new} new ({total_err} error{es}), {total_fixed} fixed, {total_carried} carried",
+        "{total_new} new ({total_err} error{es}), {total_fixed} fixed, {total_carried} carried",
         es = if total_err == 1 { "" } else { "s" }
     );
 

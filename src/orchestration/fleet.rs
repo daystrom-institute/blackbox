@@ -231,6 +231,9 @@ pub enum TranscriptItem {
         tool: Option<String>,
         content: String,
         is_error: bool,
+        /// The window-0 diagnostics rider split off the tool body, when the
+        /// harness appended one (Rust file edits). Rendered distinctly.
+        rider: Option<String>,
     },
     /// The builtin `report` tool's status line (`◆`, §2.2).
     Report { message: String, needs_input: bool },
@@ -300,14 +303,19 @@ fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>, tool_names: &HashM
             let mut steer = String::new();
             for b in blocks {
                 match b.get("type").and_then(|t| t.as_str()) {
-                    Some("tool_result") => out.push(TranscriptItem::ToolResult {
-                        tool: b
-                            .get("tool_use_id")
-                            .and_then(|i| i.as_str())
-                            .and_then(|id| tool_names.get(id).cloned()),
-                        content: extract_content_text(b.get("content")),
-                        is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
-                    }),
+                    Some("tool_result") => {
+                        let (content, rider) =
+                            split_window0_rider(extract_content_text(b.get("content")));
+                        out.push(TranscriptItem::ToolResult {
+                            tool: b
+                                .get("tool_use_id")
+                                .and_then(|i| i.as_str())
+                                .and_then(|id| tool_names.get(id).cloned()),
+                            content,
+                            is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                            rider,
+                        })
+                    }
                     Some("text") | Some("input_text") => {
                         if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
                             if !steer.is_empty() {
@@ -378,6 +386,25 @@ fn parse_assistant_event(
 }
 
 /// tool_result `content` may be a bare string or an array of text blocks.
+/// Opening marker of the window-0 diagnostics rider the harness appends to a
+/// tool-result body. WIRE CONTRACT: must match `RIDER_MARKER` in
+/// `crates/bro-harness/src/diagnostics/render.rs` (the harness crate is a
+/// sibling, so the string is duplicated rather than shared).
+const WINDOW0_RIDER_MARKER: &str = "window-0 diagnostics:";
+
+/// Split a tool-result body into `(body, rider)` on the window-0 marker. The
+/// harness appends the rider after a `\n\n` separator; we surface it separately
+/// so the TUI can render diagnostics distinctly from the tool's own output.
+fn split_window0_rider(full: String) -> (String, Option<String>) {
+    match full.find(WINDOW0_RIDER_MARKER) {
+        Some(idx) => (
+            full[..idx].trim_end().to_string(),
+            Some(full[idx..].trim_end().to_string()),
+        ),
+        None => (full, None),
+    }
+}
+
 fn extract_content_text(content: Option<&Value>) -> String {
     match content {
         Some(Value::String(s)) => s.clone(),
@@ -881,7 +908,7 @@ mod tests {
         assert!(matches!(&items[3], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
         assert!(matches!(
             &items[4],
-            TranscriptItem::ToolResult { content, is_error: false, tool }
+            TranscriptItem::ToolResult { content, is_error: false, tool, .. }
                 if content == "file.txt" && tool.as_deref() == Some("shell_run")
         ));
         assert!(matches!(

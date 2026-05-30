@@ -1236,6 +1236,7 @@ fn render_transcript(
                 tool,
                 content,
                 is_error,
+                rider,
             } => {
                 // Errors always show. Otherwise, show the body only for
                 // change-making / opaque tools (Edit/Write/MCP) where the
@@ -1246,6 +1247,28 @@ fn render_transcript(
                     lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Gray));
                 }
                 // quiet success → nothing; the ⏺ call line above stands alone.
+
+                // Window-0 diagnostics ALWAYS surface, distinct from the tool
+                // body — summary bold-flagged, detail lines yellow — so the
+                // operator sees what each edit produced and whether the agent
+                // then acts on it.
+                if let Some(r) = rider {
+                    let mut rl = r.lines();
+                    if let Some(summary) = rl.next() {
+                        lines.push(Line::from(Span::styled(
+                            format!("⚠ {summary}"),
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )));
+                    }
+                    for l in rl {
+                        lines.push(Line::from(Span::styled(
+                            l.to_string(),
+                            Style::default().fg(Color::Yellow),
+                        )));
+                    }
+                }
             }
             TranscriptItem::Report {
                 message,

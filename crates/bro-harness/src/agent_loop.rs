@@ -585,6 +585,9 @@ impl Session {
         {
             Ok(diffs) => {
                 if let Some(rider) = crate::diagnostics::render::build_rider(&diffs) {
+                    if !content.is_empty() {
+                        content.push_str("\n\n");
+                    }
                     content.push_str(&rider);
                 }
             }
