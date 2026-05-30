@@ -97,11 +97,16 @@ each linked doc is the authority for its own area. Keep coarse status here
 - **Neuralyze** — auto-per-turn checkpoint substrate, context rewind, the file
   inverse-diff journal, self-invocation guards. Nothing built.
 - **Diagnostics (window-0)** — synchronous per-mutation analyzer feedback on the
-  edit loop. Reuses the `side` spine (baseline), the `bound.rs` rider, and the
-  daemon's `LspSessionManager` (which already drains `publishDiagnostics` but
-  discards the payload). Net-new: diagnostic extraction, `didChange`
-  document-sync, pull diagnostics, the per-language classification adapter, a
-  `bbox_code_diagnostics` unary tool, and the ownership-transfer truth gate.
+  edit loop. Reuses the `side` spine (baseline) and the `bound.rs` rider, and
+  consumes LSP **in-process via a shared crate**: the session-management logic
+  (today daemon-local in `LspSessionManager`, which already drains
+  `publishDiagnostics` but discards the payload) is **extracted into a shared
+  crate** the harness links, so the harness never RPCs the daemon for diagnostics
+  (per the no-runtime-daemon-dependency convention below). Net-new: the
+  shared-crate extraction, diagnostic extraction, `didChange` document-sync, pull
+  diagnostics, the per-language classification adapter, the harness's in-process
+  window=0 call, the ownership-transfer truth gate, and — orthogonal — an optional
+  daemon-side `bbox_code_diagnostics` tool for non-harness agents.
 
 ## Dependency graph
 
@@ -169,6 +174,12 @@ clipboard. Step 6 is gated on real async work, not on the others.
 
 - The async/temporal layer (sessions, checkpoints, pending refs) is
   **harness-owned**, never behind MCP; MCP tools stay synchronous unary.
+- bro-harness shares **code** with the daemon (workspace crates like `bro-tools`)
+  but never a **runtime** dependency on it — no MCP/RPC backchannel from harness to
+  daemon. The harness runs with the daemon down; the only daemon↔harness contract
+  is the stdout stream-json envelope. Capabilities the harness needs (LSP sessions,
+  etc.) are shared by extracting code into a linked crate, not by calling a daemon
+  service.
 - Privilege lives in `SafetyPolicy` + the brofile allow/deny layer. Nudges
   steer, they never gate; neuralyze rewinds, it never escalates privilege.
 - Session-scoped state only (clipboard, todos, nudge ledger, checkpoints,
