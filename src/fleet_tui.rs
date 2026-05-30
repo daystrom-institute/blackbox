@@ -38,7 +38,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use blackbox::fleet::{
-    AgentHandle, DispatchSpec, FleetOrchestrator, Provider, TailEvent, TaskStatus,
+    AgentHandle, DispatchSpec, FleetOrchestrator, Provider, TailEvent, TaskStatus, TranscriptItem,
 };
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
@@ -123,7 +123,6 @@ struct AgentView {
     turns: Option<u64>,
     session_id: String,
     started_at: u64,
-    transcript: String,
     stderr_tail: Option<String>,
 }
 
@@ -164,7 +163,6 @@ impl Agent {
             turns: snap.num_turns,
             session_id: snap.session_id,
             started_at: snap.started_at,
-            transcript: snap.last_assistant_message.unwrap_or_default(),
             stderr_tail,
         }
     }
@@ -809,7 +807,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App, views: &[AgentView], order:
     let a = &app.agents[idx];
     let mut lines = detail_header(a, v);
     lines.push(Line::from(""));
-    lines.extend(transcript_lines(&v.transcript));
+    lines.extend(render_transcript(&a.task.transcript(), initial_prompt(a)));
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
@@ -870,7 +868,7 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         Style::default().fg(Color::DarkGray),
     )));
     lines.push(Line::from(""));
-    lines.extend(transcript_lines(&v.transcript));
+    lines.extend(render_transcript(&a.task.transcript(), initial_prompt(a)));
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let total = para.line_count(area.width.saturating_sub(2));
@@ -902,19 +900,136 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     );
 }
 
-/// Skeleton transcript: the latest assistant message rendered as markdown.
-/// The verbose inline transcript (text/tool/result/thinking/steer) is item 14,
-/// a follow-on with a net-new live-stream parser.
-fn transcript_lines(text: &str) -> Vec<Line<'static>> {
-    if text.is_empty() {
+/// The dispatch prompt (input_history[0]) — the initial `-p` first turn isn't
+/// echoed on the stream (only stdin steers are replayed), so the renderer
+/// prepends it.
+fn initial_prompt(a: &Agent) -> &str {
+    a.input_history.first().map(String::as_str).unwrap_or("")
+}
+
+/// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
+/// temporal order, structure carried by markers + color rather than folding.
+fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line<'static>> {
+    /// Soft caps for non-harness providers (the harness already spills oversized
+    /// results, §2.3); a render-side backstop so one huge block can't dominate.
+    const ARG_MAX_LINES: usize = 15;
+    const RESULT_MAX_LINES: usize = 25;
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if !initial_prompt.is_empty() {
+        lines.extend(render_steer(initial_prompt));
+        lines.push(Line::from(""));
+    }
+    if items.is_empty() && initial_prompt.is_empty() {
         return vec![Line::from(Span::styled(
             "  (no output yet)",
             Style::default().fg(Color::DarkGray),
         ))];
     }
+
+    for item in items {
+        match item {
+            TranscriptItem::UserSteer(t) => lines.extend(render_steer(t)),
+            TranscriptItem::AssistantText(t) => lines.extend(render_markdown(t)),
+            TranscriptItem::Thinking(t) => {
+                for l in t.lines() {
+                    lines.push(Line::from(Span::styled(
+                        format!("✻ {l}"),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::ITALIC),
+                    )));
+                }
+            }
+            TranscriptItem::ToolCall { name, args } => {
+                lines.push(Line::from(Span::styled(
+                    format!("⏺ {name}"),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                )));
+                lines.extend(monospace_block(args, ARG_MAX_LINES, Color::DarkGray));
+            }
+            TranscriptItem::ToolResult { content, is_error } => {
+                let color = if *is_error { Color::Red } else { Color::Gray };
+                lines.extend(monospace_block(content, RESULT_MAX_LINES, color));
+            }
+            TranscriptItem::Report {
+                message,
+                needs_input,
+            } => {
+                let color = if *needs_input {
+                    Color::Yellow
+                } else {
+                    Color::LightYellow
+                };
+                let tag = if *needs_input { " (needs input)" } else { "" };
+                lines.push(Line::from(Span::styled(
+                    format!("◆ {message}{tag}"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )));
+            }
+            TranscriptItem::CompactBoundary { trigger } => {
+                lines.push(Line::from(Span::styled(
+                    format!("── compacted ({trigger}) ──"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+            TranscriptItem::TurnFooter {
+                num_turns,
+                cost_usd,
+            } => {
+                let turns = num_turns.map(|t| format!("turn {t}")).unwrap_or_default();
+                let cost = cost_usd.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
+                lines.push(Line::from(Span::styled(
+                    format!("  — {turns}{cost} —"),
+                    Style::default().fg(Color::DarkGray),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+/// `▌ you ›` accented steer block (exact causal/temporal ordering, §5.4).
+fn render_steer(text: &str) -> Vec<Line<'static>> {
+    let accent = Style::default()
+        .fg(Color::LightBlue)
+        .add_modifier(Modifier::BOLD);
+    let mut out = vec![Line::from(Span::styled("▌ you ›", accent))];
+    for l in text.lines() {
+        out.push(Line::from(Span::styled(
+            format!("▌ {l}"),
+            Style::default().fg(Color::LightBlue),
+        )));
+    }
+    out
+}
+
+fn render_markdown(text: &str) -> Vec<Line<'static>> {
     let md = tui_markdown::from_str(text);
     let owned: Vec<Line<'static>> = md.lines.into_iter().map(super::line_into_owned).collect();
     super::stitch_ordered_list_markers(owned)
+}
+
+/// A raw monospace block (tool args / results), indented, capped at `max` lines
+/// with a truncation rider.
+fn monospace_block(text: &str, max: usize, color: Color) -> Vec<Line<'static>> {
+    let style = Style::default().fg(color);
+    let all: Vec<&str> = text.lines().collect();
+    let mut out: Vec<Line<'static>> = all
+        .iter()
+        .take(max)
+        .map(|l| Line::from(Span::styled(format!("    {l}"), style)))
+        .collect();
+    if all.len() > max {
+        out.push(Line::from(Span::styled(
+            format!("    … {} more lines", all.len() - max),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    out
 }
 
 fn draw_composer(f: &mut Frame, area: Rect, app: &App) {

@@ -154,6 +154,168 @@ impl AgentHandle {
             model: model_from_events(&inner.events),
         }
     }
+
+    /// The full verbose inline transcript, parsed fresh from the live event
+    /// buffer (§5.4). The cockpit renders this in the detail / single-agent
+    /// view; called only for the focused agent, not per roster row.
+    pub fn transcript(&self) -> Vec<TranscriptItem> {
+        parse_transcript(&self.task.inner.lock().events)
+    }
+}
+
+/// One rendered item in the verbose inline transcript (§5.4). The fleet layer
+/// owns this model rather than reusing `transcripts/types.rs` so the live
+/// cockpit view stays decoupled from the stored-transcript schema.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranscriptItem {
+    /// An operator steer / reply (`▌ you ›`).
+    UserSteer(String),
+    /// Assistant prose (rendered as markdown).
+    AssistantText(String),
+    /// Extended-thinking block (`✻`, dim).
+    Thinking(String),
+    /// A tool call with its raw JSON arguments (`⏺ name`).
+    ToolCall { name: String, args: String },
+    /// A tool result; `is_error` renders red.
+    ToolResult { content: String, is_error: bool },
+    /// The builtin `report` tool's status line (`◆`, §2.2).
+    Report { message: String, needs_input: bool },
+    /// A `/compact` or auto-compaction boundary divider (§2.4).
+    CompactBoundary { trigger: String },
+    /// End-of-turn footer with usage/cost.
+    TurnFooter {
+        num_turns: Option<u64>,
+        cost_usd: Option<f64>,
+    },
+}
+
+/// Parse the raw stream-json buffer into ordered transcript items (§5.4 — the
+/// net-new live-stream parser). Handles the harness/Claude envelope: assistant
+/// content blocks (text / thinking / tool_use), user events (steers and
+/// tool_result echoes), `report`, `compact_boundary`, and per-turn `result`
+/// footers. `stream_event` partial deltas are skipped — the full `assistant`
+/// event at the turn boundary supersedes them (token-streaming is a refinement).
+pub fn parse_transcript(events: &[Value]) -> Vec<TranscriptItem> {
+    let mut out = Vec::new();
+    for e in events {
+        match e.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "user" => parse_user_event(e, &mut out),
+            "assistant" => parse_assistant_event(e, &mut out),
+            "report" => {
+                let r = &e["report"];
+                if let Some(msg) = r.get("message").and_then(|m| m.as_str()) {
+                    out.push(TranscriptItem::Report {
+                        message: msg.to_string(),
+                        needs_input: r
+                            .get("needs_input")
+                            .and_then(|n| n.as_bool())
+                            .unwrap_or(false),
+                    });
+                }
+            }
+            "system" if e.get("subtype").and_then(|s| s.as_str()) == Some("compact_boundary") => {
+                let trigger = e
+                    .get("compact_metadata")
+                    .and_then(|m| m.get("trigger"))
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("manual")
+                    .to_string();
+                out.push(TranscriptItem::CompactBoundary { trigger });
+            }
+            "result" => out.push(TranscriptItem::TurnFooter {
+                num_turns: e.get("num_turns").and_then(|n| n.as_u64()),
+                cost_usd: e.get("total_cost_usd").and_then(|c| c.as_f64()),
+            }),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A `user` event is either an operator steer (string / text-block content) or
+/// a tool_result echo (tool_result blocks).
+fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>) {
+    match &e["message"]["content"] {
+        Value::String(s) if !s.trim().is_empty() => {
+            out.push(TranscriptItem::UserSteer(s.clone()))
+        }
+        Value::Array(blocks) => {
+            let mut steer = String::new();
+            for b in blocks {
+                match b.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_result") => out.push(TranscriptItem::ToolResult {
+                        content: extract_content_text(b.get("content")),
+                        is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                    }),
+                    Some("text") | Some("input_text") => {
+                        if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                            if !steer.is_empty() {
+                                steer.push('\n');
+                            }
+                            steer.push_str(t);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if !steer.trim().is_empty() {
+                out.push(TranscriptItem::UserSteer(steer));
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An `assistant` event carries text / thinking / tool_use content blocks.
+fn parse_assistant_event(e: &Value, out: &mut Vec<TranscriptItem>) {
+    let Some(blocks) = e["message"]["content"].as_array() else {
+        return;
+    };
+    for b in blocks {
+        match b.get("type").and_then(|t| t.as_str()) {
+            Some("text") => {
+                if let Some(t) = b.get("text").and_then(|t| t.as_str()) {
+                    if !t.trim().is_empty() {
+                        out.push(TranscriptItem::AssistantText(t.to_string()));
+                    }
+                }
+            }
+            Some("thinking") => {
+                if let Some(t) = b
+                    .get("thinking")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| b.get("text").and_then(|t| t.as_str()))
+                {
+                    out.push(TranscriptItem::Thinking(t.to_string()));
+                }
+            }
+            Some("tool_use") => out.push(TranscriptItem::ToolCall {
+                name: b
+                    .get("name")
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("tool")
+                    .to_string(),
+                args: b
+                    .get("input")
+                    .map(|i| serde_json::to_string_pretty(i).unwrap_or_default())
+                    .unwrap_or_default(),
+            }),
+            _ => {}
+        }
+    }
+}
+
+/// tool_result `content` may be a bare string or an array of text blocks.
+fn extract_content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|t| t.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 /// Read-only snapshot of a dispatched agent's live state — the cockpit's window
@@ -505,6 +667,46 @@ mod tests {
         assert!(!s.turn_active);
         assert!(s.needs_input);
         assert_eq!(s.report_message.as_deref(), Some("blocked on creds"));
+    }
+
+    #[test]
+    fn transcript_parses_envelope() {
+        let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+        let events = vec![
+            ev(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"go fix it"}}"#),
+            ev(r#"{"type":"assistant","message":{"content":[
+                {"type":"thinking","thinking":"hmm"},
+                {"type":"text","text":"on it"},
+                {"type":"tool_use","name":"shell_run","input":{"cmd":"ls"}}
+            ]}}"#),
+            ev(r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"t1","content":"file.txt","is_error":false}
+            ]}}"#),
+            ev(r#"{"type":"report","report":{"message":"need a key","needs_input":true}}"#),
+            ev(r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"}}"#),
+            ev(r#"{"type":"result","subtype":"success","num_turns":2,"total_cost_usd":0.01}"#),
+        ];
+        let items = parse_transcript(&events);
+        assert_eq!(items[0], TranscriptItem::UserSteer("go fix it".into()));
+        assert_eq!(items[1], TranscriptItem::Thinking("hmm".into()));
+        assert_eq!(items[2], TranscriptItem::AssistantText("on it".into()));
+        assert!(matches!(&items[3], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
+        assert!(matches!(
+            &items[4],
+            TranscriptItem::ToolResult { content, is_error: false } if content == "file.txt"
+        ));
+        assert!(matches!(
+            &items[5],
+            TranscriptItem::Report { needs_input: true, .. }
+        ));
+        assert!(matches!(
+            &items[6],
+            TranscriptItem::CompactBoundary { trigger } if trigger == "auto"
+        ));
+        assert!(matches!(
+            items[7],
+            TranscriptItem::TurnFooter { num_turns: Some(2), cost_usd: Some(_) }
+        ));
     }
 
     #[test]
