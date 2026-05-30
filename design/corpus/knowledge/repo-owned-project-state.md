@@ -11,11 +11,13 @@ brief: "Invert the system-of-record for project scope: durable project knowledge
 
 # Repo-Owned Project State
 
-**Status:** Proposed (rev 3, 2026-05-29)
+**Status:** Implemented (rev 3 design; landed on `main` 2026-05-30). See
+CHANGELOG "Unreleased" for the shipped surface.
 **Scope:** Where project-scoped durable knowledge (and the durable record of
 project activity) physically lives, who owns it, and what the daemon's role
 becomes for the project layer.
-**Motivating evidence:** [`scratch/second-machine-bootstrap-issues.md`](../../../scratch/second-machine-bootstrap-issues.md)
+**Motivating evidence:** a second-machine bootstrap walkthrough (2026-05-29);
+the issue log that prompted this design has since been resolved and removed.
 **Ancestor:** [Config and Artifact Locality](../../operations/config-artifacts/config-and-artifact-locality.md)
 (archived) — same half-finished locality migration, one layer down.
 
@@ -83,8 +85,8 @@ On a fresh second machine where the daemon's store is empty-for-this-project but
 the repo's instruction files are already managed and committed:
 
 1. `bbox_bootstrap` **refuses** — detects the files as "already
-   blackbox-generated" and imports nothing
-   ([scratch issues, HIGH#2](../../../scratch/second-machine-bootstrap-issues.md)).
+   blackbox-generated" and imports nothing (HIGH#2 of the second-machine
+   bootstrap issues).
 2. `bbox_render scope=project` from the empty-for-this-project store produces a
    **near-empty stub**, which would **overwrite committed content** (a 74-line
    conventions file collapses to ~6 lines).
@@ -325,7 +327,7 @@ source — is exactly what we are leaving.
 
 ## What this closes
 
-Mapped to [`scratch/second-machine-bootstrap-issues.md`](../../../scratch/second-machine-bootstrap-issues.md):
+Mapped to the second-machine bootstrap issues (scratch log since resolved and removed):
 
 - **HIGH#2 (clobber trap)** — gone by construction: render derives from the
   committed tree, identical everywhere.

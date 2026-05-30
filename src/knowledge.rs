@@ -132,13 +132,15 @@ pub struct RenderParams {
     /// Project directory path. Required when scope includes "project".
     #[serde(default)]
     pub project: Option<String>,
-    /// Which scope to render. "global" surgically patches each provider's
-    /// global-memory file (~/.claude-shared/CLAUDE.md, ~/.codex/AGENTS.md,
-    /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers and
-    /// snapshots the original to ~/.local/state/blackbox/backups/ first.
-    /// "project" writes <project>/{CLAUDE,AGENTS,GEMINI}.md from project-
-    /// scope entries plus an include reference to PROJECT.md (no global
-    /// content). "both" runs both. Defaults to "both" if `project` is
+    /// Which scope to render. "global" writes the canonical shared doc to
+    /// ~/.blackbox/BLACKBOX.md and surgically patches a managed region (an
+    /// @import pointer plus global provider-specific entries) into each
+    /// provider's global-memory file (~/.claude/CLAUDE.md, ~/.codex/AGENTS.md,
+    /// ~/.gemini/GEMINI.md) inside `<!-- bb:managed-* -->` markers, snapshotting
+    /// the original to ~/.local/state/blackbox/backups/ first. "project" writes
+    /// <project>/{CLAUDE,AGENTS,GEMINI}.md from the project's committed
+    /// .bbox/knowledge/ entries plus an include reference to PROJECT.md (no
+    /// global content). "both" runs both. Defaults to "both" if `project` is
     /// given, else "global".
     #[serde(default)]
     pub scope: Option<String>,
