@@ -1,7 +1,7 @@
 ---
 title: "Hoisting Java to First-Class Code Navigation"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -15,7 +15,8 @@ tags:
   - jdtls
   - mcp
 date: 2026-05-25
-status: "design proposal"
+updated: 2026-05-30
+status: "implemented; all five jdtls-backed code_nav tools shipped (bbox_code_usages/_implementations/_type_at/bbox_workspace_symbols/bbox_code_outline); archived 2026-05-30"
 brief: "Brings Java to parity with Rust/C# semantic navigation by adding a jdtls-backed semantic tier to bbox_code_* — References, Implementation, WorkspaceSymbol, DocumentSymbol, Hover — over the already-generic LSP substrate, with a shared lsp::convert hoist, capability expansion, the prefilter-then-resolve idiom, and a worked bbox_code_usages caller. Serves macro probes, refactor plan-shaping, and bare LLM due-diligence."
 ---
 
@@ -36,6 +37,39 @@ Phase 0 of the [Unified Code Synthesis Model](../unified-code-synthesis-model.md
 its macro `probe` operations bind to the semantic tier specified here. But the
 tier is independently valuable for refactor plan-shaping and for any LLM
 figuring out *what and how* to call before it acts.
+
+## Implementation status (archived 2026-05-30)
+
+**Shipped.** This design landed in full; the body below is retained as the
+design record. Grounding (file:line as of 2026-05-30):
+
+- **Step 1 — hoist** `lsp::convert`: done. `src/lsp/convert.rs` owns
+  `byte_to_lsp_position` / `lsp_position_to_byte` / `workspace_edit_to_file_edits`.
+- **Step 2 — capabilities**: done. `build_init_params`
+  (`src/lsp/session_manager.rs:~696`) declares hierarchical `documentSymbol`,
+  `references`, `definition`, `typeDefinition`, `implementation`,
+  `callHierarchy`, `hover`, and `workspace.symbol`.
+- **Step 3 — per-query Java callers**: done in `src/code_nav/semantic.rs`
+  (`java_find_usages`, `java_find_implementations`, `java_type_at`,
+  `java_workspace_symbols`, `java_document_outline`).
+- **Step 4 — expose in `code_nav`**: done in `src/tools/code_nav.rs` — five
+  tools, all `semantic_status="lsp_verified"`, all Java-gated, all fail-closed
+  with `error.lsp_unavailable` (RX-V3); docs in `src/tool_docs.rs`.
+
+Resolved open questions / intentional divergences from the proposal:
+
+- **Sibling tools won over the `mode:"semantic"` switch.** `DocumentSymbol`
+  shipped as its own tool `bbox_code_outline`, not as
+  `bbox_code_symbols(mode="semantic")` — OQ1 resolved toward sibling tools.
+- **Strict fail-closed, no syntactic fallback-with-caveat.** §"Tool shape"
+  floated that a code-nav tool MAY still return a labeled `syntax_only` answer
+  when jdtls is down. The shipped tools instead fail closed uniformly
+  (`error.lsp_unavailable`) and do not offer a syntactic alternate in-band; a
+  caller wanting the syntactic answer calls `bbox_code_refs` /
+  `bbox_code_node_describe` explicitly. This is the safer, RX-V3-consistent
+  choice.
+- **`CallHierarchy` deferred.** Capability is declared, but no in/out
+  call-hierarchy tool is wired (OQ3 → defer until a concrete consumer needs it).
 
 ## Current state (grounded)
 

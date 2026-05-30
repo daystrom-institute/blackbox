@@ -1,7 +1,7 @@
 ---
 title: "Unified Code Synthesis Model"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -16,11 +16,50 @@ tags:
   - java
   - transaction
 date: 2026-05-25
-status: "design proposal"
+updated: 2026-05-30
+status: "partial — Phases 0–6 + v1 macro + guice library shipped; Phase 7 (Vaadin + jOOQ dissolution) remains"
 brief: "Unifies slice, refactor, code-nav, and macro tooling into one force-amplifier model: a shared RefactorPlan IR + transaction, a thin data-defined macro layer that lowers to it, probe operations that bind to the code-nav/LSP query substrate, and a program to dissolve framework-specific Rust refactor primitives into macro ontology."
 ---
 
 # Unified Code Synthesis Model
+
+## Implementation status (2026-05-30)
+
+**Partial — the model is built; only the bulk dissolution remains.** Grounded
+against code (file:line as of 2026-05-30):
+
+- **Phase 0** (Java first-class code nav) — **shipped**, see
+  [java-code-nav.md](java/java-code-nav.md) (archived).
+- **Phase 1** (transaction additions) — **shipped**: `FileCreate` and the
+  validation steps are in the `refactor` transaction
+  (`src/macros/model.rs`, `sidecar_backend.rs`).
+- **Phase 2** (macro core) — **shipped**: eight `macro_*` MCP tools registered
+  (`macro_list/describe/validate/plan/apply/run/register/unregister` in
+  `src/tools/macros.rs`); the `explain` verb floated in the roadmap was not
+  built. Data model + bounded probe DSL + lowering live in `src/macros/`
+  (`model.rs`, `probe.rs`, `expr.rs`, `planner.rs`, `registry.rs`).
+- **Phase 3** (Java backend sidecar) — **shipped**: `JavaMacroBackend` with a
+  fail-closed `UnavailableBackend` default (`src/macros/backend.rs`,
+  `planner_ctx.rs`), the sidecar protocol/client (`java_sidecar.rs`,
+  `java_sidecar_protocol.rs`, `sidecar_backend.rs`), `BLACKBOX_JAVA_BIN` spawn
+  gating.
+- **Phase 4** (probe bindings) — **shipped** (`src/macros/probe.rs`).
+- **Phase 5** (dissolution proof) — **shipped**:
+  `builtin.java.vaadin.ensure_provider_bindings` registered;
+  `vaadin_provider_bindings.rs` deleted.
+- **Phase 6** (Lombok dissolution) — **shipped**: `builtin.java.lombok`
+  registered; `lombokify.rs` deleted.
+- **v1 macro** `java.add_service_boundary` — **shipped** (registered +
+  `java_service_boundary_tests.rs`).
+- **`builtin.java.guice`** — **shipped** (`registry.rs`), even though the body
+  below (Phase 5 note + Phase 7) still describes it as pending. Treat the
+  registry as authority.
+
+**Remaining = Phase 7**: the ~25 `java_vaadin_*` / `java_jooq_*` plan kinds are
+still live in the Rust refactor registry (`src/refactor/`) and have not been
+dissolved into macro ontology; the jOOQ analysis-kind shape question
+(§"Analysis-only kinds") is still open. The body below predates these landings
+— read it as the design record, not current state.
 
 ## Thesis — the force-amplifier lineage
 

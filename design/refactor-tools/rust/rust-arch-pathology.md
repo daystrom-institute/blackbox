@@ -1,7 +1,7 @@
 ---
 title: "Rust Architecture Pathology"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - refactor-tools
@@ -13,11 +13,33 @@ tags:
   - architecture
   - pathology
 date: 2026-05-20
-status: "reviewed draft after Opus 4.7 and DeepSeek V4 Pro feedback"
+updated: 2026-05-30
+status: "partial — full V0 shipped (arch-pathology-rust workflow + 12 V0 atoms + brofile + operator docs); post-v0 deferred atoms remain"
 brief: "Rust pathology workflow: identify Rust-specific bad-code architecture, then emit correction plans that map to Rust refactor atoms, cargo validation, and PD remediation."
 ---
 
 # Rust Architecture Pathology
+
+## Implementation status (2026-05-30)
+
+**Partial — full V0 is shipped and installable.** Grounded against artifacts as
+of 2026-05-30:
+
+- Workflow `arch-pathology-rust` —
+  `system-defaults/workflows/refactor/arch-pathology-rust.json` (6 nodes + actors).
+- Brofile `rust-architecture-pathologist` —
+  `system-defaults/brofiles/refactor/rust-architecture-pathologist.json`.
+- All **12 V0 diagnosis atoms** shipped under
+  `system-defaults/atoms/refactor/rust-architecture-*.json` (matches §"V0 Rust
+  pathology atoms" exactly).
+- Operator runbook: `docs/pathology-dispatch.md` (install + dispatch) and
+  `docs/reference-implementations.md`.
+
+Remaining: the §"Rejected or deferred from v0" / §"Future work" atoms, to be
+revisited after real pathology runs. A successful end-to-end live run is not
+recorded in-doc — kept at `partial` rather than archived for that reason. The
+sibling **[perf-pathology](../perf-pathology.md)** is the unbuilt counterpart;
+this workflow is its proven template.
 
 Rust architecture pathology is the Rust language pack for
 [Architecture Pathology](../arch-pathology.md). It keeps the same forensic
