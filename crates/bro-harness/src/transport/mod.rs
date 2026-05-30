@@ -50,6 +50,16 @@ impl Usage {
         self.cached_input_tokens += other.cached_input_tokens;
         self.cache_creation_input_tokens += other.cache_creation_input_tokens;
     }
+
+    /// Total prompt input including cache reads + cache creation — the
+    /// cache-inclusive figure that should be compared against a model's context
+    /// window for compaction decisions. The fresh-only `input_tokens` would
+    /// understate how full the window actually is on a cache-heavy session.
+    pub fn total_input_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.cache_creation_input_tokens)
+    }
 }
 
 /// A client tool the model asked us to run. `id` is the transport-native
@@ -140,6 +150,24 @@ pub struct TurnOpts {
     pub web_search: bool,
 }
 
+/// Sink for incremental, in-turn streaming events.
+///
+/// The agent loop passes an implementor (backed by the stdout `Emitter`) into
+/// `run_turn`. A transport that streams its provider response (SSE) calls
+/// `stream_event` once per parsed wire event with the **Anthropic-shaped**
+/// event payload — i.e. the value that becomes the inner `event` of a Claude
+/// `stream_event` NDJSON line. The harness wraps it for stdout, and the
+/// daemon's `parse_claude_event` already consumes that exact shape
+/// (`content_block_delta` text/thinking, `message_delta` usage). A transport
+/// that does not stream simply never calls the sink, and the loop falls back to
+/// emitting the whole assistant message at turn end.
+///
+/// `Send + Sync` so a `&dyn TurnSink` can be held across awaits inside the
+/// `Send` turn future.
+pub trait TurnSink: Send + Sync {
+    fn stream_event(&self, event: Value);
+}
+
 #[async_trait]
 pub trait Transport: Send {
     /// Stable transport id (for logging / persistence tag).
@@ -153,13 +181,34 @@ pub trait Transport: Send {
 
     /// Run one assistant turn: encode the conversation + tools, call the
     /// provider, append the assistant's native output to the buffer, and
-    /// return the normalized result.
-    async fn run_turn(&mut self, tools: &[ToolSpec], opts: &TurnOpts) -> Result<TurnOutput>;
+    /// return the normalized result. Streaming transports forward incremental
+    /// wire events to `sink` as they arrive.
+    async fn run_turn(
+        &mut self,
+        tools: &[ToolSpec],
+        opts: &TurnOpts,
+        sink: &dyn TurnSink,
+    ) -> Result<TurnOutput>;
 
     /// Transport-native conversation buffer, for persistence.
     fn snapshot(&self) -> Value;
     /// Restore a previously snapshotted buffer.
     fn restore(&mut self, snapshot: Value);
+
+    /// Compact the conversation when the context window is filling: summarize
+    /// the older prefix via a model call and replace it with a single synthetic
+    /// summary message, preserving the last `keep_tail` native messages.
+    /// Returns the summary text (for the `compact_boundary` event), or `None`
+    /// when there isn't enough history to compact safely or the transport does
+    /// not implement compaction yet (the default).
+    async fn compact(
+        &mut self,
+        _keep_tail: usize,
+        _instruction: &str,
+        _opts: &TurnOpts,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
 }
 
 /// Which transport to construct. Selected by the daemon (env

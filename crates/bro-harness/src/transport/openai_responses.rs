@@ -98,7 +98,12 @@ impl Transport for OpenAiResponsesTransport {
         }
     }
 
-    async fn run_turn(&mut self, tools: &[super::ToolSpec], opts: &TurnOpts) -> Result<TurnOutput> {
+    async fn run_turn(
+        &mut self,
+        tools: &[super::ToolSpec],
+        opts: &TurnOpts,
+        _sink: &dyn super::TurnSink,
+    ) -> Result<TurnOutput> {
         let body = self.build_body(tools, opts);
 
         let resp = super::http::send_with_retry("openai-responses", || {

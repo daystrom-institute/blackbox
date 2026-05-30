@@ -10,6 +10,7 @@
 
 mod agent_loop;
 mod cli;
+mod compaction;
 mod emit;
 mod hooks;
 mod mcp;

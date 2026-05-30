@@ -137,6 +137,14 @@ pub async fn run(cli: Cli) -> Result<()> {
     let emitter = Emitter::new(store.id.clone());
     emitter.system_init();
 
+    // Auto-compaction policy, keyed on the model's context window. Disabled (or
+    // unknown window) ⇒ threshold is None and the loop never compacts.
+    let compaction = crate::compaction::CompactionPolicy::from_env();
+    let compact_threshold = compaction.threshold(&base_opts.model);
+    // Cache-inclusive prompt size the model processed on the previous turn; the
+    // compaction trigger compares it against the threshold before the next call.
+    let mut last_prompt_tokens: u64 = 0;
+
     let mut total_usage = Usage::default();
     let mut final_text = String::new();
     let mut turns: u64 = 0;
@@ -156,6 +164,31 @@ pub async fn run(cli: Cli) -> Result<()> {
             tracing::warn!(max_turns, "hit max turns; stopping");
             break;
         }
+        // Compact before composing the next turn when the previous prompt
+        // crossed the model's window threshold. The transport summarizes its
+        // older prefix and swaps it for a synthetic summary message in place.
+        if let Some(thresh) = compact_threshold
+            && last_prompt_tokens > thresh
+        {
+            match tx
+                .compact(
+                    compaction.keep_tail(),
+                    crate::compaction::COMPACTION_INSTRUCTION,
+                    &base_opts,
+                )
+                .await
+            {
+                Ok(Some(summary)) => {
+                    tracing::info!(pre_tokens = last_prompt_tokens, "compacted conversation");
+                    emitter.compact_boundary(last_prompt_tokens, summary.len());
+                    // No reset here: the next turn refreshes last_prompt_tokens
+                    // from real usage, and the post-compaction prompt is smaller,
+                    // so the trigger naturally clears.
+                }
+                Ok(None) => {} // not enough compactible history yet
+                Err(e) => tracing::warn!("compaction failed: {e:#}"),
+            }
+        }
         // Rebuild each turn: the wire tool set grows as tool_search activates
         // deferred tools, and the manifest shrinks correspondingly.
         let tool_specs = reg.wire_specs();
@@ -173,9 +206,10 @@ pub async fn run(cli: Cli) -> Result<()> {
             system: sys,
             ..base_opts.clone()
         };
-        let out = tx.run_turn(&tool_specs, &opts).await?;
+        let out = tx.run_turn(&tool_specs, &opts, &emitter).await?;
         turns += 1;
         total_usage.add(&out.usage);
+        last_prompt_tokens = out.usage.total_input_tokens();
 
         // Assistant-turn hooks see the text + the calls about to run; their
         // system-tail nudges surface next turn.
@@ -185,9 +219,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
 
+        // Emit the full assistant turn (text + tool_use blocks) for the daemon
+        // tail / fleet transcript. Build it before the tool-call loop consumes
+        // `out.tool_calls`. When the turn streamed, the daemon dedupes the text
+        // against the `stream_event` deltas it already folded.
+        let mut assistant_content: Vec<serde_json::Value> = Vec::new();
         if !out.text.is_empty() {
-            emitter.assistant_text(&out.text);
-            final_text = out.text;
+            assistant_content.push(serde_json::json!({"type": "text", "text": out.text}));
+            final_text = out.text.clone();
+        }
+        for tc in &out.tool_calls {
+            assistant_content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": tc.id,
+                "name": tc.name,
+                "input": tc.args,
+            }));
+        }
+        if !assistant_content.is_empty() {
+            emitter.assistant_message(assistant_content);
         }
 
         if out.stop != StopReason::ToolCalls || out.tool_calls.is_empty() {
@@ -216,6 +266,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             results.push(result);
         }
+        emitter.tool_results(&results);
         tx.push_tool_results(results);
         hooks.tick();
     }

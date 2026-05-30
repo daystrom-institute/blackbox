@@ -4,8 +4,8 @@
 //! `evt["session_id"]`). Only protocol JSON goes to stdout — all logging
 //! goes to stderr.
 
-use crate::transport::Usage;
-use serde_json::json;
+use crate::transport::{ToolResult, Usage};
+use serde_json::{Value, json};
 use std::io::Write;
 
 pub struct Emitter {
@@ -35,17 +35,82 @@ impl Emitter {
         }));
     }
 
-    /// One assistant text turn. The parser uses this when no streamed
-    /// `stream_event` text was captured — which is always true in the
-    /// non-streaming cut.
-    pub fn assistant_text(&self, text: &str) {
+    /// One incremental streaming event — the inner Anthropic `event` wrapped as
+    /// a Claude `stream_event` line. The daemon's parser folds
+    /// `content_block_delta` text into the live assistant message and reads
+    /// `message_delta` usage; the fleet TUI's live transcript reads the richer
+    /// `content_block_start` (tool_use) and `input_json_delta` (args) too.
+    pub fn stream_event(&self, event: Value) {
+        self.write_line(json!({
+            "type": "stream_event",
+            "session_id": self.session_id,
+            "event": event,
+        }));
+    }
+
+    /// The full assistant turn as an Anthropic content array (text + thinking +
+    /// tool_use blocks). When the turn streamed, the daemon dedupes the text
+    /// against what it already accumulated from `stream_event` deltas
+    /// (`streaming_captured` guard); the tool_use blocks are what surface tool
+    /// calls to supervision and the fleet transcript. When the turn did NOT
+    /// stream (non-streaming transports), this is the authoritative text.
+    pub fn assistant_message(&self, content: Vec<Value>) {
         self.write_line(json!({
             "type": "assistant",
             "session_id": self.session_id,
             "message": {
                 "role": "assistant",
-                "content": [{"type": "text", "text": text}],
+                "content": content,
                 "session_id": self.session_id,
+            },
+        }));
+    }
+
+    /// Tool results for the calls just dispatched, as a `user` turn of
+    /// `tool_result` blocks (the Anthropic shape). The daemon's claude parser
+    /// ignores `user` lines (no handler), so this is purely additive — it gives
+    /// the fleet transcript the tool responses to render inline. Skips emission
+    /// when there are no results.
+    pub fn tool_results(&self, results: &[ToolResult]) {
+        if results.is_empty() {
+            return;
+        }
+        let blocks: Vec<Value> = results
+            .iter()
+            .map(|r| {
+                json!({
+                    "type": "tool_result",
+                    "tool_use_id": r.id,
+                    "content": r.content,
+                    "is_error": r.is_error,
+                })
+            })
+            .collect();
+        self.write_line(json!({
+            "type": "user",
+            "session_id": self.session_id,
+            "message": {
+                "role": "user",
+                "content": blocks,
+                "session_id": self.session_id,
+            },
+        }));
+    }
+
+    /// Marks an auto-compaction boundary in the stream — the harness summarized
+    /// and replaced the older conversation prefix. The daemon's claude parser
+    /// ignores unknown `system` subtypes, so this is purely a marker for the
+    /// fleet TUI transcript (rendered as a divider). `pre_tokens` is the prompt
+    /// size that tripped the threshold.
+    pub fn compact_boundary(&self, pre_tokens: u64, summary_chars: usize) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "compact_boundary",
+            "session_id": self.session_id,
+            "compact_metadata": {
+                "trigger": "auto",
+                "pre_tokens": pre_tokens,
+                "summary_chars": summary_chars,
             },
         }));
     }
@@ -73,5 +138,11 @@ impl Emitter {
             v["total_cost_usd"] = json!(c);
         }
         self.write_line(v);
+    }
+}
+
+impl crate::transport::TurnSink for Emitter {
+    fn stream_event(&self, event: Value) {
+        Emitter::stream_event(self, event);
     }
 }
