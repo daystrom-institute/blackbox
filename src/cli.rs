@@ -39,6 +39,7 @@ use ratatui::widgets::*;
 use serde::Deserialize;
 
 mod council_tui;
+mod fleet_tui;
 mod parser;
 use parser::{
     EventDetail, MessageRole, SystemSignalKind, TranscriptEvent, parse_codex_line_rich,
@@ -88,6 +89,16 @@ enum BroCommand {
     Orchestrate(OrchestrateArgs),
     /// Multi-peer chat councils — convene a team into a deliberation
     Council(CouncilArgs),
+    /// Fleet cockpit — dispatch and live-drive many top-level agents
+    Fleet(FleetArgs),
+}
+
+#[derive(Debug, Args)]
+struct FleetArgs {
+    /// Default working directory for dispatched agents. Defaults to the
+    /// cockpit's launch cwd.
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1421,6 +1432,11 @@ fn main() -> anyhow::Result<()> {
         }
         BroCommand::Council(args) => {
             let result = rt.block_on(run_council(args));
+            drop(rt);
+            return result;
+        }
+        BroCommand::Fleet(args) => {
+            let result = rt.block_on(fleet_tui::run(args.cwd));
             drop(rt);
             return result;
         }

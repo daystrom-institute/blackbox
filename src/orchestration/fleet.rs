@@ -1,0 +1,240 @@
+//! `FleetOrchestrator` — the daemon-free façade the `bro fleet` cockpit drives.
+//!
+//! The cockpit links the `blackbox` lib and spawns top-level entrypoint agents
+//! **in-process** — no HTTP to a running `blackboxd` (design
+//! `design/orchestration/fleet-tui.md` §3). This façade owns the three plain
+//! values `spawn_task` needs — a `TaskStore`, a tail `broadcast::Sender`, and a
+//! `store_dir` — and hands the cockpit a single `dispatch` entry point plus a
+//! tail subscription. Ownership is clean: the cockpit owns exactly the tasks it
+//! spawned (it keeps the returned `Arc<Task>` handles), so the façade stays
+//! intentionally thin.
+//!
+//! Net-new item 7 in the design's "what needs to be added" list. The keystone
+//! bidirectional control protocol (persistent stdin, `control_request`,
+//! `/compact`) is **not** here — that is harness + dispatch-seam work tracked
+//! separately. v1 dispatch reuses the existing one-shot `build_exec_args` /
+//! `spawn_task` path so the cockpit shell is buildable and runnable today; live
+//! steering lands once the bidirectional seam exists.
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use parking_lot::RwLock;
+use tokio::sync::broadcast;
+
+use super::providers::ExecOpts;
+use super::{Task, TaskStore, spawn_task};
+
+// Re-export the consumer-facing types so the `bro fleet` cockpit depends only
+// on `blackbox::fleet::*` and never reaches into the crate-private
+// `orchestration` module directly. `Task` itself is NOT re-exported — the
+// cockpit handles agents through the opaque [`AgentHandle`] and reads state via
+// [`TaskSnapshot`], so the crate-private `TaskInner` (and its private-typed
+// fields) never leak into the public API.
+pub use super::providers::Provider;
+pub use super::tail::TailEvent;
+pub use super::TaskStatus;
+
+/// What to dispatch as a new top-level entrypoint agent. The cockpit's
+/// composer fills this in; cwd/model are optional and resolved per dispatch
+/// (no stickiness on the agent itself — provider is fixed at spawn, §4).
+#[derive(Debug, Clone)]
+pub struct DispatchSpec {
+    pub provider: Provider,
+    pub prompt: String,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    /// Extra env overrides for the child (e.g. MCP injection wiring). The
+    /// cockpit's TUI-local config (§5.2) feeds this; `None` for a bare launch.
+    pub env_overrides: Option<HashMap<String, String>>,
+}
+
+impl DispatchSpec {
+    pub fn new(provider: Provider, prompt: impl Into<String>) -> Self {
+        Self {
+            provider,
+            prompt: prompt.into(),
+            cwd: None,
+            model: None,
+            env_overrides: None,
+        }
+    }
+}
+
+/// Opaque handle to a dispatched entrypoint agent. Wraps the live task; the
+/// cockpit holds these (it owns exactly what it spawned) and reads state
+/// through [`AgentHandle::snapshot`] without touching crate-private internals.
+#[derive(Clone)]
+pub struct AgentHandle {
+    task: Arc<Task>,
+}
+
+impl AgentHandle {
+    pub fn id(&self) -> String {
+        self.task.id()
+    }
+
+    /// Point-in-time copy of the agent's live state, read under one lock.
+    pub fn snapshot(&self) -> TaskSnapshot {
+        let inner = self.task.inner.lock();
+        TaskSnapshot {
+            status: inner.status,
+            provider: inner.provider,
+            session_id: inner.session_id.clone(),
+            last_assistant_message: inner.last_assistant_message.clone(),
+            report_message: inner.report.as_ref().map(|r| r.message.clone()),
+            report_needs: inner.report.as_ref().and_then(|r| r.needs.clone()),
+            cost_usd: inner.cost_usd,
+            num_turns: inner.num_turns,
+            started_at: inner.started_at,
+            cwd: inner.cwd.clone(),
+            stderr: inner.stderr.clone(),
+            model: model_from_events(&inner.events),
+        }
+    }
+}
+
+/// Read-only snapshot of a dispatched agent's live state — the cockpit's window
+/// into a task without naming the crate-private `Task`/`TaskInner`.
+#[derive(Debug, Clone)]
+pub struct TaskSnapshot {
+    pub status: TaskStatus,
+    pub provider: Provider,
+    pub session_id: String,
+    pub last_assistant_message: Option<String>,
+    pub report_message: Option<String>,
+    pub report_needs: Option<String>,
+    pub cost_usd: Option<f64>,
+    pub num_turns: Option<u64>,
+    pub started_at: u64,
+    pub cwd: Option<String>,
+    pub stderr: String,
+    pub model: Option<String>,
+}
+
+/// Best-effort model id from an `init`/assistant event in the stream-json buffer.
+fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
+    events.iter().find_map(|e| {
+        e.get("model")
+            .or_else(|| e.get("message").and_then(|m| m.get("model")))
+            .and_then(|m| m.as_str())
+            .map(|s| s.to_string())
+    })
+}
+
+/// Daemon-free orchestration core for the fleet cockpit. Holds the `TaskStore`,
+/// the tail broadcast channel, and the on-disk `store_dir` that `spawn_task`
+/// persists task state into.
+pub struct FleetOrchestrator {
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: broadcast::Sender<TailEvent>,
+    store_dir: PathBuf,
+}
+
+impl FleetOrchestrator {
+    /// Construct over an explicit `store_dir`. Tests and embedders use this;
+    /// the cockpit normally goes through [`FleetOrchestrator::from_config`].
+    pub fn new(store_dir: PathBuf) -> Self {
+        let (tail_tx, _rx) = broadcast::channel(1024);
+        Self {
+            task_store: Arc::new(RwLock::new(TaskStore::new())),
+            tail_tx,
+            store_dir,
+        }
+    }
+
+    /// Build from the resolved blackbox config, reusing the daemon's
+    /// orchestration `store_dir` (`paths.bro_home`) so persisted/resumable
+    /// sessions land in the same place the daemon would have written them —
+    /// without putting the daemon in the execution path.
+    pub fn from_config() -> anyhow::Result<Self> {
+        let cfg = crate::config::load()?;
+        Ok(Self::new(cfg.paths.bro_home))
+    }
+
+    /// Subscribe to the tail stream. Each call returns an independent receiver;
+    /// the cockpit forwards these into its (sync) TUI loop the same way
+    /// `council_tui` forwards SSE signals.
+    pub fn subscribe(&self) -> broadcast::Receiver<TailEvent> {
+        self.tail_tx.subscribe()
+    }
+
+    /// Handles to every task this orchestrator has spawned. The cockpit
+    /// normally keeps the handles returned by [`dispatch`] directly (it owns
+    /// exactly what it spawned), so this is a convenience for
+    /// recovery/enumeration paths.
+    pub fn tasks(&self) -> Vec<AgentHandle> {
+        self.task_store
+            .read()
+            .all_tasks()
+            .into_iter()
+            .map(|task| AgentHandle { task })
+            .collect()
+    }
+
+    pub fn store_dir(&self) -> &std::path::Path {
+        &self.store_dir
+    }
+
+    /// Spawn a new top-level entrypoint agent. v1 reuses the one-shot
+    /// `build_exec_args` path; the persistent bidirectional session (keystone,
+    /// §2) replaces the arg construction here once the harness/CLI seam lands.
+    /// Returns an [`AgentHandle`] — the cockpit holds it to read state.
+    pub fn dispatch(&self, spec: DispatchSpec) -> AgentHandle {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
+
+        let opts = ExecOpts {
+            model: spec.model.clone(),
+            effort: None,
+            provider_defaults: None,
+        };
+        let args = spec.provider.build_exec_args(
+            &spec.prompt,
+            &session_id,
+            spec.cwd.as_deref(),
+            Some(&opts),
+        );
+
+        let task = spawn_task(
+            task_id,
+            spec.provider,
+            args,
+            session_id,
+            spec.cwd,
+            spec.env_overrides,
+            self.store_dir.clone(),
+            self.task_store.clone(),
+            self.tail_tx.clone(),
+            // Fleet agents are entrypoint agents, not bros — no team/brofile
+            // label and no `bro_report` surface (design §2.2). bro_label stays
+            // None; the cockpit names rows from the initial prompt (§5).
+            None,
+            None,
+            None,
+        );
+        AgentHandle { task }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_orchestrator_has_no_tasks() {
+        let orch = FleetOrchestrator::new(std::env::temp_dir().join("bbox-fleet-test"));
+        assert!(orch.tasks().is_empty());
+        // subscribe must yield a live receiver without a prior dispatch.
+        let _rx = orch.subscribe();
+    }
+
+    #[test]
+    fn dispatch_spec_builder_defaults() {
+        let spec = DispatchSpec::new(Provider::Claude, "hello");
+        assert_eq!(spec.prompt, "hello");
+        assert!(spec.cwd.is_none());
+        assert!(spec.model.is_none());
+    }
+}

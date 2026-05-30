@@ -52,6 +52,9 @@ mod mcp_tools;
 mod migration;
 mod notes;
 mod orchestration;
+/// Daemon-free orchestration façade for the `bro fleet` cockpit. The rest of
+/// `orchestration` stays crate-private; the fleet cockpit links only this.
+pub use orchestration::fleet;
 mod packets;
 mod parser;
 mod path_cache;
