@@ -316,7 +316,6 @@ impl Provider {
                     prompt.into(),
                     "--output".into(),
                     "json".into(),
-                    "--auto-approve".into(),
                 ]
             }
             Provider::Gemini => {
@@ -451,7 +450,6 @@ impl Provider {
                     prompt.into(),
                     "--output".into(),
                     "json".into(),
-                    "--auto-approve".into(),
                 ]
             }
             Provider::Gemini => {
