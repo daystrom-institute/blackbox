@@ -4731,6 +4731,50 @@ fn ensure_git_clean_for_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Validate a rewritten TOML file with the canonical `toml` parser instead of
+/// tree-sitter. Returns a `has_error` result (never an `Err`) so a malformed
+/// rewrite surfaces as a normal parse-validation failure, matching the
+/// tree-sitter path's contract.
+fn validate_toml_source(path: &Path, source: &str) -> ParseValidationResult {
+    match source.parse::<toml::Value>() {
+        Ok(_) => ParseValidationResult {
+            path: path_string(path),
+            has_error: false,
+            error_nodes: 0,
+            missing_nodes: 0,
+            error_excerpts: Vec::new(),
+        },
+        Err(err) => {
+            let byte_start = err.span().map(|span| span.start).unwrap_or(0);
+            let byte_end = err.span().map(|span| span.end).unwrap_or(byte_start);
+            let (line, column) = line_column_for_byte(source, byte_start);
+            ParseValidationResult {
+                path: path_string(path),
+                has_error: true,
+                error_nodes: 1,
+                missing_nodes: 0,
+                error_excerpts: vec![ParseErrorExcerpt {
+                    kind: "error".to_string(),
+                    line,
+                    column,
+                    byte_start,
+                    byte_end,
+                    snippet: err.message().to_string(),
+                }],
+            }
+        }
+    }
+}
+
+/// 1-based (line, column) of `byte` within `source`, counting UTF-8 bytes.
+fn line_column_for_byte(source: &str, byte: usize) -> (usize, usize) {
+    let clamped = byte.min(source.len());
+    let prefix = &source[..clamped];
+    let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
+    let column = clamped - prefix.rfind('\n').map(|idx| idx + 1).unwrap_or(0) + 1;
+    (line, column)
+}
+
 fn validate_rewritten_files(files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<ParseValidationResult>> {
     files
         .iter()
@@ -4741,6 +4785,15 @@ fn validate_rewritten_files(files: &[(PathBuf, Vec<u8>)]) -> Result<Vec<ParseVal
         .map(|(path, bytes, language)| {
             let source = std::str::from_utf8(bytes)
                 .with_context(|| format!("{} is not valid utf-8", path.display()))?;
+            // TOML has a canonical native parser; validate with it rather than
+            // tree-sitter. `ts_language_for_name` serves toml only via the shared
+            // tree-sitter-language-pack process, which is unavailable to the
+            // direct-grammar fallback under load — so a tree-sitter toml validate
+            // fails intermittently with "unsupported language toml". The `toml`
+            // crate is the authoritative validator and is deterministic.
+            if language == "toml" {
+                return Ok(validate_toml_source(path, source));
+            }
             let tree = parse_source(language, source)?;
             let (report, error_locations) = parse_report_with_locations(tree.root_node());
             let error_excerpts =
