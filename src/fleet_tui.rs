@@ -120,6 +120,7 @@ struct AgentView {
     cost: Option<f64>,
     turns: Option<u64>,
     started_at: u64,
+    last_activity_ms: Option<u64>,
     stderr_tail: Option<String>,
 }
 
@@ -152,6 +153,7 @@ impl Agent {
             cost: snap.cost_usd,
             turns: snap.num_turns,
             started_at: snap.started_at,
+            last_activity_ms: snap.last_event_at_ms,
             stderr_tail,
         }
     }
@@ -255,10 +257,14 @@ impl App {
     fn ordered_agents(&self) -> (Vec<AgentView>, Vec<usize>) {
         let views: Vec<AgentView> = self.agents.iter().map(Agent::view).collect();
         let mut order: Vec<usize> = (0..self.agents.len()).collect();
+        // Within a bucket, most-recently-interacted first (last activity, then
+        // start time as a tiebreak).
+        let last_activity = |v: &AgentView| v.last_activity_ms.unwrap_or(v.started_at);
         order.sort_by(|&a, &b| {
             let ba = bucket_rank(views[a].state);
             let bb = bucket_rank(views[b].state);
             ba.cmp(&bb)
+                .then_with(|| last_activity(&views[b]).cmp(&last_activity(&views[a])))
                 .then_with(|| views[b].started_at.cmp(&views[a].started_at))
         });
         (views, order)
@@ -643,9 +649,9 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     let (views, order) = app.ordered_agents();
     draw_title(f, chunks[0], app, &views);
-    // Per-agent stats ride under the composer (not at the top of the
-    // scrollback), in the single-agent view.
-    let composer_stats = if app.zone == Zone::SingleAgent {
+    // Per-agent stats live on the help line, directly under the composer (not
+    // atop the transcript), in the single-agent view.
+    let stats = if app.zone == Zone::SingleAgent {
         order
             .get(app.roster_selected)
             .map(|&idx| agent_stats_line(&app.agents[idx], &views[idx]))
@@ -656,25 +662,35 @@ fn draw(f: &mut Frame, app: &mut App) {
         Zone::SingleAgent => draw_single_agent(f, chunks[1], app, &views),
         _ => draw_roster_body(f, chunks[1], app, &views, &order),
     }
-    draw_composer(f, chunks[2], app, composer_stats.as_deref());
-    draw_help(f, chunks[3], app);
+    draw_composer(f, chunks[2], app);
+    draw_help(f, chunks[3], app, stats.as_deref());
 }
 
-/// One-line per-agent stats for the composer's bottom border (§ feedback:
-/// stats belong under the text entry, not atop the transcript).
+/// One-line per-agent stats for the help row under the composer.
 fn agent_stats_line(a: &Agent, v: &AgentView) -> String {
     let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
     let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
     let model = v.model.clone().unwrap_or_else(|| "—".into());
-    let cwd = v.cwd.clone().unwrap_or_else(|| "—".into());
+    let cwd = v.cwd.as_deref().map(path_tail).unwrap_or_else(|| "—".into());
     format!(
-        " {} · {} · {} · {} turns · cwd {} ",
+        "{} · {} · {} · {} turns · {}",
         provider_tag(a.provider),
         model,
         cost,
         turns,
         cwd
     )
+}
+
+/// Last two path components (keeps the cwd readable on one line).
+fn path_tail(p: &str) -> String {
+    let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
+    let tail = if parts.len() > 2 {
+        format!("…/{}/{}", parts[parts.len() - 2], parts[parts.len() - 1])
+    } else {
+        p.to_string()
+    };
+    tail
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
@@ -760,7 +776,7 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
             }
             let v = &views[i];
             let a = &app.agents[i];
-            items.push(agent_list_item(a, v, glyph, color));
+            items.push(agent_list_item(a, v, glyph, color, area.width as usize));
             seen_in_order += 1;
         }
     }
@@ -800,24 +816,36 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-fn agent_list_item(a: &Agent, v: &AgentView, glyph: &str, color: Color) -> ListItem<'static> {
+fn agent_list_item(
+    a: &Agent,
+    v: &AgentView,
+    glyph: &str,
+    color: Color,
+    width: usize,
+) -> ListItem<'static> {
     let tag = provider_tag(a.provider);
-    // Row = glyph · provider · name · age. The name is the initial user turn
-    // (until renamed) — no truncated assistant-line summary (it was clutter).
+    // Row = glyph · provider · name … (right-aligned) started Xm · last Ys.
+    // `started` = session age; `last` = time since the last stream event.
+    let started = age(v.started_at);
+    let last = v.last_activity_ms.map(age).unwrap_or_else(|| started.clone());
+    let timing = format!("start {started}  ·  last {last}");
+
+    // glyph(2) + provider(5). Cap the name so the timing has room on the right.
+    let fixed = 2 + 5;
+    let name_max = width.saturating_sub(fixed + timing.chars().count() + 2).max(8);
+    let name = truncate(&a.name, name_max);
+    let used = fixed + name.chars().count();
+    let pad = width.saturating_sub(used + timing.chars().count()).max(1);
+
     let spans = vec![
         Span::styled(format!("{glyph} "), Style::default().fg(color)),
         Span::styled(
-            format!("{tag:<4}"),
+            format!("{tag:<4} "),
             Style::default().fg(provider_color(a.provider)),
         ),
-        Span::styled(
-            truncate(&a.name, 52),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  {}", age(v.started_at)),
-            Style::default().fg(Color::DarkGray),
-        ),
+        Span::styled(name, Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(timing, Style::default().fg(Color::DarkGray)),
     ];
     ListItem::new(Line::from(spans))
 }
@@ -934,9 +962,13 @@ fn render_transcript(
     const ARG_MAX_LINES: usize = 15;
     const RESULT_MAX_LINES: usize = 25;
 
+    let hr = || Line::from(Span::styled("─".repeat(width.max(1)), Style::default().fg(Color::DarkGray)));
+
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !initial_prompt.is_empty() {
+        // Rule sits between the user turn and the assistant response.
         lines.extend(render_steer(initial_prompt));
+        lines.push(hr());
         lines.push(Line::from(""));
     }
     if items.is_empty() && initial_prompt.is_empty() {
@@ -949,7 +981,12 @@ fn render_transcript(
     for item in items {
         let before = lines.len();
         match item {
-            TranscriptItem::UserSteer(t) => lines.extend(render_steer(t)),
+            // Each steer is followed by the turn rule (user → assistant
+            // boundary); the assistant response renders after it.
+            TranscriptItem::UserSteer(t) => {
+                lines.extend(render_steer(t));
+                lines.push(hr());
+            }
             TranscriptItem::AssistantText(t) => lines.extend(render_markdown(t)),
             TranscriptItem::Thinking(t) => {
                 for l in t.lines() {
@@ -1006,18 +1043,10 @@ fn render_transcript(
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            TranscriptItem::TurnFooter { .. } => {
-                // A single tight horizontal rule between turns — no "turn N ·
-                // $cost" text (those stats live under the composer now). Replace
-                // the preceding blank with the rule so it stays one line tall.
-                if matches!(lines.last(), Some(l) if line_is_blank(l)) {
-                    lines.pop();
-                }
-                lines.push(Line::from(Span::styled(
-                    "─".repeat(width.max(1)),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+            // The turn rule now leads each turn (after the user steer), so the
+            // end-of-turn result footer renders nothing — its stats live under
+            // the composer.
+            TranscriptItem::TurnFooter { .. } => {}
         }
         // Only space items that actually rendered (a suppressed quiet result
         // adds nothing — no blank line either).
@@ -1026,12 +1055,6 @@ fn render_transcript(
         }
     }
     lines
-}
-
-/// True for a visually empty transcript line (the spacer we insert between
-/// items) — used to keep the turn rule tight.
-fn line_is_blank(l: &Line<'static>) -> bool {
-    l.spans.iter().all(|s| s.content.trim().is_empty())
 }
 
 /// Show a tool's result body verbosely? Change-making and opaque tools
@@ -1091,7 +1114,7 @@ fn monospace_block(text: &str, max: usize, color: Color) -> Vec<Line<'static>> {
     out
 }
 
-fn draw_composer(f: &mut Frame, area: Rect, app: &App, bottom_stats: Option<&str>) {
+fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
     let (title, color) = if app.rename_target.is_some() {
         (" rename (Enter=save · Esc=cancel) ", Color::Magenta)
     } else {
@@ -1103,17 +1126,10 @@ fn draw_composer(f: &mut Frame, area: Rect, app: &App, bottom_stats: Option<&str
             ),
         }
     };
-    let mut block = Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color))
         .title(Span::styled(title, Style::default().fg(color)));
-    // Per-agent stats ride on the bottom border, under the text entry.
-    if let Some(stats) = bottom_stats {
-        block = block.title_bottom(Line::from(Span::styled(
-            stats.to_string(),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -1123,16 +1139,26 @@ fn draw_composer(f: &mut Frame, area: Rect, app: &App, bottom_stats: Option<&str
     f.render_widget(Paragraph::new(buf).wrap(Wrap { trim: false }), inner);
 }
 
-fn draw_help(f: &mut Frame, area: Rect, app: &App) {
+fn draw_help(f: &mut Frame, area: Rect, app: &App, stats: Option<&str>) {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // Per-agent stats (single-agent view) sit here, directly under the composer
+    // — readable, not on a border. Stats first (bright), nav hints dim.
+    if let Some(s) = stats {
+        spans.push(Span::styled(
+            s.to_string(),
+            Style::default().fg(Color::Gray),
+        ));
+        spans.push(Span::styled("   ·   ", Style::default().fg(Color::DarkGray)));
+    }
     let nav = match app.zone {
         Zone::ProviderSelector => "↑/↓ provider  →/Tab confirm",
-        Zone::Roster => "↑/↓ agent  → open  ← provider  Tab provider",
-        Zone::SingleAgent => "Enter steer  Esc interrupt  ← roster  ↑/↓ history  PgUp/PgDn scroll",
+        Zone::Roster => "↑/↓ agent  → open  ← provider  Ctrl+R rename",
+        Zone::SingleAgent => "← roster  Esc interrupt  ↑/↓ history",
     };
-    let mut spans = vec![Span::styled(
+    spans.push(Span::styled(
         format!("{nav}  ·  Ctrl+Q quit"),
         Style::default().fg(Color::DarkGray),
-    )];
+    ));
     if let Some(s) = &app.status {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(s.clone(), Style::default().fg(Color::LightYellow)));

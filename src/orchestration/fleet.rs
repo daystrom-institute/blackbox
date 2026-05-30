@@ -149,6 +149,10 @@ impl AgentHandle {
             cost_usd: inner.cost_usd,
             num_turns: inner.num_turns,
             started_at: inner.started_at,
+            // Wall-clock of the last observed stream event — "last interaction",
+            // a roster timing column + sort axis. Stamped by the reader on every
+            // event via supervision.observe_event.
+            last_event_at_ms: inner.supervision.last_event_at_ms,
             cwd: inner.cwd.clone(),
             stderr: inner.stderr.clone(),
             model: model_from_events(&inner.events),
@@ -359,7 +363,10 @@ pub struct TaskSnapshot {
     pub turn_active: bool,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
+    /// Wall-clock (ms) the session started.
     pub started_at: u64,
+    /// Wall-clock (ms) of the last observed stream event ("last interaction").
+    pub last_event_at_ms: Option<u64>,
     pub cwd: Option<String>,
     pub stderr: String,
     pub model: Option<String>,
