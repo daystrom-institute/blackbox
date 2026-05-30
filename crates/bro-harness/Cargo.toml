@@ -14,6 +14,8 @@ path = "src/main.rs"
 
 [dependencies]
 bro-tools = { path = "../bro-tools" }
+bro-lsp = { path = "../bro-lsp" }
+lsp-types = "0.94.1"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
