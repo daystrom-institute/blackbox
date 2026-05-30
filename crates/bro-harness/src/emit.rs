@@ -17,6 +17,10 @@ impl Emitter {
         Self { session_id }
     }
 
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     fn write_line(&self, v: serde_json::Value) {
         let mut out = std::io::stdout().lock();
         // A failed write to stdout (closed pipe) is unrecoverable for the
@@ -32,6 +36,42 @@ impl Emitter {
             "type": "system",
             "subtype": "init",
             "session_id": self.session_id,
+        }));
+    }
+
+    /// `system/init` for bidirectional mode, advertising the in-stream slash
+    /// commands the harness accepts (currently `/compact`) so a driver knows the
+    /// control surface (NDJSON_FORMAT.md §system/init `slash_commands`).
+    pub fn system_init_session(&self) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "init",
+            "session_id": self.session_id,
+            "slash_commands": ["compact"],
+        }));
+    }
+
+    /// Re-emit a stdin user message as a `user` event (for
+    /// `--replay-user-messages`), tagged `isReplay` so the driver can tell it
+    /// from a fresh turn.
+    pub fn replay_user(&self, message: &Value) {
+        self.write_line(json!({
+            "type": "user",
+            "session_id": self.session_id,
+            "isReplay": true,
+            "message": message,
+        }));
+    }
+
+    /// A successful `control_response` for a `control_request` (e.g. interrupt,
+    /// set_model). The Claude Agent SDK shape: `response.{subtype,request_id}`.
+    pub fn control_response_success(&self, request_id: Option<&str>) {
+        self.write_line(json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": request_id,
+            },
         }));
     }
 
@@ -102,13 +142,13 @@ impl Emitter {
     /// ignores unknown `system` subtypes, so this is purely a marker for the
     /// fleet TUI transcript (rendered as a divider). `pre_tokens` is the prompt
     /// size that tripped the threshold.
-    pub fn compact_boundary(&self, pre_tokens: u64, summary_chars: usize) {
+    pub fn compact_boundary(&self, trigger: &str, pre_tokens: u64, summary_chars: usize) {
         self.write_line(json!({
             "type": "system",
             "subtype": "compact_boundary",
             "session_id": self.session_id,
             "compact_metadata": {
-                "trigger": "auto",
+                "trigger": trigger,
                 "pre_tokens": pre_tokens,
                 "summary_chars": summary_chars,
             },

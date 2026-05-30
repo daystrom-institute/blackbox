@@ -17,6 +17,19 @@ pub struct Cli {
     #[arg(long = "output-format")]
     pub output_format: Option<String>,
 
+    /// Bidirectional control plane. When `stream-json`, the harness keeps a
+    /// persistent session: it reads successive user-turn messages and
+    /// `control_request`s (interrupt, set_model, …) from stdin as NDJSON, stays
+    /// alive between turns, and treats `/compact` as an in-stream slash command.
+    /// Absent ⇒ legacy one-shot mode (read one prompt, run, exit).
+    #[arg(long = "input-format")]
+    pub input_format: Option<String>,
+
+    /// Re-emit each stdin user message back on stdout as a `user` event (gated
+    /// on stream-json in/out). Mirrors the claude CLI's `--replay-user-messages`.
+    #[arg(long = "replay-user-messages", default_value_t = false)]
+    pub replay_user_messages: bool,
+
     /// Session id to mint/persist under.
     #[arg(long = "session-id")]
     pub session_id: Option<String>,
