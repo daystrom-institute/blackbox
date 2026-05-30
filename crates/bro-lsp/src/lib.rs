@@ -329,16 +329,29 @@ impl SessionPool {
     }
 
     pub async fn diagnostics(&self, doc: &OpenDocument, version: i32) -> Result<Vec<Diagnostic>> {
-        let session = self.session(doc.root.clone(), doc.language).await?;
+        self.diagnostics_for_uri(doc.root.clone(), doc.language, doc.uri.clone(), version)
+            .await
+    }
+
+    pub async fn diagnostics_for_uri(
+        &self,
+        root: impl Into<PathBuf>,
+        language: Language,
+        uri: Url,
+        version: i32,
+    ) -> Result<Vec<Diagnostic>> {
+        let root = root.into();
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("canonicalizing project root {}", root.display()))?;
+        let session = self.session(root, language).await?;
         let mut session = session.lock().await;
         session.last_used = Instant::now();
-        session.ensure_current_version(&doc.uri, version)?;
+        session.ensure_current_version(&uri, version)?;
         if session.supports_pull_diagnostics() {
-            session.pull_diagnostics(doc.uri.clone(), version).await
+            session.pull_diagnostics(uri, version).await
         } else {
-            session
-                .drain_published_diagnostics(doc.uri.clone(), version)
-                .await
+            session.drain_published_diagnostics(uri, version).await
         }
     }
 
