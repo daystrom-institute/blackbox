@@ -176,8 +176,14 @@ pub enum TranscriptItem {
     Thinking(String),
     /// A tool call with its raw JSON arguments (`⏺ name`).
     ToolCall { name: String, args: String },
-    /// A tool result; `is_error` renders red.
-    ToolResult { content: String, is_error: bool },
+    /// A tool result. `tool` is the originating tool name (correlated by
+    /// tool_use_id) so the renderer can show change-making tools (Edit/MCP)
+    /// verbosely while suppressing noisy output (Bash). `is_error` renders red.
+    ToolResult {
+        tool: Option<String>,
+        content: String,
+        is_error: bool,
+    },
     /// The builtin `report` tool's status line (`◆`, §2.2).
     Report { message: String, needs_input: bool },
     /// A `/compact` or auto-compaction boundary divider (§2.4).
@@ -197,10 +203,13 @@ pub enum TranscriptItem {
 /// event at the turn boundary supersedes them (token-streaming is a refinement).
 pub fn parse_transcript(events: &[Value]) -> Vec<TranscriptItem> {
     let mut out = Vec::new();
+    // tool_use_id → tool name, so tool_result echoes can be attributed to the
+    // tool that produced them (drives verbose-vs-quiet rendering).
+    let mut tool_names: HashMap<String, String> = HashMap::new();
     for e in events {
         match e.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "user" => parse_user_event(e, &mut out),
-            "assistant" => parse_assistant_event(e, &mut out),
+            "user" => parse_user_event(e, &mut out, &tool_names),
+            "assistant" => parse_assistant_event(e, &mut out, &mut tool_names),
             "report" => {
                 let r = &e["report"];
                 if let Some(msg) = r.get("message").and_then(|m| m.as_str()) {
@@ -234,7 +243,7 @@ pub fn parse_transcript(events: &[Value]) -> Vec<TranscriptItem> {
 
 /// A `user` event is either an operator steer (string / text-block content) or
 /// a tool_result echo (tool_result blocks).
-fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>) {
+fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>, tool_names: &HashMap<String, String>) {
     match &e["message"]["content"] {
         Value::String(s) if !s.trim().is_empty() => {
             out.push(TranscriptItem::UserSteer(s.clone()))
@@ -244,6 +253,10 @@ fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>) {
             for b in blocks {
                 match b.get("type").and_then(|t| t.as_str()) {
                     Some("tool_result") => out.push(TranscriptItem::ToolResult {
+                        tool: b
+                            .get("tool_use_id")
+                            .and_then(|i| i.as_str())
+                            .and_then(|id| tool_names.get(id).cloned()),
                         content: extract_content_text(b.get("content")),
                         is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
                     }),
@@ -267,7 +280,11 @@ fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>) {
 }
 
 /// An `assistant` event carries text / thinking / tool_use content blocks.
-fn parse_assistant_event(e: &Value, out: &mut Vec<TranscriptItem>) {
+fn parse_assistant_event(
+    e: &Value,
+    out: &mut Vec<TranscriptItem>,
+    tool_names: &mut HashMap<String, String>,
+) {
     let Some(blocks) = e["message"]["content"].as_array() else {
         return;
     };
@@ -289,17 +306,24 @@ fn parse_assistant_event(e: &Value, out: &mut Vec<TranscriptItem>) {
                     out.push(TranscriptItem::Thinking(t.to_string()));
                 }
             }
-            Some("tool_use") => out.push(TranscriptItem::ToolCall {
-                name: b
+            Some("tool_use") => {
+                let name = b
                     .get("name")
                     .and_then(|n| n.as_str())
                     .unwrap_or("tool")
-                    .to_string(),
-                args: b
-                    .get("input")
-                    .map(|i| serde_json::to_string_pretty(i).unwrap_or_default())
-                    .unwrap_or_default(),
-            }),
+                    .to_string();
+                // Record id → name so the tool_result echo can be attributed.
+                if let Some(id) = b.get("id").and_then(|i| i.as_str()) {
+                    tool_names.insert(id.to_string(), name.clone());
+                }
+                out.push(TranscriptItem::ToolCall {
+                    name,
+                    args: b
+                        .get("input")
+                        .map(|i| serde_json::to_string_pretty(i).unwrap_or_default())
+                        .unwrap_or_default(),
+                });
+            }
             _ => {}
         }
     }
@@ -677,7 +701,7 @@ mod tests {
             ev(r#"{"type":"assistant","message":{"content":[
                 {"type":"thinking","thinking":"hmm"},
                 {"type":"text","text":"on it"},
-                {"type":"tool_use","name":"shell_run","input":{"cmd":"ls"}}
+                {"type":"tool_use","id":"t1","name":"shell_run","input":{"cmd":"ls"}}
             ]}}"#),
             ev(r#"{"type":"user","message":{"role":"user","content":[
                 {"type":"tool_result","tool_use_id":"t1","content":"file.txt","is_error":false}
@@ -693,7 +717,8 @@ mod tests {
         assert!(matches!(&items[3], TranscriptItem::ToolCall { name, .. } if name == "shell_run"));
         assert!(matches!(
             &items[4],
-            TranscriptItem::ToolResult { content, is_error: false } if content == "file.txt"
+            TranscriptItem::ToolResult { content, is_error: false, tool }
+                if content == "file.txt" && tool.as_deref() == Some("shell_run")
         ));
         assert!(matches!(
             &items[5],

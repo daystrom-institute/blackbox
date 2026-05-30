@@ -44,7 +44,7 @@ use blackbox::fleet::{
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
 const NAME_LEN: usize = 36;
-const ROSTER_WIDTH: u16 = 40;
+const PROVIDER_SEL_WIDTH: u16 = 22;
 const COMPOSER_HEIGHT: u16 = 3;
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
@@ -104,7 +104,6 @@ impl FleetState {
 /// so it holds the live `Arc<Task>` handle and derives display state from it.
 struct Agent {
     task: AgentHandle,
-    id: String,
     provider: Provider,
     /// Display name: first N chars of the initial prompt, renamable (§5).
     name: String,
@@ -287,7 +286,6 @@ impl App {
         let id = task.id();
         self.agents.push(Agent {
             task,
-            id: id.clone(),
             provider: self.next_provider,
             name: truncate(&prompt, NAME_LEN),
             input_history: vec![prompt],
@@ -631,17 +629,19 @@ fn draw_roster_body(
     views: &[AgentView],
     order: &[usize],
 ) {
-    let split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(ROSTER_WIDTH), Constraint::Min(0)])
-        .split(area);
-
+    // The roster is the focus — full width, no transcript here (that lives in
+    // the single-agent view, `→`). In the provider-selector zone a slim
+    // selector sits to the left of the roster.
     if app.zone == Zone::ProviderSelector {
+        let split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(PROVIDER_SEL_WIDTH), Constraint::Min(0)])
+            .split(area);
         draw_provider_selector(f, split[0], app);
+        draw_roster(f, split[1], app, views, order);
     } else {
-        draw_roster(f, split[0], app, views, order);
+        draw_roster(f, area, app, views, order);
     }
-    draw_detail(f, split[1], app, views, order);
 }
 
 fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], order: &[usize]) {
@@ -690,16 +690,10 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
     let mut state = ListState::default();
     state.select(flat_selected);
 
-    let border_color = if app.zone == Zone::Roster {
-        Color::Cyan
-    } else {
-        Color::DarkGray
-    };
-    let block = Block::default()
-        .borders(Borders::RIGHT)
-        .border_style(Style::default().fg(border_color));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    // Full-width, borderless — the roster is the focus (the title bar and
+    // composer frame it). In provider-selector mode the selector to the left
+    // carries its own separator.
+    let inner = area;
 
     if app.agents.is_empty() {
         let hint = Paragraph::new(vec![
@@ -786,72 +780,6 @@ fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_detail(f: &mut Frame, area: Rect, app: &App, views: &[AgentView], order: &[usize]) {
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(Style::default().fg(Color::DarkGray));
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    let Some(&idx) = order.get(app.roster_selected) else {
-        f.render_widget(
-            Paragraph::new(Span::styled(
-                "  select or dispatch an agent",
-                Style::default().fg(Color::DarkGray),
-            )),
-            inner,
-        );
-        return;
-    };
-    let v = &views[idx];
-    let a = &app.agents[idx];
-    let mut lines = detail_header(a, v);
-    lines.push(Line::from(""));
-    lines.extend(render_transcript(&a.task.transcript(), initial_prompt(a)));
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-}
-
-fn detail_header(a: &Agent, v: &AgentView) -> Vec<Line<'static>> {
-    let (glyph, color) = v.state.glyph();
-    let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
-    let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
-    let model = v.model.clone().unwrap_or_else(|| "—".into());
-    let cwd = v.cwd.clone().unwrap_or_else(|| "—".into());
-    let mut lines = vec![Line::from(vec![
-        Span::styled(format!("{glyph} "), Style::default().fg(color)),
-        Span::styled(
-            a.name.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  [{}]", v.state.label()),
-            Style::default().fg(color),
-        ),
-    ])];
-    lines.push(Line::from(Span::styled(
-        format!(
-            "  {} · {} · {} · turns {} · {}",
-            provider_tag(a.provider),
-            model,
-            cost,
-            turns,
-            short_id(&a.id),
-        ),
-        Style::default().fg(Color::DarkGray),
-    )));
-    lines.push(Line::from(Span::styled(
-        format!("  cwd {cwd} · sess {}", short_id(&v.session_id)),
-        Style::default().fg(Color::DarkGray),
-    )));
-    if let Some(err) = &v.stderr_tail {
-        lines.push(Line::from(Span::styled(
-            format!("  ✗ {}", truncate(err, 80)),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    lines
-}
-
 fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView]) {
     // `order` indexes into `views` (both derived from app.agents, same indexing).
     let (_, order) = app.ordered_agents();
@@ -861,12 +789,33 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     };
     let v = &views[idx];
     let a = &app.agents[idx];
+    let (glyph, _) = v.state.glyph();
 
-    let mut lines = detail_header(a, v);
-    lines.push(Line::from(Span::styled(
-        "  ── transcript ──",
+    // Identity (glyph · name · state) lives in the block title; the body opens
+    // with a single dim metadata line — no name repeat, no separate header
+    // stack.
+    let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
+    let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
+    let model = v.model.clone().unwrap_or_else(|| "—".into());
+    let cwd = v.cwd.clone().unwrap_or_else(|| "—".into());
+    let mut lines: Vec<Line<'static>> = vec![Line::from(Span::styled(
+        format!(
+            "{} · {} · {} · {} turns · cwd {} · sess {}",
+            provider_tag(a.provider),
+            model,
+            cost,
+            turns,
+            cwd,
+            short_id(&v.session_id),
+        ),
         Style::default().fg(Color::DarkGray),
-    )));
+    ))];
+    if let Some(err) = &v.stderr_tail {
+        lines.push(Line::from(Span::styled(
+            format!("✗ {}", truncate(err, 100)),
+            Style::default().fg(Color::Red),
+        )));
+    }
     lines.push(Line::from(""));
     lines.extend(render_transcript(&a.task.transcript(), initial_prompt(a)));
 
@@ -882,13 +831,17 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     let from_bottom = app.scroll_from_bottom.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(from_bottom) as u16;
 
-    let footer = if from_bottom == 0 { "" } else { " ↑ scrolled" };
+    let scrolled = if from_bottom == 0 { "" } else { " ↑ scrolled" };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            format!(" {} (← roster){footer} ", a.name),
-            Style::default().fg(Color::Cyan),
+            format!(
+                " {glyph} {} · {} · ← roster{scrolled} ",
+                a.name,
+                v.state.label()
+            ),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -928,6 +881,7 @@ fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line
     }
 
     for item in items {
+        let before = lines.len();
         match item {
             TranscriptItem::UserSteer(t) => lines.extend(render_steer(t)),
             TranscriptItem::AssistantText(t) => lines.extend(render_markdown(t)),
@@ -950,9 +904,20 @@ fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line
                 )));
                 lines.extend(monospace_block(args, ARG_MAX_LINES, Color::DarkGray));
             }
-            TranscriptItem::ToolResult { content, is_error } => {
-                let color = if *is_error { Color::Red } else { Color::Gray };
-                lines.extend(monospace_block(content, RESULT_MAX_LINES, color));
+            TranscriptItem::ToolResult {
+                tool,
+                content,
+                is_error,
+            } => {
+                // Errors always show. Otherwise, show the body only for
+                // change-making / opaque tools (Edit/Write/MCP) where the
+                // result matters; suppress noisy output (Bash, Read, Grep).
+                if *is_error {
+                    lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Red));
+                } else if tool_result_is_verbose(tool.as_deref()) {
+                    lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Gray));
+                }
+                // quiet success → nothing; the ⏺ call line above stands alone.
             }
             TranscriptItem::Report {
                 message,
@@ -987,9 +952,30 @@ fn render_transcript(items: &[TranscriptItem], initial_prompt: &str) -> Vec<Line
                 )));
             }
         }
-        lines.push(Line::from(""));
+        // Only space items that actually rendered (a suppressed quiet result
+        // adds nothing — no blank line either).
+        if lines.len() > before {
+            lines.push(Line::from(""));
+        }
     }
     lines
+}
+
+/// Show a tool's result body verbosely? Change-making and opaque tools
+/// (Edit/Write/MultiEdit, MCP) → yes (we want to see what changed). Noisy
+/// command/query output (Bash, Read, Grep, …) → no (operator feedback). Errors
+/// bypass this entirely.
+fn tool_result_is_verbose(name: Option<&str>) -> bool {
+    let Some(n) = name else {
+        return false;
+    };
+    let n = n.to_ascii_lowercase();
+    n.starts_with("mcp__")
+        || n.contains("mcp")
+        || n.contains("edit")
+        || n.contains("write")
+        || n.contains("apply_patch")
+        || n.contains("notebook")
 }
 
 /// `▌ you ›` accented steer block (exact causal/temporal ordering, §5.4).
