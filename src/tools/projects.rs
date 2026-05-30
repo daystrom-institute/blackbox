@@ -10,8 +10,8 @@ use crate::mcp_tools;
 use crate::mcp_tools::provenance::ProvenanceParams;
 use crate::orchestration;
 use crate::projects::{
-    ProjectInitParams, ProjectListResponse, ProjectRegisterParams, ProjectRenameParams,
-    ProjectUnregisterParams,
+    ProjectEjectParams, ProjectInitParams, ProjectListResponse, ProjectRegisterParams,
+    ProjectRenameParams, ProjectUnregisterParams,
 };
 use crate::server::routes::{
     migrate_project_refs, project_ref_counts, trigger_project_bootstrap_arc,
@@ -388,6 +388,49 @@ impl BlackboxServer {
                 "ref_counts": counts,
                 "orphaned_refs": total_refs,
                 "forced": total_refs > 0 && force,
+            }))?)
+        })
+    }
+
+    #[tool(
+        name = "bbox_project_eject",
+        description = "Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope) and dropped from the central store. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them."
+    )]
+    pub(crate) fn bbox_project_eject(
+        &self,
+        Parameters(p): Parameters<ProjectEjectParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_project_eject", || {
+            let record = self
+                .state
+                .projects
+                .read()
+                .resolve(&p.project)?
+                .with_context(|| format!("project not registered: {}", p.project))?;
+            let dir = record.canonical_path.clone();
+            let dry_run = p.dry_run.unwrap_or(false);
+
+            // Ensure the project's repo is in kb roots so already-ejected files
+            // are accounted for and the post-eject reload loads from the repo.
+            crate::server::routes::sync_kb_project_roots(&self.state);
+
+            let entries = if dry_run {
+                self.state.kb.read().count_project_entries(&dir)
+            } else {
+                self.state.kb.write().eject_project_to_repo(&dir)?
+            };
+
+            Ok(serde_json::to_string_pretty(&json!({
+                "status": if dry_run { "dry_run" } else { "ok" },
+                "project_id": record.project_id,
+                "canonical_path": dir,
+                "entries": entries,
+                "target": format!("{}/.bbox/knowledge", dir),
+                "detail": if dry_run {
+                    "preview only; re-run without dry_run to write repo files and drop central copies"
+                } else {
+                    "written to repo .bbox/knowledge/ and removed from central store; commit the files to publish"
+                },
             }))?)
         })
     }

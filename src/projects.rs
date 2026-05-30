@@ -71,6 +71,17 @@ pub struct ProjectUnregisterParams {
     pub dry_run: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectEjectParams {
+    /// Project whose central-store knowledge to migrate into the repo. Accepts
+    /// project_id, registered canonical_path, or an absolute path resolving to
+    /// a registered project.
+    pub project: String,
+    /// Preview the count without writing repo files or touching the central store.
+    #[serde(default)]
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, schemars::JsonSchema)]
 pub struct ProjectRecord {
     pub project_id: String,

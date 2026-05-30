@@ -350,6 +350,13 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         ),
     },
     ToolDoc {
+        name: "bbox_project_eject",
+        category: ToolCategory::Projects,
+        summary: "Migrate a registered project's central-store knowledge entries into the repo's committed .bbox/knowledge/ (one file per entry), so the project's durable knowledge travels with the checkout. Accepts project (project_id, registered canonical_path, or absolute path) and optional dry_run. Entries are written without the absolute project path (location encodes scope) and dropped from the central store. dry_run=true reports the count without writing. Commit the resulting .bbox/ files to publish them.",
+        when_to_use: "Run once per existing project to move pre-migration central knowledge into the repo, then commit the .bbox/ files. New project-scope writes already land in .bbox/ automatically; eject is for backfilling entries created before the repo-owned cutover. Prefer dry_run=true first to see the count.",
+        example: Some(r#"bbox_project_eject(project="/home/me/repos/blackbox", dry_run=true)"#),
+    },
+    ToolDoc {
         name: "bbox_project_list",
         category: ToolCategory::Projects,
         summary: "List registered project roots with their project_id, repo_id (null for non-git), canonical_path, registered_at, and is_git_repo flag. Idempotent read; safe to call repeatedly. project_ids are stable across daemon restarts. Use this before bbox_project_register to check whether a path is already registered.",

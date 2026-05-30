@@ -865,6 +865,30 @@ impl Knowledge {
         &self.store.entries
     }
 
+    /// Count entries currently scoped to `project_dir` (across central and any
+    /// already-ejected repo files merged into the surface).
+    pub fn count_project_entries(&self, project_dir: &str) -> usize {
+        self.store
+            .entries
+            .iter()
+            .filter(|e| e.project.as_deref() == Some(project_dir))
+            .count()
+    }
+
+    /// Migrate a project's entries out of the central store into the owning
+    /// repo's `.bbox/knowledge/`. With scope routing in place this is just a
+    /// reload+save: the central entries load into memory, then `save` writes
+    /// them to repo files and drops them from central. Returns the count moved.
+    pub fn eject_project_to_repo(&mut self, project_dir: &str) -> Result<usize> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            let count = self.count_project_entries(project_dir);
+            self.save()?;
+            Ok(count)
+        })
+    }
+
     pub fn rename_project_refs(&mut self, old_project: &str, new_project: &str) -> Result<usize> {
         let path = self.store_path.clone();
         crate::json_store::with_store_lock(&path, || {
@@ -2985,6 +3009,69 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .expect("entry should reload from repo .bbox/knowledge/");
         assert_eq!(loaded.project.as_deref(), Some(proj.as_str()));
         assert_eq!(loaded.scope, Scope::Project);
+    }
+
+    #[test]
+    fn eject_moves_legacy_central_project_entries_into_repo() {
+        // Pre-cutover, a project-scoped entry sat in the central store. Eject
+        // migrates it into the owning repo's .bbox/knowledge/ and drops it from
+        // central, one-time, with the absolute path scrubbed from the file.
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let proj = repo_root.to_string_lossy().to_string();
+        let kb_path = central.path().join("kb.json");
+
+        let legacy = KnowledgeStore {
+            version: 1,
+            entries: vec![KnowledgeEntry {
+                id: "legacy01".into(),
+                title: "old convention".into(),
+                content: "LEGACY_MARKER".into(),
+                cluster: None,
+                variants: HashMap::new(),
+                category: Category::Convention,
+                scope: Scope::Project,
+                project: Some(proj.clone()),
+                providers: vec![],
+                priority: Priority::Standard,
+                weight: 100,
+                render: true,
+                decay: true,
+                review_at: None,
+                status: Status::Active,
+                approval: Approval::UserConfirmed,
+                supersedes: None,
+                links: vec![],
+                rationale: None,
+                expires_at: None,
+                source: "user".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                updated_at: "2026-01-01T00:00:00Z".into(),
+                recall_count: 0,
+                last_recalled: None,
+            }],
+        };
+        std::fs::write(&kb_path, serde_json::to_string_pretty(&legacy).unwrap()).unwrap();
+
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        kb.set_project_roots(vec![repo_root.clone()]).unwrap();
+        let moved = kb.eject_project_to_repo(&proj).unwrap();
+        assert_eq!(moved, 1);
+
+        assert!(
+            repo_root
+                .join(".bbox")
+                .join("knowledge")
+                .join("legacy01.json")
+                .exists(),
+            "ejected entry should be written into the repo"
+        );
+        let central_raw = std::fs::read_to_string(&kb_path).unwrap();
+        assert!(
+            !central_raw.contains("legacy01"),
+            "ejected entry should be removed from central store: {central_raw}"
+        );
     }
 
     #[test]
