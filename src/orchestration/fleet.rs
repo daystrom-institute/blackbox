@@ -68,6 +68,34 @@ impl DispatchSpec {
     }
 }
 
+/// Resume a prior (Interrupted / reloaded) session and continue it with a new
+/// turn — `--resume <session_id> -p <prompt>` (§5: steering an Interrupted
+/// session auto-resumes). The harness/Claude CLI reloads the on-disk transcript.
+#[derive(Debug, Clone)]
+pub struct ResumeSpec {
+    pub provider: Provider,
+    pub session_id: String,
+    pub prompt: String,
+    pub cwd: Option<String>,
+    pub model: Option<String>,
+    pub name: Option<String>,
+    pub env_overrides: Option<HashMap<String, String>>,
+}
+
+impl ResumeSpec {
+    pub fn new(provider: Provider, session_id: impl Into<String>, prompt: impl Into<String>) -> Self {
+        Self {
+            provider,
+            session_id: session_id.into(),
+            prompt: prompt.into(),
+            cwd: None,
+            model: None,
+            name: None,
+            env_overrides: None,
+        }
+    }
+}
+
 /// Opaque handle to a dispatched entrypoint agent. Wraps the live task; the
 /// cockpit holds these (it owns exactly what it spawned) and reads state
 /// through [`AgentHandle::snapshot`] without touching crate-private internals.
@@ -559,24 +587,7 @@ impl FleetOrchestrator {
             .clone()
             .or_else(|| Some(prompt_head(&spec.prompt)));
         if bidi {
-            let spawned = spawn_task_interactive(
-                task_id,
-                spec.provider,
-                args,
-                session_id,
-                spec.cwd,
-                env_overrides,
-                self.store_dir.clone(),
-                self.task_store.clone(),
-                self.tail_tx.clone(),
-                label,
-                None,
-                None,
-            );
-            AgentHandle {
-                task: spawned.task,
-                stdin: spawned.stdin.map(|s| Arc::new(AsyncMutex::new(s))),
-            }
+            self.launch_interactive(task_id, spec.provider, args, session_id, spec.cwd, label, env_overrides)
         } else {
             let task = spawn_task(
                 task_id,
@@ -593,6 +604,84 @@ impl FleetOrchestrator {
                 None,
             );
             AgentHandle { task, stdin: None }
+        }
+    }
+
+    /// Resume a prior session (§5). Builds `--resume <id> -p <prompt>` and
+    /// relaunches a persistent bidirectional session continuing the same
+    /// `session_id`; the prompt is the first turn of the resumed conversation.
+    /// Bidi-capable providers only.
+    pub fn resume(&self, spec: ResumeSpec) -> AgentHandle {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let opts = ExecOpts {
+            model: spec.model.clone(),
+            effort: None,
+            provider_defaults: None,
+        };
+        let args = spec
+            .provider
+            .build_resume_args(&spec.session_id, &spec.prompt, Some(&opts));
+        let resolved_env = super::brofile::resolve_provider_env(
+            spec.provider,
+            None,
+            spec.model.as_deref(),
+            &self.store_dir,
+            None,
+        );
+        let env_overrides = merge_env(resolved_env, spec.env_overrides);
+        self.launch_interactive(
+            task_id,
+            spec.provider,
+            args,
+            spec.session_id,
+            spec.cwd,
+            spec.name,
+            env_overrides,
+        )
+    }
+
+    /// Drop a task from the store (used after a resume supersedes the old
+    /// Interrupted task, so a reload doesn't show a stale duplicate).
+    pub fn forget(&self, task_id: &str) {
+        self.task_store
+            .write()
+            .retain_drop(|t| t.id() != task_id);
+        self.persist();
+    }
+
+    /// Spawn a persistent bidirectional session from already-built provider args
+    /// (shared by dispatch + resume): append the input-format flags, keep stdin
+    /// writable, wrap into an [`AgentHandle`].
+    fn launch_interactive(
+        &self,
+        task_id: String,
+        provider: Provider,
+        mut args: Vec<String>,
+        session_id: String,
+        cwd: Option<String>,
+        name: Option<String>,
+        env_overrides: Option<HashMap<String, String>>,
+    ) -> AgentHandle {
+        args.push("--input-format".into());
+        args.push("stream-json".into());
+        args.push("--replay-user-messages".into());
+        let spawned = spawn_task_interactive(
+            task_id,
+            provider,
+            args,
+            session_id,
+            cwd,
+            env_overrides,
+            self.store_dir.clone(),
+            self.task_store.clone(),
+            self.tail_tx.clone(),
+            name,
+            None,
+            None,
+        );
+        AgentHandle {
+            task: spawned.task,
+            stdin: spawned.stdin.map(|s| Arc::new(AsyncMutex::new(s))),
         }
     }
 }
@@ -621,8 +710,9 @@ fn merge_env(
 
 /// Providers that speak the persistent bidirectional stream-json control
 /// protocol: Claude (CLI bidi mode) and the bro-harness providers GLM /
-/// DeepSeek / Brodex (§2). Others are one-shot only.
-fn provider_supports_bidi(provider: Provider) -> bool {
+/// DeepSeek / Brodex (§2). Others are one-shot only. Public so the cockpit can
+/// tell whether a non-live agent is resumable.
+pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
         Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex

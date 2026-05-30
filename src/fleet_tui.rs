@@ -38,7 +38,8 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use blackbox::fleet::{
-    AgentHandle, DispatchSpec, FleetOrchestrator, Provider, TailEvent, TaskStatus, TranscriptItem,
+    AgentHandle, DispatchSpec, FleetOrchestrator, Provider, ResumeSpec, TailEvent, TaskStatus,
+    TranscriptItem, provider_supports_bidi,
 };
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
@@ -528,30 +529,61 @@ fn submit(app: &mut App) {
     }
 }
 
-/// Send the composer text as a user-turn into the focused agent's live session.
+/// Send the composer text into the focused agent. A live session takes it as a
+/// user-turn; a non-live but resumable one (Interrupted / reloaded) auto-resumes
+/// (§5); a one-shot provider can't be steered.
 fn steer_selected(app: &mut App) {
     let Some(idx) = app.selected_agent() else {
         return;
     };
+    let provider = app.agents[idx].provider;
     let handle = app.agents[idx].task.clone();
-    if !handle.can_steer() {
+
+    if handle.can_steer() {
+        let text = std::mem::take(&mut app.input);
+        app.history_cursor = None;
+        app.agents[idx].input_history.push(text.clone());
+        // AgentHandle::send_user_turn is async; fire it on the runtime. Errors
+        // are surfaced only as a best-effort log — the loop stays responsive.
+        app.rt.spawn(async move {
+            if let Err(e) = handle.send_user_turn(&text).await {
+                tracing::warn!("fleet steer failed: {e:#}");
+            }
+        });
+        app.set_status("steer sent", Duration::from_secs(2));
+    } else if provider_supports_bidi(provider) {
+        resume_selected(app, idx);
+    } else {
         app.set_status(
             "this provider runs one-shot — can't be steered (§2.1)",
             Duration::from_secs(4),
         );
+    }
+}
+
+/// Resume a non-live bidi session with the composer text as its next turn (§5):
+/// relaunch `--resume <session_id> -p <text>` and swap in the live handle.
+fn resume_selected(app: &mut App, idx: usize) {
+    let snap = app.agents[idx].task.snapshot();
+    if snap.session_id.is_empty() || snap.session_id == "pending" {
+        app.set_status("no session id — can't resume", Duration::from_secs(4));
         return;
     }
     let text = std::mem::take(&mut app.input);
     app.history_cursor = None;
-    app.agents[idx].input_history.push(text.clone());
-    // AgentHandle::send_user_turn is async; fire it on the runtime. Errors are
-    // surfaced only as a best-effort log — the loop stays responsive.
-    app.rt.spawn(async move {
-        if let Err(e) = handle.send_user_turn(&text).await {
-            tracing::warn!("fleet steer failed: {e:#}");
-        }
-    });
-    app.set_status("steer sent", Duration::from_secs(2));
+    let old_id = app.agents[idx].task.id();
+
+    let mut spec = ResumeSpec::new(app.agents[idx].provider, snap.session_id, text.clone());
+    spec.cwd = snap.cwd;
+    spec.model = snap.model;
+    spec.name = Some(app.agents[idx].name.clone());
+    let handle = app.orch.resume(spec);
+
+    app.orch.forget(&old_id); // drop the stale Interrupted task
+    app.agents[idx].task = handle;
+    app.agents[idx].input_history.push(text);
+    app.orch.persist();
+    app.set_status("resumed session", Duration::from_secs(3));
 }
 
 /// `Esc` in the single-agent view: interrupt the running turn (§1.1). If a
