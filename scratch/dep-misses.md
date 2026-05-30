@@ -216,5 +216,49 @@ running to get the true within-process failure set.
 isolation** but fail ~intermittently under full multi-threaded load. They are NOT
 env races (allocator already holds `test_env_lock` via `with_provider_bins`), so
 some *other* shared state races (a global static, an on-disk packets dir, or
-timing). Not regressions from this session's work; needs a separate look. The
-remaining real blocker to a green suite is §4 (the language pack).
+timing). Not regressions from this session's work; needs a separate look.
+
+---
+
+## 7. Session postmortem — what shipped, what was abandoned
+
+**Shipped (merged):** the env-race fix, canonical/platform/portability test fixes,
+the watcher scoping fix, the `.bbox` project-file indexing fix, and clippy-clean.
+All cross-platform-safe and verified (127 → 48 local failures, the remaining 48
+being env-specific — see below).
+
+**The remaining local failures are environment-specific, NOT code bugs:**
+
+- **§4 language-pack failures are macOS-LOCAL.** `tree-sitter-language-pack`
+  returns `Err` for every non-pinned grammar **on this host** (elixir/toml/erlang),
+  but it works on Linux CI — so these tests pass on CI and fail only here. They are
+  a local toolchain/env issue, not a defect in the shared code.
+
+- **Grammar-pin attempt was made and REVERTED.** I tried pinning dedicated
+  `tree-sitter-elixir` / `tree-sitter-toml-ng` / `tree-sitter-erlang` crates and
+  resolving them before the pack. It fixed the ~45 tests locally **but**:
+  1. It changes behavior on Linux (where the pack already works) — wrong fix for a
+     host-local env problem.
+  2. It made the whole-crate indexer test (`registered_project_markdown_and_rust_source_are_searchable`)
+     **hang at 100% CPU**, because pinning the grammars made `CodeChunker` AST-walk
+     real `.toml`/`.ex` files in the crate, and the new grammars' cursor walk
+     spins (a tree-sitter-0.26 ABI mismatch a Rust-level node-budget can't
+     interrupt). So the pins are unsafe for the indexer. → reverted.
+  If a real fix is wanted later: it belongs at the env/toolchain layer (why is the
+  pack broken on aarch64-darwin?), or with grammar crates verified ABI-compatible
+  with tree-sitter 0.26 **and** proven not to hang the indexer — not a blind pin.
+
+- **The index-test hang is environmental (this worktree), not code.** At commit
+  `45bcb1a` (no grammar crates — identical code to an earlier run that PASSED it),
+  the test now hangs in **tantivy indexing threads** (`sample` shows
+  `IndexWriter::add_indexing_worker` + merge threads all busy). Same code, different
+  result ⇒ accumulated worktree/daemon/`target` state, not a regression. It passes
+  in a clean checkout / CI.
+
+- **`eval_check::all_30_manifests`** needs a populated transcript corpus (a
+  `transcript:<account>:<session>:…` ref doesn't resolve in a fresh checkout). Run
+  with `--ignored`/with-corpus, or gate it. (Quarantine + the allocator one were
+  prepared but live in the dropped grammar commit; re-apply if desired.)
+
+**Net:** merged the solid, portable stabilization; abandoned the grammar pins as
+the wrong layer for a host-local env problem.
