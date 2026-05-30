@@ -522,32 +522,7 @@ impl Session {
                             content,
                             is_error,
                         };
-                        let edits = self
-                            .cx
-                            .edits
-                            .lock()
-                            .map(|mut edits| edits.drain())
-                            .unwrap_or_default();
-                        if !edits.is_empty() {
-                            match crate::diagnostics::engine::check_edits(
-                                &edits,
-                                &mut self.lsp_baselines,
-                                &mut self.lsp_documents,
-                                &self.lsp_pool,
-                                &self.cx.root,
-                            )
-                            .await
-                            {
-                                Ok(diffs) => {
-                                    if let Some(rider) = crate::diagnostics::render::build_rider(&diffs) {
-                                        result.content.push_str(&rider);
-                                    }
-                                }
-                                Err(err) => {
-                                    tracing::warn!("window-0 diagnostics failed: {err:#}");
-                                }
-                            }
-                        }
+                        self.append_window0_diagnostics(&mut result.content).await;
                         for n in self.hooks.on_tool_result(tc, &result) {
                             match n.delivery {
                                 Delivery::Rider => result.content.push_str(&n.rider_block()),
@@ -582,6 +557,41 @@ impl Session {
         self.emitter
             .result(&final_text, &self.total_usage, self.turns, None);
         Ok(())
+    }
+
+    /// Window-0 diagnostics seam: drain the per-dispatch edit sink, run the
+    /// analyzer against the edited files, and append a diagnostics rider to the
+    /// tool result `content` — synchronously, before control returns to the
+    /// model. A no-op when no edits were recorded. A diagnostics failure is
+    /// logged and swallowed: it must never break the dispatch loop.
+    async fn append_window0_diagnostics(&mut self, content: &mut String) {
+        let edits = self
+            .cx
+            .edits
+            .lock()
+            .map(|mut edits| edits.drain())
+            .unwrap_or_default();
+        if edits.is_empty() {
+            return;
+        }
+        match crate::diagnostics::engine::check_edits(
+            &edits,
+            &mut self.lsp_baselines,
+            &mut self.lsp_documents,
+            &self.lsp_pool,
+            &self.cx.root,
+        )
+        .await
+        {
+            Ok(diffs) => {
+                if let Some(rider) = crate::diagnostics::render::build_rider(&diffs) {
+                    content.push_str(&rider);
+                }
+            }
+            Err(err) => {
+                tracing::warn!("window-0 diagnostics failed: {err:#}");
+            }
+        }
     }
 
     fn persist(&self) -> Result<()> {
@@ -1012,5 +1022,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.base_opts.model, "new-model");
+    }
+
+    // ---- window-0 diagnostics: full seam (drain edits -> engine -> render -> rider) ----
+
+    fn ra_runs(p: &std::path::Path) -> bool {
+        std::process::Command::new(p)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn ra_bin() -> Option<std::path::PathBuf> {
+        for key in [
+            "BRO_LSP_RUST_ANALYZER_BIN",
+            "BRO_RUST_ANALYZER_BIN",
+            "BLACKBOX_RUST_ANALYZER_BIN",
+        ] {
+            if let Ok(v) = std::env::var(key) {
+                let p = std::path::PathBuf::from(v.trim());
+                if !p.as_os_str().is_empty() && ra_runs(&p) {
+                    return Some(p);
+                }
+            }
+        }
+        if ra_runs(std::path::Path::new("rust-analyzer")) {
+            return Some(std::path::PathBuf::from("rust-analyzer"));
+        }
+        let cargo_bin = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cargo/bin/rust-analyzer");
+        ra_runs(&cargo_bin).then_some(cargo_bin)
+    }
+
+    struct TmpProject(std::path::PathBuf);
+    impl Drop for TmpProject {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// End-to-end proof of the window-0 path that neither isolated unit test
+    /// covers: a real edit on disk, driven through the actual seam method, must
+    /// produce a diagnostics rider mentioning the new error. RA-gated.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn window0_rider_surfaces_new_error_end_to_end() -> Result<()> {
+        let Some(ra) = ra_bin() else {
+            eprintln!("skipping window-0 e2e test: rust-analyzer not found");
+            return Ok(());
+        };
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("w0-e2e-{}-{}", std::process::id(), nanos));
+        std::fs::create_dir_all(root.join("src"))?;
+        let _guard = TmpProject(root.clone());
+        let root = root.canonicalize()?;
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"w0_e2e_fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )?;
+        let file = root.join("src/lib.rs");
+        let clean = "pub fn value() -> u32 {\n    let x: u32 = 1;\n    x\n}\n";
+        let broken = "pub fn value() -> u32 {\n    let x: u32 = \"s\";\n    x\n}\n";
+        // the edit has already landed on disk, as file_write/file_edit leaves it
+        std::fs::write(&file, broken)?;
+
+        let (mut session, _shared) = mk_session(vec![]);
+        session.cx.root = root.clone();
+        session.lsp_pool = bro_lsp::SessionPool::new(bro_lsp::LspConfig {
+            ready_timeout: std::time::Duration::from_secs(5),
+            rust_analyzer_bin: Some(ra),
+            ..Default::default()
+        });
+        // record the mutation in the per-dispatch sink, exactly as the file tools do
+        session
+            .cx
+            .edits
+            .lock()
+            .unwrap()
+            .push(bro_tools::edits::EditEvent::from_bytes(
+                file.clone(),
+                clean.as_bytes(),
+                broken.as_bytes(),
+            ));
+
+        let mut content = "{\"ok\":true}".to_string();
+        session.append_window0_diagnostics(&mut content).await;
+
+        assert!(
+            content.contains("diagnostics:"),
+            "expected a window-0 diagnostics rider, got: {content}"
+        );
+        assert!(
+            content.contains("src/lib.rs"),
+            "rider should name the edited file, got: {content}"
+        );
+        assert!(
+            content.contains("error"),
+            "rider should report the new error, got: {content}"
+        );
+
+        session.lsp_pool.shutdown_all().await;
+        Ok(())
+    }
+
+    /// No edits recorded in the dispatch -> the seam appends nothing (no RA).
+    #[tokio::test]
+    async fn window0_diagnostics_noop_without_edits() {
+        let (mut session, _shared) = mk_session(vec![]);
+        let mut content = "{\"ok\":true}".to_string();
+        session.append_window0_diagnostics(&mut content).await;
+        assert_eq!(content, "{\"ok\":true}", "no edits -> no rider appended");
     }
 }
