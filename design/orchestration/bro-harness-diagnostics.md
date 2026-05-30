@@ -1,7 +1,7 @@
 ---
 title: "bro-harness diagnostics (window-0 analyzer feedback)"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - orchestration
@@ -24,6 +24,40 @@ brief: "Synchronous, per-mutation analyzer feedback for the bro-harness edit loo
 > depending on the `blackbox` lib, so this design extracts a minimal session core
 > into a shared crate (see "The dependency constraint" below). Latency figures
 > below were measured this session on this workspace.
+
+> **Implementation status (shipped 2026-05-30).** The **instant/error tier MVP is
+> built and on `main`** (window-0 waves 1–2):
+> - `crates/bro-lsp` — in-process LSP client: session pool, persistent `didChange`,
+>   pull diagnostics + `publishDiagnostics` fallback, version-correlated drop-stale,
+>   fail-closed. No dependency on the `blackbox` lib (DX-9; the session core was
+>   built fresh in the shared crate, the daemon's `src/lsp/` left untouched — the
+>   migrate-vs-copy fork is still open).
+> - harness substrate — `EditSink` pre-image capture (model-facing result
+>   untouched) + the `side`-persisted `LspBaselines` cell.
+> - the integration — `diagnostics::{engine,render}` + the `agent_loop`
+>   `append_window0_diagnostics` seam: drain edits → run `bro-lsp` → stable-key
+>   (span-text, not line) diff vs baseline → classify (error tier) → rider on the
+>   tool result, with an end-to-end test gated on rust-analyzer.
+>
+> **The check and truth tiers are deferred — sound design, low value now.** The
+> instant tier already captures the catastrophically-compounding diagnostics
+> (types, borrows, unresolved names). The check tier (flycheck lints —
+> `unused_imports`, `dead_code`, clippy) targets diagnostics this very doc argues
+> *do not* compound, largely duplicates the `cargo check`/`clippy` validation an
+> agent already runs before committing, performs worst on the hub crate where it
+> would help most (~8.8–16s vs ~380ms on a leaf crate), and pulls in
+> disproportionate machinery (≥2-check persistence gating, the `Scope`/`candidate`
+> config-fragility model, the no-fix-from-fragile re-verification — the last
+> existing only to handle a hazard the tier itself creates). The truth tier is
+> orchestrator-owned (see "The truth tier" below) and further out still.
+> **Revisit trigger:** config-fragile lints become a real pain point, or crates are
+> split enough that check-tier latency is leaf-crate-fast. The
+> `{class,tier,confidence,scope}` envelope vocabulary already lives in
+> `diagnostics/mod.rs`, so the deferred tiers are additive; the `Scope`-on-
+> `DiffResult` decision is recorded on that struct and in `note-b59cadc5`. One
+> verification owed before that wave: confirm whether the MVP already surfaces RA
+> flycheck warnings crudely through the `publishDiagnostics` drain — if so, the
+> deferred work is gating + scope-honesty, not new surfacing.
 
 This doc specifies how the harness should give an agent analyzer feedback on
 its own edits. It is a sibling of [anthropic-harness](anthropic-harness.md) (the
