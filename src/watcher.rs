@@ -11,7 +11,9 @@ use crate::artifacts::{ArtifactCatalog, ArtifactScope};
 /// installed artifact changes. Keeps the watcher alive for the daemon lifetime.
 pub struct BbxWatcher {
     debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
-    watched_roots: Arc<Mutex<Vec<PathBuf>>>,
+    /// `(project_id, canonical .bbox root)` pairs. The project_id is the one
+    /// supplied at registration — never reconstructed from the directory name.
+    watched_roots: Arc<Mutex<Vec<(String, PathBuf)>>>,
 }
 
 impl BbxWatcher {
@@ -20,7 +22,7 @@ impl BbxWatcher {
         projects: Vec<(String, PathBuf)>, // (project_id, canonical_project_dir)
         catalog: Arc<ArtifactCatalog>,
     ) -> anyhow::Result<Self> {
-        let watched_roots: Arc<Mutex<Vec<PathBuf>>> = Arc::new(Mutex::new(Vec::new()));
+        let watched_roots: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
         let watched_roots_cb = watched_roots.clone();
         let catalog_cb = catalog.clone();
 
@@ -60,7 +62,7 @@ impl BbxWatcher {
         self.watch_project_inner(project_id, project_dir)
     }
 
-    fn watch_project_inner(&mut self, _project_id: &str, project_dir: &Path) -> anyhow::Result<()> {
+    fn watch_project_inner(&mut self, project_id: &str, project_dir: &Path) -> anyhow::Result<()> {
         let bbox_dir = project_dir.join(".bbox");
         if !bbox_dir.exists() {
             return Ok(());
@@ -71,10 +73,10 @@ impl BbxWatcher {
         };
         {
             let mut roots = self.watched_roots.lock().unwrap();
-            if roots.contains(&canonical) {
+            if roots.iter().any(|(_, r)| r == &canonical) {
                 return Ok(());
             }
-            roots.push(canonical.clone());
+            roots.push((project_id.to_string(), canonical.clone()));
         }
         self.debouncer
             .watch(&canonical, notify::RecursiveMode::Recursive)?;
@@ -83,7 +85,11 @@ impl BbxWatcher {
 }
 
 /// Route a single debounced notify event to the appropriate artifact action.
-pub(crate) fn handle_event(event: &notify::Event, roots: &[PathBuf], catalog: &ArtifactCatalog) {
+pub(crate) fn handle_event(
+    event: &notify::Event,
+    roots: &[(String, PathBuf)],
+    catalog: &ArtifactCatalog,
+) {
     let is_create_or_rename_to = matches!(
         event.kind,
         notify::EventKind::Create(_)
@@ -110,17 +116,10 @@ pub(crate) fn handle_event(event: &notify::Event, roots: &[PathBuf], catalog: &A
             continue;
         }
 
-        let (project_id, bbox_root) = match roots.iter().find_map(|r| {
-            path.starts_with(r).then(|| {
-                let pid = r
-                    .parent()
-                    .and_then(|p| p.file_name())
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
-                (pid, r.clone())
-            })
-        }) {
+        let (project_id, bbox_root) = match roots
+            .iter()
+            .find_map(|(pid, r)| path.starts_with(r).then(|| (pid.clone(), r.clone())))
+        {
             Some(v) => v,
             None => continue,
         };
@@ -223,7 +222,10 @@ mod tests {
     #[test]
     fn watcher_installs_atomic_rename() {
         let dir = tempdir().unwrap();
-        let project_dir = dir.path().join("myproject");
+        // Canonicalize first: on macOS tempdir() lives under /var, which
+        // canonicalizes to /private/var, and the watcher canonicalizes its
+        // roots — so the event path must be canonical too or starts_with misses.
+        let project_dir = dir.path().canonicalize().unwrap().join("myproject");
         let bbox_dir = project_dir.join(".bbox");
         let wf_dir = bbox_dir.join("workflows");
         std::fs::create_dir_all(&wf_dir).unwrap();
@@ -246,11 +248,29 @@ mod tests {
             paths: vec![final_path],
             attrs: Default::default(),
         };
-        let roots = vec![bbox_dir.canonicalize().unwrap()];
+        // Register with a project_id that deliberately differs from the project
+        // directory name, to prove the watcher scopes by the registered
+        // project_id and not the `.bbox` parent directory basename (regression:
+        // handle_event used to reconstruct the id from the dir name).
+        let roots = vec![("proj-alpha".to_string(), bbox_dir.canonicalize().unwrap())];
         handle_event(&event, &roots, &catalog);
 
-        // Artifact should be installed in the scoped path for "myproject".
+        // Artifact should be installed under the registered project_id.
         let scoped = catalog
+            .load_artifact_value_scoped(
+                Some("proj-alpha"),
+                crate::artifacts::ArtifactKind::Workflow,
+                "watch-flow",
+            )
+            .unwrap();
+        assert!(
+            scoped.is_some(),
+            "artifact should be installed under the registered project_id"
+        );
+
+        // Lookup under the directory basename must be empty — the dir name is
+        // not the scope key.
+        let by_dirname = catalog
             .load_artifact_value_scoped(
                 Some("myproject"),
                 crate::artifacts::ArtifactKind::Workflow,
@@ -258,8 +278,8 @@ mod tests {
             )
             .unwrap();
         assert!(
-            scoped.is_some(),
-            "artifact should be installed in scoped path"
+            by_dirname.is_none(),
+            "artifact must NOT be scoped by the .bbox parent directory name"
         );
 
         // Global lookup must return None (not polluted).
@@ -272,7 +292,10 @@ mod tests {
     #[test]
     fn watcher_deletion_marks_removed_not_deleted() {
         let dir = tempdir().unwrap();
-        let project_dir = dir.path().join("myproject");
+        // Canonicalize first: on macOS tempdir() lives under /var, which
+        // canonicalizes to /private/var, and the watcher canonicalizes its
+        // roots — so the event path must be canonical too or starts_with misses.
+        let project_dir = dir.path().canonicalize().unwrap().join("myproject");
         let bbox_dir = project_dir.join(".bbox");
         let wf_dir = bbox_dir.join("workflows");
         std::fs::create_dir_all(&wf_dir).unwrap();
@@ -289,7 +312,8 @@ mod tests {
             paths: vec![artifact_path.clone()],
             attrs: Default::default(),
         };
-        let roots = vec![bbox_dir.canonicalize().unwrap()];
+        // project_id differs from the directory name ("myproject") on purpose.
+        let roots = vec![("proj-beta".to_string(), bbox_dir.canonicalize().unwrap())];
         handle_event(&create_event, &roots, &catalog);
 
         // Delete the file and fire remove event.
@@ -301,10 +325,11 @@ mod tests {
         };
         handle_event(&remove_event, &roots, &catalog);
 
-        // Artifact JSON in catalog must still exist (audit trail).
+        // Artifact JSON in catalog must still exist (audit trail), scoped under
+        // the registered project_id.
         let scoped = catalog
             .load_artifact_value_scoped(
-                Some("myproject"),
+                Some("proj-beta"),
                 crate::artifacts::ArtifactKind::Workflow,
                 "del-flow",
             )
