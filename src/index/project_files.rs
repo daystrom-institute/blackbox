@@ -526,10 +526,16 @@ fn scan_project_files(root: &Path, out: &mut Vec<(String, u64, u64)>) -> Result<
 }
 
 fn is_skipped_entry(entry: &DirEntry) -> bool {
+    // `.bbox/` is blackbox's own control directory: project config, MCP wiring,
+    // catalog-owned artifacts, and (per the repo-owned-project-state design)
+    // structured knowledge owned by a dedicated spooler. It must NOT be pulled
+    // into the generic project_file corpus, or its JSON/TOML/MD gets indexed as
+    // project source — duplicating catalog/knowledge entities with confusing
+    // search hits. Skip it like any other dotdir.
     entry
         .file_name()
         .to_str()
-        .is_some_and(|name| SKIP_DIRS.contains(&name) || (name.starts_with('.') && name != ".bbox"))
+        .is_some_and(|name| SKIP_DIRS.contains(&name) || name.starts_with('.'))
 }
 
 fn is_supported_text_path(path: &Path) -> bool {
@@ -1550,5 +1556,46 @@ mod tests {
             MAT_HEAD,
             false
         ));
+    }
+
+    #[test]
+    fn scan_skips_bbox_control_dir() {
+        use std::fs;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Normal project source — must be indexed.
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("README.md"), "# project").unwrap();
+
+        // blackbox control dir — must NOT be indexed (config, MCP wiring,
+        // catalog-owned artifacts, and future structured knowledge live here,
+        // owned by other subsystems).
+        fs::create_dir_all(root.join(".bbox/knowledge")).unwrap();
+        fs::write(root.join(".bbox/config.toml"), "x = 1").unwrap();
+        fs::write(root.join(".bbox/mcp.json"), "{}").unwrap();
+        fs::write(root.join(".bbox/knowledge/entry.json"), "{}").unwrap();
+
+        // Another dotdir — already skipped; sanity anchor.
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config"), "[core]").unwrap();
+
+        let mut out = Vec::new();
+        scan_project_files(root, &mut out).unwrap();
+        let indexed: Vec<String> = out.iter().map(|(p, _, _)| p.clone()).collect();
+
+        assert!(
+            indexed.iter().any(|p| p.ends_with("src/main.rs")),
+            "normal source should be indexed: {indexed:?}"
+        );
+        assert!(
+            indexed.iter().any(|p| p.ends_with("README.md")),
+            "top-level markdown should be indexed: {indexed:?}"
+        );
+        assert!(
+            indexed.iter().all(|p| !p.contains("/.bbox/")),
+            ".bbox control dir must be excluded from project_file indexing: {indexed:?}"
+        );
     }
 }
