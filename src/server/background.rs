@@ -24,6 +24,7 @@ pub(super) async fn start_background_tasks(shared: Arc<SharedState>) -> anyhow::
     restore_runtime_state(&shared).await;
     compact_system_events(&shared);
     spawn_outbox_worker(shared.clone());
+    spawn_account_probe_refresh(shared.clone());
     spawn_packet_self_heal_scanner(shared);
     Ok(())
 }
@@ -223,6 +224,41 @@ fn compact_system_events(shared: &Arc<SharedState>) {
 fn spawn_outbox_worker(shared: Arc<SharedState>) {
     tokio::spawn(async move {
         system_events::worker::run_worker(shared).await;
+    });
+}
+
+/// Periodically refresh provider account utilization probes (the producer the
+/// allocator's `quota_capacity` consumer was always missing). Seeds immediately
+/// at startup, then every `BBOX_ACCOUNT_PROBE_INTERVAL_SECS` (default 900;
+/// 0 disables). v1 probes GLM/Z.AI; the prober suite extends to other providers.
+fn spawn_account_probe_refresh(shared: Arc<SharedState>) {
+    let interval_secs = std::env::var("BBOX_ACCOUNT_PROBE_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(900);
+    if interval_secs == 0 {
+        tracing::debug!("account probe refresh: disabled (interval=0)");
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        tracing::warn!("account probe refresh: no home dir resolvable; disabled");
+        return;
+    };
+    let store_dir = shared.store_dir.clone();
+    tracing::info!(interval_secs, "account probe refresh: enabled");
+    tokio::spawn(async move {
+        // tokio interval fires its first tick immediately → seed at startup,
+        // then refresh on cadence.
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        loop {
+            ticker.tick().await;
+            let now = orchestration::now_ms();
+            let written =
+                orchestration::account_probes::refresh_account_probes(&store_dir, &home, now).await;
+            if written > 0 {
+                tracing::info!(probes = written, "account probe refresh: wrote probes");
+            }
+        }
     });
 }
 

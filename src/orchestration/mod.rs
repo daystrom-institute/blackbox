@@ -1,3 +1,4 @@
+pub mod account_probes;
 pub mod agents;
 pub mod allocator;
 pub mod atoms;

@@ -1285,7 +1285,7 @@ fn required_capabilities(request: &RuntimeRequest) -> Vec<Capability> {
     caps
 }
 
-fn lane_key(provider: Provider, account: Option<&str>) -> String {
+pub(crate) fn lane_key(provider: Provider, account: Option<&str>) -> String {
     format!("{}:{}", provider.as_str(), account.unwrap_or("default"))
 }
 
