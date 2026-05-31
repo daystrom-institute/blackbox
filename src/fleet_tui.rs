@@ -160,6 +160,19 @@ impl Agent {
     }
 }
 
+/// Providers offered in the cockpit's provider selector. Deliberately narrower
+/// than `Provider::ALL`: only the bidi/steerable set (Claude + the bro-harness
+/// providers) is surfaced here, since they're the providers fleet drives well
+/// (persistent sessions, `--mcp-config` injection). One-shot/under-supported
+/// providers (Codex, Gemini, Vibe, Inception, Copilot) are hidden from the list;
+/// they remain dispatchable elsewhere, just not pickable in the cockpit.
+const FLEET_PROVIDERS: &[Provider] = &[
+    Provider::Claude,
+    Provider::Glm,
+    Provider::Deepseek,
+    Provider::Brodex,
+];
+
 // ── Zoom axis (§5.1) ──────────────────────────────────────────────────────
 
 /// Left/right is a zoom axis; up/down selects within the current zone.
@@ -182,7 +195,7 @@ struct App {
     zone: Zone,
     /// Index into the bucket-ordered agent list (see [`ordered_agents`]).
     roster_selected: usize,
-    /// Index into `Provider::ALL` for the provider selector.
+    /// Index into [`FLEET_PROVIDERS`] for the provider selector.
     provider_cursor: usize,
     /// Sticky-next provider — applies to the next dispatch only (§4).
     next_provider: Provider,
@@ -746,7 +759,7 @@ fn zoom_right(app: &mut App) {
     match app.zone {
         Zone::ProviderSelector => {
             // confirm sticky-next, return to roster
-            app.next_provider = Provider::ALL[app.provider_cursor];
+            app.next_provider = FLEET_PROVIDERS[app.provider_cursor];
             app.flash_provider();
             app.zone = Zone::Roster;
         }
@@ -764,7 +777,7 @@ fn zoom_right(app: &mut App) {
 fn vertical(app: &mut App, delta: isize) {
     match app.zone {
         Zone::ProviderSelector => {
-            let n = Provider::ALL.len() as isize;
+            let n = FLEET_PROVIDERS.len() as isize;
             let cur = app.provider_cursor as isize;
             app.provider_cursor = (((cur + delta) % n + n) % n) as usize;
         }
@@ -781,10 +794,10 @@ fn vertical(app: &mut App, delta: isize) {
 }
 
 fn cycle_provider(app: &mut App, delta: isize) {
-    let n = Provider::ALL.len() as isize;
+    let n = FLEET_PROVIDERS.len() as isize;
     let cur = app.provider_cursor as isize;
     app.provider_cursor = (((cur + delta) % n + n) % n) as usize;
-    app.next_provider = Provider::ALL[app.provider_cursor];
+    app.next_provider = FLEET_PROVIDERS[app.provider_cursor];
     // Flash the title-bar `next:` value instead of a duplicate status line.
     app.flash_provider();
 }
@@ -1087,7 +1100,7 @@ fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     let mut lines = Vec::new();
-    for (i, p) in Provider::ALL.iter().enumerate() {
+    for (i, p) in FLEET_PROVIDERS.iter().enumerate() {
         let selected = i == app.provider_cursor;
         let marker = if selected { "▶ " } else { "  " };
         let style = if selected {
