@@ -6,6 +6,19 @@ corpus: blackbox-design
 topic:
   - operations
   - config-artifacts
+question_shapes:
+  - question_shape: where
+    query: Locate the artifact catalog, install/deactivate dispatch, MCP artifact tools, inlet registries, macro registry, team store, event hub, project watcher, and tool-doc coverage that this plan extends.
+    scope_hint: src/artifacts.rs src/server/routes.rs src/tools/artifacts.rs src/tools/orchestrate.rs src/crons.rs src/pollers.rs src/webhooks.rs src/system_events/hub.rs src/system_events/types.rs src/macros/registry.rs src/orchestration/team.rs src/server/restore.rs src/watcher.rs src/tool_docs.rs
+    known_evidence: file:src/artifacts.rs
+  - question_shape: what
+    query: Identify the new managed artifact kinds (Poller, Webhook, Reaction, Macro, Teamplate, Bundle), the ArtifactActivator trait and Prepared/Activation/Deactivation result types, bundle plan/apply/generation records, doctor, and upgrade-check surfaces this plan must add.
+    scope_hint: src/artifacts.rs src/server/routes.rs src/tools/artifacts.rs
+    known_evidence: file:src/server/routes.rs
+  - question_shape: impact
+    query: Find integration points and blast radius — daemon startup restore, runtime/inlet path migration, the mcp-surface routing packet, macro include_str! removal, install-teams.sh retirement, watcher .bbox/bundles handling, and the tests/tool-doc coverage that gate each phase.
+    scope_hint: src/server/restore.rs src/macros/registry.rs system-defaults/mcp-surfaces/routing.json system-defaults/agentic-corpus/scripts/install-teams.sh src/watcher.rs src/tool_docs.rs
+    known_evidence: file:src/server/restore.rs
 ---
 
 # Ops Artifact Bundles And Doctor - Implementation Plan
