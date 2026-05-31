@@ -1,0 +1,20 @@
+{
+  "id": "41339b99",
+  "title": "Durable workflow actors must tier, not static-pin providers",
+  "content": "Durable workflow actors (workflow executors/ensemble members marked `durable`, e.g. the phase-decompose facilitator, inlet, panel, recompose council, implementers) must express runtime intent via `runtime.tier` (e.g. `premium`; advisor `standard`), NOT a static `provider`/`model` pin in the brofile. Durability routes the actor through the runtime allocator (`runtime_for_actor → allocate`), which overwrites any brofile provider/model with its free-selected lane — so a static pin on a durable actor is both wrong and inert, and every run silently dispatches the allocator default (e.g. `brodex/gpt-5.5`) regardless of the brofile. Exception: an actor with a genuine hard-provider need (e.g. corpus scout pinned to `codex/gpt-5.5` because Claude scouts underperform) may still pin — that is a real constraint, not the anti-pattern.",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": false,
+  "decay": false,
+  "rationale": "Discovered fixing 6ae3437: phase-decompose runs kept tripping the SynthesizeDag DAG lint because the durable facilitator's static brofile pin was silently overwritten by the allocator, so it never ran on its intended reasoning lane. The lesson lived only in the commit message and was documented in no design doc; without it a future agent adding a durable actor/brofile will reintroduce the inert static pin.",
+  "source": "user",
+  "created_at": "2026-05-31T16:31:47Z",
+  "updated_at": "2026-05-31T16:31:47Z",
+  "recall_count": 0
+}

@@ -57,6 +57,25 @@ The reusable supervision primitives in
 Phase 6 (foreach implementers run inside supervised subworkflows).
 ```
 
+### Operational note: durable actors tier, never static-pin
+
+All durable actors in this workflow family (facilitator, inlet, panel members,
+recompose council, implementers) are routed through the runtime allocator
+(`runtime_for_actor → allocate`), which **overwrites** any `provider`/`model`
+pinned in the brofile with its free-selected lane. A static provider/model pin
+on a durable actor is therefore both wrong and inert: every run silently
+dispatches the allocator default (e.g. `brodex/gpt-5.5`) regardless of the
+brofile. That is what kept tripping the DAG lint — the facilitator was never
+running on its intended reasoning lane. Durable reasoning/edit brofiles must
+express runtime intent via `runtime.tier` (`premium`; advisor `standard`) so the
+allocator resolves a real lane and the existing lease pins it. The lone
+exception is an actor with a genuine hard-provider need — the corpus scout stays
+pinned to `codex/gpt-5.5` because Claude scouts underperform; that is a real
+constraint, not the anti-pattern. Fixed in `6ae3437` (with mechanical
+DAG-synthesis guards in `normalize-dag-measurements.py` that repair the
+deterministic single-pass slips the facilitator makes, so the lint only fails on
+real decomposition errors).
+
 ---
 
 ## Phase 1: `bbox_ref_size` MCP tool
