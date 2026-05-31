@@ -234,7 +234,11 @@ const DEFAULT_FLEET_PROVIDER: Provider = Provider::Brodex;
 /// Left/right is a zoom axis; up/down selects within the current zone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Zone {
-    /// `←` from roster: ↑/↓ cycle providers, `→` confirms sticky-next.
+    /// `←` from effort selector: ↑/↓ cycle efforts, `→` commits + home, Enter/Space commits + home.
+    EffortSelector,
+    /// `←` from model selector: ↑/↓ cycle efforts for the selected model, `→` pops to model, Enter/Space commits + home.
+    ModelSelector,
+    /// `←` from provider selector: ↑/↓ cycle models for the selected provider, `→` pops to provider, Enter/Space commits + home (assumes default effort).
     ProviderSelector,
     /// Home: ↑/↓ cycle agents, `←` provider selector, `→` enter agent.
     Roster,
@@ -256,6 +260,10 @@ struct App {
     focused_agent_id: Option<String>,
     /// Index into [`FLEET_PROVIDERS`] for the provider selector.
     provider_cursor: usize,
+    /// Index into the selected provider's model catalog for the model selector.
+    model_cursor: usize,
+    /// Index into the selected provider's effort catalog for the effort selector.
+    effort_cursor: usize,
     /// Sticky-next provider — applies to the next dispatch only (§4).
     next_provider: Provider,
     /// Sticky-next model and effort, scoped to [`next_provider`].
@@ -315,13 +323,26 @@ impl App {
     ) -> Self {
         let (classifier_tx, classifier_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
+        let provider_cursor = default_fleet_provider_cursor();
+        let model_cursor = default_provider
+            .models()
+            .iter()
+            .position(|m| m.default)
+            .unwrap_or(0);
+        let effort_cursor = default_provider
+            .efforts()
+            .iter()
+            .position(|e| e.default)
+            .unwrap_or(0);
         Self {
             orch,
             agents: Vec::new(),
             zone: Zone::Roster,
             roster_selected: 0,
             focused_agent_id: None,
-            provider_cursor: default_fleet_provider_cursor(),
+            provider_cursor,
+            model_cursor,
+            effort_cursor,
             next_provider: default_provider,
             next_model: default_model_for(default_provider).map(str::to_string),
             next_effort: default_effort_for(default_provider).map(str::to_string),
@@ -1006,13 +1027,30 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         return;
     }
     // Slash carveout: while the slash menu is up, Tab completes the selection
-    // and ↑/↓ cycle completions (§5.1). Otherwise Tab cycles the provider.
+    // and ↑/↓ cycle completions (§5.1). Otherwise Tab cycles the current
+    // sub-selector level (provider / model / effort).
     let slash = slash_active(app);
     if key.code == KeyCode::Tab {
         if slash {
             complete_slash(app);
         } else {
-            cycle_provider(app, 1);
+            match app.zone {
+                Zone::ModelSelector => {
+                    let models = FLEET_PROVIDERS[app.provider_cursor].models();
+                    let n = models.len();
+                    if n > 0 {
+                        app.model_cursor = (app.model_cursor + 1) % n;
+                    }
+                }
+                Zone::EffortSelector => {
+                    let efforts = FLEET_PROVIDERS[app.provider_cursor].efforts();
+                    let n = efforts.len();
+                    if n > 0 {
+                        app.effort_cursor = (app.effort_cursor + 1) % n;
+                    }
+                }
+                _ => cycle_provider(app, 1),
+            }
         }
         return;
     }
@@ -1058,6 +1096,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         KeyCode::Enter if shift || ctrl => app.input.push('\n'),
         KeyCode::Char('j') if ctrl => app.input.push('\n'),
+        // Enter/Space in sub-selectors: commit selection and jump home to roster.
+        KeyCode::Enter | KeyCode::Char(' ')
+            if matches!(
+                app.zone,
+                Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector
+            ) =>
+        {
+            commit_full_selection(app);
+            app.zone = Zone::Roster;
+        }
         KeyCode::Enter => submit(app),
 
         KeyCode::Backspace if ctrl || alt => delete_previous_word(app),
@@ -1202,7 +1250,9 @@ fn submit(app: &mut App) {
         }
         // Roster / provider-selector: dispatch a new entrypoint agent. Enter
         // stays on the roster — you watch it surface in its bucket (§5).
-        Zone::Roster | Zone::ProviderSelector => app.dispatch_current_input(),
+        Zone::Roster | Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector => {
+            app.dispatch_current_input()
+        }
     }
 }
 
@@ -1414,15 +1464,79 @@ fn zoom_left(app: &mut App) {
     }
     app.zone = match app.zone {
         Zone::SingleAgent => Zone::Roster,
-        Zone::Roster => Zone::ProviderSelector,
-        Zone::ProviderSelector => Zone::ProviderSelector,
+        Zone::Roster => {
+            // Entering provider selector — sync cursor to current next_provider.
+            sync_provider_cursor(app);
+            Zone::ProviderSelector
+        }
+        Zone::ProviderSelector => {
+            // Drill into model selector for the selected provider.
+            sync_model_cursor(app);
+            Zone::ModelSelector
+        }
+        Zone::ModelSelector => {
+            // Drill into effort selector for the selected model's provider.
+            sync_effort_cursor(app);
+            Zone::EffortSelector
+        }
+        Zone::EffortSelector => Zone::EffortSelector,
     };
+}
+
+/// Sync `provider_cursor` to match `next_provider`.
+fn sync_provider_cursor(app: &mut App) {
+    if let Some(idx) = FLEET_PROVIDERS
+        .iter()
+        .position(|p| *p == app.next_provider)
+    {
+        app.provider_cursor = idx;
+    }
+}
+
+/// Sync `model_cursor` to match `next_model` within the selected provider's catalog.
+fn sync_model_cursor(app: &mut App) {
+    let provider = FLEET_PROVIDERS[app.provider_cursor];
+    let models = provider.models();
+    if let Some(idx) = app
+        .next_model
+        .as_deref()
+        .and_then(|m| models.iter().position(|mi| mi.id == m))
+    {
+        app.model_cursor = idx;
+    } else {
+        app.model_cursor = models.iter().position(|m| m.default).unwrap_or(0);
+    }
+}
+
+/// Sync `effort_cursor` to match `next_effort` within the selected provider's catalog.
+fn sync_effort_cursor(app: &mut App) {
+    let provider = FLEET_PROVIDERS[app.provider_cursor];
+    let efforts = provider.efforts();
+    if let Some(idx) = app
+        .next_effort
+        .as_deref()
+        .and_then(|e| efforts.iter().position(|ei| ei.id == e))
+    {
+        app.effort_cursor = idx;
+    } else {
+        app.effort_cursor = efforts.iter().position(|e| e.default).unwrap_or(0);
+    }
 }
 
 fn zoom_right(app: &mut App) {
     match app.zone {
+        Zone::EffortSelector => {
+            // Commit effort + model + provider and jump home.
+            commit_full_selection(app);
+            app.zone = Zone::Roster;
+        }
+        Zone::ModelSelector => {
+            // Pop back to provider selector without committing model.
+            // User is exploring; right = undo drill-down.
+            app.zone = Zone::ProviderSelector;
+        }
         Zone::ProviderSelector => {
-            // confirm sticky-next, return to roster
+            // Confirm sticky-next provider, return to roster.
             set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
             app.flash_provider();
             app.zone = Zone::Roster;
@@ -1439,8 +1553,48 @@ fn zoom_right(app: &mut App) {
     }
 }
 
+/// Commit the full provider + model + effort selection and flash.
+fn commit_full_selection(app: &mut App) {
+    let provider = FLEET_PROVIDERS[app.provider_cursor];
+    app.next_provider = provider;
+
+    let models = provider.models();
+    if let Some(mi) = models.get(app.model_cursor) {
+        app.next_model = Some(mi.id.to_string());
+    } else {
+        app.next_model = default_model_for(provider).map(str::to_string);
+    }
+
+    let efforts = provider.efforts();
+    if let Some(ei) = efforts.get(app.effort_cursor) {
+        app.next_effort = Some(ei.id.to_string());
+    } else {
+        app.next_effort = default_effort_for(provider).map(str::to_string);
+    }
+
+    app.flash_provider();
+}
+
 fn vertical(app: &mut App, delta: isize) {
     match app.zone {
+        Zone::EffortSelector => {
+            let efforts = FLEET_PROVIDERS[app.provider_cursor].efforts();
+            let n = efforts.len() as isize;
+            if n == 0 {
+                return;
+            }
+            let cur = app.effort_cursor as isize;
+            app.effort_cursor = (((cur + delta) % n + n) % n) as usize;
+        }
+        Zone::ModelSelector => {
+            let models = FLEET_PROVIDERS[app.provider_cursor].models();
+            let n = models.len() as isize;
+            if n == 0 {
+                return;
+            }
+            let cur = app.model_cursor as isize;
+            app.model_cursor = (((cur + delta) % n + n) % n) as usize;
+        }
         Zone::ProviderSelector => {
             let n = FLEET_PROVIDERS.len() as isize;
             let cur = app.provider_cursor as isize;
@@ -1963,14 +2117,23 @@ fn draw_roster_body(
     order: &[usize],
 ) {
     // The roster is the focus — full width, no transcript here (that lives in
-    // the single-agent view, `→`). In the provider-selector zone a slim
-    // selector sits to the left of the roster.
-    if app.zone == Zone::ProviderSelector {
+    // the single-agent view, `→`). In sub-selector zones a slim selector panel
+    // sits to the left of the roster.
+    let sub_zone = matches!(
+        app.zone,
+        Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector
+    );
+    if sub_zone {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Length(PROVIDER_SEL_WIDTH), Constraint::Min(0)])
             .split(area);
-        draw_provider_selector(f, split[0], app);
+        match app.zone {
+            Zone::EffortSelector => draw_effort_selector(f, split[0], app),
+            Zone::ModelSelector => draw_model_selector(f, split[0], app),
+            Zone::ProviderSelector => draw_provider_selector(f, split[0], app),
+            _ => unreachable!(),
+        }
         draw_roster(f, split[1], app, views, order);
     } else {
         draw_roster(f, area, app, views, order);
@@ -2153,6 +2316,118 @@ fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
             ),
         ]));
     }
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_model_selector(f: &mut Frame, area: Rect, app: &App) {
+    let provider = FLEET_PROVIDERS[app.provider_cursor];
+    let models = provider.models();
+    let title = format!(" model · {} ", provider.as_str());
+    let block = Block::default()
+        .borders(Borders::RIGHT | Borders::TOP)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    for (i, m) in models.iter().enumerate() {
+        let selected = i == app.model_cursor;
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        let default_marker = if m.default { " ★" } else { "" };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(truncate(m.id, 24), style),
+            Span::styled(default_marker, Style::default().fg(Color::Yellow)),
+        ]));
+        if selected {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(
+                    truncate(m.description, PROVIDER_SEL_WIDTH as usize - 6),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    }
+    // Hint line
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter: confirm  ←: effort  →: back",
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_effort_selector(f: &mut Frame, area: Rect, app: &App) {
+    let provider = FLEET_PROVIDERS[app.provider_cursor];
+    let models = provider.models();
+    let model_id = models
+        .get(app.model_cursor)
+        .map(|m| m.id)
+        .unwrap_or("—");
+    let efforts = provider.efforts();
+    let title = format!(" effort · {} · {} ", provider.as_str(), model_id);
+    let block = Block::default()
+        .borders(Borders::RIGHT | Borders::TOP)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            title,
+            Style::default().fg(Color::Cyan),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let mut lines = Vec::new();
+    if efforts.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no effort levels for this provider",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        for (i, e) in efforts.iter().enumerate() {
+            let selected = i == app.effort_cursor;
+            let marker = if selected { "▶ " } else { "  " };
+            let style = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let default_marker = if e.default { " ★" } else { "" };
+            lines.push(Line::from(vec![
+                Span::raw(marker),
+                Span::styled(format!("{:<10}", e.id), style),
+                Span::styled(default_marker, Style::default().fg(Color::Yellow)),
+            ]));
+            if selected {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(
+                        truncate(e.description, PROVIDER_SEL_WIDTH as usize - 6),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                ]));
+            }
+        }
+    }
+    // Hint line
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        " Enter: confirm  →: back",
+        Style::default().fg(Color::DarkGray),
+    )));
     f.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -3233,7 +3508,9 @@ fn draw_composer(
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let mut spans: Vec<Span<'static>> = Vec::new();
     let nav = match app.zone {
-        Zone::ProviderSelector => "↑/↓ provider  →/Tab confirm",
+        Zone::EffortSelector => "↑/↓ effort  Enter confirm  → back",
+        Zone::ModelSelector => "↑/↓ model  Enter confirm  ← effort  → back",
+        Zone::ProviderSelector => "↑/↓ provider  Enter confirm  ← model  → confirm",
         Zone::Roster => "↑/↓ agent  → open  ← provider  Ctrl+R rename  Ctrl+X stop/del",
         Zone::SingleAgent => "← roster  Esc interrupt  Ctrl+X stop/del  ↑/↓ history",
     };
