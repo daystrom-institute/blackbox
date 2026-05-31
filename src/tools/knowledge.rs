@@ -155,7 +155,9 @@ impl BlackboxServer {
                 tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
             }
             if let Some(old_id) = result.superseded.as_deref() {
-                self.tombstone_knowledge_entry_in_index(old_id)?;
+                if let Err(err) = self.tombstone_knowledge_entry_in_index(old_id) {
+                    tracing::warn!(error = %err, entry = %old_id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
+                }
             }
             let mut message = result.message;
             if let Some(rider) = self.state.kb.read().repo_record_rider(&result.id) {
@@ -266,7 +268,9 @@ impl BlackboxServer {
     pub(crate) fn bbox_forget(&self, Parameters(p): Parameters<ForgetParams>) -> CallToolResult {
         Self::run("bbox_forget", || {
             let message = self.state.kb.write().forget(&p)?;
-            self.tombstone_knowledge_entry_in_index(&p.id)?;
+            if let Err(err) = self.tombstone_knowledge_entry_in_index(&p.id) {
+                tracing::warn!(error = %err, entry = %p.id, "knowledge index tombstone failed; will reconstruct on next reindex cycle");
+            }
             Ok(message)
         })
     }

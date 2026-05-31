@@ -16,8 +16,18 @@ impl BlackboxServer {
     }
 
     pub(crate) fn tombstone_knowledge_entry_in_index(&self, entry_id: &str) -> anyhow::Result<()> {
-        self.state.idx.write().delete_knowledge_entry(entry_id)?;
+        // Tombstone the embedding unconditionally, even when the tantivy delete
+        // fails on a transient writer-lock collision (the background reindexer holds
+        // the single IndexWriter for a whole pass). The embed queue is independent of
+        // that lock, and the reindex reconciles tantivy (re-adding only
+        // Active|Superseded knowledge docs) but does NOT reconcile vectors — so
+        // skipping this on a lock failure would leak, and bbox_reembed could later
+        // revive, a deleted entry in vector search. Run the embed tombstone first,
+        // then surface the tantivy error so callers can warn (reindex purges tantivy
+        // regardless).
+        let tantivy_result = self.state.idx.write().delete_knowledge_entry(entry_id);
         embed_queue::tombstone_knowledge(&crate::index::knowledge_entity_id(entry_id));
+        tantivy_result?;
         Ok(())
     }
 

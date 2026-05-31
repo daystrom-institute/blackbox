@@ -766,6 +766,12 @@ fn enqueue_reembed_routes(
     let mut enqueued = 0usize;
     if buckets.contains(&Bucket::Knowledge) {
         for entry in state.kb.read().all_entries() {
+            // Don't re-embed retired entries — `all_entries()` includes Deleted,
+            // which would revive a forgotten entry in vector search. Mirror the
+            // tantivy reindex's indexable filter (Active|Superseded only).
+            if !crate::index::indexable_knowledge_entry(entry) {
+                continue;
+            }
             if limit_reached(max_entities, enqueued) {
                 return Ok(enqueued);
             }
