@@ -21,6 +21,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::HashMap;
+use std::ffi::OsString;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -275,6 +277,34 @@ fn terminal_result(
     ToolResult::Json(out)
 }
 
+fn shell_path_env() -> Option<OsString> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    augmented_path_env(
+        std::env::var_os("BRO_EXTRA_PATH"),
+        home,
+        std::env::var_os("PATH"),
+    )
+}
+
+fn augmented_path_env(
+    extra_path: Option<OsString>,
+    home: Option<PathBuf>,
+    current_path: Option<OsString>,
+) -> Option<OsString> {
+    let mut entries = Vec::new();
+    if let Some(raw) = extra_path {
+        entries.extend(std::env::split_paths(&raw).filter(|path| !path.as_os_str().is_empty()));
+    }
+    if let Some(home) = home {
+        entries.push(home.join(".local").join("bin"));
+        entries.push(home.join(".cargo").join("bin"));
+    }
+    if let Some(path) = current_path {
+        entries.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(entries).ok()
+}
+
 // ---------------------------------------------------------------------------
 // shell_run
 // ---------------------------------------------------------------------------
@@ -357,6 +387,9 @@ impl Tool for ShellRun {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(path) = shell_path_env() {
+            cmd.env("PATH", path);
+        }
         for (k, v) in &args.env {
             cmd.env(k, v);
         }
@@ -707,6 +740,23 @@ mod tests {
         assert_eq!(v["timed_out"], false, "timed_out always present");
         assert!(v["session_id"].is_null(), "no session for a finished cmd");
         assert_eq!(v["stdout"], "hi\n");
+    }
+
+    #[test]
+    fn shell_path_env_prepends_user_local_bins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = augmented_path_env(
+            Some(OsString::from("/opt/tools")),
+            Some(tmp.path().to_path_buf()),
+            Some(OsString::from("/usr/bin")),
+        )
+        .unwrap();
+        let entries: Vec<_> = std::env::split_paths(&path).collect();
+
+        assert_eq!(entries[0], PathBuf::from("/opt/tools"));
+        assert_eq!(entries[1], tmp.path().join(".local").join("bin"));
+        assert_eq!(entries[2], tmp.path().join(".cargo").join("bin"));
+        assert_eq!(entries[3], PathBuf::from("/usr/bin"));
     }
 
     #[tokio::test]

@@ -400,22 +400,12 @@ impl App {
         }
     }
 
-    /// Agent indices in roster display order: bucket (attention) then
-    /// last-activity desc. Returns `(views, ordered_indices)` so callers reuse
+    /// Agent indices in roster display order: bucket (attention) then stable
+    /// session start time. Returns `(views, ordered_indices)` so callers reuse
     /// the per-agent snapshot without re-locking.
     fn ordered_agents(&self) -> (Vec<AgentView>, Vec<usize>) {
         let views: Vec<AgentView> = self.agents.iter().map(Agent::view).collect();
-        let mut order: Vec<usize> = (0..self.agents.len()).collect();
-        // Within a bucket, most-recently-interacted first (last activity, then
-        // start time as a tiebreak).
-        let last_activity = |v: &AgentView| v.last_activity_ms.unwrap_or(v.started_at);
-        order.sort_by(|&a, &b| {
-            let ba = bucket_rank(views[a].state);
-            let bb = bucket_rank(views[b].state);
-            ba.cmp(&bb)
-                .then_with(|| last_activity(&views[b]).cmp(&last_activity(&views[a])))
-                .then_with(|| views[b].started_at.cmp(&views[a].started_at))
-        });
+        let order = ordered_agent_indices(&views);
         (views, order)
     }
 
@@ -703,6 +693,17 @@ fn bucket_rank(state: FleetState) -> usize {
         .iter()
         .position(|b| *b == state)
         .unwrap_or(usize::MAX)
+}
+
+fn ordered_agent_indices(views: &[AgentView]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..views.len()).collect();
+    order.sort_by(|&a, &b| {
+        bucket_rank(views[a].state)
+            .cmp(&bucket_rank(views[b].state))
+            .then_with(|| views[a].started_at.cmp(&views[b].started_at))
+            .then_with(|| a.cmp(&b))
+    });
+    order
 }
 
 fn default_model_for(provider: Provider) -> Option<&'static str> {
@@ -1485,10 +1486,7 @@ fn zoom_left(app: &mut App) {
 
 /// Sync `provider_cursor` to match `next_provider`.
 fn sync_provider_cursor(app: &mut App) {
-    if let Some(idx) = FLEET_PROVIDERS
-        .iter()
-        .position(|p| *p == app.next_provider)
-    {
+    if let Some(idx) = FLEET_PROVIDERS.iter().position(|p| *p == app.next_provider) {
         app.provider_cursor = idx;
     }
 }
@@ -2326,10 +2324,7 @@ fn draw_model_selector(f: &mut Frame, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::RIGHT | Borders::TOP)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            title,
-            Style::default().fg(Color::Cyan),
-        ));
+        .title(Span::styled(title, Style::default().fg(Color::Cyan)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -2372,19 +2367,13 @@ fn draw_model_selector(f: &mut Frame, area: Rect, app: &App) {
 fn draw_effort_selector(f: &mut Frame, area: Rect, app: &App) {
     let provider = FLEET_PROVIDERS[app.provider_cursor];
     let models = provider.models();
-    let model_id = models
-        .get(app.model_cursor)
-        .map(|m| m.id)
-        .unwrap_or("—");
+    let model_id = models.get(app.model_cursor).map(|m| m.id).unwrap_or("—");
     let efforts = provider.efforts();
     let title = format!(" effort · {} · {} ", provider.as_str(), model_id);
     let block = Block::default()
         .borders(Borders::RIGHT | Borders::TOP)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            title,
-            Style::default().fg(Color::Cyan),
-        ));
+        .title(Span::styled(title, Style::default().fg(Color::Cyan)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -3776,6 +3765,29 @@ mod tests {
             fleet_state_from_snapshot(TaskStatus::Running, true, false, false, None),
             FleetState::Active
         );
+    }
+
+    #[test]
+    fn roster_order_is_bucket_then_started_at_not_activity() {
+        let view = |state, started_at, last_activity_ms| AgentView {
+            state,
+            turn_active: false,
+            needs_input: false,
+            model: None,
+            cwd: None,
+            report_message: None,
+            turns: None,
+            started_at,
+            last_activity_ms,
+            stderr_tail: None,
+        };
+        let views = vec![
+            view(FleetState::Idle, 30, Some(1_000)),
+            view(FleetState::Idle, 10, Some(5)),
+            view(FleetState::Waiting, 20, Some(20)),
+        ];
+
+        assert_eq!(ordered_agent_indices(&views), vec![2, 1, 0]);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use tantivy::schema::IndexRecordOption;
 use crate::index::TranscriptIndex;
 use crate::knowledge::KnowledgeListParams;
 use crate::notes::{NoteListParams, NoteParams};
+use crate::orchestration::providers::dispatch_path_env;
 use crate::server::state::{BlackboxServer, SharedState};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -244,6 +245,7 @@ fn run_with_timeout(
     cmd.arg("-c")
         .arg(command)
         .current_dir(cwd)
+        .env("PATH", dispatch_path_env())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     configure_child_process_group(&mut cmd);
@@ -405,6 +407,10 @@ pub struct WorkGitDiffParams {
     /// Optional path to restrict the diff to.
     #[serde(default)]
     pub path: Option<String>,
+    /// Include untracked files as new-file patches. Useful for closeout review
+    /// before staging newly created files.
+    #[serde(default)]
+    pub include_untracked: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -794,6 +800,7 @@ fn impl_work_git_diff(
     repo_path: &Path,
     staged: bool,
     path_filter: Option<&str>,
+    include_untracked: bool,
 ) -> anyhow::Result<String> {
     let mut args: Vec<&str> = vec!["diff"];
     if staged {
@@ -804,15 +811,60 @@ fn impl_work_git_diff(
         args.push(pf);
     }
 
-    let raw = git_run(repo_path, &args)?;
+    let mut raw = git_run(repo_path, &args)?;
+    let mut untracked_count = 0usize;
+    if include_untracked {
+        let untracked = git_untracked_paths(repo_path, path_filter)?;
+        untracked_count = untracked.len();
+        for path in untracked {
+            let patch = git_diff_untracked_file(repo_path, &path)?;
+            if !patch.is_empty() {
+                if !raw.is_empty() && !raw.ends_with('\n') {
+                    raw.push('\n');
+                }
+                raw.push_str(&patch);
+            }
+        }
+    }
     let (output, truncated) = cap_output(&raw);
 
     Ok(serde_json::to_string_pretty(&json!({
         "staged": staged,
         "path_filter": path_filter,
+        "include_untracked": include_untracked,
+        "untracked_count": untracked_count,
         "diff": output,
         "truncated": truncated,
     }))?)
+}
+
+fn git_untracked_paths(repo_path: &Path, path_filter: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let mut args = vec!["ls-files", "--others", "--exclude-standard", "-z"];
+    if let Some(path) = path_filter {
+        args.push("--");
+        args.push(path);
+    }
+    let raw = git_run(repo_path, &args)?;
+    Ok(raw
+        .split('\0')
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+fn git_diff_untracked_file(repo_path: &Path, path: &str) -> anyhow::Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["diff", "--no-index", "--", "/dev/null", path])
+        .output()
+        .map_err(|e| anyhow::anyhow!("git exec failed: {e}"))?;
+    let code = out.status.code().unwrap_or(1);
+    if code != 0 && code != 1 {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::bail!("git error ({}): {}", out.status, stderr.trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn impl_work_git_show(repo_path: &Path, sha: &str) -> anyhow::Result<String> {
@@ -975,7 +1027,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "work_git_diff",
-        description = "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap."
+        description = "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap. Set include_untracked=true to include untracked files as new-file patches."
     )]
     pub(crate) fn work_git_diff(
         &self,
@@ -983,7 +1035,12 @@ impl BlackboxServer {
     ) -> CallToolResult {
         Self::run("work_git_diff", || {
             let repo = resolve_repo(p.repo.as_deref())?;
-            impl_work_git_diff(&repo, p.staged.unwrap_or(false), p.path.as_deref())
+            impl_work_git_diff(
+                &repo,
+                p.staged.unwrap_or(false),
+                p.path.as_deref(),
+                p.include_untracked.unwrap_or(false),
+            )
         })
     }
 
@@ -1249,5 +1306,82 @@ mod tests {
             assert_eq!(v["branch"].as_str().unwrap_or(""), "main");
         }
         // If git init fails (CI without git), the test is a no-op
+    }
+
+    #[test]
+    fn git_diff_can_include_untracked_files() {
+        use std::process::Command;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+
+        if !Command::new("git")
+            .args(["init", "-b", "main"])
+            .current_dir(repo)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            return;
+        }
+
+        Command::new("git")
+            .args(["config", "user.email", "test@example.com"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["config", "user.name", "Test User"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        std::fs::write(repo.join("tracked.txt"), "base\n").unwrap();
+        Command::new("git")
+            .args(["add", "tracked.txt"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        Command::new("git")
+            .args(["commit", "-m", "init"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+
+        std::fs::write(repo.join("new.txt"), "hello\n").unwrap();
+
+        let result = impl_work_git_diff(repo, false, None, true).unwrap();
+        let v: Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(v["include_untracked"], true);
+        assert_eq!(v["untracked_count"], 1);
+        let diff = v["diff"].as_str().unwrap();
+        assert!(diff.contains("diff --git"), "{diff}");
+        assert!(diff.contains("new.txt"), "{diff}");
+        assert!(diff.contains("+hello"), "{diff}");
+    }
+
+    #[test]
+    fn work_bash_uses_dispatch_path_for_user_local_bins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("HOME", tmp.path());
+        env.remove("BRO_EXTRA_PATH");
+        env.set("PATH", "/usr/bin:/bin");
+
+        let local_bin = tmp.path().join(".local").join("bin");
+        std::fs::create_dir_all(&local_bin).unwrap();
+        let fake = local_bin.join("fake-rtk");
+        std::fs::write(&fake, "#!/bin/sh\necho fake-ok\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&fake).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&fake, perms).unwrap();
+        }
+
+        let (exit_code, stdout, stderr, _, _) =
+            run_with_timeout("fake-rtk", tmp.path(), 5, None).unwrap();
+        assert_eq!(exit_code, 0, "{stderr}");
+        assert_eq!(stdout, "fake-ok\n");
     }
 }

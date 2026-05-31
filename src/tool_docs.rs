@@ -1468,9 +1468,9 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "work_git_diff",
         category: ToolCategory::Workspace,
-        summary: "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap.",
-        when_to_use: "Use to review changes before committing or verify that an edit produced the expected delta.",
-        example: Some(r#"work_git_diff(repo="/repo/x", staged=true)"#),
+        summary: "Structured git diff for working tree or staged changes, optionally path-restricted, with 32KB output cap. Can include untracked files as new-file patches.",
+        when_to_use: "Use to review changes before committing or verify that an edit produced the expected delta. Set include_untracked=true during closeout review when new files may not be staged yet.",
+        example: Some(r#"work_git_diff(repo="/repo/x", staged=true, include_untracked=true)"#),
     },
     ToolDoc {
         name: "work_git_show",

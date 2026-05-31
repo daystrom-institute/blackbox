@@ -489,12 +489,102 @@ read_git_tool!(
     "Show recent commits (`git log --oneline -20`).",
     &["log", "--oneline", "-20"]
 );
-read_git_tool!(
-    GitDiff,
-    "git_diff",
-    "Show the unstaged working-tree diff.",
-    &["diff"]
-);
+
+#[derive(Deserialize, JsonSchema)]
+struct GitDiffInput {
+    /// Include untracked files as new-file patches.
+    include_untracked: Option<bool>,
+}
+
+pub struct GitDiff;
+
+#[async_trait]
+impl Tool for GitDiff {
+    fn name(&self) -> &str {
+        "git_diff"
+    }
+    fn description(&self) -> &str {
+        "Show the unstaged working-tree diff. Set include_untracked=true to include untracked files as new-file patches."
+    }
+    fn input_schema(&self) -> Value {
+        schema_for::<GitDiffInput>()
+    }
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: GitDiffInput = match serde_json::from_value(input) {
+            Ok(v) => v,
+            Err(e) => return ToolResult::Error(e.to_string()),
+        };
+        if args.include_untracked.unwrap_or(false) {
+            git_diff_include_untracked(cx).await
+        } else {
+            git(cx, &["diff"]).await
+        }
+    }
+}
+
+async fn git_diff_include_untracked(cx: &ToolCx) -> ToolResult {
+    let mut diff = match git_stdout(&cx.root, &["diff"]).await {
+        Ok(diff) => diff,
+        Err(e) => return ToolResult::Error(e),
+    };
+    let raw_untracked = match git_stdout(
+        &cx.root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    .await
+    {
+        Ok(raw) => raw,
+        Err(e) => return ToolResult::Error(e),
+    };
+    for path in raw_untracked.split('\0').filter(|path| !path.is_empty()) {
+        match git_no_index_new_file(&cx.root, path).await {
+            Ok(patch) if !patch.is_empty() => {
+                if !diff.is_empty() && !diff.ends_with('\n') {
+                    diff.push('\n');
+                }
+                diff.push_str(&patch);
+            }
+            Ok(_) => {}
+            Err(e) => return ToolResult::Error(e),
+        }
+    }
+    ToolResult::Text(diff)
+}
+
+async fn git_stdout(root: &Path, args: &[&str]) -> Result<String, String> {
+    let out = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| format!("git {args:?}: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
+
+async fn git_no_index_new_file(root: &Path, path: &str) -> Result<String, String> {
+    let out = tokio::process::Command::new("git")
+        .args(["diff", "--no-index", "--", "/dev/null", path])
+        .current_dir(root)
+        .output()
+        .await
+        .map_err(|e| format!("git diff --no-index {path}: {e}"))?;
+    let code = out.status.code().unwrap_or(1);
+    if code == 0 || code == 1 {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).into_owned())
+    }
+}
 
 #[derive(Deserialize, JsonSchema)]
 struct GitShowInput {
