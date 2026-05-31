@@ -793,8 +793,8 @@ mod tests {
             source: file.to_string_lossy().into_owned(),
             ..Default::default()
         };
-        let err = plan_java_vaadin_static_ui_context_audit(&params)
-            .expect_err("non-java must fail");
+        let err =
+            plan_java_vaadin_static_ui_context_audit(&params).expect_err("non-java must fail");
         let msg = format!("{err}");
         assert!(msg.contains("java"), "unexpected error: {msg}");
     }

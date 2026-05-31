@@ -294,8 +294,12 @@ impl BlackboxServer {
             let counts = if response.dry_run {
                 project_ref_counts(&self.state, &old_project)?
             } else {
-                let counts =
-                    migrate_project_refs(&self.state, &old_project, &new_project, &response.record)?;
+                let counts = migrate_project_refs(
+                    &self.state,
+                    &old_project,
+                    &new_project,
+                    &response.record,
+                )?;
                 // Re-point kb roots at the new path now that migration has
                 // rewritten entries into the renamed repo's `.bbox/`, and
                 // re-enqueue embeds under the new path.

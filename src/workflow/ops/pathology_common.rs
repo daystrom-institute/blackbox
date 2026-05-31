@@ -196,8 +196,12 @@ pub(super) fn write_pathology_plan(
     for component in shape.out_subdir {
         out_dir.push(component);
     }
-    fs::create_dir_all(&out_dir)
-        .map_err(|e| anyhow!("create correction-plan directory {}: {e}", out_dir.display()))?;
+    fs::create_dir_all(&out_dir).map_err(|e| {
+        anyhow!(
+            "create correction-plan directory {}: {e}",
+            out_dir.display()
+        )
+    })?;
     let out_path = out_dir.join(format!("{slug}.md"));
 
     let title = plan
@@ -263,15 +267,22 @@ pub(super) fn write_pathology_plan(
         ),
         frontmatter = frontmatter,
         title = title,
-        diagnosis =
-            pathology_markdown(plan.get("diagnosis_summary"), "No diagnosis survived review."),
+        diagnosis = pathology_markdown(
+            plan.get("diagnosis_summary"),
+            "No diagnosis survived review."
+        ),
         evidence = pathology_markdown(plan.get("evidence"), "No evidence was retained."),
         authority = pathology_optional_section(plan.get("authority_grades"), "Authority Grades"),
         atom_mapping = pathology_optional_section(plan.get("atom_mapping"), "Atom Mapping"),
-        remediation =
-            pathology_markdown(plan.get("remediation_plan"), "No remediation slices were retained."),
+        remediation = pathology_markdown(
+            plan.get("remediation_plan"),
+            "No remediation slices were retained."
+        ),
         criteria = pathology_criteria_markdown(&criteria, criteria_prefix),
-        deferred = pathology_markdown(plan.get("deferred"), "No deferred candidates were recorded."),
+        deferred = pathology_markdown(
+            plan.get("deferred"),
+            "No deferred candidates were recorded."
+        ),
         dispatch = pathology_dispatch_payload(
             project_root.to_string_lossy().as_ref(),
             &plan_rel,

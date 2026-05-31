@@ -48,10 +48,10 @@ use super::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp
 use super::java_sidecar::JavaWorkerPool;
 use super::java_sidecar_protocol::{
     DeleteMemberParams, EmitTypeParams, InsertClassAnnotationParams, InsertFieldAnnotationParams,
-    InsertMemberParams, InsertStatementInMethodParams, PruneUnusedImportParams,
-    ReplaceMethodBodyParams, METHOD_DELETE_MEMBER, METHOD_EMIT_TYPE, METHOD_INSERT_CLASS_ANNOTATION,
-    METHOD_INSERT_FIELD_ANNOTATION, METHOD_INSERT_MEMBER, METHOD_INSERT_STATEMENT_IN_METHOD,
-    METHOD_PRUNE_UNUSED_IMPORT, METHOD_REPLACE_METHOD_BODY,
+    InsertMemberParams, InsertStatementInMethodParams, METHOD_DELETE_MEMBER, METHOD_EMIT_TYPE,
+    METHOD_INSERT_CLASS_ANNOTATION, METHOD_INSERT_FIELD_ANNOTATION, METHOD_INSERT_MEMBER,
+    METHOD_INSERT_STATEMENT_IN_METHOD, METHOD_PRUNE_UNUSED_IMPORT, METHOD_REPLACE_METHOD_BODY,
+    PruneUnusedImportParams, ReplaceMethodBodyParams,
 };
 use crate::refactor::{FileCreate, FileEdit, TextEdit};
 
@@ -90,9 +90,7 @@ impl JavaMacroBackend for SidecarBackend {
         } = op;
 
         let worker_arc = self.pool.worker_for(&self.project_root).map_err(|e| {
-            anyhow!(
-                "error.backend_unavailable: Java macro sidecar unavailable for emit: {e}"
-            )
+            anyhow!("error.backend_unavailable: Java macro sidecar unavailable for emit: {e}")
         })?;
 
         let result: super::java_sidecar_protocol::EmitTypeResult = worker_arc
@@ -108,11 +106,7 @@ impl JavaMacroBackend for SidecarBackend {
                     source_text: source_text.clone(),
                 },
             )
-            .map_err(|e| {
-                anyhow!(
-                    "error.backend_unavailable: emitType RPC failed: {e}"
-                )
-            })?;
+            .map_err(|e| anyhow!("error.backend_unavailable: emitType RPC failed: {e}"))?;
 
         let file_creates: Vec<FileCreate> = result
             .file_creates
@@ -501,7 +495,8 @@ impl JavaMacroBackend for SidecarBackend {
                 imports,
             } => {
                 check_rewrite_path_contained(target_file, &canonical_root)?;
-                let worker_arc = self.acquire_worker("rewrite/insertStatementInMethod(override)")?;
+                let worker_arc =
+                    self.acquire_worker("rewrite/insertStatementInMethod(override)")?;
                 let result: super::java_sidecar_protocol::InsertStatementInMethodResult =
                     worker_arc
                         .lock()
@@ -683,9 +678,9 @@ impl SidecarBackend {
         &self,
         op_name: &str,
     ) -> Result<std::sync::Arc<std::sync::Mutex<super::java_sidecar::JavaWorker>>> {
-        self.pool
-            .worker_for(&self.project_root)
-            .map_err(|e| anyhow!("error.backend_unavailable: Java macro sidecar unavailable for {op_name}: {e}"))
+        self.pool.worker_for(&self.project_root).map_err(|e| {
+            anyhow!("error.backend_unavailable: Java macro sidecar unavailable for {op_name}: {e}")
+        })
     }
 }
 
@@ -893,11 +888,7 @@ mod tests {
         let rewrite_target = dir.path().join("FooImpl.java");
         std::fs::write(&rewrite_target, "// placeholder").unwrap();
         assert!(
-            check_rewrite_path_contained(
-                rewrite_target.to_str().unwrap(),
-                &canonical_root
-            )
-            .is_ok(),
+            check_rewrite_path_contained(rewrite_target.to_str().unwrap(), &canonical_root).is_ok(),
             "in-project rewrite path should pass containment"
         );
     }
@@ -1017,9 +1008,7 @@ mod tests {
     #[test]
     fn live_emit_test_skips_when_jar_absent() {
         let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
-            eprintln!(
-                "[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — skipping live emit test"
-            );
+            eprintln!("[sidecar_backend] BLACKBOX_JAVA_WORKER_JAR unset — skipping live emit test");
             return;
         };
         if !PathBuf::from(&jar).exists() {
@@ -1041,8 +1030,7 @@ mod tests {
                     !bes.file_creates.is_empty(),
                     "live emit should produce at least one file_create"
                 );
-                let paths: Vec<&str> =
-                    bes.file_creates.iter().map(|fc| fc.path.as_str()).collect();
+                let paths: Vec<&str> = bes.file_creates.iter().map(|fc| fc.path.as_str()).collect();
                 assert!(
                     paths.iter().any(|p| p.contains("LiveTest")),
                     "emitted path should contain type name 'LiveTest'; got: {paths:?}"
@@ -1354,8 +1342,14 @@ mod tests {
             member_name: "getName".into(),
             parameter_types: Some(vec![]),
         };
-        let bes = backend.rewrite(&del_getter).expect("deleteMember must succeed");
-        assert_eq!(bes.file_edits.len(), 1, "deleting getName must produce one edit");
+        let bes = backend
+            .rewrite(&del_getter)
+            .expect("deleteMember must succeed");
+        assert_eq!(
+            bes.file_edits.len(),
+            1,
+            "deleting getName must produce one edit"
+        );
         let rewritten = bes.file_edits[0].new_text.clone().unwrap();
         assert!(
             !rewritten.contains("getName"),
@@ -1369,7 +1363,9 @@ mod tests {
 
         // -- (2) Idempotency: deleting an absent member is a no-op ---------
         std::fs::write(&target_file, &rewritten).expect("write rewritten back");
-        let bes2 = backend.rewrite(&del_getter).expect("second deleteMember must succeed");
+        let bes2 = backend
+            .rewrite(&del_getter)
+            .expect("second deleteMember must succeed");
         assert!(
             bes2.file_edits.is_empty(),
             "deleting an already-absent member must be a no-op; got {} edit(s)",
@@ -1406,7 +1402,9 @@ mod tests {
             member_name: "run".into(),
             parameter_types: Some(vec!["int".into()]),
         };
-        let bes3 = backend.rewrite(&del_specific).expect("disambiguated delete must succeed");
+        let bes3 = backend
+            .rewrite(&del_specific)
+            .expect("disambiguated delete must succeed");
         let rewritten3 = bes3.file_edits[0].new_text.clone().unwrap();
         assert!(
             rewritten3.contains("run()") && !rewritten3.contains("run(int n)"),
@@ -1451,7 +1449,9 @@ mod tests {
             imports: vec!["lombok.Getter".into()],
         };
 
-        let bes = backend.rewrite(&op).expect("insertFieldAnnotation must succeed");
+        let bes = backend
+            .rewrite(&op)
+            .expect("insertFieldAnnotation must succeed");
         assert_eq!(bes.file_edits.len(), 1, "must produce one edit");
         let rewritten = bes.file_edits[0].new_text.clone().unwrap();
         assert!(
@@ -1499,7 +1499,9 @@ mod tests {
             return;
         };
         if !PathBuf::from(&jar).exists() {
-            eprintln!("[sidecar_backend] worker JAR missing — skipping live pruneUnusedImport test");
+            eprintln!(
+                "[sidecar_backend] worker JAR missing — skipping live pruneUnusedImport test"
+            );
             return;
         }
 
@@ -1519,7 +1521,11 @@ mod tests {
             imports: vec!["java.util.List".into()],
         };
         let bes = backend.rewrite(&op_unused).expect("prune must succeed");
-        assert_eq!(bes.file_edits.len(), 1, "unreferenced import must be removed");
+        assert_eq!(
+            bes.file_edits.len(),
+            1,
+            "unreferenced import must be removed"
+        );
         let rewritten = bes.file_edits[0].new_text.clone().unwrap();
         assert!(
             !rewritten.contains("import java.util.List;"),

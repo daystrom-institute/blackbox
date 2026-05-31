@@ -457,19 +457,34 @@ mod disruption_tests {
     #[test]
     fn detects_structured_api_error_status() {
         let rl = json!({"type": "assistant", "apiErrorStatus": 429, "isApiErrorMessage": true});
-        assert_eq!(Provider::Claude.detect_disruption(&rl), Some(Disruption::RateLimited));
+        assert_eq!(
+            Provider::Claude.detect_disruption(&rl),
+            Some(Disruption::RateLimited)
+        );
         let ov = json!({"apiErrorStatus": 529});
-        assert_eq!(Provider::Claude.detect_disruption(&ov), Some(Disruption::Overloaded));
+        assert_eq!(
+            Provider::Claude.detect_disruption(&ov),
+            Some(Disruption::Overloaded)
+        );
         // harness providers share the Claude envelope.
-        assert_eq!(Provider::Glm.detect_disruption(&rl), Some(Disruption::RateLimited));
+        assert_eq!(
+            Provider::Glm.detect_disruption(&rl),
+            Some(Disruption::RateLimited)
+        );
     }
 
     #[test]
     fn detects_explicit_error_text_only_on_error_fields() {
         let err = json!({"type": "result", "is_error": true, "result": "Error: rate_limit_error — too many requests"});
-        assert_eq!(Provider::Codex.detect_disruption(&err), Some(Disruption::RateLimited));
+        assert_eq!(
+            Provider::Codex.detect_disruption(&err),
+            Some(Disruption::RateLimited)
+        );
         let ov = json!({"error": {"message": "the model is overloaded, please retry"}});
-        assert_eq!(Provider::Claude.detect_disruption(&ov), Some(Disruption::Overloaded));
+        assert_eq!(
+            Provider::Claude.detect_disruption(&ov),
+            Some(Disruption::Overloaded)
+        );
     }
 
     #[test]

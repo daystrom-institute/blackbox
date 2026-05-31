@@ -15,11 +15,11 @@
 
 use std::path::Path;
 
+use crate::macros::MacroPlan;
 use crate::macros::model::MacroInvocation;
 use crate::macros::planner::MacroPlanner;
 use crate::macros::planner_ctx::MacroPlannerContext;
 use crate::macros::registry::MacroRegistry;
-use crate::macros::MacroPlan;
 
 /// Plan `builtin.java.guice` for the given inputs and return the resulting
 /// `MacroPlan`. No JVM worker is required (delegate is pure Rust).
@@ -112,7 +112,14 @@ fn guice_macro_emits_field_injection_wiring() {
     )
     .unwrap();
 
-    let plan = plan_guice(dir.path(), &source, &target, "Service", "service", &["save"]);
+    let plan = plan_guice(
+        dir.path(),
+        &source,
+        &target,
+        "Service",
+        "service",
+        &["save"],
+    );
     assert!(plan.refusals.is_empty(), "no refusals: {:?}", plan.refusals);
 
     let src_edits = source_edit_replacements(&plan, &source);
@@ -156,7 +163,14 @@ fn guice_macro_plans_even_when_source_has_no_inject_fields() {
     )
     .unwrap();
 
-    let plan = plan_guice(dir.path(), &source, &target, "Service", "service", &["save"]);
+    let plan = plan_guice(
+        dir.path(),
+        &source,
+        &target,
+        "Service",
+        "service",
+        &["save"],
+    );
     assert!(
         plan.refusals.is_empty(),
         "macro must NOT refuse a non-DI source — there is no @Inject guard: {:?}",

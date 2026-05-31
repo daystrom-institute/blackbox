@@ -72,11 +72,12 @@ pub(crate) fn reindex_knowledge_store_standalone(
     // the central store, so a reindex that only read kb.json would silently drop
     // them from search. Load the registered repos' roots so committed project
     // knowledge is indexed too.
-    let roots: Vec<std::path::PathBuf> = crate::projects::ProjectRegistry::load_records(projects_path)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|r| std::path::PathBuf::from(r.canonical_path))
-        .collect();
+    let roots: Vec<std::path::PathBuf> =
+        crate::projects::ProjectRegistry::load_records(projects_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| std::path::PathBuf::from(r.canonical_path))
+            .collect();
     if let Err(e) = knowledge.set_project_roots(roots) {
         tracing::warn!("kb reindex project-root load: {e:#}");
     }
@@ -300,9 +301,14 @@ mod tests {
         let index = Index::create_in_ram(schema);
         let mut writer: IndexWriter = index.writer(15_000_000).unwrap();
         let mut meta = HashMap::new();
-        let docs =
-            reindex_knowledge_store_standalone(&kb_path, &projects_path, fields, &mut writer, &mut meta)
-                .unwrap();
+        let docs = reindex_knowledge_store_standalone(
+            &kb_path,
+            &projects_path,
+            fields,
+            &mut writer,
+            &mut meta,
+        )
+        .unwrap();
 
         assert_eq!(
             docs, 1,

@@ -16,10 +16,10 @@ mod diagnostics;
 mod emit;
 mod hooks;
 mod lsp_baselines;
-mod report;
 mod mcp;
 mod project_doc;
 mod registry;
+mod report;
 mod session;
 mod transport;
 

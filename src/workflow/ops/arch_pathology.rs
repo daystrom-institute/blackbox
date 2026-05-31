@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::OpEffect;
-use super::pathology_common::{NormalizeShape, PlanShape, normalize_atom_requests, write_pathology_plan};
+use super::pathology_common::{
+    NormalizeShape, PlanShape, normalize_atom_requests, write_pathology_plan,
+};
 
 /// Default allowlist when a workflow does not pass `allowed_atoms` explicitly
 /// (the Java architecture-pathology survey set). The Rust workflow passes its

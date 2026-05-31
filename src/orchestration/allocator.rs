@@ -2490,10 +2490,7 @@ mod tests {
         assert!(!durable_only.expresses_selection_intent());
         let seeded =
             pin_static_provider_if_inert(Some(durable_only), Provider::Claude, None, None).unwrap();
-        assert_eq!(
-            seeded.pin.and_then(|p| p.provider),
-            Some(Provider::Claude)
-        );
+        assert_eq!(seeded.pin.and_then(|p| p.provider), Some(Provider::Claude));
 
         // No request at all stays None (never reaches the allocator).
         assert!(pin_static_provider_if_inert(None, Provider::Codex, None, None).is_none());
@@ -2543,7 +2540,10 @@ mod tests {
         assert!(exclude_providers_for_diversity(None, &[Provider::Codex]).is_none());
         let untouched =
             exclude_providers_for_diversity(Some(RuntimeRequest::default()), &[]).unwrap();
-        assert!(untouched.pool.is_none(), "empty exclude must not set a pool");
+        assert!(
+            untouched.pool.is_none(),
+            "empty exclude must not set a pool"
+        );
 
         // Soft floor: excluding every provider does NOT empty the pool — it
         // falls back to allowing repeats rather than stranding the dispatch.

@@ -322,7 +322,10 @@ fn test_harness_stream_json_envelope_roundtrips_through_parser() {
         Provider::Brodex.parse_event(evt, &mut sink);
     }
     assert_eq!(sink.session_id.as_deref(), Some(sid));
-    assert_eq!(sink.last_assistant_message.as_deref(), Some("brodex-via-harness-ok"));
+    assert_eq!(
+        sink.last_assistant_message.as_deref(),
+        Some("brodex-via-harness-ok")
+    );
     assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 1559);
     assert_eq!(sink.usage.as_ref().unwrap().output_tokens, 69);
     assert_eq!(sink.num_turns, Some(2));
@@ -806,7 +809,11 @@ fn test_mcp_add_args_shape_per_provider() {
 
     // GLM/DeepSeek/Brodex ride bro-harness with transient inline --mcp-config;
     // they have no vendor-CLI `mcp add` subcommand.
-    assert!(Provider::Glm.build_mcp_add_http_args("blackbox", u, &[]).is_none());
+    assert!(
+        Provider::Glm
+            .build_mcp_add_http_args("blackbox", u, &[])
+            .is_none()
+    );
     assert!(
         Provider::Deepseek
             .build_mcp_add_http_args("blackbox", u, &[])
@@ -910,7 +917,10 @@ fn test_harness_filter_emits_deny_tools_comma_joined() {
     };
     for provider in [Provider::Glm, Provider::Deepseek, Provider::Brodex] {
         let args = provider.build_filter_args(&filters);
-        let i = args.iter().position(|a| a == "--deny-tools").expect("--deny-tools present");
+        let i = args
+            .iter()
+            .position(|a| a == "--deny-tools")
+            .expect("--deny-tools present");
         let csv = &args[i + 1];
         assert!(csv.contains("mcp__blackbox__bro_exec"), "{provider}: {csv}");
         assert!(csv.contains(','), "comma-joined: {csv}");

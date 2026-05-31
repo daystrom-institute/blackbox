@@ -15,12 +15,12 @@ use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::macros::sidecar_backend::SidecarBackend;
 use crate::macros::model::{MacroAnchors, MacroDefinition, MacroInvocation, MacroPlan};
 use crate::macros::planner::{MacroPlanner, build_macro_apply_params};
 use crate::macros::planner_ctx::MacroPlannerContext;
 use crate::macros::probe::CodeNavProbeRunner;
 use crate::macros::registry::{MacroRegistry, RegistryError};
+use crate::macros::sidecar_backend::SidecarBackend;
 use crate::refactor;
 use crate::server::state::BlackboxServer;
 

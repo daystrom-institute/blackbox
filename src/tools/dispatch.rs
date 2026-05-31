@@ -2075,13 +2075,13 @@ mod tests {
         // A completed task named explicitly — no status given, so the
         // any-terminal rule applies and it matches despite the legacy
         // default being "failed".
-        server.bro_prune(Parameters(prune_params(
-            Some(vec!["drop-me".into()]),
-            None,
-        )));
+        server.bro_prune(Parameters(prune_params(Some(vec!["drop-me".into()]), None)));
 
         let store = server.state.task_store.read();
-        assert!(store.get("drop-me").is_none(), "listed task should be dropped");
+        assert!(
+            store.get("drop-me").is_none(),
+            "listed task should be dropped"
+        );
         assert!(store.get("keep-failed").is_some(), "unlisted task kept");
         assert!(store.get("keep-other").is_some(), "unlisted task kept");
     }
@@ -2098,8 +2098,14 @@ mod tests {
         )));
 
         let store = server.state.task_store.read();
-        assert!(store.get("keep-running").is_some(), "running is never pruned");
-        assert!(store.get("drop-me").is_none(), "listed terminal task dropped");
+        assert!(
+            store.get("keep-running").is_some(),
+            "running is never pruned"
+        );
+        assert!(
+            store.get("drop-me").is_none(),
+            "listed terminal task dropped"
+        );
     }
 
     #[test]
@@ -2131,9 +2137,18 @@ mod tests {
         server.bro_prune(Parameters(prune_params(None, None)));
 
         let store = server.state.task_store.read();
-        assert!(store.get("keep-failed").is_none(), "failed default still drops failed");
-        assert!(store.get("drop-me").is_some(), "completed untouched by default sweep");
-        assert!(store.get("keep-other").is_some(), "completed untouched by default sweep");
+        assert!(
+            store.get("keep-failed").is_none(),
+            "failed default still drops failed"
+        );
+        assert!(
+            store.get("drop-me").is_some(),
+            "completed untouched by default sweep"
+        );
+        assert!(
+            store.get("keep-other").is_some(),
+            "completed untouched by default sweep"
+        );
     }
 
     fn save_test_brofile(tmp: &tempfile::TempDir, name: &str) {

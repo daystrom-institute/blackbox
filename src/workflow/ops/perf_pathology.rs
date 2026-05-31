@@ -2,7 +2,9 @@ use anyhow::Result;
 use serde_json::Value;
 
 use super::OpEffect;
-use super::pathology_common::{NormalizeShape, PlanShape, normalize_atom_requests, write_pathology_plan};
+use super::pathology_common::{
+    NormalizeShape, PlanShape, normalize_atom_requests, write_pathology_plan,
+};
 
 /// Default perf detector allowlist when a workflow does not pass `allowed_atoms`
 /// explicitly. The v0 set covers the ten smells in

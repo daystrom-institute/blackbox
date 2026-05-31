@@ -94,6 +94,10 @@ mod tests {
     fn tolerates_null_and_garbage() {
         assert!(LspBaselines::from_side(&Value::Null).files.is_empty());
         assert!(LspBaselines::from_side(&json!("nope")).files.is_empty());
-        assert!(LspBaselines::from_side(&json!({"files": "garbage"})).files.is_empty());
+        assert!(
+            LspBaselines::from_side(&json!({"files": "garbage"}))
+                .files
+                .is_empty()
+        );
     }
 }

@@ -215,7 +215,10 @@ mod tests {
 
         let out = assemble(&cwd, None).expect("cwd doc present");
         assert!(out.contains("CHILD-DOC"));
-        assert!(!out.contains("PARENT-DOC"), "must not walk up outside a repo");
+        assert!(
+            !out.contains("PARENT-DOC"),
+            "must not walk up outside a repo"
+        );
         fs::remove_dir_all(&root).ok();
     }
 

@@ -385,11 +385,10 @@ impl Transport for AnthropicTransport {
         let mut tool_calls: Vec<super::ToolCall> = Vec::new();
         for b in &blocks {
             match b.kind.as_str() {
-                "text"
-                    if !b.text.is_empty() => {
-                        content.push(json!({"type": "text", "text": b.text}));
-                        text_out.push_str(&b.text);
-                    }
+                "text" if !b.text.is_empty() => {
+                    content.push(json!({"type": "text", "text": b.text}));
+                    text_out.push_str(&b.text);
+                }
                 "tool_use" => {
                     let args: Value = serde_json::from_str(if b.tool_json.is_empty() {
                         "{}"

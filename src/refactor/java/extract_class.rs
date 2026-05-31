@@ -59,8 +59,9 @@ pub(crate) fn plan_extract_java_class(p: &RefactorPlanParams) -> Result<String> 
     let delegate_field_annotation_imports =
         wiring.delegate_field_annotation_imports.unwrap_or_default();
     let target_constructor_annotations = wiring.target_constructor_annotations.unwrap_or_default();
-    let target_constructor_annotation_imports =
-        wiring.target_constructor_annotation_imports.unwrap_or_default();
+    let target_constructor_annotation_imports = wiring
+        .target_constructor_annotation_imports
+        .unwrap_or_default();
 
     // Mutable-capture-with-write refusal. A capture that is (a) non-final on
     // the source, (b) not listed in `move_fields`, and (c) WRITTEN inside any

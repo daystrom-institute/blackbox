@@ -428,7 +428,10 @@ mod tests {
         let non_json = bbox_root.join("knowledge").join("README.md");
         let artifact = bbox_root.join("workflows").join("flow.json");
         let create = |p: &std::path::Path| {
-            mk(notify::EventKind::Create(notify::event::CreateKind::File), p)
+            mk(
+                notify::EventKind::Create(notify::event::CreateKind::File),
+                p,
+            )
         };
         assert!(!event_touches_knowledge(&create(&non_json), &roots));
         assert!(!event_touches_knowledge(&create(&artifact), &roots));

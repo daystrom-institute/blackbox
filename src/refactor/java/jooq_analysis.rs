@@ -873,8 +873,7 @@ fn receiver_looks_like_provider(call: Node<'_>, source: &str) -> bool {
 // ===========================================================================
 
 pub(crate) fn plan_java_jooq_projection_mapping_analysis(p: &RefactorPlanParams) -> Result<String> {
-    let per_file =
-        analyze_each_source(p, analyze_projection_mapping_in)?;
+    let per_file = analyze_each_source(p, analyze_projection_mapping_in)?;
     let body = serde_json::json!({
         "status": "planned",
         "kind": "java_jooq_projection_mapping_analysis",

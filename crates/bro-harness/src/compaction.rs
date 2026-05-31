@@ -57,9 +57,7 @@ pub struct CompactionPolicy {
 impl CompactionPolicy {
     pub fn from_env() -> Self {
         let enabled = std::env::var("BRO_HARNESS_COMPACTION")
-            .map(|v| {
-                v != "0" && !v.eq_ignore_ascii_case("off") && !v.eq_ignore_ascii_case("false")
-            })
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("off") && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(true);
         let keep_tail = std::env::var("BRO_HARNESS_COMPACTION_KEEP_TAIL")
             .ok()
@@ -74,13 +72,15 @@ impl CompactionPolicy {
                     None
                 }
             })
-            .and_then(|s| match serde_json::from_str::<BTreeMap<String, Entry>>(&s) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    tracing::warn!("compaction config parse error: {e}; using defaults");
-                    None
-                }
-            })
+            .and_then(
+                |s| match serde_json::from_str::<BTreeMap<String, Entry>>(&s) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        tracing::warn!("compaction config parse error: {e}; using defaults");
+                        None
+                    }
+                },
+            )
             .unwrap_or_else(default_entries);
         Self {
             entries,
@@ -111,7 +111,8 @@ impl CompactionPolicy {
                 .or_else(|| glob.and_then(f))
                 .or_else(|| default.and_then(f))
         };
-        let window = field(&|e| e.context_window.map(|w| w as f64)).unwrap_or(DEFAULT_WINDOW as f64);
+        let window =
+            field(&|e| e.context_window.map(|w| w as f64)).unwrap_or(DEFAULT_WINDOW as f64);
         let ratio = field(&|e| e.compact_at).unwrap_or(DEFAULT_RATIO);
         (window as u64, ratio)
     }

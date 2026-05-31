@@ -755,7 +755,9 @@ async fn resolve_xform_source(
     file: Option<&str>,
 ) -> Result<(String, String), String> {
     match (from, file) {
-        (Some(_), Some(_)) => Err("provide `from` (a register) or `file` (a path), not both".into()),
+        (Some(_), Some(_)) => {
+            Err("provide `from` (a register) or `file` (a path), not both".into())
+        }
         (Some(reg), None) => {
             let text = cx.clipboard.lock().unwrap().consume_text(reg)?;
             Ok((text, normalize_register(reg).to_string()))
@@ -1427,7 +1429,10 @@ mod tool_tests {
         );
         assert_eq!(v["register"], "@");
         assert!(v.get("text").is_none());
-        assert_eq!(cx.clipboard.lock().unwrap().get("@").unwrap().text, "ship it");
+        assert_eq!(
+            cx.clipboard.lock().unwrap().get("@").unwrap().text,
+            "ship it"
+        );
     }
 
     #[tokio::test]

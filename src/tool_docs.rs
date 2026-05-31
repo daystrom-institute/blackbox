@@ -1778,7 +1778,6 @@ pub fn all_tool_names() -> Vec<&'static str> {
     TOOL_DOCS.iter().map(|d| d.name).collect()
 }
 
-
 /// Prefixed bro_* tools blocked by the default recursion guard.
 /// `bro_report` is intentionally excluded: it is telemetry, not
 /// recursive dispatch, and dispatched agents should be able to report

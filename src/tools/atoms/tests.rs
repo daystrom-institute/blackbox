@@ -838,9 +838,7 @@ async fn shipped_perf_pathology_artifacts_install_and_validate() {
         (
             "system-defaults/atoms/refactor/perf-eager-materialization.json",
             "perf-eager-materialization",
-            include_str!(
-                "../../../system-defaults/atoms/refactor/perf-eager-materialization.json"
-            ),
+            include_str!("../../../system-defaults/atoms/refactor/perf-eager-materialization.json"),
         ),
         (
             "system-defaults/atoms/refactor/perf-n-plus-one-fetch.json",

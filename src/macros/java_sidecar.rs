@@ -89,10 +89,7 @@ impl JavaWorkerPool {
             return Ok(Arc::clone(w));
         }
         let worker = JavaWorker::spawn(&canonical).with_context(|| {
-            format!(
-                "spawning blackbox-java-worker for {}",
-                canonical.display()
-            )
+            format!("spawning blackbox-java-worker for {}", canonical.display())
         })?;
         let arc = Arc::new(Mutex::new(worker));
         workers.insert(canonical, Arc::clone(&arc));
@@ -374,9 +371,7 @@ mod tests {
         // Mirror of csharp_sidecar's resolver_returns_some_when_sidecar_available.
         // This test is a no-op unless BLACKBOX_JAVA_WORKER_JAR points to a real jar.
         let Some(jar) = std::env::var_os("BLACKBOX_JAVA_WORKER_JAR") else {
-            eprintln!(
-                "[java_sidecar] BLACKBOX_JAVA_WORKER_JAR unset — skipping live worker test"
-            );
+            eprintln!("[java_sidecar] BLACKBOX_JAVA_WORKER_JAR unset — skipping live worker test");
             return;
         };
         if !PathBuf::from(&jar).exists() {

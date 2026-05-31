@@ -70,8 +70,8 @@ pub use planner::MacroPlanner;
 #[allow(unused_imports)]
 pub use planner_ctx::MacroPlannerContext;
 #[allow(unused_imports)]
-pub use sidecar_backend::SidecarBackend;
-#[allow(unused_imports)]
 pub use probe::{CodeNavProbeRunner, ProbeOutput, ProbeRunner, ProbeSpec, UnavailableProbeRunner};
 #[allow(unused_imports)]
 pub use registry::{MacroRegistry, RegistryError};
+#[allow(unused_imports)]
+pub use sidecar_backend::SidecarBackend;

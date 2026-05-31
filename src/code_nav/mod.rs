@@ -2469,7 +2469,11 @@ pub fn project_text_search(
 }
 
 /// Apply normalization and optional case-folding to a string for text matching.
-fn prepare_needle(s: &str, case_sensitive: bool, normalization: &ProjectTextNormalization) -> String {
+fn prepare_needle(
+    s: &str,
+    case_sensitive: bool,
+    normalization: &ProjectTextNormalization,
+) -> String {
     let base = if matches!(normalization, ProjectTextNormalization::RemoveWhitespace) {
         // Collapse all runs of ASCII whitespace to a single space, then strip
         // leading/trailing whitespace.

@@ -199,10 +199,7 @@ async fn normalize_perf_pathology_atom_requests_inherits_perf_keys() {
     match effect {
         OpEffect::SetVar { key, value } => {
             assert_eq!(key, "atom_requests");
-            assert_eq!(
-                value[0]["atom_ref"],
-                "atom:perf-n-plus-one-fetch@v1"
-            );
+            assert_eq!(value[0]["atom_ref"], "atom:perf-n-plus-one-fetch@v1");
             // survey_json string is structure-coerced
             assert_eq!(value[0]["args"]["survey_json"]["focus"], "order creation");
             // single-string hot_paths is array-normalized
@@ -287,9 +284,9 @@ async fn write_perf_pathology_plan_emits_perf_path_and_frontmatter() {
     assert!(body.contains("generated_by: perf-pathology"));
     // explicit criterion id is preserved
     assert!(body.contains("- PP-2: Query count drops from 47 to no more than 3."));
-    assert!(body.contains(
-        "\"phase_doc_path\": \"design/refactor/perf/plans/order-creation-n-1.md\""
-    ));
+    assert!(
+        body.contains("\"phase_doc_path\": \"design/refactor/perf/plans/order-creation-n-1.md\"")
+    );
 }
 
 #[tokio::test]

@@ -35,7 +35,6 @@ use serde_json::Value;
 
 use super::context::{ArcContext, VarsSchema, resolve_arg_value};
 use arch_pathology::{exec_normalize_arch_pathology_atom_requests, exec_write_arch_pathology_plan};
-use perf_pathology::{exec_normalize_perf_pathology_atom_requests, exec_write_perf_pathology_plan};
 use auto_digest::{
     exec_aggregate_auto_edge_votes, exec_append_knowledge_link, exec_apply_entry,
     exec_extract_candidate_pairs, exec_log_reject, exec_read_session, exec_surface_to_inbox,
@@ -44,6 +43,7 @@ use auto_digest::{
 use eval_score::exec_score_eval_output;
 use external::{exec_http_json, exec_mcp_call, exec_shell};
 use json_ops::exec_parse_json;
+use perf_pathology::{exec_normalize_perf_pathology_atom_requests, exec_write_perf_pathology_plan};
 use schema_migration::{exec_schema_migration_drop, exec_schema_migration_rebuild};
 use system_events::{exec_require_identity, exec_system_event_compact};
 use vars::{

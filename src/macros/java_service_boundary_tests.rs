@@ -69,48 +69,60 @@ impl MockProbeRunner {
     /// caller_method_probe.count = 0 → triggers error.caller_method_not_found.
     fn no_caller_method() -> Self {
         let mut r = Self::happy_path();
-        r.responses
-            .insert("caller_method_probe", json!({"exists": false, "count": 0, "items": []}));
+        r.responses.insert(
+            "caller_method_probe",
+            json!({"exists": false, "count": 0, "items": []}),
+        );
         r
     }
 
     /// caller_method_probe.count = 2 → triggers error.caller_method_ambiguous.
     fn ambiguous_caller_method() -> Self {
         let mut r = Self::happy_path();
-        r.responses
-            .insert("caller_method_probe", json!({"exists": true, "count": 2, "items": []}));
+        r.responses.insert(
+            "caller_method_probe",
+            json!({"exists": true, "count": 2, "items": []}),
+        );
         r
     }
 
     /// service_type_exists.count = 1 → triggers error.type_already_exists (interface).
     fn service_type_already_exists() -> Self {
         let mut r = Self::happy_path();
-        r.responses
-            .insert("service_type_exists", json!({"exists": true, "count": 1, "items": []}));
+        r.responses.insert(
+            "service_type_exists",
+            json!({"exists": true, "count": 1, "items": []}),
+        );
         r
     }
 
     /// impl_type_exists.count = 1 → triggers error.type_already_exists (implementation).
     fn impl_type_already_exists() -> Self {
         let mut r = Self::happy_path();
-        r.responses
-            .insert("impl_type_exists", json!({"exists": true, "count": 1, "items": []}));
+        r.responses.insert(
+            "impl_type_exists",
+            json!({"exists": true, "count": 1, "items": []}),
+        );
         r
     }
 
     /// guice_module.count = 0 → triggers error.guice_module_not_found.
     fn no_guice_module() -> Self {
         let mut r = Self::happy_path();
-        r.responses
-            .insert("guice_module", json!({"exists": false, "count": 0, "items": []}));
+        r.responses.insert(
+            "guice_module",
+            json!({"exists": false, "count": 0, "items": []}),
+        );
         r
     }
 
     /// guice_module.count = 2 → triggers error.guice_module_ambiguous.
     fn ambiguous_guice_module() -> Self {
         let mut r = Self::happy_path();
-        r.responses
-            .insert("guice_module", json!({"exists": true, "count": 2, "items": []}));
+        r.responses.insert(
+            "guice_module",
+            json!({"exists": true, "count": 2, "items": []}),
+        );
         r
     }
 }
@@ -161,10 +173,7 @@ fn make_invocation(
     inputs.insert("caller_file".into(), json!(caller_file));
     inputs.insert("caller_type".into(), json!("CallerService"));
     inputs.insert("caller_method".into(), json!("processOrder"));
-    inputs.insert(
-        "caller_method_parameter_types".into(),
-        json!(["String"]),
-    );
+    inputs.insert("caller_method_parameter_types".into(), json!(["String"]));
     inputs.insert(
         "method_contract".into(),
         json!("void processOrder(String orderId);"),
@@ -388,8 +397,7 @@ fn refusal_behavior_move_unsupported_when_body_empty() {
         "/tmp/AppModule.java",
     );
     // Override implementation_body to empty string — triggers the refusal.
-    inv.inputs
-        .insert("implementation_body".into(), json!(""));
+    inv.inputs.insert("implementation_body".into(), json!(""));
     let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (refusal)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
@@ -416,8 +424,7 @@ fn refusal_authority_gate_missing() {
         "/tmp/AppModule.java",
     );
     inv.operator_opt_outs.clear();
-    let plan =
-        MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (gate refusal)");
+    let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (gate refusal)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
         codes.contains(&"error.authority_required"),
@@ -507,7 +514,13 @@ fn integration_plan_lower_apply_with_real_sidecar() {
     );
 
     let def = load_service_boundary_def();
-    let inv = make_invocation(&def, &project_dir, &source_root, &caller_file, &guice_module_file);
+    let inv = make_invocation(
+        &def,
+        &project_dir,
+        &source_root,
+        &caller_file,
+        &guice_module_file,
+    );
 
     // Use CodeNavProbeRunner backed by the tempdir project.
     let project_record = crate::projects::ProjectRecord {
@@ -537,14 +550,22 @@ fn integration_plan_lower_apply_with_real_sidecar() {
 
     // 3 Rewrite ops + 2 Emit ops + 1 Record op + 4 top-level probe ops logged
     let emit_count = plan.operations.iter().filter(|o| o.kind == "emit").count();
-    let rewrite_count = plan.operations.iter().filter(|o| o.kind == "rewrite").count();
+    let rewrite_count = plan
+        .operations
+        .iter()
+        .filter(|o| o.kind == "rewrite")
+        .count();
     assert_eq!(emit_count, 2, "expect 2 emit operations");
     assert_eq!(rewrite_count, 3, "expect 3 rewrite operations");
 
     // 2 new files (interface + impl); 3 edits (caller field, caller delegation,
     // module binding) — but the same-file chaining collapses the two caller
     // edits into one FileEdit, so we expect 2 file_edits total.
-    assert_eq!(plan.edits.file_creates.len(), 2, "expect 2 new files created");
+    assert_eq!(
+        plan.edits.file_creates.len(),
+        2,
+        "expect 2 new files created"
+    );
     assert_eq!(
         plan.edits.file_edits.len(),
         2,
@@ -559,7 +580,9 @@ fn integration_plan_lower_apply_with_real_sidecar() {
         .find(|fc| fc.path.contains("InventoryService.java") && !fc.path.contains("Impl"))
         .expect("InventoryService.java should be in file_creates");
     assert!(
-        iface_create.content.contains("void processOrder(String orderId);"),
+        iface_create
+            .content
+            .contains("void processOrder(String orderId);"),
         "interface source must contain the method_contract; got:\n{}",
         iface_create.content
     );
@@ -609,20 +632,24 @@ fn integration_plan_lower_apply_with_real_sidecar() {
     let pkg = tmp.path().join("src/main/java/com/example");
     let iface_path = pkg.join("InventoryService.java");
     let impl_path = pkg.join("InventoryServiceImpl.java");
-    assert!(iface_path.exists(), "InventoryService.java should be created");
-    assert!(impl_path.exists(), "InventoryServiceImpl.java should be created");
+    assert!(
+        iface_path.exists(),
+        "InventoryService.java should be created"
+    );
+    assert!(
+        impl_path.exists(),
+        "InventoryServiceImpl.java should be created"
+    );
 
     // Assert interface file content matches the contract.
-    let iface_content =
-        std::fs::read_to_string(&iface_path).expect("read InventoryService.java");
+    let iface_content = std::fs::read_to_string(&iface_path).expect("read InventoryService.java");
     assert!(
         iface_content.contains("void processOrder(String orderId);"),
         "InventoryService.java must contain the method contract"
     );
 
     // Assert implementation file content includes the method body.
-    let impl_content =
-        std::fs::read_to_string(&impl_path).expect("read InventoryServiceImpl.java");
+    let impl_content = std::fs::read_to_string(&impl_path).expect("read InventoryServiceImpl.java");
     assert!(
         impl_content.contains("implements InventoryService"),
         "InventoryServiceImpl.java must implement InventoryService; got:\n{impl_content}"
@@ -638,8 +665,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
     );
 
     // Assert CallerService.java was modified: @Inject field + delegation body.
-    let caller_content =
-        std::fs::read_to_string(&caller_file).expect("read CallerService.java");
+    let caller_content = std::fs::read_to_string(&caller_file).expect("read CallerService.java");
     assert!(
         caller_content.contains("@com.google.inject.Inject") || caller_content.contains("@Inject"),
         "CallerService.java must contain @Inject annotation; got:\n{caller_content}"
@@ -660,8 +686,7 @@ fn integration_plan_lower_apply_with_real_sidecar() {
     );
 
     // Assert AppModule.java was modified with the Guice binding.
-    let module_content =
-        std::fs::read_to_string(&guice_module_file).expect("read AppModule.java");
+    let module_content = std::fs::read_to_string(&guice_module_file).expect("read AppModule.java");
     assert!(
         module_content.contains("bind(InventoryService.class).to(InventoryServiceImpl.class)"),
         "AppModule.java must contain the exact bind() statement; got:\n{module_content}"

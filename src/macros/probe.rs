@@ -828,7 +828,9 @@ impl CodeNavProbeRunner {
         let worker = super::java_sidecar::pool()
             .worker_for(&project_root)
             .map_err(|e| {
-                anyhow!("error.backend_unavailable: Java macro worker unavailable for analyzeClass: {e}")
+                anyhow!(
+                    "error.backend_unavailable: Java macro worker unavailable for analyzeClass: {e}"
+                )
             })?;
 
         let value: Value = worker
@@ -1171,10 +1173,16 @@ mod tests {
         }
 
         let items = [
-            FakeSym { name: Some("AppModule".into()) },      // exact match → keep
-            FakeSym { name: Some("AppModuleTest".into()) },  // superset → reject
-            FakeSym { name: Some("configure".into()) },      // unrelated method in same file → reject
-            FakeSym { name: None },                          // no name (path-only hit) → reject
+            FakeSym {
+                name: Some("AppModule".into()),
+            }, // exact match → keep
+            FakeSym {
+                name: Some("AppModuleTest".into()),
+            }, // superset → reject
+            FakeSym {
+                name: Some("configure".into()),
+            }, // unrelated method in same file → reject
+            FakeSym { name: None }, // no name (path-only hit) → reject
         ];
 
         let exact_name = "AppModule";
@@ -1183,11 +1191,7 @@ mod tests {
             .filter(|i| i.name.as_deref() == Some(exact_name))
             .collect();
 
-        assert_eq!(
-            filtered.len(),
-            1,
-            "only the exact-name item should survive"
-        );
+        assert_eq!(filtered.len(), 1, "only the exact-name item should survive");
         assert_eq!(filtered[0].name.as_deref(), Some("AppModule"));
     }
 
@@ -1197,8 +1201,7 @@ mod tests {
     /// This exercises the fail-closed guard without needing a real sidecar.
     #[test]
     fn name_equals_truncation_fails_closed() {
-        let err = CodeNavProbeRunner::check_name_filter_truncation("AppModule", true)
-            .unwrap_err();
+        let err = CodeNavProbeRunner::check_name_filter_truncation("AppModule", true).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("error.probe_truncated"),
@@ -1414,7 +1417,9 @@ mod tests {
         assert_eq!(out.value["count"], 1);
         let needles_arr = out.value["matched_needles"].as_array().unwrap();
         assert!(
-            needles_arr.iter().any(|v| v == "import com.example.Service"),
+            needles_arr
+                .iter()
+                .any(|v| v == "import com.example.Service"),
             "matched_needles should contain the needle"
         );
     }
@@ -1923,8 +1928,16 @@ mod tests {
         // Two instance fields (the static logger is excluded).
         assert_eq!(v["fields"].as_array().unwrap().len(), 2, "fields: {v}");
         // Trivial getters/setters correlated to both fields → full coverage.
-        assert_eq!(v["trivial_getters"].as_array().unwrap().len(), 2, "getters: {v}");
-        assert_eq!(v["trivial_setters"].as_array().unwrap().len(), 2, "setters: {v}");
+        assert_eq!(
+            v["trivial_getters"].as_array().unwrap().len(),
+            2,
+            "getters: {v}"
+        );
+        assert_eq!(
+            v["trivial_setters"].as_array().unwrap().len(),
+            2,
+            "setters: {v}"
+        );
         assert_eq!(v["getter_covers_all_fields"], json!(true));
         assert_eq!(v["setter_covers_all_non_final_fields"], json!(true));
         // Canonical no-arg constructor.
@@ -1938,7 +1951,9 @@ mod tests {
         // A getter is correlated to its field with the field's type.
         let getters = v["trivial_getters"].as_array().unwrap();
         assert!(
-            getters.iter().any(|g| g["field"] == json!("name") && g["type"] == json!("String")),
+            getters
+                .iter()
+                .any(|g| g["field"] == json!("name") && g["type"] == json!("String")),
             "expected a getName→name:String getter; got: {v}"
         );
     }

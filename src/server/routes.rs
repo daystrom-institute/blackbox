@@ -1505,10 +1505,7 @@ fn edge_sidecar_signature(edges_dir: &std::path::Path) -> EdgeSidecarSignature {
                 // an atomic rename, so counting them makes the watcher observe
                 // mid-write churn and rebuild against a half-written overlay.
                 // (Original fix by @benstpierre in PR #3, incorporated here.)
-                if path
-                    .extension()
-                    .is_some_and(|ext| ext == "write-tmp")
-                {
+                if path.extension().is_some_and(|ext| ext == "write-tmp") {
                     continue;
                 }
                 stack.push(path);

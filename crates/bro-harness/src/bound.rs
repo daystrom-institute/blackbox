@@ -69,7 +69,13 @@ pub fn bound_tool_result(tool: &str, content: String, cap: usize, dir: &Path, id
 
 fn sanitize(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -78,7 +84,10 @@ fn head(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
     }
-    let end = (0..=max).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0);
+    let end = (0..=max)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
     s[..end].to_string()
 }
 

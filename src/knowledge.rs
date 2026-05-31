@@ -707,7 +707,10 @@ fn load_repo_kb_stats(project_dir: &Path) -> std::collections::BTreeMap<String, 
         Err(_) => return std::collections::BTreeMap::new(),
     };
     serde_json::from_str(&raw).unwrap_or_else(|e| {
-        tracing::warn!("kb recall-stats sidecar unparseable at {}: {e}", path.display());
+        tracing::warn!(
+            "kb recall-stats sidecar unparseable at {}: {e}",
+            path.display()
+        );
         std::collections::BTreeMap::new()
     })
 }
@@ -727,8 +730,7 @@ fn persist_repo_kb_stats(
     if stats.is_empty() && !path.exists() {
         return Ok(());
     }
-    fs::create_dir_all(&local_dir)
-        .with_context(|| format!("creating {}", local_dir.display()))?;
+    fs::create_dir_all(&local_dir).with_context(|| format!("creating {}", local_dir.display()))?;
     // Mirror `bbox_project_init`: gitignore everything under local/ except the
     // ignore file itself, so the sidecar is host-local and never committed.
     let gitignore = local_dir.join(".gitignore");
@@ -3294,9 +3296,18 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .repo_record_rider(&proj_id)
             .expect("committed project entry should rider");
         let rel = format!(".bbox/knowledge/{proj_id}.json");
-        assert!(rider.contains(&rel), "rider names repo-relative path: {rider}");
-        assert!(rider.contains(&format!("git add {rel}")), "rider hints git add: {rider}");
-        assert!(!rider.contains(&proj), "rider must not leak the absolute project path: {rider}");
+        assert!(
+            rider.contains(&rel),
+            "rider names repo-relative path: {rider}"
+        );
+        assert!(
+            rider.contains(&format!("git add {rel}")),
+            "rider hints git add: {rider}"
+        );
+        assert!(
+            !rider.contains(&proj),
+            "rider must not leak the absolute project path: {rider}"
+        );
 
         // Global entry → host-local, nothing committed → no rider.
         let global_id = kb

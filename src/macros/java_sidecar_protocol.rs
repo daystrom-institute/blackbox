@@ -581,7 +581,9 @@ mod tests {
     fn delete_member_params_round_trips() {
         let params = DeleteMemberParams {
             target_file: "/repo/src/User.java".to_string(),
-            source_text: "package com.example;\npublic class User { public String getName(){return name;} }".to_string(),
+            source_text:
+                "package com.example;\npublic class User { public String getName(){return name;} }"
+                    .to_string(),
             target_type: "User".to_string(),
             member_name: "getName".to_string(),
             parameter_types: Some(vec![]),
@@ -736,7 +738,9 @@ mod tests {
     #[test]
     fn insert_statement_in_method_result_round_trips() {
         let result = InsertStatementInMethodResult {
-            rewritten_source: "package com.example;\npublic class FooImpl { void init() { this.ready = true; } }".to_string(),
+            rewritten_source:
+                "package com.example;\npublic class FooImpl { void init() { this.ready = true; } }"
+                    .to_string(),
             changed: true,
             no_op: false,
             diagnostics: vec![],

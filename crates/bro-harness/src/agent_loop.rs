@@ -1064,7 +1064,8 @@ mod tests {
         if ra_runs(std::path::Path::new("rust-analyzer")) {
             return Some(std::path::PathBuf::from("rust-analyzer"));
         }
-        let cargo_bin = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cargo/bin/rust-analyzer");
+        let cargo_bin =
+            std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cargo/bin/rust-analyzer");
         ra_runs(&cargo_bin).then_some(cargo_bin)
     }
 

@@ -475,9 +475,7 @@ fn lifecycle_interfaces_in_source(source: &str) -> Vec<String> {
         }
         // Take text until the next `{` or `;` (class body or stray).
         let tail = &source[after_idx..];
-        let end = tail
-            .find(['{', ';'])
-            .unwrap_or(tail.len());
+        let end = tail.find(['{', ';']).unwrap_or(tail.len());
         let clause = &tail[..end];
         for iface in NAV_LIFECYCLE_INTERFACES {
             if has_whole_token(clause, iface) && !out.iter().any(|s| s == iface) {

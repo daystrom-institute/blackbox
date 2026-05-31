@@ -509,8 +509,8 @@ fn finish_mutation(
             },
             projects,
         )?;
-        let apply_result: Value = serde_json::from_str(&apply_result_raw)
-            .unwrap_or(Value::String(apply_result_raw));
+        let apply_result: Value =
+            serde_json::from_str(&apply_result_raw).unwrap_or(Value::String(apply_result_raw));
         let apply_status = apply_result
             .get("status")
             .and_then(Value::as_str)

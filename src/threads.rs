@@ -299,9 +299,10 @@ pub(crate) fn load_repo_records(project_dir: &Path) -> Vec<ThreadRecord> {
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        match fs::read_to_string(&path).ok().and_then(|raw| {
-            serde_json::from_str::<ThreadRecord>(&raw).ok()
-        }) {
+        match fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<ThreadRecord>(&raw).ok())
+        {
             Some(record) => out.push(record),
             None => tracing::warn!("skipping unreadable thread record {}", path.display()),
         }
@@ -779,7 +780,10 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(&thread_for_embed.project, &path)),
+            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(
+                &thread_for_embed.project,
+                &path,
+            )),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -828,7 +832,10 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(&thread_for_embed.project, &path)),
+            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(
+                &thread_for_embed.project,
+                &path,
+            )),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -1180,7 +1187,9 @@ mod tests {
         assert_eq!(rec.status, ThreadStatus::Resolved);
         assert_eq!(rec.topic, "audit the dispatch path");
         assert!(
-            rec.notes.iter().any(|n| n.contains("resolve_provider_pool")),
+            rec.notes
+                .iter()
+                .any(|n| n.contains("resolve_provider_pool")),
             "investigation note should be recorded: {:?}",
             rec.notes
         );
@@ -1193,7 +1202,11 @@ mod tests {
         let repo_root = repo.path().canonicalize().unwrap();
         let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
 
-        let id = open_thread_id(&mut threads, "triad convergence", &repo_root.to_string_lossy());
+        let id = open_thread_id(
+            &mut threads,
+            "triad convergence",
+            &repo_root.to_string_lossy(),
+        );
         threads
             .thread(&ThreadParams {
                 id: Some(id.clone()),
@@ -1249,7 +1262,11 @@ mod tests {
         let repo = tempdir().unwrap();
         let repo_root = repo.path().canonicalize().unwrap();
         let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
-        let id = open_thread_id(&mut threads, "tier the allocator", &repo_root.to_string_lossy());
+        let id = open_thread_id(
+            &mut threads,
+            "tier the allocator",
+            &repo_root.to_string_lossy(),
+        );
 
         let msg = threads
             .thread(&ThreadParams {
@@ -1279,7 +1296,10 @@ mod tests {
         let rider = crate::util::repo_artifact_rider(root, path);
         assert!(rider.contains(".bbox/record/thread-abc.json"));
         assert!(rider.contains("git add .bbox/record/thread-abc.json"));
-        assert!(!rider.contains("/repo/x/.bbox"), "must be repo-relative, not absolute");
+        assert!(
+            !rider.contains("/repo/x/.bbox"),
+            "must be repo-relative, not absolute"
+        );
     }
 
     fn set_last_activity(store_path: &Path, thread_id: &str, last_activity: &str) {

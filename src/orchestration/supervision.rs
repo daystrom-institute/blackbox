@@ -964,7 +964,10 @@ mod tests {
         assert_eq!(snap["idle_seconds"], 181);
         // No events were observed (last_event_at_ms set directly), so the
         // tool-running state is unknown and the notice says so.
-        assert_eq!(snap["idle_notice"], "no activity for 181s (tool state unknown)");
+        assert_eq!(
+            snap["idle_notice"],
+            "no activity for 181s (tool state unknown)"
+        );
         assert!(
             snap["alerts"]
                 .as_array()
@@ -1032,7 +1035,8 @@ mod tests {
         let snap = state.snapshot(1_000 + STALL_NOTICE_MS + 1_000);
         assert!(snap["tool_running"].is_null());
         assert_eq!(
-            snap["idle_notice"], "no activity for 181s (tool state unknown)"
+            snap["idle_notice"],
+            "no activity for 181s (tool state unknown)"
         );
     }
 
@@ -1115,11 +1119,15 @@ mod tests {
         state.observe_event(&serde_json::json!({"note": "n"}), &sink, 1_000);
 
         let snap = state.snapshot(1_100);
-        assert_eq!(snap["total_input_tokens"], 1200, "fresh input is the headline");
+        assert_eq!(
+            snap["total_input_tokens"], 1200,
+            "fresh input is the headline"
+        );
         assert_eq!(snap["total_cached_input_tokens"], 50000);
         assert_eq!(snap["total_cache_creation_input_tokens"], 800);
         assert_eq!(
-            snap["total_input_tokens_with_cache"], 1200 + 50000 + 800,
+            snap["total_input_tokens_with_cache"],
+            1200 + 50000 + 800,
             "cache-inclusive grand total is surfaced alongside"
         );
     }

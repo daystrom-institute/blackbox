@@ -137,11 +137,7 @@ fn parse_zai_quota(account: Option<String>, body: &Value, now: u64) -> Result<Pr
     Ok(rec)
 }
 
-async fn probe_glm(
-    client: &reqwest::Client,
-    home: &Path,
-    now: u64,
-) -> Vec<(String, ProbeRecord)> {
+async fn probe_glm(client: &reqwest::Client, home: &Path, now: u64) -> Vec<(String, ProbeRecord)> {
     let mut out = Vec::new();
     for acct in discover_zai_accounts(home) {
         let result = async {
@@ -191,7 +187,11 @@ fn header_fraction(headers: &HeaderMap, name: &str) -> Option<f64> {
 
 /// Parse Anthropic unified rate-limit headers. These utilizations are already
 /// fractions (e.g. `0.02`), unlike GLM/Codex percentages.
-fn parse_claude_ratelimit(account: Option<String>, headers: &HeaderMap, now: u64) -> Option<ProbeRecord> {
+fn parse_claude_ratelimit(
+    account: Option<String>,
+    headers: &HeaderMap,
+    now: u64,
+) -> Option<ProbeRecord> {
     let five_hour = header_fraction(headers, "anthropic-ratelimit-unified-5h-utilization");
     let seven_day = header_fraction(headers, "anthropic-ratelimit-unified-7d-utilization");
     if five_hour.is_none() && seven_day.is_none() {
@@ -357,7 +357,9 @@ fn parse_deepseek_balance(body: &Value, now: u64) -> ProbeRecord {
     } else {
         QuotaStatus::Exhausted
     };
-    rec.raw_summary = Some(format!("deepseek balance ${balance:.2} available={available}"));
+    rec.raw_summary = Some(format!(
+        "deepseek balance ${balance:.2} available={available}"
+    ));
     rec
 }
 
@@ -498,7 +500,10 @@ mod tests {
             "anthropic-ratelimit-unified-7d-utilization",
             "0.17".parse().unwrap(),
         );
-        h.insert("anthropic-ratelimit-unified-status", "allowed".parse().unwrap());
+        h.insert(
+            "anthropic-ratelimit-unified-status",
+            "allowed".parse().unwrap(),
+        );
         let rec = parse_claude_ratelimit(None, &h, 5).unwrap();
         assert_eq!(rec.provider, Provider::Claude);
         // Already fractions — NOT divided by 100.
@@ -514,7 +519,10 @@ mod tests {
             "anthropic-ratelimit-unified-5h-utilization",
             "0.5".parse().unwrap(),
         );
-        h.insert("anthropic-ratelimit-unified-status", "rejected".parse().unwrap());
+        h.insert(
+            "anthropic-ratelimit-unified-status",
+            "rejected".parse().unwrap(),
+        );
         let rec = parse_claude_ratelimit(None, &h, 0).unwrap();
         assert!(matches!(rec.quota_status, QuotaStatus::Exhausted));
         // No utilization headers at all → no probe.
@@ -591,13 +599,17 @@ mod tests {
         let mut store = probe_store_load(store_dir);
         let mut seed = base_record(Provider::Claude, None, 100);
         seed.five_hour_utilization = Some(0.4);
-        store
-            .records
-            .insert(lane_key(Provider::Claude, None), seed);
+        store.records.insert(lane_key(Provider::Claude, None), seed);
         probe_store_save(store_dir, &store);
 
         // A 429 lands on a real dispatch.
-        record_disruption_cooldown(store_dir, Provider::Claude, None, Disruption::RateLimited, 1000);
+        record_disruption_cooldown(
+            store_dir,
+            Provider::Claude,
+            None,
+            Disruption::RateLimited,
+            1000,
+        );
 
         let rec = probe_store_load(store_dir)
             .records
@@ -606,15 +618,28 @@ mod tests {
         // Cooldown set 300s out; the lane is now exhausted; utilization kept.
         assert_eq!(rec.cooldown_until, Some(1000 + 300_000));
         assert!(matches!(rec.quota_status, QuotaStatus::Exhausted));
-        assert!(matches!(rec.quota_confidence, QuotaConfidence::RuntimeRateLimit));
-        assert_eq!(rec.five_hour_utilization, Some(0.4), "probe util must survive");
+        assert!(matches!(
+            rec.quota_confidence,
+            QuotaConfidence::RuntimeRateLimit
+        ));
+        assert_eq!(
+            rec.five_hour_utilization,
+            Some(0.4),
+            "probe util must survive"
+        );
         assert_eq!(rec.last_runtime_observation_at, Some(1000));
     }
 
     #[test]
     fn record_disruption_cooldown_overload_is_shorter_and_not_exhausted() {
         let dir = tempfile::tempdir().unwrap();
-        record_disruption_cooldown(dir.path(), Provider::Glm, Some("z2"), Disruption::Overloaded, 0);
+        record_disruption_cooldown(
+            dir.path(),
+            Provider::Glm,
+            Some("z2"),
+            Disruption::Overloaded,
+            0,
+        );
         let rec = probe_store_load(dir.path())
             .records
             .remove(&lane_key(Provider::Glm, Some("z2")))

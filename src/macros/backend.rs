@@ -370,7 +370,9 @@ mod tests {
         assert_eq!(v["package"], json!("com.example"));
         let back: JavaEmitOp = serde_json::from_value(v).unwrap();
         match back {
-            JavaEmitOp::EmitType { name, source_root, .. } => {
+            JavaEmitOp::EmitType {
+                name, source_root, ..
+            } => {
                 assert_eq!(name, "PaymentService");
                 assert_eq!(source_root, "/repo/src/main/java");
             }
@@ -391,7 +393,11 @@ mod tests {
         assert_eq!(v["target_file"], json!("/repo/src/FooImpl.java"));
         let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
         match back {
-            JavaRewriteOp::InsertMember { target_type, imports, .. } => {
+            JavaRewriteOp::InsertMember {
+                target_type,
+                imports,
+                ..
+            } => {
                 assert_eq!(target_type, "FooImpl");
                 assert_eq!(imports, vec!["com.example.Port"]);
             }
@@ -416,7 +422,12 @@ mod tests {
         assert_eq!(v["parameter_types"][0], json!("String"));
         let back: JavaRewriteOp = serde_json::from_value(v).unwrap();
         match back {
-            JavaRewriteOp::ReplaceMethodBody { method_name, parameter_types, new_body, .. } => {
+            JavaRewriteOp::ReplaceMethodBody {
+                method_name,
+                parameter_types,
+                new_body,
+                ..
+            } => {
                 assert_eq!(method_name, "doWork");
                 assert_eq!(parameter_types, vec!["String", "int"]);
                 assert!(new_body.contains("length"));

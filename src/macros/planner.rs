@@ -390,8 +390,8 @@ impl MacroPlanner {
                     // can reference its result via expr_ctx.
                     // Interpolate ${inputs.*} (and prior probe results already in
                     // expr_ctx) before decoding to a typed ProbeSpec.
-                    let interpolated_spec =
-                        interpolate_value_strings(spec_val, &expr_ctx).map_err(|e| {
+                    let interpolated_spec = interpolate_value_strings(spec_val, &expr_ctx)
+                        .map_err(|e| {
                             anyhow!(
                                 "error.probe_spec_interpolation: macro '{}' inline Probe '{}' \
                                  spec interpolation failed: {}",
@@ -400,8 +400,8 @@ impl MacroPlanner {
                                 e
                             )
                         })?;
-                    let spec: ProbeSpec =
-                        serde_json::from_value(interpolated_spec.clone()).with_context(|| {
+                    let spec: ProbeSpec = serde_json::from_value(interpolated_spec.clone())
+                        .with_context(|| {
                             format!(
                                 "error.probe_spec_invalid: macro '{}' inline Probe operation \
                                  '{}' has an invalid spec after interpolation: {}",
@@ -552,10 +552,7 @@ impl MacroPlanner {
                         kind: "for_each".to_string(),
                         name: None,
                         semantic_status: MacroSemanticStatus::SyntaxOnly,
-                        summary: format!(
-                            "ForEach over '{}': expanded {} item(s)",
-                            over, expanded
-                        ),
+                        summary: format!("ForEach over '{}': expanded {} item(s)", over, expanded),
                     });
                 }
 
@@ -1000,7 +997,11 @@ fn process_rewrite(
             register_path(sink.touched_paths, &fe.path)?;
         }
         if let Some(new_text) = &fe.new_text {
-            let orig_len = fe.edits.first().map(|e| e.byte_end).unwrap_or(new_text.len());
+            let orig_len = fe
+                .edits
+                .first()
+                .map(|e| e.byte_end)
+                .unwrap_or(new_text.len());
             sink.pending_rewrite_content.insert(
                 fe.path.clone(),
                 (new_text.clone(), fe.original_sha256.clone(), orig_len),
@@ -2174,9 +2175,7 @@ mod tests {
     /// arm falls through to `register_path`, which detects the duplicate.
     #[test]
     fn delegate_refactor_then_rewrite_same_path_is_duplicate() {
-        use crate::macros::backend::{
-            BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp,
-        };
+        use crate::macros::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
         use crate::refactor::{FileEdit, TextEdit};
 
         // A test-only backend that returns a canned FileEdit for any rewrite.
@@ -2236,7 +2235,9 @@ mod tests {
 
         let inv = minimal_invocation(&def, &project_dir);
         let ctx = MacroPlannerContext::new(
-            Box::new(CannedRewriteBackend { rewrite_path: target_path }),
+            Box::new(CannedRewriteBackend {
+                rewrite_path: target_path,
+            }),
             None,
             Box::new(crate::macros::probe::UnavailableProbeRunner),
         );
@@ -2264,9 +2265,21 @@ mod tests {
         let mut inputs = serde_json::Map::new();
         inputs.insert("strategy".into(), json!("bridge")); // supplied — must win
         apply_input_schema_defaults(&mut inputs, &schema);
-        assert_eq!(inputs.get("strategy"), Some(&json!("bridge")), "supplied value must not be overridden");
-        assert_eq!(inputs.get("count"), Some(&json!(3)), "absent default must be filled");
-        assert_eq!(inputs.get("name"), None, "property without a default stays absent");
+        assert_eq!(
+            inputs.get("strategy"),
+            Some(&json!("bridge")),
+            "supplied value must not be overridden"
+        );
+        assert_eq!(
+            inputs.get("count"),
+            Some(&json!(3)),
+            "absent default must be filled"
+        );
+        assert_eq!(
+            inputs.get("name"),
+            None,
+            "property without a default stays absent"
+        );
     }
 
     #[test]
@@ -2284,9 +2297,7 @@ mod tests {
     /// `${item.*}` per element and honoring the body's per-item `when` guard.
     #[test]
     fn for_each_fans_out_rewrite_per_probe_item_with_per_item_guard() {
-        use crate::macros::backend::{
-            BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp,
-        };
+        use crate::macros::backend::{BackendEditSet, JavaEmitOp, JavaMacroBackend, JavaRewriteOp};
         use crate::macros::probe::{ProbeOutput, ProbeRunner, ProbeSpec};
         use crate::refactor::{FileEdit, TextEdit};
         use std::sync::Mutex;
@@ -2395,11 +2406,19 @@ mod tests {
         let ctx = MacroPlannerContext::new(backend, None, Box::new(CannedItemsRunner));
 
         let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed");
-        assert!(plan.refusals.is_empty(), "no refusals expected: {:?}", plan.refusals);
+        assert!(
+            plan.refusals.is_empty(),
+            "no refusals expected: {:?}",
+            plan.refusals
+        );
 
         // Two of three items kept → two distinct file edits (Beta skipped by guard).
-        let mut paths: Vec<String> =
-            plan.edits.file_edits.iter().map(|e| e.path.clone()).collect();
+        let mut paths: Vec<String> = plan
+            .edits
+            .file_edits
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
         paths.sort();
         assert_eq!(
             paths,
@@ -2602,8 +2621,7 @@ mod tests {
             "missing authority gate should produce a refusal"
         );
         assert_eq!(
-            plan.refusals[0].code,
-            "error.authority_required",
+            plan.refusals[0].code, "error.authority_required",
             "refusal code must be error.authority_required"
         );
         assert!(
@@ -2707,13 +2725,12 @@ mod tests {
         let inv = minimal_invocation(&def, "/tmp");
         let ctx = MacroPlannerContext::default();
 
-        let plan = MacroPlanner::plan(&inv, &def, &ctx)
-            .expect("gate refusal returns Ok(MacroPlan)");
+        let plan =
+            MacroPlanner::plan(&inv, &def, &ctx).expect("gate refusal returns Ok(MacroPlan)");
 
         assert_eq!(plan.refusals.len(), 1, "only the gate refusal should fire");
         assert_eq!(
-            plan.refusals[0].code,
-            "error.authority_required",
+            plan.refusals[0].code, "error.authority_required",
             "gate refusal must take precedence over regular refusals"
         );
     }
@@ -3712,10 +3729,7 @@ mod tests {
         let ctx = expr::Context {
             inputs: {
                 let mut m = serde_json::Map::new();
-                m.insert(
-                    "param_types".into(),
-                    json!(["Order", "int"]),
-                );
+                m.insert("param_types".into(), json!(["Order", "int"]));
                 m
             },
             probes: std::collections::HashMap::new(),
@@ -3872,7 +3886,10 @@ mod tests {
             op.summary
         );
         // No edits produced (backend was not called).
-        assert!(plan.edits.file_creates.is_empty(), "no file_creates expected");
+        assert!(
+            plan.edits.file_creates.is_empty(),
+            "no file_creates expected"
+        );
         assert!(plan.edits.file_edits.is_empty(), "no file_edits expected");
     }
 
@@ -3938,7 +3955,8 @@ mod tests {
             }),
         }];
         let mut inv = minimal_invocation(&def, "/tmp");
-        inv.inputs.insert("enabled".into(), serde_json::json!("yes"));
+        inv.inputs
+            .insert("enabled".into(), serde_json::json!("yes"));
         // UnavailableBackend returns Err — proves the backend was reached.
         let ctx = MacroPlannerContext::default();
         let err = MacroPlanner::plan(&inv, &def, &ctx).unwrap_err();

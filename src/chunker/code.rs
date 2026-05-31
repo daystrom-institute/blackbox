@@ -4,7 +4,9 @@ use std::sync::{Mutex, OnceLock};
 
 use anyhow::{Context, Result, anyhow};
 use tree_sitter::Node;
-use tree_sitter_language_pack::{ProcessConfig, ProcessResult, StructureItem, StructureKind, process};
+use tree_sitter_language_pack::{
+    ProcessConfig, ProcessResult, StructureItem, StructureKind, process,
+};
 
 use super::{Chunk, Edge, SourceFormatChunker, placeholder_chunk};
 

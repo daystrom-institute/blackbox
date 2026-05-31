@@ -477,16 +477,17 @@ fn default_claude_compatible_env(
         Provider::Deepseek => ".claude-ds",
         _ => return None,
     };
-    let mut env = HashMap::from([(
-        "BRO_HARNESS_TRANSPORT".to_string(),
-        "anthropic".to_string(),
-    )]);
+    let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
 
     let settings = home_dir.join(rel_path).join("settings.json");
     if let Ok(body) = std::fs::read_to_string(&settings)
         && let Ok(v) = serde_json::from_str::<serde_json::Value>(&body)
     {
-        for key in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+        for key in [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ] {
             if let Some(val) = v["env"][key].as_str() {
                 env.insert(key.to_string(), val.to_string());
             }

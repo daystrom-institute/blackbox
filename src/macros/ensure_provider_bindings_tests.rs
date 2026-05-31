@@ -59,15 +59,36 @@ impl MockProbeRunner {
     /// existing bindings → both provider methods will be inserted.
     fn happy_path() -> Self {
         let mut r = HashMap::new();
-        r.insert("spring_markers", json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
+        r.insert(
+            "spring_markers",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
         r.insert("vaadin_markers", json!({"exists": true,  "count": 1, "matched_needles": ["com.vaadin.flow"], "files": []}));
         r.insert("guice_module",   json!({"exists": true,  "count": 1, "matched_needles": ["com.google.inject"], "files": []}));
-        r.insert("module_class",   json!({"exists": true,  "count": 1, "items": []}));
-        r.insert("ui_binding_present",           json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
-        r.insert("ui_binding_present_dot",        json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
-        r.insert("session_binding_present",       json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
-        r.insert("session_binding_present_dot",   json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
-        r.insert("provider_import_present",       json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
+        r.insert(
+            "module_class",
+            json!({"exists": true,  "count": 1, "items": []}),
+        );
+        r.insert(
+            "ui_binding_present",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
+        r.insert(
+            "ui_binding_present_dot",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
+        r.insert(
+            "session_binding_present",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
+        r.insert(
+            "session_binding_present_dot",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
+        r.insert(
+            "provider_import_present",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
         Self { responses: r }
     }
 
@@ -97,28 +118,40 @@ impl MockProbeRunner {
     /// Not a Guice module → `error.not_guice_module`.
     fn not_guice_module() -> Self {
         let mut r = Self::happy_path();
-        r.responses.insert("guice_module", json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
+        r.responses.insert(
+            "guice_module",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
         r
     }
 
     /// No Vaadin usage detected → `error.no_vaadin_detected`.
     fn no_vaadin_detected() -> Self {
         let mut r = Self::happy_path();
-        r.responses.insert("vaadin_markers", json!({"exists": false, "count": 0, "matched_needles": [], "files": []}));
+        r.responses.insert(
+            "vaadin_markers",
+            json!({"exists": false, "count": 0, "matched_needles": [], "files": []}),
+        );
         r
     }
 
     /// Module class not found → `error.module_class_not_found`.
     fn module_class_not_found() -> Self {
         let mut r = Self::happy_path();
-        r.responses.insert("module_class", json!({"exists": false, "count": 0, "items": []}));
+        r.responses.insert(
+            "module_class",
+            json!({"exists": false, "count": 0, "items": []}),
+        );
         r
     }
 
     /// Module class ambiguous (count=2) → `error.module_class_ambiguous`.
     fn module_class_ambiguous() -> Self {
         let mut r = Self::happy_path();
-        r.responses.insert("module_class", json!({"exists": true, "count": 2, "items": []}));
+        r.responses.insert(
+            "module_class",
+            json!({"exists": true, "count": 2, "items": []}),
+        );
         r
     }
 
@@ -168,7 +201,9 @@ fn load_vaadin_def() -> crate::macros::model::MacroDefinition {
     MacroRegistry::list(None)
         .into_iter()
         .find(|d| d.id == "builtin.java.vaadin.ensure_provider_bindings")
-        .expect("builtin.java.vaadin.ensure_provider_bindings must be present in builtin_definitions()")
+        .expect(
+            "builtin.java.vaadin.ensure_provider_bindings must be present in builtin_definitions()",
+        )
 }
 
 fn make_invocation(
@@ -205,10 +240,18 @@ fn vaadin_builtin_macro_loads_from_registry() {
         "no authority gates: primitive has none; got: {:?}",
         def.authority_gates
     );
-    assert_eq!(def.probes.len(), 9, "expect 9 probe slots (6 original + 2 dot-form + 1 provider_import)");
+    assert_eq!(
+        def.probes.len(),
+        9,
+        "expect 9 probe slots (6 original + 2 dot-form + 1 provider_import)"
+    );
     assert_eq!(def.refusals.len(), 5, "expect 5 refusal rules");
     // 4 rewrite ops (2 UI × 2 variants + 2 session × 2 variants) + 1 record
-    assert_eq!(def.operations.len(), 5, "expect 5 operations (4 rewrite + 1 record)");
+    assert_eq!(
+        def.operations.len(),
+        5,
+        "expect 5 operations (4 rewrite + 1 record)"
+    );
 }
 
 #[test]
@@ -235,8 +278,8 @@ fn refusal_spring_detected() {
         Box::new(MockProbeRunner::spring_detected()),
     );
     let inv = make_invocation(&def, "/tmp", "/tmp/VaadinModule.java", "VaadinModule");
-    let plan = MacroPlanner::plan(&inv, &def, &ctx)
-        .expect("plan should succeed (refusal, not error)");
+    let plan =
+        MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (refusal, not error)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
         codes.contains(&"error.spring_detected"),
@@ -253,8 +296,7 @@ fn refusal_not_guice_module() {
         Box::new(MockProbeRunner::not_guice_module()),
     );
     let inv = make_invocation(&def, "/tmp", "/tmp/VaadinModule.java", "VaadinModule");
-    let plan = MacroPlanner::plan(&inv, &def, &ctx)
-        .expect("plan should succeed (refusal)");
+    let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (refusal)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
         codes.contains(&"error.not_guice_module"),
@@ -271,8 +313,7 @@ fn refusal_no_vaadin_detected() {
         Box::new(MockProbeRunner::no_vaadin_detected()),
     );
     let inv = make_invocation(&def, "/tmp", "/tmp/VaadinModule.java", "VaadinModule");
-    let plan = MacroPlanner::plan(&inv, &def, &ctx)
-        .expect("plan should succeed (refusal)");
+    let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (refusal)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
         codes.contains(&"error.no_vaadin_detected"),
@@ -289,8 +330,7 @@ fn refusal_module_class_not_found() {
         Box::new(MockProbeRunner::module_class_not_found()),
     );
     let inv = make_invocation(&def, "/tmp", "/tmp/VaadinModule.java", "VaadinModule");
-    let plan = MacroPlanner::plan(&inv, &def, &ctx)
-        .expect("plan should succeed (refusal)");
+    let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (refusal)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
         codes.contains(&"error.module_class_not_found"),
@@ -307,8 +347,7 @@ fn refusal_module_class_ambiguous() {
         Box::new(MockProbeRunner::module_class_ambiguous()),
     );
     let inv = make_invocation(&def, "/tmp", "/tmp/VaadinModule.java", "VaadinModule");
-    let plan = MacroPlanner::plan(&inv, &def, &ctx)
-        .expect("plan should succeed (refusal)");
+    let plan = MacroPlanner::plan(&inv, &def, &ctx).expect("plan should succeed (refusal)");
     let codes: Vec<&str> = plan.refusals.iter().map(|r| r.code.as_str()).collect();
     assert!(
         codes.contains(&"error.module_class_ambiguous"),
@@ -445,8 +484,7 @@ fn fixture_path() -> std::path::PathBuf {
 fn copy_fixture(filename: &str, dest_dir: &std::path::Path) -> String {
     let src = fixture_path().join(filename);
     let dst = dest_dir.join(filename);
-    std::fs::copy(&src, &dst)
-        .unwrap_or_else(|e| panic!("copy fixture {filename}: {e}"));
+    std::fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy fixture {filename}: {e}"));
     dst.to_string_lossy().into_owned()
 }
 
@@ -468,10 +506,16 @@ fn init_git_project(project_dir: &str) {
     );
     git_ok(
         std::process::Command::new("git").args([
-            "-C", project_dir,
-            "-c", "user.email=test@example.com",
-            "-c", "user.name=Test",
-            "commit", "-q", "-m", "fixture",
+            "-C",
+            project_dir,
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "user.name=Test",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
         ]),
         "git commit",
     );
@@ -551,7 +595,11 @@ fn integration_happy_path_adds_both_provider_methods() {
         file_edit.path
     );
     // Collect all TextEdit replacements; insertions carry the new method text.
-    let combined: String = file_edit.edits.iter().map(|e| e.replacement.as_str()).collect();
+    let combined: String = file_edit
+        .edits
+        .iter()
+        .map(|e| e.replacement.as_str())
+        .collect();
     assert!(
         combined.contains("@Provides"),
         "combined replacement text must contain @Provides; got:\n{combined}"
@@ -584,7 +632,11 @@ fn integration_happy_path_adds_both_provider_methods() {
     // Lower succeeds.
     let refactor_plan =
         MacroPlanner::lower(&plan).expect("lowering should succeed for syntax-only plan");
-    assert_eq!(refactor_plan.edits.len(), 1, "expect 1 edit in lowered refactor plan");
+    assert_eq!(
+        refactor_plan.edits.len(),
+        1,
+        "expect 1 edit in lowered refactor plan"
+    );
     assert!(
         refactor_plan.file_creates.is_empty(),
         "no file creates expected"
@@ -777,7 +829,10 @@ fn integration_dot_form_ui_binding_only_session_added() {
         !plan.edits.file_edits.is_empty(),
         "expected file edits for the session provider; got none"
     );
-    let combined: String = plan.edits.file_edits.iter()
+    let combined: String = plan
+        .edits
+        .file_edits
+        .iter()
         .flat_map(|fe| fe.edits.iter().map(|e| e.replacement.as_str()))
         .collect();
     assert!(
@@ -869,7 +924,10 @@ fn integration_jakarta_provider_import_selects_sans_variant() {
         !plan.edits.file_edits.is_empty(),
         "expected file edits for both provider methods"
     );
-    let combined: String = plan.edits.file_edits.iter()
+    let combined: String = plan
+        .edits
+        .file_edits
+        .iter()
         .flat_map(|fe| fe.edits.iter().map(|e| e.replacement.as_str()))
         .collect();
     assert!(

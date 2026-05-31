@@ -178,13 +178,8 @@ impl BlackboxServer {
             exec_opts.as_ref(),
         );
         let filters = brofile_filters.unwrap_or_default();
-        let dispatch_filters = resolve_dispatch_filters(
-            provider,
-            cwd.as_deref(),
-            false,
-            &task_id,
-            Some(&filters),
-        )?;
+        let dispatch_filters =
+            resolve_dispatch_filters(provider, cwd.as_deref(), false, &task_id, Some(&filters))?;
         let effective_filters = dispatch_filters.filters.clone();
         args.extend(dispatch_filters.args);
 

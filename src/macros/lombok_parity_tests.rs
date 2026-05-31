@@ -125,7 +125,12 @@ fn macro_output_strategy(
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join(format!("{type_name}.java"));
     std::fs::write(&file, src).unwrap();
-    Some(run_macro_strategy(dir.path(), &file, type_name, Some(strategy)))
+    Some(run_macro_strategy(
+        dir.path(),
+        &file,
+        type_name,
+        Some(strategy),
+    ))
 }
 
 /// A primitive `boolean` field with a hand-rolled `getActive()` — the generated
@@ -180,10 +185,14 @@ fn macro_bulk_by_composition_over_directory() {
     let out_plain = run_macro(dir.path(), &plain, "Plain");
     let out_svc = run_macro(dir.path(), &svc, "Service");
 
-    assert!(out_pair.contains("@Getter") && !out_pair.contains("getA()"),
-        "Pair must be lombokified; got:\n{out_pair}");
-    assert!(out_plain.contains("@Getter") && !out_plain.contains("getName()"),
-        "Plain must be lombokified; got:\n{out_plain}");
+    assert!(
+        out_pair.contains("@Getter") && !out_pair.contains("getA()"),
+        "Pair must be lombokified; got:\n{out_pair}"
+    );
+    assert!(
+        out_plain.contains("@Getter") && !out_plain.contains("getName()"),
+        "Plain must be lombokified; got:\n{out_plain}"
+    );
     // Leftover: the non-POJO is untouched (no-op), not an error.
     assert_eq!(
         out_svc, svc_src,
@@ -198,23 +207,40 @@ fn macro_boolean_getter_skip_leaves_mismatch_untouched() {
     else {
         return;
     };
-    assert!(!out.contains("@Getter"), "skip must not add @Getter; got:\n{out}");
-    assert!(out.contains("public boolean getActive()"), "getActive must remain; got:\n{out}");
-    assert!(!out.contains("lombok"), "no lombok import under skip; got:\n{out}");
+    assert!(
+        !out.contains("@Getter"),
+        "skip must not add @Getter; got:\n{out}"
+    );
+    assert!(
+        out.contains("public boolean getActive()"),
+        "getActive must remain; got:\n{out}"
+    );
+    assert!(
+        !out.contains("lombok"),
+        "no lombok import under skip; got:\n{out}"
+    );
 }
 
 #[test]
 fn macro_boolean_getter_bridge_delegates_to_generated() {
     // bridge: @Getter generates isActive(); getActive() is kept but rewritten to
     // delegate, so existing callers of getActive() still compile.
-    let Some(out) =
-        macro_output_strategy("bool_bridge", "Toggle", BOOLEAN_MISMATCH_SRC, "bridge")
+    let Some(out) = macro_output_strategy("bool_bridge", "Toggle", BOOLEAN_MISMATCH_SRC, "bridge")
     else {
         return;
     };
-    assert!(out.contains("@Getter"), "bridge must add @Getter; got:\n{out}");
-    assert!(out.contains("import lombok.Getter;"), "bridge must add the import; got:\n{out}");
-    assert!(out.contains("public boolean getActive()"), "bridge keeps getActive(); got:\n{out}");
+    assert!(
+        out.contains("@Getter"),
+        "bridge must add @Getter; got:\n{out}"
+    );
+    assert!(
+        out.contains("import lombok.Getter;"),
+        "bridge must add the import; got:\n{out}"
+    );
+    assert!(
+        out.contains("public boolean getActive()"),
+        "bridge keeps getActive(); got:\n{out}"
+    );
     // The body now delegates to the generated accessor.
     let normalized: String = out.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
@@ -227,14 +253,19 @@ fn macro_boolean_getter_bridge_delegates_to_generated() {
 fn macro_boolean_getter_rename_drops_mismatch() {
     // rename: @Getter generates isActive(); getActive() is dropped (callers
     // accept the rename).
-    let Some(out) =
-        macro_output_strategy("bool_rename", "Toggle", BOOLEAN_MISMATCH_SRC, "rename")
+    let Some(out) = macro_output_strategy("bool_rename", "Toggle", BOOLEAN_MISMATCH_SRC, "rename")
     else {
         return;
     };
-    assert!(out.contains("@Getter"), "rename must add @Getter; got:\n{out}");
+    assert!(
+        out.contains("@Getter"),
+        "rename must add @Getter; got:\n{out}"
+    );
     assert!(out.contains("import lombok.Getter;"));
-    assert!(!out.contains("getActive"), "rename must drop getActive(); got:\n{out}");
+    assert!(
+        !out.contains("getActive"),
+        "rename must drop getActive(); got:\n{out}"
+    );
 }
 
 #[test]
@@ -271,7 +302,10 @@ fn macro_getters_setters_allargs_ctor() {
     // Boilerplate removed; fields preserved.
     assert!(!out.contains("getX()"), "getX must be removed; got:\n{out}");
     assert!(!out.contains("setY("), "setY must be removed; got:\n{out}");
-    assert!(!out.contains("public Point("), "ctor must be removed; got:\n{out}");
+    assert!(
+        !out.contains("public Point("),
+        "ctor must be removed; got:\n{out}"
+    );
     assert!(out.contains("private int x;") && out.contains("private int y;"));
 }
 
@@ -307,14 +341,23 @@ fn macro_data_collapse() {
     ) else {
         return;
     };
-    assert!(out.contains("@Data"), "expected @Data collapse; got:\n{out}");
+    assert!(
+        out.contains("@Data"),
+        "expected @Data collapse; got:\n{out}"
+    );
     assert!(out.contains("import lombok.Data;"));
     // The individual annotations must NOT appear (collapsed into @Data).
     for ann in ["@Getter", "@Setter", "@EqualsAndHashCode", "@ToString"] {
-        assert!(!out.contains(ann), "{ann} must be collapsed into @Data; got:\n{out}");
+        assert!(
+            !out.contains(ann),
+            "{ann} must be collapsed into @Data; got:\n{out}"
+        );
     }
     // Boilerplate + now-unused Apache imports removed.
-    assert!(!out.contains("EqualsBuilder"), "EqualsBuilder must be gone; got:\n{out}");
+    assert!(
+        !out.contains("EqualsBuilder"),
+        "EqualsBuilder must be gone; got:\n{out}"
+    );
     assert!(!out.contains("getName()") && !out.contains("hashCode()"));
     assert!(out.contains("private String name;") && out.contains("private int count;"));
 }
@@ -352,9 +395,15 @@ fn macro_value_collapse() {
     ) else {
         return;
     };
-    assert!(out.contains("@Value"), "expected @Value collapse; got:\n{out}");
+    assert!(
+        out.contains("@Value"),
+        "expected @Value collapse; got:\n{out}"
+    );
     assert!(out.contains("import lombok.Value;"));
-    assert!(!out.contains("@AllArgsConstructor"), "@AllArgsConstructor implied by @Value; got:\n{out}");
+    assert!(
+        !out.contains("@AllArgsConstructor"),
+        "@AllArgsConstructor implied by @Value; got:\n{out}"
+    );
     assert!(!out.contains("EqualsBuilder") && !out.contains("getCurrency()"));
     assert!(out.contains("private final String currency;"));
 }
@@ -376,10 +425,23 @@ fn macro_partial_per_field_getter() {
     };
     // Partial coverage → @Getter lands per-field on `first` (exactly once),
     // never class-level; the computed getSecond stays.
-    assert!(out.contains("@Getter"), "expected per-field @Getter; got:\n{out}");
-    assert_eq!(out.matches("@Getter").count(), 1, "exactly one @Getter; got:\n{out}");
-    assert!(!out.contains("getFirst()"), "getFirst must be removed; got:\n{out}");
-    assert!(out.contains("getSecond()"), "computed getSecond must remain; got:\n{out}");
+    assert!(
+        out.contains("@Getter"),
+        "expected per-field @Getter; got:\n{out}"
+    );
+    assert_eq!(
+        out.matches("@Getter").count(),
+        1,
+        "exactly one @Getter; got:\n{out}"
+    );
+    assert!(
+        !out.contains("getFirst()"),
+        "getFirst must be removed; got:\n{out}"
+    );
+    assert!(
+        out.contains("getSecond()"),
+        "computed getSecond must remain; got:\n{out}"
+    );
 }
 
 #[test]
@@ -400,7 +462,10 @@ fn macro_slf4j_logger_keeps_slf4j_imports() {
     };
     assert!(out.contains("@Slf4j") && out.contains("@Getter"));
     assert!(out.contains("import lombok.extern.slf4j.Slf4j;"));
-    assert!(!out.contains("LoggerFactory.getLogger"), "logger field must be removed; got:\n{out}");
+    assert!(
+        !out.contains("LoggerFactory.getLogger"),
+        "logger field must be removed; got:\n{out}"
+    );
     // Parity with lombokify: slf4j imports are intentionally left, not pruned.
     assert!(
         out.contains("import org.slf4j.Logger;") && out.contains("import org.slf4j.LoggerFactory;"),
@@ -428,8 +493,14 @@ fn macro_custom_hashcode_seed_keeps_methods() {
         return;
     };
     // Custom seed → decline @EqualsAndHashCode and keep both methods + imports.
-    assert!(!out.contains("@EqualsAndHashCode"), "must decline @EqualsAndHashCode; got:\n{out}");
-    assert!(out.contains("HashCodeBuilder(17, 37)"), "hashCode must be preserved; got:\n{out}");
+    assert!(
+        !out.contains("@EqualsAndHashCode"),
+        "must decline @EqualsAndHashCode; got:\n{out}"
+    );
+    assert!(
+        out.contains("HashCodeBuilder(17, 37)"),
+        "hashCode must be preserved; got:\n{out}"
+    );
     assert!(out.contains("import org.apache.commons.lang3.builder.EqualsBuilder;"));
 }
 
@@ -445,8 +516,14 @@ fn macro_javadoc_getter_skipped() {
         return;
     };
     // Documented getter is not trivial → no change.
-    assert!(!out.contains("@Getter"), "documented getter must be skipped; got:\n{out}");
-    assert!(out.contains("public String getName()"), "getter must remain; got:\n{out}");
+    assert!(
+        !out.contains("@Getter"),
+        "documented getter must be skipped; got:\n{out}"
+    );
+    assert!(
+        out.contains("public String getName()"),
+        "getter must remain; got:\n{out}"
+    );
 }
 
 #[test]
@@ -462,7 +539,16 @@ fn macro_validation_setter_skipped() {
         return;
     };
     // Getter is trivial (sole field → class-level @Getter); validation setter declined.
-    assert!(out.contains("@Getter"), "trivial getter should collapse; got:\n{out}");
-    assert!(!out.contains("@Setter"), "validation setter must be declined; got:\n{out}");
-    assert!(out.contains("Objects.requireNonNull"), "validation setter must remain; got:\n{out}");
+    assert!(
+        out.contains("@Getter"),
+        "trivial getter should collapse; got:\n{out}"
+    );
+    assert!(
+        !out.contains("@Setter"),
+        "validation setter must be declined; got:\n{out}"
+    );
+    assert!(
+        out.contains("Objects.requireNonNull"),
+        "validation setter must remain; got:\n{out}"
+    );
 }

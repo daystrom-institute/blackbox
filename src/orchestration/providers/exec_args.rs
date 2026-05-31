@@ -311,12 +311,7 @@ impl Provider {
             Provider::Vibe => {
                 // Vibe CLI has no `--model` flag; model selection is out-of-band.
                 let _ = model;
-                vec![
-                    "-p".into(),
-                    prompt.into(),
-                    "--output".into(),
-                    "json".into(),
-                ]
+                vec!["-p".into(), prompt.into(), "--output".into(), "json".into()]
             }
             Provider::Gemini => {
                 let mut args = vec![
