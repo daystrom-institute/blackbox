@@ -20,7 +20,7 @@
 //! until the seam exists. The verbose inline transcript parser (§5.4, item 14)
 //! is also a follow-up; this skeleton renders the latest assistant message.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -59,6 +59,7 @@ const COMPOSER_CHROME_COLOR: Color = Color::Rgb(90, 110, 128);
 const TOOL_CALL_GLYPH: &str = "▸";
 const ROSTER_SELECTED_MARKER: &str = "› ";
 const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
+const FINISHED_AFTER_IDLE_MS: u64 = 20 * 60 * 1000;
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -77,16 +78,19 @@ enum FleetState {
     Active,
     /// Process not live but session resumable (stop / crash / cockpit orphan).
     Interrupted,
+    /// Work has been folded down or the process completed; kept for history.
+    Finished,
 }
 
 impl FleetState {
     /// Attention order, top of the roster first.
-    const BUCKETS: [FleetState; 5] = [
+    const BUCKETS: [FleetState; 6] = [
         FleetState::Alerting,
         FleetState::Waiting,
-        FleetState::Idle,
         FleetState::Active,
+        FleetState::Idle,
         FleetState::Interrupted,
+        FleetState::Finished,
     ];
 
     fn label(self) -> &'static str {
@@ -96,6 +100,7 @@ impl FleetState {
             FleetState::Idle => "Idle",
             FleetState::Active => "Active",
             FleetState::Interrupted => "Interrupted",
+            FleetState::Finished => "Finished",
         }
     }
 
@@ -107,6 +112,7 @@ impl FleetState {
             FleetState::Waiting => ("?", Color::Yellow),
             FleetState::Alerting => ("!", Color::Red),
             FleetState::Interrupted => ("↻", Color::LightYellow),
+            FleetState::Finished => ("✓", Color::DarkGray),
         }
     }
 }
@@ -129,6 +135,14 @@ struct Agent {
     /// The initial dispatch prompt + every subsequent steer (§5.3). Recallable
     /// in the single-agent view.
     input_history: Vec<String>,
+    /// Steers successfully written to stdin but not yet replayed by the harness.
+    /// This is deliberately separate from recall history so queued rendering is
+    /// per-agent and does not reconstruct state from old transcript text.
+    pending_inputs: VecDeque<String>,
+    /// Cursor into transcript `UserSteer` echoes already reconciled against
+    /// pending stdin writes. Prevents older transcript echoes from clearing a
+    /// newly queued duplicate line.
+    seen_user_steers: usize,
 }
 
 /// Snapshot of a task's live fields, read under one lock per draw.
@@ -148,7 +162,13 @@ struct AgentView {
 impl Agent {
     fn view(&self) -> AgentView {
         let snap = self.task.snapshot();
-        let state = fleet_state_from_snapshot(snap.status, snap.turn_active, snap.needs_input);
+        let state = fleet_state_from_snapshot(
+            snap.status,
+            snap.turn_active,
+            snap.needs_input,
+            snap.worktree_finished,
+            snap.last_event_at_ms,
+        );
         let stderr_tail = if matches!(state, FleetState::Interrupted) && !snap.stderr.is_empty() {
             Some(last_line(&snap.stderr))
         } else {
@@ -173,7 +193,12 @@ fn fleet_state_from_snapshot(
     status: TaskStatus,
     turn_active: bool,
     needs_input: bool,
+    worktree_finished: bool,
+    last_activity_ms: Option<u64>,
 ) -> FleetState {
+    let stale_finished = worktree_finished
+        && last_activity_ms
+            .is_some_and(|last| now_ms_ui().saturating_sub(last) >= FINISHED_AFTER_IDLE_MS);
     match status {
         // While the process stays Running (the steady state for a persistent
         // bidi session), the live distinction comes from the event stream:
@@ -182,10 +207,10 @@ fn fleet_state_from_snapshot(
         // is a follow-on, not yet derived.
         TaskStatus::Running if turn_active => FleetState::Active,
         TaskStatus::Running if needs_input => FleetState::Waiting,
+        TaskStatus::Running if stale_finished => FleetState::Finished,
         TaskStatus::Running => FleetState::Idle,
-        // Process exit: a one-shot agent or a closed session rests at Idle
-        // (an entrypoint agent never self-completes; §5 "No Done").
-        TaskStatus::Completed => FleetState::Idle,
+        TaskStatus::Completed => FleetState::Finished,
+        TaskStatus::Failed | TaskStatus::Cancelled if stale_finished => FleetState::Finished,
         TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
     }
 }
@@ -226,6 +251,9 @@ struct App {
     zone: Zone,
     /// Index into the bucket-ordered agent list (see [`ordered_agents`]).
     roster_selected: usize,
+    /// Stable task id for the currently open single-agent view. Roster order is
+    /// live-sorted, so a row index is not a stable identity while agents update.
+    focused_agent_id: Option<String>,
     /// Index into [`FLEET_PROVIDERS`] for the provider selector.
     provider_cursor: usize,
     /// Sticky-next provider — applies to the next dispatch only (§4).
@@ -292,6 +320,7 @@ impl App {
             agents: Vec::new(),
             zone: Zone::Roster,
             roster_selected: 0,
+            focused_agent_id: None,
             provider_cursor: default_fleet_provider_cursor(),
             next_provider: default_provider,
             next_model: default_model_for(default_provider).map(str::to_string),
@@ -370,8 +399,21 @@ impl App {
     }
 
     fn selected_agent(&self) -> Option<usize> {
+        if self.zone == Zone::SingleAgent
+            && let Some(id) = &self.focused_agent_id
+            && let Some(idx) = self.agents.iter().position(|a| a.task.id() == *id)
+        {
+            return Some(idx);
+        }
         let (_, order) = self.ordered_agents();
         order.get(self.roster_selected).copied()
+    }
+
+    fn roster_position_for_agent_id(&self, id: &str) -> Option<usize> {
+        let (_, order) = self.ordered_agents();
+        order
+            .iter()
+            .position(|&idx| self.agents[idx].task.id() == id)
     }
 
     fn dispatch_current_input(&mut self) {
@@ -441,6 +483,8 @@ impl App {
             name,
             // Display the operator's own prompt, not the rider-wrapped first turn.
             input_history: vec![prompt],
+            pending_inputs: VecDeque::new(),
+            seen_user_steers: 0,
         });
         self.input.clear();
         // Persist so the session is recoverable even before it terminates.
@@ -822,6 +866,8 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
             selected_cwd: project_display_cwd(snap.cwd.as_deref()),
             name,
             input_history: Vec::new(),
+            pending_inputs: VecDeque::new(),
+            seen_user_steers: 0,
         });
     }
 
@@ -1090,6 +1136,7 @@ fn stop_or_delete_selected(app: &mut App) {
         app.activity_clocks.remove(&activity_key("agent", &id));
         app.orch.forget(&id);
         app.agents.remove(idx);
+        app.focused_agent_id = None;
         let n = app.agents.len();
         if n == 0 || app.roster_selected >= n {
             app.roster_selected = n.saturating_sub(1);
@@ -1279,12 +1326,20 @@ fn steer_selected(app: &mut App) {
     let handle = app.agents[idx].task.clone();
 
     if handle.can_steer() {
+        let transcript = app.agents[idx].task.transcript();
+        let _ = queued_user_turns(&mut app.agents[idx], &transcript);
         let text = std::mem::take(&mut app.input);
         app.history_cursor = None;
-        app.agents[idx].input_history.push(text.clone());
         match run_agent_write(app, handle.send_user_turn(&text)) {
-            Ok(()) => app.set_status("steer queued to stdin", Duration::from_secs(2)),
-            Err(e) => app.set_status(format!("steer: {e:#}"), Duration::from_secs(4)),
+            Ok(()) => {
+                app.agents[idx].input_history.push(text.clone());
+                app.agents[idx].pending_inputs.push_back(text);
+                app.set_status("steer queued to stdin", Duration::from_secs(2));
+            }
+            Err(e) => {
+                app.input = text;
+                app.set_status(format!("steer: {e:#}"), Duration::from_secs(4));
+            }
         }
     } else if provider_supports_bidi(provider) {
         resume_selected(app, idx);
@@ -1319,6 +1374,8 @@ fn resume_selected(app: &mut App, idx: usize) {
     app.agents[idx].task = handle;
     app.agents[idx].classifier = None;
     app.agents[idx].input_history.push(text);
+    app.agents[idx].pending_inputs.clear();
+    app.agents[idx].seen_user_steers = 0;
     app.orch.persist();
     app.set_status("resumed session", Duration::from_secs(3));
 }
@@ -1347,6 +1404,14 @@ where
 }
 
 fn zoom_left(app: &mut App) {
+    if app.zone == Zone::SingleAgent {
+        if let Some(id) = app.focused_agent_id.as_deref()
+            && let Some(pos) = app.roster_position_for_agent_id(id)
+        {
+            app.roster_selected = pos;
+        }
+        app.focused_agent_id = None;
+    }
     app.zone = match app.zone {
         Zone::SingleAgent => Zone::Roster,
         Zone::Roster => Zone::ProviderSelector,
@@ -1363,7 +1428,8 @@ fn zoom_right(app: &mut App) {
             app.zone = Zone::Roster;
         }
         Zone::Roster => {
-            if app.selected_agent().is_some() {
+            if let Some(idx) = app.selected_agent() {
+                app.focused_agent_id = Some(app.agents[idx].task.id());
                 app.zone = Zone::SingleAgent;
                 app.scroll_from_bottom = 0;
                 app.history_cursor = None;
@@ -1582,9 +1648,9 @@ fn fleet_counts(views: &[AgentView]) -> (usize, usize) {
 fn selected_activity_spans(
     app: &mut App,
     views: &[AgentView],
-    order: &[usize],
+    _order: &[usize],
 ) -> Vec<Span<'static>> {
-    let Some(&idx) = order.get(app.roster_selected) else {
+    let Some(idx) = app.selected_agent() else {
         return vec![Span::styled(
             "  ○ Agent idle   ·   ○ Classifier off  ",
             Style::default().fg(Color::DarkGray),
@@ -1619,7 +1685,13 @@ fn selected_activity_spans(
     if let Some(classifier) = classifier {
         let classifier_id = classifier.id();
         let snap = classifier.snapshot();
-        let state = fleet_state_from_snapshot(snap.status, snap.turn_active, snap.needs_input);
+        let state = fleet_state_from_snapshot(
+            snap.status,
+            snap.turn_active,
+            snap.needs_input,
+            snap.worktree_finished,
+            snap.last_event_at_ms,
+        );
         let classifier_key = activity_key("classifier", &classifier_id);
         let classifier_clock = sync_activity_clock(
             &mut app.activity_clocks,
@@ -1708,7 +1780,7 @@ fn single_agent_composer_top_titles(
     order: &[usize],
 ) -> Vec<Line<'static>> {
     let mut titles = vec![Line::from(selected_activity_spans(app, views, order))];
-    if let Some(&idx) = order.get(app.roster_selected) {
+    if let Some(idx) = app.selected_agent() {
         let a = &app.agents[idx];
         let v = &views[idx];
         titles.push(
@@ -1725,14 +1797,14 @@ fn single_agent_composer_top_titles(
 fn single_agent_status_spans(
     app: &App,
     views: &[AgentView],
-    order: &[usize],
+    _order: &[usize],
 ) -> Vec<Span<'static>> {
     let (active, waiting) = fleet_counts(views);
     let mut spans = Vec::new();
     let byline = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
 
-    if let Some(&idx) = order.get(app.roster_selected) {
+    if let Some(idx) = app.selected_agent() {
         let a = &app.agents[idx];
         let project = a
             .selected_cwd
@@ -1850,6 +1922,13 @@ fn activity_segment(
         )
     } else if state == FleetState::Interrupted {
         format!("↻ {label} interrupted")
+    } else if state == FleetState::Finished {
+        format!(
+            "✓ {label} finished{}",
+            since_compact(last_activity_ms, now_ms)
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default()
+        )
     } else if let Some(duration) = clock.last_duration_ms {
         format!("✓ {label} complete took {}", duration_compact(duration))
     } else {
@@ -2078,21 +2157,22 @@ fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView]) {
-    // `order` indexes into `views` (both derived from app.agents, same indexing).
-    let (_, order) = app.ordered_agents();
-    let Some(&idx) = order.get(app.roster_selected) else {
+    let Some(idx) = app.selected_agent() else {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
+        app.focused_agent_id = None;
         app.zone = Zone::Roster;
         return;
     };
     let v = &views[idx];
-    let a = &app.agents[idx];
-    let transcript = a.task.transcript();
+    let transcript = app.agents[idx].task.transcript();
     let latest_todo = latest_todo_state(&transcript);
 
     let mut transcript_area = area;
-    if let Some(todo) = latest_todo.as_ref().filter(|_| area.height >= 8) {
+    if let Some(todo) = latest_todo
+        .as_ref()
+        .filter(|todo| !todo.items.is_empty() && area.height >= 8)
+    {
         let todo_h = todo_panel_height(todo, area.height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2114,13 +2194,10 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         )));
         lines.push(Line::from(""));
     }
-    let queued = queued_user_turns(&transcript, &a.input_history);
-    lines.extend(render_transcript(
-        &transcript,
-        initial_prompt(a),
-        &queued,
-        width,
-    ));
+    let initial = initial_prompt(&app.agents[idx]).to_string();
+    let queued = queued_user_turns(&mut app.agents[idx], &transcript);
+    let queued: Vec<&str> = queued.iter().map(String::as_str).collect();
+    lines.extend(render_transcript(&transcript, &initial, &queued, width));
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let total = para.line_count(transcript_area.width.max(1));
@@ -2155,10 +2232,11 @@ fn initial_prompt(a: &Agent) -> &str {
 }
 
 fn latest_todo_state(items: &[TranscriptItem]) -> Option<TodoState> {
-    items.iter().rev().find_map(|item| match item {
+    let todo = items.iter().rev().find_map(|item| match item {
         TranscriptItem::TodoState(todo) => Some(todo.clone()),
         _ => None,
-    })
+    })?;
+    (!todo.items.is_empty()).then_some(todo)
 }
 
 fn todo_panel_height(todo: &TodoState, area_height: u16) -> u16 {
@@ -2202,29 +2280,34 @@ fn draw_todo_panel(f: &mut Frame, area: Rect, todo: &TodoState) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn queued_user_turns<'a>(items: &[TranscriptItem], history: &'a [String]) -> Vec<&'a str> {
-    let mut accepted = items
-        .iter()
-        .filter_map(|item| match item {
-            TranscriptItem::UserSteer(text) => Some(text.as_str()),
-            _ => None,
-        })
-        .peekable();
-    if let (Some(first_history), Some(first_seen)) = (history.first(), accepted.peek()) {
-        if first_history == *first_seen {
-            accepted.next();
+fn queued_user_turns(agent: &mut Agent, items: &[TranscriptItem]) -> Vec<String> {
+    reconcile_pending_user_turns(
+        &mut agent.pending_inputs,
+        &mut agent.seen_user_steers,
+        user_steers(items),
+    )
+}
+
+fn user_steers(items: &[TranscriptItem]) -> impl Iterator<Item = &str> {
+    items.iter().filter_map(|item| match item {
+        TranscriptItem::UserSteer(text) => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+fn reconcile_pending_user_turns<'a>(
+    pending: &mut VecDeque<String>,
+    seen_user_steers: &mut usize,
+    accepted: impl IntoIterator<Item = &'a str>,
+) -> Vec<String> {
+    let accepted: Vec<&str> = accepted.into_iter().collect();
+    for seen in accepted.iter().skip(*seen_user_steers) {
+        if pending.front().is_some_and(|pending| pending == *seen) {
+            pending.pop_front();
         }
     }
-    let mut queued = Vec::new();
-    for text in history.iter().skip(1) {
-        match accepted.peek() {
-            Some(seen) if *seen == text => {
-                accepted.next();
-            }
-            _ => queued.push(text.as_str()),
-        }
-    }
-    queued
+    *seen_user_steers = accepted.len();
+    pending.iter().cloned().collect()
 }
 
 /// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
@@ -2368,8 +2451,13 @@ fn render_transcript(
                 )));
             }
             TranscriptItem::TodoState(todo) => {
+                let text = if todo.items.is_empty() {
+                    "☑ todo cleared".to_string()
+                } else {
+                    format!("☑ todo {} / {} updated", todo.completed, todo.total)
+                };
                 lines.push(Line::from(Span::styled(
-                    format!("☑ todo {} / {} updated", todo.completed, todo.total),
+                    text,
                     Style::default().fg(Color::LightYellow),
                 )));
             }
@@ -2477,6 +2565,20 @@ fn shell_result_tool(name: Option<&str>) -> bool {
 }
 
 fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Line<'static>> {
+    const MAX_SHELL_RESULT_JSON_BYTES: usize = 200_000;
+    if content.len() > MAX_SHELL_RESULT_JSON_BYTES {
+        return vec![Line::from(Span::styled(
+            format!(
+                "↳ shell result too large for live render ({}); inspect transcript/tool dump",
+                bytes_compact(content.len())
+            ),
+            Style::default().fg(if is_error {
+                Color::Red
+            } else {
+                Color::DarkGray
+            }),
+        ))];
+    }
     let value = match serde_json::from_str::<serde_json::Value>(content) {
         Ok(value) => value,
         Err(_) => {
@@ -3028,19 +3130,34 @@ fn prepend_line_prefix(
 /// with a truncation rider.
 fn monospace_block(text: &str, max: usize, color: Color) -> Vec<Line<'static>> {
     let style = Style::default().fg(color);
-    let all: Vec<&str> = text.lines().collect();
-    let mut out: Vec<Line<'static>> = all
-        .iter()
+    let mut remaining = false;
+    let mut out: Vec<Line<'static>> = text
+        .lines()
         .take(max)
         .map(|l| Line::from(Span::styled(format!("    {l}"), style)))
         .collect();
-    if all.len() > max {
+    if text.lines().nth(max).is_some() {
+        remaining = true;
+    }
+    if remaining {
         out.push(Line::from(Span::styled(
-            format!("    … {} more lines", all.len() - max),
+            "    … more lines",
             Style::default().fg(Color::DarkGray),
         )));
     }
     out
+}
+
+fn bytes_compact(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    if bytes >= 1024 * 1024 {
+        format!("{:.1} MiB", bytes as f64 / MB)
+    } else if bytes >= 1024 {
+        format!("{:.1} KiB", bytes as f64 / KB)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 fn composer_display_text(input: &str) -> String {
@@ -3333,6 +3450,48 @@ mod tests {
     }
 
     #[test]
+    fn latest_todo_state_treats_empty_state_as_cleared() {
+        let items = vec![
+            TranscriptItem::TodoState(TodoState {
+                total: 1,
+                completed: 0,
+                items: vec![blackbox::fleet::TodoItem {
+                    status: TodoItemStatus::Pending,
+                    text: "keep visible".into(),
+                }],
+            }),
+            TranscriptItem::TodoState(TodoState {
+                total: 0,
+                completed: 0,
+                items: vec![],
+            }),
+        ];
+        assert_eq!(latest_todo_state(&items), None);
+    }
+
+    #[test]
+    fn fleet_state_marks_completed_and_stale_exited_as_finished() {
+        assert_eq!(
+            fleet_state_from_snapshot(TaskStatus::Completed, false, false, false, None),
+            FleetState::Finished
+        );
+        assert_eq!(
+            fleet_state_from_snapshot(
+                TaskStatus::Running,
+                false,
+                false,
+                true,
+                Some(now_ms_ui().saturating_sub(FINISHED_AFTER_IDLE_MS + 1))
+            ),
+            FleetState::Finished
+        );
+        assert_eq!(
+            fleet_state_from_snapshot(TaskStatus::Running, false, false, true, Some(now_ms_ui())),
+            FleetState::Idle
+        );
+    }
+
+    #[test]
     fn delete_previous_word_text_removes_trailing_word_and_space() {
         let mut input = "ask the model   ".to_string();
         delete_previous_word_text(&mut input);
@@ -3402,6 +3561,24 @@ mod tests {
                 .any(|line| line.contains("queued to stdin; waiting for harness echo")),
             "{rendered:?}"
         );
+    }
+
+    #[test]
+    fn queued_turn_reconcile_ignores_old_matching_echoes() {
+        let mut pending = VecDeque::from(["repeat".to_string()]);
+        let mut seen = 1;
+        let queued = reconcile_pending_user_turns(&mut pending, &mut seen, ["repeat"]);
+        assert_eq!(queued, vec!["repeat"]);
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn queued_turn_reconcile_clears_new_echoes_fifo() {
+        let mut pending = VecDeque::from(["same".to_string(), "same".to_string()]);
+        let mut seen = 1;
+        let queued = reconcile_pending_user_turns(&mut pending, &mut seen, ["same", "same"]);
+        assert_eq!(queued, vec!["same"]);
+        assert_eq!(seen, 2);
     }
 
     #[test]
@@ -3505,6 +3682,23 @@ mod tests {
         assert!(rendered.iter().any(|l| l.contains("err")), "{rendered:?}");
         assert!(
             !rendered.iter().any(|l| l.contains("exit_code")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn shell_result_renderer_skips_huge_payloads() {
+        let huge = format!(
+            r#"{{"exit_code":0,"stdout":"{}","stderr":"","running":false,"timed_out":false}}"#,
+            "x".repeat(210_000)
+        );
+        let rendered: Vec<String> = shell_result_block(&huge, false, 10)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(rendered.len(), 1);
+        assert!(
+            rendered[0].contains("shell result too large for live render"),
             "{rendered:?}"
         );
     }

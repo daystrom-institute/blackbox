@@ -412,6 +412,7 @@ impl AgentHandle {
                 .or_else(|| inner.report.as_ref().map(|r| r.message.clone())),
             needs_input: stream.needs_input,
             turn_active: stream.turn_active,
+            worktree_finished: stream.worktree_finished,
             cost_usd: inner.cost_usd,
             num_turns: inner.num_turns,
             started_at: inner.started_at,
@@ -424,6 +425,7 @@ impl AgentHandle {
             model: model_from_events(&inner.events),
             // The cockpit's durable display name (stored in bro_label, §5).
             name: inner.bro_label.clone(),
+            recoverable: inner.recoverable,
         }
     }
 
@@ -598,6 +600,23 @@ fn parse_todo_state(content: &str) -> Option<TodoState> {
     let list = value.get("list").and_then(|v| v.as_str())?;
     let items: Vec<TodoItem> = list.lines().filter_map(parse_todo_item).collect();
     if items.is_empty() {
+        let total = value
+            .get("total")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+        let completed = value
+            .get("completed")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+        if total == 0 && completed == 0 {
+            return Some(TodoState {
+                total,
+                completed,
+                items,
+            });
+        }
         return None;
     }
     let total = value
@@ -739,6 +758,8 @@ pub struct TaskSnapshot {
     /// A turn is in flight (events streaming past the last `result` boundary) —
     /// distinguishes Active from Idle while the process stays Running (§5).
     pub turn_active: bool,
+    /// True once the transcript contains a successful `exit_worktree` result.
+    pub worktree_finished: bool,
     pub cost_usd: Option<f64>,
     pub num_turns: Option<u64>,
     /// Wall-clock (ms) the session started.
@@ -750,6 +771,9 @@ pub struct TaskSnapshot {
     pub model: Option<String>,
     /// Durable display name (from `bro_label`) — survives a cockpit reload.
     pub name: Option<String>,
+    /// Loaded/orphaned tasks are marked recoverable so the cockpit can
+    /// distinguish resumable interruption from ordinary terminal state.
+    pub recoverable: bool,
 }
 
 /// Harness-envelope state derived from the raw stream-json buffer.
@@ -757,6 +781,7 @@ struct StreamState {
     turn_active: bool,
     needs_input: bool,
     report_message: Option<String>,
+    worktree_finished: bool,
 }
 
 /// Walk the stream-json events chronologically to recover state the daemon
@@ -768,14 +793,14 @@ fn derive_stream_state(events: &[serde_json::Value]) -> StreamState {
     let mut turn_active = false;
     let mut needs_input = false;
     let mut report_message = None;
+    let mut worktree_finished = false;
+    let mut tool_names: HashMap<String, String> = HashMap::new();
     for e in events {
         match e.get("type").and_then(|t| t.as_str()) {
             // A `result` closes the current turn → Idle until the next turn.
             Some("result") => turn_active = false,
-            // Assistant output / tool traffic means a turn is running. (`user`
-            // covers both a steer and a tool_result echo; either implies the
-            // model is mid-turn.)
-            Some("assistant") | Some("stream_event") | Some("user") => turn_active = true,
+            // Streaming output means a turn is running.
+            Some("stream_event") => turn_active = true,
             // The builtin report tool's status/needs signal.
             Some("report") => {
                 let r = &e["report"];
@@ -788,6 +813,16 @@ fn derive_stream_state(events: &[serde_json::Value]) -> StreamState {
                     .and_then(|n| n.as_bool())
                     .unwrap_or(false);
             }
+            Some("assistant") => {
+                remember_tool_names(e, &mut tool_names);
+                turn_active = true;
+            }
+            Some("user") => {
+                if user_event_has_successful_tool_result(e, &tool_names, "exit_worktree") {
+                    worktree_finished = true;
+                }
+                turn_active = true;
+            }
             _ => {}
         }
     }
@@ -795,7 +830,53 @@ fn derive_stream_state(events: &[serde_json::Value]) -> StreamState {
         turn_active,
         needs_input,
         report_message,
+        worktree_finished,
     }
+}
+
+fn remember_tool_names(e: &serde_json::Value, tool_names: &mut HashMap<String, String>) {
+    let Some(blocks) = e["message"]["content"].as_array() else {
+        return;
+    };
+    for b in blocks {
+        if b.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+            && let (Some(id), Some(name)) = (
+                b.get("id").and_then(|id| id.as_str()),
+                b.get("name").and_then(|name| name.as_str()),
+            )
+        {
+            tool_names.insert(id.to_string(), name.to_string());
+        }
+    }
+}
+
+fn user_event_has_successful_tool_result(
+    e: &serde_json::Value,
+    tool_names: &HashMap<String, String>,
+    tool_name: &str,
+) -> bool {
+    let Some(blocks) = e["message"]["content"].as_array() else {
+        return false;
+    };
+    blocks.iter().any(|b| {
+        if b.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            return false;
+        }
+        let Some(id) = b.get("tool_use_id").and_then(|id| id.as_str()) else {
+            return false;
+        };
+        if tool_names.get(id).map(String::as_str) != Some(tool_name) {
+            return false;
+        }
+        if b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return false;
+        }
+        let content = extract_content_text(b.get("content"));
+        serde_json::from_str::<Value>(&content)
+            .ok()
+            .and_then(|v| v.get("ok").and_then(|ok| ok.as_bool()))
+            .unwrap_or(false)
+    })
 }
 
 /// Best-effort model id from an `init`/assistant event in the stream-json buffer.
@@ -1405,6 +1486,42 @@ mod tests {
                     && items[1].status == TodoItemStatus::InProgress
                     && items[2].status == TodoItemStatus::Pending
         ));
+    }
+
+    #[test]
+    fn transcript_parses_empty_todo_write_as_clear_state() {
+        let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+        let events = vec![
+            ev(r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"todo1","name":"todo_write","input":{"items":[]}}
+            ]}}"#),
+            ev(r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"todo1","content":"{\"ok\":true,\"total\":0,\"completed\":0,\"list\":\"(todo list is empty)\"}","is_error":false}
+            ]}}"#),
+        ];
+        let items = parse_transcript(&events);
+        assert!(matches!(
+            &items[1],
+            TranscriptItem::TodoState(TodoState { total: 0, completed: 0, items })
+                if items.is_empty()
+        ));
+    }
+
+    #[test]
+    fn stream_state_detects_successful_exit_worktree() {
+        let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+        let events = vec![
+            ev(r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"exit1","name":"exit_worktree","input":{"disposition":"publish"}}
+            ]}}"#),
+            ev(r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"exit1","content":"{\"ok\":true,\"disposition\":\"publish\"}","is_error":false}
+            ]}}"#),
+            ev(r#"{"type":"result","subtype":"success"}"#),
+        ];
+        let stream = derive_stream_state(&events);
+        assert!(stream.worktree_finished);
+        assert!(!stream.turn_active);
     }
 
     #[test]
