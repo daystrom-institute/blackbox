@@ -5,7 +5,7 @@
 //! `design/fleet-tui/fleet-tui.md`.
 //!
 //! ## What this skeleton covers (net-new items 11-16)
-//! - The four-region layout (title · roster|detail · composer · help, §5).
+//! - The roster/detail · composer · footer layout (§5).
 //! - A selectable, state-grouped roster (`ListState`; none existed before).
 //! - The zoom-axis navigation model + dual-mode composer (§5.1).
 //! - The fleet-state taxonomy + attention buckets (§5 state model).
@@ -135,7 +135,6 @@ struct AgentView {
     needs_input: bool,
     model: Option<String>,
     cwd: Option<String>,
-    cost: Option<f64>,
     report_message: Option<String>,
     turns: Option<u64>,
     started_at: u64,
@@ -158,7 +157,6 @@ impl Agent {
             needs_input: snap.needs_input,
             model: snap.model,
             cwd: snap.cwd,
-            cost: snap.cost_usd,
             report_message: snap.report_message,
             turns: snap.num_turns,
             started_at: snap.started_at,
@@ -232,7 +230,7 @@ struct App {
     /// Sticky-next model and effort, scoped to [`next_provider`].
     next_model: Option<String>,
     next_effort: Option<String>,
-    /// Flash the title-bar `next:` value (yellow) until this instant, after the
+    /// Flash the footer `next:` value (yellow) until this instant, after the
     /// provider is cycled — instead of a duplicate status message.
     provider_flash_until: Option<Instant>,
     /// Selected completion in the slash-command menu (§5.1 slash carveout).
@@ -335,7 +333,7 @@ impl App {
         self.status_until = Some(Instant::now() + ttl);
     }
 
-    /// Briefly highlight the title-bar `next:` provider after it's cycled.
+    /// Briefly highlight the footer `next:` provider after it's cycled.
     fn flash_provider(&mut self) {
         self.provider_flash_until = Some(Instant::now() + Duration::from_millis(1200));
     }
@@ -1397,7 +1395,7 @@ fn cycle_provider(app: &mut App, delta: isize) {
     let cur = app.provider_cursor as isize;
     app.provider_cursor = (((cur + delta) % n + n) % n) as usize;
     set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
-    // Flash the title-bar `next:` value instead of a duplicate status line.
+    // Flash the footer `next:` value instead of a duplicate status line.
     app.flash_provider();
 }
 
@@ -1435,10 +1433,9 @@ fn draw(f: &mut Frame, app: &mut App) {
         ]
     } else {
         vec![
-            Constraint::Length(1),               // title
             Constraint::Min(0),                  // body
             Constraint::Length(composer_height), // composer
-            Constraint::Length(1),               // help
+            Constraint::Length(1),               // footer
         ]
     };
     let chunks = Layout::default()
@@ -1462,12 +1459,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     } else {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
-        draw_title(f, chunks[0], app, &views);
-        draw_roster_body(f, chunks[1], app, &views, &order);
-        draw_composer(f, chunks[2], app, None, None);
-        draw_help(f, chunks[3], app);
+        draw_roster_body(f, chunks[0], app, &views, &order);
+        draw_composer(f, chunks[1], app, None, None);
+        draw_help(f, chunks[2], app);
         if slash_active(app) {
-            draw_slash_menu(f, chunks[2], app);
+            draw_slash_menu(f, chunks[1], app);
         }
     }
 }
@@ -1563,34 +1559,7 @@ fn project_display_cwd(cwd: Option<&str>) -> Option<String> {
         .or_else(|| Some(cwd.to_string()))
 }
 
-fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
-    let (active, waiting, spend) = fleet_counts(views);
-    // The `next:` provider flashes yellow briefly when cycled (the only place it
-    // is shown — no duplicate status line).
-    let flashing = app.provider_flash_until.is_some_and(|t| Instant::now() < t);
-    let next_style = if flashing {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::DarkGray)
-    };
-    let line = Line::from(vec![
-        Span::styled(
-            "fleet",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(format!(
-            " · {active} active · {waiting} waiting · spend ${spend:.4}"
-        )),
-        Span::styled(format!("   next: {}", next_tuple(app)), next_style),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
-}
-
-fn fleet_counts(views: &[AgentView]) -> (usize, usize, f64) {
+fn fleet_counts(views: &[AgentView]) -> (usize, usize) {
     let active = views
         .iter()
         .filter(|v| v.state == FleetState::Active)
@@ -1599,8 +1568,7 @@ fn fleet_counts(views: &[AgentView]) -> (usize, usize, f64) {
         .iter()
         .filter(|v| v.state == FleetState::Waiting)
         .count();
-    let spend = views.iter().filter_map(|v| v.cost).sum();
-    (active, waiting, spend)
+    (active, waiting)
 }
 
 fn selected_activity_spans(
@@ -1698,7 +1666,7 @@ fn single_agent_status_spans(
     views: &[AgentView],
     order: &[usize],
 ) -> Vec<Span<'static>> {
-    let (active, waiting, _) = fleet_counts(views);
+    let (active, waiting) = fleet_counts(views);
     let mut spans = Vec::new();
     let byline = Style::default().fg(Color::White);
     let dim = Style::default().fg(Color::DarkGray);
@@ -3088,6 +3056,21 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         format!("{nav}  ·  Ctrl+Q quit"),
         Style::default().fg(Color::DarkGray),
     ));
+
+    let flashing = app.provider_flash_until.is_some_and(|t| Instant::now() < t);
+    let next_style = if flashing {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    spans.push(Span::styled(
+        "  ·  next: ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    spans.push(Span::styled(next_tuple(app), next_style));
+
     if let Some(s) = &app.status {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
