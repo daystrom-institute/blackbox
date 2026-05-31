@@ -5,6 +5,27 @@
       "url": "http://127.0.0.1:7264/mcp"
     }
   },
+  "pinTools": [
+    "bro_exec",
+    "bro_resume",
+    "bro_wait",
+    "bro_when_all",
+    "bbox_describe_schema",
+    "bbox_hybrid_search",
+    "bbox_inspect_entity",
+    "bbox_find_paths",
+    "bbox_bundle_evidence",
+    "bbox_knowledge",
+    "bbox_search",
+    "bbox_cite",
+    "bbox_code_symbols",
+    "bbox_code_query",
+    "bbox_code_node_describe",
+    "atom_search",
+    "atom_describe",
+    "macro_list",
+    "macro_describe"
+  ],
   "classifier": {
     "_comment": "Classifier mode is enabled by the presence of this object. Copy this file to $XDG_CONFIG_HOME/blackbox/fleet.json to validate the classifier activity strip in bro fleet.",
     "provider": "claude",

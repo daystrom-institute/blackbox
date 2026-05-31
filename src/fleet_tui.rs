@@ -21,7 +21,10 @@
 //! is also a follow-up; this skeleton renders the latest assistant message.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -39,7 +42,8 @@ use ratatui::widgets::*;
 
 use blackbox::fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, DispatchSpec, FleetOrchestrator, Provider, ResumeSpec,
-    TailEvent, TaskStatus, TranscriptItem, intern_rider, provider_supports_bidi,
+    TailEvent, TaskStatus, TodoItemStatus, TodoState, TranscriptItem, intern_rider,
+    provider_supports_bidi,
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
@@ -372,6 +376,17 @@ impl App {
             return;
         }
         let name = truncate(&prompt, NAME_LEN);
+        let worktree =
+            match prepare_dispatch_worktree(&self.orch, self.launch_cwd.as_deref(), &prompt) {
+                Ok(worktree) => worktree,
+                Err(e) => {
+                    self.set_status(
+                        format!("worktree isolation failed: {e}"),
+                        Duration::from_secs(8),
+                    );
+                    return;
+                }
+            };
 
         // Classifier companion: if enabled, prepend the intern rider to the
         // executor's first turn ONLY when suggestions will actually be relayed
@@ -382,16 +397,20 @@ impl App {
         let frame_executor = classifier_cfg
             .as_ref()
             .is_some_and(|c| c.auto_send_resolved());
-        let dispatch_prompt = if frame_executor {
-            format!("{}\n\n{}", intern_rider(), prompt)
-        } else {
-            prompt.clone()
-        };
+        let mut dispatch_prompt = String::new();
+        dispatch_prompt.push_str(&worktree.grounding);
+        dispatch_prompt.push_str("\n\n");
+        if frame_executor {
+            dispatch_prompt.push_str(&intern_rider());
+            dispatch_prompt.push_str("\n\n");
+        }
+        dispatch_prompt.push_str(&prompt);
 
         let mut spec = DispatchSpec::new(self.next_provider, dispatch_prompt);
-        spec.cwd = self.launch_cwd.clone();
+        spec.cwd = Some(worktree.cwd.clone());
         spec.model = self.next_model.clone();
         spec.effort = self.next_effort.clone();
+        spec.env_overrides = worktree.env_overrides.clone();
         spec.name = Some(name.clone());
         let task = self.orch.dispatch(spec);
         let id = task.id();
@@ -414,7 +433,7 @@ impl App {
             provider: self.next_provider,
             selected_model: self.next_model.clone(),
             selected_effort: self.next_effort.clone(),
-            selected_cwd: self.launch_cwd.clone().or_else(current_dir_string),
+            selected_cwd: Some(worktree.cwd.clone()),
             name,
             // Display the operator's own prompt, not the rider-wrapped first turn.
             input_history: vec![prompt],
@@ -424,13 +443,176 @@ impl App {
         self.orch.persist();
         self.set_status(
             format!(
-                "dispatched {} agent {}",
+                "dispatched {} agent {} in {}",
                 self.next_provider,
-                &id[..8.min(id.len())]
+                &id[..8.min(id.len())],
+                path_tail(&worktree.cwd)
             ),
             Duration::from_secs(3),
         );
     }
+}
+
+#[derive(Debug, Clone)]
+struct DispatchWorktree {
+    cwd: String,
+    grounding: String,
+    env_overrides: Option<HashMap<String, String>>,
+}
+
+fn prepare_dispatch_worktree(
+    orch: &FleetOrchestrator,
+    launch_cwd: Option<&str>,
+    prompt: &str,
+) -> Result<DispatchWorktree, String> {
+    let base_cwd = launch_cwd
+        .map(PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+        .ok_or_else(|| "cannot resolve launch cwd".to_string())?;
+    let git_root_raw = git_capture(&base_cwd, &["rev-parse", "--show-toplevel"])
+        .map_err(|e| format!("launch cwd is not inside a git repository: {e}"))?;
+    let git_root = PathBuf::from(git_root_raw.trim())
+        .canonicalize()
+        .map_err(|e| format!("canonicalizing git root: {e}"))?;
+    let base_branch = git_capture(&git_root, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .or_else(|_| git_capture(&git_root, &["rev-parse", "--abbrev-ref", "HEAD"]))
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let base_sha = git_capture(&git_root, &["rev-parse", "--short=12", "HEAD"])
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+    let base_status = git_capture(&git_root, &["status", "--short", "--branch"])
+        .unwrap_or_else(|e| format!("git status unavailable: {e}"));
+
+    let repo_name = git_root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("repo");
+    let suffix = uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(8)
+        .collect::<String>();
+    let slug = prompt_slug(prompt);
+    let branch = format!("bro-fleet/{slug}-{suffix}");
+    let worktree_dir = orch
+        .store_dir()
+        .join("worktrees")
+        .join(sanitize_path_component(repo_name));
+    fs::create_dir_all(&worktree_dir)
+        .map_err(|e| format!("creating worktree parent {}: {e}", worktree_dir.display()))?;
+    let worktree_path = worktree_dir.join(format!("{slug}-{suffix}"));
+    let add = Command::new("git")
+        .arg("-C")
+        .arg(&git_root)
+        .args(["worktree", "add", "-b"])
+        .arg(&branch)
+        .arg(&worktree_path)
+        .arg("HEAD")
+        .output()
+        .map_err(|e| format!("starting git worktree add: {e}"))?;
+    if !add.status.success() {
+        return Err(format!(
+            "git worktree add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
+    }
+    let worktree_path = worktree_path
+        .canonicalize()
+        .map_err(|e| format!("canonicalizing worktree path: {e}"))?;
+    let worktree_status = git_capture(&worktree_path, &["status", "--short", "--branch"])
+        .unwrap_or_else(|e| format!("git status unavailable: {e}"));
+
+    let mut env = HashMap::new();
+    let cargo_target = git_root.join("target");
+    if git_root.join("Cargo.toml").is_file() {
+        env.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            cargo_target.display().to_string(),
+        );
+    }
+    let env_overrides = (!env.is_empty()).then_some(env);
+    let cargo_line = env_overrides
+        .as_ref()
+        .and_then(|m| m.get("CARGO_TARGET_DIR"))
+        .map(|target| format!("\nShared Cargo target dir: {target}"))
+        .unwrap_or_default();
+
+    let grounding = format!(
+        "[fleet worktree grounding]\n\
+You are running in an isolated git worktree created for this fleet dispatch.\n\
+Worktree path: {}\n\
+Worktree branch: {branch}\n\
+Base repository: {}\n\
+Base branch/ref: {base_branch} @ {base_sha}{cargo_line}\n\
+Make code changes only inside the worktree path above unless the operator explicitly redirects you.\n\
+\n\
+Initial worktree git status:\n```text\n{}\n```\n\
+Source worktree status at dispatch time:\n```text\n{}\n```",
+        worktree_path.display(),
+        git_root.display(),
+        worktree_status.trim(),
+        base_status.trim(),
+    );
+
+    Ok(DispatchWorktree {
+        cwd: worktree_path.display().to_string(),
+        grounding,
+        env_overrides,
+    })
+}
+
+fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .map_err(|e| format!("git {}: {e}", args.join(" ")))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+    }
+}
+
+fn prompt_slug(prompt: &str) -> String {
+    let first = prompt.lines().next().unwrap_or("task");
+    let slug = sanitize_path_component(first)
+        .trim_matches('-')
+        .chars()
+        .take(36)
+        .collect::<String>();
+    if slug.is_empty() {
+        "task".to_string()
+    } else {
+        slug
+    }
+}
+
+fn sanitize_path_component(raw: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in raw.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() {
+            ch.to_ascii_lowercase()
+        } else {
+            '-'
+        };
+        if normalized == '-' {
+            if !last_dash {
+                out.push('-');
+                last_dash = true;
+            }
+        } else {
+            out.push(normalized);
+            last_dash = false;
+        }
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Attention rank for bucket ordering (lower = higher in roster).
@@ -1090,7 +1272,7 @@ fn steer_selected(app: &mut App) {
                 tracing::warn!("fleet steer failed: {e:#}");
             }
         });
-        app.set_status("steer sent", Duration::from_secs(2));
+        app.set_status("steer queued to stdin", Duration::from_secs(2));
     } else if provider_supports_bidi(provider) {
         resume_selected(app, idx);
     } else {
@@ -1326,12 +1508,6 @@ fn path_tail(p: &str) -> String {
         p.to_string()
     };
     tail
-}
-
-fn current_dir_string() -> Option<String> {
-    std::env::current_dir()
-        .ok()
-        .map(|p| p.display().to_string())
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
@@ -1801,11 +1977,24 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     let v = &views[idx];
     let a = &app.agents[idx];
     let (glyph, _) = v.state.glyph();
+    let transcript = a.task.transcript();
+    let latest_todo = latest_todo_state(&transcript);
+
+    let mut transcript_area = area;
+    if let Some(todo) = latest_todo.as_ref().filter(|_| area.height >= 8) {
+        let todo_h = todo_panel_height(todo, area.height);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(todo_h), Constraint::Min(3)])
+            .split(area);
+        draw_todo_panel(f, chunks[0], todo);
+        transcript_area = chunks[1];
+    }
 
     // Identity in the block title; per-agent stats under the composer. The body
     // opens straight into the transcript (only a failure tail leads, when the
     // agent is interrupted).
-    let width = area.width.saturating_sub(2) as usize;
+    let width = transcript_area.width.saturating_sub(2) as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(err) = &v.stderr_tail {
         lines.push(Line::from(Span::styled(
@@ -1814,20 +2003,22 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         )));
         lines.push(Line::from(""));
     }
+    let queued = queued_user_turns(&transcript, &a.input_history);
     lines.extend(render_transcript(
-        &a.task.transcript(),
+        &transcript,
         initial_prompt(a),
+        &queued,
         width,
     ));
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-    let total = para.line_count(area.width.saturating_sub(2));
+    let total = para.line_count(transcript_area.width.saturating_sub(2));
     if app.scroll_from_bottom > 0 && total > app.cached_total_lines {
         let delta = total - app.cached_total_lines;
         app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(delta);
     }
     app.cached_total_lines = total;
-    let body_h = area.height.saturating_sub(2) as usize;
+    let body_h = transcript_area.height.saturating_sub(2) as usize;
     let max_scroll = total.saturating_sub(body_h);
     let from_bottom = app.scroll_from_bottom.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(from_bottom) as u16;
@@ -1850,10 +2041,10 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ));
-    let inner = block.inner(area);
+    let inner = block.inner(transcript_area);
     app.transcript_y_range = Some((inner.y, inner.y.saturating_add(inner.height)));
     app.last_transcript_height = inner.height;
-    f.render_widget(block, area);
+    f.render_widget(block, transcript_area);
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1869,11 +2060,85 @@ fn initial_prompt(a: &Agent) -> &str {
     a.input_history.first().map(String::as_str).unwrap_or("")
 }
 
+fn latest_todo_state(items: &[TranscriptItem]) -> Option<TodoState> {
+    items.iter().rev().find_map(|item| match item {
+        TranscriptItem::TodoState(todo) => Some(todo.clone()),
+        _ => None,
+    })
+}
+
+fn todo_panel_height(todo: &TodoState, area_height: u16) -> u16 {
+    let wanted = todo.items.len().min(6) as u16 + 2;
+    wanted.max(3).min(area_height.saturating_sub(3).max(3))
+}
+
+fn draw_todo_panel(f: &mut Frame, area: Rect, todo: &TodoState) {
+    let title = format!(" todo {} / {} ", todo.completed, todo.total);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    let lines: Vec<Line<'static>> = todo
+        .items
+        .iter()
+        .take(inner.height as usize)
+        .map(|item| {
+            let (mark, style) = match item.status {
+                TodoItemStatus::Pending => ("[ ]", Style::default().fg(Color::Gray)),
+                TodoItemStatus::InProgress => ("[~]", Style::default().fg(Color::Yellow)),
+                TodoItemStatus::Completed => ("[x]", Style::default().fg(Color::DarkGray)),
+            };
+            Line::from(vec![
+                Span::styled(mark.to_string(), style),
+                Span::raw(" "),
+                Span::styled(
+                    truncate(&item.text, inner.width.saturating_sub(5) as usize),
+                    style,
+                ),
+            ])
+        })
+        .collect();
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn queued_user_turns<'a>(items: &[TranscriptItem], history: &'a [String]) -> Vec<&'a str> {
+    let mut accepted = items
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::UserSteer(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .peekable();
+    if let (Some(first_history), Some(first_seen)) = (history.first(), accepted.peek()) {
+        if first_history == *first_seen {
+            accepted.next();
+        }
+    }
+    let mut queued = Vec::new();
+    for text in history.iter().skip(1) {
+        match accepted.peek() {
+            Some(seen) if *seen == text => {
+                accepted.next();
+            }
+            _ => queued.push(text.as_str()),
+        }
+    }
+    queued
+}
+
 /// Verbose inline transcript (§5.4): render the parsed [`TranscriptItem`]s in
 /// temporal order, structure carried by markers + color rather than folding.
 fn render_transcript(
     items: &[TranscriptItem],
     initial_prompt: &str,
+    queued_turns: &[&str],
     width: usize,
 ) -> Vec<Line<'static>> {
     /// Soft caps for non-harness providers (the harness already spills oversized
@@ -1891,25 +2156,34 @@ fn render_transcript(
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !initial_prompt.is_empty() {
         // Rule sits between the user turn and the assistant response.
-        lines.extend(render_steer(initial_prompt, width));
+        let status = if items.is_empty() {
+            TurnRenderStatus::Waiting
+        } else {
+            TurnRenderStatus::Normal
+        };
+        lines.extend(render_steer_with_status(initial_prompt, width, status));
         lines.push(hr());
         lines.push(Line::from(""));
     }
-    if items.is_empty() && initial_prompt.is_empty() {
+    if items.is_empty() && initial_prompt.is_empty() && queued_turns.is_empty() {
         return vec![Line::from(Span::styled(
             "  (no output yet)",
             Style::default().fg(Color::DarkGray),
         ))];
     }
 
-    for item in items {
+    for (idx, item) in items.iter().enumerate() {
         let before = lines.len();
         let mut compact_tool_call = false;
         match item {
             // Each steer is followed by the turn rule (user → assistant
             // boundary); the assistant response renders after it.
             TranscriptItem::UserSteer(t) => {
-                lines.extend(render_steer(t, width));
+                lines.extend(render_steer_with_status(
+                    t,
+                    width,
+                    turn_render_status(items, idx),
+                ));
                 lines.push(hr());
             }
             TranscriptItem::AssistantText(t) => lines.extend(render_markdown(t)),
@@ -1996,6 +2270,12 @@ fn render_transcript(
                     Style::default().fg(color).add_modifier(Modifier::BOLD),
                 )));
             }
+            TranscriptItem::TodoState(todo) => {
+                lines.push(Line::from(Span::styled(
+                    format!("☑ todo {} / {} updated", todo.completed, todo.total),
+                    Style::default().fg(Color::LightYellow),
+                )));
+            }
             TranscriptItem::CompactBoundary { trigger } => {
                 lines.push(Line::from(Span::styled(
                     format!("── compacted ({trigger}) ──"),
@@ -2013,7 +2293,56 @@ fn render_transcript(
             lines.push(Line::from(""));
         }
     }
+    for queued in queued_turns {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        lines.extend(render_steer_with_status(
+            queued,
+            width,
+            TurnRenderStatus::Queued,
+        ));
+        lines.push(hr());
+    }
     lines
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TurnRenderStatus {
+    Normal,
+    Queued,
+    Waiting,
+    EmptyResult,
+}
+
+fn turn_render_status(items: &[TranscriptItem], idx: usize) -> TurnRenderStatus {
+    let mut saw_any = false;
+    let mut saw_modelish = false;
+    let mut saw_footer = false;
+    for item in items.iter().skip(idx + 1) {
+        if matches!(item, TranscriptItem::UserSteer(_)) {
+            break;
+        }
+        saw_any = true;
+        match item {
+            TranscriptItem::TurnFooter { .. } => saw_footer = true,
+            TranscriptItem::AssistantText(_)
+            | TranscriptItem::Thinking(_)
+            | TranscriptItem::ToolCall { .. }
+            | TranscriptItem::ToolResult { .. }
+            | TranscriptItem::Report { .. }
+            | TranscriptItem::TodoState(_)
+            | TranscriptItem::CompactBoundary { .. } => saw_modelish = true,
+            TranscriptItem::UserSteer(_) => {}
+        }
+    }
+    if !saw_any {
+        TurnRenderStatus::Waiting
+    } else if saw_footer && !saw_modelish {
+        TurnRenderStatus::EmptyResult
+    } else {
+        TurnRenderStatus::Normal
+    }
 }
 
 fn tool_call_style() -> Style {
@@ -2039,7 +2368,11 @@ fn tool_result_is_verbose(name: Option<&str>) -> bool {
 
 fn is_internal_tool(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    n == "tool_search" || n == "tool_search_tool" || n.starts_with("tool_search.")
+    n == "report"
+        || n == "todo_write"
+        || n == "tool_search"
+        || n == "tool_search_tool"
+        || n.starts_with("tool_search.")
 }
 
 fn shell_result_tool(name: Option<&str>) -> bool {
@@ -2233,8 +2566,16 @@ fn compact_string_arg(s: &str) -> String {
     }
 }
 
-/// Accented user-turn block (exact causal/temporal ordering, §5.4).
+#[cfg(test)]
 fn render_steer(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_steer_with_status(text, width, TurnRenderStatus::Normal)
+}
+
+fn render_steer_with_status(
+    text: &str,
+    width: usize,
+    status: TurnRenderStatus,
+) -> Vec<Line<'static>> {
     let user_bg = Color::Rgb(38, 42, 46);
     let gutter = Style::default()
         .fg(Color::LightBlue)
@@ -2242,11 +2583,33 @@ fn render_steer(text: &str, width: usize) -> Vec<Line<'static>> {
         .add_modifier(Modifier::BOLD);
     let bg = Style::default().bg(user_bg);
     let content_width = width.saturating_sub(2).max(1);
-    render_markdown(text.trim_matches('\n'))
+    let mut out: Vec<Line<'static>> = render_markdown(text.trim_matches('\n'))
         .into_iter()
         .flat_map(|line| wrap_line_by_chars(line, content_width))
         .map(|line| prepend_line_prefix(line, "▌ ", gutter, bg))
-        .collect()
+        .collect();
+    let Some(label) = turn_status_label(status) else {
+        return out;
+    };
+    out.push(prepend_line_prefix(
+        Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::DarkGray).bg(user_bg),
+        )),
+        "▌ ",
+        gutter,
+        bg,
+    ));
+    out
+}
+
+fn turn_status_label(status: TurnRenderStatus) -> Option<&'static str> {
+    match status {
+        TurnRenderStatus::Normal => None,
+        TurnRenderStatus::Queued => Some("queued to stdin; waiting for harness echo"),
+        TurnRenderStatus::Waiting => Some("accepted; waiting for model output"),
+        TurnRenderStatus::EmptyResult => Some("turn ended with no model output"),
+    }
 }
 
 fn wrap_line_by_chars(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
@@ -2723,7 +3086,7 @@ mod tests {
                 args: r#"{"cmd":"cargo test"}"#.into(),
             },
         ];
-        let rendered: Vec<String> = render_transcript(&items, "", 100)
+        let rendered: Vec<String> = render_transcript(&items, "", &[], 100)
             .iter()
             .map(line_text)
             .collect();
@@ -2764,7 +3127,112 @@ mod tests {
     fn internal_tool_search_is_hidden() {
         assert!(is_internal_tool("tool_search"));
         assert!(is_internal_tool("tool_search_tool"));
+        assert!(is_internal_tool("report"));
+        assert!(is_internal_tool("todo_write"));
         assert!(!is_internal_tool("shell_run"));
+    }
+
+    #[test]
+    fn render_transcript_marks_empty_completed_turn() {
+        let items = vec![
+            TranscriptItem::UserSteer("again".into()),
+            TranscriptItem::TurnFooter {
+                num_turns: Some(2),
+                cost_usd: Some(0.0),
+            },
+        ];
+        let rendered: Vec<String> = render_transcript(&items, "", &[], 100)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("turn ended with no model output")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_transcript_shows_queued_local_turns() {
+        let rendered: Vec<String> = render_transcript(&[], "initial", &["later"], 100)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered
+                .iter()
+                .any(|line| line.contains("queued to stdin; waiting for harness echo")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn prompt_slug_is_stable_and_path_safe() {
+        assert_eq!(prompt_slug("Fix TUI/harness gaps!"), "fix-tui-harness-gaps");
+        assert_eq!(prompt_slug("!!!"), "task");
+    }
+
+    #[test]
+    fn prepare_dispatch_worktree_creates_isolated_git_worktree() {
+        let repo = tempfile::tempdir().unwrap();
+        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["config", "user.email", "test@example.com"]);
+        run_git(repo.path(), &["config", "user.name", "Test User"]);
+        std::fs::write(repo.path().join("Cargo.toml"), "[workspace]\n").unwrap();
+        std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
+        run_git(repo.path(), &["add", "."]);
+        run_git(repo.path(), &["commit", "-m", "init"]);
+
+        let store = tempfile::tempdir().unwrap();
+        let orch = FleetOrchestrator::new(store.path().join("fleet"));
+        let worktree = prepare_dispatch_worktree(
+            &orch,
+            Some(repo.path().to_str().unwrap()),
+            "Fix the launch flow",
+        )
+        .unwrap();
+
+        let cwd = PathBuf::from(&worktree.cwd);
+        assert!(cwd.join("README.md").is_file());
+        assert!(worktree.grounding.contains("isolated git worktree"));
+        assert!(worktree.grounding.contains("Worktree branch: bro-fleet/"));
+        assert_eq!(
+            worktree
+                .env_overrides
+                .as_ref()
+                .and_then(|m| m.get("CARGO_TARGET_DIR"))
+                .map(String::as_str),
+            Some(
+                repo.path()
+                    .canonicalize()
+                    .unwrap()
+                    .join("target")
+                    .to_str()
+                    .unwrap()
+            )
+        );
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", &worktree.cwd],
+        );
+    }
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed:\nstdout={}\nstderr={}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     #[test]

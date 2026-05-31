@@ -56,6 +56,17 @@ pub struct FleetConfig {
     #[serde(default, rename = "mcpServers")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 
+    /// Extra harness tools to pin into the hot tool surface for every fleet
+    /// agent. Fleet also contributes [`DEFAULT_FLEET_PIN_TOOLS`], so this field
+    /// is additive rather than replacing the core grounding surface.
+    #[serde(
+        default,
+        rename = "pinTools",
+        alias = "pinnedTools",
+        alias = "pin_tools"
+    )]
+    pub pin_tools: Vec<String>,
+
     /// Experimental classifier-companion ("intern") config. When present, every
     /// executor dispatched from the cockpit gets a paired classifier session
     /// that watches its activity and suggests tools/atoms/skills/strategies. See
@@ -146,6 +157,23 @@ pub const INTERN_PREFIX: &str = "[INTERN]";
 /// cockpit can keep them out of the roster (and skip them on reload).
 pub const CLASSIFIER_NAME_PREFIX: &str = "\u{27c2}intern:";
 
+/// Fleet-mode hot tools. Setting `BRO_HARNESS_PIN_TOOLS` replaces the harness
+/// defaults, so fleet supplies both the existing clipboard/slice affordances
+/// and its mandatory grounding tools when launching Brodex/GLM/DeepSeek agents.
+const DEFAULT_FLEET_PIN_TOOLS: &[&str] = &[
+    "bbox_slice_*",
+    "clip_yank",
+    "clip_paste",
+    "clip_transform",
+    "clip_slice",
+    "clip_grep",
+    "bbox_describe_schema",
+    "bbox_hybrid_search",
+    "bbox_inspect_entity",
+    "bbox_find_paths",
+    "bbox_bundle_evidence",
+];
+
 /// Default classifier prompt. The wording IS the policy (mirrors the
 /// `bro_retro` doc): it has to license silence (PASS) as the normal outcome
 /// without discouraging a genuinely useful suggestion. Calibration phrases here
@@ -202,6 +230,24 @@ impl FleetConfig {
                 Self::default()
             }
         }
+    }
+}
+
+impl FleetConfig {
+    fn resolved_pin_tools(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for tool in DEFAULT_FLEET_PIN_TOOLS
+            .iter()
+            .copied()
+            .map(str::to_string)
+            .chain(self.pin_tools.iter().cloned())
+        {
+            let tool = tool.trim();
+            if !tool.is_empty() && !out.iter().any(|existing| existing == tool) {
+                out.push(tool.to_string());
+            }
+        }
+        out
     }
 }
 
@@ -413,6 +459,8 @@ pub enum TranscriptItem {
     },
     /// The builtin `report` tool's status line (`◆`, §2.2).
     Report { message: String, needs_input: bool },
+    /// Current shared TodoWrite state, parsed from the `todo_write` tool result.
+    TodoState(TodoState),
     /// A `/compact` or auto-compaction boundary divider (§2.4).
     CompactBoundary { trigger: String },
     /// End-of-turn footer with usage/cost.
@@ -420,6 +468,26 @@ pub enum TranscriptItem {
         num_turns: Option<u64>,
         cost_usd: Option<f64>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TodoState {
+    pub total: usize,
+    pub completed: usize,
+    pub items: Vec<TodoItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoItem {
+    pub status: TodoItemStatus,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoItemStatus {
+    Pending,
+    InProgress,
+    Completed,
 }
 
 /// Parse the raw stream-json buffer into ordered transcript items (§5.4 — the
@@ -484,11 +552,18 @@ fn parse_user_event(
                     Some("tool_result") => {
                         let (content, rider) =
                             split_window0_rider(extract_content_text(b.get("content")));
+                        let tool = b
+                            .get("tool_use_id")
+                            .and_then(|i| i.as_str())
+                            .and_then(|id| tool_names.get(id).cloned());
+                        if tool.as_deref() == Some("todo_write") {
+                            if let Some(todo) = parse_todo_state(&content) {
+                                out.push(TranscriptItem::TodoState(todo));
+                                continue;
+                            }
+                        }
                         out.push(TranscriptItem::ToolResult {
-                            tool: b
-                                .get("tool_use_id")
-                                .and_then(|i| i.as_str())
-                                .and_then(|id| tool_names.get(id).cloned()),
+                            tool,
                             content,
                             is_error: b.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
                             rider,
@@ -511,6 +586,58 @@ fn parse_user_event(
         }
         _ => {}
     }
+}
+
+fn parse_todo_state(content: &str) -> Option<TodoState> {
+    let value: Value = serde_json::from_str(content).ok()?;
+    if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+        return None;
+    }
+    let list = value.get("list").and_then(|v| v.as_str())?;
+    let items: Vec<TodoItem> = list.lines().filter_map(parse_todo_item).collect();
+    if items.is_empty() {
+        return None;
+    }
+    let total = value
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or(items.len());
+    let completed = value
+        .get("completed")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize)
+        .unwrap_or_else(|| {
+            items
+                .iter()
+                .filter(|i| i.status == TodoItemStatus::Completed)
+                .count()
+        });
+    Some(TodoState {
+        total,
+        completed,
+        items,
+    })
+}
+
+fn parse_todo_item(line: &str) -> Option<TodoItem> {
+    let trimmed = line.trim();
+    let (status, text) = if let Some(rest) = trimmed.strip_prefix("[ ]") {
+        (TodoItemStatus::Pending, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("[~]") {
+        (TodoItemStatus::InProgress, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("[x]") {
+        (TodoItemStatus::Completed, rest)
+    } else if let Some(rest) = trimmed.strip_prefix("[X]") {
+        (TodoItemStatus::Completed, rest)
+    } else {
+        return None;
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| TodoItem {
+        status,
+        text: text.to_string(),
+    })
 }
 
 /// An `assistant` event carries text / thinking / tool_use content blocks.
@@ -692,6 +819,9 @@ pub struct FleetOrchestrator {
     /// Experimental classifier-companion config from `fleet.json`; `None` when
     /// the feature is off.
     classifier: Option<ClassifierConfig>,
+    /// Resolved fleet-level hot tools injected into Brodex-family harness
+    /// children through `BRO_HARNESS_PIN_TOOLS`.
+    pin_tools: Vec<String>,
 }
 
 impl FleetOrchestrator {
@@ -709,6 +839,7 @@ impl FleetOrchestrator {
             store_dir,
             mcp_servers: BTreeMap::new(),
             classifier: None,
+            pin_tools: Vec::new(),
         }
     }
 
@@ -727,6 +858,7 @@ impl FleetOrchestrator {
         // TUI-local MCP servers injected into every dispatched agent (§5.2),
         // plus the optional classifier-companion config — loaded once.
         let cfg = FleetConfig::load();
+        orch.pin_tools = cfg.resolved_pin_tools();
         orch.mcp_servers = cfg.mcp_servers;
         orch.classifier = cfg.classifier;
         Ok(orch)
@@ -809,7 +941,10 @@ impl FleetOrchestrator {
             &self.store_dir,
             None,
         );
-        let env_overrides = merge_env(resolved_env, spec.env_overrides);
+        let env_overrides = merge_env(
+            merge_env(resolved_env, self.pin_tools_env(spec.provider)),
+            spec.env_overrides,
+        );
 
         // Fleet agents are entrypoint agents, not bros, so `bro_label` carries no
         // team/brofile meaning here — the cockpit reuses it as the durable
@@ -872,7 +1007,10 @@ impl FleetOrchestrator {
             &self.store_dir,
             None,
         );
-        let env_overrides = merge_env(resolved_env, spec.env_overrides);
+        let env_overrides = merge_env(
+            merge_env(resolved_env, self.pin_tools_env(spec.provider)),
+            spec.env_overrides,
+        );
         let seed = bidi_seeds_turn1_via_stdin(spec.provider).then(|| spec.prompt.clone());
         self.launch_interactive(
             task_id,
@@ -951,6 +1089,16 @@ impl FleetOrchestrator {
         }
         handle
     }
+
+    fn pin_tools_env(&self, provider: Provider) -> Option<HashMap<String, String>> {
+        if self.pin_tools.is_empty() || !provider_uses_bro_harness(provider) {
+            return None;
+        }
+        Some(HashMap::from([(
+            "BRO_HARNESS_PIN_TOOLS".to_string(),
+            self.pin_tools.join(","),
+        )]))
+    }
 }
 
 /// First line of the prompt, capped — the durable display name for a session.
@@ -996,6 +1144,13 @@ pub fn provider_supports_bidi(provider: Provider) -> bool {
 /// would double the first turn. Hence: seed via stdin for Claude only.
 fn bidi_seeds_turn1_via_stdin(provider: Provider) -> bool {
     matches!(provider, Provider::Claude)
+}
+
+fn provider_uses_bro_harness(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Glm | Provider::Deepseek | Provider::Brodex
+    )
 }
 
 /// One NDJSON user-turn message for the harness/Claude input stream
@@ -1081,6 +1236,15 @@ mod tests {
         // must deserialize, not error — mcpServers defaults to empty.
         let cfg: FleetConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn fleet_config_pin_tools_are_additive_to_grounding_defaults() {
+        let cfg: FleetConfig = serde_json::from_str(r#"{ "pinTools": ["extra_tool"] }"#).unwrap();
+        let pins = cfg.resolved_pin_tools();
+        assert!(pins.iter().any(|p| p == "bbox_describe_schema"));
+        assert!(pins.iter().any(|p| p == "bbox_hybrid_search"));
+        assert!(pins.iter().any(|p| p == "extra_tool"));
     }
 
     #[test]
@@ -1215,6 +1379,29 @@ mod tests {
                 num_turns: Some(2),
                 cost_usd: Some(_)
             }
+        ));
+    }
+
+    #[test]
+    fn transcript_parses_todo_write_result_as_todo_state() {
+        let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+        let events = vec![
+            ev(r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"todo1","name":"todo_write","input":{"items":[]}}
+            ]}}"#),
+            ev(r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"todo1","content":"{\"ok\":true,\"total\":3,\"completed\":1,\"list\":\"[x] Done\\n[~] Doing\\n[ ] Later\"}","is_error":false}
+            ]}}"#),
+        ];
+        let items = parse_transcript(&events);
+        assert!(matches!(&items[0], TranscriptItem::ToolCall { name, .. } if name == "todo_write"));
+        assert!(matches!(
+            &items[1],
+            TranscriptItem::TodoState(TodoState { total: 3, completed: 1, items })
+                if items.len() == 3
+                    && items[0].status == TodoItemStatus::Completed
+                    && items[1].status == TodoItemStatus::InProgress
+                    && items[2].status == TodoItemStatus::Pending
         ));
     }
 

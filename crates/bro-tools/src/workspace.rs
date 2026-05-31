@@ -36,10 +36,19 @@ pub(crate) fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf>
 /// Resolve a read-only file path. Normal worktree confinement still applies,
 /// but explicit `@...` file mentions get Codex-style handling: `@relative/path`
 /// strips the marker and resolves inside the worktree, while `@/abs/path.md`
-/// can read instruction docs outside the worktree. This is intentionally not
-/// used by write/edit/shell tools.
+/// can read instruction docs outside the worktree. Harness-owned dump files are
+/// also readable by absolute path so oversized tool-result riders can point at
+/// a lossless recovery path. This is intentionally not used by write/edit/shell
+/// tools.
 fn resolve_read_path(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let Some(stripped) = raw.strip_prefix('@') else {
+        let path = Path::new(raw);
+        if path.is_absolute() {
+            let normalized = normalize_lexical(path);
+            if is_allowed_harness_dump(&normalized) {
+                return Ok(normalized);
+            }
+        }
         return resolve_in_root(root, raw);
     };
     if stripped.is_empty() {
@@ -48,12 +57,32 @@ fn resolve_read_path(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
     let path = Path::new(stripped);
     if path.is_absolute() {
         let normalized = normalize_lexical(path);
-        if is_allowed_external_instruction_doc(&normalized) {
+        if is_allowed_external_instruction_doc(&normalized) || is_allowed_harness_dump(&normalized)
+        {
             return Ok(normalized);
         }
         anyhow::bail!("external @ file mention is not an allowed instruction doc: {raw}");
     }
     resolve_in_root(root, stripped)
+}
+
+fn is_allowed_harness_dump(path: &Path) -> bool {
+    harness_dump_roots()
+        .into_iter()
+        .any(|root| path.starts_with(root))
+}
+
+fn harness_dump_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(home) = std::env::var("BRO_HOME") {
+        roots.push(normalize_lexical(
+            &PathBuf::from(home).join("harness-dumps"),
+        ));
+    }
+    roots.push(normalize_lexical(
+        &std::env::temp_dir().join("bro-harness-dumps"),
+    ));
+    roots
 }
 
 fn is_allowed_external_instruction_doc(path: &Path) -> bool {
@@ -152,7 +181,7 @@ impl Tool for FileRead {
         "file_read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 text file in the worktree. Supports explicit @file mentions: @relative/path resolves inside the worktree, and @/absolute/instruction.md can read instruction docs outside it. Optionally restrict to a 1-based [start_line, end_line] range. Returns at most max_lines lines (default 2000); the read stops early at the range/cap rather than loading the whole file. Set line_numbers=true to prefix each line with its 1-based number."
+        "Read a UTF-8 text file in the worktree. Supports explicit @file mentions: @relative/path resolves inside the worktree, and @/absolute/instruction.md can read instruction docs outside it. Absolute harness dump paths from oversized tool-result riders are also readable. Optionally restrict to a 1-based [start_line, end_line] range. Returns at most max_lines lines (default 2000); the read stops early at the range/cap rather than loading the whole file. Set line_numbers=true to prefix each line with its 1-based number."
     }
     fn input_schema(&self) -> Value {
         schema_for::<FileReadInput>()
@@ -943,7 +972,7 @@ impl Tool for SmartRead {
         "smart_read"
     }
     fn description(&self) -> &str {
-        "Read a file; small files are returned whole, large files are summarized as a definition outline (with line numbers) plus a head sample, so you can then file_read specific ranges. Supports @file mention syntax with the same read-only instruction-doc carveout as file_read."
+        "Read a file; small files are returned whole, large files are summarized as a definition outline (with line numbers) plus a head sample, so you can then file_read specific ranges. Supports @file mention syntax and absolute harness dump paths with the same read-only external carveouts as file_read."
     }
     fn input_schema(&self) -> Value {
         schema_for::<SmartReadInput>()
@@ -1162,6 +1191,40 @@ mod tests {
             ToolResult::Text(t) => assert_eq!(t, "global blackbox instructions"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn file_read_allows_harness_dump_absolute_path() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let dump_root = std::env::temp_dir()
+            .join("bro-harness-dumps")
+            .join(format!("workspace-read-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dump_root);
+        let dump = dump_root.join("tool-tu_1.txt");
+        std::fs::create_dir_all(dump.parent().unwrap()).unwrap();
+        std::fs::write(&dump, "full spilled payload\n").unwrap();
+        let cx = cx_at(&root);
+
+        let r = FileRead
+            .call(json!({"file_path": dump.display().to_string()}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => assert_eq!(t, "full spilled payload"),
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        let r = FileRead
+            .call(
+                json!({"file_path": root.parent().unwrap().join("x.txt").display().to_string()}),
+                &cx,
+            )
+            .await;
+        assert!(
+            r.is_error(),
+            "absolute non-dump path should remain confined: {r:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dump_root);
     }
 
     #[tokio::test]

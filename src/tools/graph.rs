@@ -1,6 +1,7 @@
 use crate::mcp_tools;
 use crate::mcp_tools::blame::BlameParams;
 use crate::mcp_tools::bundle_evidence::BundleEvidenceParams;
+use crate::mcp_tools::describe_schema::DescribeSchemaOptions;
 use crate::mcp_tools::find_paths::FindPathsParams;
 use crate::mcp_tools::inspect::InspectEntityParams;
 use crate::mcp_tools::provenance::ProvenanceParams;
@@ -32,6 +33,27 @@ pub(crate) struct EdgeCompactParams {
     /// rebuild. Defaults to false because graph rebuilds can be expensive while
     /// legacy sidecars are still large.
     pub rebuild: Option<bool>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DescribeSchemaParams {
+    /// Include the installed-agent catalog. Default false: compact orientation
+    /// returns graph vocabulary/traversal tips without the potentially large
+    /// agent list.
+    pub include_agents: Option<bool>,
+    /// Convenience mode. `full` includes installed agents; `orientation` keeps
+    /// the compact default.
+    pub mode: Option<String>,
+}
+
+impl DescribeSchemaParams {
+    fn include_agents_resolved(&self) -> bool {
+        self.include_agents.unwrap_or_else(|| {
+            self.mode
+                .as_deref()
+                .is_some_and(|m| matches!(m, "full" | "agents"))
+        })
+    }
 }
 
 #[tool_router(router = graph_tools)]
@@ -66,12 +88,22 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_describe_schema",
-        description = "Catalog agentic-corpus entity types, edge families, and installed agents. Use before bbox_inspect_entity, bbox_find_paths, or evidence bundling when you need the graph vocabulary, filterable fields, population counts, or traversal tips. Also use for installed-agent discovery: the agents section lists name, version, description, when_to_use, anti_patterns, cost_class, and example invocation for every active agent, grouped by dispatch_adapter."
+        description = "Catalog agentic-corpus entity types and edge families. Default is compact orientation for grounding: graph vocabulary, filterable fields, population counts, and traversal tips without the installed-agent catalog. Pass include_agents=true or mode=\"full\" only when you need installed-agent discovery."
     )]
-    pub(crate) fn bbox_describe_schema(&self) -> CallToolResult {
+    pub(crate) fn bbox_describe_schema(
+        &self,
+        Parameters(p): Parameters<DescribeSchemaParams>,
+    ) -> CallToolResult {
         Self::run("bbox_describe_schema", || {
-            let agents = self.build_agent_schema_entries();
-            mcp_tools::describe_schema::describe_schema(&self.describe_schema_counts(), &agents)
+            let include_agents = p.include_agents_resolved();
+            let agents = include_agents
+                .then(|| self.build_agent_schema_entries())
+                .unwrap_or_default();
+            mcp_tools::describe_schema::describe_schema_with_options(
+                &self.describe_schema_counts(),
+                &agents,
+                DescribeSchemaOptions { include_agents },
+            )
         })
     }
 
@@ -213,7 +245,7 @@ mod tests {
         wire["content"][0]["text"].as_str().unwrap().to_string()
     }
     #[test]
-    fn bbox_describe_schema_includes_installed_agents() {
+    fn bbox_describe_schema_omits_installed_agents_by_default() {
         let tmp = tempfile::tempdir().unwrap();
         let server = test_server(&tmp);
         let cat = server.state.artifacts.read();
@@ -258,9 +290,72 @@ mod tests {
         .unwrap();
         drop(cat);
 
-        let result = server.bbox_describe_schema();
+        let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams::default()));
         assert_ne!(result.is_error, Some(true));
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["agents_omitted"].as_bool(), Some(true));
+        assert_eq!(body["agents"].as_array().unwrap().len(), 0);
+        assert!(
+            body["text"]
+                .as_str()
+                .unwrap()
+                .contains("Omitted from compact orientation")
+        );
+    }
+
+    #[test]
+    fn bbox_describe_schema_includes_installed_agents_when_requested() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = test_server(&tmp);
+        let cat = server.state.artifacts.read();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "schema-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "schema-tester",
+                "version": 1,
+                "manifest": {
+                    "description": "Agent for schema test.",
+                    "when_to_use": ["use when testing schema"],
+                    "anti_patterns": ["do not use in prod"],
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "normal",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        cat.install_value(
+            artifacts::ArtifactKind::Agent,
+            "badgey-agent.json".into(),
+            &serde_json::json!({
+                "kind": "agent",
+                "name": "badgey-agent",
+                "version": 3,
+                "manifest": {
+                    "description": "Badgey-backed agent.",
+                    "brofile_inline": {"provider": "claude"},
+                    "cost_class": "cheap",
+                    "dispatch_adapter": "badgey",
+                },
+            }),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        drop(cat);
+
+        let result = server.bbox_describe_schema(Parameters(DescribeSchemaParams {
+            include_agents: Some(true),
+            mode: None,
+        }));
+        assert_ne!(result.is_error, Some(true));
+        let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+        assert_eq!(body["agents_omitted"].as_bool(), Some(false));
         let agents = body["agents"].as_array().expect("agents array");
         assert_eq!(agents.len(), 2);
         let schema_tester = agents

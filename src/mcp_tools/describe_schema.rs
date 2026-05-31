@@ -27,9 +27,31 @@ pub struct ConsultantSchemaEntry {
     pub anti_patterns: Vec<&'static str>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct DescribeSchemaOptions {
+    pub include_agents: bool,
+}
+
+impl Default for DescribeSchemaOptions {
+    fn default() -> Self {
+        Self {
+            include_agents: true,
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn describe_schema(
     counts: &BTreeMap<String, usize>,
     agents: &[AgentSchemaEntry],
+) -> anyhow::Result<String> {
+    describe_schema_with_options(counts, agents, DescribeSchemaOptions::default())
+}
+
+pub fn describe_schema_with_options(
+    counts: &BTreeMap<String, usize>,
+    agents: &[AgentSchemaEntry],
+    options: DescribeSchemaOptions,
 ) -> anyhow::Result<String> {
     let vertex_types = providers::all_providers()
         .iter()
@@ -47,15 +69,24 @@ pub fn describe_schema(
         })
         .collect::<Vec<_>>();
     let edge_families = edge_families();
-    let agents_by_adapter = group_agents_by_adapter(agents);
+    let included_agents = if options.include_agents { agents } else { &[] };
+    let agents_by_adapter = group_agents_by_adapter(included_agents);
     let consultants = consultants();
-    let text = render_text(&vertex_types, &edge_families, agents, &consultants);
+    let text = render_text(
+        &vertex_types,
+        &edge_families,
+        included_agents,
+        &consultants,
+        !options.include_agents,
+    );
     let response = json!({
         "status": "ok",
         "text": text,
         "vertex_types": vertex_types,
         "edge_families": edge_families,
-        "agents": agents,
+        "agents": included_agents,
+        "agents_omitted": !options.include_agents,
+        "agents_hint": "Pass include_agents=true or mode=\"full\" to include the installed-agent catalog.",
         "agents_by_dispatch_adapter": agents_by_adapter,
         "consultants": consultants,
     });
@@ -67,6 +98,7 @@ fn render_text(
     edge_families: &[serde_json::Value],
     agents: &[AgentSchemaEntry],
     consultants: &[ConsultantSchemaEntry],
+    agents_omitted: bool,
 ) -> String {
     let mut text = String::from("## Agentic Corpus Schema\n\n### Vertex Types\n");
     for vertex in vertex_types {
@@ -104,6 +136,10 @@ fn render_text(
                 }
             }
         }
+    } else if agents_omitted {
+        text.push_str(
+            "\n### Installed Agents\n- Omitted from compact orientation. Call `bbox_describe_schema` with `include_agents=true` or `mode=\"full\"` for the installed-agent catalog.\n",
+        );
     }
     if !consultants.is_empty() {
         text.push_str("\n### Consultants\n");

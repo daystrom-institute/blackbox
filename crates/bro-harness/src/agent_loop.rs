@@ -407,9 +407,10 @@ impl Session {
         }
 
         let mut final_text = String::new();
+        let mut turn_steps = 0u64;
 
         loop {
-            if self.turns >= self.max_turns {
+            if turn_steps >= self.max_turns {
                 tracing::warn!(max_turns = self.max_turns, "hit max turns; stopping");
                 break;
             }
@@ -463,6 +464,7 @@ impl Session {
                 _ = cancel.changed() => break,
                 r = self.tx.run_turn(&tool_specs, &opts, &self.emitter) => r?,
             };
+            turn_steps += 1;
             self.turns += 1;
             self.total_usage.add(&out.usage);
             self.last_prompt_tokens = out.usage.total_input_tokens();
@@ -964,6 +966,24 @@ mod tests {
         tx.send(Input::User("alpha".into())).unwrap();
         tx.send(Input::User("beta".into())).unwrap();
         drop(tx); // EOF after both
+        let ctrl = Emitter::new("ctrl".into());
+        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+            .await
+            .unwrap();
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(users, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn max_turns_is_per_user_turn_in_persistent_session() {
+        let (mut session, shared) =
+            mk_session(vec![MockTurn::Text("1".into()), MockTurn::Text("2".into())]);
+        session.max_turns = 1;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::User("alpha".into())).unwrap();
+        tx.send(Input::User("beta".into())).unwrap();
+        drop(tx);
         let ctrl = Emitter::new("ctrl".into());
         session_loop(&mut session, rx, &ctrl, VecDeque::new())
             .await

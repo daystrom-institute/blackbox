@@ -16,11 +16,13 @@
 //!     `project_doc_max_bytes=0` + the AGENTS-omitting `CODEX_HOME` overlay.
 //!   * absent (`None`)    ⇒ not overridden ⇒ this Codex-style overlay.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Codex's default `project_doc_max_bytes`. Caps the *project* doc chain only;
 /// the global `$CODEX_HOME` instructions are uncapped, matching Codex.
 const DEFAULT_PROJECT_DOC_MAX_BYTES: usize = 32 * 1024;
+const MAX_INCLUDE_DEPTH: usize = 8;
 const AGENTS_FILE: &str = "AGENTS.md";
 const AGENTS_OVERRIDE_FILE: &str = "AGENTS.override.md";
 
@@ -96,6 +98,112 @@ fn read_nonempty(path: &Path) -> Option<String> {
     }
 }
 
+fn canonical_file(path: &Path) -> Option<PathBuf> {
+    let canonical = path.canonicalize().ok()?;
+    canonical.is_file().then_some(canonical)
+}
+
+fn is_allowed_instruction_doc(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if matches!(
+        name,
+        "AGENTS.md"
+            | "AGENTS.override.md"
+            | "BLACKBOX.md"
+            | "CLAUDE.md"
+            | "GEMINI.md"
+            | "PROJECT.md"
+            | "RTK.md"
+            | "README.md"
+    ) {
+        return true;
+    }
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("md" | "markdown" | "txt")
+    )
+}
+
+fn resolve_include(referrer: &Path, mention: &str) -> Option<PathBuf> {
+    let raw = mention.strip_prefix('@')?;
+    if raw.is_empty() {
+        return None;
+    }
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        referrer.parent()?.join(raw)
+    };
+    let canonical = canonical_file(&candidate)?;
+    is_allowed_instruction_doc(&canonical).then_some(canonical)
+}
+
+fn extract_at_mentions(body: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let chars: Vec<(usize, char)> = body.char_indices().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].1 != '@' {
+            i += 1;
+            continue;
+        }
+        let start = chars[i].0;
+        let mut end = body.len();
+        let mut j = i + 1;
+        while j < chars.len() {
+            let (idx, ch) = chars[j];
+            if ch.is_whitespace() || matches!(ch, ')' | ']' | '}' | '>' | '`' | '"' | '\'' | ',') {
+                end = idx;
+                break;
+            }
+            j += 1;
+        }
+        let mention = body[start..end].trim_end_matches(['.', ';', ':']);
+        if mention.len() > 1 {
+            out.push(mention.to_string());
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
+fn read_doc_tree(
+    path: &Path,
+    loaded_paths: &mut HashSet<PathBuf>,
+    loaded: &mut Vec<String>,
+    depth: usize,
+) -> Vec<String> {
+    if depth > MAX_INCLUDE_DEPTH {
+        tracing::warn!(
+            path = %path.display(),
+            max_depth = MAX_INCLUDE_DEPTH,
+            "skipping nested AGENTS include beyond max depth"
+        );
+        return Vec::new();
+    }
+    let Some(canonical) = canonical_file(path) else {
+        return Vec::new();
+    };
+    if !loaded_paths.insert(canonical.clone()) {
+        return Vec::new();
+    }
+    let Some(body) = read_nonempty(&canonical) else {
+        return Vec::new();
+    };
+    loaded.push(canonical.display().to_string());
+
+    let mut sections = vec![body.clone()];
+    for mention in extract_at_mentions(&body) {
+        let Some(include) = resolve_include(&canonical, &mention) else {
+            continue;
+        };
+        sections.extend(read_doc_tree(&include, loaded_paths, loaded, depth + 1));
+    }
+    sections
+}
+
 fn truncate_on_char_boundary(s: &mut String, cap: usize) {
     if s.len() <= cap {
         return;
@@ -120,15 +228,13 @@ pub(crate) fn discover() -> Option<String> {
 fn assemble(cwd: &Path, codex_home: Option<&Path>) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     let mut loaded: Vec<String> = Vec::new();
+    let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
 
     // Global scope: $CODEX_HOME/AGENTS.md (+ override), uncapped.
     if let Some(home) = codex_home {
         for name in [AGENTS_FILE, AGENTS_OVERRIDE_FILE] {
             let p = home.join(name);
-            if let Some(body) = read_nonempty(&p) {
-                sections.push(body);
-                loaded.push(p.display().to_string());
-            }
+            sections.extend(read_doc_tree(&p, &mut loaded_paths, &mut loaded, 0));
         }
     }
 
@@ -136,10 +242,7 @@ fn assemble(cwd: &Path, codex_home: Option<&Path>) -> Option<String> {
     // per Codex `project_doc_max_bytes`.
     let mut project: Vec<String> = Vec::new();
     for p in project_agents_paths(cwd) {
-        if let Some(body) = read_nonempty(&p) {
-            project.push(body);
-            loaded.push(p.display().to_string());
-        }
+        project.extend(read_doc_tree(&p, &mut loaded_paths, &mut loaded, 0));
     }
     if !project.is_empty() {
         let mut joined = project.join("\n\n");
@@ -239,5 +342,56 @@ mod tests {
         assert!(g < o && o < p, "order: global, override, then project");
         fs::remove_dir_all(&home).ok();
         fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn recursively_merges_at_mentioned_instruction_docs() {
+        let root = scratch();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        write(
+            &root.join(AGENTS_FILE),
+            "ROOT-DOC\nRead @PROJECT.md and @docs/EXTRA.md",
+        );
+        write(&root.join("PROJECT.md"), "PROJECT-DOC\nSee @docs/NESTED.md");
+        write(&root.join("docs").join("EXTRA.md"), "EXTRA-DOC");
+        write(&root.join("docs").join("NESTED.md"), "NESTED-DOC");
+
+        let out = assemble(&root, None).expect("docs present");
+        let root_at = out.find("ROOT-DOC").unwrap();
+        let project_at = out.find("PROJECT-DOC").unwrap();
+        let extra_at = out.find("EXTRA-DOC").unwrap();
+        let nested_at = out.find("NESTED-DOC").unwrap();
+        assert!(
+            root_at < project_at && project_at < nested_at && root_at < extra_at,
+            "includes should be appended after the referring doc: {out}"
+        );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn absolute_at_mentions_are_instruction_doc_only_and_deduped() {
+        let root = scratch();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        let external = scratch();
+        let blackbox = external.join("BLACKBOX.md");
+        let secret = external.join("secret.json");
+        write(&blackbox, "BLACKBOX-DOC");
+        write(&secret, "SECRET");
+        write(
+            &root.join(AGENTS_FILE),
+            &format!(
+                "ROOT-DOC\n@{}\n@{}\n@{}",
+                blackbox.display(),
+                blackbox.display(),
+                secret.display()
+            ),
+        );
+
+        let out = assemble(&root, None).expect("docs present");
+        assert!(out.contains("BLACKBOX-DOC"));
+        assert_eq!(out.matches("BLACKBOX-DOC").count(), 1);
+        assert!(!out.contains("SECRET"));
+        fs::remove_dir_all(&root).ok();
+        fs::remove_dir_all(&external).ok();
     }
 }
