@@ -39,6 +39,7 @@ use ratatui::widgets::*;
 use serde::Deserialize;
 
 mod council_tui;
+mod fleet_classifier;
 mod fleet_tui;
 mod parser;
 use parser::{

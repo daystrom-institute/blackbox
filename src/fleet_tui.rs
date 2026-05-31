@@ -20,7 +20,7 @@
 //! until the seam exists. The verbose inline transcript parser (§5.4, item 14)
 //! is also a follow-up; this skeleton renders the latest assistant message.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -38,9 +38,11 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use blackbox::fleet::{
-    AgentHandle, DispatchSpec, FleetOrchestrator, Provider, ResumeSpec, TailEvent, TaskStatus,
-    TranscriptItem, provider_supports_bidi,
+    AgentHandle, CLASSIFIER_NAME_PREFIX, DispatchSpec, FleetOrchestrator, Provider, ResumeSpec,
+    TailEvent, TaskStatus, TranscriptItem, intern_rider, provider_supports_bidi,
 };
+
+use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
 
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
@@ -227,6 +229,14 @@ struct App {
     /// Runtime handle for firing the async steer/interrupt calls (AgentHandle
     /// methods are async; the TUI loop is sync) off the blocking loop.
     rt: tokio::runtime::Handle,
+
+    /// Surfaced classifier ("intern") suggestions, keyed by executor task id.
+    /// Empty unless `fleet.json` enabled the classifier companion.
+    classifier_notes: HashMap<String, Vec<ClassifierNote>>,
+    /// Cloned per spawned monitor; monitors push suggestions here.
+    classifier_tx: mpsc::Sender<ClassifierNote>,
+    /// Drained into `classifier_notes` each tick.
+    classifier_rx: mpsc::Receiver<ClassifierNote>,
 }
 
 impl App {
@@ -235,6 +245,7 @@ impl App {
         launch_cwd: Option<String>,
         rt: tokio::runtime::Handle,
     ) -> Self {
+        let (classifier_tx, classifier_rx) = mpsc::channel();
         Self {
             orch,
             agents: Vec::new(),
@@ -255,7 +266,23 @@ impl App {
             status_until: None,
             quit: false,
             rt,
+            classifier_notes: HashMap::new(),
+            classifier_tx,
+            classifier_rx,
         }
+    }
+
+    /// Record a classifier suggestion against its executor and flash it.
+    fn ingest_classifier_note(&mut self, note: ClassifierNote) {
+        let tag = if note.auto_sent { "✻ intern (sent)" } else { "✻ intern" };
+        self.set_status(
+            format!("{tag}: {}", truncate(&note.text, 60)),
+            Duration::from_secs(6),
+        );
+        self.classifier_notes
+            .entry(note.executor_id.clone())
+            .or_default()
+            .push(note);
     }
 
     fn set_status(&mut self, msg: impl Into<String>, ttl: Duration) {
@@ -307,15 +334,45 @@ impl App {
             return;
         }
         let name = truncate(&prompt, NAME_LEN);
-        let mut spec = DispatchSpec::new(self.next_provider, prompt.clone());
+
+        // Classifier companion: if enabled, prepend the intern rider to the
+        // executor's first turn ONLY when suggestions will actually be relayed
+        // (classifier present AND auto_send). Gating on both keeps observe-only
+        // runs from telling the executor about an intern whose voice never
+        // appears — which would confuse a future agent reading the transcript.
+        let classifier_cfg = self.orch.classifier().cloned();
+        let frame_executor = classifier_cfg
+            .as_ref()
+            .is_some_and(|c| c.auto_send_resolved());
+        let dispatch_prompt = if frame_executor {
+            format!("{}\n\n{}", intern_rider(), prompt)
+        } else {
+            prompt.clone()
+        };
+
+        let mut spec = DispatchSpec::new(self.next_provider, dispatch_prompt);
         spec.cwd = self.launch_cwd.clone();
         spec.name = Some(name.clone());
         let task = self.orch.dispatch(spec);
         let id = task.id();
+
+        // Spawn the watching intern for this executor.
+        if let Some(cfg) = classifier_cfg {
+            spawn_monitor(
+                &self.rt,
+                self.orch.clone(),
+                task.clone(),
+                name.clone(),
+                cfg,
+                self.classifier_tx.clone(),
+            );
+        }
+
         self.agents.push(Agent {
             task,
             provider: self.next_provider,
             name,
+            // Display the operator's own prompt, not the rider-wrapped first turn.
             input_history: vec![prompt],
         });
         self.input.clear();
@@ -411,6 +468,10 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
     for handle in orch.tasks() {
         let snap = handle.snapshot();
         let name = snap.name.clone().unwrap_or_else(|| "(session)".to_string());
+        // Hidden classifier-companion sessions never surface in the roster.
+        if name.starts_with(CLASSIFIER_NAME_PREFIX) {
+            continue;
+        }
         app.agents.push(Agent {
             task: handle,
             provider: snap.provider,
@@ -463,6 +524,15 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
 
             while let Ok(ev) = signals.try_recv() {
                 handle_tail(app, ev);
+            }
+            // Drain classifier suggestions (collect first to avoid borrowing
+            // app.classifier_rx while mutating app.classifier_notes).
+            let mut notes = Vec::new();
+            while let Ok(note) = app.classifier_rx.try_recv() {
+                notes.push(note);
+            }
+            for note in notes {
+                app.ingest_classifier_note(note);
             }
             app.maybe_clear_status();
         }
@@ -1065,11 +1135,21 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
             let model = v.model.clone().unwrap_or_else(|| "—".into());
             let started = age(v.started_at);
             let last = v.last_activity_ms.map(age).unwrap_or_else(|| started.clone());
+            // Mark rows whose executor has intern suggestions waiting.
+            let display_name = if app
+                .classifier_notes
+                .get(&a.task.id())
+                .is_some_and(|n| !n.is_empty())
+            {
+                format!("✻ {}", a.name)
+            } else {
+                a.name.clone()
+            };
             rows.push(Row::new(vec![
                 Cell::from(glyph).style(Style::default().fg(gcolor)),
                 Cell::from(provider_tag(a.provider))
                     .style(Style::default().fg(provider_color(a.provider))),
-                Cell::from(a.name.clone()).style(Style::default().add_modifier(Modifier::BOLD)),
+                Cell::from(display_name).style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(truncate(&model, 13)).style(Style::default().fg(Color::Gray)),
                 Cell::from(cost).style(Style::default().fg(Color::Gray)),
                 Cell::from(turns).style(Style::default().fg(Color::Gray)),
@@ -1146,6 +1226,27 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         initial_prompt(a),
         width,
     ));
+
+    // Intern suggestions for this executor, pinned at the bottom (most recent
+    // last). Operator-visible scrutiny surface for classifier-enabled runs.
+    if let Some(notes) = app.classifier_notes.get(&a.task.id()) {
+        if !notes.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "── intern suggestions ──",
+                Style::default().fg(Color::Magenta),
+            )));
+            for n in notes.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
+                let tag = if n.auto_sent { "✻ intern › (sent)" } else { "✻ intern ›" };
+                lines.push(Line::from(Span::styled(
+                    format!("{tag} {}", n.text),
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+        }
+    }
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let total = para.line_count(area.width.saturating_sub(2));

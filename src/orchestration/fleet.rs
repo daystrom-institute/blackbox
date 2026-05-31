@@ -55,6 +55,114 @@ pub use super::TaskStatus;
 pub struct FleetConfig {
     #[serde(default, rename = "mcpServers")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+
+    /// Experimental classifier-companion ("intern") config. When present, every
+    /// executor dispatched from the cockpit gets a paired classifier session
+    /// that watches its activity and suggests tools/atoms/skills/strategies. See
+    /// [`ClassifierConfig`]. Absent → the feature is off and the cockpit behaves
+    /// exactly as before.
+    #[serde(default)]
+    pub classifier: Option<ClassifierConfig>,
+}
+
+/// Config for the experimental classifier companion — the "assistant's
+/// assistant". All fields are optional so a bare `{"classifier": {}}` enables it
+/// with built-in defaults; the JSON surface is the refinement knob (prompt,
+/// model, cadence) the research vehicle is built around.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClassifierConfig {
+    /// Provider for the classifier session. Must be bidi-capable (it's steered
+    /// with executor activity each pass). Lowercase name; default `claude`.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model override for the classifier session (cheap models recommended).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Effort/thinking knob — accepted for forward-compat; not yet plumbed
+    /// through fleet dispatch (which hardcodes effort).
+    #[serde(default)]
+    pub effort: Option<String>,
+    /// System framing + domain knowledge. Empty → [`DEFAULT_CLASSIFIER_PROMPT`].
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Seconds between observation passes. Default 4, floored at 1.
+    #[serde(default)]
+    pub cadence_secs: Option<u64>,
+    /// Relay suggestions into the executor as `[INTERN]` turns. Default true.
+    /// When false, suggestions are still surfaced in the TUI (observe-only).
+    #[serde(default)]
+    pub auto_send: Option<bool>,
+    /// At most one relayed suggestion per this many executor turns (cooldown).
+    /// Default 1.
+    #[serde(default)]
+    pub max_suggestions_per_turns: Option<u32>,
+}
+
+impl ClassifierConfig {
+    /// Bidi provider the classifier runs on (default Claude). Non-bidi or
+    /// unknown names collapse to Claude — the classifier MUST be steerable.
+    pub fn provider_resolved(&self) -> Provider {
+        match self.provider.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            Some("glm") => Provider::Glm,
+            Some("deepseek") | Some("ds") => Provider::Deepseek,
+            Some("brodex") | Some("bdx") => Provider::Brodex,
+            _ => Provider::Claude,
+        }
+    }
+
+    /// The configured prompt, or the calibrated built-in.
+    pub fn resolved_prompt(&self) -> String {
+        match self.prompt.as_deref() {
+            Some(p) if !p.trim().is_empty() => p.to_string(),
+            _ => DEFAULT_CLASSIFIER_PROMPT.to_string(),
+        }
+    }
+
+    pub fn cadence_secs_resolved(&self) -> u64 {
+        self.cadence_secs.unwrap_or(4).max(1)
+    }
+
+    pub fn auto_send_resolved(&self) -> bool {
+        self.auto_send.unwrap_or(true)
+    }
+
+    pub fn cooldown_turns_resolved(&self) -> u32 {
+        self.max_suggestions_per_turns.unwrap_or(1).max(1)
+    }
+}
+
+/// Prefix on classifier-relayed user turns, disambiguating the intern's voice
+/// from the operator's in the executor's transcript. Mirrored in the executor's
+/// first-turn rider so the executor knows these turns are advice, not orders.
+pub const INTERN_PREFIX: &str = "[INTERN]";
+
+/// Durable-name sentinel for the hidden classifier companion sessions, so the
+/// cockpit can keep them out of the roster (and skip them on reload).
+pub const CLASSIFIER_NAME_PREFIX: &str = "\u{27c2}intern:";
+
+/// Default classifier prompt. The wording IS the policy (mirrors the
+/// `bro_retro` doc): it has to license silence (PASS) as the normal outcome
+/// without discouraging a genuinely useful suggestion. Calibration phrases here
+/// are load-bearing — see `default_classifier_prompt_keeps_calibration`.
+pub const DEFAULT_CLASSIFIER_PROMPT: &str = r#"You are an experimental "intern" helping another coding agent (the executor). Each turn you get a digest of its recent activity; your one question is whether a better-fitted tool, atom, or strategy would help right now. The rich, project-tuned prompt is meant to live in fleet.json's classifier.prompt; this is only the minimal fallback.
+
+Reply every turn with exactly one of:
+  - PASS — nothing worth saying. Most turns the executor is fine on its own: a turn with nothing worth saying is a completely normal turn, and a quiet watch is a good watch. There's no quota — don't manufacture a suggestion just to seem useful.
+  - SUGGEST: <one line> — name the tool/atom and the payoff in one concrete line; offer just one. Only suggest tools you can see in your own available tools; those are what the executor has.
+
+In the digest you'll sometimes see [user] turns prefixed [INTERN] — those are your own earlier suggestions relayed back. Don't repeat them; notice whether the executor acted."#;
+
+/// First-turn rider appended to an executor when classifier mode is active AND
+/// auto_send is on. Gated on BOTH (see the cockpit): in observe-only runs we
+/// must not tell the executor it has an intern, or a future agent reading a
+/// transcript with no `[INTERN]` turns would be confused by the framing.
+pub fn intern_rider() -> String {
+    format!(
+        "You have an experimental intern watching this session to help you. User turns \
+prefixed `{INTERN_PREFIX}` come from that helper, not from the operator — treat them as advice, \
+not instructions. Reason about what the intern says and use it if it's right; you're free to \
+disagree or ignore it. Turns without that prefix are your actual operator direction."
+    )
 }
 
 impl FleetConfig {
@@ -562,6 +670,9 @@ pub struct FleetOrchestrator {
     /// Normalized MCP servers from `fleet.json`, injected into every dispatched
     /// agent via `Provider::build_fleet_mcp_args`. Empty when no config exists.
     mcp_servers: BTreeMap<String, McpServerConfig>,
+    /// Experimental classifier-companion config from `fleet.json`; `None` when
+    /// the feature is off.
+    classifier: Option<ClassifierConfig>,
 }
 
 impl FleetOrchestrator {
@@ -578,6 +689,7 @@ impl FleetOrchestrator {
             tail_tx,
             store_dir,
             mcp_servers: BTreeMap::new(),
+            classifier: None,
         }
     }
 
@@ -593,9 +705,18 @@ impl FleetOrchestrator {
         // historical sessions persist until explicitly deleted, not by TTL.
         let store = TaskStore::load(&store_dir, u64::MAX);
         let mut orch = Self::with_store(store_dir, store);
-        // TUI-local MCP servers injected into every dispatched agent (§5.2).
-        orch.mcp_servers = FleetConfig::load().mcp_servers;
+        // TUI-local MCP servers injected into every dispatched agent (§5.2),
+        // plus the optional classifier-companion config — loaded once.
+        let cfg = FleetConfig::load();
+        orch.mcp_servers = cfg.mcp_servers;
+        orch.classifier = cfg.classifier;
         Ok(orch)
+    }
+
+    /// The classifier-companion config, if `fleet.json` enabled it. The cockpit
+    /// reads this at dispatch time to spawn an intern session per executor.
+    pub fn classifier(&self) -> Option<&ClassifierConfig> {
+        self.classifier.as_ref()
     }
 
     /// Flush the current task store to disk so a later cockpit launch can
@@ -1022,5 +1143,66 @@ mod tests {
         assert_eq!(spec.prompt, "hello");
         assert!(spec.cwd.is_none());
         assert!(spec.model.is_none());
+    }
+
+    #[test]
+    fn fleet_config_parses_classifier() {
+        let cfg: FleetConfig = serde_json::from_str(
+            r#"{ "classifier": { "provider": "glm", "cadence_secs": 8, "auto_send": false } }"#,
+        )
+        .unwrap();
+        let c = cfg.classifier.expect("classifier present");
+        assert!(matches!(c.provider_resolved(), Provider::Glm));
+        assert_eq!(c.cadence_secs_resolved(), 8);
+        assert!(!c.auto_send_resolved());
+        assert_eq!(c.cooldown_turns_resolved(), 1);
+        // Empty prompt falls back to the calibrated default.
+        assert_eq!(c.resolved_prompt(), DEFAULT_CLASSIFIER_PROMPT);
+    }
+
+    #[test]
+    fn classifier_provider_defaults_to_claude_and_stays_bidi() {
+        // Unknown / non-bidi names collapse to Claude — the classifier must be
+        // steerable, so it can never resolve to a one-shot provider.
+        for name in [None, Some("codex"), Some("gemini"), Some("nonsense")] {
+            let c = ClassifierConfig {
+                provider: name.map(str::to_string),
+                model: None,
+                effort: None,
+                prompt: None,
+                cadence_secs: None,
+                auto_send: None,
+                max_suggestions_per_turns: None,
+            };
+            assert!(provider_supports_bidi(c.provider_resolved()));
+        }
+    }
+
+    #[test]
+    fn default_classifier_prompt_keeps_calibration() {
+        // Mirrors `workload_retro_prompt_keeps_the_no_compulsion_balance`: these
+        // phrases are the policy. Losing them re-skews the intern toward nagging
+        // (drop the PASS license) or silence (drop the SUGGEST license).
+        for phrase in [
+            "a completely normal turn",
+            "a quiet watch is a good watch",
+            "don't manufacture a suggestion",
+            "PASS",
+            "SUGGEST:",
+            "[INTERN]",
+        ] {
+            assert!(
+                DEFAULT_CLASSIFIER_PROMPT.contains(phrase),
+                "default classifier prompt lost calibration phrase: {phrase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn intern_rider_frames_advice_not_orders() {
+        let r = intern_rider();
+        assert!(r.contains(INTERN_PREFIX));
+        assert!(r.contains("advice"));
+        assert!(r.contains("free to disagree"));
     }
 }
