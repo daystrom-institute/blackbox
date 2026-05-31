@@ -1653,6 +1653,8 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     let env_overrides_export = env_overrides.clone();
     let cwd_export = cwd.clone();
     let system_events_progress = system_events.clone();
+    let disruption_store_dir = store_dir.clone();
+    let disruption_task_id = id.clone();
 
     let (stdout_done_tx, stdout_done_rx) = tokio::sync::oneshot::channel::<()>();
 
@@ -1662,8 +1664,29 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
             let mut last_emitted_snippet: Option<String> = None;
+            // Cooldown the lane the instant the provider returns a 429/overload,
+            // so dispatch steers off it without waiting for the next probe tick.
+            // Once per run is enough.
+            let mut disruption_recorded = false;
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Ok(evt) = serde_json::from_str::<Value>(&line) {
+                    if !disruption_recorded {
+                        if let Some(disruption) = provider.detect_disruption(&evt) {
+                            disruption_recorded = true;
+                            let account = allocator::lookup_lease_for_task(
+                                &disruption_store_dir,
+                                &disruption_task_id,
+                            )
+                            .and_then(|lease| lease.account);
+                            account_probes::record_disruption_cooldown(
+                                &disruption_store_dir,
+                                provider,
+                                account.as_deref(),
+                                disruption,
+                                now_ms(),
+                            );
+                        }
+                    }
                     let snippet_to_emit = {
                         let mut inner = task_ref.inner.lock();
                         inner.events.push(evt.clone());

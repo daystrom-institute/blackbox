@@ -9,7 +9,7 @@ mod session;
 mod tests;
 
 pub use catalog::{EffortInfo, ModelInfo};
-pub use events::{EventSink, Usage, parse_opencode_export};
+pub use events::{Disruption, EventSink, Usage, parse_opencode_export};
 #[cfg(test)]
 use exec_args::{
     CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE, CODEX_DISABLE_PROJECT_DOCS_OVERRIDE,

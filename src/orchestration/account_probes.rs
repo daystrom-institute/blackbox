@@ -25,7 +25,10 @@ use crate::orchestration::allocator::{
     CredentialStatus, ProbeRecord, QuotaConfidence, QuotaStatus, lane_key, probe_store_load,
     probe_store_save,
 };
-use crate::orchestration::providers::Provider;
+use crate::orchestration::providers::{Disruption, Provider};
+
+const COOLDOWN_RATE_LIMITED_SECS: u64 = 300;
+const COOLDOWN_OVERLOADED_SECS: u64 = 60;
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -422,6 +425,37 @@ pub async fn refresh_account_probes(store_dir: &Path, home: &Path, now: u64) -> 
     probed.len()
 }
 
+/// Record a runtime disruption (a 429/overload the provider returned on a real
+/// dispatch) as a cooldown on the lane's probe, so the allocator steers off it
+/// until it recovers. Merges onto any existing probe — utilization numbers are
+/// preserved; only the cooldown/observation fields are set.
+pub fn record_disruption_cooldown(
+    store_dir: &Path,
+    provider: Provider,
+    account: Option<&str>,
+    disruption: Disruption,
+    now: u64,
+) {
+    let cooldown_secs = match disruption {
+        Disruption::RateLimited => COOLDOWN_RATE_LIMITED_SECS,
+        Disruption::Overloaded => COOLDOWN_OVERLOADED_SECS,
+    };
+    let key = lane_key(provider, account);
+    let mut store = probe_store_load(store_dir);
+    let rec = store
+        .records
+        .entry(key)
+        .or_insert_with(|| base_record(provider, account.map(str::to_string), now));
+    rec.cooldown_until = Some(now.saturating_add(cooldown_secs * 1000));
+    rec.last_runtime_observation_at = Some(now);
+    rec.quota_confidence = QuotaConfidence::RuntimeRateLimit;
+    if matches!(disruption, Disruption::RateLimited) {
+        rec.quota_status = QuotaStatus::Exhausted;
+    }
+    tracing::info!(%provider, ?account, ?disruption, "runtime disruption → lane cooldown");
+    probe_store_save(store_dir, &store);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,5 +581,46 @@ mod tests {
         );
         assert_eq!(empty.balance_capacity, Some(0.0));
         assert!(matches!(empty.quota_status, QuotaStatus::Exhausted));
+    }
+
+    #[test]
+    fn record_disruption_cooldown_sets_cooldown_and_preserves_utilization() {
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path();
+        // Seed a healthy probe for the lane (real utilization from a probe).
+        let mut store = probe_store_load(store_dir);
+        let mut seed = base_record(Provider::Claude, None, 100);
+        seed.five_hour_utilization = Some(0.4);
+        store
+            .records
+            .insert(lane_key(Provider::Claude, None), seed);
+        probe_store_save(store_dir, &store);
+
+        // A 429 lands on a real dispatch.
+        record_disruption_cooldown(store_dir, Provider::Claude, None, Disruption::RateLimited, 1000);
+
+        let rec = probe_store_load(store_dir)
+            .records
+            .remove(&lane_key(Provider::Claude, None))
+            .unwrap();
+        // Cooldown set 300s out; the lane is now exhausted; utilization kept.
+        assert_eq!(rec.cooldown_until, Some(1000 + 300_000));
+        assert!(matches!(rec.quota_status, QuotaStatus::Exhausted));
+        assert!(matches!(rec.quota_confidence, QuotaConfidence::RuntimeRateLimit));
+        assert_eq!(rec.five_hour_utilization, Some(0.4), "probe util must survive");
+        assert_eq!(rec.last_runtime_observation_at, Some(1000));
+    }
+
+    #[test]
+    fn record_disruption_cooldown_overload_is_shorter_and_not_exhausted() {
+        let dir = tempfile::tempdir().unwrap();
+        record_disruption_cooldown(dir.path(), Provider::Glm, Some("z2"), Disruption::Overloaded, 0);
+        let rec = probe_store_load(dir.path())
+            .records
+            .remove(&lane_key(Provider::Glm, Some("z2")))
+            .unwrap();
+        assert_eq!(rec.cooldown_until, Some(60_000));
+        // Overload is transient, not quota exhaustion.
+        assert!(matches!(rec.quota_status, QuotaStatus::Known));
     }
 }
