@@ -284,23 +284,6 @@ fn write_thread_record(thread: &Thread) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-/// Neutral rider appended to a tool response when a durable repo-owned file is
-/// written into the working tree, so the caller knows to commit it rather than
-/// mistaking it for untracked exhaust. `repo_root` is stripped to render the
-/// path repo-relative.
-pub(crate) fn repo_artifact_rider(repo_root: &str, path: &Path) -> String {
-    let rel = path
-        .strip_prefix(repo_root)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|_| path.to_path_buf());
-    let rel = rel.display();
-    format!(
-        "\n\nNote: wrote `{rel}` into the working tree — a durable repo-owned artifact \
-         that travels with the repo. It is currently untracked; include it with your work \
-         (`git add {rel}`)."
-    )
-}
-
 /// Load every committed thread record under `<project_dir>/.bbox/record/`.
 /// These are durable snapshots of settled threads that travel with the repo;
 /// on a clone (where the live thread store doesn't carry them) they are the
@@ -796,7 +779,7 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some(path)) => Some(repo_artifact_rider(&thread_for_embed.project, &path)),
+            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(&thread_for_embed.project, &path)),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -845,7 +828,7 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some(path)) => Some(repo_artifact_rider(&thread_for_embed.project, &path)),
+            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(&thread_for_embed.project, &path)),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -1293,7 +1276,7 @@ mod tests {
     fn repo_artifact_rider_renders_relative_path_and_add_hint() {
         let root = "/repo/x";
         let path = Path::new("/repo/x/.bbox/record/thread-abc.json");
-        let rider = repo_artifact_rider(root, path);
+        let rider = crate::util::repo_artifact_rider(root, path);
         assert!(rider.contains(".bbox/record/thread-abc.json"));
         assert!(rider.contains("git add .bbox/record/thread-abc.json"));
         assert!(!rider.contains("/repo/x/.bbox"), "must be repo-relative, not absolute");

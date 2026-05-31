@@ -76,22 +76,30 @@ impl BlackboxServer {
         })() {
             Ok((result, warning)) => {
                 let ms = start.elapsed().as_secs_f64() * 1000.0;
+                let rider = self.state.kb.read().repo_record_rider(&result.id);
                 match format {
                     ResponseFormat::Text => {
-                        let text = match warning {
+                        let mut text = match warning {
                             Some(w) => format!("{}{}", result.message, w),
                             None => result.message,
                         };
+                        if let Some(rider) = &rider {
+                            text.push_str(rider);
+                        }
                         tracing::info!(target: "blackbox::tool", tool = "bbox_learn", elapsed_ms = ms, bytes = text.len(), "ok");
                         Self::ok_text(&text)
                     }
                     ResponseFormat::Json => {
+                        let message = match &rider {
+                            Some(rider) => format!("{}{}", result.message, rider),
+                            None => result.message,
+                        };
                         let mut payload = serde_json::json!({
                             "id": result.id,
                             "action": result.action,
                             "rendered": result.rendered,
                             "render_pending": result.render_pending,
-                            "message": result.message,
+                            "message": message,
                         });
                         if let Some(summary) = result.summary {
                             payload["summary"] = serde_json::json!(summary);
@@ -128,7 +136,11 @@ impl BlackboxServer {
             if let Err(err) = self.sync_knowledge_entry_to_index(&result.id) {
                 tracing::warn!(error = %err, entry = %result.id, "knowledge index sync failed; will reconstruct on next reindex cycle");
             }
-            Ok(result.message)
+            let mut message = result.message;
+            if let Some(rider) = self.state.kb.read().repo_record_rider(&result.id) {
+                message.push_str(&rider);
+            }
+            Ok(message)
         })
     }
 
@@ -145,7 +157,11 @@ impl BlackboxServer {
             if let Some(old_id) = result.superseded.as_deref() {
                 self.tombstone_knowledge_entry_in_index(old_id)?;
             }
-            Ok(result.message)
+            let mut message = result.message;
+            if let Some(rider) = self.state.kb.read().repo_record_rider(&result.id) {
+                message.push_str(&rider);
+            }
+            Ok(message)
         })
     }
 

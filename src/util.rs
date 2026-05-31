@@ -7,6 +7,24 @@ use std::path::{Path, PathBuf};
 
 pub const DEFAULT_BLACKBOX_MCP_NAME: &str = "blackbox";
 
+/// Neutral rider appended to a tool response when a durable repo-owned file is
+/// written into the working tree (a settled thread snapshot under
+/// `.bbox/record/`, a project knowledge entry under `.bbox/knowledge/`, …), so
+/// the caller knows to commit it rather than mistaking it for untracked
+/// exhaust. `repo_root` is stripped to render the path repo-relative.
+pub fn repo_artifact_rider(repo_root: &str, path: &Path) -> String {
+    let rel = path
+        .strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf());
+    let rel = rel.display();
+    format!(
+        "\n\nNote: wrote `{rel}` into the working tree — a durable repo-owned artifact \
+         that travels with the repo. It is currently untracked; include it with your work \
+         (`git add {rel}`)."
+    )
+}
+
 // Not `#[cfg(test)]` gated: binary crates (e.g. `bro-slack`, `src/slack_bridge.rs`)
 // reference this from their own test modules as `blackbox::util::test_env_lock`,
 // which only resolves when the symbol is compiled into the lib even in non-test

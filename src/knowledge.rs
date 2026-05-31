@@ -1202,6 +1202,24 @@ impl Knowledge {
         })
     }
 
+    /// Commit-this rider for a just-written entry, when it persisted into a
+    /// repo-owned project's committed `.bbox/knowledge/`. Returns `None` for
+    /// global/central entries (host-local, nothing to commit) or unknown ids.
+    /// Read-only; safe to call after any learn/remember/decide write.
+    pub fn repo_record_rider(&self, id: &str) -> Option<String> {
+        let entry = self.store.entries.iter().find(|e| e.id == id)?;
+        if entry.scope != Scope::Project {
+            return None;
+        }
+        let dir = entry.project.as_deref().filter(|d| !d.is_empty())?;
+        let project_dir = Path::new(dir);
+        if !project_is_repo_owned(project_dir) {
+            return None;
+        }
+        let path = repo_kb_dir(project_dir).join(format!("{id}.json"));
+        Some(crate::util::repo_artifact_rider(dir, &path))
+    }
+
     fn learn_result_locked(
         &mut self,
         p: &LearnParams,
@@ -3237,6 +3255,75 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .expect("entry should reload from repo .bbox/knowledge/");
         assert_eq!(loaded.project.as_deref(), Some(proj.as_str()));
         assert_eq!(loaded.scope, Scope::Project);
+    }
+
+    #[test]
+    fn repo_record_rider_fires_for_committed_project_entries_only() {
+        let central = tempfile::tempdir().unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let proj = repo_root.to_string_lossy().to_string();
+        let kb_path = central.path().join("kb.json");
+        std::fs::create_dir_all(repo_root.join(".bbox").join("knowledge")).unwrap();
+
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        kb.set_project_roots(vec![repo_root.clone()]).unwrap();
+
+        // Project-scoped entry on a repo-owned project → committed file → rider.
+        let proj_id = kb
+            .learn_result(
+                &LearnParams {
+                    content: "always run cargo test --lib before pushing".into(),
+                    category: "convention".into(),
+                    format: None,
+                    title: Some("test before push".into()),
+                    scope: Some("project".into()),
+                    project: Some(proj.clone()),
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: None,
+                    id: None,
+                },
+                false,
+            )
+            .unwrap()
+            .id;
+        let rider = kb
+            .repo_record_rider(&proj_id)
+            .expect("committed project entry should rider");
+        let rel = format!(".bbox/knowledge/{proj_id}.json");
+        assert!(rider.contains(&rel), "rider names repo-relative path: {rider}");
+        assert!(rider.contains(&format!("git add {rel}")), "rider hints git add: {rider}");
+        assert!(!rider.contains(&proj), "rider must not leak the absolute project path: {rider}");
+
+        // Global entry → host-local, nothing committed → no rider.
+        let global_id = kb
+            .learn_result(
+                &LearnParams {
+                    content: "prefer fd over find".into(),
+                    category: "convention".into(),
+                    format: None,
+                    title: Some("fd over find".into()),
+                    scope: Some("global".into()),
+                    project: None,
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: None,
+                    id: None,
+                },
+                false,
+            )
+            .unwrap()
+            .id;
+        assert!(
+            kb.repo_record_rider(&global_id).is_none(),
+            "global entry must not rider a commit"
+        );
+        assert!(kb.repo_record_rider("nonexistent").is_none());
     }
 
     #[test]
