@@ -252,13 +252,17 @@ fn scrub_host_identity_with(s: &str, home: Option<&Path>) -> String {
 
 /// Snapshot a settled thread into its owning repo's `.bbox/record/`. No-op when
 /// the thread isn't project-scoped or its repo isn't present on this host.
-fn write_thread_record(thread: &Thread) -> Result<()> {
+/// Write a durable, host-scrubbed snapshot of a settled thread into the
+/// project's committed `.bbox/record/`. Returns the path written so callers can
+/// surface a commit-this rider; `Ok(None)` when no project is bound (nothing
+/// written).
+fn write_thread_record(thread: &Thread) -> Result<Option<PathBuf>> {
     if thread.project.trim().is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let project_dir = Path::new(&thread.project);
     if !project_dir.is_dir() {
-        return Ok(());
+        return Ok(None);
     }
     let dir = project_dir.join(".bbox").join("record");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -276,7 +280,25 @@ fn write_thread_record(thread: &Thread) -> Result<()> {
         resolved_at: thread.resolved_at.clone().unwrap_or_default(),
     };
     let path = dir.join(format!("{}.json", thread.id));
-    crate::json_store::atomic_write_json_locked(&path, &record)
+    crate::json_store::atomic_write_json_locked(&path, &record)?;
+    Ok(Some(path))
+}
+
+/// Neutral rider appended to a tool response when a durable repo-owned file is
+/// written into the working tree, so the caller knows to commit it rather than
+/// mistaking it for untracked exhaust. `repo_root` is stripped to render the
+/// path repo-relative.
+pub(crate) fn repo_artifact_rider(repo_root: &str, path: &Path) -> String {
+    let rel = path
+        .strip_prefix(repo_root)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|_| path.to_path_buf());
+    let rel = rel.display();
+    format!(
+        "\n\nNote: wrote `{rel}` into the working tree — a durable repo-owned artifact \
+         that travels with the repo. It is currently untracked; include it with your work \
+         (`git add {rel}`)."
+    )
 }
 
 /// Load every committed thread record under `<project_dir>/.bbox/record/`.
@@ -773,13 +795,22 @@ impl Threads {
         let thread_for_embed = thread.clone();
 
         self.save()?;
-        if let Err(e) = write_thread_record(&thread_for_embed) {
-            tracing::warn!("thread record write for {id}: {e:#}");
-        }
+        let record_rider = match write_thread_record(&thread_for_embed) {
+            Ok(Some(path)) => Some(repo_artifact_rider(&thread_for_embed.project, &path)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("thread record write for {id}: {e:#}");
+                None
+            }
+        };
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
+        let mut message = format!("Thread {id} resolved — \"{topic}\"");
+        if let Some(rider) = record_rider {
+            message.push_str(&rider);
+        }
         Ok(ThreadMutation {
-            message: format!("Thread {id} resolved — \"{topic}\""),
+            message,
             changed_thread: Some(thread_for_embed),
             changed_edges: false,
         })
@@ -813,13 +844,22 @@ impl Threads {
         let thread_for_embed = thread.clone();
 
         self.save()?;
-        if let Err(e) = write_thread_record(&thread_for_embed) {
-            tracing::warn!("thread record write for {id}: {e:#}");
-        }
+        let record_rider = match write_thread_record(&thread_for_embed) {
+            Ok(Some(path)) => Some(repo_artifact_rider(&thread_for_embed.project, &path)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("thread record write for {id}: {e:#}");
+                None
+            }
+        };
         crate::embed_queue::enqueue_thread(&thread_for_embed);
 
+        let mut message = format!("Thread {id} promoted to {promoted_to} — \"{topic}\"");
+        if let Some(rider) = record_rider {
+            message.push_str(&rider);
+        }
         Ok(ThreadMutation {
-            message: format!("Thread {id} promoted to {promoted_to} — \"{topic}\""),
+            message,
             changed_thread: Some(thread_for_embed),
             changed_edges: false,
         })
@@ -1206,13 +1246,57 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
         let id = open_thread_id(&mut threads, "x", "/nonexistent/repo/path");
-        threads
+        let msg = threads
             .thread(&ThreadParams {
                 id: Some(id),
                 ..params("resolve")
             })
             .unwrap();
         assert!(!Path::new("/nonexistent/repo/path").exists());
+        // No project on this host → nothing written → no commit-this rider.
+        assert!(
+            !msg.contains(".bbox/record"),
+            "no rider when the repo record was not written: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_message_riders_the_record_path_for_commit() {
+        let dir = tempdir().unwrap();
+        let repo = tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+        let id = open_thread_id(&mut threads, "tier the allocator", &repo_root.to_string_lossy());
+
+        let msg = threads
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                ..params("resolve")
+            })
+            .unwrap();
+
+        // The response surfaces the written record as repo-relative, with a
+        // git-add hint, so the caller commits it instead of treating it as
+        // untracked exhaust.
+        let rel = format!(".bbox/record/{id}.json");
+        assert!(
+            msg.contains(&rel),
+            "resolve message must name the record path repo-relative: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("git add {rel}")),
+            "resolve message must hint the git add: {msg}"
+        );
+    }
+
+    #[test]
+    fn repo_artifact_rider_renders_relative_path_and_add_hint() {
+        let root = "/repo/x";
+        let path = Path::new("/repo/x/.bbox/record/thread-abc.json");
+        let rider = repo_artifact_rider(root, path);
+        assert!(rider.contains(".bbox/record/thread-abc.json"));
+        assert!(rider.contains("git add .bbox/record/thread-abc.json"));
+        assert!(!rider.contains("/repo/x/.bbox"), "must be repo-relative, not absolute");
     }
 
     fn set_last_activity(store_path: &Path, thread_id: &str, last_activity: &str) {
