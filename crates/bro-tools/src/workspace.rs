@@ -15,10 +15,46 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
-/// Resolve a caller-supplied path against the worktree root and refuse
-/// escapes (`..`, absolute paths outside root, symlink traversal). Shared with
-/// the `shell` module so shell `cwd` resolution uses the same confinement.
+/// Effective workspace root. Normally this is the harness launch root. After
+/// `exit_worktree(publish)` removes a managed fleet worktree, the harness
+/// process may continue running for retros/cleanup while `cx.root` points at a
+/// deleted path. In that one managed case, transition read/shell/git tools back
+/// to the base repository advertised by the fleet env.
+pub(crate) fn effective_root(root: &Path) -> PathBuf {
+    let base_repo = std::env::var_os("BRO_FLEET_BASE_REPO").map(PathBuf::from);
+    let worktree_root = std::env::var_os("BRO_FLEET_WORKTREE_ROOT").map(PathBuf::from);
+    effective_root_with_env(root, base_repo.as_deref(), worktree_root.as_deref())
+}
+
+fn effective_root_with_env(
+    root: &Path,
+    base_repo: Option<&Path>,
+    worktree_root: Option<&Path>,
+) -> PathBuf {
+    let root_norm = normalize_lexical(root);
+    if root_norm.exists() {
+        return root_norm;
+    }
+    let Some(base_repo) = base_repo.filter(|path| path.exists()) else {
+        return root_norm;
+    };
+    let Some(worktree_root) = worktree_root else {
+        return root_norm;
+    };
+    let worktree_root = normalize_lexical(worktree_root);
+    if root_norm.starts_with(&worktree_root) {
+        normalize_lexical(base_repo)
+    } else {
+        root_norm
+    }
+}
+
+/// Resolve a caller-supplied path against the effective worktree root and
+/// refuse escapes (`..`, absolute paths outside root, symlink traversal).
+/// Shared with the `shell` module so shell `cwd` resolution uses the same
+/// confinement.
 pub(crate) fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    let root = effective_root(root);
     let joined = if Path::new(rel).is_absolute() {
         PathBuf::from(rel)
     } else {
@@ -26,7 +62,7 @@ pub(crate) fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf>
     };
     // Lexical containment check first (works for not-yet-existing paths).
     let normalized = normalize_lexical(&joined);
-    let root_norm = normalize_lexical(root);
+    let root_norm = normalize_lexical(&root);
     if !normalized.starts_with(&root_norm) {
         anyhow::bail!("path escapes worktree root: {rel}");
     }
@@ -436,9 +472,10 @@ impl Tool for ListDir {
 // ---------------------------------------------------------------------------
 
 async fn git(cx: &ToolCx, args: &[&str]) -> ToolResult {
+    let root = effective_root(&cx.root);
     let out = tokio::process::Command::new("git")
         .args(args)
-        .current_dir(&cx.root)
+        .current_dir(&root)
         .output()
         .await;
     match out {
@@ -529,21 +566,18 @@ impl Tool for GitDiff {
 }
 
 async fn git_diff_include_untracked(cx: &ToolCx) -> ToolResult {
-    let mut diff = match git_stdout(&cx.root, &["diff"]).await {
+    let root = effective_root(&cx.root);
+    let mut diff = match git_stdout(&root, &["diff"]).await {
         Ok(diff) => diff,
         Err(e) => return ToolResult::Error(e),
     };
-    let raw_untracked = match git_stdout(
-        &cx.root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-    )
-    .await
-    {
-        Ok(raw) => raw,
-        Err(e) => return ToolResult::Error(e),
-    };
+    let raw_untracked =
+        match git_stdout(&root, &["ls-files", "--others", "--exclude-standard", "-z"]).await {
+            Ok(raw) => raw,
+            Err(e) => return ToolResult::Error(e),
+        };
     for path in raw_untracked.split('\0').filter(|path| !path.is_empty()) {
-        match git_no_index_new_file(&cx.root, path).await {
+        match git_no_index_new_file(&root, path).await {
             Ok(patch) if !patch.is_empty() => {
                 if !diff.is_empty() && !diff.ends_with('\n') {
                     diff.push('\n');
@@ -840,6 +874,7 @@ impl Tool for ContentSearch {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
+        let root = effective_root(&cx.root);
         let cap = args.max_results.unwrap_or(200).min(5000);
         let ctx = args.context_lines.unwrap_or(0).min(50);
 
@@ -861,7 +896,7 @@ impl Tool for ContentSearch {
             let Some(text) = read_text_capped(p, 2_000_000) else {
                 continue;
             };
-            let rel = p.strip_prefix(&cx.root).unwrap_or(p).display().to_string();
+            let rel = p.strip_prefix(&root).unwrap_or(p).display().to_string();
             let lines: Vec<&str> = text.lines().collect();
 
             match args.mode {
@@ -993,6 +1028,7 @@ impl Tool for Glob {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
+        let root = effective_root(&cx.root);
         // Collect (relpath, mtime) so we can order before formatting.
         let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
         for entry in WalkBuilder::new(&base).build().flatten() {
@@ -1008,7 +1044,7 @@ impl Tool for Glob {
                     .and_then(|m| m.modified().ok())
                     .unwrap_or(std::time::UNIX_EPOCH);
                 out.push((
-                    p.strip_prefix(&cx.root).unwrap_or(p).display().to_string(),
+                    p.strip_prefix(&root).unwrap_or(p).display().to_string(),
                     mtime,
                 ));
                 if out.len() >= GLOB_SCAN_CEILING {
@@ -1140,6 +1176,34 @@ mod tests {
         assert!(resolve_in_root(&root, "src/main.rs").is_ok());
         assert!(resolve_in_root(&root, "/work/repo/src/x").is_ok());
         assert!(resolve_in_root(&root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn deleted_managed_worktree_root_transitions_to_base_repo() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let worktree_root = tempfile::tempdir().unwrap();
+        let base = base_dir.path().canonicalize().unwrap();
+        let fleet_root = worktree_root.path().canonicalize().unwrap();
+        let removed = fleet_root.join("repo").join("task-123");
+
+        assert_eq!(
+            effective_root_with_env(&removed, Some(&base), Some(&fleet_root)),
+            base
+        );
+    }
+
+    #[test]
+    fn deleted_unmanaged_root_does_not_transition_to_base_repo() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let worktree_root = tempfile::tempdir().unwrap();
+        let removed = tempfile::tempdir().unwrap().path().join("task-123");
+        let base = base_dir.path().canonicalize().unwrap();
+        let fleet_root = worktree_root.path().canonicalize().unwrap();
+
+        assert_eq!(
+            effective_root_with_env(&removed, Some(&base), Some(&fleet_root)),
+            normalize_lexical(&removed)
+        );
     }
 
     #[test]
