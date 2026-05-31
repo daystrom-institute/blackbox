@@ -183,16 +183,37 @@ pub(crate) fn new_window_argv(
     argv
 }
 
-pub(crate) fn send_text_argv(pane_id: &str, text: &str) -> Vec<String> {
-    // `-l` sends the literal string: it is not interpreted as tmux key names,
-    // and because it is a single argv element it cannot be re-split or shell
-    // expanded.
+/// Per-pane tmux buffer name used to stage pasted text.
+pub(crate) fn paste_buffer_name(pane_id: &str) -> String {
+    format!("bbox-{}", pane_id.trim_start_matches('%'))
+}
+
+/// Stage `text` into a named tmux buffer. `--` then the text as a single argv
+/// element: no shell, no key-name interpretation, and crucially newlines are
+/// preserved verbatim rather than each becoming an Enter (which `send-keys`
+/// would do, submitting a multi-line prompt line-by-line).
+pub(crate) fn set_buffer_argv(buffer: &str, text: &str) -> Vec<String> {
     vec![
-        "send-keys".into(),
+        "set-buffer".into(),
+        "-b".into(),
+        buffer.into(),
+        "--".into(),
+        text.into(),
+    ]
+}
+
+/// Paste the staged buffer into the pane using bracketed paste (`-p`) so a
+/// multi-line prompt lands as one composer entry, and delete the buffer (`-d`).
+/// A separate `send_enter` submits it.
+pub(crate) fn paste_buffer_argv(buffer: &str, pane_id: &str) -> Vec<String> {
+    vec![
+        "paste-buffer".into(),
+        "-p".into(),
+        "-d".into(),
+        "-b".into(),
+        buffer.into(),
         "-t".into(),
         pane_id.into(),
-        "-l".into(),
-        text.into(),
     ]
 }
 
@@ -296,7 +317,11 @@ impl TmuxBackend for CliTmuxBackend {
     }
 
     async fn send_text(&self, pane_id: &str, text: &str) -> Result<(), TmuxError> {
-        self.run(&send_text_argv(pane_id, text)).await.map(|_| ())
+        let buffer = paste_buffer_name(pane_id);
+        self.run(&set_buffer_argv(&buffer, text)).await?;
+        self.run(&paste_buffer_argv(&buffer, pane_id))
+            .await
+            .map(|_| ())
     }
 
     async fn send_enter(&self, pane_id: &str) -> Result<(), TmuxError> {
@@ -331,14 +356,29 @@ mod tests {
     }
 
     #[test]
-    fn send_text_uses_literal_flag_and_single_arg() {
-        let argv = send_text_argv("%9", "rm -rf / ; echo $(whoami)");
-        // The dangerous-looking text is one argv element after `-l`, never a
-        // shell string and never split.
-        assert_eq!(argv[0], "send-keys");
-        assert!(argv.contains(&"-l".to_string()), "{argv:?}");
-        assert_eq!(argv.last().unwrap(), "rm -rf / ; echo $(whoami)");
+    fn set_buffer_keeps_text_as_single_arg_after_dashdash() {
+        // Dangerous-looking, multi-line text is one argv element after `--`:
+        // never a shell string, never split, newlines preserved (not Enter).
+        let text = "rm -rf / ; echo $(whoami)\nsecond line";
+        let argv = set_buffer_argv("bbox-9", text);
+        assert_eq!(argv[0], "set-buffer");
+        let sep = argv.iter().position(|a| a == "--").expect("-- present");
+        assert_eq!(argv[sep + 1], text);
         assert_eq!(argv.iter().filter(|a| a.contains("whoami")).count(), 1);
+    }
+
+    #[test]
+    fn paste_buffer_uses_bracketed_paste_and_deletes() {
+        let argv = paste_buffer_argv("bbox-9", "%9");
+        assert!(argv.contains(&"-p".to_string()), "bracketed paste: {argv:?}");
+        assert!(argv.contains(&"-d".to_string()), "delete buffer: {argv:?}");
+        let t = argv.iter().position(|a| a == "-t").unwrap();
+        assert_eq!(argv[t + 1], "%9");
+    }
+
+    #[test]
+    fn paste_buffer_name_is_per_pane() {
+        assert_eq!(paste_buffer_name("%14"), "bbox-14");
     }
 
     #[test]

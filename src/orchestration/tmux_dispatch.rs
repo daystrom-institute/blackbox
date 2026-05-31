@@ -4,34 +4,38 @@
 //! tmux pane, and resolves the turn output **from the transcript read plane** —
 //! never from pane capture (cutover rule #3). The flow:
 //!
-//! 1. launch the provider TUI in a tmux pane (`TmuxBackend`),
-//! 2. bind the provider session id (Codex: discover the new rollout file under
-//!    the launch cwd; Claude: pre-mint `--session-id` and locate it),
-//! 3. snapshot the pre-prompt transcript cursor,
-//! 4. type the prompt into the pane and submit it,
-//! 5. poll the transcript adapter until a turn-complete predicate fires, then
-//!    return the assistant text of that turn.
+//! 1. snapshot existing provider sessions (Codex) and pre-mint a session id
+//!    (Claude) so binding is unambiguous,
+//! 2. launch the provider TUI in a tmux pane (`TmuxBackend`),
+//! 3. clear first-run/trust prompts and wait until the TUI is ready
+//!    (`prepare_tui`, fail-closed; pane capture used for control only),
+//! 4. submit `<prompt>` plus a unique per-turn nonce by bracketed-paste +
+//!    Enter (newlines never submit early),
+//! 5. bind the provider session (Codex: the new rollout whose transcript
+//!    contains our nonce; Claude: locate the pre-minted id),
+//! 6. poll the transcript until a provider-specific **turn-complete marker**
+//!    fires (Codex `task_complete`; Claude assistant `stop_reason=end_turn`),
+//!    then return that turn's assistant text.
 //!
-//! Session binding and the turn resolver are the two pieces that did NOT exist
-//! before this slice; the rest reuses the landed read plane
-//! (`crate::transcripts`). See
+//! On any post-launch error the actor window is killed before returning, so
+//! failures do not leak panes. See
 //! `design/orchestration/workflows/tmux-terminal-mode-slice.md`.
 //
 // Wired into the workflow actor-node path in a follow-up; until then the entry
-// point is exercised by the live-ignored integration test and any direct caller.
+// point is exercised by the live-ignored integration tests and direct callers.
 #![allow(dead_code)]
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::orchestration::providers::{self, Provider};
-use crate::orchestration::tmux::{TmuxBackend, container_session_name};
+use crate::orchestration::tmux::{TmuxBackend, TmuxHandle, container_session_name};
 use crate::transcripts::adapters::{TranscriptAdapterRegistry, codex_location};
 use crate::transcripts::types::{
-    NormalizedTranscriptEvent, TranscriptCursor, TranscriptEventKind, TranscriptLocation,
-    TranscriptRole,
+    NormalizedTranscriptEvent, TranscriptEventKind, TranscriptLocation, TranscriptRole,
 };
 
 /// What to run in the pane and where.
@@ -51,17 +55,15 @@ pub struct TerminalTurnConfig {
 /// Timing knobs (separate so tests / callers can shrink them).
 #[derive(Debug, Clone)]
 pub struct TerminalTurnTiming {
-    /// How long to wait for the provider session file to appear after launch.
+    /// How long to wait for the provider session to bind after prompt submit.
     pub session_discovery_timeout: Duration,
     /// Settle delay after launching the TUI before the first pane capture.
     pub submit_settle: Duration,
     /// Budget for the provider TUI to become ready (clear first-run/trust
-    /// prompts) before we submit the prompt.
+    /// prompts) before we submit the prompt. Fail-closed on expiry.
     pub tui_ready_timeout: Duration,
     /// Overall budget for the assistant turn to complete.
     pub turn_timeout: Duration,
-    /// Quiet window with no new transcript events that marks the turn done.
-    pub quiescence: Duration,
     /// Transcript poll interval.
     pub poll_interval: Duration,
 }
@@ -73,7 +75,6 @@ impl Default for TerminalTurnTiming {
             submit_settle: Duration::from_millis(1500),
             tui_ready_timeout: Duration::from_secs(25),
             turn_timeout: Duration::from_secs(300),
-            quiescence: Duration::from_secs(4),
             poll_interval: Duration::from_secs(1),
         }
     }
@@ -84,8 +85,22 @@ impl Default for TerminalTurnTiming {
 pub struct TerminalTurnOutcome {
     pub session_id: String,
     pub location: TranscriptLocation,
-    pub handle: crate::orchestration::tmux::TmuxHandle,
+    pub handle: TmuxHandle,
     pub assistant_text: String,
+}
+
+/// Validate an effort token before it is interpolated into provider args.
+/// Restricting to `[A-Za-z0-9-]` prevents quote/newline injection into the
+/// Codex `-c model_reasoning_effort="..."` TOML override (and is harmless for
+/// Claude's `--effort` flag value).
+fn sanitize_effort(effort: Option<&str>) -> Result<Option<String>> {
+    match effort {
+        None => Ok(None),
+        Some(e) if e.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && !e.is_empty() => {
+            Ok(Some(e.to_string()))
+        }
+        Some(e) => bail!("invalid effort value {e:?}: only [A-Za-z0-9-] allowed"),
+    }
 }
 
 /// Resolve the interactive launch argv (binary + args) for a TUI-capable
@@ -93,8 +108,12 @@ pub struct TerminalTurnOutcome {
 /// headless (`-p`/`--output-format stream-json`, `exec --json`). Terminal mode
 /// launches the real TUI and submits the prompt by typing, so the prompt is
 /// never a launch arg here.
-fn tui_launch_command(cfg: &TerminalTurnConfig, preminted_session: Option<&str>) -> Result<Vec<String>> {
+fn tui_launch_command(
+    cfg: &TerminalTurnConfig,
+    preminted_session: Option<&str>,
+) -> Result<Vec<String>> {
     let provider = cfg.provider;
+    let effort = sanitize_effort(cfg.effort.as_deref())?;
     let raw_bin = match blackbox::config::load() {
         Ok(c) => provider.bin_with_config(&c.providers),
         Err(_) => provider.bin(),
@@ -113,7 +132,7 @@ fn tui_launch_command(cfg: &TerminalTurnConfig, preminted_session: Option<&str>)
                 args.push("--model".into());
                 args.push(m.clone());
             }
-            if let Some(e) = &cfg.effort {
+            if let Some(e) = &effort {
                 args.push("-c".into());
                 args.push(format!("model_reasoning_effort=\"{e}\""));
             }
@@ -130,7 +149,7 @@ fn tui_launch_command(cfg: &TerminalTurnConfig, preminted_session: Option<&str>)
                 args.push("--model".into());
                 args.push(m.clone());
             }
-            if let Some(e) = &cfg.effort {
+            if let Some(e) = &effort {
                 args.push("--effort".into());
                 args.push(e.clone());
             }
@@ -140,7 +159,8 @@ fn tui_launch_command(cfg: &TerminalTurnConfig, preminted_session: Option<&str>)
     Ok(args)
 }
 
-/// Drive one terminal-mode turn end to end.
+/// Drive one terminal-mode turn end to end. On any error after the pane is
+/// created, the actor window is killed before returning (no pane leak).
 pub async fn run_terminal_turn(
     backend: &dyn TmuxBackend,
     registry: &TranscriptAdapterRegistry,
@@ -157,16 +177,24 @@ pub async fn run_terminal_turn(
         bail!("tmux is not available; terminal_mode=tmux requires tmux on PATH");
     }
 
-    let canon_cwd = cfg
-        .cwd
-        .canonicalize()
-        .unwrap_or_else(|_| cfg.cwd.clone());
+    let canon_cwd = cfg.cwd.canonicalize().unwrap_or_else(|_| cfg.cwd.clone());
     let cwd_str = cfg.cwd.to_string_lossy().to_string();
 
-    // Claude can pin its session id up front; Codex must discover it post-launch.
+    // Unique per-turn nonce, embedded in the submitted text. It disambiguates
+    // session binding under concurrent same-cwd launches and verifies the
+    // prompt actually landed in the bound session.
+    let nonce = format!("bbox-turn-{}", uuid::Uuid::new_v4().simple());
+    let submitted_text = format!("{}\n\n[{}]", cfg.prompt, nonce);
+
+    // Claude pins its session id up front; Codex discovers it post-submit. For
+    // Codex, snapshot existing rollouts so discovery only considers new ones.
     let preminted = match cfg.provider {
         Provider::Claude => Some(uuid::Uuid::new_v4().to_string()),
         _ => None,
+    };
+    let pre_existing: HashSet<PathBuf> = match cfg.provider {
+        Provider::Codex => codex_rollout_paths(),
+        _ => HashSet::new(),
     };
 
     let command = tui_launch_command(cfg, preminted.as_deref())?;
@@ -180,63 +208,96 @@ pub async fn run_terminal_turn(
         .await
         .map_err(|e| anyhow!("create tmux window: {e}"))?;
 
-    // Let the TUI boot, then clear first-run/trust prompts so it can accept the
-    // prompt. Pane capture here is CONTROL-plane only (readiness/trust
-    // handshake) — it is never used as node output.
+    // Everything after the pane exists is fallible; kill the window on any error
+    // so failures don't leak panes.
+    let result = drive_after_launch(
+        backend,
+        registry,
+        cfg,
+        timing,
+        &handle,
+        &submitted_text,
+        &nonce,
+        preminted.as_deref(),
+        &canon_cwd,
+        &pre_existing,
+    )
+    .await;
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(e) => {
+            let _ = backend.kill_window(&handle).await;
+            Err(e)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn drive_after_launch(
+    backend: &dyn TmuxBackend,
+    registry: &TranscriptAdapterRegistry,
+    cfg: &TerminalTurnConfig,
+    timing: &TerminalTurnTiming,
+    handle: &TmuxHandle,
+    submitted_text: &str,
+    nonce: &str,
+    preminted: Option<&str>,
+    canon_cwd: &Path,
+    pre_existing: &HashSet<PathBuf>,
+) -> Result<TerminalTurnOutcome> {
+    // Let the TUI boot, then clear first-run/trust prompts. Pane capture here is
+    // CONTROL-plane only (readiness/trust handshake) — never node output.
     tokio::time::sleep(timing.submit_settle).await;
     prepare_tui(backend, cfg.provider, &handle.pane_id, timing).await?;
 
-    // Submit the prompt by typing into the pane. For interactive Codex the
-    // rollout file is only created once the first turn is submitted, so session
-    // binding must happen AFTER this point.
-    let prompt_at_wall = wall_ms();
+    // Submit prompt+nonce by bracketed paste, then one Enter. For interactive
+    // Codex the rollout file is only created on the first submitted turn, so
+    // binding happens AFTER this point.
+    let submit_wall = wall_ms();
     let bind_at = Instant::now();
     backend
-        .send_text(&handle.pane_id, &cfg.prompt)
+        .send_text(&handle.pane_id, submitted_text)
         .await
-        .map_err(|e| anyhow!("send prompt: {e}"))?;
+        .map_err(|e| anyhow!("paste prompt: {e}"))?;
     backend
         .send_enter(&handle.pane_id)
         .await
         .map_err(|e| anyhow!("submit prompt: {e}"))?;
 
-    // ---- bind the provider session id + transcript location (fail closed) ----
+    // Bind session id + transcript location (fail closed).
     let (session_id, location) = bind_session(
         registry,
         cfg.provider,
-        preminted.as_deref(),
-        &canon_cwd,
-        prompt_at_wall,
+        preminted,
+        canon_cwd,
+        nonce,
+        submit_wall,
         bind_at,
+        pre_existing,
         timing,
     )
     .await
-    .with_context(|| {
-        format!(
-            "binding {} session after prompt submission (cwd {})",
-            cfg.provider, cwd_str
-        )
-    })?;
+    .with_context(|| format!("binding {} session (cwd {})", cfg.provider, canon_cwd.display()))?;
 
-    // ---- turn resolver: read the fresh session transcript until turn-complete.
-    // We read from the start (None): the session was created by our turn, so the
-    // resolver finds our prompt as a user turn then waits for the assistant.
+    // Resolve the turn from the transcript, gated on a provider-specific
+    // turn-complete marker (not first-event / quiescence).
     let adapter = registry
         .adapter(cfg.provider)
         .ok_or_else(|| anyhow!("no transcript adapter for {}", cfg.provider))?;
-    let assistant_text = resolve_turn(adapter, &location, None, &cfg.prompt, timing).await?;
+    let assistant_text = resolve_turn(adapter, cfg.provider, &location, nonce, timing).await?;
 
     Ok(TerminalTurnOutcome {
         session_id,
         location,
-        handle,
+        handle: handle.clone(),
         assistant_text,
     })
 }
 
 /// Clear first-run/trust prompts and wait until the provider TUI is ready to
-/// accept a typed prompt. Best-effort: on timeout it returns Ok and lets the
-/// submit proceed. Uses pane capture for control only (never as node output).
+/// accept a typed prompt. **Fail-closed**: errors if readiness is not proven
+/// within `tui_ready_timeout`, so we never type a prompt into a trust prompt or
+/// half-booted UI. Pane capture is control-plane only (never node output).
 async fn prepare_tui(
     backend: &dyn TmuxBackend,
     provider: Provider,
@@ -246,16 +307,21 @@ async fn prepare_tui(
     let deadline = Instant::now() + timing.tui_ready_timeout;
     let mut trust_cleared = false;
     loop {
-        let pane = backend.capture_pane(pane_id, 80).await.unwrap_or_default();
+        let pane = backend
+            .capture_pane(pane_id, 80)
+            .await
+            .map_err(|e| anyhow!("capture pane for readiness: {e}"))?;
         match provider {
             Provider::Codex => {
                 if !trust_cleared && pane.contains("Do you trust") {
-                    backend.send_enter(pane_id).await.ok();
+                    backend
+                        .send_enter(pane_id)
+                        .await
+                        .map_err(|e| anyhow!("accept codex trust prompt: {e}"))?;
                     trust_cleared = true;
                     tokio::time::sleep(timing.poll_interval).await;
                     continue;
                 }
-                // Main TUI ready markers.
                 if pane.contains("OpenAI Codex")
                     || pane.contains("/model to change")
                     || pane.contains("permissions:")
@@ -264,18 +330,17 @@ async fn prepare_tui(
                 }
             }
             Provider::Claude => {
-                // First-run folder-trust gate: "Quick safety check: Is this a
-                // project you created or one you trust?" — Enter accepts the
-                // default ("Yes, I trust this folder").
                 if !trust_cleared
                     && (pane.contains("trust this folder") || pane.contains("Quick safety check"))
                 {
-                    backend.send_enter(pane_id).await.ok();
+                    backend
+                        .send_enter(pane_id)
+                        .await
+                        .map_err(|e| anyhow!("accept claude trust prompt: {e}"))?;
                     trust_cleared = true;
                     tokio::time::sleep(timing.poll_interval).await;
                     continue;
                 }
-                // Main TUI ready markers.
                 if pane.contains("bypass permissions")
                     || pane.contains("? for shortcuts")
                     || pane.contains("/effort")
@@ -283,10 +348,14 @@ async fn prepare_tui(
                     return Ok(());
                 }
             }
-            _ => return Ok(()),
+            other => bail!("prepare_tui unsupported for provider {other}"),
         }
         if Instant::now() >= deadline {
-            return Ok(());
+            bail!(
+                "{provider} TUI did not reach a ready state within {:?}; failing closed (will not \
+                 type into an unproven UI)",
+                timing.tui_ready_timeout
+            );
         }
         tokio::time::sleep(timing.poll_interval).await;
     }
@@ -294,13 +363,16 @@ async fn prepare_tui(
 
 /// Provider-specific session binding. Returns `(session_id, location)` or fails
 /// closed if it cannot bind within `session_discovery_timeout`.
+#[allow(clippy::too_many_arguments)]
 async fn bind_session(
     registry: &TranscriptAdapterRegistry,
     provider: Provider,
     preminted: Option<&str>,
     canon_cwd: &Path,
+    nonce: &str,
     since_wall_ms: u128,
     started_at: Instant,
+    pre_existing: &HashSet<PathBuf>,
     timing: &TerminalTurnTiming,
 ) -> Result<(String, TranscriptLocation)> {
     let adapter = registry
@@ -318,9 +390,14 @@ async fn bind_session(
                 }
             }
             Provider::Codex => {
-                if let Some((sid, path)) = discover_codex_session(canon_cwd, since_wall_ms) {
+                // Bind to the NEW rollout whose transcript contains our nonce.
+                // cwd + mtime bound the search; the nonce is the authoritative,
+                // collision-proof identifier (handles concurrent same-cwd runs).
+                if let Some(path) =
+                    discover_codex_session(canon_cwd, since_wall_ms, nonce, pre_existing)
+                {
                     let loc = codex_location(&path);
-                    let sid = loc.session_id.clone().unwrap_or(sid);
+                    let sid = loc.session_id.clone().unwrap_or_default();
                     return Ok((sid, loc));
                 }
             }
@@ -336,8 +413,7 @@ async fn bind_session(
     }
 }
 
-/// Resolve the codex session root the same way the runtime registry does:
-/// `TRANSCRIPT_SEARCH_CODEX_ROOT`, else `~/.codex` when it has a `sessions` dir.
+/// Resolve the codex sessions dir the same way the runtime registry does.
 fn codex_sessions_root() -> Option<PathBuf> {
     if let Ok(root) = std::env::var("TRANSCRIPT_SEARCH_CODEX_ROOT") {
         return Some(PathBuf::from(root).join("sessions"));
@@ -347,39 +423,61 @@ fn codex_sessions_root() -> Option<PathBuf> {
     sessions.exists().then_some(sessions)
 }
 
-/// Find the newest codex rollout file created at/after `since_wall_ms` whose
-/// `session_meta.cwd` canonicalizes to `canon_cwd`. A small mtime slack absorbs
-/// filesystem timestamp granularity.
-fn discover_codex_session(canon_cwd: &Path, since_wall_ms: u128) -> Option<(String, PathBuf)> {
+/// Snapshot of all existing codex rollout file paths (pre-launch exclude set).
+fn codex_rollout_paths() -> HashSet<PathBuf> {
+    let mut paths = HashSet::new();
+    let Some(sessions) = codex_sessions_root() else {
+        return paths;
+    };
+    for entry in walkdir::WalkDir::new(&sessions)
+        .follow_links(true)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if is_rollout_file(p) {
+            paths.insert(p.to_path_buf());
+        }
+    }
+    paths
+}
+
+fn is_rollout_file(path: &Path) -> bool {
+    path.extension().map(|x| x == "jsonl").unwrap_or(false)
+        && path
+            .file_name()
+            .map(|n| n.to_string_lossy().starts_with("rollout-"))
+            .unwrap_or(false)
+}
+
+/// Find the codex rollout created at/after `since_wall_ms`, not in the
+/// pre-existing snapshot, whose file content contains `nonce`. The nonce is
+/// globally unique, so a content match is authoritative even under concurrent
+/// same-cwd launches; `canon_cwd`/mtime are cheap pre-filters.
+fn discover_codex_session(
+    canon_cwd: &Path,
+    since_wall_ms: u128,
+    nonce: &str,
+    pre_existing: &HashSet<PathBuf>,
+) -> Option<PathBuf> {
     let sessions = codex_sessions_root()?;
-    let slack_ms: u128 = 3_000;
-    let floor = since_wall_ms.saturating_sub(slack_ms);
-    let mut best: Option<(u128, String, PathBuf)> = None;
+    let floor = since_wall_ms.saturating_sub(3_000);
     for entry in walkdir::WalkDir::new(&sessions)
         .follow_links(true)
         .into_iter()
         .filter_map(|e| e.ok())
     {
         let path = entry.path();
-        if path.extension().map(|x| x != "jsonl").unwrap_or(true) {
+        if !is_rollout_file(path) || pre_existing.contains(path) {
             continue;
         }
-        let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-        if !name.starts_with("rollout-") {
-            continue;
-        }
-        let mtime_ms = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
+        let mtime_ms = file_mtime_ms(entry.metadata().ok());
         if mtime_ms < floor {
             continue;
         }
+        // cwd pre-filter (cheap; parses first lines).
         let loc = codex_location(path);
-        let matches_cwd = loc
+        let cwd_ok = loc
             .cwd
             .as_deref()
             .map(|c| {
@@ -387,82 +485,157 @@ fn discover_codex_session(canon_cwd: &Path, since_wall_ms: u128) -> Option<(Stri
                 cp.canonicalize().unwrap_or(cp) == canon_cwd
             })
             .unwrap_or(false);
-        if !matches_cwd {
+        if !cwd_ok {
             continue;
         }
-        let sid = loc.session_id.clone().unwrap_or_default();
-        if best.as_ref().map(|(m, _, _)| mtime_ms > *m).unwrap_or(true) {
-            best = Some((mtime_ms, sid, path.to_path_buf()));
+        // Authoritative: our nonce appears in this session's content.
+        if file_contains(path, nonce) {
+            return Some(path.to_path_buf());
         }
     }
-    best.map(|(_, sid, path)| (sid, path))
+    None
 }
 
-/// Transcript-only turn resolver. Returns the assistant text once the turn is
-/// complete, defined as: our prompt has appeared as a user turn (binding +
-/// landing verification), at least one assistant message has followed it, and
-/// the transcript has been quiet for `quiescence`. Fails closed on timeout.
+fn file_mtime_ms(meta: Option<std::fs::Metadata>) -> u128 {
+    meta.and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
+}
+
+fn file_contains(path: &Path, needle: &str) -> bool {
+    std::fs::read_to_string(path)
+        .map(|s| s.contains(needle))
+        .unwrap_or(false)
+}
+
+/// Transcript-only turn resolver. Completion is gated on a **provider-specific
+/// turn-complete marker** in the raw session file — Codex `task_complete`,
+/// Claude assistant `stop_reason` in {end_turn, stop_sequence, max_tokens} —
+/// not on the first assistant message or a quiescence window (a tool-call pause
+/// must not look like completion). Returns the turn's assistant text. Fails
+/// closed on timeout.
+///
+/// MVP scope: a freshly-created single-turn session. Durable multi-turn resume
+/// (positional marker disambiguation, persisted cursors) is part of the
+/// workflow-engine wiring follow-up.
 async fn resolve_turn(
     adapter: &dyn crate::transcripts::adapters::TranscriptReadAdapter,
+    provider: Provider,
     location: &TranscriptLocation,
-    start_cursor: Option<TranscriptCursor>,
-    prompt: &str,
+    nonce: &str,
     timing: &TerminalTurnTiming,
 ) -> Result<String> {
     let deadline = Instant::now() + timing.turn_timeout;
-    let mut cursor = start_cursor;
     let mut saw_prompt = false;
-    let mut assistant_chunks: Vec<String> = Vec::new();
-    let mut assistant_after_prompt = false;
-    let mut last_event_at = Instant::now();
-    let prompt_needle = prompt.trim();
-
     loop {
-        let batch = adapter
-            .read_since(location, cursor.as_ref())
-            .map_err(|e| anyhow!("turn resolver read: {e}"))?;
-        if let Some(c) = batch.cursor.clone() {
-            cursor = Some(c);
+        // Confirm our prompt landed (nonce in a user turn) — also re-verifies
+        // the binding. Then wait for the provider's turn-complete marker.
+        if !saw_prompt && session_has_user_nonce(provider, location, nonce)? {
+            saw_prompt = true;
         }
-        let mut got_new = false;
-        for ev in &batch.events {
-            got_new = true;
-            if !saw_prompt {
-                if is_user_message(ev) && event_matches_prompt(ev, prompt_needle) {
-                    saw_prompt = true;
-                }
-                // Ignore everything before our prompt lands.
-                continue;
-            }
-            if is_assistant_message(ev) {
-                assistant_after_prompt = true;
-                if !ev.content.trim().is_empty() {
-                    assistant_chunks.push(ev.content.clone());
-                }
-            }
-        }
-        if got_new {
-            last_event_at = Instant::now();
-        }
-
-        if saw_prompt
-            && assistant_after_prompt
-            && last_event_at.elapsed() >= timing.quiescence
-        {
-            return Ok(assistant_chunks.join("\n"));
+        if saw_prompt && provider_turn_complete(provider, &location.path)? {
+            return collect_assistant_text(adapter, provider, location, nonce);
         }
 
         if Instant::now() >= deadline {
             if !saw_prompt {
                 bail!(
-                    "turn resolver timed out before our prompt appeared in the transcript; \
-                     binding may be wrong (failing closed, no pane-text fallback)"
+                    "turn resolver timed out before our prompt (nonce) appeared in the bound \
+                     session; failing closed (no pane-text fallback)"
                 );
             }
-            bail!("turn resolver timed out after {:?} waiting for the assistant turn to settle", timing.turn_timeout);
+            bail!(
+                "turn resolver timed out after {:?} waiting for the {provider} turn-complete marker",
+                timing.turn_timeout
+            );
         }
         tokio::time::sleep(timing.poll_interval).await;
     }
+}
+
+/// True once a user-role message in the session contains our nonce.
+fn session_has_user_nonce(
+    provider: Provider,
+    location: &TranscriptLocation,
+    nonce: &str,
+) -> Result<bool> {
+    // Cheap raw check: the nonce only ever appears in the user turn we typed.
+    let _ = provider;
+    Ok(file_contains(&location.path, nonce))
+}
+
+/// Detect the provider-specific turn-complete marker in the raw session file.
+fn provider_turn_complete(provider: Provider, path: &Path) -> Result<bool> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(anyhow!("read session {}: {e}", path.display())),
+    };
+    match provider {
+        Provider::Codex => {
+            for line in content.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if v.get("type").and_then(|t| t.as_str()) == Some("event_msg")
+                    && v.get("payload")
+                        .and_then(|p| p.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("task_complete")
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Provider::Claude => {
+            for line in content.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let msg = v.get("message");
+                let role = msg.and_then(|m| m.get("role")).and_then(|r| r.as_str());
+                let stop = msg
+                    .and_then(|m| m.get("stop_reason"))
+                    .and_then(|s| s.as_str());
+                if role == Some("assistant")
+                    && matches!(stop, Some("end_turn") | Some("stop_sequence") | Some("max_tokens"))
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        other => bail!("no turn-complete marker defined for provider {other}"),
+    }
+}
+
+/// Collect the assistant text of the completed turn from normalized events:
+/// assistant messages that appear after the user turn carrying our nonce.
+fn collect_assistant_text(
+    adapter: &dyn crate::transcripts::adapters::TranscriptReadAdapter,
+    _provider: Provider,
+    location: &TranscriptLocation,
+    nonce: &str,
+) -> Result<String> {
+    let batch = adapter
+        .read_since(location, None)
+        .map_err(|e| anyhow!("read session for assistant text: {e}"))?;
+    let mut after_prompt = false;
+    let mut chunks: Vec<String> = Vec::new();
+    for ev in &batch.events {
+        if !after_prompt {
+            if is_user_message(ev) && ev.content.contains(nonce) {
+                after_prompt = true;
+            }
+            continue;
+        }
+        if is_assistant_message(ev) && !ev.content.trim().is_empty() {
+            chunks.push(ev.content.clone());
+        }
+    }
+    Ok(chunks.join("\n"))
 }
 
 fn is_user_message(ev: &NormalizedTranscriptEvent) -> bool {
@@ -471,14 +644,6 @@ fn is_user_message(ev: &NormalizedTranscriptEvent) -> bool {
 
 fn is_assistant_message(ev: &NormalizedTranscriptEvent) -> bool {
     matches!(ev.role, TranscriptRole::Assistant) && matches!(ev.kind, TranscriptEventKind::Message)
-}
-
-fn event_matches_prompt(ev: &NormalizedTranscriptEvent, prompt_needle: &str) -> bool {
-    if prompt_needle.is_empty() {
-        return true;
-    }
-    let content = ev.content.trim();
-    content.contains(prompt_needle) || prompt_needle.contains(content) && !content.is_empty()
 }
 
 fn wall_ms() -> u128 {
@@ -507,13 +672,11 @@ mod tests {
     #[test]
     fn codex_launch_is_interactive_no_headless_flags() {
         let args = tui_launch_command(&cfg(Provider::Codex), None).unwrap();
-        // No headless markers.
         assert!(!args.iter().any(|a| a == "exec"), "{args:?}");
         assert!(!args.iter().any(|a| a == "--json"), "{args:?}");
         assert!(!args.iter().any(|a| a == "-p"), "{args:?}");
-        // Interactive markers.
         assert!(args.iter().any(|a| a == "--no-alt-screen"), "{args:?}");
-        assert!(args.iter().any(|a| a == "say hi") == false, "prompt must not be a launch arg: {args:?}");
+        assert!(!args.iter().any(|a| a == "say hi"), "prompt not a launch arg: {args:?}");
         assert!(args.iter().any(|a| a == "gpt-5.5"));
     }
 
@@ -532,14 +695,63 @@ mod tests {
         assert!(tui_launch_command(&cfg(Provider::Brodex), None).is_err());
     }
 
-    /// Live smoke against the real codex TUI. Ignored by default (needs tmux +
-    /// codex + an authenticated account + LLM spend). Run with:
+    #[test]
+    fn effort_injection_is_rejected() {
+        // A quote/newline-laced effort must not reach the TOML override.
+        let mut c = cfg(Provider::Codex);
+        c.effort = Some("high\" evil=\"1".into());
+        assert!(tui_launch_command(&c, None).is_err());
+        c.effort = Some("high".into());
+        assert!(tui_launch_command(&c, None).is_ok());
+        assert_eq!(sanitize_effort(Some("xhigh")).unwrap().as_deref(), Some("xhigh"));
+        assert!(sanitize_effort(Some("a b")).is_err());
+    }
+
+    #[test]
+    fn codex_turn_complete_detects_task_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("rollout-x.jsonl");
+        std::fs::write(
+            &p,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n\
+             {\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n",
+        )
+        .unwrap();
+        assert!(!provider_turn_complete(Provider::Codex, &p).unwrap());
+        std::fs::write(
+            &p,
+            "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n\
+             {\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+        )
+        .unwrap();
+        assert!(provider_turn_complete(Provider::Codex, &p).unwrap());
+    }
+
+    #[test]
+    fn claude_turn_complete_keys_on_end_turn_stop_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("s.jsonl");
+        // tool_use stop_reason is NOT terminal.
+        std::fs::write(
+            &p,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"tool_use\"}}\n",
+        )
+        .unwrap();
+        assert!(!provider_turn_complete(Provider::Claude, &p).unwrap());
+        std::fs::write(
+            &p,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"stop_reason\":\"end_turn\"}}\n",
+        )
+        .unwrap();
+        assert!(provider_turn_complete(Provider::Claude, &p).unwrap());
+    }
+
+    /// Live smoke against the real codex TUI. Ignored by default. Run with:
     ///   CARGO_TARGET_DIR=... cargo test --lib -- --ignored live_codex_terminal_turn --nocapture
     #[tokio::test]
     #[ignore]
     async fn live_codex_terminal_turn() {
         use crate::orchestration::tmux::{CliTmuxBackend, TmuxBackend};
-
         let backend = CliTmuxBackend::new();
         let registry = TranscriptAdapterRegistry::from_runtime_config();
         let tmp = tempfile::tempdir().unwrap();
@@ -557,34 +769,25 @@ mod tests {
             submit_settle: Duration::from_secs(2),
             tui_ready_timeout: Duration::from_secs(30),
             turn_timeout: Duration::from_secs(180),
-            quiescence: Duration::from_secs(5),
             poll_interval: Duration::from_secs(1),
         };
-
         let outcome = run_terminal_turn(&backend, &registry, &cfg, &timing)
             .await
             .expect("terminal turn");
-        eprintln!(
-            "session={} pane={} text={:?}",
-            outcome.session_id, outcome.handle.pane_id, outcome.assistant_text
-        );
-        // cleanup the actor window
+        eprintln!("session={} text={:?}", outcome.session_id, outcome.assistant_text);
         let _ = backend.kill_window(&outcome.handle).await;
-
         assert!(
             outcome.assistant_text.to_uppercase().contains("PONG"),
-            "assistant text should contain PONG, got: {:?}",
+            "want PONG, got: {:?}",
             outcome.assistant_text
         );
     }
 
-    /// Live smoke against the real Claude TUI. Ignored by default. Run with:
-    ///   CARGO_TARGET_DIR=... cargo test --lib -- --ignored live_claude_terminal_turn --nocapture
+    /// Live smoke against the real Claude TUI. Ignored by default.
     #[tokio::test]
     #[ignore]
     async fn live_claude_terminal_turn() {
         use crate::orchestration::tmux::{CliTmuxBackend, TmuxBackend};
-
         let backend = CliTmuxBackend::new();
         let registry = TranscriptAdapterRegistry::from_runtime_config();
         let tmp = tempfile::tempdir().unwrap();
@@ -602,54 +805,17 @@ mod tests {
             submit_settle: Duration::from_secs(2),
             tui_ready_timeout: Duration::from_secs(40),
             turn_timeout: Duration::from_secs(180),
-            quiescence: Duration::from_secs(5),
             poll_interval: Duration::from_secs(1),
         };
-
         let outcome = run_terminal_turn(&backend, &registry, &cfg, &timing)
             .await
             .expect("terminal turn");
-        eprintln!(
-            "session={} pane={} text={:?}",
-            outcome.session_id, outcome.handle.pane_id, outcome.assistant_text
-        );
+        eprintln!("session={} text={:?}", outcome.session_id, outcome.assistant_text);
         let _ = backend.kill_window(&outcome.handle).await;
-
         assert!(
             outcome.assistant_text.to_uppercase().contains("PONG"),
-            "assistant text should contain PONG, got: {:?}",
+            "want PONG, got: {:?}",
             outcome.assistant_text
         );
-    }
-
-    #[test]
-    fn prompt_matching_is_lenient_both_directions() {
-        let mk = |content: &str| NormalizedTranscriptEvent {
-            provider: Provider::Codex,
-            role: TranscriptRole::User,
-            kind: TranscriptEventKind::Message,
-            content: content.into(),
-            session_id: "s".into(),
-            timestamp: None,
-            git_branch: None,
-            is_subagent: false,
-            agent_slug: None,
-            cwd: None,
-            tool_call: None,
-            raw: crate::transcripts::types::RawTranscriptRef {
-                provider: Provider::Codex,
-                storage: crate::transcripts::types::TranscriptStorage::JsonlFile,
-                path: PathBuf::from("/x"),
-                byte_offset: Some(0),
-                event_idx: Some(0),
-                line_len: Some(0),
-                provider_event_id: None,
-                entity_id: None,
-            },
-        };
-        // exact + wrapped + substring
-        assert!(event_matches_prompt(&mk("say hi"), "say hi"));
-        assert!(event_matches_prompt(&mk("please: say hi now"), "say hi"));
-        assert!(is_user_message(&mk("x")));
     }
 }
