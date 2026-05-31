@@ -1,0 +1,19 @@
+{
+  "id": "25004002",
+  "title": "Multiple agents operate concurrently across worktrees — only touch files you changed",
+  "content": "Multiple agents operate concurrently in this repo — the main worktree plus additional git/Claude worktrees — against shared working state. Treat the working tree as multi-tenant: only stage, commit, discard, restore, or stash files that THIS session changed. Files you didn't touch may carry a peer agent's uncommitted edits.\n\nWhy: a clean repo at session start does not stay clean — background/peer agents mutate brofiles, .bbox state, and source mid-session. A blanket `git add -A`, `git commit -a`, `git checkout -- .`, or `git stash` can swallow or destroy a peer's in-flight work.\n\nHow to apply: scope every git mutation to your own files by explicit path. Before discarding or overwriting anything you didn't create, inspect it and surface it to the operator rather than reverting. When you need a clean tree to rebase, stash only the peer-foreign dirty files by path and restore them afterward. Complements the test-isolation invariants (per-test tempdirs / real-HOME isolation) and the ask-before-mutating-shared-services convention.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-05-31T01:10:45Z",
+  "updated_at": "2026-05-31T01:10:45Z",
+  "recall_count": 0
+}

@@ -6,6 +6,30 @@ Read @PROJECT.md fully before acting; it contains the shared project context and
 @PROJECT.md
 ## Conventions
 
+**Multiple agents operate concurrently across worktrees — only touch files you changed**
+
+Multiple agents operate concurrently in this repo — the main worktree plus additional git/Claude worktrees — against shared working state. Treat the working tree as multi-tenant: only stage, commit, discard, restore, or stash files that THIS session changed. Files you didn't touch may carry a peer agent's uncommitted edits.
+
+Why: a clean repo at session start does not stay clean — background/peer agents mutate brofiles, .bbox state, and source mid-session. A blanket `git add -A`, `git commit -a`, `git checkout -- .`, or `git stash` can swallow or destroy a peer's in-flight work.
+
+How to apply: scope every git mutation to your own files by explicit path. Before discarding or overwriting anything you didn't create, inspect it and surface it to the operator rather than reverting. When you need a clean tree to rebase, stash only the peer-foreign dirty files by path and restore them afterward. Complements the test-isolation invariants (per-test tempdirs / real-HOME isolation) and the ask-before-mutating-shared-services convention.
+
+**RX-V1: operator-authority opt-out invariant for refactor flags**
+
+Operator-authority flags on Rust refactor plan kinds — `acknowledge_repr` (move_rust_struct_fields, RX-S1) and `acknowledge_public_api_change` (rewrite_rust_error_type RX-E1 and other public-surface kinds) — are operator authority, not agent discretion. Atomic agents from design/refactor-agents.md MAY pass these flags through from operator-supplied inputs but MUST NOT default them, MUST NOT infer them from context ("delta looks small" is not a reason), and MUST NOT set them silently after seeing a refusal. An atom that sets these flags on the operator's behalf is no longer atomic — it is a general executor with discretion. Plan responses carry an `operator_opt_outs_used` audit field listing flags actually consumed; this field lives on the durable RefactorPlan (not just the summary) so saved plans preserve the audit trail.
+
+**RX-V2: bbox_refactor_run cargo-only command allowlist for atom dispatches**
+
+For `bbox_refactor_run` invocations dispatched from atomic refactor agents (design/refactor-agents.md), command steps are restricted to a narrow cargo allowlist: `cargo check` (any args, including --message-format=json and feature flags), `cargo test` (any args), `cargo clippy` (any args), `cargo fmt` only when `touches` is explicitly declared, `cargo build` (allowed but typically wasteful). Any other command in an atom-dispatched run is a prompt-discipline violation; the atom should refuse to compose it. v1 enforcement is via atom prompt templates + brofile Bash/Write/Edit denial. v2 path: runner inspects `dispatch_origin` flag (set by bro_agent_dispatch) and enforces server-side. Mutating commands not in the allowlist must declare `touches` so the runner can snapshot/rollback; an atom-dispatched run with an undeclared-touches mutating command is unsupported.
+
+**RX-V3: RA-backed Rust refactor plan kinds fail closed on rust-analyzer unavailability**
+
+The rust-analyzer-backed plan kinds `rust_lsp_rename`, `rust_organize_imports`, `rust_ra_move_item_to_module` (RX-R1), and `rust_ra_classify_callbacks` (RX-R2) require an active LspSessionManager. When rust-analyzer is unavailable (binary missing, init timeout, crashed mid-run), these plan kinds MUST fail closed with `error.lsp_unavailable` and the underlying cause. They MUST NOT silently downgrade to a syntax_only / indexed_hints approximation, because callers chose the LSP-backed kind specifically for semantic_status=lsp_verified. This is intentional asymmetry vs the Java side's documented tree-sitter fallback for rust_organize_imports — the Rust LSP-backed kinds in design/refactor-rust-expansion.md treat fallback as a silent semantic downgrade and refuse it.
+
+**Repo-owned vs host-local: remember is durable, not exhaust**
+
+Project-scoped `remember` entries are durable repo-owned knowledge, not operational exhaust — they travel with the repo in `.bbox/knowledge/` alongside `learn`/`decide`. Only live threads, side-channel notes, and pins are host-local exhaust. When deciding where a project-scoped store belongs: durable+reviewable (knowledge, decisions, remembered facts, settled/promoted thread records) → committed `.bbox/`; high-churn session/bro/task-bound activity → host-local. See design/corpus/knowledge/repo-owned-project-state.md.
+
 **Rust test isolation invariants (tempdir canonicalization + real-HOME isolation)**
 
 Rust test isolation invariants (this repo, surfaced on macOS aarch64). Two conventions every new test must follow, learned while taking `cargo test --lib` to 0 failures:
@@ -17,5 +41,58 @@ Rust test isolation invariants (this repo, surfaced on macOS aarch64). Two conve
 **bro-harness shares code with daemon, never runtime**
 
 bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share **code** via workspace crates (e.g. bro-tools), but bro-harness must never have a **runtime** dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it's going the wrong way. Corollary: shared capabilities the harness needs (e.g. LSP session management) are shared by extracting code into a workspace crate both link, not by the harness calling a daemon service.
+
+### Forgejo Coordination Identity
+
+**Distinct Forgejo Identities For Agent Audit Trail**
+
+For Forgejo-backed coordination, implementers and reviewers must use distinct external identities for auditability. Identity mappings should key at least by coordination instance, bro/role identity, provider, and model; per-dispatch metadata such as effort belongs on system events, audit comments, and performance records rather than multiplying durable external users.
+
+
+### MCP namespaces
+
+**work_* namespace is workflow-agent-facing only**
+
+In transcript-search, `work_*` MCP tools are reserved for restricted agents operating inside atoms/workflows. Only add tools under `work_*` when the operator explicitly asks for an atom/workflow-internal surface; general MCP tool families should use `bbox_*` or a dedicated prefix cluster such as `macro_*` when large enough.
+
+
+### Provider Catalog
+
+**Do not expose mercury-edit-2**
+
+For the Inception provider catalog in blackbox, expose `inception/mercury-2` as the tool-capable model and do not make `inception/mercury-edit-2` available. Manual OpenCode smoke showed `mercury-2` can execute MCP tools, while `mercury-edit-2` rejects OpenAI-style tool schemas.
+
+**Semantic Claude-compatible GLM and DeepSeek providers**
+
+Bro provider names should remain semantic: use `glm` for the Z.AI Coding Plan API and `deepseek` for the DeepSeek API. Both are Claude Code CLI-backed Anthropic-compatible transports, with credentials/configuration owned by the selected Claude config directory (`~/.claude-zai` and `~/.claude-ds` by default). OpenCode remains available for Inception and future nonstandard provider transports.
+
+
+### Render Hygiene
+
+**Deep docs belong in system memories**
+
+In transcript-search/blackbox, deep tool and workflow documentation must stay out of always-rendered provider memory. Use scoped/deferred surfaces and code-owned system memories for role-specific or cold docs. When adding a new tool category, do not trim unrelated hot docs or raise the prompt-size budget to compensate; put the tool behind the appropriate surface/deferred memory boundary unless it is genuinely hot-path guidance.
+
+
+### System Memory
+
+**System memories are invariants, not ledgers**
+
+System memories must state current system invariants and operational runbooks, not serve as release ledgers or artifact inventories. Do not mirror atom names, versions, statuses, costs, eval fixtures, supersession history, or implementation chronology in SMs. Mention atoms only as contextual signposts to `atom_search` / `atom_describe` when an atom should replace a manual tool sequence; put deeper atom mechanics in `sm-atoms`, and keep shipped artifact inventory in manifests/artifact tooling.
+
+
+
+## Workflow
+
+**List Before Create**
+
+Before any create/open/save/add action that could duplicate an existing object, call the list/get/search variant first to check for an existing match. Applies to brofiles, teamplates/teams, MCP servers, threads, and dedupe-sensitive knowledge/decision writes.
+
+### Shared Infrastructure Safety
+
+**Ask Before Mutating Shared Services**
+
+Before restarting, stopping, reloading, replacing, or otherwise mutating shared services or containers that active agents may depend on, first perform a read-only scope check and get explicit operator approval for the named service/container. Applies to blackbox.service, Forgejo, runners, Docker Compose stacks, and other coordination infrastructure.
+
 
 
