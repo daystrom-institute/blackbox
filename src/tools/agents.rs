@@ -882,6 +882,17 @@ impl BlackboxServer {
         } else {
             runtime
         };
+        // If the request is inert (synthesized purely from a derived
+        // StructuredOutput capability or the durable flag, with no
+        // tier/pool/pin), honor the brofile's declared provider rather than
+        // letting the allocator free-select across Provider::ALL and
+        // silently override it.
+        let runtime = orchestration::allocator::pin_static_provider_if_inert(
+            runtime,
+            provider,
+            exec_opts.as_ref().and_then(|o| o.model.clone()),
+            exec_opts.as_ref().and_then(|o| o.effort.clone()),
+        );
         let dispatched =
             match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,

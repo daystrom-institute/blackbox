@@ -394,6 +394,10 @@ pub fn built_in_config() -> AllocatorConfig {
         vec![
             (Claude, Some("claude-haiku-4-5-20251001"), Some("low"), None),
             (Codex, Some("gpt-5.3-codex-spark"), Some("low"), None),
+            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
+            (Brodex, Some("gpt-5.3-codex-spark"), Some("low"), None),
+            // Copilot mirrors the codex GPT lane (spark -> mini).
+            (Copilot, Some("gpt-5.3-codex-mini"), Some("low"), None),
             (Glm, Some("glm-4.5-air"), Some("low"), None),
             (Deepseek, Some("deepseek-v4-flash"), Some("low"), None),
             (Gemini, Some("gemini-3.1-flash-lite-preview"), None, None),
@@ -405,9 +409,12 @@ pub fn built_in_config() -> AllocatorConfig {
         vec![
             (Claude, Some("claude-sonnet-4-6"), Some("high"), None),
             (Codex, Some("gpt-5.5"), Some("medium"), None),
+            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
+            (Brodex, Some("gpt-5.5"), Some("medium"), None),
+            // Copilot mirrors the codex GPT lane.
+            (Copilot, Some("gpt-5.5"), Some("medium"), None),
             (Glm, Some("glm-5-turbo"), Some("medium"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("medium"), None),
-            (Inception, Some("inception/mercury-2"), Some("medium"), None),
             (Gemini, Some("gemini-3-flash-preview"), None, None),
             (Vibe, None, None, None),
         ],
@@ -415,18 +422,42 @@ pub fn built_in_config() -> AllocatorConfig {
     tier(
         "premium",
         vec![
-            (Claude, Some("claude-opus-4-8"), Some("xhigh"), None),
+            (Claude, Some("claude-opus-4-8"), Some("high"), None),
             (Codex, Some("gpt-5.5"), Some("high"), None),
+            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
+            (Brodex, Some("gpt-5.5"), Some("high"), None),
+            // Copilot mirrors the codex GPT lane.
+            (Copilot, Some("gpt-5.5"), Some("high"), None),
             (Glm, Some("glm-5.1"), Some("high"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("high"), None),
             (Gemini, Some("gemini-3.1-pro-preview"), None, None),
         ],
     );
     tier(
+        "deepthink",
+        vec![
+            (Claude, Some("claude-opus-4-8"), Some("xhigh"), None),
+            (Codex, Some("gpt-5.5"), Some("xhigh"), None),
+            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
+            (Brodex, Some("gpt-5.5"), Some("xhigh"), None),
+            // Copilot mirrors the codex GPT lane.
+            (Copilot, Some("gpt-5.5"), Some("xhigh"), None),
+            (Deepseek, Some("deepseek-v4-pro"), Some("max"), None),
+        ],
+    );
+    tier(
         "super-el-cheapo-drones",
         vec![
             (Codex, Some("gpt-5.3-codex-spark"), Some("low"), Some(1.0)),
+            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
+            (Brodex, Some("gpt-5.3-codex-spark"), Some("low"), Some(1.0)),
+            // Copilot mirrors the codex GPT lane (spark -> mini).
+            (Copilot, Some("gpt-5.3-codex-mini"), Some("low"), Some(1.0)),
             (Glm, Some("glm-4.5-air"), Some("low"), Some(0.8)),
+            (Deepseek, Some("deepseek-v4-flash"), Some("low"), Some(0.8)),
+            // Vibe is model-less (host-bound via VIBE_ACTIVE_MODEL/agent);
+            // it joins as a cheap local-drone lane with no model slug.
+            (Vibe, None, None, Some(0.8)),
         ],
     );
 
@@ -1474,6 +1505,59 @@ pub fn with_derived_capability(
     Some(request.clone())
 }
 
+impl RuntimeRequest {
+    /// True when the request carries any signal that should drive
+    /// cross-provider allocation: a tier (or tier bounds/ladder), a pool,
+    /// a pin, a preference, a selection policy, or explicit capability
+    /// requirements. A request that lacks all of these is *inert* — it was
+    /// synthesized purely from the `durable` flag and/or
+    /// `derived_capabilities` (e.g. `StructuredOutput` forced by an output
+    /// schema) and expresses no provider preference of its own.
+    pub fn expresses_selection_intent(&self) -> bool {
+        self.tier.is_some()
+            || self.tier_ladder.is_some()
+            || self.min_tier.is_some()
+            || self.max_tier.is_some()
+            || self.pool.is_some()
+            || self.pin.is_some()
+            || self.prefer.is_some()
+            || self.selection_policy.is_some()
+            || !self.capabilities.is_empty()
+    }
+}
+
+/// Honor a brofile's static provider when its allocation request is inert.
+///
+/// A brofile with a static `provider` but no `runtime` block still reaches
+/// the allocator as `Some(RuntimeRequest)` whenever a derived capability
+/// (output-schema `StructuredOutput`) or the durable flag forces one into
+/// existence. With no tier/pool/pin, the allocator then free-selects across
+/// `Provider::ALL` and silently overrides the static provider. When the
+/// request expresses no selection intent of its own, seed an artifact-level
+/// pin from the static provider/model/effort so the allocator resolves the
+/// declared provider instead of free-selecting. No-op when the request
+/// already expresses selection intent, or when there is no request at all
+/// (a `None` request never reaches the allocator).
+pub fn pin_static_provider_if_inert(
+    runtime: Option<RuntimeRequest>,
+    provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+) -> Option<RuntimeRequest> {
+    let mut request = runtime?;
+    if request.expresses_selection_intent() {
+        return Some(request);
+    }
+    request.pin = Some(RuntimePin {
+        provider: Some(provider),
+        account: None,
+        model,
+        effort,
+        authority: PinAuthority::Artifact,
+    });
+    Some(request)
+}
+
 pub fn provider_candidates_for_request(
     request: &RuntimeRequest,
     config: &AllocatorConfig,
@@ -2263,6 +2347,68 @@ mod tests {
 
         let created = with_derived_capability(None, Capability::ToolUse).unwrap();
         assert_eq!(created.derived_capabilities, vec![Capability::ToolUse]);
+    }
+
+    #[test]
+    fn pin_static_provider_seeds_pin_for_inert_request() {
+        // A request synthesized purely from a derived StructuredOutput
+        // capability carries no selection intent → must be pinned to the
+        // brofile's static provider instead of free-selecting.
+        let inert = RuntimeRequest {
+            derived_capabilities: vec![Capability::StructuredOutput],
+            ..Default::default()
+        };
+        assert!(!inert.expresses_selection_intent());
+        let pinned = pin_static_provider_if_inert(
+            Some(inert),
+            Provider::Codex,
+            Some("gpt-5.5".to_string()),
+            Some("medium".to_string()),
+        )
+        .unwrap();
+        let pin = pinned.pin.expect("pin seeded");
+        assert_eq!(pin.provider, Some(Provider::Codex));
+        assert_eq!(pin.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(pin.effort.as_deref(), Some("medium"));
+        assert_eq!(pin.authority, PinAuthority::Artifact);
+        // Derived capability preserved alongside the seeded pin.
+        assert_eq!(
+            pinned.derived_capabilities,
+            vec![Capability::StructuredOutput]
+        );
+    }
+
+    #[test]
+    fn pin_static_provider_noop_when_request_has_selection_intent() {
+        // A request that already names a tier expresses intent → untouched.
+        let tiered = RuntimeRequest {
+            tier: Some("premium".to_string()),
+            durable: true,
+            derived_capabilities: vec![Capability::StructuredOutput],
+            ..Default::default()
+        };
+        assert!(tiered.expresses_selection_intent());
+        let result =
+            pin_static_provider_if_inert(Some(tiered), Provider::Codex, None, None).unwrap();
+        assert!(result.pin.is_none(), "tiered request must not be pinned");
+
+        // The durable flag alone is NOT selection intent — a durable
+        // executor with a static-provider brofile and no tier should still
+        // honor the declared provider.
+        let durable_only = RuntimeRequest {
+            durable: true,
+            ..Default::default()
+        };
+        assert!(!durable_only.expresses_selection_intent());
+        let seeded =
+            pin_static_provider_if_inert(Some(durable_only), Provider::Claude, None, None).unwrap();
+        assert_eq!(
+            seeded.pin.and_then(|p| p.provider),
+            Some(Provider::Claude)
+        );
+
+        // No request at all stays None (never reaches the allocator).
+        assert!(pin_static_provider_if_inert(None, Provider::Codex, None, None).is_none());
     }
 
     /// Regression for the `try_lock`-fails-on-contention bug that used to

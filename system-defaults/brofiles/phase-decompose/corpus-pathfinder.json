@@ -1,7 +1,15 @@
 {
   "name": "corpus-pathfinder",
-  "version": 3,
+  "version": 4,
   "provider": "codex",
+  "runtime": {
+    "pin": {
+      "provider": "codex",
+      "model": "gpt-5.5",
+      "effort": "medium",
+      "authority": "operator"
+    }
+  },
   "context": {
     "provider_defaults": "suppress_when_supported"
   },

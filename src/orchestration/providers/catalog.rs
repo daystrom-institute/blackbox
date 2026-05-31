@@ -329,8 +329,18 @@ static COPILOT_MODELS: &[ModelInfo] = &[
         default: false,
     },
     ModelInfo {
+        id: "gpt-5.5",
+        description: "OpenAI general purpose (codex tier mirror)",
+        default: false,
+    },
+    ModelInfo {
         id: "gpt-5.3-codex",
         description: "OpenAI Codex-optimized",
+        default: false,
+    },
+    ModelInfo {
+        id: "gpt-5.3-codex-mini",
+        description: "OpenAI Codex lightweight (economy tier mirror)",
         default: false,
     },
     ModelInfo {
