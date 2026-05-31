@@ -12,12 +12,36 @@ topic:
 
 Date: 2026-05-14
 Status: implementation proposal
+Regrounded: 2026-05-30
 Companion to: [Ops Artifact Bundles And Doctor](ops-artifact-bundles-and-doctor.md)
 
 This plan extracts the implementation work from the design proposal and orders
 it into testable cuts. The priority is to delete redundant lifecycle surfaces by
 first making the artifact path capable of doing the whole job: validate, plan,
 activate, deactivate, record provenance, and report drift.
+
+## Regrounding Note (2026-05-30)
+
+Nothing here is implemented yet (`ArtifactKind` is still the original seven;
+verified `src/artifacts.rs:16-24`). Beyond the original poller/webhook/bundle
+scope, the regrounded design adds five new managed kinds and one migration:
+
+- `Macro` — de-`include_str!` the builtins (`src/macros/registry.rs:195-215`)
+  and install shipped macros from disk; identity is `id`.
+- `Teamplate` + `Team` — replace the no-op team arm
+  (`src/server/routes.rs:1065-1067`, `1414-1416`) with real activators over
+  `src/orchestration/team.rs`, and retire `install-teams.sh`.
+- `Reaction` — inlet kind over `src/system_events/` (`ReactionSpec`,
+  `src/system_events/types.rs:324-341`); fold `reaction_install`/`reaction_list`
+  into the artifact path.
+- Workflow asset validation — the `Workflow` arm stages no assets
+  (`routes.rs:1027-1041`) but workflows reference scripts by repo path
+  (`system-defaults/workflows/phase-decompose/main.json:222`).
+
+Two categories stay out of the artifact model: system memories (auto-loaded,
+`src/server/open.rs:236`) and — only after the macro migration — nothing else.
+`.audit_examples.json` are packet companion datasets with no runtime consumer,
+not artifacts. See the companion design's Regrounding Note for the full table.
 
 ```text
 Phase 0 -> Phase 1 -> Phase 2 -> Phase 3 -> Phase 4 -> Phase 5 -> Phase 6 -> Phase 7
@@ -80,10 +104,31 @@ Record the current code anchors before editing:
   - `bro_webhook_install/list`
   - `bro_poller_install/list`
   - `bro_cron_install/list/upcoming`
-- `src/main.rs`
-  - startup restore for webhooks, pollers, crons, workflows
-- `src/crons.rs`, `src/pollers.rs`, `src/webhooks.rs`
-  - registry install/list/handle state
+- `src/tools/system_events.rs`
+  - `reaction_install/list` (to fold into artifact path) and
+    `reaction_execute/replay/retry/deliveries` (to keep)
+- `src/tools/macros.rs`
+  - `macro_register/unregister` (kept for interactive project-scope authoring;
+    require `project_dir`, write `.bbox/macros/`) and the read/exec tools
+- `src/macros/registry.rs`
+  - `builtin_definitions()` `include_str!` block (to delete), scope resolution,
+    `register`/`unregister`
+- `src/orchestration/team.rs`
+  - `save_teamplate`/`list_teamplates`/`save_team`/`load_all_teams`/`remove_team`
+- `src/server/routes.rs`
+  - `Team` install/deactivate no-op arms; `admin_team_upsert`
+- `system-defaults/agentic-corpus/scripts/install-teams.sh`
+  - the shell install path to retire; inline `contradiction-specialists` to
+    promote to a JSON file
+- `src/system_events/types.rs`
+  - `ReactionSpec`; reaction registry persistence dir
+- `src/server/restore.rs`
+  - `restore_runtime_state` already restores webhooks, pollers, crons, **and
+    reactions** (`restore.rs:6-14`); workflows restore via the workflow registry.
+    Do NOT look in `src/main.rs` for this — that anchor was wrong.
+- `src/crons.rs`, `src/pollers.rs`, `src/webhooks.rs`, `src/system_events/hub.rs`
+  - registry install/list/handle state; `EventHub` install/restore (no
+    `remove_reaction` yet)
 - `src/watcher.rs`
   - `.bbox/` path-to-kind handling and scoped install behavior
 - `src/tool_docs.rs`
@@ -144,7 +189,9 @@ Update all current write sites:
 
 ### 1.2 Startup Restore And Old-Path Relocation
 
-Update `src/main.rs` startup restore:
+Update startup restore in `src/server/restore.rs` (`restore_runtime_state`),
+**not** `src/main.rs`. Reactions already restore here (`restore.rs:14`); this
+phase only changes the paths the restore reads from:
 
 - read new paths first;
 - read old `store_dir/{webhooks,pollers,crons,workflows}` only for adoption or
@@ -178,6 +225,12 @@ impl WebhookRegistry {
     fn uninstall(&self, name: &str) -> Option<WebhookSpec>;
     fn status(&self, name: &str) -> Option<InletRuntimeStatus>;
 }
+
+impl EventHub {
+    // No teardown exists today — install + restore only (hub.rs).
+    fn remove_reaction(&self, name: &str) -> Option<ReactionSpec>; // drop registration + persisted spec
+    fn reaction_status(&self, name: &str) -> Option<InletRuntimeStatus>;
+}
 ```
 
 `InletRuntimeStatus` should be a read-only projection for doctor/planner output:
@@ -191,7 +244,10 @@ Uninstall rules:
   `remove` method already does the core teardown, but status/return-value shape
   should be normalized for activators and doctor;
 - poller: abort handle and drop the per-name dedup ring;
-- webhook: drop endpoint registration and per-name delivery ring.
+- webhook: drop endpoint registration and per-name delivery ring;
+- reaction: `EventHub` has no teardown today — add `remove_reaction` that drops
+  the in-memory registration and deletes the persisted spec from the reactions
+  dir. This is a prerequisite for `reaction` deactivation in Phase 2.
 
 No public uninstall MCP tools are added in this phase.
 
@@ -223,16 +279,20 @@ surface roles while preserving behavior for existing kinds.
 
 Update `src/artifacts.rs`:
 
-- keep the existing `Cron` variant and add `Poller`, `Webhook`, and `Bundle` to
-  `ArtifactKind`;
+- keep the existing `Cron` variant and add `Poller`, `Webhook`, `Reaction`,
+  `Macro`, `Teamplate`, and `Bundle` to `ArtifactKind`;
 - update string parsing/rendering for new kinds;
 - update/verify `artifact_kind_from_dir_pub` for:
   - `crons`
   - `pollers`
   - `webhooks`
+  - `reactions`
+  - `macros`
+  - `teamplates`
   - `bundles`
-- update/verify `artifact_name()` so `Cron`, `Poller`, `Webhook`, and `Bundle`
-  all read `value["name"]`;
+- update/verify `artifact_name()` so `Cron`, `Poller`, `Webhook`, `Reaction`,
+  `Teamplate`, and `Bundle` read `value["name"]`, and so `Macro` reads
+  `value["id"]` (macro identity is `id`, not `name`);
 - extend `ArtifactInstallParams` with optional `role` so MCP-surface packets can
   stay `kind="packet"` while still carrying role metadata into the catalog;
 - extend `ArtifactMetadata`:
@@ -296,17 +356,62 @@ Extract current kinds first:
 - brofile
 - agent
 - atom
-- team
+- team (currently a no-op — see the real activator below)
 
 Then add inlet activators:
 
 - cron: schedule validation, routing packet validation, persist, spawn loop;
 - poller: spec validation, routing packet validation, persist, spawn loop;
 - webhook: signature policy validation, routing packet validation, persist
-  endpoint.
+  endpoint;
+- reaction: validate `event_kinds`/`action`, persist the spec to the reactions
+  dir, and **register in `EventHub`** (`src/system_events/hub.rs`) — reactions
+  are not HTTP endpoints. Deactivate calls the `remove_reaction` teardown added
+  in Phase 1. Mirror the existing `EventHub` install helper; do not call the
+  `reaction_install` MCP tool internally.
 
-Do not call `bro_*_install` tools internally. Activators call runtime helpers
-directly.
+Then the new non-inlet activators:
+
+- **macro**: there is no managed macro scope today — the registry resolves
+  project → user → builtin only and `macro_register` writes project scope only
+  (`src/macros/registry.rs:618-629`, `:649`). So this phase must FIRST add a
+  managed scope: a daemon-owned macros dir plus a registry loader with precedence
+  project → user → **managed** → builtin (managed shadows the compiled-in
+  fallback). The activator then parses `MacroDefinition`, validates
+  `inputs_schema`, and writes the managed scope (deactivate = remove from managed
+  scope). Identity is `id`; version from the spec.
+  **Do NOT delete the `include_str!` builtins in this phase** — bundle apply does
+  not exist until Phase 3, so the fallback must stay or shipped macros vanish.
+  The `include_str!` removal is a separate, later cut (Phase 4) gated on the
+  refactor bundle applying and verifying.
+- **teamplate**: validate every member brofile ref resolves, then
+  `save_teamplate` (`src/orchestration/team.rs`). Deactivate removes the
+  teamplate.
+- **team**: define a `TeamArtifactSpec` (name + member refs, optional teamplate
+  ref) — do NOT ship a raw runtime `Team` blob, which carries runtime fields
+  (`created_at`, session/history, expanded members; `src/orchestration/team.rs:109`)
+  that must not be hand-authored. The activator deterministically materializes a
+  runtime `Team` through the same synthesis `admin_team_upsert` uses
+  (`routes.rs:2214-2225`, which today accepts only `members: Vec<String>`), then
+  `save_team`. Deactivate `remove_team`. This replaces the no-op arms at
+  `routes.rs:1065-1067`/`1414-1416` and retires
+  `system-defaults/agentic-corpus/scripts/install-teams.sh`. Promote the inline
+  `contradiction-specialists` roster to a shipped `TeamArtifactSpec` JSON.
+
+Do not call `bro_*_install`/`reaction_install`/`macro_register` MCP tools
+internally. Activators call runtime helpers directly.
+
+Workflow activator addition: extend the workflow `validate` step to resolve
+referenced **assets** (script/fixture paths) against the defaults root and fail
+preflight if any are missing. Validation is a backstop, not the resolution
+mechanism — at runtime, shell ops resolve `cwd` to the run's worktree/project
+(`src/workflow/ops/external.rs:112`), so a repo-relative argv only works when the
+target project is this repo. Add an `${asset_root}` (a.k.a. `${defaults_dir}`)
+interpolation that the workflow executor resolves to the managed defaults dir,
+and migrate shipped workflows that reference assets to use it (e.g.
+`${asset_root}/phase-decompose/scripts/epoch-check.py`). The executor-side
+interpolation is the real fix; defer copy/staging to absolute paths until a
+no-source-tree deployment requires it.
 
 Update deactivation dispatch as part of this extraction. Today
 `deactivate_artifact` is a free `match` over the original artifact kinds, and
@@ -334,11 +439,23 @@ This helper is for doctor/upgrade-check adoption, not ordinary install.
 Tests:
 
 - new artifact kinds parse and round-trip;
+- `Macro` reads `value["id"]` as its name; macro install writes the new
+  `MacroScope::Managed` dir and the registry resolves managed-scope macros at
+  precedence project → user → managed → builtin;
+- with the `include_str!` builtins still present (Phase 2), the managed-scope
+  macro shadows the builtin of the same `id`; resolution never regresses while
+  both exist (the builtin removal and its test land in Phase 4);
+- teamplate install validates member brofiles and `save_teamplate` round-trips;
+  team install materializes a runtime `Team` from a `TeamArtifactSpec` and
+  `save_team` round-trips; deactivate removes;
+- reaction install persists the spec + registers in `EventHub`; deactivate calls
+  `remove_reaction`, dropping the persisted spec and the registration;
 - old metadata files load with new optional fields absent;
 - `role="mcp_surface"` persists in metadata;
 - scoped artifact list includes `.bbox/` artifacts when requested;
-- existing six kind installs still behave the same through activators;
-- direct cron/poller/webhook install rejects missing `version`;
+- existing kind installs still behave the same through activators;
+- direct cron/poller/webhook/reaction install rejects missing `version`;
+- workflow install fails preflight when a referenced asset path is missing;
 - adoption path records `version="unmanaged"` and an install warning.
 
 **Acceptance gate:** all existing artifact installs pass through activators, and
@@ -364,7 +481,9 @@ BundleManifest {
 
 BundleMember {
     kind,
-    source,
+    source?,        // single artifact source
+    source_glob?,   // OR a directory glob expanded at plan time
+    exclude?,       // glob exclusions (e.g. _*.json, *.audit_examples.json)
     name?,
     version?,
     role?,
@@ -377,7 +496,9 @@ It does not apply members.
 `bbox_artifact_remove(kind="bundle", name=...)` removes the bundle manifest and
 metadata only. It does not deactivate member artifacts; use
 `bbox_artifact_bundle_apply(operation="uninstall", ...)` for that. Generation
-records are preserved for audit unless a future explicit purge tool is added.
+records are retained per the retention rule in 3.3 (active + previous kept hot;
+older records archived, not deleted) and are only hard-removed by an explicit
+future purge tool — never as a side effect of `bbox_artifact_remove`.
 
 ### 3.2 Planning
 
@@ -445,10 +566,15 @@ artifacts/bundles/<bundle-name>/metadata.json
 artifacts/bundles/<bundle-name>/.generations/<generation>.json
 ```
 
-Retention rule:
+Retention rule (single contract — do not contradict 3.1):
 
-- keep active generation plus the previous generation for recovery;
-- prune older generation records unless explicitly pinned.
+- keep the active generation plus the previous generation hot for recovery;
+- older generation records are **archived, not deleted** — moved to an
+  `.generations/archive/` (or marked archived) so audit/rollback evidence
+  survives;
+- only an explicit purge tool may hard-delete archived records, and only when
+  no retained member still depends on them for drift/rollback review;
+- pinned generations are never archived or pruned.
 
 ### 3.4 Runtime Drift Decisions
 
@@ -477,22 +603,50 @@ Update `src/watcher.rs`:
 
 ### 3.6 System Defaults Manifests
 
-Add:
+Add, grounded in the real directory groups (see the companion design's
+[System Defaults Bundle Layout](ops-artifact-bundles-and-doctor.md#system-defaults-bundle-layout)):
 
 ```text
 system-defaults/bundles/
-  blackbox-system-defaults.json
-  badgey.json
-  agentic-corpus-maintenance.json
-  refactor-atoms.json
+  blackbox-system-defaults.json   # meta → children
   mcp-surfaces.json
+  agentic-corpus.json             # incl. promoted contradiction-specialists team
+  maintenance.json                # daily-compaction (own tree)
+  agents.json                     # agents + agent-eval cron/packets/workflows
+  phase-decompose.json            # workflows + brofiles + packets + teamplates + assets
+  supervision.json
+  refactor.json                   # 140 atoms (glob) + brofiles + workflows + macros
+  badgey.json
 ```
 
 Use shallow meta-bundle references. The generation record expands transitive
 membership so uninstall remains precise.
 
-Verify shipped cron specs keep top-level `version` fields. Require the same for
-future shipped poller/webhook defaults.
+Use `source_glob` for large groups (refactor atoms, workflow trees) rather than
+enumerating members by hand. Exclusions are mandatory: skip
+`*.audit_examples.json` (packet companion datasets), `_*.json`
+(`_base.outputs.schema.json`), and `_*.md` (`_template.prompt.md`). The planner
+carries a packet's `.audit_examples.json` sidecar alongside it for hashing/copy
+but never installs it as a member.
+
+The `refactor.json` bundle includes the four macros and is the migration target
+for the de-`include_str!`'d builtins. The `agentic-corpus.json` bundle owns the
+promoted `contradiction-specialists` team JSON and is the retirement point for
+`install-teams.sh`.
+
+Out-of-tree asset (decided): `nightly-eval-arc` runs `bash eval/run-agentic-eval.sh`
+(`system-defaults/agentic-corpus/workflows/nightly-eval-arc.json:32`), and that
+script lives at the **repo root**, outside `system-defaults/`. It is classified
+**repo-internal and excluded** from the portable bundle (it only runs correctly
+against this repo's `project_dir`), so `agentic-corpus.json`'s workflow
+`source_glob` must exclude `nightly-eval-arc.json`. If it is ever made portable,
+relocate the script under the defaults tree and switch the workflow to
+`${asset_root}`. A bundle must never ship a workflow whose asset it cannot place
+or resolve.
+
+Verify shipped cron specs keep top-level `version` fields. Macros already carry
+`version`; teamplates carry `version`; `ReactionSpec` carries `version`. Require
+the same for future shipped poller/webhook/reaction defaults.
 
 ### 3.7 Tests
 
@@ -529,6 +683,30 @@ Remove from MCP registration and `src/tool_docs.rs`:
 - `bro_workflow_install`
 - `bro_workflow_list`
 - `bro_cron_upcoming`
+- `reaction_install`
+- `reaction_list`
+
+Retire (non-MCP):
+
+- `system-defaults/agentic-corpus/scripts/install-teams.sh` (replaced by the
+  agentic-corpus bundle's team/teamplate members)
+- the `include_str!` builtin-macro block in `src/macros/registry.rs` — **only
+  after** the managed macro scope (Phase 2) exists and the refactor bundle has
+  been applied and verified, so the macros never disappear mid-migration. Test
+  here: with the refactor bundle applied, removing `builtin_definitions()` does
+  not change macro resolution; without it applied, the removal is refused/flagged
+  by doctor (`action`: missing managed macros)
+
+Update the managed MCP surface packet:
+
+- `system-defaults/mcp-surfaces/routing.json` enumerates tools being deleted
+  here — `reaction_install`, `reaction_list`, `bro_workflow_install`,
+  `bro_cron_*`, etc. (`routing.json:12,18,30`). Removing the tools without
+  updating the surface packet leaves the `default`/`readonly`/`ops` surfaces
+  referencing dead tool names. Edit `routing.json` to drop the deleted lifecycle
+  tools and add the artifact-path replacements, recompile it (as the
+  `role="mcp_surface"` packet), and replay the surfaces via `bbox_mcp_surface`.
+  This is a Phase 4 **acceptance item**, not just a docs update.
 
 Add:
 
@@ -538,8 +716,14 @@ Keep:
 
 - `bro_webhook_replay`
 - `bro_webhook_deliveries`
+- `reaction_execute`, `reaction_replay`, `reaction_retry`, `reaction_deliveries`
+- `macro_register`, `macro_unregister` (interactive **project-scope** macro
+  authoring — they require `project_dir` and write `.bbox/macros/`), and
+  `macro_list`/`macro_describe`/`macro_plan`/`macro_apply`/`macro_run`/
+  `macro_validate` (execution/inspection)
 
-These are diagnostic/action tools, not install/list lifecycle.
+These are diagnostic/action/authoring tools, not install/list lifecycle for
+shipped defaults.
 
 ### 4.2 Docs And Examples
 
@@ -604,10 +788,15 @@ Implement sections incrementally:
 - `graph`: entity counts, EdgeIndex rebuild/compaction status if available;
 - `projects`: registered roots, missing paths, project-file coverage;
 - `artifacts`: active counts by kind, missing payloads, unmanaged runtime
-  specs, stale old-path files, bundle generation drift;
-- `inlets`: installed webhooks/pollers/crons, routing packet existence,
-  poller/cron loop status;
-- `workflows`: installed workflows and statically detectable missing refs;
+  specs, stale old-path files, bundle generation drift; shipped macros not yet
+  catalog-managed (stale compiled-in builtin); teamplates/teams in the store but
+  uncataloged (leftover `install-teams.sh` rosters);
+- `inlets`: installed webhooks/pollers/crons/reactions, routing packet
+  existence, poller/cron loop status;
+- `workflows`: installed workflows, statically detectable missing refs, and
+  missing workflow assets (unresolved script/fixture paths);
+- `memories`: system-memory catalog loaded and `defaults_memories_dir` resolved
+  (auto-loaded surface, verify-only);
 - `knowledge`: `bbox_lint` severity summary and rendered-file freshness when
   available;
 - `attention`: unresolved inbox counts by kind.

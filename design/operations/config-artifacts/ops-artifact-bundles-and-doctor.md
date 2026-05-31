@@ -12,6 +12,59 @@ topic:
 
 Date: 2026-05-13
 Status: design proposal v1
+Regrounded: 2026-05-30
+
+## Regrounding Note (2026-05-30)
+
+This proposal has not been implemented. As of this regrounding, `ArtifactKind`
+is still exactly `Workflow, Packet, Brofile, Agent, Atom, Team, Cron`
+(`src/artifacts.rs:16-24`); there is no `Poller`/`Webhook`/`Bundle` variant, no
+`ArtifactActivator` trait, no `BundleManifest`, no `bbox_doctor`/
+`bbox_upgrade_check`, no `runtime_paths` helpers, and no `InletRuntimeStatus`.
+`ArtifactMetadata` (`src/artifacts.rs:83-107`) carries none of the proposed
+`bundle`/`bundle_generation`/`managed_by`/`runtime_ref`/`role` fields. The
+Phase 0-7 plan in the companion doc is still all forward work.
+
+Since v1 the shipped `system-defaults/` surface has grown well past the handful
+of members the original examples imply. The full default surface is 275 JSON
+files (264 excluding sidecars/templates) plus markdown and script assets:
+
+| Category | Count | Install path today |
+|---|---|---|
+| atoms | 140 | `bbox_artifact_install kind=atom` |
+| workflows | 41 | `bbox_artifact_install kind=workflow` or `bro_workflow_install` |
+| brofiles | 35 | `bbox_artifact_install kind=brofile` |
+| packets | 30 (+10 `.audit_examples.json` sidecars) | `bbox_artifact_install kind=packet` |
+| agents | 6 | `bbox_artifact_install kind=agent` |
+| crons | 6 | partial artifact path or `bro_cron_install` |
+| macros | 4 | **compiled into the binary** (`include_str!`) |
+| teamplates | 2 (+1 inline team) | **shell script** curling `/admin/team/upsert` |
+| mcp-surfaces | 1 | `bbox_compile` |
+| system memories | 28 `.md` | **loaded at daemon init**, never installed |
+| scripts/fixtures | 7 `.py`/`.sh` + 2 `.md` | workflow-referenced assets, never staged |
+
+Two categories are **already auto-loaded** and are NOT manual-install gaps:
+
+- **System memories** load at startup via
+  `system_memory::init(&cfg.paths.defaults_memories_dir, ...)`
+  (`src/server/open.rs:236`). They are markdown runbooks resolved from a
+  defaults dir, not versioned JSON specs, and editing one needs no rebuild.
+  They stay out of the artifact/bundle model; doctor only verifies the catalog
+  loaded. See [Auto-Loaded Default Surfaces](#auto-loaded-default-surfaces).
+- **Macros** are currently `include_str!`-baked into the binary via
+  `MacroRegistry::builtin_definitions()` (`src/macros/registry.rs:195-215`).
+  This is a wart: tweaking a macro requires a daemon rebuild. This design
+  **migrates macros off `include_str!`** and onto the managed-artifact path so
+  they are installed from disk like every other default. See
+  [Macro Management](#macro-management).
+
+New tool families exist that v1 did not account for: `macro_*` (registry-backed
+macro lifecycle), `reaction_*` (event-reaction inlets, `src/system_events/`),
+and `identity_*` (read-only actor identities). Reactions are an inlet-class
+managed kind; identities are read-only and out of scope.
+
+The sections below have been updated against this reality. Where a section still
+reflects v1 framing, the regrounded detail is called out inline.
 
 ## Problem
 
@@ -149,6 +202,54 @@ Operations baseline:
 - Startup already runs one schema-like maintenance action:
   `ArtifactCatalog::backfill_content_hashes`.
 
+Newly surfaced subsystems and gaps (2026-05-30 regrounding):
+
+- **Team activation is a no-op.** `install_artifact_value`'s `Team` arm is a
+  bare comment, "Teams are stored as artifacts but have no additional validation
+  at install time" (`src/server/routes.rs:1065-1067`); the deactivate arm is the
+  same (`routes.rs:1414-1416`). The actual team/teamplate registry lives in
+  `src/orchestration/team.rs` (`save_teamplate`, `save_team`, `load_all_teams`),
+  and shipped teams are installed today by a **shell script**,
+  `system-defaults/agentic-corpus/scripts/install-teams.sh`, which curls
+  `/admin/team/upsert` (`admin_team_upsert`, `routes.rs:2220`). Teamplates ship
+  as JSON (`system-defaults/phase-decompose/teamplates/*.json`, identity `name`,
+  members declared by brofile ref), but the `contradiction-specialists` team
+  exists only inline in the shell script, not as a file.
+- **Macros are compiled into the binary.** The four shipped
+  `system-defaults/macros/*.json` are pulled in by `include_str!` in
+  `MacroRegistry::builtin_definitions()` (`src/macros/registry.rs:195-215`) and
+  surface at `builtin` scope. The registry also resolves `user`
+  (`~/.config/blackbox/macros/` or `BLACKBOX_MACROS_DIR`) and `project`
+  (`<project>/.bbox/macros/<id>.json`) scopes. Lifecycle runs through
+  `macro_register`/`macro_unregister` (`src/tools/macros.rs:341-405`), not the
+  artifact catalog. Macro identity is `id`; specs carry `version` (currently
+  "not yet consumed — the registry resolves by id only").
+- **Reactions are an inlet-class kind with a parallel lifecycle tool.**
+  `ReactionSpec` (`src/system_events/types.rs:324-341`) carries `name`,
+  `version: u32`, `event_kinds`, `when`, `action`, `retry`, `on_failure`.
+  `reaction_install` "Validates and persists to disk"
+  (`src/tools/system_events.rs:236`), persisting under a reactions dir, exactly
+  paralleling `bro_cron_install`/`bro_poller_install`/`bro_webhook_install`.
+  There are no shipped reaction defaults yet. `identity_get`/`identity_list` are
+  read-only (no install path) and out of scope.
+- **Workflow activation does not stage assets.** The `Workflow` arm only
+  compiles, capability-validates, and writes the spec to `store_dir/workflows`
+  (`routes.rs:1027-1041`). But shipped workflows reference sibling assets by
+  repo-relative path — e.g.
+  `system-defaults/workflows/phase-decompose/main.json` references
+  `system-defaults/phase-decompose/scripts/epoch-check.py`. A bundle that
+  installs such a workflow must guarantee those `.py`/`.md` assets resolve; the
+  catalog has no concept of workflow assets today. See
+  [Workflow Assets](#workflow-assets).
+- **`.audit_examples.json` are companion datasets, not auto-loaded.** They pair
+  with packets (`entry-quality.json` ↔ `entry-quality.audit_examples.json`) but
+  have **no runtime consumer in `src/`** — they are validated only by a shipped
+  test (`shipped_packet_audit_examples_pass`, `src/tools/artifacts.rs:1054`) and
+  are the `{entity, expected}` datasets an operator feeds to `bbox_audit`. They
+  are not separate artifacts and are not read by packet install/compile. A
+  bundle treats the sidecar as travelling with its packet member for hashing and
+  copy, not as an installable unit.
+
 ## Thesis
 
 **All daemon-owned installable JSON specs should be managed artifacts.**
@@ -244,10 +345,34 @@ Initial managed kinds:
 | `brofile` | brofile store | `name` | save and resolve brofile |
 | `agent` | agent catalog/registry | `name` | validate, embed manifest, provenance edges |
 | `atom` | atom catalog/registry | `name` | validate atom install |
-| `team` | team artifact catalog | `name` | catalog only until team activation is formalized |
-| `cron` | cron registry | `name` | validate schedule, persist, spawn loop |
-| `poller` | poller registry | `name` | validate fetch/selector shape, persist, spawn loop |
-| `webhook` | webhook registry | `name` | validate signature policy, persist endpoint |
+| `macro` | macro registry | `id` | validate `inputs_schema`, register into `MacroRegistry` (replaces `include_str!` builtins) |
+| `teamplate` | team store (`teamplates/`) | `name` | validate member brofile refs exist, `save_teamplate` |
+| `team` | team store (`teams/`) | `name` | resolve members, `save_team` / `admin_team_upsert` (replaces `install-teams.sh`) |
+| `cron` | cron registry | `name` | validate schedule + routing packet, persist, spawn loop |
+| `poller` | poller registry | `name` | validate fetch/selector shape + routing packet, persist, spawn loop |
+| `webhook` | webhook registry | `name` | validate signature policy + routing packet, persist endpoint |
+| `reaction` | `EventHub` | `name` | validate `event_kinds`/`action`, persist spec, register in `EventHub` (event-reaction inlet; **not** an HTTP endpoint) |
+
+Notes on the kind table:
+
+- `macro` identity is `id`, not `name`; the activator's `name()` reads
+  `value["id"]`. Macros already carry `version`. This kind exists to take the
+  shipped macros off `include_str!` so editing one is a reinstall, not a
+  rebuild — see [Macro Management](#macro-management).
+- `teamplate` and `team` are split rather than collapsed: a teamplate is a
+  reusable template (members declared by brofile + alias + count); a team is an
+  instantiated roster. Both are owned by `src/orchestration/team.rs`, and both
+  retire the `install-teams.sh` shell path — see
+  [Team And Teamplate Activation](#team-and-teamplate-activation).
+- `reaction` is added now for surface consistency even though no defaults ship
+  yet: `reaction_install`/`reaction_list` already duplicate the inlet lifecycle
+  the catalog should own. Reactions persist a JSON spec under the reactions dir
+  and register in `EventHub` (`src/system_events/hub.rs`); there is no HTTP
+  endpoint and, critically, **no remove API today** — `EventHub` exposes install
+  + restore but no `remove_reaction`. That teardown method is a prerequisite
+  before `reaction` deactivation/removal can be wired (see impl Phase 1).
+- `identity` (`identity_get`/`identity_list`) is read-only and is **not** a
+  managed kind.
 
 MCP surfaces should be managed as `packet` artifacts with an artifact role, not
 as a separate `ArtifactKind`. `system-defaults/mcp-surfaces/routing.json` is
@@ -341,6 +466,196 @@ The generation is the uninstall boundary. "Remove system defaults" means remove
 the members installed by the selected bundle generation, not every artifact whose
 source happens to live under `system-defaults/`.
 
+## Auto-Loaded Default Surfaces
+
+Not everything under `system-defaults/` is a manual-install gap. Two categories
+are loaded by the daemon directly and are deliberately **out of the
+artifact/bundle model**:
+
+- **System memories** (`system-defaults/memories/*.md`, 28 files) load at
+  startup through `system_memory::init(&cfg.paths.defaults_memories_dir, ...)`
+  (`src/server/open.rs:236`). They are markdown runbooks resolved from a
+  configurable defaults dir, not versioned JSON specs with activators. Editing a
+  memory already needs no rebuild. Forcing them into the JSON-spec activator
+  path would add lifecycle ceremony without removing any real friction. They
+  stay auto-loaded; doctor's `knowledge`/`daemon` sections only verify the
+  catalog loaded and the memories dir resolved.
+
+- **Builtin macros** are currently in this category by accident:
+  `include_str!` bakes the four shipped macro JSONs into the binary
+  (`MacroRegistry::builtin_definitions()`). Unlike memories, this *does* impose
+  a rebuild to edit. This design moves macros **out** of the compiled-in
+  category and onto the managed-artifact path (next section). After that
+  migration, only system memories remain genuinely auto-loaded.
+
+The distinguishing test: a default belongs out of the bundle only if it is
+loaded by a dedicated runtime loader AND editing it needs no rebuild. Memories
+pass; compiled-in macros fail the second clause, which is why they move.
+
+## Macro Management
+
+Macros become a managed `macro` artifact kind. The driving requirement: tweaking
+a macro must not require a daemon rebuild, and macros should live inside the same
+version/source/generation/drift lifecycle as every other default.
+
+Current state (`src/macros/registry.rs`):
+
+- `builtin_definitions()` uses `include_str!` to embed the four shipped macros at
+  compile time, surfaced at `builtin` scope.
+- The registry also resolves `user` (`~/.config/blackbox/macros/` or
+  `BLACKBOX_MACROS_DIR`) and `project` (`<project>/.bbox/macros/<id>.json`)
+  scopes from disk.
+- `macro_register`/`macro_unregister` (`src/tools/macros.rs`) write the
+  **project** scope only (they require `project_dir` and write
+  `<project>/.bbox/macros/`); the catalog is not involved. `MacroScope`
+  (`src/macros/model.rs:39`) is `Builtin | User | Project` — there is no managed
+  variant yet.
+
+Constraint to respect: today there is **no managed/global macro scope**. The
+registry resolves project → user → `builtin_definitions()` only
+(`src/macros/registry.rs:618-629`), and `macro_register` writes the **project**
+scope exclusively (`registry.rs:649`). So an artifact macro activator cannot just
+"register into the registry" — there is nowhere managed for it to write. The
+migration must add a scope before it can remove the builtins.
+
+Target state, in order (the sequencing is load-bearing — see impl Phase 2/4):
+
+1. **Add a managed macro scope + loader.** Add a `MacroScope::Managed` variant
+   (`src/macros/model.rs:39` is `Builtin | User | Project` today) and a
+   daemon-owned macros dir (e.g. `inlets/`-sibling `macros/` runtime store, or a
+   global macro dir) that the registry loads with defined precedence
+   (project → user → **managed** → builtin, so the managed scope shadows the
+   compiled-in fallback). The loader assigns scope **by source directory**, not
+   by the payload's `scope` field — shipped macro JSONs carry `"scope":
+   "builtin"` (e.g. `builtin.java.lombok.json`), and the activator normalizes
+   that to `managed` when installing from the bundle. The macro activator parses
+   `MacroDefinition`, validates `inputs_schema`, writes the managed dir
+   (deactivate = remove from the managed dir). Identity is `id`; version from the
+   spec.
+2. **Ship the four macros as members of the refactor bundle** (they are Java
+   refactor macros). `bbox_artifact_bundle_apply` installs them into the managed
+   scope.
+3. **Only after** the managed scope exists and the refactor bundle can be applied
+   and verified, **remove the `include_str!` builtin block**. Until then the
+   builtins remain as a fallback so a daemon that has not applied the bundle does
+   not lose the macros.
+- **Migration policy:** prefer requiring `bbox_artifact_bundle_apply` for the
+  refactor bundle as a documented post-upgrade step surfaced by
+  `bbox_upgrade_check`, over a silent startup auto-install (consistent with the
+  no-startup-auto-install non-goal). While the builtins still exist as fallback,
+  doctor reports the shipped macros as `info` (managed copy not yet installed);
+  after the builtins are removed, the same gap becomes `action`.
+- `macro_register`/`macro_unregister` remain for interactive **project-scope**
+  macro authoring (they require `project_dir` and write `.bbox/macros/`, the
+  macro analog of editing a `.bbox/` file), but shipped defaults flow through the
+  artifact path. See the tool-surface table for the
+  disposition.
+
+## Team And Teamplate Activation
+
+v1 listed `team` as "catalog only until team activation is formalized." That
+formalization is now required work, because the real install path today is a
+shell script.
+
+Current state:
+
+- `install_artifact_value` `Team` arm and `deactivate_artifact` `Team` arm are
+  both no-ops (`src/server/routes.rs:1065-1067`, `1414-1416`).
+- The team/teamplate store is `src/orchestration/team.rs`: `save_teamplate`,
+  `list_teamplates`, `save_team`, `load_all_teams`, `remove_team`, all under
+  `store_dir/teamplates/` and `store_dir/teams/`.
+- Shipped teamplates: `system-defaults/phase-decompose/teamplates/*.json`
+  (`phase-decomposer-panel`, `phase-recompose-council`), members declared by
+  `{ brofile, alias, count }`.
+- The `contradiction-specialists` team is **not a file** — it exists only inline
+  in `system-defaults/agentic-corpus/scripts/install-teams.sh`, which curls
+  `/admin/team/upsert`.
+
+Target state:
+
+- `teamplate` activator: validate every member brofile ref resolves
+  (dependency edge: brofiles activate before teamplates), then `save_teamplate`.
+  Deactivate removes the teamplate. The shipped teamplate JSON is already the
+  `Teamplate` shape (`name`, `version`, `members[{brofile,alias,count}]`), so the
+  teamplate spec needs no new type.
+- `team` activator: **needs a dedicated install spec, not the runtime `Team`.**
+  The runtime `Team` (`src/orchestration/team.rs:109`) carries activation/runtime
+  fields (`created_at`, session/history, expanded members) that must not be
+  hand-authored in a shipped default. The existing admin path
+  (`admin_team_upsert`, `routes.rs:2214-2225`) only accepts
+  `members: Vec<String>` and synthesizes aliases/teamplate/team. Define a
+  `TeamArtifactSpec` (name + member refs, optionally a teamplate ref) whose
+  activator deterministically materializes a runtime `Team` via the same path
+  `admin_team_upsert` uses, then `save_team`. Deactivate `remove_team`. Do not
+  ship a raw runtime `Team` blob.
+- Promote `contradiction-specialists` to a shipped `TeamArtifactSpec` JSON
+  (`system-defaults/agentic-corpus/teams/contradiction-specialists.json`) and
+  retire `install-teams.sh`. The agentic-corpus maintenance bundle owns it.
+- Teamplate members reference brofiles; the bundle planner must order brofiles
+  before teamplates before any teamplate-backed team.
+
+## Workflow Assets
+
+Workflow activation today writes only the spec (`routes.rs:1027-1041`), but
+shipped workflows reference sibling assets by repo-relative path. Confirmed
+example: `system-defaults/workflows/phase-decompose/main.json` references
+`system-defaults/phase-decompose/scripts/epoch-check.py`. The phase-decompose
+tree alone ships 6 `.py` scripts and 2 `.md` fixtures that workflows and hooks
+invoke by path.
+
+**Install-time validation alone is insufficient — the problem is runtime
+resolution.** Shell ops resolve `cwd` from the op args, then the worktree, then
+`meta.project_dir` (`src/workflow/ops/external.rs:112`), and the shipped argv is
+a repo-relative path with `cwd: "${vars.project_dir}"`
+(`system-defaults/workflows/phase-decompose/main.json:220`). So the asset only
+resolves when the **target project happens to be this repo**. Validating that
+`system-defaults/phase-decompose/scripts/epoch-check.py` exists in the defaults
+tree at plan time does nothing for a workflow run against some other project's
+`project_dir`. A managed default that ships an asset reference must make that
+reference resolve regardless of the run's `project_dir`.
+
+Options:
+
+- **Asset-root interpolation (preferred).** Add a `${defaults_dir}` /
+  `${asset_root}` interpolation that the workflow executor resolves to the
+  managed asset location (the configured defaults dir, same source memories
+  already resolve from). Rewrite shipped workflow argv to
+  `${asset_root}/phase-decompose/scripts/epoch-check.py` so the script path is
+  independent of the run's `project_dir`. The bundle also validates the asset
+  exists at plan time, but resolution no longer depends on cwd.
+- **Staged absolute paths (heavier).** Copy referenced assets into a daemon
+  runtime asset dir and rewrite argv to absolute managed paths. Needed only for
+  deployments without the source tree present at runtime.
+
+Decision: introduce `${asset_root}` interpolation and migrate shipped workflows
+that reference assets to use it; keep plan-time existence validation as a
+backstop. Pure existence-validation against the defaults tree is explicitly
+**rejected** as the sole mechanism because it does not survive a foreign
+`project_dir`.
+
+### Out-of-tree assets
+
+Not every shipped workflow's asset lives under `system-defaults/`.
+`system-defaults/agentic-corpus/workflows/nightly-eval-arc.json:32` runs
+`bash eval/run-agentic-eval.sh` with `cwd: "${meta.project_dir}"`, and
+`eval/run-agentic-eval.sh` lives at the **repo root**, not under
+`system-defaults/`. This workflow is effectively a *repo-self-eval* — it only
+runs correctly when `project_dir` is this repository. Two consequences:
+
+- The "automate everything in `system-defaults/` in one bundle" goal cannot
+  bundle this asset, because the asset is not in the tree.
+- Such repo-internal workflows are classified separately from portable defaults.
+
+Decision: `nightly-eval-arc` is **repo-internal and excluded** from the portable
+system-defaults bundle — it evaluates this repository's own corpus and only runs
+correctly when `project_dir` is this repo. The agentic-corpus bundle's workflow
+`source_glob` excludes `nightly-eval-arc.json` (see ownership note in the bundle
+layout). If a future need makes it portable, relocate
+`eval/run-agentic-eval.sh` under the defaults tree and switch the workflow to
+`${asset_root}`. More generally, the planner must reject any bundle member whose
+referenced asset it can neither place nor resolve, rather than ship a workflow
+that silently fails at run time.
+
 ## Proposed MCP Surface
 
 ### `bbox_artifact_install`
@@ -351,6 +666,10 @@ Extend `kind` to include:
   completion)
 - `poller`
 - `webhook`
+- `reaction`
+- `macro` (identity field is `id`; replaces the `include_str!` builtins)
+- `teamplate`
+- `team` (gains a real activator; no longer catalog-only)
 - `bundle`
 
 Keep the existing artifact install shape: `source`, optional `name`, optional
@@ -543,8 +862,23 @@ The desired end state removes kind-specific ops lifecycle tools from MCP:
 | `bro_webhook_list` | `bbox_artifact_list(kind="webhook")` plus doctor inlet section |
 | `bro_workflow_install` | `bbox_artifact_install(kind="workflow", source=...)` |
 | `bro_workflow_list` | `bbox_artifact_list(kind="workflow")` |
+| `reaction_install` | `bbox_artifact_install(kind="reaction", source=...)` |
+| `reaction_list` | `bbox_artifact_list(kind="reaction")` plus doctor inlet section |
+| `install-teams.sh` shell script | `bbox_artifact_install(kind="team"/"teamplate", source=...)` via the agentic-corpus bundle |
 | `bro_cron_upcoming` | `bbox_cron_upcoming` |
 | direct `bbox_compile` for shipped MCP surfaces | `bbox_artifact_install(kind="packet", role="mcp_surface", source=...)` |
+| `include_str!` builtin macros | `bbox_artifact_install(kind="macro", source=...)` via the refactor bundle |
+
+`reaction_install`/`reaction_list` are removed for the same reason as the other
+inlet lifecycle tools. Keep `reaction_execute`, `reaction_replay`,
+`reaction_retry`, and `reaction_deliveries` — they are diagnostics/actions, the
+reaction analog of `bro_webhook_replay`/`bro_webhook_deliveries`.
+
+`macro_register`/`macro_unregister` are **not** removed: they remain the
+interactive surface for ad-hoc project-scope macros (they require `project_dir`
+and write `.bbox/macros/`, the macro analog of editing a `.bbox/` file by hand).
+Only the shipped builtin macros move to the artifact path. `macro_list`/`macro_describe`/`macro_plan`/`macro_apply`/`macro_run`/
+`macro_validate` are execution/inspection tools and are untouched.
 
 Keep non-lifecycle diagnostic/action tools:
 
@@ -566,14 +900,25 @@ place to reason about install/uninstall/provenance/upgrade behavior.
 Bundle order may be explicit, but the installer should still validate obvious
 dependency edges:
 
-- cron/poller/webhook routing packets must exist before activation.
+- cron/poller/webhook/reaction routing packets must exist before activation.
 - workflow references to packets, atoms, brofiles, teams, subworkflows, and MCP
   hook targets must validate before activation.
+- workflow **assets** (scripts/fixtures referenced by repo-relative path, e.g.
+  `system-defaults/phase-decompose/scripts/epoch-check.py`) must resolve at plan
+  time — see [Workflow Assets](#workflow-assets).
 - workflow-backed atoms need their workflow active.
 - profile-backed atoms need their brofile active.
 - agents with `brofile_ref` need the brofile active.
+- teamplate members reference brofiles; brofiles activate before teamplates.
+- teamplate-backed teams need their teamplate (and its member brofiles) active.
 - MCP surfaces compile as packets and should be available before provider sync
   steps that reference the surface.
+
+Activation order for the system-default surface therefore settles to roughly:
+packets/mcp-surface → brofiles → macros/agents/atoms → teamplates → teams →
+workflows → inlets (cron/poller/webhook/reaction). The bundle planner enforces
+the edges it can detect; explicit bundle order covers the rest until Phase 7
+auto-ordering lands.
 
 The first bundle implementation can use explicit bundle order plus validation.
 A later pass can add static
@@ -586,30 +931,80 @@ fails before any endpoint or tick loop is installed.
 
 ## System Defaults Bundle Layout
 
-Add:
+The v1 layout (a flat `refactor-atoms`, one `agentic-corpus-maintenance`,
+`badgey`, `mcp-surfaces`) under-counts the real tree. The shipped surface splits
+into cohesive directory groups, several of which v1 omitted entirely
+(`phase-decompose/`, `supervision/`, a `maintenance/` tree separate from
+`agentic-corpus/`). The bundle manifests map onto these directory groups:
 
 ```text
 system-defaults/bundles/
-  blackbox-system-defaults.json
-  badgey.json
-  agentic-corpus-maintenance.json
-  refactor-atoms.json
-  mcp-surfaces.json
+  blackbox-system-defaults.json   # top-level meta-bundle → child bundles
+  mcp-surfaces.json               # routing.json as packet role=mcp_surface
+  agentic-corpus.json             # auto-digest/auto-edge/contradiction/eval/embed packets+workflows+brofiles+crons, contradiction-specialists team
+  maintenance.json                # daily-compaction cron+packet+workflow (own tree, NOT agentic-corpus)
+  agents.json                     # default agents + agent-eval cron/packets/workflows
+  phase-decompose.json            # phase-decompose workflows + brofiles + packets + teamplates + script/fixture assets
+  supervision.json                # supervision atoms + brofiles + workflows + packets
+  refactor.json                   # refactor atoms (140) + brofiles + workflow wrappers + macros
+  badgey.json                     # badgey agents + brofiles + workflows + packets + crons
 ```
 
-Suggested ownership:
+Suggested ownership, grounded in the directory groups:
 
-- `blackbox-system-defaults`: top-level meta-bundle. Depends on the others.
-- `mcp-surfaces`: default MCP surface routing.
-- `agentic-corpus-maintenance`: schema migration, project bootstrap,
-  auto-digest, auto-edge, eval, embed compaction workflows/packets/brofiles and
-  related crons.
-- `badgey`: Badgey agents, brofiles, workflows, packets, and crons.
-- `refactor-atoms`: refactor brofiles, atoms, and workflow wrappers.
+- `blackbox-system-defaults`: shallow meta-bundle that references the children.
+- `mcp-surfaces`: `system-defaults/mcp-surfaces/routing.json` installed as a
+  `packet` with `role="mcp_surface"`.
+- `agentic-corpus`: `system-defaults/agentic-corpus/**` packets, workflows,
+  brofiles, and crons, plus the promoted `contradiction-specialists` team
+  (retiring `install-teams.sh`). **Excludes `nightly-eval-arc`** — it runs the
+  repo-root `eval/run-agentic-eval.sh` against `${meta.project_dir}` and only
+  works against this repository, so it is classified repo-internal and is not a
+  portable bundle member (see Workflow Assets → Out-of-tree assets). The
+  `source_glob` for this bundle's workflows must exclude `nightly-eval-arc.json`.
+- `maintenance`: `system-defaults/maintenance/**` — daily-compaction cron, its
+  cron-routing packet, and the arc workflow. This is a separate shipped tree and
+  deserves its own bundle, not folding into agentic-corpus.
+- `agents`: `system-defaults/agents/**` — default agents plus their co-located
+  `crons/`, `packets/`, and eval `workflows/`.
+- `phase-decompose`: `system-defaults/phase-decompose/**` teamplates and
+  script/fixture assets, plus `system-defaults/workflows/phase-decompose/**`,
+  `system-defaults/brofiles/phase-decompose/**`, and the phase-decompose packets
+  under `agentic-corpus/packets/phase-decompose/`. This is the strongest case
+  for asset-aware activation.
+- `supervision`: `system-defaults/atoms/supervision/**`,
+  `brofiles/supervision-*`, `workflows/supervision/**`, and supervision packets.
+- `refactor`: the 140 `system-defaults/atoms/refactor/**` atoms, the refactor
+  brofiles/personas, `workflows/refactor/**`, and the four macros.
+- `badgey`: `system-defaults/badgey/**` agents, brofiles, workflows, packets,
+  and crons.
 
-Meta-bundles should be shallow references to child bundles rather than giant
-duplicated member lists. The generation record expands transitive membership so
-uninstall remains precise.
+Meta-bundles are shallow references to child bundles, never duplicated member
+lists. The generation record expands transitive membership so uninstall stays
+precise.
+
+### Glob membership
+
+Enumerating 140 refactor atoms (or 41 workflows) by hand in a manifest does not
+scale and rots on every add. Bundle members must support directory-glob sources
+so a manifest can declare a whole group:
+
+```jsonc
+{
+  "kind": "atom",
+  "source_glob": "system-defaults/atoms/refactor/*.json",
+  "exclude": ["**/_*.json"]   // skip _base.outputs.schema.json templates
+}
+```
+
+The planner expands a `source_glob` member into concrete members at plan time,
+records each resolved source + hash in the generation, and applies the same
+dependency/drift checks per file. Exclusions are required because some "json"
+files are sidecars/templates, not artifacts: `.audit_examples.json` (packet
+companion datasets), `_base.outputs.schema.json` and `_template.prompt.md`
+(refactor atom templates). The planner must not treat those as installable
+members; it carries `.audit_examples.json` alongside its packet for hashing/copy
+only.
 
 ## Upgrade Helper
 
@@ -708,11 +1103,17 @@ Sections:
   status if available, sidecar compaction candidates
 - `projects`: registered roots, missing paths, project-file index coverage
 - `artifacts`: active catalog counts by kind, inactive/superseded counts,
-  missing payloads, unmanaged runtime specs, bundle generation drift
-- `inlets`: installed webhooks/pollers/crons, routing packet existence,
-  running tick loops for poller/cron specs
+  missing payloads, unmanaged runtime specs, bundle generation drift; shipped
+  macros that are not yet catalog-managed (i.e. still relying on a stale
+  compiled-in builtin); teamplates/teams present in the store but uncataloged
+  (e.g. left over from `install-teams.sh`)
+- `inlets`: installed webhooks/pollers/crons/reactions, routing packet
+  existence, running tick loops for poller/cron specs
 - `workflows`: installed workflow count, missing referenced packets/atoms/
-  brofiles where statically detectable
+  brofiles where statically detectable, and **missing workflow assets**
+  (referenced script/fixture paths that do not resolve)
+- `memories`: system-memory catalog loaded and `defaults_memories_dir` resolved
+  (auto-loaded surface, not catalog-managed)
 - `knowledge`: `bbox_lint` severity summary and rendered-file freshness if
   detectable
 - `attention`: unresolved inbox counts by kind
@@ -752,10 +1153,13 @@ pub enum ArtifactKind {
     Brofile,
     Agent,
     Atom,
-    Team,
+    Macro,      // identity = `id`; replaces include_str! builtins
+    Teamplate,  // team template (members by brofile)
+    Team,       // instantiated roster; gains a real activator
     Cron,
     Poller,
     Webhook,
+    Reaction,   // event-reaction inlet
     Bundle,
 }
 ```
@@ -851,3 +1255,45 @@ drift and require an explicit operator choice:
 - `adopt_runtime`: install the current runtime copy into the catalog as the new
   managed payload.
 - `skip`: leave it alone and keep reporting drift.
+
+### Regrounding Decisions (2026-05-30)
+
+- **Macros are managed artifacts, not `include_str!` builtins.** Editing a macro
+  must not require a daemon rebuild; macros join the version/source/generation/
+  drift lifecycle like every other default. The four shipped macros become
+  refactor-bundle members. The `include_str!` `builtin_definitions()` block is
+  removed **only after** a `MacroScope::Managed` scope + loader exists and the
+  refactor bundle has been applied and verified — never mid-migration, or the
+  macros vanish (see Macro Management for the ordered sequence). Migration
+  prefers documented `bbox_artifact_bundle_apply` (surfaced by
+  `bbox_upgrade_check`) over a silent startup auto-install, to honor the
+  no-startup-auto-install non-goal.
+- **System memories stay auto-loaded and out of the bundle.** They already load
+  from `defaults_memories_dir` at init with no rebuild cost and are markdown, not
+  JSON specs. Doctor verifies the catalog loaded; it does not install them. The
+  distinguishing test for "out of bundle" is: dedicated runtime loader AND no
+  rebuild to edit. Memories pass; compiled-in macros failed and therefore move.
+- **Team activation is real; `install-teams.sh` is retired.** `teamplate` and
+  `team` are separate kinds with activators that call `save_teamplate`/
+  `save_team`. `contradiction-specialists` is promoted to a shipped JSON owned by
+  the agentic-corpus bundle.
+- **Reactions are added as an inlet kind now** for surface consistency, with
+  `reaction_install`/`reaction_list` removed in favor of the artifact path and
+  `reaction_execute`/`replay`/`retry`/`deliveries` kept as diagnostics, even
+  though no reaction defaults ship yet. Identities remain read-only and excluded.
+- **Workflow assets are first-class.** The real fix is an `${asset_root}`
+  executor interpolation that resolves asset paths independent of the run's
+  `project_dir` (shell `cwd` resolves to the run project/worktree, so
+  repo-relative argv breaks outside this repo); plan-time existence validation is
+  only a backstop. Shipped workflows that reference assets migrate to
+  `${asset_root}`. Copy/staging to absolute paths is deferred until a
+  no-source-tree deployment requires it. Repo-internal workflows whose assets
+  live outside `system-defaults/` (e.g. `nightly-eval-arc`) are excluded from the
+  portable bundle.
+- **`.audit_examples.json` are packet companion datasets, not artifacts.** They
+  travel with their packet member for hashing/copy and feed `bbox_audit`; they
+  are never installed as standalone units. Glob membership must exclude them
+  along with `_*.json` / `_*.md` refactor templates.
+- **Bundle membership supports `source_glob`.** Hand-enumerating 140 atoms is a
+  rot hazard; manifests declare directory groups and the planner expands them at
+  plan time.
