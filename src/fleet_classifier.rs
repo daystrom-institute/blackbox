@@ -50,7 +50,7 @@ pub fn spawn_monitor(
 ) {
     let cadence = Duration::from_secs(cfg.cadence_secs_resolved());
     let auto_send = cfg.auto_send_resolved();
-    let cooldown_turns = cfg.cooldown_turns_resolved() as u64;
+    let min_activity = cfg.min_activity_resolved() as usize;
 
     // The companion is a normal bidi session, hidden from the roster by its
     // sentinel name, co-located with the executor's cwd.
@@ -64,7 +64,6 @@ pub fn spawn_monitor(
 
     rt.spawn(async move {
         let mut executor_items_seen = 0usize;
-        let mut last_suggest_turn: Option<u64> = None;
 
         loop {
             tokio::time::sleep(cadence).await;
@@ -73,13 +72,15 @@ pub fn spawn_monitor(
             if is_terminal(snap.status) {
                 break;
             }
-            // Only evaluate at turn boundaries — turn-end is the natural rate
-            // limiter (cf. supervision's `turn_end_only` cadence).
-            if snap.turn_active {
-                continue;
-            }
             let items = executor.transcript();
-            if items.len() <= executor_items_seen {
+            let new = items.len().saturating_sub(executor_items_seen);
+            // Digest mid-turn once enough new activity accrues, and flush the
+            // remainder at turn-end. A long autonomous turn (hundreds of tool
+            // calls) thus gets periodic check-ins instead of a single
+            // end-of-turn look — gating on turn boundaries left the intern blind
+            // for the whole turn.
+            let enough = new >= min_activity || (!snap.turn_active && new > 0);
+            if !enough {
                 continue;
             }
             let delta = digest_items(&items[executor_items_seen..]);
@@ -100,18 +101,18 @@ pub fn spawn_monitor(
                 continue; // PASS / anything else → stay quiet
             };
 
-            // Cooldown: at most one relayed suggestion per `cooldown_turns`
-            // executor turns.
-            let turns = snap.num_turns.unwrap_or(0);
-            if let Some(last) = last_suggest_turn {
-                if turns.saturating_sub(last) < cooldown_turns {
-                    continue;
-                }
-            }
-            last_suggest_turn = Some(turns);
+            // No per-turn cooldown: rate is governed by min_activity batching,
+            // the classifier's own response latency, and its PASS-by-default
+            // calibration. One hint per (possibly 30-minute) turn was too stingy.
 
+            // Relay regardless of whether the executor is mid-turn: a user turn
+            // sent mid-turn QUEUES at the next turn boundary (both the Claude CLI
+            // and bro-harness `session_loop` push it to `pending`) — it does not
+            // interrupt. An earlier `!turn_active` gate here silently DROPPED the
+            // suggestion whenever the executor was busy, so the intern produced
+            // verdicts the executor never received.
             let mut auto_sent = false;
-            if auto_send && !executor.snapshot().turn_active {
+            if auto_send {
                 let line = format!("{INTERN_PREFIX} {suggestion}");
                 if executor.send_user_turn(&line).await.is_ok() {
                     auto_sent = true;

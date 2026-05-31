@@ -92,10 +92,11 @@ pub struct ClassifierConfig {
     /// When false, suggestions are still surfaced in the TUI (observe-only).
     #[serde(default)]
     pub auto_send: Option<bool>,
-    /// At most one relayed suggestion per this many executor turns (cooldown).
-    /// Default 1.
+    /// Minimum new transcript items (tool calls / messages) accrued before the
+    /// monitor digests again. This is what lets long turns get periodic mid-turn
+    /// check-ins instead of a single end-of-turn look. Default 10.
     #[serde(default)]
-    pub max_suggestions_per_turns: Option<u32>,
+    pub min_activity: Option<u32>,
 }
 
 impl ClassifierConfig {
@@ -126,8 +127,8 @@ impl ClassifierConfig {
         self.auto_send.unwrap_or(true)
     }
 
-    pub fn cooldown_turns_resolved(&self) -> u32 {
-        self.max_suggestions_per_turns.unwrap_or(1).max(1)
+    pub fn min_activity_resolved(&self) -> u32 {
+        self.min_activity.unwrap_or(10).max(1)
     }
 }
 
@@ -1212,7 +1213,7 @@ mod tests {
         assert!(matches!(c.provider_resolved(), Provider::Glm));
         assert_eq!(c.cadence_secs_resolved(), 8);
         assert!(!c.auto_send_resolved());
-        assert_eq!(c.cooldown_turns_resolved(), 1);
+        assert_eq!(c.min_activity_resolved(), 10);
         // Empty prompt falls back to the calibrated default.
         assert_eq!(c.resolved_prompt(), DEFAULT_CLASSIFIER_PROMPT);
     }
@@ -1229,7 +1230,7 @@ mod tests {
                 prompt: None,
                 cadence_secs: None,
                 auto_send: None,
-                max_suggestions_per_turns: None,
+                min_activity: None,
             };
             assert!(provider_supports_bidi(c.provider_resolved()));
         }
