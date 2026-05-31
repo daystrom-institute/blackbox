@@ -55,6 +55,7 @@ const NAME_LEN: usize = 36;
 const PROVIDER_SEL_WIDTH: u16 = 38;
 const COMPOSER_HEIGHT: u16 = 3;
 const COMPOSER_MAX_HEIGHT: u16 = 10;
+const COMPOSER_CHROME_COLOR: Color = Color::Rgb(90, 110, 128);
 const TOOL_CALL_GLYPH: &str = "▸";
 const ROSTER_SELECTED_MARKER: &str = "› ";
 const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
@@ -1462,7 +1463,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
         draw_roster_body(f, chunks[0], app, &views, &order);
-        draw_composer(f, chunks[1], app, None, None);
+        let top_titles = app
+            .rename_target
+            .is_none()
+            .then(|| roster_composer_top_titles(app));
+        let bottom_title = Some(Line::from(roster_status_spans(app, &views)));
+        draw_composer(f, chunks[1], app, top_titles, bottom_title);
         draw_help(f, chunks[2], app);
         if slash_active(app) {
             draw_slash_menu(f, chunks[1], app);
@@ -1640,6 +1646,59 @@ fn selected_activity_spans(
     }
 
     spans.push(Span::raw("  "));
+    spans
+}
+
+fn roster_composer_top_titles(app: &App) -> Vec<Line<'static>> {
+    let flashing = app.provider_flash_until.is_some_and(|t| Instant::now() < t);
+    let next_style = if flashing {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    vec![
+        Line::from(Span::styled(
+            " dispatch ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            format!(" next: {} ", next_tuple(app)),
+            next_style,
+        ))
+        .right_aligned(),
+    ]
+}
+
+fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
+    let (active, waiting) = fleet_counts(views);
+    let byline = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
+    let project = app
+        .launch_cwd
+        .as_deref()
+        .map(path_name)
+        .unwrap_or_else(|| "fleet".to_string());
+
+    let mut spans = vec![
+        Span::styled(format!(" [{project}] "), byline),
+        Span::styled("──", dim),
+        Span::styled(format!(" [{} agents] ", views.len()), byline),
+        Span::styled("──", dim),
+        Span::styled(format!(" [{active} active] "), byline),
+        Span::styled("-", dim),
+        Span::styled(format!(" [{waiting} waiting] "), byline),
+    ];
+    if let Some(status) = &app.status {
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(
+            format!(" [{}] ", truncate(status, 70)),
+            byline,
+        ));
+    }
     spans
 }
 
@@ -3012,10 +3071,10 @@ fn draw_composer(
         (" rename (Enter=save · Esc=cancel) ", Color::Magenta)
     } else {
         match app.zone {
-            Zone::SingleAgent => ("", Color::Rgb(90, 110, 128)),
+            Zone::SingleAgent => ("", COMPOSER_CHROME_COLOR),
             _ => (
                 " dispatch (Enter=spawn · Shift+Enter=newline · Tab=provider · Ctrl+R=rename) ",
-                Color::Green,
+                COMPOSER_CHROME_COLOR,
             ),
         }
     };
@@ -3065,28 +3124,6 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         format!("{nav}  ·  Ctrl+Q quit"),
         Style::default().fg(Color::DarkGray),
     ));
-
-    let flashing = app.provider_flash_until.is_some_and(|t| Instant::now() < t);
-    let next_style = if flashing {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
-    spans.push(Span::styled(
-        "  ·  next: ",
-        Style::default().fg(Color::DarkGray),
-    ));
-    spans.push(Span::styled(next_tuple(app), next_style));
-
-    if let Some(s) = &app.status {
-        spans.push(Span::raw("  "));
-        spans.push(Span::styled(
-            s.clone(),
-            Style::default().fg(Color::LightYellow),
-        ));
-    }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
