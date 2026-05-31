@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::schemars;
@@ -492,6 +493,7 @@ fn finish_mutation(
     projects: &[ProjectRecord],
 ) -> Result<String> {
     let previews = previews_for_plan(&plan)?;
+    let effective_projects = effective_slice_projects(project_dir, projects);
     if options.confirm == Some(true) {
         let plan_value = serde_json::to_value(&plan)?;
         let apply_result_raw = refactor::apply(
@@ -507,7 +509,7 @@ fn finish_mutation(
                     .or_else(|| project_dir.map(str::to_string)),
                 force_path: options.force_path,
             },
-            projects,
+            &effective_projects,
         )?;
         let apply_result: Value =
             serde_json::from_str(&apply_result_raw).unwrap_or(Value::String(apply_result_raw));
@@ -545,6 +547,78 @@ fn finish_mutation(
             apply_result: None,
         })?)
     }
+}
+
+fn effective_slice_projects(
+    project_dir: Option<&str>,
+    projects: &[ProjectRecord],
+) -> Vec<ProjectRecord> {
+    let mut out = projects.to_vec();
+    if let Some(record) = managed_fleet_worktree_project(project_dir, projects) {
+        out.push(record);
+    }
+    out
+}
+
+fn managed_fleet_worktree_project(
+    project_dir: Option<&str>,
+    projects: &[ProjectRecord],
+) -> Option<ProjectRecord> {
+    let project_dir = project_dir?;
+    let worktree = fs::canonicalize(project_dir).ok()?;
+    if projects.iter().any(|project| {
+        let root = Path::new(&project.canonical_path);
+        worktree == root || worktree.starts_with(root)
+    }) {
+        return None;
+    }
+    let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+    if !branch.trim().starts_with("bro-fleet/") {
+        return None;
+    }
+    let worktree_common = git_common_dir(&worktree).ok()?;
+    let base = projects.iter().find(|project| {
+        git_common_dir(Path::new(&project.canonical_path))
+            .ok()
+            .is_some_and(|common| common == worktree_common)
+    })?;
+    Some(ProjectRecord {
+        project_id: format!("{}:fleet-worktree", base.project_id),
+        repo_id: base.repo_id.clone(),
+        canonical_path: path_string(&worktree),
+        registered_at: "fleet-managed".to_string(),
+        is_git_repo: true,
+        languages: base.languages.clone(),
+    })
+}
+
+fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
+    let raw = git_capture(cwd, &["rev-parse", "--git-common-dir"])?;
+    let path = PathBuf::from(raw.trim());
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    fs::canonicalize(path)
+        .with_context(|| format!("canonicalizing git common dir for {}", cwd.display()))
+}
+
+fn git_capture(cwd: &Path, args: &[&str]) -> Result<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .with_context(|| format!("running git {}", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn plan_from_edits(
@@ -1169,6 +1243,66 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_insert_allows_managed_fleet_worktree_for_registered_base_repo() {
+        let repo = tempfile::tempdir().unwrap();
+        if !git_ok(repo.path(), &["init", "-b", "main"]) {
+            return;
+        }
+        git(repo.path(), &["config", "user.email", "test@example.com"]);
+        git(repo.path(), &["config", "user.name", "Test User"]);
+        fs::write(repo.path().join("a.txt"), "a\n").unwrap();
+        git(repo.path(), &["add", "a.txt"]);
+        git(repo.path(), &["commit", "-m", "init"]);
+
+        let worktrees = tempfile::tempdir().unwrap();
+        let worktree = worktrees.path().join("task");
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/slice-test",
+                worktree.to_str().unwrap(),
+            ],
+        );
+
+        let base = ProjectRecord {
+            project_id: "base".into(),
+            repo_id: None,
+            canonical_path: path_string(&repo.path().canonicalize().unwrap()),
+            registered_at: "test".into(),
+            is_git_repo: true,
+            languages: BTreeSet::new(),
+        };
+        let p = SliceInsertTextParams {
+            project_dir: Some(path_string(&worktree.canonicalize().unwrap())),
+            target: "a.txt".into(),
+            insert: InsertSelector::Append,
+            text: "b\n".into(),
+            apply: SliceApplyOptions {
+                confirm: Some(true),
+                allow_dirty_worktree: None,
+                allow_unregistered_paths: None,
+                cwd: Some(path_string(&worktree)),
+                force_path: None,
+            },
+        };
+        let response: SliceMutationResponse =
+            serde_json::from_str(&insert_text_slice(&p, &[base]).unwrap()).unwrap();
+        assert_eq!(response.status, "applied");
+        assert_eq!(
+            fs::read_to_string(worktree.join("a.txt")).unwrap(),
+            "a\nb\n"
+        );
+
+        git(
+            repo.path(),
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        );
+    }
+
+    #[test]
     fn cross_file_move_dry_run_carries_two_file_edits() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("a.txt");
@@ -1189,5 +1323,31 @@ mod tests {
         assert!(response.dry_run);
         assert_eq!(response.plan.edits.len(), 2);
         assert_eq!(response.previews.len(), 2);
+    }
+
+    fn git_ok(cwd: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false)
+    }
+
+    fn git(cwd: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {} failed:\nstdout={}\nstderr={}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
