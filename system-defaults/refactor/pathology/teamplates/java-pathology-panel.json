@@ -1,0 +1,11 @@
+{
+  "name": "java-pathology-panel",
+  "version": 1,
+  "members": [
+    { "brofile": "java-pathology-soundness", "alias": "soundness", "count": 1 },
+    { "brofile": "java-pathology-precision", "alias": "precision", "count": 1 },
+    { "brofile": "java-pathology-economy", "alias": "economy", "count": 1 },
+    { "brofile": "java-pathology-resilience", "alias": "resilience", "count": 1 },
+    { "brofile": "java-pathology-corroboration", "alias": "corroboration", "count": 1 }
+  ]
+}

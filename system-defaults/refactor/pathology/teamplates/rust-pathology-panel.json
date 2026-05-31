@@ -1,0 +1,11 @@
+{
+  "name": "rust-pathology-panel",
+  "version": 1,
+  "members": [
+    { "brofile": "rust-pathology-soundness", "alias": "soundness", "count": 1 },
+    { "brofile": "rust-pathology-precision", "alias": "precision", "count": 1 },
+    { "brofile": "rust-pathology-economy", "alias": "economy", "count": 1 },
+    { "brofile": "rust-pathology-resilience", "alias": "resilience", "count": 1 },
+    { "brofile": "rust-pathology-corroboration", "alias": "corroboration", "count": 1 }
+  ]
+}
