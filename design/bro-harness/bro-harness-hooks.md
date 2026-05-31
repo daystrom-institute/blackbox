@@ -1,13 +1,21 @@
 ---
 title: "bro-harness hooks & nudges (the ambient-meta seam)"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - surfaces
 brief: "An internal, harness-owned interception subsystem for the bro-harness agent loop. Named hook points observe loop state (user turn, assistant turn, tool result) and contribute ambient meta — the first consumer being a Nudger that surfaces blackbox atoms/tools/system-memories when behavioral or lexical triggers fire. Separates what is injected (a nudge) from where it lands (delivery mechanism), and depends on a static/volatile split of the system prompt for cache safety."
 ---
+
+> **As-built record.** §1 (system-prompt static/volatile split), §2 (hook
+> scaffold + gating ledger), §3 (delivery mechanisms), and the Nudger v1 engine
+> with four shipped rules are all built. The v2 catalog-metadata channel
+> (`nudge_triggers` on atom/SM/tool descriptors → daemon-compiled blob) and the
+> broader rule set were excised to
+> [`backlog-hooks-catalog-metadata.md`](./backlog-hooks-catalog-metadata.md) —
+> deliberately gated on the §6 adoption loop showing the engine earns its keep.
 
 # bro-harness hooks & nudges (the ambient-meta seam)
 
@@ -235,17 +243,11 @@ ordered by trigger quality:
    the engine and the adoption loop (§6) can be validated before investing in a
    metadata channel. Start with the 2-3 highest-quality behavioral rules
    (copy-paste→slice, shell-grep→code-search) plus the refactor signpost.
-2. **Catalog metadata as v2.** Hardcoding regex→atom in the harness rots the
-   moment the atom catalog changes and violates the project's "system memories
-   are signposts, not ledgers" rule. End-state: atom/SM/tool descriptors carry
-   optional `nudge_triggers` metadata; the daemon compiles the active set into a
-   blob injected at dispatch (same channel discipline as `--mcp-config`). The
-   harness stays a **generic** engine that knows nothing about specific atoms;
-   adding an atom can ship its own nudge without touching the harness. Source of
-   truth stays in `atom_search`/`atom_describe`.
-
-Do not build the metadata channel until the adoption loop shows the engine
-earns its keep.
+   **This shipped (Nudger v1).**
+2. **Catalog metadata as v2** — extracted to
+   [`backlog-hooks-catalog-metadata.md`](./backlog-hooks-catalog-metadata.md).
+   Not built; deliberately gated on the §6 adoption loop showing the engine earns
+   its keep.
 
 ## §5 — The nudge ledger (state)
 
@@ -330,8 +332,10 @@ signal channel, not a progress log:
    not instrumented in the harness; it is the transcript query of §6.
 3. **Nudger v1.** The 2-3 highest-quality behavioral rules + the refactor
    signpost, harness-shipped.
-4. **Catalog metadata channel.** Only after §6 shows adoption. Atom/SM/tool
-   `nudge_triggers` → daemon-compiled blob → generic harness engine.
+4. **Catalog metadata channel** — see
+   [`backlog-hooks-catalog-metadata.md`](./backlog-hooks-catalog-metadata.md).
+   Only after §6 shows adoption. Atom/SM/tool `nudge_triggers` → daemon-compiled
+   blob → generic harness engine.
 
 ## Non-goals
 

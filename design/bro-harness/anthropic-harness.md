@@ -1,13 +1,20 @@
 ---
 title: "Custom provider harness (bro-harness)"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - providers
 brief: "A minimal headless coding agent that speaks provider APIs directly (Anthropic Messages, OpenAI Responses, OpenAI Chat Completions) behind one Transport interface, runs its own tool-calling loop, and slots into the existing Claude-CLI dispatch seam — so GLM/DeepSeek/Codex/etc. stop depending on the broken `claude` CLI path. Always emits the Claude stream-json envelope on stdout."
 ---
+
+> **As-built record.** The three-transport harness, agent loop, SSE streaming,
+> model-keyed compaction, bidirectional session/control protocol, deferred
+> tiering, and recursion guard are all built and live-verified end-to-end. The
+> residual "later" items (web_search fallback, result normalization, structured
+> output, RTK output compaction, in-process executor, namespace isolation) were
+> excised to [`backlog-transport-polish.md`](./backlog-transport-polish.md).
 
 # Custom provider harness (`bro-harness`)
 
@@ -494,46 +501,13 @@ idea: every tool stays reachable, only used ones cost a full schema.
 
 ## Open questions / later
 
-- **Client-side `web_search` fallback backend**: only needed for providers
-  without a server-side search tool. GLM and DeepSeek both have one, so this
-  is not required for the initial GLM/DeepSeek goal. If/when added, Brave
-  (pg_recon's choice, paid key) vs. an alternative, pluggable behind a trait.
-- **Server result normalization**: whether to canonicalize GLM's
-  `web_search_prime`/`tool_result` variant into the Anthropic
-  `web_search_tool_result` shape inside the conversation, or relay verbatim.
-  Verbatim is simpler and the model tolerated its own provider's shape
-  pre-regression; revisit only if a model gets confused by its own format.
-- **Structured output**: add `--output-schema` + forced `tool_choice` to the
-  harness if/when an actor needs `StructuredOutput` from GLM/DeepSeek.
-- **Reusing the harness for `Provider::Claude` itself**: out of scope now,
-  but the design is provider-generic — if the official CLI keeps drifting we
-  could route Claude through the same harness against the first-party
-  endpoint.
-- **Namespace isolation**: the daemon already sets cwd per task; if we want
-  PID/mount isolation (daystrom does `unshare`) it belongs in the daemon's
-  spawn path, not the harness, and applies to all providers uniformly.
-- **In-process future**: because tools live in `crates/bro-tools` and are
-  provider-agnostic, a later in-process executor can reuse them without
-  touching the subprocess path.
-- **Output compaction (RTK) — deferred (2026-05-29).** Distinct from the
-  shipped model-keyed *context-window* compaction (`compaction.rs`); this item
-  is about per-command *output* token-saving. Idea: bake
-  RTK-style (`rtk-ai/rtk`) token-saving output compaction into our tools at
-  the *output* layer (never the command layer), eliminating the hook's
-  command-rewrite mangling class by construction. Investigation found rtk's
-  per-command filtering is *coupled to execution* (`runner::run` +
-  large `cmds/*` modules, e.g. `git.rs` ~102KB), with no exposed
-  `filter(argv, captured) -> String` dispatch; rtk also only handles
-  recognized *single* commands, not arbitrary shell lines. So a clean
-  in-process lib needs a sizable refactor (high upstream-merge friction for a
-  vendored fork). Realistic path if revisited: vendor rtk as an in-tree fork
-  (`git subtree`, track upstream `develop`), mutate minimally
-  (`lib.rs` re-export + telemetry-off), and invoke it as a subprocess for
-  recognized single commands only (compound/piped → raw), always with a
-  `raw` bypass + full-output tee. The historical content-substitution
-  mangling (`HOME`→`n`) appears fixed in rtk 0.40.0; the command-rewrite
-  mangling is inherent to the *hook* and is avoided by direct argv
-  invocation. Deferred in favor of MCP client + remaining tool bodies.
+Extracted to [`backlog-transport-polish.md`](./backlog-transport-polish.md):
+client-side `web_search` fallback backend (Brave), server result normalization,
+structured output (`--output-schema`), reusing the harness for `Provider::Claude`,
+namespace isolation, the in-process executor future, and RTK-style per-command
+*output* compaction. That backlog doc also carries the live transport-polish
+residue from thread-ca160aa2 (MCP connection pooling, `codex_auth` retry
+wrapping, deferred-manifest token trimming).
 
 ## Validation plan
 

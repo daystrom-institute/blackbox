@@ -20,18 +20,16 @@ agentic work.
 - [Agent System - Implementation Skeleton](agents/agent-system-impl.md)
 - [Atom Capability Runtime](atoms/atom-capability-runtime.md)
 
-## Provider Transport
+## Provider Transport & Cockpit (moved out)
 
-- [Anthropic-shaped Custom Harness (bro-harness)](anthropic-harness.md)
+The custom provider harness and the fleet cockpit are **top-level** design
+clusters now — daemon-independent abstractions, not orchestration sub-topics. See
+the [Design Corpus](../design-corpus.md) Topic Hubs:
 
-## Harness Tool Surface
-
-- [**bro-harness Design Map** (start here — dependency graph + build order)](bro-harness.md)
-- [bro-harness Tool Surface — Ideal Built-in Subset](bro-harness-tool-surface.md)
-- [bro-harness Clipboard (clip_* registers)](bro-harness-clipboard.md)
-- [bro-harness Tool Chaining (the ref ABI)](bro-harness-tool-chaining.md)
-- [bro-harness Hooks & Nudges (ambient-meta seam)](bro-harness-hooks.md)
-- [bro-harness Neuralyze (rewind + carry a message)](bro-harness-neuralyze.md)
+- [Bro-Harness](../bro-harness/bro-harness.md) — the custom headless agent
+  (transports, tool surface, clipboard, chaining, hooks, diagnostics, neuralyze).
+- [Fleet TUI](../fleet-tui/fleet-tui.md) — `bro fleet`, the multi-provider
+  live-driving cockpit.
 
 ## Workflow Execution
 

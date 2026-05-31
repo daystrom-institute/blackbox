@@ -148,7 +148,7 @@ routing facts:
   into the existing dispatch seam. Needs `bro-harness` on PATH or
   `BRO_HARNESS_BIN`; transport + credentials are selected via env in
   `brofile::resolve_provider_env`. See
-  `design/orchestration/anthropic-harness.md`.
+  `design/bro-harness/anthropic-harness.md`.
 - Codex dispatches through the codex CLI — a path distinct from Brodex
   (`codex` → codex CLI; `brodex` → bro-harness/Responses), preserved unchanged.
 - Inception dispatches through OpenCode transport.
@@ -236,6 +236,12 @@ or system memories and link/pointer from here.
 - `design/orchestration/` - topic home for atoms, agents, workflows,
   supervision, phase decomposition, runtime allocation, and live handoff
   designs.
+- `design/bro-harness/` - top-level home for the custom headless coding agent
+  (`crates/bro-harness`, `crates/bro-tools`): transports, tool surface,
+  clipboard, tool chaining, hooks, diagnostics, neuralyze. Daemon-independent by
+  invariant; separate from `orchestration/`.
+- `design/fleet-tui/` - top-level home for `bro fleet`, the in-process
+  multi-provider cockpit for live-driving entrypoint agents.
 - `design/refactor-tools/` - topic home for structural refactor tools,
   refactor atoms, Rust expansion, and Java refactor closure designs.
 - `design/integrations/` - topic home for editor/chat/external UI

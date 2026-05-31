@@ -1,13 +1,18 @@
 ---
 title: "bro-harness tool surface — the ideal built-in subset"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - surfaces
 brief: "Defines the target built-in tool subset for bro-harness, derived from the superset of capabilities across the Claude Code and Codex CLIs. Inventories what bro-harness has today (verified arg shapes), what CC and Codex offer, and gives a per-capability verdict: adopt / already-have / skip — with shape notes."
 ---
+
+> **As-built record.** The adopt list shipped — `shell_run` quartet,
+> `file_read`/`content_search`/`glob` shape upgrades, and `todo_write`. The one
+> deferred item, per-call privilege escalation, was excised to
+> [`backlog-per-call-escalation.md`](./backlog-per-call-escalation.md).
 
 # bro-harness tool surface — the ideal built-in subset
 
@@ -224,12 +229,10 @@ todo list is a loop-level side-cell persisted in the `SessionStore` file
 
 ### Per-call escalation (deferred — spec only)
 
-The Codex model: run `shell_run` (and any future networked tool) least-privilege
-by default; require `escalate:true` + `justification` for mutating or networked
-commands, recorded for audit. **Not built in v1** — it overlaps the brofile
-allow/deny layer and the static `SafetyPolicy`, and shipping it now would create
-two competing privilege systems. Revisit once the privilege model is unified;
-the `shell_run` shape can gain the two fields without breaking callers.
+Deferred; extracted to
+[`backlog-per-call-escalation.md`](./backlog-per-call-escalation.md). The
+`shell_run` shape can gain the `escalate`/`justification` fields without breaking
+callers once the privilege model is unified.
 
 ## Explicit skips (and why)
 

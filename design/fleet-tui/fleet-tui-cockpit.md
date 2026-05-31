@@ -1,15 +1,27 @@
 ---
 title: "Fleet TUI — multi-provider agent cockpit"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - fleet-tui
   - surfaces
 brief: "A new top-level bro-client TUI: a human cockpit for dispatching and live-driving many concurrent TOP-LEVEL entrypoint agents across providers — GLM, DeepSeek, Brodex (all via bro-harness) and Claude as first-class peers. The TUI drives every entrypoint agent over ONE control protocol: the Claude Agent SDK bidirectional stream-json control scheme (control_request/control_response + stream-json events). The keystone: blackbox today dispatches EVERY provider one-shot (-p --output-format stream-json), so the cockpit needs the bidirectional input mode the claude CLI already supports but blackbox does not yet use, AND bro-harness must implement that mode (it is one-shot today). The TUI links the orchestration core as a library and spawns agents in-process; blackboxd is not in the execution path. Every claim below is cited to code."
 ---
 
 # Fleet TUI — multi-provider agent cockpit
+
+> **As-built record.** The v1 cockpit and its entire harness-side substrate
+> (keystone §2, exec model §3, roster/nav/transcript §5) are built and runnable.
+> The residual work was excised to the backlog:
+> [`backlog-follow-ons.md`](./backlog-follow-ons.md) (§7 items 8/9/10/15/16:
+> `@project` cwd+MCP config, input-history persistence, allocator probe-core
+> extraction, capability badges + headroom v2, Alerting reuse + `/resume`-deleted)
+> and [`backlog-standalone-view.md`](./backlog-standalone-view.md) (§5.5). Net-new
+> UX polish surfaced by operator feedback (animated throbber, roster
+> cost→report-teaser, compact tool-call rendering) lives in
+> [`backlog-ux-polish.md`](./backlog-ux-polish.md). §7 is retained below as the
+> as-built ledger.
 
 > **Status.** Partial — **the v1 cockpit is built and runnable** (`bro fleet`,
 > 2026-05-30, branch `feat/fleet-tui-cockpit`). The **entire harness-side
@@ -384,18 +396,13 @@ the TUI keeps a render-side soft-cap only as a backstop for non-harness provider
 
 ### 5.5 Standalone single-agent view (v2, deferred)
 
-The single-agent view (§5.4) is a **reusable component** — transcript + steering
-composer + header. **Fleet embeds it** behind the roster (`→` to focus). A
-**standalone** shell — the harness launched directly into that component, no
-roster / no fleet chrome — is **v2, deferred**. It is the only context where:
-
-- **`/clear`** — start a fresh session — is meaningful (in fleet, "new session" =
-  dispatch a new agent; resetting one = `Ctrl+X`+`Ctrl+X` + redispatch, so
-  `/clear` is redundant).
-- **`/resume`** carries the "open a session into a dedicated single view" sense.
-
-The v1 win is **multi-agent management** (the fleet). Standalone single-agent is a
-secondary shell deferred to v2; it reuses the same view component, no new model.
+Deferred to v2; extracted to
+[`backlog-standalone-view.md`](./backlog-standalone-view.md). In brief: the
+single-agent view (§5.4) is a reusable component (transcript + composer + header)
+that fleet embeds behind the roster; a standalone shell launching the harness
+directly into it (no roster / no fleet chrome) is the only context where
+`/clear` and a dedicated-view `/resume` are meaningful. The v1 win is multi-agent
+management; the standalone shell reuses the same component with no new model.
 
 ## 6. Relationship to other surfaces
 
@@ -405,6 +412,12 @@ secondary shell deferred to v2; it reuses the same view component, no new model.
 - **`bro council`** (`cli.rs:90`, `council_tui.rs`): orthogonal chat board.
 
 ## 7. What needs to be added (net new)
+
+> Retained as the **as-built ledger**. The ✅ items are shipped. The residual
+> ◑/○ items (8 `@project` config, 9 input-history persist, 10 allocator
+> probe-core, 15 capability badges + headroom v2, 16 Alerting reuse +
+> `/resume`-deleted) are tracked as actionable work in
+> [`backlog-follow-ons.md`](./backlog-follow-ons.md).
 
 Substrate:
 

@@ -1,10 +1,10 @@
 ---
 title: "bro-harness diagnostics (window-0 analyzer feedback)"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - surfaces
 brief: "Synchronous, per-mutation analyzer feedback for the bro-harness edit loop: a diagnostic for the state an edit produced rides that edit's tool result before the agent can act again (window=0). The organizing constraint is the agent's TRUST in the channel, not latency — stale or unconfirmable diagnostics bankrupt the channel (chase + alarm-fatigue), so the design trades latency and fussiness for precision. Affordable because the diagnostics that compound catastrophically (errors/types/borrow) are language-server-instant while the slow ones (lints) don't compound. Transport is LSP, consumed in-process: bro-harness owns its own warm session via shared-crate code and stays fully functional with the daemon down — never a runtime backchannel to blackbox. Per-language semantics live in a thin classification adapter whose size tracks the gap to a unified Roslyn-like toolchain. The truth tier is not a harness concern at all: it is owned by whoever performs the ownership transfer (the orchestrator at collection, or an explicit solo act), because the harness — as the payload being transferred — cannot observe the boundary."
 ---
@@ -58,6 +58,13 @@ brief: "Synchronous, per-mutation analyzer feedback for the bro-harness edit loo
 > verification owed before that wave: confirm whether the MVP already surfaces RA
 > flycheck warnings crudely through the `publishDiagnostics` drain — if so, the
 > deferred work is gating + scope-honesty, not new surfacing.
+>
+> The actionable residual (check-tier gating, the orchestrator-owned truth tier,
+> and the open migrate-vs-copy `bro-lsp`/`src/lsp` fork) is tracked as a pickup
+> item in [`backlog-diagnostics-truth-tiers.md`](./backlog-diagnostics-truth-tiers.md).
+> The full rationale for *why* those tiers are shaped this way stays in this
+> as-built record; the body below is retained as the authority for the shipped
+> instant tier and the deferred design.
 
 This doc specifies how the harness should give an agent analyzer feedback on
 its own edits. It is a sibling of [anthropic-harness](anthropic-harness.md) (the

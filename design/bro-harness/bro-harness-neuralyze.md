@@ -4,7 +4,7 @@ kind: design
 lifecycle: proposed
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - surfaces
 brief: "A harness-owned time-travel primitive: rewind the agent loop's context (and optionally its file mutations) to a prior checkpoint, then re-emit a single replacement message at that point. One tool, two callers — an external orchestrator steering a session via plain prose, or the agent self-correcting out of a poisoned context. Built on an auto-per-turn checkpoint substrate; detection is delegated to existing supervision telemetry, not reinvented."
 ---

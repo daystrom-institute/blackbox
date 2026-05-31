@@ -1,17 +1,18 @@
 ---
 title: "bro-harness clipboard (clip_* registers)"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - surfaces
 brief: "A session-durable, snapshot register store for the bro-harness tool loop. Lets an agent yank a text slice into a named register and paste it elsewhere — fan-out, gather, and cross-turn staging — without the content ever transiting the model context. The settled-ref layer of the broader tool-chaining design."
 ---
 
 # bro-harness clipboard (`clip_*` registers)
 
-> **Status.** Partial — as-built (and since **expanded**) in
+> **As-built record (shipped).** No open residual; the v1 non-goals below stay
+> inline as scope notes. As-built (and since **expanded**) in
 > `crates/bro-tools/src/clipboard.rs` and
 > `crates/bro-tools/src/slice_core.rs` (the first-cut duplicated selector
 > vocabulary + resolver). The register store now backs **nine** `clip_*`

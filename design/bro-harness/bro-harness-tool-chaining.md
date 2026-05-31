@@ -1,13 +1,19 @@
 ---
 title: "bro-harness tool chaining (the ref ABI)"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
-  - orchestration
+  - bro-harness
   - surfaces
 brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, server-held value cells that tools produce and consume by handle instead of marshalling full content through the model context. A clipboard register is a settled ref; a Task is a pending ref. Chainability is built at the settled layer with zero async machinery; Tasks enter only when a producer can't finish within the turn."
 ---
+
+> **As-built record.** Stages 1–2 (settled refs: the clipboard, plus
+> `kind`-tagged producers/consumers for tool→tool chaining) are built. Stage 3
+> (pending refs = Task, the async arm) was excised to
+> [`backlog-tool-chaining-stage-3.md`](./backlog-tool-chaining-stage-3.md); it is
+> gated on an async producer existing to need it.
 
 # bro-harness tool chaining (the ref ABI)
 
@@ -154,29 +160,13 @@ tools declare which kinds each param accepts.
 
 ### Stage 3 — pending refs = Task (only now does Task appear)
 
-When a producer is *async* — background `shell_run`, `bro_exec`, a long job —
-its output register cannot settle within the turn. That pending register **is**
-the Task:
-
-```rust
-enum RegisterState {
-    Settled(Register),
-    Pending { task_id: String, kind: RefKind },
-}
-```
-
-A consumer of `task:abc.output` either blocks until the ref settles, or — the
-richer path — the harness **defers** the consuming `tool_call` until the ref
-resolves. That deferral is exactly the wake/event-loop machinery discussed for
-async tools generally: a tool call that registers a wake condition instead of
-returning a value. So Stage 3 is not a new subsystem; it is the ref resolver
-gaining a `Pending` arm, reusing whatever async-producer infrastructure the
-harness grows.
-
-Durability note: a Task-produced ref that must survive `exec → resume` (the
-async work finishes between turns) requires the ref store to be session-durable
-and the task handle re-bindable on resume — consistent with the clipboard's
-`SessionStore` persistence, since the ref store *is* the clipboard store.
+Not built; extracted to
+[`backlog-tool-chaining-stage-3.md`](./backlog-tool-chaining-stage-3.md). In
+brief: when a producer is async (background `shell_run`, in-harness sub-dispatch),
+its output register can't settle within the turn — that pending register *is* the
+Task (`RegisterState::Pending { task_id, kind }`), and the resolver gains a
+`Pending` arm rather than a new subsystem. Gated on an async producer actually
+existing.
 
 ## Why this is the right shape
 
