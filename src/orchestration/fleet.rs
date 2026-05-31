@@ -172,6 +172,8 @@ const DEFAULT_FLEET_PIN_TOOLS: &[&str] = &[
     "bbox_inspect_entity",
     "bbox_find_paths",
     "bbox_bundle_evidence",
+    "enter_worktree",
+    "exit_worktree",
 ];
 
 /// Default classifier prompt. The wording IS the policy (mirrors the

@@ -10,6 +10,8 @@
     "bro_resume",
     "bro_wait",
     "bro_when_all",
+    "enter_worktree",
+    "exit_worktree",
     "bbox_describe_schema",
     "bbox_hybrid_search",
     "bbox_inspect_entity",

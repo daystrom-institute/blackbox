@@ -22,6 +22,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -256,8 +257,8 @@ struct App {
     status_until: Option<Instant>,
     quit: bool,
 
-    /// Runtime handle for firing the async steer/interrupt calls (AgentHandle
-    /// methods are async; the TUI loop is sync) off the blocking loop.
+    /// Runtime handle for async agent writes. The TUI loop is sync, so short
+    /// stdin writes are bridged synchronously to preserve operator input order.
     rt: tokio::runtime::Handle,
 
     /// Cloned per spawned monitor; monitors push suggestions here.
@@ -498,10 +499,8 @@ fn prepare_dispatch_worktree(
         .collect::<String>();
     let slug = prompt_slug(prompt);
     let branch = format!("bro-fleet/{slug}-{suffix}");
-    let worktree_dir = orch
-        .store_dir()
-        .join("worktrees")
-        .join(sanitize_path_component(repo_name));
+    let worktree_root = orch.store_dir().join("worktrees");
+    let worktree_dir = worktree_root.join(sanitize_path_component(repo_name));
     fs::create_dir_all(&worktree_dir)
         .map_err(|e| format!("creating worktree parent {}: {e}", worktree_dir.display()))?;
     let worktree_path = worktree_dir.join(format!("{slug}-{suffix}"));
@@ -527,6 +526,19 @@ fn prepare_dispatch_worktree(
         .unwrap_or_else(|e| format!("git status unavailable: {e}"));
 
     let mut env = HashMap::new();
+    env.insert(
+        "BRO_FLEET_BASE_REPO".to_string(),
+        git_root.display().to_string(),
+    );
+    env.insert(
+        "BRO_FLEET_WORKTREE_ROOT".to_string(),
+        worktree_root.display().to_string(),
+    );
+    env.insert(
+        "BRO_FLEET_PARENT_WORKTREE".to_string(),
+        git_root.display().to_string(),
+    );
+    env.insert("BRO_FLEET_WORKTREE_BRANCH".to_string(), branch.clone());
     let cargo_target = git_root.join("target");
     if git_root.join("Cargo.toml").is_file() {
         env.insert(
@@ -534,7 +546,7 @@ fn prepare_dispatch_worktree(
             cargo_target.display().to_string(),
         );
     }
-    let env_overrides = (!env.is_empty()).then_some(env);
+    let env_overrides = Some(env);
     let cargo_line = env_overrides
         .as_ref()
         .and_then(|m| m.get("CARGO_TARGET_DIR"))
@@ -1265,14 +1277,10 @@ fn steer_selected(app: &mut App) {
         let text = std::mem::take(&mut app.input);
         app.history_cursor = None;
         app.agents[idx].input_history.push(text.clone());
-        // AgentHandle::send_user_turn is async; fire it on the runtime. Errors
-        // are surfaced only as a best-effort log — the loop stays responsive.
-        app.rt.spawn(async move {
-            if let Err(e) = handle.send_user_turn(&text).await {
-                tracing::warn!("fleet steer failed: {e:#}");
-            }
-        });
-        app.set_status("steer queued to stdin", Duration::from_secs(2));
+        match run_agent_write(app, handle.send_user_turn(&text)) {
+            Ok(()) => app.set_status("steer queued to stdin", Duration::from_secs(2)),
+            Err(e) => app.set_status(format!("steer: {e:#}"), Duration::from_secs(4)),
+        }
     } else if provider_supports_bidi(provider) {
         resume_selected(app, idx);
     } else {
@@ -1320,12 +1328,17 @@ fn interrupt_selected(app: &mut App) {
     if !handle.can_steer() {
         return;
     }
-    app.rt.spawn(async move {
-        if let Err(e) = handle.interrupt().await {
-            tracing::warn!("fleet interrupt failed: {e:#}");
-        }
-    });
-    app.set_status("interrupt sent", Duration::from_secs(2));
+    match run_agent_write(app, handle.interrupt()) {
+        Ok(()) => app.set_status("interrupt sent", Duration::from_secs(2)),
+        Err(e) => app.set_status(format!("interrupt: {e:#}"), Duration::from_secs(4)),
+    }
+}
+
+fn run_agent_write<F>(app: &App, fut: F) -> anyhow::Result<()>
+where
+    F: Future<Output = anyhow::Result<()>>,
+{
+    tokio::task::block_in_place(|| app.rt.block_on(fut))
 }
 
 fn zoom_left(app: &mut App) {
@@ -3211,6 +3224,21 @@ mod tests {
                     .to_str()
                     .unwrap()
             )
+        );
+        let env = worktree.env_overrides.as_ref().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        let worktree_root = store.path().join("fleet").join("worktrees");
+        assert_eq!(
+            env.get("BRO_FLEET_BASE_REPO").map(String::as_str),
+            Some(repo_root.to_str().unwrap())
+        );
+        assert_eq!(
+            env.get("BRO_FLEET_WORKTREE_ROOT").map(String::as_str),
+            Some(worktree_root.to_str().unwrap())
+        );
+        assert!(
+            env.get("BRO_FLEET_WORKTREE_BRANCH")
+                .is_some_and(|branch| branch.starts_with("bro-fleet/fix-the-launch-flow-"))
         );
 
         run_git(

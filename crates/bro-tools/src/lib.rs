@@ -11,6 +11,7 @@
 
 pub mod clipboard;
 pub mod edits;
+pub mod fleet_worktree;
 pub mod jq;
 pub mod safety;
 pub mod shell;
@@ -55,6 +56,8 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitCommit),
         Arc::new(web::WebFetch),
         Arc::new(crate::todo::TodoWrite),
+        Arc::new(crate::fleet_worktree::EnterWorktree),
+        Arc::new(crate::fleet_worktree::ExitWorktree),
     ];
     let mut tools = tools;
     tools.extend(crate::clipboard::clip_tools());

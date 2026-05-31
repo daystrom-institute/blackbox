@@ -28,7 +28,7 @@ use bro_tools::{SafetyPolicy, ToolCx, builtin_tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Read as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::{mpsc, watch};
 
@@ -53,7 +53,9 @@ pub async fn run(cli: Cli) -> Result<()> {
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
-    session.user_turn(&prompt, cancel_rx).await?;
+    session
+        .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
+        .await?;
     session.persist()?;
     Ok(())
 }
@@ -122,13 +124,16 @@ async fn session_loop(
         }
 
         // Run the turn while concurrently watching stdin for an interrupt
-        // (cancels the turn) or a steer (queues for the next boundary). The
-        // stdin arms must NOT touch `session` — it's borrowed by the turn.
+        // (cancels the turn) or a steer. User steers received during a
+        // tool-calling turn are injected at the next model-call boundary inside
+        // that same turn, after any outstanding tool results are pushed.
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let mut stdin_closed = false;
         let mut deferred: Vec<(String, Value)> = Vec::new();
+        let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
+            Arc::new(StdMutex::new(VecDeque::new()));
         {
-            let turn = session.user_turn(&prompt, cancel_rx);
+            let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -144,7 +149,11 @@ async fn session_loop(
                             let _ = cancel_tx.send(true);
                             ctrl_emitter.control_response_success(req_id.as_deref());
                         }
-                        Some(Input::User(p)) => pending.push_back(p),
+                        Some(Input::User(p)) => {
+                            if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                                inputs.push_back(p);
+                            }
+                        }
                         Some(Input::Control { subtype, req_id, raw }) => {
                             // Non-interrupt controls (set_model, …) ack now and
                             // apply at the turn boundary, when self is free.
@@ -162,6 +171,11 @@ async fn session_loop(
         // The turn (and its &mut self borrow) is done — apply deferred controls.
         for (subtype, raw) in deferred {
             session.apply_control(&subtype, &raw);
+        }
+        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+            while let Some(p) = inputs.pop_back() {
+                pending.push_front(p);
+            }
         }
         if stdin_closed && pending.is_empty() {
             break;
@@ -398,13 +412,13 @@ impl Session {
     /// call leaves no assistant message (buffer stays valid); a cancelled tool
     /// dispatch pads the remaining tool_uses with an interrupted marker result
     /// so the buffer stays valid for the next turn.
-    async fn user_turn(&mut self, prompt: &str, mut cancel: watch::Receiver<bool>) -> Result<()> {
-        self.tx.push_user_text(prompt);
-        for n in self.hooks.on_user_turn(prompt) {
-            if n.delivery == Delivery::SystemTail {
-                self.tail_nudge = Some(n.message);
-            }
-        }
+    async fn user_turn(
+        &mut self,
+        prompt: &str,
+        mut cancel: watch::Receiver<bool>,
+        mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
+    ) -> Result<()> {
+        self.push_user_text(prompt);
 
         let mut final_text = String::new();
         let mut turn_steps = 0u64;
@@ -553,12 +567,35 @@ impl Session {
 
             self.emitter.tool_results(&results);
             self.tx.push_tool_results(results);
+            self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
             self.hooks.tick();
         }
 
         self.emitter
             .result(&final_text, &self.total_usage, self.turns, None);
         Ok(())
+    }
+
+    fn push_user_text(&mut self, prompt: &str) {
+        self.tx.push_user_text(prompt);
+        for n in self.hooks.on_user_turn(prompt) {
+            if n.delivery == Delivery::SystemTail {
+                self.tail_nudge = Some(n.message);
+            }
+        }
+    }
+
+    fn drain_mid_turn_user_inputs(&mut self, inputs: &Arc<StdMutex<VecDeque<String>>>) {
+        let Ok(mut inputs) = inputs.lock() else {
+            return;
+        };
+        while let Some(prompt) = inputs.pop_front() {
+            if prompt.trim() == "/compact" {
+                tracing::info!("deferring /compact received during active turn");
+                continue;
+            }
+            self.push_user_text(&prompt);
+        }
     }
 
     /// Window-0 diagnostics seam: drain the per-dispatch edit sink, run the
@@ -821,6 +858,8 @@ mod tests {
     enum MockTurn {
         /// Return text immediately (Done, no tool calls).
         Text(String),
+        /// Wait on the shared gate, then request a tool call.
+        ToolCallAfterGate,
         /// Await a gate that tests never release — to be cancelled by interrupt.
         Block,
     }
@@ -831,12 +870,14 @@ mod tests {
         started: Arc<AtomicUsize>,
         completed: Arc<AtomicUsize>,
         compact_calls: Arc<AtomicUsize>,
+        model_gate: Arc<Notify>,
+        tool_started: Arc<AtomicUsize>,
+        tool_gate: Arc<Notify>,
     }
 
     struct MockTransport {
         shared: MockShared,
         scripts: Arc<Mutex<VecDeque<MockTurn>>>,
-        gate: Arc<Notify>,
     }
 
     #[async_trait]
@@ -867,8 +908,22 @@ mod tests {
                 .unwrap_or(MockTurn::Text("ok".into()));
             match script {
                 MockTurn::Block => {
-                    self.gate.notified().await;
+                    self.shared.model_gate.notified().await;
                     unreachable!("gate is never released in tests");
+                }
+                MockTurn::ToolCallAfterGate => {
+                    self.shared.model_gate.notified().await;
+                    self.shared.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(transport::TurnOutput {
+                        text: String::new(),
+                        tool_calls: vec![transport::ToolCall {
+                            id: "tool-1".into(),
+                            name: "slow_tool".into(),
+                            args: json!({}),
+                        }],
+                        stop: StopReason::ToolCalls,
+                        usage: Usage::default(),
+                    })
                 }
                 MockTurn::Text(t) => {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
@@ -896,12 +951,36 @@ mod tests {
         }
     }
 
+    struct SlowTool {
+        shared: MockShared,
+    }
+
+    #[async_trait]
+    impl bro_tools::Tool for SlowTool {
+        fn name(&self) -> &str {
+            "slow_tool"
+        }
+
+        fn description(&self) -> &str {
+            "test-only slow tool"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+            self.shared.tool_started.fetch_add(1, Ordering::SeqCst);
+            self.shared.tool_gate.notified().await;
+            bro_tools::ToolResult::Text("slow done".into())
+        }
+    }
+
     fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
         let shared = MockShared::default();
         let mock = MockTransport {
             shared: shared.clone(),
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
-            gate: Arc::new(Notify::new()),
         };
         let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
         let clipboard = Arc::new(Mutex::new(bro_tools::Registers::default()));
@@ -922,7 +1001,9 @@ mod tests {
         let session = Session {
             tx: Box::new(mock),
             reg: Registry::new(
-                vec![],
+                vec![Arc::new(SlowTool {
+                    shared: shared.clone(),
+                })],
                 vec![],
                 &PinPolicy::from_env(),
                 &mcp::ToolFilter::default(),
@@ -1021,6 +1102,54 @@ mod tests {
             0,
             "the blocked turn was cancelled, never completed"
         );
+    }
+
+    #[tokio::test]
+    async fn stdin_steer_during_tool_turn_injects_before_next_model_call() {
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::ToolCallAfterGate,
+            MockTurn::Text("done".into()),
+        ]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::User("alpha".into())).unwrap();
+        let ctrl = Emitter::new("ctrl".into());
+        let run =
+            tokio::spawn(
+                async move { session_loop(&mut session, rx, &ctrl, VecDeque::new()).await },
+            );
+
+        loop {
+            if shared.started.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        shared.model_gate.notify_waiters();
+        loop {
+            if shared.tool_started.load(Ordering::SeqCst) >= 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tx.send(Input::User("beta".into())).unwrap();
+        tokio::task::yield_now().await;
+        shared.tool_gate.notify_waiters();
+        loop {
+            if shared.completed.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        drop(tx);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), run)
+            .await
+            .expect("session_loop must finish")
+            .expect("session task must not panic")
+            .unwrap();
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(users, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
