@@ -78,8 +78,8 @@ pub struct ClassifierConfig {
     /// Model override for the classifier session (cheap models recommended).
     #[serde(default)]
     pub model: Option<String>,
-    /// Effort/thinking knob — accepted for forward-compat; not yet plumbed
-    /// through fleet dispatch (which hardcodes effort).
+    /// Effort/thinking level for the classifier session, passed to the CLI's
+    /// `--effort` (e.g. "medium"). Threaded through fleet dispatch.
     #[serde(default)]
     pub effort: Option<String>,
     /// System framing + domain knowledge. Empty → [`DEFAULT_CLASSIFIER_PROMPT`].
@@ -206,6 +206,8 @@ pub struct DispatchSpec {
     pub prompt: String,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    /// Effort/thinking level passed to the provider CLI's `--effort`.
+    pub effort: Option<String>,
     /// Extra env overrides for the child (e.g. MCP injection wiring). The
     /// cockpit's TUI-local config (§5.2) feeds this; `None` for a bare launch.
     pub env_overrides: Option<HashMap<String, String>>,
@@ -221,6 +223,7 @@ impl DispatchSpec {
             prompt: prompt.into(),
             cwd: None,
             model: None,
+            effort: None,
             env_overrides: None,
             name: None,
         }
@@ -762,7 +765,7 @@ impl FleetOrchestrator {
 
         let opts = ExecOpts {
             model: spec.model.clone(),
-            effort: None,
+            effort: spec.effort.clone(),
             provider_defaults: None,
         };
         let mut args = spec.provider.build_exec_args(
@@ -801,7 +804,17 @@ impl FleetOrchestrator {
             .clone()
             .or_else(|| Some(prompt_head(&spec.prompt)));
         if bidi {
-            self.launch_interactive(task_id, spec.provider, args, session_id, spec.cwd, label, env_overrides)
+            let seed = bidi_seeds_turn1_via_stdin(spec.provider).then(|| spec.prompt.clone());
+            self.launch_interactive(
+                task_id,
+                spec.provider,
+                args,
+                session_id,
+                spec.cwd,
+                label,
+                env_overrides,
+                seed,
+            )
         } else {
             let task = spawn_task(
                 task_id,
@@ -844,6 +857,7 @@ impl FleetOrchestrator {
             None,
         );
         let env_overrides = merge_env(resolved_env, spec.env_overrides);
+        let seed = bidi_seeds_turn1_via_stdin(spec.provider).then(|| spec.prompt.clone());
         self.launch_interactive(
             task_id,
             spec.provider,
@@ -852,6 +866,7 @@ impl FleetOrchestrator {
             spec.cwd,
             spec.name,
             env_overrides,
+            seed,
         )
     }
 
@@ -883,6 +898,7 @@ impl FleetOrchestrator {
         cwd: Option<String>,
         name: Option<String>,
         env_overrides: Option<HashMap<String, String>>,
+        seed_prompt: Option<String>,
     ) -> AgentHandle {
         args.push("--input-format".into());
         args.push("stream-json".into());
@@ -901,10 +917,25 @@ impl FleetOrchestrator {
             None,
             None,
         );
-        AgentHandle {
+        let handle = AgentHandle {
             task: spawned.task,
             stdin: spawned.stdin.map(|s| Arc::new(AsyncMutex::new(s))),
+        };
+        // Seed turn-1 over stdin for providers that ignore `-p` in stream-json
+        // input mode (Claude). Fire-and-forget on the same runtime that spawned
+        // the child's stdout reader; the write queues in the pipe until the CLI
+        // reads it. Without this the Claude session launches and hangs (no turn).
+        if let Some(seed) = seed_prompt {
+            if handle.stdin.is_some() {
+                let h = handle.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = h.send_user_turn(&seed).await {
+                        tracing::warn!("fleet: failed to seed first turn over stdin: {e:#}");
+                    }
+                });
+            }
         }
+        handle
     }
 }
 
@@ -939,6 +970,18 @@ pub fn provider_supports_bidi(provider: Provider) -> bool {
         provider,
         Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex
     )
+}
+
+/// Whether fleet must write turn-1 to the session's stdin after launch.
+///
+/// The Claude CLI **ignores `-p`** in `--input-format stream-json` mode — it
+/// keeps the session alive and waits for the first user turn on stdin, so a
+/// `-p`-only launch just hangs (0 events → Idle). bro-harness is the opposite:
+/// its bidi `run_session` seeds turn-1 from `-p` directly
+/// (`crates/bro-harness/src/agent_loop.rs`), so writing turn-1 to its stdin too
+/// would double the first turn. Hence: seed via stdin for Claude only.
+fn bidi_seeds_turn1_via_stdin(provider: Provider) -> bool {
+    matches!(provider, Provider::Claude)
 }
 
 /// One NDJSON user-turn message for the harness/Claude input stream
@@ -1024,6 +1067,20 @@ mod tests {
         // must deserialize, not error — mcpServers defaults to empty.
         let cfg: FleetConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn only_claude_seeds_turn1_via_stdin() {
+        // Claude ignores `-p` in stream-json input mode → must seed turn-1 over
+        // stdin. bro-harness seeds turn-1 from `-p` → must NOT be stdin-seeded
+        // (would double the first turn).
+        assert!(bidi_seeds_turn1_via_stdin(Provider::Claude));
+        for p in [Provider::Glm, Provider::Deepseek, Provider::Brodex] {
+            assert!(
+                !bidi_seeds_turn1_via_stdin(p),
+                "{p} seeds turn-1 from -p; stdin-seeding would double it"
+            );
+        }
     }
 
     #[test]

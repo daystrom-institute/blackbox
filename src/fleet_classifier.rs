@@ -56,6 +56,7 @@ pub fn spawn_monitor(
     // sentinel name, co-located with the executor's cwd.
     let mut spec = DispatchSpec::new(cfg.provider_resolved(), cfg.resolved_prompt());
     spec.model = cfg.model.clone();
+    spec.effort = cfg.effort.clone();
     spec.cwd = executor.snapshot().cwd;
     spec.name = Some(format!("{CLASSIFIER_NAME_PREFIX}{executor_name}"));
     let classifier = orch.dispatch(spec);
