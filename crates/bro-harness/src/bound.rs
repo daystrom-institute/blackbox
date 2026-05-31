@@ -1,4 +1,4 @@
-//! Bounded tool results (design/orchestration/fleet-tui.md §2.3).
+//! Bounded tool results (design/fleet-tui/fleet-tui.md §2.3).
 //!
 //! Any tool result over a configured size is spilled to a harness-owned dump
 //! file and replaced inline with a head + a rider pointing at the file. This is:

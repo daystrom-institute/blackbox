@@ -1,7 +1,7 @@
 //! `bro-tools` — provider-agnostic tool implementations and the `Tool`
 //! abstraction used by the Anthropic harness (`bro-harness`).
 //!
-//! See `design/orchestration/anthropic-harness.md`. The split mirrors
+//! See `design/bro-harness/anthropic-harness.md`. The split mirrors
 //! daystrom-mk2's `Daystrom.Worker/Tools` (workspace tools) and pg_recon's
 //! `WebToolFunctions` (web tools), Rust-native: typed inputs derive
 //! `schemars::JsonSchema` instead of C# reflection-based schema generation.

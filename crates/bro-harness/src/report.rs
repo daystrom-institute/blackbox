@@ -1,5 +1,5 @@
 //! Builtin `report` tool — the agent's status/needs signal for the fleet
-//! cockpit (design/orchestration/fleet-tui.md §2.2).
+//! cockpit (design/fleet-tui/fleet-tui.md §2.2).
 //!
 //! When the agent calls `report`, the harness emits a `report` stream-json line
 //! that the cockpit reads to drive the **Waiting** bucket (when `needs_input`)

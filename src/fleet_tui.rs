@@ -2,7 +2,7 @@
 //!
 //! A human cockpit for dispatching and live-driving many concurrent top-level
 //! entrypoint agents across providers. Design:
-//! `design/orchestration/fleet-tui.md`.
+//! `design/fleet-tui/fleet-tui.md`.
 //!
 //! ## What this skeleton covers (net-new items 11-16)
 //! - The four-region layout (title · roster|detail · composer · help, §5).

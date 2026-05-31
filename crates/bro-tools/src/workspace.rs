@@ -92,7 +92,7 @@ struct FileReadInput {
     /// metadata (register, hashes, counts, preview_head) but not the content,
     /// so a follow-up clip_paste / file_write{from} moves the bytes without
     /// them ever entering your context. Ignores `line_numbers` (registers hold
-    /// raw text). See design/orchestration/bro-harness-tool-chaining.md.
+    /// raw text). See design/bro-harness/bro-harness-tool-chaining.md.
     #[serde(default)]
     into: Option<String>,
 }
@@ -223,7 +223,7 @@ struct FileWriteInput {
     content: Option<String>,
     /// Ref ABI (chaining): write the contents of this clipboard register
     /// instead of inlining `content`, so the bytes never pass through your
-    /// context. See design/orchestration/bro-harness-tool-chaining.md.
+    /// context. See design/bro-harness/bro-harness-tool-chaining.md.
     #[serde(default)]
     from: Option<String>,
 }
@@ -624,7 +624,7 @@ struct ContentSearchInput {
     /// register instead of being returned, so a large match set never costs
     /// context tokens. The response carries metadata + preview; consume it with
     /// clip_paste / file_write{from} / clip_peek. See
-    /// design/orchestration/bro-harness-tool-chaining.md.
+    /// design/bro-harness/bro-harness-tool-chaining.md.
     #[serde(default)]
     into: Option<String>,
 }

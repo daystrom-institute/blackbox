@@ -2,7 +2,7 @@
 //!
 //! The cockpit links the `blackbox` lib and spawns top-level entrypoint agents
 //! **in-process** — no HTTP to a running `blackboxd` (design
-//! `design/orchestration/fleet-tui.md` §3). This façade owns the three plain
+//! `design/fleet-tui/fleet-tui.md` §3). This façade owns the three plain
 //! values `spawn_task` needs — a `TaskStore`, a tail `broadcast::Sender`, and a
 //! `store_dir` — and hands the cockpit a single `dispatch` entry point plus a
 //! tail subscription. Ownership is clean: the cockpit owns exactly the tasks it

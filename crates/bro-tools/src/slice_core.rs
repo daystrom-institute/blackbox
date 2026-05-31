@@ -10,7 +10,7 @@
 //! (same serde `tag`/`rename_all`), so `clip_*` selectors read exactly like
 //! `bbox_slice_*` selectors to the model. The clean end-state is a shared leaf
 //! crate both depend on; that extraction is deferred until this is proven.
-//! See `design/orchestration/bro-harness-clipboard.md` §"Selector reuse".
+//! See `design/bro-harness/bro-harness-clipboard.md` §"Selector reuse".
 
 use anyhow::{Result, anyhow, bail};
 use schemars::JsonSchema;

@@ -28,7 +28,7 @@ struct WebFetchInput {
     /// clipboard register instead of being returned, so a large page never costs
     /// context tokens — `max_chars` is then ignored (the register cap bounds it).
     /// The response carries metadata + preview; consume it with clip_paste /
-    /// file_write{from} / clip_peek. See design/orchestration/bro-harness-tool-chaining.md.
+    /// file_write{from} / clip_peek. See design/bro-harness/bro-harness-tool-chaining.md.
     #[serde(default)]
     into: Option<String>,
 }

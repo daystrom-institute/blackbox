@@ -7,7 +7,7 @@
 //! of which transport produced the turn — that is the daemon contract.
 //!
 //! Three transports cover most providers in the wild (all verified live,
-//! 2026-05-29 — see design/orchestration/anthropic-harness.md):
+//! 2026-05-29 — see design/bro-harness/anthropic-harness.md):
 //!
 //! - `anthropic` — Anthropic Messages API (GLM, DeepSeek-anthropic, Claude)
 //! - `openai-responses` — modern OpenAI Responses API (Codex/ChatGPT backend)
@@ -120,7 +120,7 @@ pub struct ToolSpec {
 /// renders the split natively (Anthropic: two `system` blocks, cache_control on
 /// the first; OpenAI Chat: leading system message + trailing system message;
 /// Responses: `instructions` + trailing `developer` input item). See
-/// design/orchestration/bro-harness-hooks.md §1.
+/// design/bro-harness/bro-harness-hooks.md §1.
 #[derive(Debug, Default, Clone)]
 pub struct SystemPrompt {
     pub stable: Option<String>,

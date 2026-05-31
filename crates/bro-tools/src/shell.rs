@@ -8,7 +8,7 @@
 //! draining it (and may feed more stdin). This is the cooperative middle path
 //! between block-forever and a full background task registry — no wake
 //! machinery, synchronous from the agent loop's view. See
-//! design/orchestration/bro-harness-tool-surface.md.
+//! design/bro-harness/bro-harness-tool-surface.md.
 //!
 //! Sessions are in-memory and live only within a single harness `run()` (across
 //! the LLM turns of one dispatch, NOT across exec → resume): a live OS child
@@ -313,7 +313,7 @@ struct ShellRunInput {
     /// reports the register + byte count + sha; consume it with clip_paste /
     /// file_write{from} / clip_peek. Only honored when the command finishes
     /// within this call (not for yielded/background sessions). stderr is still
-    /// returned inline. See design/orchestration/bro-harness-tool-chaining.md.
+    /// returned inline. See design/bro-harness/bro-harness-tool-chaining.md.
     #[serde(default)]
     stdout_to: Option<String>,
     /// Ref ABI (chaining): feed this clipboard register's content as stdin

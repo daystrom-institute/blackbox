@@ -9,7 +9,7 @@
 //!   alive, reading successive user-turn messages and `control_request`s
 //!   (interrupt, set_model, …) from stdin as NDJSON, and `/compact` as an
 //!   in-stream slash command. This is the fleet-cockpit control plane
-//!   (design/orchestration/fleet-tui.md §2). Wire shapes follow the Claude Agent
+//!   (design/fleet-tui/fleet-tui.md §2). Wire shapes follow the Claude Agent
 //!   SDK control protocol (hyperclaude SDK_PROTOCOL.md / NDJSON_FORMAT.md).
 //!
 //! The transport handles all wire differences; the loop and the stdout envelope

@@ -12,7 +12,7 @@
 //! tool→tool chaining (Stage 2 — see `file_read{into}`, `file_write{from}`,
 //! `shell_run{stdout_to,stdin_from}`). A `Task` would be the *pending*-ref
 //! specialization (Stage 3, not built). See
-//! `design/orchestration/bro-harness-{clipboard,tool-chaining}.md`.
+//! `design/bro-harness/bro-harness-{clipboard,tool-chaining}.md`.
 //!
 //! The store rides the session `side` cell exactly like `todos`/`nudges`, so it
 //! survives `exec → resume`. Because the session file is fully rewritten every

@@ -2,7 +2,7 @@
 //! observe turn state and contribute *ambient meta* (nudges) steering the model
 //! toward the rich blackbox toolbox. Nudges never gate or remove tools.
 //!
-//! See design/orchestration/bro-harness-hooks.md: the scaffold + gating ledger
+//! See design/bro-harness/bro-harness-hooks.md: the scaffold + gating ledger
 //! + the two delivery mechanisms + the shipped rule set.
 //!
 //! Adoption is deliberately *not* tracked here. Whether a nudge was adopted (or
