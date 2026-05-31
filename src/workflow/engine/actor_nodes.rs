@@ -44,9 +44,10 @@ impl<'a> WorkflowRunner<'a> {
         let task = if matches!(actor.terminal_mode, TerminalMode::Tmux) {
             // Terminal mode: run the provider TUI in a tmux pane and resolve the
             // turn from the transcript. Returns an already-completed synthetic
-            // task. Durable resume is not yet supported here (fresh session per
-            // visit), so existing_session/existing_task_id are intentionally not
-            // threaded through.
+            // task. For a durable actor, `existing_session` resumes the same
+            // provider session across visits (claude --resume / codex resume),
+            // so a durable terminal-mode node keeps context instead of
+            // cold-starting.
             self.server
                 .workflow_dispatch_executor_tmux(
                     brofile,
@@ -54,6 +55,7 @@ impl<'a> WorkflowRunner<'a> {
                     self.project_dir.as_deref(),
                     &self.ctx.meta.arc_id,
                     actor_name,
+                    existing_session.as_deref(),
                 )
                 .await
                 .map_err(|e| anyhow!("tmux dispatch for node '{node_id}': {e}"))?

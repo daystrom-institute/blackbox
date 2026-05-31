@@ -47,6 +47,7 @@ impl BlackboxServer {
         project_dir: Option<&str>,
         arc_id: &str,
         actor_label: &str,
+        existing_session: Option<&str>,
     ) -> Result<Arc<orch::Task>, String> {
         use crate::orchestration::tmux::CliTmuxBackend;
         use crate::orchestration::tmux_dispatch::{
@@ -83,8 +84,14 @@ impl BlackboxServer {
 
         let id = format!("tmux-{}", uuid::Uuid::new_v4());
         let cwd_str = cfg.cwd.to_string_lossy().to_string();
-        let task = match run_terminal_turn(&backend, &registry, &cfg, &TerminalTurnTiming::default())
-            .await
+        let task = match run_terminal_turn(
+            &backend,
+            &registry,
+            &cfg,
+            &TerminalTurnTiming::default(),
+            existing_session,
+        )
+        .await
         {
             Ok(outcome) => {
                 // MVP has no durable resume or portal, so the turn is the
