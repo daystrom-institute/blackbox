@@ -30,6 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use tokio_util::sync::CancellationToken;
 
 use crate::orchestration::providers::{self, Provider};
 use crate::orchestration::tmux::{TmuxBackend, TmuxHandle, container_session_name};
@@ -182,6 +183,7 @@ pub async fn run_terminal_turn(
     cfg: &TerminalTurnConfig,
     timing: &TerminalTurnTiming,
     existing_session: Option<&str>,
+    cancel: &CancellationToken,
 ) -> Result<TerminalTurnOutcome> {
     if !cfg.provider.tui_capable() {
         bail!(
@@ -226,21 +228,26 @@ pub async fn run_terminal_turn(
         .map_err(|e| anyhow!("create tmux window: {e}"))?;
 
     // Everything after the pane exists is fallible; kill the window on any error
-    // so failures don't leak panes.
-    let result = drive_after_launch(
-        backend,
-        registry,
-        cfg,
-        timing,
-        &handle,
-        &submitted_text,
-        &nonce,
-        preminted.as_deref(),
-        existing_session,
-        &canon_cwd,
-        &pre_existing,
-    )
-    .await;
+    // (including arc cancellation) so failures don't leak panes. Racing the
+    // drive against the cancel token lets `bro_arc_cancel` interrupt a
+    // long-running turn promptly instead of waiting out the turn timeout.
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err(anyhow!("terminal turn cancelled (arc cancel)")),
+        r = drive_after_launch(
+            backend,
+            registry,
+            cfg,
+            timing,
+            &handle,
+            &submitted_text,
+            &nonce,
+            preminted.as_deref(),
+            existing_session,
+            &canon_cwd,
+            &pre_existing,
+        ) => r,
+    };
     match result {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
@@ -704,6 +711,90 @@ fn wall_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestration::tmux::{TmuxError, TmuxHandle, TmuxSession};
+    use std::sync::Mutex;
+
+    /// Backend that never reports the TUI ready (capture returns empty), so a
+    /// turn blocks in `prepare_tui` until cancelled — lets us assert that arc
+    /// cancellation interrupts the turn and kills the window.
+    #[derive(Default)]
+    struct StuckBackend {
+        killed: Mutex<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl TmuxBackend for StuckBackend {
+        async fn tmux_available(&self) -> bool {
+            true
+        }
+        async fn ensure_session(&self, name: &str) -> Result<TmuxSession, TmuxError> {
+            Ok(TmuxSession {
+                name: name.to_string(),
+                existed: false,
+            })
+        }
+        async fn create_window(
+            &self,
+            session: &str,
+            _name: &str,
+            _cwd: Option<&str>,
+            _command: &[String],
+        ) -> Result<TmuxHandle, TmuxError> {
+            Ok(TmuxHandle {
+                session: session.to_string(),
+                window_id: "@1".into(),
+                pane_id: "%1".into(),
+            })
+        }
+        async fn send_text(&self, _pane: &str, _text: &str) -> Result<(), TmuxError> {
+            Ok(())
+        }
+        async fn send_enter(&self, _pane: &str) -> Result<(), TmuxError> {
+            Ok(())
+        }
+        async fn capture_pane(&self, _pane: &str, _lines: usize) -> Result<String, TmuxError> {
+            Ok(String::new()) // never ready
+        }
+        async fn kill_window(&self, _handle: &TmuxHandle) -> Result<(), TmuxError> {
+            *self.killed.lock().unwrap() = true;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn arc_cancel_interrupts_turn_and_kills_window() {
+        let backend = StuckBackend::default();
+        // Real registry so the adapter lookup succeeds and the turn reaches the
+        // prepare_tui spin loop (where cancel fires); no transcript is read.
+        let registry = TranscriptAdapterRegistry::from_runtime_config();
+        let cancel = CancellationToken::new();
+        let cfg = TerminalTurnConfig {
+            provider: Provider::Claude,
+            arc_id: "cancel-test".into(),
+            actor_label: "x".into(),
+            prompt: "hi".into(),
+            cwd: PathBuf::from("/tmp"),
+            model: Some("claude-opus-4-8".into()),
+            effort: None,
+        };
+        let timing = TerminalTurnTiming {
+            tui_ready_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(20),
+            ..Default::default()
+        };
+        let c2 = cancel.clone();
+        let canceller = async {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            c2.cancel();
+        };
+        let (res, _) = tokio::join!(
+            run_terminal_turn(&backend, &registry, &cfg, &timing, None, &cancel),
+            canceller
+        );
+        let err = res.expect_err("cancel should abort the turn");
+        assert!(err.to_string().contains("cancel"), "{err}");
+        assert!(*backend.killed.lock().unwrap(), "window must be killed on cancel");
+    }
 
     fn cfg(provider: Provider) -> TerminalTurnConfig {
         TerminalTurnConfig {
@@ -835,7 +926,7 @@ mod tests {
             turn_timeout: Duration::from_secs(180),
             poll_interval: Duration::from_secs(1),
         };
-        let outcome = run_terminal_turn(&backend, &registry, &cfg, &timing, None)
+        let outcome = run_terminal_turn(&backend, &registry, &cfg, &timing, None, &CancellationToken::new())
             .await
             .expect("terminal turn");
         eprintln!("session={} text={:?}", outcome.session_id, outcome.assistant_text);
@@ -871,7 +962,7 @@ mod tests {
             turn_timeout: Duration::from_secs(180),
             poll_interval: Duration::from_secs(1),
         };
-        let outcome = run_terminal_turn(&backend, &registry, &cfg, &timing, None)
+        let outcome = run_terminal_turn(&backend, &registry, &cfg, &timing, None, &CancellationToken::new())
             .await
             .expect("terminal turn");
         eprintln!("session={} text={:?}", outcome.session_id, outcome.assistant_text);
@@ -915,7 +1006,7 @@ mod tests {
         let mut t1 = base.clone();
         t1.prompt =
             "Remember this secret word for later: ZUCCHINI. Just reply OK.".into();
-        let out1 = run_terminal_turn(&backend, &registry, &t1, &timing, None)
+        let out1 = run_terminal_turn(&backend, &registry, &t1, &timing, None, &CancellationToken::new())
             .await
             .expect("turn 1");
         let session = out1.session_id.clone();
@@ -925,7 +1016,7 @@ mod tests {
         let mut t2 = base.clone();
         t2.prompt =
             "What was the secret word I asked you to remember? Reply with only that word.".into();
-        let out2 = run_terminal_turn(&backend, &registry, &t2, &timing, Some(&session))
+        let out2 = run_terminal_turn(&backend, &registry, &t2, &timing, Some(&session), &CancellationToken::new())
             .await
             .expect("turn 2 (resume)");
         eprintln!("turn2 session={} text={:?}", out2.session_id, out2.assistant_text);
@@ -965,7 +1056,7 @@ mod tests {
         };
         let mut t1 = base.clone();
         t1.prompt = "Remember this secret word for later: ZUCCHINI. Just reply OK.".into();
-        let out1 = run_terminal_turn(&backend, &registry, &t1, &timing, None)
+        let out1 = run_terminal_turn(&backend, &registry, &t1, &timing, None, &CancellationToken::new())
             .await
             .expect("turn 1");
         let session = out1.session_id.clone();
@@ -974,7 +1065,7 @@ mod tests {
         let mut t2 = base.clone();
         t2.prompt =
             "What was the secret word I asked you to remember? Reply with only that word.".into();
-        let out2 = run_terminal_turn(&backend, &registry, &t2, &timing, Some(&session))
+        let out2 = run_terminal_turn(&backend, &registry, &t2, &timing, Some(&session), &CancellationToken::new())
             .await
             .expect("turn 2 (resume)");
         eprintln!("turn2 session={} text={:?}", out2.session_id, out2.assistant_text);

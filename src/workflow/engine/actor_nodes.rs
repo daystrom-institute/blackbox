@@ -56,6 +56,7 @@ impl<'a> WorkflowRunner<'a> {
                     &self.ctx.meta.arc_id,
                     actor_name,
                     existing_session.as_deref(),
+                    &self.cancel_token,
                 )
                 .await
                 .map_err(|e| anyhow!("tmux dispatch for node '{node_id}': {e}"))?

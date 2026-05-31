@@ -48,6 +48,7 @@ impl BlackboxServer {
         arc_id: &str,
         actor_label: &str,
         existing_session: Option<&str>,
+        cancel: &CancellationToken,
     ) -> Result<Arc<orch::Task>, String> {
         use crate::orchestration::tmux::CliTmuxBackend;
         use crate::orchestration::tmux_dispatch::{
@@ -90,15 +91,16 @@ impl BlackboxServer {
             &cfg,
             &TerminalTurnTiming::default(),
             existing_session,
+            cancel,
         )
         .await
         {
             Ok(outcome) => {
-                // MVP has no durable resume or portal, so the turn is the
-                // window's whole life: kill it on success so the provider TUI
-                // process does not linger. (Error paths already kill inside
-                // run_terminal_turn.) The empty container session is reaped by
-                // startup reconciliation — a documented follow-up.
+                // No portal yet, so a non-durable turn's window is dead weight
+                // after completion; kill it so the provider TUI process does not
+                // linger. (run_terminal_turn already kills on the error path.)
+                // The empty container session is reaped by startup
+                // reconciliation — a documented follow-up.
                 use crate::orchestration::tmux::TmuxBackend;
                 let _ = backend.kill_window(&outcome.handle).await;
                 orch::synthetic_terminal_task(
@@ -111,6 +113,11 @@ impl BlackboxServer {
                     Some(cwd_str),
                     Some(outcome.location),
                 )
+            }
+            // Cancellation is not a task failure — propagate it so the runner
+            // tears the arc down rather than recording a failed node.
+            Err(_) if cancel.is_cancelled() => {
+                return Err("terminal-mode turn cancelled by arc cancel".to_string());
             }
             Err(e) => orch::synthetic_terminal_task(
                 id.clone(),
