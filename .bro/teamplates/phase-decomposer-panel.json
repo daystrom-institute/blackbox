@@ -16,5 +16,6 @@
       "alias": "risk",
       "count": 1
     }
-  ]
+  ],
+  "diversity_floor": 3
 }
