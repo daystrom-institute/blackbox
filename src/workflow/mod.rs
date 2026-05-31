@@ -24,7 +24,7 @@ pub use engine::{
 pub use schema::load_workflow;
 pub use schema::{
     ActorFailureMode, ActorKind, ActorSpec, AtomBinding, AtomBindingLimits, ForeachSpec, GateMode,
-    ItemFailurePolicy, MatrixSpec, NodeMode, NodeSpec, NodeTransition, Workflow,
+    ItemFailurePolicy, MatrixSpec, NodeMode, NodeSpec, NodeTransition, TerminalMode, Workflow,
 };
 
 use anyhow::{Result, anyhow, bail};

@@ -1,0 +1,20 @@
+{
+  "name": "e2e-terminal-mode-tmux",
+  "version": 1,
+  "actors": {
+    "implementer": {
+      "kind": "executor",
+      "brofile": "codex-executor",
+      "durable": true,
+      "terminal_mode": "tmux"
+    }
+  },
+  "start": "Implement",
+  "nodes": {
+    "Implement": {
+      "actor": "implementer",
+      "prompt": "Say one short sentence confirming you are running. No preamble.",
+      "next": { "type": "terminal" }
+    }
+  }
+}

@@ -55,6 +55,25 @@ pub struct Workflow {
     pub on_arc_cancel: Vec<HookOp>,
 }
 
+/// How a dispatched actor's provider process is hosted.
+///
+/// `Native` is the existing headless dispatch: the provider CLI runs as a
+/// child process whose stdout stream-json is the dispatch channel.
+///
+/// `Tmux` runs the provider's interactive TUI inside a tmux pane instead, and
+/// the node completes from the transcript read plane rather than from piped
+/// stdout. Only valid for `Provider::tui_capable()` providers — harness-backed
+/// providers (Brodex/GLM/DeepSeek) have no interactive TUI and are rejected by
+/// workflow capability validation. See
+/// `design/orchestration/workflows/tmux-terminal-mode-slice.md`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    #[default]
+    Native,
+    Tmux,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActorSpec {
     pub kind: ActorKind,
@@ -84,6 +103,13 @@ pub struct ActorSpec {
     /// Optional runtime allocation defaults for executor dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeRequest>,
+    /// How this actor's provider process is hosted. Defaults to `Native`
+    /// (headless child). `Tmux` runs the provider's interactive TUI in a
+    /// tmux pane and completes the node from the transcript read plane; it
+    /// is only valid for TUI-capable providers (validated in
+    /// `validate_workflow_capabilities`).
+    #[serde(default)]
+    pub terminal_mode: TerminalMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -492,4 +518,57 @@ pub enum BranchSelector {
 #[allow(dead_code)] // test-only entry point; tests use this through the workflow::load_workflow reexport
 pub fn load_workflow(src: &str) -> Result<Workflow> {
     serde_json::from_str(src).context("workflow JSON parse failed")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn actor_json(extra: &str) -> ActorSpec {
+        serde_json::from_str(&format!(r#"{{"kind":"executor"{extra}}}"#)).unwrap()
+    }
+
+    #[test]
+    fn terminal_mode_defaults_to_native_when_absent() {
+        assert_eq!(actor_json("").terminal_mode, TerminalMode::Native);
+    }
+
+    #[test]
+    fn terminal_mode_parses_native_and_tmux() {
+        assert_eq!(
+            actor_json(r#","terminal_mode":"native""#).terminal_mode,
+            TerminalMode::Native
+        );
+        assert_eq!(
+            actor_json(r#","terminal_mode":"tmux""#).terminal_mode,
+            TerminalMode::Tmux
+        );
+    }
+
+    #[test]
+    fn terminal_mode_rejects_unknown_value() {
+        let err = serde_json::from_str::<ActorSpec>(
+            r#"{"kind":"executor","terminal_mode":"screen"}"#,
+        );
+        assert!(err.is_err(), "unknown terminal_mode should fail to parse");
+    }
+
+    #[test]
+    fn terminal_mode_round_trips_through_json() {
+        let actor = actor_json(r#","terminal_mode":"tmux""#);
+        let json = serde_json::to_string(&actor).unwrap();
+        let back: ActorSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.terminal_mode, TerminalMode::Tmux);
+    }
+
+    #[test]
+    fn example_terminal_mode_tmux_workflow_parses() {
+        let json = include_str!("../../examples/workflows/e2e-terminal-mode-tmux.json");
+        let spec = load_workflow(json).expect("parse e2e-terminal-mode-tmux");
+        let actor = spec
+            .actors
+            .get("implementer")
+            .expect("implementer actor present");
+        assert_eq!(actor.terminal_mode, TerminalMode::Tmux);
+    }
 }

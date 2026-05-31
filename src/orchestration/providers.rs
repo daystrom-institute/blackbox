@@ -145,6 +145,25 @@ impl Provider {
         v.iter().copied().collect()
     }
 
+    /// True iff this provider dispatches through an interactive TUI process
+    /// that can be steered with typed input and persists a transcript store.
+    ///
+    /// Terminal mode (`ActorSpec.terminal_mode = Tmux`) is only valid for
+    /// TUI-capable providers: the daemon launches the provider's real TUI in a
+    /// tmux pane and completes the workflow node from the transcript read
+    /// plane. This is a dispatch-surface fact, deliberately separate from
+    /// `capabilities()` (which describes model capabilities).
+    ///
+    /// Harness-backed providers (Brodex/GLM/DeepSeek via bro-harness) emit the
+    /// Claude stream-json envelope with no interactive surface to type into, so
+    /// they are excluded — structurally, not by policy. Codex (the `codex` CLI)
+    /// and Brodex (bro-harness, Responses transport) are distinct variants for
+    /// exactly this reason. OpenCode/Copilot/Vibe/Gemini are not promoted until
+    /// each has a manual TUI smoke record (see the slice design doc).
+    pub fn tui_capable(&self) -> bool {
+        matches!(self, Provider::Claude | Provider::Codex)
+    }
+
     pub fn as_str(&self) -> &'static str {
         match self {
             Provider::Claude => "claude",

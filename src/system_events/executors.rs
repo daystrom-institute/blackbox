@@ -746,7 +746,7 @@ mod tests {
 
     fn install_minimal_workflow(state: &Arc<SharedState>, name: &str) {
         use crate::workflow::schema::{
-            ActorKind, ActorSpec, NodeMode, NodeSpec, NodeTransition, Workflow,
+            ActorKind, ActorSpec, NodeMode, NodeSpec, NodeTransition, TerminalMode, Workflow,
         };
         let wf = Workflow {
             name: name.to_string(),
@@ -763,6 +763,7 @@ mod tests {
                         compaction_anchor: false,
                         requires: Vec::new(),
                         runtime: None,
+                        terminal_mode: TerminalMode::Native,
                     },
                 );
                 m

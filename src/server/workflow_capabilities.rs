@@ -13,6 +13,26 @@ pub(crate) fn validate_workflow_capabilities(
     state: &Arc<SharedState>,
 ) -> Result<(), String> {
     for (actor_name, actor) in &compiled.spec.actors {
+        // Terminal-mode eligibility is independent of `requires`: an actor may
+        // set `terminal_mode=tmux` with an empty `requires`, so this check runs
+        // before the `requires` short-circuit below. Fail closed — every
+        // provider the actor can resolve to must be TUI-capable, since for a
+        // runtime pool we cannot predict which candidate the allocator picks.
+        if actor.terminal_mode == workflow::TerminalMode::Tmux {
+            let providers = resolve_actor_providers(actor, state)?;
+            if providers.is_empty() {
+                return Err(format!(
+                    "actor '{actor_name}' sets terminal_mode=tmux but resolves to no providers"
+                ));
+            }
+            if let Some(provider) = providers.iter().find(|p| !p.tui_capable()) {
+                return Err(format!(
+                    "actor '{actor_name}' sets terminal_mode=tmux but provider '{provider}' is not \
+                     TUI-capable; terminal mode requires an interactive TUI, so harness-backed \
+                     providers (brodex/glm/deepseek) are not eligible"
+                ));
+            }
+        }
         if actor.requires.is_empty() {
             continue;
         }
@@ -299,6 +319,7 @@ mod tests {
                         }),
                         ..Default::default()
                     }),
+                    terminal_mode: workflow::TerminalMode::Native,
                 },
             )]),
             atom_bindings: HashMap::new(),
@@ -343,5 +364,134 @@ mod tests {
             err.contains("no runtime candidate provider satisfies"),
             "{err}"
         );
+    }
+
+    /// Build a single-actor workflow whose actor uses a runtime provider pool
+    /// and the given `terminal_mode` / `requires`. Lets terminal-mode tests run
+    /// without a brofile on disk.
+    fn terminal_mode_actor_workflow(
+        providers: Vec<orchestration::providers::Provider>,
+        terminal_mode: workflow::TerminalMode,
+        requires: Vec<orchestration::providers::Capability>,
+    ) -> workflow::CompiledWorkflow {
+        workflow::compile(workflow::Workflow {
+            name: "terminal-mode".into(),
+            version: 1,
+            actors: HashMap::from([(
+                "worker".into(),
+                workflow::ActorSpec {
+                    kind: workflow::ActorKind::Executor,
+                    brofile: None,
+                    team: None,
+                    durable: false,
+                    compaction_anchor: false,
+                    requires,
+                    runtime: Some(orchestration::allocator::RuntimeRequest {
+                        pool: Some(orchestration::allocator::PoolRef {
+                            name: None,
+                            providers,
+                        }),
+                        ..Default::default()
+                    }),
+                    terminal_mode,
+                },
+            )]),
+            atom_bindings: HashMap::new(),
+            nodes: HashMap::from([(
+                "run".into(),
+                workflow::NodeSpec {
+                    actor: "worker".into(),
+                    prompt: Some("work".into()),
+                    next: workflow::NodeTransition::Terminal,
+                    ..Default::default()
+                },
+            )]),
+            start: "run".into(),
+            policy_packet: None,
+            vars_schema: None,
+            on_arc_exit: Vec::new(),
+            on_arc_cancel: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn terminal_mode_tmux_accepts_tui_capable_provider_with_empty_requires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        // Empty requires: the terminal-mode check must still run.
+        let compiled = terminal_mode_actor_workflow(
+            vec![orchestration::providers::Provider::Codex],
+            workflow::TerminalMode::Tmux,
+            Vec::new(),
+        );
+
+        validate_workflow_capabilities(&compiled, &state).unwrap();
+    }
+
+    #[test]
+    fn terminal_mode_tmux_accepts_claude_and_codex_with_requires() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        let compiled = terminal_mode_actor_workflow(
+            vec![
+                orchestration::providers::Provider::Claude,
+                orchestration::providers::Provider::Codex,
+            ],
+            workflow::TerminalMode::Tmux,
+            vec![orchestration::providers::Capability::StructuredOutput],
+        );
+
+        validate_workflow_capabilities(&compiled, &state).unwrap();
+    }
+
+    #[test]
+    fn terminal_mode_tmux_rejects_harness_backed_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        // Brodex is harness-backed: no interactive TUI, must be rejected even
+        // with empty requires.
+        let compiled = terminal_mode_actor_workflow(
+            vec![orchestration::providers::Provider::Brodex],
+            workflow::TerminalMode::Tmux,
+            Vec::new(),
+        );
+
+        let err = validate_workflow_capabilities(&compiled, &state).unwrap_err();
+        assert!(err.contains("not TUI-capable"), "{err}");
+        assert!(err.contains("terminal_mode=tmux"), "{err}");
+    }
+
+    #[test]
+    fn terminal_mode_tmux_rejects_pool_with_any_non_tui_provider() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        // Fail closed: even one non-TUI candidate in the pool rejects, since we
+        // cannot predict which candidate the allocator picks.
+        let compiled = terminal_mode_actor_workflow(
+            vec![
+                orchestration::providers::Provider::Codex,
+                orchestration::providers::Provider::Glm,
+            ],
+            workflow::TerminalMode::Tmux,
+            Vec::new(),
+        );
+
+        let err = validate_workflow_capabilities(&compiled, &state).unwrap_err();
+        assert!(err.contains("TUI-capable"), "{err}");
+    }
+
+    #[test]
+    fn terminal_mode_native_does_not_trigger_tui_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
+        // Native mode on a harness-backed provider is fine.
+        let compiled = terminal_mode_actor_workflow(
+            vec![orchestration::providers::Provider::Brodex],
+            workflow::TerminalMode::Native,
+            Vec::new(),
+        );
+
+        validate_workflow_capabilities(&compiled, &state).unwrap();
     }
 }
