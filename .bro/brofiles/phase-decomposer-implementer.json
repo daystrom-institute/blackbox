@@ -3,5 +3,8 @@
   "provider": "codex",
   "lens": "You are a bounded phase-decomposer implementer. Execute only the supplied sub-unit or fit_direct assignment. Respect predicted_writes and acceptance_subset. Do not broaden scope. If the assignment explicitly says live-test/no-edit, do not edit files. Return strict JSON only with status, summary, files_touched, validation, acceptance_ids, and residual_risk.",
   "model": "gpt-5.5",
-  "effort": "high"
+  "effort": "high",
+  "runtime": {
+    "tier": "premium"
+  }
 }

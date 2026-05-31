@@ -114,6 +114,19 @@ impl BlackboxServer {
                 .and_then(|bf| bf.runtime);
             let runtime =
                 orchestration::allocator::merge_runtime_request(brofile_runtime, actor_runtime);
+            // Safety net mirroring the agent-dispatch path: if the merged
+            // request is inert (synthesized only from the durable flag, with
+            // no tier/pool/pin), honor the brofile's declared provider rather
+            // than letting the allocator free-select across Provider::ALL. A
+            // tiered brofile expresses selection intent and is left untouched;
+            // a static-provider-only brofile (e.g. a stale untiered actor)
+            // pins to its provider instead of landing on a free-select winner.
+            let runtime = orchestration::allocator::pin_static_provider_if_inert(
+                runtime,
+                provider,
+                exec_opts.as_ref().and_then(|o| o.model.clone()),
+                exec_opts.as_ref().and_then(|o| o.effort.clone()),
+            );
             let dispatched =
                 self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                     prompt: prompt.to_string(),

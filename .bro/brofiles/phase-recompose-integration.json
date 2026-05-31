@@ -11,5 +11,8 @@
       "Bash",
       "NotebookEdit"
     ]
+  },
+  "runtime": {
+    "tier": "premium"
   }
 }

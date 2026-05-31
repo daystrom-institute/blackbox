@@ -13,5 +13,8 @@
       "bbox_note",
       "mcp__blackbox__bbox_note"
     ]
+  },
+  "runtime": {
+    "tier": "premium"
   }
 }
