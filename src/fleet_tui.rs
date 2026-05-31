@@ -2214,7 +2214,10 @@ fn render_transcript(
                 if is_internal_tool(name) {
                     continue;
                 }
-                if let Some(line) = compact_tool_call_line(name, args, width) {
+                if let Some(edit_lines) = render_file_edit_call(name, args, width) {
+                    compact_tool_call = true;
+                    lines.extend(edit_lines);
+                } else if let Some(line) = compact_tool_call_line(name, args, width) {
                     compact_tool_call = true;
                     lines.push(Line::from(Span::styled(line, tool_call_style())));
                 } else {
@@ -2468,6 +2471,76 @@ fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Li
     out
 }
 
+fn render_file_edit_call(name: &str, args: &str, width: usize) -> Option<Vec<Line<'static>>> {
+    if name != "file_edit" {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(args).ok()?;
+    let obj = value.as_object()?;
+    let path = obj
+        .get("file_path")
+        .or_else(|| obj.get("path"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let old = obj.get("old_string").and_then(|v| v.as_str())?;
+    let new = obj.get("new_string").and_then(|v| v.as_str())?;
+    let replace_all = obj
+        .get("replace_all")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let suffix = if replace_all {
+        ", replace_all=true"
+    } else {
+        ""
+    };
+    let content_width = width.saturating_sub(2).max(12);
+    let mut out = vec![Line::from(Span::styled(
+        format!(
+            "{TOOL_CALL_GLYPH} file_edit({}{suffix})",
+            truncate(path, content_width)
+        ),
+        tool_call_style(),
+    ))];
+    out.push(Line::from(Span::styled(
+        "--- old_string",
+        Style::default().fg(Color::DarkGray),
+    )));
+    out.extend(diff_side_lines(old, '-', Color::Red, content_width));
+    out.push(Line::from(Span::styled(
+        "+++ new_string",
+        Style::default().fg(Color::DarkGray),
+    )));
+    out.extend(diff_side_lines(new, '+', Color::Green, content_width));
+    Some(out)
+}
+
+fn diff_side_lines(text: &str, marker: char, color: Color, width: usize) -> Vec<Line<'static>> {
+    const MAX_DIFF_SIDE_LINES: usize = 12;
+    let mut out = Vec::new();
+    let mut lines = text.lines().peekable();
+    if lines.peek().is_none() {
+        out.push(Line::from(Span::styled(
+            format!("{marker}"),
+            Style::default().fg(color),
+        )));
+        return out;
+    }
+    let line_width = width.saturating_sub(2).max(1);
+    for line in lines.by_ref().take(MAX_DIFF_SIDE_LINES) {
+        out.push(Line::from(Span::styled(
+            format!("{marker} {}", truncate(line, line_width)),
+            Style::default().fg(color),
+        )));
+    }
+    if lines.next().is_some() {
+        out.push(Line::from(Span::styled(
+            format!("{marker} …"),
+            Style::default().fg(color),
+        )));
+    }
+    out
+}
+
 fn compact_tool_call_line(name: &str, args: &str, width: usize) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(args).ok()?;
     let rendered = compact_tool_args(name, &value)?;
@@ -2477,6 +2550,9 @@ fn compact_tool_call_line(name: &str, args: &str, width: usize) -> Option<String
 }
 
 fn compact_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
+    if tool == "shell_run" {
+        return compact_shell_run_args(value);
+    }
     match value {
         serde_json::Value::Object(map) => {
             if map.is_empty() {
@@ -2504,6 +2580,24 @@ fn compact_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
         }
         serde_json::Value::Null => Some(String::new()),
         _ => compact_json_value(value),
+    }
+}
+
+fn compact_shell_run_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let cmd = obj
+        .get("cmd")
+        .or_else(|| obj.get("command"))
+        .and_then(|v| v.as_str())?;
+    let cmd = quote_flat_string(cmd);
+    let cwd = obj
+        .get("cwd")
+        .or_else(|| obj.get("workdir"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty());
+    match cwd {
+        Some(cwd) => Some(format!("cwd: {}, cmd: {cmd}", compact_string_arg(cwd))),
+        None => Some(format!("cmd: {cmd}")),
     }
 }
 
@@ -2577,6 +2671,11 @@ fn compact_string_arg(s: &str) -> String {
     } else {
         flat
     }
+}
+
+fn quote_flat_string(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    serde_json::to_string(&flat).unwrap_or_else(|_| format!("{flat:?}"))
 }
 
 #[cfg(test)]
@@ -3067,7 +3166,27 @@ mod tests {
     fn compact_tool_call_line_quotes_shell_commands() {
         let line =
             compact_tool_call_line("shell_run", r#"{"cmd":"cargo test --lib"}"#, 100).unwrap();
-        assert_eq!(line, r#"▸ shell_run("cargo test --lib")"#);
+        assert_eq!(line, r#"▸ shell_run(cmd: "cargo test --lib")"#);
+    }
+
+    #[test]
+    fn compact_tool_call_line_shell_run_shows_cwd_when_present() {
+        let line = compact_tool_call_line(
+            "shell_run",
+            r#"{"cmd":"cargo test","cwd":"crates/bro-tools"}"#,
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            r#"▸ shell_run(cwd: crates/bro-tools, cmd: "cargo test")"#
+        );
+    }
+
+    #[test]
+    fn compact_tool_call_line_shell_run_hides_null_cwd() {
+        let line = compact_tool_call_line("shell_run", r#"{"cmd":"pwd","cwd":null}"#, 100).unwrap();
+        assert_eq!(line, r#"▸ shell_run(cmd: "pwd")"#);
     }
 
     #[test]
@@ -3105,7 +3224,36 @@ mod tests {
             .collect();
         assert_eq!(rendered.len(), 2, "{rendered:?}");
         assert_eq!(rendered[0], "▸ smart_read(src/a.rs)");
-        assert_eq!(rendered[1], r#"▸ shell_run("cargo test")"#);
+        assert_eq!(rendered[1], r#"▸ shell_run(cmd: "cargo test")"#);
+    }
+
+    #[test]
+    fn file_edit_tool_call_renders_diff_block() {
+        let items = vec![TranscriptItem::ToolCall {
+            name: "file_edit".into(),
+            args: serde_json::json!({
+                "file_path": "src/a.rs",
+                "old_string": "let x = 1;\nlet y = 2;",
+                "new_string": "let x = 9;\nlet y = 2;",
+            })
+            .to_string(),
+        }];
+        let rendered: Vec<String> = render_transcript(&items, "", &[], 100)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "▸ file_edit(src/a.rs)",
+                "--- old_string",
+                "- let x = 1;",
+                "- let y = 2;",
+                "+++ new_string",
+                "+ let x = 9;",
+                "+ let y = 2;",
+            ]
+        );
     }
 
     #[test]
