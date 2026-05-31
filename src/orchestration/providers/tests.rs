@@ -1277,6 +1277,48 @@ fn resolve_bin_returns_none_for_unknown_binary() {
 }
 
 #[test]
+fn dispatch_path_env_includes_user_local_and_cargo_bins() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = crate::util::TestEnvGuard::new();
+    env.set("HOME", tmp.path());
+    env.remove("BRO_EXTRA_PATH");
+    env.set("PATH", "/usr/bin");
+
+    let path = dispatch_path_env();
+    let entries: Vec<_> = std::env::split_paths(&path).collect();
+
+    assert!(entries.contains(&tmp.path().join(".local").join("bin")));
+    assert!(entries.contains(&tmp.path().join(".cargo").join("bin")));
+    assert!(entries.contains(&std::path::PathBuf::from("/usr/bin")));
+}
+
+#[test]
+fn resolve_bin_finds_executable_in_user_cargo_bin() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut env = crate::util::TestEnvGuard::new();
+    env.set("HOME", tmp.path());
+    env.remove("BRO_EXTRA_PATH");
+    env.set("PATH", "/usr/bin:/bin");
+
+    let cargo_bin = tmp.path().join(".cargo").join("bin");
+    std::fs::create_dir_all(&cargo_bin).unwrap();
+    let exe = cargo_bin.join("fake-rtk");
+    std::fs::write(&exe, "#!/bin/sh\nexit 0\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&exe).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&exe, perms).unwrap();
+    }
+
+    assert_eq!(
+        resolve_bin("fake-rtk").as_deref(),
+        Some(exe.to_str().unwrap())
+    );
+}
+
+#[test]
 fn resolve_bin_finds_sh_in_standard_path() {
     // `sh` is guaranteed to exist on any Unix system the daemon runs on.
     let path = resolve_bin("sh").expect("sh should resolve");

@@ -1,6 +1,8 @@
 use crate::config::ProviderConfig;
 use crate::orchestration::brofile::{BrofileContext, ProviderDefaultsMode};
 
+use std::path::PathBuf;
+
 use super::Provider;
 use super::mcp_args::{claude_mcp_config_json, transient_blackbox_name, transient_blackbox_url};
 
@@ -57,6 +59,33 @@ impl Provider {
     }
 }
 
+/// Extra path entries prepended for spawned provider processes and their child
+/// tools. Agents often follow rendered instructions to run operator-local
+/// helpers like `rtk`; those live outside launchd/systemd's narrow PATH on
+/// many hosts. Keep the fallback list small and user-local.
+pub fn dispatch_extra_path_entries() -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    if let Ok(raw) = std::env::var("BRO_EXTRA_PATH") {
+        entries.extend(std::env::split_paths(&raw).filter(|path| !path.as_os_str().is_empty()));
+    }
+    if let Some(home) = dirs::home_dir() {
+        entries.push(home.join(".local").join("bin"));
+        entries.push(home.join(".cargo").join("bin"));
+    }
+    entries
+}
+
+pub fn dispatch_path_env() -> String {
+    let mut entries = dispatch_extra_path_entries();
+    if let Some(path) = std::env::var_os("PATH") {
+        entries.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(entries)
+        .unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Resolve a provider binary name to an absolute path using a login shell.
 ///
 /// The daemon is typically launched from `launchctl` / `systemd` with a
@@ -78,18 +107,7 @@ pub fn resolve_bin(bin: &str) -> Option<String> {
     if bin.contains('/') {
         return Some(bin.to_string());
     }
-    let extra_path = std::env::var("BRO_EXTRA_PATH").unwrap_or_else(|_| {
-        dirs::home_dir()
-            .unwrap_or_default()
-            .join(".local/bin")
-            .to_string_lossy()
-            .to_string()
-    });
-    let augmented_path = format!(
-        "{}:{}",
-        extra_path,
-        std::env::var("PATH").unwrap_or_default()
-    );
+    let augmented_path = dispatch_path_env();
     let output = std::process::Command::new("bash")
         .args(["-lc", &format!("command -v '{bin}'")])
         .env("PATH", &augmented_path)

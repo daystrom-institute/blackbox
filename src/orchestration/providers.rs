@@ -15,7 +15,7 @@ use exec_args::{
     CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE, CODEX_DISABLE_PROJECT_DOCS_OVERRIDE,
     CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE, CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE,
 };
-pub use exec_args::{ExecOpts, exec_opts_with_provider_defaults, resolve_bin};
+pub use exec_args::{ExecOpts, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin};
 #[cfg(test)]
 use mcp_args::{MatchState, copilot_format_mcp_tool, format_toml_string_array};
 pub use mcp_args::{transient_blackbox_name, transient_blackbox_url};
