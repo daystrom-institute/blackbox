@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -193,19 +195,55 @@ pub(super) fn needs_reindex(config: &ReindexConfig) -> bool {
     false
 }
 
+/// Restores the reindex-dirty flag when a *triggered* pass exits before
+/// committing (writer lock busy, or any phase/commit error via `?`/panic).
+/// Disarmed on a committed pass or a genuine no-op, so a satisfied trigger is
+/// not replayed forever. Events arriving *during* a pass re-set the flag
+/// independently (after the gate's `swap(false)`) and are therefore preserved.
+struct DirtyRestore<'a> {
+    flag: &'a AtomicBool,
+    armed: bool,
+}
+
+impl DirtyRestore<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DirtyRestore<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 /// Background reindex: speculative scan → try-lock → reload meta → index → commit.
 /// Returns Ok(()) even when skipped (lock busy, no changes). Errors only on real failures.
+///
+/// `reindex_dirty` lets out-of-band sources (the `.bbox/knowledge` watcher,
+/// daemon startup) force one pass even when `needs_reindex` sees no tracked
+/// source-file change — repo-owned `.bbox/knowledge` files are deliberately not
+/// in the meta-tracked source set, so they can only be picked up this way.
 fn try_background_reindex(
     index: &Index,
     config: &ReindexConfig,
     fields: FieldHandles,
     full: bool,
+    reindex_dirty: &AtomicBool,
 ) -> Result<()> {
-    // 1. Speculative scan — cheap, no writer allocation
-    if !full && !needs_reindex(config) {
+    // 1. Speculative scan — cheap, no writer allocation. `dirty` forces a pass
+    //    (and is consumed here); a failed/lock-busy pass restores it via the guard.
+    let dirty = reindex_dirty.swap(false, Ordering::Relaxed);
+    if !full && !needs_reindex(config) && !dirty {
         tracing::debug!("auto-reindex: no changes detected");
         return Ok(());
     }
+    let mut dirty_guard = DirtyRestore {
+        flag: reindex_dirty,
+        armed: dirty,
+    };
 
     // 2. Acquire writer — returns LockBusy immediately if another process holds it
     let mut writer: IndexWriter = match index.writer(100_000_000) {
@@ -368,8 +406,13 @@ fn try_background_reindex(
         "auto-reindex: purge phase complete"
     );
 
-    if !full && indexed_files == 0 && purged == 0 {
+    // A dirty-triggered pass must still commit even when no *tracked* source
+    // file changed: the knowledge reindex above may have deleted/re-added repo
+    // entries (e.g. a deleted `.bbox/knowledge` file) whose delete_term must
+    // land. Only short-circuit when nothing triggered us.
+    if !full && indexed_files == 0 && purged == 0 && !dirty {
         tracing::debug!("auto-reindex: no changes after post-lock re-check");
+        dirty_guard.disarm();
         return Ok(());
     }
 
@@ -386,6 +429,9 @@ fn try_background_reindex(
         "auto-reindex: commit phase complete"
     );
 
+    // Committed successfully — the trigger is satisfied; don't replay it.
+    dirty_guard.disarm();
+
     let segments = segment_count(index);
     tracing::info!(
         "auto-reindex: indexed {} files ({} docs), skipped {} unchanged, purged {} deleted, segments {}",
@@ -399,11 +445,16 @@ fn try_background_reindex(
 }
 
 /// Spawn the background reindex thread. Runs every `interval` seconds.
+///
+/// `reindex_dirty` is a shared out-of-band trigger: the `.bbox/knowledge`
+/// watcher (and daemon startup) set it so repo-owned knowledge changes that
+/// `needs_reindex` cannot see still drive one incremental pass.
 pub fn spawn_reindex_thread(
     index: Index,
     config: ReindexConfig,
     fields: FieldHandles,
     interval: Duration,
+    reindex_dirty: Arc<AtomicBool>,
 ) {
     std::thread::Builder::new()
         .name("blackbox-reindex".into())
@@ -435,7 +486,8 @@ pub fn spawn_reindex_thread(
                 tick = tick.wrapping_add(1);
                 let full =
                     full_reindex_every_ticks != 0 && tick.is_multiple_of(full_reindex_every_ticks);
-                if let Err(e) = try_background_reindex(&index, &config, fields, full) {
+                if let Err(e) = try_background_reindex(&index, &config, fields, full, &reindex_dirty)
+                {
                     tracing::error!("background reindex failed: {:#}", e);
                 }
                 std::thread::sleep(interval);

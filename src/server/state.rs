@@ -39,6 +39,11 @@ pub(crate) struct SharedState {
     pub(crate) packets: RwLock<Packets>,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
+    /// Out-of-band trigger for the background reindex thread. The `.bbox/knowledge`
+    /// watcher (and daemon startup) set it so repo-owned knowledge changes that
+    /// `needs_reindex` does not track still drive one incremental search pass.
+    /// Shared with the reindex thread (same `Arc`).
+    pub(crate) reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
     #[allow(dead_code)]
     pub(crate) edge_index: RwLock<edge_index::EdgeIndex>,
     pub(crate) path_cache: RwLock<path_cache::PathCache>,
@@ -309,6 +314,7 @@ impl SharedState {
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
             bbox_watcher: std::sync::Mutex::new(None),
+            reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             edge_index: RwLock::new(edge_index::EdgeIndex::default()),
             path_cache: RwLock::new(path_cache::PathCache::default()),
             task_store: Arc::new(RwLock::new(TaskStore::new())),

@@ -161,12 +161,37 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
         .map(|r| (r.project_id, std::path::PathBuf::from(r.canonical_path)))
         .collect();
     let catalog = Arc::new(shared.artifacts.read().clone());
-    match watcher::BbxWatcher::start(project_roots, catalog) {
+
+    // On a committed `.bbox/knowledge/` change (e.g. `git pull`, manual edit):
+    // reload the in-memory knowledge store so `bbox_knowledge`/`render` see it
+    // immediately, and flag the reindex thread to refresh search on its next
+    // tick. A `Weak` ref avoids a cycle — `SharedState` owns the watcher. The
+    // callback deliberately does NOT touch the search index directly: the
+    // reindex thread is the single tantivy writer, so this adds no writer
+    // contention and cannot deadlock against `idx`/`kb` readers.
+    let weak = Arc::downgrade(shared);
+    let on_knowledge_change: watcher::KnowledgeChangeCallback = Arc::new(move || {
+        let Some(state) = weak.upgrade() else {
+            return;
+        };
+        {
+            let mut kb = state.kb.write();
+            if let Err(e) = kb.reload() {
+                tracing::warn!("watcher: kb reload after .bbox/knowledge change failed: {e:#}");
+            }
+        }
+        state
+            .reindex_dirty
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!("watcher: .bbox/knowledge change → kb reloaded, reindex flagged");
+    });
+
+    match watcher::BbxWatcher::start(project_roots, catalog, Some(on_knowledge_change)) {
         Ok(w) => {
             *shared.bbox_watcher.lock().unwrap() = Some(w);
-            tracing::info!(".bbox/ artifact watcher started");
+            tracing::info!(".bbox/ watcher started (artifacts + knowledge)");
         }
-        Err(e) => tracing::warn!(".bbox/ artifact watcher failed to start: {e:#}"),
+        Err(e) => tracing::warn!(".bbox/ watcher failed to start: {e:#}"),
     }
 }
 

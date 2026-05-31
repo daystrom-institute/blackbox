@@ -673,6 +673,75 @@ fn repo_kb_dir(project_dir: &Path) -> PathBuf {
     project_dir.join(".bbox").join("knowledge")
 }
 
+/// Host-local recall telemetry for a repo's entries. Recall stats (`recall_count`,
+/// `last_recalled`) are high-churn *activity*, not durable knowledge: bumping them
+/// on every search would rewrite the committed `.bbox/knowledge/<id>.json` files
+/// (git churn) and — since the daemon watches `.bbox/knowledge/` for live refresh —
+/// self-trigger a reload/reindex on every query. So they live host-local under
+/// `.bbox/local/` (gitignored), keyed by entry id, and are merged back onto the
+/// committed entries at load. Per the design's split-by-nature: durable content is
+/// committed, activity stays local.
+fn repo_kb_stats_path(project_dir: &Path) -> PathBuf {
+    project_dir
+        .join(".bbox")
+        .join("local")
+        .join("knowledge-stats.json")
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RecallStat {
+    #[serde(default)]
+    recall_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_recalled: Option<String>,
+}
+
+/// Load the host-local recall-stats sidecar for a repo (`id -> RecallStat`).
+/// Tolerant: a missing or unparseable sidecar yields an empty map (recall stats
+/// are advisory ranking input, never durable truth — losing them only resets a
+/// small ranking boost, so a corrupt sidecar must never block loading entries).
+fn load_repo_kb_stats(project_dir: &Path) -> std::collections::BTreeMap<String, RecallStat> {
+    let path = repo_kb_stats_path(project_dir);
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(_) => return std::collections::BTreeMap::new(),
+    };
+    serde_json::from_str(&raw).unwrap_or_else(|e| {
+        tracing::warn!("kb recall-stats sidecar unparseable at {}: {e}", path.display());
+        std::collections::BTreeMap::new()
+    })
+}
+
+/// Persist the host-local recall-stats sidecar for a repo. A `BTreeMap` keyed by
+/// id keeps key order stable (no spurious diffs), and the dir's `.gitignore`
+/// (`*`, except itself) is ensured so the sidecar is never committed. Writes only
+/// when content changed, so an unchanged stats set does not rewrite the file.
+fn persist_repo_kb_stats(
+    project_dir: &Path,
+    stats: &std::collections::BTreeMap<String, RecallStat>,
+) -> Result<()> {
+    let path = repo_kb_stats_path(project_dir);
+    let local_dir = project_dir.join(".bbox").join("local");
+    // If there is nothing to record and no sidecar exists yet, do not create the
+    // local dir at all (keeps a pristine repo free of an empty sidecar).
+    if stats.is_empty() && !path.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(&local_dir)
+        .with_context(|| format!("creating {}", local_dir.display()))?;
+    // Mirror `bbox_project_init`: gitignore everything under local/ except the
+    // ignore file itself, so the sidecar is host-local and never committed.
+    let gitignore = local_dir.join(".gitignore");
+    if !gitignore.exists() {
+        let _ = fs::write(&gitignore, "*\n!.gitignore\n");
+    }
+    let new_bytes = serde_json::to_vec_pretty(stats)?;
+    if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
+        return Ok(());
+    }
+    crate::json_store::atomic_write_json_locked(&path, stats)
+}
+
 /// A project is "repo-owned" once its `.bbox/knowledge/` directory exists —
 /// created by a clone that carries it, by `bbox_project_init`, or by
 /// `bbox_project_eject`. Only then does `save` route the project's entries into
@@ -692,23 +761,84 @@ fn load_repo_kb_entries(project_dir: &Path) -> Result<Vec<KnowledgeEntry>> {
     }
     let project = project_dir.to_string_lossy().to_string();
     let mut out = Vec::new();
-    for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let path = de?.path();
+    let mut skipped = 0usize;
+    // A directory-level read failure (TOCTOU between the exists() check and the
+    // read, a permissions blip) must also be non-fatal: aborting here would let
+    // `reload` return Err after it already reset the central store, leaving the
+    // in-memory set partial. Treat it like an empty/skipped root — the next
+    // watcher event or reindex pass retries.
+    let read_dir = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!("kb load: cannot read {}: {e}", dir.display());
+            return Ok(Vec::new());
+        }
+    };
+    // Skip-and-continue per file: a single malformed/partial entry (e.g. an
+    // atomic-rename mid-`git pull`) must not abort the whole load and leave the
+    // store partial. Mirrors the tolerant shape of thread-record loading.
+    for de in read_dir {
+        let path = match de {
+            Ok(de) => de.path(),
+            Err(e) => {
+                tracing::warn!("kb load: unreadable dir entry in {}: {e}", dir.display());
+                skipped += 1;
+                continue;
+            }
+        };
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        let raw =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let mut entry: KnowledgeEntry =
-            serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!("kb load: skipping unreadable {}: {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        let mut entry: KnowledgeEntry = match serde_json::from_str(&raw) {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("kb load: skipping unparseable {}: {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
         entry.project = Some(project.clone());
         out.push(entry);
+    }
+    // Merge host-local recall telemetry back onto the committed (recall-free)
+    // entries. Absent stats leave the defaults (recall_count=0, last_recalled=None).
+    let stats = load_repo_kb_stats(project_dir);
+    if !stats.is_empty() {
+        for entry in &mut out {
+            if let Some(stat) = stats.get(&entry.id) {
+                entry.recall_count = stat.recall_count;
+                entry.last_recalled = stat.last_recalled.clone();
+            }
+        }
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            "kb load: {} loaded={} skipped={}",
+            dir.display(),
+            out.len(),
+            skipped
+        );
+    } else {
+        tracing::debug!("kb load: {} loaded={}", dir.display(), out.len());
     }
     Ok(out)
 }
 
 /// Persist `entries` (all owned by `project_dir`) one file per entry under
-/// `<project_dir>/.bbox/knowledge/`, with the `project` field cleared.
+/// `<project_dir>/.bbox/knowledge/`, with the `project` field and recall
+/// telemetry cleared. Recall stats are written to the host-local sidecar instead
+/// (see `persist_repo_kb_stats`); the committed file holds only durable content,
+/// so a recall-only bump produces a byte-identical file and is skipped — no git
+/// churn and (since the daemon watches `.bbox/knowledge/`) no self-triggered
+/// reload.
 ///
 /// `purge` enables generation semantics: committed files whose id is no longer
 /// present are deleted (so a removed entry deletes its file). Purge is only
@@ -739,12 +869,47 @@ fn persist_repo_kb_entries(
         }
     }
 
+    // Recall telemetry -> host-local sidecar. When authoritative (purge), rebuild
+    // from scratch so stats for removed ids are pruned. When additive (the set may
+    // be incomplete), merge onto the existing sidecar so we don't drop stats for
+    // entries that aren't in this in-memory set.
+    let mut stats: std::collections::BTreeMap<String, RecallStat> = if purge {
+        std::collections::BTreeMap::new()
+    } else {
+        load_repo_kb_stats(project_dir)
+    };
     for entry in entries {
+        // Record recall telemetry host-local (only for entries that have any).
+        // Do NOT remove on zero telemetry: in merge mode (purge=false) the
+        // in-memory entry may be a central copy with default `recall_count=0`
+        // while the sidecar holds the real stats — removing would drop them. In
+        // rebuild mode (purge=true) the map started empty, so a zero-telemetry
+        // entry is simply absent (effectively pruned) without an explicit remove.
+        if entry.recall_count > 0 || entry.last_recalled.is_some() {
+            stats.insert(
+                entry.id.clone(),
+                RecallStat {
+                    recall_count: entry.recall_count,
+                    last_recalled: entry.last_recalled.clone(),
+                },
+            );
+        }
         let mut on_disk = (*entry).clone();
         on_disk.project = None;
+        // Durable content only — recall telemetry lives in the sidecar.
+        on_disk.recall_count = 0;
+        on_disk.last_recalled = None;
         let path = dir.join(format!("{}.json", entry.id));
+        // Skip the write when the committed content is byte-identical, so a
+        // recall-only bump (which changed nothing durable) does not rewrite the
+        // file, churn git, or trip the `.bbox/knowledge/` watcher.
+        let new_bytes = serde_json::to_vec_pretty(&on_disk)?;
+        if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
+            continue;
+        }
         crate::json_store::atomic_write_json_locked(&path, &on_disk)?;
     }
+    persist_repo_kb_stats(project_dir, &stats)?;
     Ok(())
 }
 
@@ -835,6 +1000,15 @@ impl Knowledge {
                 .with_context(|| format!("reading {}", self.store_path.display()))?;
             self.store = serde_json::from_str(&raw)
                 .with_context(|| format!("parsing {}", self.store_path.display()))?;
+        } else {
+            // Central kb.json absent: reset to an empty store before merging repo
+            // entries. Without this, a re-reload (e.g. driven by the watcher)
+            // would merge onto the previous in-memory store and retain stale
+            // repo-owned entries that were deleted on disk — `load_project_entries`
+            // only adds/overwrites by id, it never removes. The central-present
+            // path self-corrects because `self.store` is reset to global-only
+            // central first, then current repo entries are re-added.
+            self.store = KnowledgeStore::new();
         }
         self.load_project_entries()?;
         Ok(())
@@ -2525,6 +2699,12 @@ mod tests {
             recall_count: 0,
             last_recalled: None,
         });
+        // Persist the seeded entry so it survives the `reload()` that `learn`
+        // performs. `/tmp/proj` is not repo-owned, so `save()` routes it to the
+        // central store and writes `kb.json`; without this the entry lives only
+        // in memory and a reload (which correctly discards unsaved state when
+        // central is absent) would drop it.
+        kb.save().expect("persist seeded entry");
     }
 
     #[test]
@@ -2744,6 +2924,11 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             "Stale entry to disable",
             "no longer present in any rendered file",
         ));
+        // Persist before `absorb` reloads: global entries are saved to the
+        // central store in production, so seed them to disk here too. Otherwise
+        // the reload inside `absorb` correctly discards the unsaved in-memory
+        // state (central kb.json absent → reset) and the entries vanish.
+        kb.save().expect("persist seeded global entries");
 
         unsafe {
             std::env::set_var("BLACKBOX_GLOBAL_CLAUDE_MD", claude_md.to_str().unwrap());
@@ -3114,6 +3299,140 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
         assert!(
             !std::fs::read_to_string(&kb_path).unwrap().contains(&id),
             "entry should leave central after eject"
+        );
+    }
+
+    #[test]
+    fn recall_telemetry_goes_to_sidecar_not_committed_files() {
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        fs::create_dir_all(repo_kb_dir(&repo_root)).unwrap(); // repo-owned
+
+        let mut entry = KnowledgeEntry {
+            id: "recl0001".into(),
+            title: "durable title".into(),
+            content: "durable body".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: Some(repo_root.to_string_lossy().to_string()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "user".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 7,
+            last_recalled: Some("2026-05-30T00:00:00Z".into()),
+        };
+
+        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+
+        // Committed file holds durable content only — no recall telemetry.
+        let committed_path = repo_kb_dir(&repo_root).join("recl0001.json");
+        let committed = fs::read_to_string(&committed_path).unwrap();
+        assert!(
+            !committed.contains("last_recalled"),
+            "committed file must omit last_recalled: {committed}"
+        );
+        assert!(
+            committed.contains("\"recall_count\": 0"),
+            "committed recall_count must be cleared to 0: {committed}"
+        );
+
+        // Telemetry lives in the gitignored host-local sidecar.
+        assert!(
+            repo_kb_stats_path(&repo_root).exists(),
+            "recall-stats sidecar must be written"
+        );
+        assert!(
+            repo_root.join(".bbox/local/.gitignore").exists(),
+            "local/.gitignore must be created so the sidecar is never committed"
+        );
+        let sidecar = fs::read_to_string(repo_kb_stats_path(&repo_root)).unwrap();
+        assert!(sidecar.contains("recl0001") && sidecar.contains("\"recall_count\": 7"));
+
+        // A recall-only bump must NOT rewrite the committed file (no git churn,
+        // no self-triggered watcher event).
+        let before = fs::read(&committed_path).unwrap();
+        entry.recall_count = 99;
+        entry.last_recalled = Some("2026-05-31T00:00:00Z".into());
+        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        let after = fs::read(&committed_path).unwrap();
+        assert_eq!(
+            before, after,
+            "a recall-only bump must not rewrite the committed file"
+        );
+
+        // Reload merges telemetry back onto the recall-free committed entry.
+        let loaded = load_repo_kb_entries(&repo_root).unwrap();
+        let e = loaded.iter().find(|e| e.id == "recl0001").unwrap();
+        assert_eq!(e.recall_count, 99);
+        assert_eq!(e.last_recalled.as_deref(), Some("2026-05-31T00:00:00Z"));
+    }
+
+    #[test]
+    fn additive_save_does_not_drop_existing_recall_stats() {
+        // Regression: a non-authoritative (purge=false) save of an entry whose
+        // in-memory telemetry is zero (e.g. a central copy) must NOT delete the
+        // real recall stat already in the host-local sidecar.
+        let repo = tempfile::tempdir().unwrap();
+        let repo_root = repo.path().canonicalize().unwrap();
+        fs::create_dir_all(repo_kb_dir(&repo_root)).unwrap();
+
+        let mut entry = KnowledgeEntry {
+            id: "keep0001".into(),
+            title: "t".into(),
+            content: "durable".into(),
+            cluster: None,
+            variants: HashMap::new(),
+            category: Category::Convention,
+            scope: Scope::Project,
+            project: Some(repo_root.to_string_lossy().to_string()),
+            providers: vec![],
+            priority: Priority::Standard,
+            weight: 100,
+            render: true,
+            decay: true,
+            review_at: None,
+            status: Status::Active,
+            approval: Approval::UserConfirmed,
+            supersedes: None,
+            links: Vec::new(),
+            rationale: None,
+            expires_at: None,
+            source: "user".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            recall_count: 5,
+            last_recalled: Some("2026-05-30T00:00:00Z".into()),
+        };
+        // Authoritative save seeds the sidecar with real stats.
+        persist_repo_kb_entries(&repo_root, &[&entry], true).unwrap();
+        assert!(
+            fs::read_to_string(repo_kb_stats_path(&repo_root))
+                .unwrap()
+                .contains("\"recall_count\": 5")
+        );
+
+        // Additive save with zero in-memory telemetry must preserve the stat.
+        entry.recall_count = 0;
+        entry.last_recalled = None;
+        persist_repo_kb_entries(&repo_root, &[&entry], false).unwrap();
+        let sidecar = fs::read_to_string(repo_kb_stats_path(&repo_root)).unwrap();
+        assert!(
+            sidecar.contains("keep0001") && sidecar.contains("\"recall_count\": 5"),
+            "additive save must not drop existing recall stats: {sidecar}"
         );
     }
 

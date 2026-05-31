@@ -55,6 +55,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
         packets: RwLock::new(packets),
         artifacts: RwLock::new(artifacts),
         bbox_watcher: std::sync::Mutex::new(None),
+        reindex_dirty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         edge_index: RwLock::new(edge_index::EdgeIndex::default()),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(TaskStore::new())),

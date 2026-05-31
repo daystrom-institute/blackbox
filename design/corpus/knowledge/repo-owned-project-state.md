@@ -1,7 +1,7 @@
 ---
 title: "Repo-Owned Project State"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - corpus
@@ -11,8 +11,10 @@ brief: "Invert the system-of-record for project scope: durable project knowledge
 
 # Repo-Owned Project State
 
-**Status:** Implemented (rev 3 design; landed on `main` 2026-05-30). See
-CHANGELOG "Unreleased" for the shipped surface.
+**Status:** Partial (rev 4, 2026-05-30; landed on `main` 2026-05-30) —
+durable-knowledge layer + activity→record seam + live in-memory refresh shipped;
+identity model, the designed generation/purge spooler, `render --check`, and
+`bbox_lint` merge-gating not yet. See CHANGELOG "Unreleased" for the shipped surface.
 **Scope:** Where project-scoped durable knowledge (and the durable record of
 project activity) physically lives, who owns it, and what the daemon's role
 becomes for the project layer.
@@ -35,6 +37,59 @@ the issue log that prompted this design has since been resolved and removed.
 > render/source circularity with explicit authoring-render vs `render --check`
 > modes; added the `.bbox/` double-indexing hazard (`project_files.rs:528`
 > exempts `.bbox` from the dotfile skip) to the spooler contract.
+>
+> **rev 4 changelog (what shipped + stale-premise corrections):**
+> - **Shipped:** repo-owned `.bbox/knowledge/<id>.json` (load on
+>   startup/register/rename/unregister, project field omitted on disk),
+>   `bbox_project_eject`, the thread activity→record seam
+>   (`.bbox/record/<id>.json`, scrubbed), one-way render projection (absorb stays
+>   a no-op), and — this revision — **live in-memory refresh** so external
+>   `.bbox/knowledge/` changes (`git pull`, manual edit) are picked up without a
+>   restart.
+> - **Double-indexing hazard is CLOSED, not open.** rev 3 cited
+>   `project_files.rs:528` as exempting `.bbox` from the dotfile skip. Commit
+>   `ab31daa5` removed the `&& name != ".bbox"` carve-out, so `scan_project_files`
+>   (the only generic walker) now skips `.bbox` like any dotdir. `.bbox/knowledge`
+>   is indexed *only* as structured knowledge entities. The spooler contract's
+>   point 5 is satisfied.
+> - **Spooler shipped as a watcher-driven refresh, not the designed
+>   generation/purge spooler.** The existing `.bbox/` artifact watcher
+>   (`src/watcher.rs`, recursive) now also detects committed
+>   `.bbox/knowledge/*.json` create/modify/remove and fires a callback that (a)
+>   reloads the in-memory store (`Knowledge::reload`) and (b) sets a shared
+>   `reindex_dirty: AtomicBool` consumed by the background reindex thread. The
+>   watcher does **not** open a tantivy writer — the reindex thread stays the
+>   sole writer, so there is no new writer contention, no `idx`/`kb` lock
+>   inversion, and `bbox_learn` is unaffected. Search self-heals within ≤1
+>   reindex interval; the in-memory store is immediate. The designed snapshot
+>   spooler with explicit generation/purge bookkeeping (contract points 2–4) was
+>   not needed: `reload`/`reindex_knowledge_store_standalone` rebuild from the
+>   working tree each pass, which already drops entries no longer present.
+> - **Tolerance/atomicity:** `load_repo_kb_entries` now skips unreadable/partial
+>   files (a mid-pull atomic-rename no longer aborts the whole load) and treats a
+>   directory-level read failure as a skipped root rather than aborting the whole
+>   reload; `Knowledge::reload` resets to an empty central store when `kb.json` is
+>   absent so a re-reload does not retain stale deleted repo entries.
+> - **Recall telemetry is activity, not durable knowledge — moved host-local.**
+>   `recall_count`/`last_recalled` are bumped on every search hit; persisting them
+>   into the committed `.bbox/knowledge/<id>.json` caused git churn *and* (with
+>   live refresh) self-triggered the watcher on every query. They now live in a
+>   gitignored per-repo sidecar `.bbox/local/knowledge-stats.json`, merged onto
+>   entries at load; the committed file holds durable content only and a
+>   recall-only bump is skipped as a byte-identical no-op. This is the
+>   split-by-nature rule (durable→committed, activity→`.bbox/local/`) applied to
+>   recall stats.
+> - **`reindex_dirty` is initialized `true`** so one pass runs after startup,
+>   covering knowledge changes made while the daemon was down (no event fires for
+>   those and `needs_reindex` does not track `.bbox/knowledge`).
+> - **Not claimed:** `.bbox/record/` deletion does **not** self-heal in search
+>   (`reindex_project_records_standalone` delete-before-adds only *present* record
+>   files); record refresh remains periodic-only and out of this scope.
+> - **Still unimplemented:** the `(repo_id, bbox_root_relpath)` identity model
+>   (scope is still keyed on the absolute path / repo-owned-by-existence), the
+>   `BbxWatcher` `project_id` reconstruction concern from rev 2/3 (already false
+>   in current code — id is passed, never reconstructed), `render --check` CI
+>   gating, and `bbox_lint` as a required merge gate.
 
 ---
 

@@ -7,8 +7,15 @@ use notify_debouncer_full::{DebounceEventResult, Debouncer, RecommendedCache, ne
 
 use crate::artifacts::{ArtifactCatalog, ArtifactScope};
 
+/// Fired (once per debounced batch) when a committed `.bbox/knowledge/*.json`
+/// file is created, modified, or removed. The daemon uses it to reload the
+/// in-memory knowledge store and trigger a search reindex. Deliberately a bare
+/// `Fn()` so the watcher stays decoupled from `SharedState`.
+pub type KnowledgeChangeCallback = Arc<dyn Fn() + Send + Sync>;
+
 /// Handle to the filesystem watcher that monitors `.bbox/` directories for
-/// installed artifact changes. Keeps the watcher alive for the daemon lifetime.
+/// installed artifact changes and committed knowledge changes. Keeps the
+/// watcher alive for the daemon lifetime.
 pub struct BbxWatcher {
     debouncer: Debouncer<RecommendedWatcher, RecommendedCache>,
     /// `(project_id, canonical .bbox root)` pairs. The project_id is the one
@@ -18,9 +25,15 @@ pub struct BbxWatcher {
 
 impl BbxWatcher {
     /// Start watching all registered projects.
+    ///
+    /// `on_knowledge_change`, when set, is invoked once per debounced batch in
+    /// which any committed `.bbox/knowledge/*.json` file changed. This is
+    /// detected independently of the artifact-routing gate below (which ignores
+    /// in-place modifies), because knowledge files are also edited in place.
     pub fn start(
         projects: Vec<(String, PathBuf)>, // (project_id, canonical_project_dir)
         catalog: Arc<ArtifactCatalog>,
+        on_knowledge_change: Option<KnowledgeChangeCallback>,
     ) -> anyhow::Result<Self> {
         let watched_roots: Arc<Mutex<Vec<(String, PathBuf)>>> = Arc::new(Mutex::new(Vec::new()));
         let watched_roots_cb = watched_roots.clone();
@@ -38,8 +51,20 @@ impl BbxWatcher {
                     }
                 };
                 let roots = watched_roots_cb.lock().unwrap().clone();
+                let mut knowledge_dirty = false;
                 for event in events {
+                    if !knowledge_dirty && event_touches_knowledge(&event.event, &roots) {
+                        knowledge_dirty = true;
+                    }
                     handle_event(&event.event, &roots, &catalog_cb);
+                }
+                // Fire once for the whole batch — a `git pull` lands many files
+                // under one debounce window, and the reload/reindex it triggers
+                // is a full refresh, not per-file.
+                if knowledge_dirty {
+                    if let Some(cb) = &on_knowledge_change {
+                        cb();
+                    }
                 }
             },
         )?;
@@ -192,6 +217,25 @@ fn handle_remove(path: &Path, project_id: &str, bbox_root: &Path, catalog: &Arti
     }
 }
 
+/// True when an event is a create/modify/remove of a committed
+/// `<bbox_root>/knowledge/*.json` file. Modify is included on purpose: artifact
+/// routing ignores in-place modifies, but knowledge entries are edited in place
+/// (manual edits, some editor/git write patterns). Access events are ignored.
+fn event_touches_knowledge(event: &notify::Event, roots: &[(String, PathBuf)]) -> bool {
+    if !matches!(
+        event.kind,
+        notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
+    ) {
+        return false;
+    }
+    event.paths.iter().any(|path| {
+        path.extension().and_then(|e| e.to_str()) == Some("json")
+            && roots
+                .iter()
+                .any(|(_, root)| path.starts_with(root.join("knowledge")))
+    })
+}
+
 fn is_local_path(path: &Path, bbox_root: &Path) -> bool {
     path.starts_with(bbox_root.join("local"))
 }
@@ -338,5 +382,63 @@ mod tests {
             scoped.is_some(),
             "artifact JSON must be preserved after deletion (audit trail)"
         );
+    }
+
+    #[test]
+    fn knowledge_change_detection_matches_committed_entries_only() {
+        let dir = tempdir().unwrap();
+        let bbox_root = dir.path().canonicalize().unwrap().join(".bbox");
+        let roots = vec![("proj-k".to_string(), bbox_root.clone())];
+
+        let kb_entry = bbox_root.join("knowledge").join("abc12345.json");
+        let mk = |kind: notify::EventKind, path: &std::path::Path| notify::Event {
+            kind,
+            paths: vec![path.to_path_buf()],
+            attrs: Default::default(),
+        };
+
+        // Create / modify (in-place edit) / remove of a knowledge json all count.
+        for kind in [
+            notify::EventKind::Create(notify::event::CreateKind::File),
+            notify::EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            notify::EventKind::Remove(notify::event::RemoveKind::File),
+        ] {
+            assert!(
+                event_touches_knowledge(&mk(kind, &kb_entry), &roots),
+                "knowledge {kind:?} should be detected"
+            );
+        }
+
+        // Access events are not changes.
+        assert!(
+            !event_touches_knowledge(
+                &mk(
+                    notify::EventKind::Access(notify::event::AccessKind::Read),
+                    &kb_entry
+                ),
+                &roots
+            ),
+            "access events must not trigger a refresh"
+        );
+
+        // Non-json under knowledge/, and a json under a different .bbox subdir
+        // (an artifact), must not be treated as knowledge changes.
+        let non_json = bbox_root.join("knowledge").join("README.md");
+        let artifact = bbox_root.join("workflows").join("flow.json");
+        let create = |p: &std::path::Path| {
+            mk(notify::EventKind::Create(notify::event::CreateKind::File), p)
+        };
+        assert!(!event_touches_knowledge(&create(&non_json), &roots));
+        assert!(!event_touches_knowledge(&create(&artifact), &roots));
+
+        // A path outside any watched root is ignored.
+        let foreign = dir
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("other/.bbox/knowledge/x.json");
+        assert!(!event_touches_knowledge(&create(&foreign), &roots));
     }
 }

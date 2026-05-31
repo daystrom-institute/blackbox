@@ -128,7 +128,13 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     )?);
 
     let (tail_tx, _) = broadcast::channel::<TailEvent>(1024);
-    spawn_reindex_thread(&cfg, &idx);
+    // Shared reindex trigger. Initialized `true` so the first background pass
+    // runs once after startup and indexes repo-owned `.bbox/knowledge` that may
+    // have changed while the daemon was down (no watcher event fires for those,
+    // and `needs_reindex` does not track them). The `.bbox/knowledge` watcher
+    // sets it on live changes; the same `Arc` is stored in `SharedState`.
+    let reindex_dirty = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    spawn_reindex_thread(&cfg, &idx, reindex_dirty.clone());
 
     let bind_host = cfg.daemon.bind.clone();
     let bind_is_loopback = is_loopback_bind(&bind_host);
@@ -155,6 +161,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
         bbox_watcher: std::sync::Mutex::new(None),
+        reindex_dirty,
         edge_index: RwLock::new(edge_index),
         path_cache: RwLock::new(path_cache::PathCache::default()),
         task_store: Arc::new(RwLock::new(task_store)),
@@ -269,13 +276,18 @@ fn backfill_artifact_hashes(artifacts_store: &artifacts::ArtifactCatalog) {
     }
 }
 
-fn spawn_reindex_thread(cfg: &config::Config, idx: &TranscriptIndex) {
+fn spawn_reindex_thread(
+    cfg: &config::Config,
+    idx: &TranscriptIndex,
+    reindex_dirty: Arc<std::sync::atomic::AtomicBool>,
+) {
     let reindex_interval = cfg.index.reindex_interval_secs;
     index::spawn_reindex_thread(
         idx.index_handle(),
         idx.reindex_config(),
         idx.field_handles(),
         std::time::Duration::from_secs(reindex_interval),
+        reindex_dirty,
     );
 }
 

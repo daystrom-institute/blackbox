@@ -62,10 +62,11 @@ pub(crate) fn reindex_knowledge_store_standalone(
     meta: &mut HashMap<String, FileMeta>,
 ) -> Result<u64> {
     writer.delete_term(Term::from_field_text(fields.doc_type, "knowledge"));
-    if !knowledge_path.exists() {
-        meta.remove(knowledge_path.to_string_lossy().as_ref());
-        return Ok(0);
-    }
+    // Do NOT early-return when central kb.json is absent. On a repo-owned-only
+    // host the central store may not exist, but the committed per-repo
+    // .bbox/knowledge entries still must be indexed. `Knowledge::open` tolerates
+    // an absent central store (resets to an empty central, then merges repo
+    // roots), so we always open + load roots and index whatever is present.
     let mut knowledge = Knowledge::open(knowledge_path)?;
     // Project-scoped entries live in each repo's committed .bbox/knowledge/, not
     // the central store, so a reindex that only read kb.json would silently drop
@@ -88,8 +89,15 @@ pub(crate) fn reindex_knowledge_store_standalone(
         writer.add_document(build_knowledge_doc(entry, knowledge_path, fields))?;
         docs += 1;
     }
-    if let Some(file_meta) = file_meta(knowledge_path) {
-        meta.insert(knowledge_path.to_string_lossy().to_string(), file_meta);
+    match file_meta(knowledge_path) {
+        Some(file_meta) => {
+            meta.insert(knowledge_path.to_string_lossy().to_string(), file_meta);
+        }
+        // Central absent: clear any stale meta entry so its disappearance does
+        // not wrongly suppress future reindex passes.
+        None => {
+            meta.remove(knowledge_path.to_string_lossy().as_ref());
+        }
     }
     Ok(docs)
 }

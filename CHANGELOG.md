@@ -119,6 +119,33 @@ out explicitly under `Changed` or `Removed`.
   searchable on a clone where the host-local thread store does not carry them.
   Live threads, side-channel notes, and pins remain host-local operational
   exhaust by design.
+- Live refresh of repo-owned knowledge. External changes to a repo's committed
+  `.bbox/knowledge/` (a `git pull`, a branch switch, a manual edit) are now
+  picked up without a daemon restart. The existing `.bbox/` watcher detects
+  committed knowledge create/modify/remove and reloads the in-memory store, so
+  `bbox_knowledge` and `bbox_render scope=project` reflect the change
+  immediately; a shared dirty flag drives the background reindex thread to
+  refresh search on its next pass (within one reindex interval), and the flag is
+  set once at startup so changes made while the daemon was down are also indexed.
+  The watcher never opens its own search-index writer — the reindex thread stays
+  the single writer, so this adds no write contention and leaves `bbox_learn`
+  latency unchanged. Knowledge loading is now tolerant of an unreadable/partial
+  entry file (skip-and-continue) so an atomic-rename mid-pull cannot leave the
+  store partial, and a reload with an absent central `kb.json` resets cleanly so
+  deleted repo entries do not linger.
+- Recall telemetry no longer churns committed knowledge. `recall_count` /
+  `last_recalled` are bumped on every search hit; for repo-owned entries that
+  was rewriting the committed `.bbox/knowledge/<id>.json` on each query — git
+  churn, and (with live refresh) a self-triggered reload/reindex every search.
+  Recall stats now live in a gitignored host-local sidecar
+  (`.bbox/local/knowledge-stats.json`, one map per repo) and are merged back
+  onto entries at load; the committed file holds durable content only, and a
+  recall-only bump produces a byte-identical file that is skipped (no rewrite).
+  Ranking (`search/rerank`) still sees recall stats; they survive restart via
+  the sidecar. One-time migration: on first save after upgrade, repo-owned
+  entries that previously had recall telemetry baked into their committed files
+  are rewritten once to strip it (the stats move to the sidecar) — expected, and
+  the only churn; steady state is zero.
 
 ### Changed
 
