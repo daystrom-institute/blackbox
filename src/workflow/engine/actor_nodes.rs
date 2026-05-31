@@ -59,7 +59,16 @@ impl<'a> WorkflowRunner<'a> {
                     &self.cancel_token,
                 )
                 .await
-                .map_err(|e| anyhow!("tmux dispatch for node '{node_id}': {e}"))?
+                .map_err(|e| {
+                    // Emit the canonical "arc cancelled" sentinel so the runner
+                    // classifies a cancelled turn as `cancelled`, not `failed`
+                    // (engine.rs maps only the exact sentinel to cancelled).
+                    if self.cancel_token.is_cancelled() {
+                        anyhow!("arc cancelled")
+                    } else {
+                        anyhow!("tmux dispatch for node '{node_id}': {e}")
+                    }
+                })?
         } else {
             self.server
                 .workflow_dispatch_executor(
