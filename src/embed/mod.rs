@@ -482,7 +482,16 @@ fn buckets_for_reembed_route(route: &str) -> Result<Vec<Bucket>> {
 
 fn count_reembed_entities(state: &Arc<SharedState>, buckets: &[Bucket]) -> Result<usize> {
     let knowledge_count = if buckets.contains(&Bucket::Knowledge) {
-        state.kb.read().all_entries().len()
+        // Only indexable entries (Active|Superseded) are embedded; counting
+        // Deleted/Draft/Disabled here makes bbox_embed_status coverage look
+        // artificially low. Mirror enqueue_reembed_routes' filter.
+        state
+            .kb
+            .read()
+            .all_entries()
+            .iter()
+            .filter(|e| crate::index::indexable_knowledge_entry(e))
+            .count()
     } else {
         0
     };
@@ -527,6 +536,11 @@ pub(crate) fn route_coverage(
     let mut active_by_route = BTreeMap::new();
     if buckets.contains(&Bucket::Knowledge) {
         for entry in state.kb.read().all_entries() {
+            // Non-indexable entries (Deleted/Draft/Disabled) aren't in the
+            // searchable index — skip so coverage reflects indexable knowledge.
+            if !crate::index::indexable_knowledge_entry(entry) {
+                continue;
+            }
             record_coverage(
                 &router,
                 &mut coverage,
