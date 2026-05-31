@@ -56,6 +56,8 @@ const PROVIDER_SEL_WIDTH: u16 = 38;
 const COMPOSER_HEIGHT: u16 = 3;
 const COMPOSER_MAX_HEIGHT: u16 = 10;
 const TOOL_CALL_GLYPH: &str = "▸";
+const ROSTER_SELECTED_MARKER: &str = "› ";
+const ROSTER_SELECTED_BG: Color = Color::Rgb(36, 40, 48);
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -1954,7 +1956,14 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
     let table = Table::new(rows, widths)
         .header(header)
         .column_spacing(1)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+        .row_highlight_style(Style::default().bg(ROSTER_SELECTED_BG))
+        .highlight_symbol(Text::styled(
+            ROSTER_SELECTED_MARKER,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(table, inner, &mut state);
 }
 
