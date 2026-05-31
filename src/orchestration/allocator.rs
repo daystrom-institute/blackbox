@@ -1681,6 +1681,49 @@ mod tests {
     }
 
     #[test]
+    fn inert_structured_output_request_honors_static_provider_pin() {
+        with_provider_bins(|| {
+            // Simulate corpus-pathfinder: a static-provider brofile with no
+            // runtime block whose output schema forces a StructuredOutput
+            // derived capability into existence. The request carries no
+            // tier/pool/pin of its own — it is inert.
+            let inert = with_derived_capability(None, Capability::StructuredOutput);
+            assert!(
+                !inert.as_ref().unwrap().expresses_selection_intent(),
+                "derived-only request must be inert"
+            );
+            // The dispatch seam seeds a pin from the brofile's static provider.
+            let request = pin_static_provider_if_inert(
+                inert,
+                Provider::Codex,
+                Some("gpt-5.5".into()),
+                Some("medium".into()),
+            )
+            .expect("inert request seeded");
+
+            let allocation = allocate(
+                request,
+                &built_in_config(),
+                &BroConfig::default(),
+                &AllocationContext {
+                    in_flight: BTreeMap::new(),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                allocation.trace.error.is_none(),
+                "{:?}",
+                allocation.trace.error
+            );
+            // Honors the declared provider instead of free-selecting across
+            // Provider::ALL — the pre-fix bug landed on claude-opus-4-8.
+            assert_eq!(allocation.lane.provider, Provider::Codex);
+            assert_eq!(allocation.lane.model.as_deref(), Some("gpt-5.5"));
+            assert_eq!(allocation.lane.effort.as_deref(), Some("medium"));
+        });
+    }
+
+    #[test]
     fn allocation_fails_closed_on_missing_capability() {
         with_provider_bins(|| {
             let cfg = built_in_config();
