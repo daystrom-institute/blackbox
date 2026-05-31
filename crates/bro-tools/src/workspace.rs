@@ -33,6 +33,51 @@ pub(crate) fn resolve_in_root(root: &Path, rel: &str) -> anyhow::Result<PathBuf>
     Ok(normalized)
 }
 
+/// Resolve a read-only file path. Normal worktree confinement still applies,
+/// but explicit `@...` file mentions get Codex-style handling: `@relative/path`
+/// strips the marker and resolves inside the worktree, while `@/abs/path.md`
+/// can read instruction docs outside the worktree. This is intentionally not
+/// used by write/edit/shell tools.
+fn resolve_read_path(root: &Path, raw: &str) -> anyhow::Result<PathBuf> {
+    let Some(stripped) = raw.strip_prefix('@') else {
+        return resolve_in_root(root, raw);
+    };
+    if stripped.is_empty() {
+        anyhow::bail!("empty @ file mention");
+    }
+    let path = Path::new(stripped);
+    if path.is_absolute() {
+        let normalized = normalize_lexical(path);
+        if is_allowed_external_instruction_doc(&normalized) {
+            return Ok(normalized);
+        }
+        anyhow::bail!("external @ file mention is not an allowed instruction doc: {raw}");
+    }
+    resolve_in_root(root, stripped)
+}
+
+fn is_allowed_external_instruction_doc(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    if matches!(
+        name,
+        "AGENTS.md"
+            | "BLACKBOX.md"
+            | "CLAUDE.md"
+            | "GEMINI.md"
+            | "PROJECT.md"
+            | "RTK.md"
+            | "README.md"
+    ) {
+        return true;
+    }
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("md" | "markdown" | "txt")
+    )
+}
+
 fn normalize_lexical(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in p.components() {
@@ -72,7 +117,9 @@ const FILE_READ_DEFAULT_MAX_LINES: usize = 2000;
 
 #[derive(Deserialize, JsonSchema)]
 struct FileReadInput {
-    /// Path to the file, relative to the worktree root.
+    /// Path to the file, relative to the worktree root. `@relative/path` is
+    /// accepted as a file mention; `@/absolute/instruction.md` is accepted for
+    /// read-only instruction docs outside the worktree.
     file_path: String,
     /// 1-based start line (inclusive). Omit to read from the beginning.
     start_line: Option<usize>,
@@ -105,7 +152,7 @@ impl Tool for FileRead {
         "file_read"
     }
     fn description(&self) -> &str {
-        "Read a UTF-8 text file in the worktree. Optionally restrict to a 1-based [start_line, end_line] range. Returns at most max_lines lines (default 2000); the read stops early at the range/cap rather than loading the whole file. Set line_numbers=true to prefix each line with its 1-based number."
+        "Read a UTF-8 text file in the worktree. Supports explicit @file mentions: @relative/path resolves inside the worktree, and @/absolute/instruction.md can read instruction docs outside it. Optionally restrict to a 1-based [start_line, end_line] range. Returns at most max_lines lines (default 2000); the read stops early at the range/cap rather than loading the whole file. Set line_numbers=true to prefix each line with its 1-based number."
     }
     fn input_schema(&self) -> Value {
         schema_for::<FileReadInput>()
@@ -123,7 +170,7 @@ impl Tool for FileRead {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let path = match resolve_in_root(&cx.root, &args.file_path) {
+        let path = match resolve_read_path(&cx.root, &args.file_path) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
@@ -296,7 +343,10 @@ fn record_edit(cx: &ToolCx, path: &Path, pre: &[u8], post: &[u8]) {
             pre,
             post,
         )),
-        Err(_) => tracing::warn!("edits sink poisoned; dropping {} edit event", path.display()),
+        Err(_) => tracing::warn!(
+            "edits sink poisoned; dropping {} edit event",
+            path.display()
+        ),
     }
 }
 
@@ -876,7 +926,9 @@ impl Tool for Glob {
 
 #[derive(Deserialize, JsonSchema)]
 struct SmartReadInput {
-    /// Path to the file, relative to the worktree root.
+    /// Path to the file, relative to the worktree root. `@relative/path` is
+    /// accepted as a file mention; `@/absolute/instruction.md` is accepted for
+    /// read-only instruction docs outside the worktree.
     file_path: String,
     /// Line count above which the file is outlined instead of returned whole
     /// (default 400).
@@ -891,7 +943,7 @@ impl Tool for SmartRead {
         "smart_read"
     }
     fn description(&self) -> &str {
-        "Read a file; small files are returned whole, large files are summarized as a definition outline (with line numbers) plus a head sample, so you can then file_read specific ranges."
+        "Read a file; small files are returned whole, large files are summarized as a definition outline (with line numbers) plus a head sample, so you can then file_read specific ranges. Supports @file mention syntax with the same read-only instruction-doc carveout as file_read."
     }
     fn input_schema(&self) -> Value {
         schema_for::<SmartReadInput>()
@@ -907,7 +959,7 @@ impl Tool for SmartRead {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        let path = match resolve_in_root(&cx.root, &args.file_path) {
+        let path = match resolve_read_path(&cx.root, &args.file_path) {
             Ok(p) => p,
             Err(e) => return ToolResult::Error(e.to_string()),
         };
@@ -969,6 +1021,31 @@ mod tests {
         assert!(resolve_in_root(&root, "src/main.rs").is_ok());
         assert!(resolve_in_root(&root, "/work/repo/src/x").is_ok());
         assert!(resolve_in_root(&root, "/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn read_paths_accept_at_instruction_docs() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let project_doc = root.join("PROJECT.md");
+        std::fs::write(&project_doc, "project instructions\n").unwrap();
+
+        assert_eq!(
+            resolve_read_path(&root, "@PROJECT.md").unwrap(),
+            project_doc
+        );
+
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_root = external_dir.path().canonicalize().unwrap();
+        let blackbox_doc = external_root.join("BLACKBOX.md");
+        std::fs::write(&blackbox_doc, "global instructions\n").unwrap();
+
+        assert_eq!(
+            resolve_read_path(&root, &format!("@{}", blackbox_doc.display())).unwrap(),
+            blackbox_doc
+        );
+        assert!(resolve_read_path(&root, "@/etc/passwd").is_err());
+        assert!(resolve_read_path(&root, "@").is_err());
     }
 
     fn cx_at(root: &Path) -> ToolCx {
@@ -1066,6 +1143,48 @@ mod tests {
             ToolResult::Text(t) => assert_eq!(t, "3\tline3\n4\tline4"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn file_read_allows_external_at_instruction_doc() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_root = external_dir.path().canonicalize().unwrap();
+        let doc = external_root.join("BLACKBOX.md");
+        std::fs::write(&doc, "global blackbox instructions\n").unwrap();
+        let cx = cx_at(&root);
+
+        let r = FileRead
+            .call(json!({"file_path": format!("@{}", doc.display())}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => assert_eq!(t, "global blackbox instructions"),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_edit_still_rejects_external_at_instruction_doc() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().canonicalize().unwrap();
+        let external_dir = tempfile::tempdir().unwrap();
+        let external_root = external_dir.path().canonicalize().unwrap();
+        let doc = external_root.join("BLACKBOX.md");
+        std::fs::write(&doc, "global blackbox instructions\n").unwrap();
+        let cx = cx_at(&root);
+
+        let r = FileEdit
+            .call(
+                json!({
+                    "file_path": format!("@{}", doc.display()),
+                    "old_string": "global",
+                    "new_string": "changed"
+                }),
+                &cx,
+            )
+            .await;
+        assert!(r.is_error(), "file_edit should remain confined: {r:?}");
     }
 
     #[tokio::test]
@@ -1278,10 +1397,7 @@ mod tests {
         // 1) Fresh file_write: empty pre-image, post-image matches content.
         let new_body = "first contents\n";
         let r = FileWrite
-            .call(
-                json!({"file_path": "fresh.txt", "content": new_body}),
-                &cx,
-            )
+            .call(json!({"file_path": "fresh.txt", "content": new_body}), &cx)
             .await;
         assert!(!r.is_error(), "{r:?}");
 
@@ -1298,15 +1414,16 @@ mod tests {
         //    the previous bytes.
         let overwrite = "third contents\n";
         let r = FileWrite
-            .call(
-                json!({"file_path": "fresh.txt", "content": overwrite}),
-                &cx,
-            )
+            .call(json!({"file_path": "fresh.txt", "content": overwrite}), &cx)
             .await;
         assert!(!r.is_error(), "{r:?}");
 
         let events = cx.edits.lock().unwrap().drain();
-        assert_eq!(events.len(), 3, "expected one event per mutation: {events:?}");
+        assert_eq!(
+            events.len(),
+            3,
+            "expected one event per mutation: {events:?}"
+        );
 
         let expected_path = root.join("fresh.txt");
         let empty_sha = sha256_hex(b"");
@@ -1317,7 +1434,10 @@ mod tests {
 
         // (a) fresh file_write
         assert_eq!(events[0].path, expected_path);
-        assert!(events[0].pre_image.is_empty(), "fresh write: empty pre-image");
+        assert!(
+            events[0].pre_image.is_empty(),
+            "fresh write: empty pre-image"
+        );
         assert_eq!(events[0].pre_sha256, empty_sha);
         assert_eq!(events[0].post_sha256, first_sha);
 

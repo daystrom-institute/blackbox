@@ -334,6 +334,14 @@ struct PersistedTask {
 
 impl TaskStore {
     pub fn persist(&self, store_dir: &std::path::Path) {
+        self.persist_with_event_limit(store_dir, MAX_PERSISTED_EVENTS);
+    }
+
+    pub fn persist_all_events(&self, store_dir: &std::path::Path) {
+        self.persist_with_event_limit(store_dir, usize::MAX);
+    }
+
+    fn persist_with_event_limit(&self, store_dir: &std::path::Path, event_limit: usize) {
         let records: Vec<PersistedTask> = self
             .tasks
             .values()
@@ -347,7 +355,7 @@ impl TaskStore {
                         .events
                         .iter()
                         .rev()
-                        .take(MAX_PERSISTED_EVENTS)
+                        .take(event_limit)
                         .rev()
                         .cloned()
                         .collect(),
@@ -2185,8 +2193,7 @@ pub fn task_result_json(task: &Task) -> Value {
             });
             if u.cached_input_tokens > 0 || u.cache_creation_input_tokens > 0 {
                 usage["cached_input_tokens"] = Value::from(u.cached_input_tokens);
-                usage["cache_creation_input_tokens"] =
-                    Value::from(u.cache_creation_input_tokens);
+                usage["cache_creation_input_tokens"] = Value::from(u.cache_creation_input_tokens);
                 usage["total_input_tokens"] = Value::from(u.total_input_tokens());
             }
             obj["usage"] = usage;
@@ -2385,6 +2392,47 @@ mod tests {
         }
     }
 
+    fn persisted_event_count_after<F>(events: Vec<Value>, persist: F) -> usize
+    where
+        F: FnOnce(&TaskStore, &std::path::Path),
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = TaskStore::new();
+        store
+            .insert(
+                "t".into(),
+                Arc::new(task_with(TaskStatus::Failed, "", events)),
+            )
+            .unwrap();
+
+        persist(&store, &root);
+
+        TaskStore::load(&root, u64::MAX)
+            .get("t")
+            .unwrap()
+            .inner
+            .lock()
+            .events
+            .len()
+    }
+
+    #[test]
+    fn task_store_default_persist_caps_events_but_full_persist_keeps_history() {
+        let events: Vec<Value> = (0..60)
+            .map(|idx| serde_json::json!({"type": "assistant", "idx": idx}))
+            .collect();
+
+        assert_eq!(
+            persisted_event_count_after(events.clone(), |store, root| store.persist(root)),
+            MAX_PERSISTED_EVENTS
+        );
+        assert_eq!(
+            persisted_event_count_after(events, |store, root| store.persist_all_events(root)),
+            60
+        );
+    }
+
     #[test]
     fn status_surfaces_stderr_tail_on_silent_failure() {
         // The bug this guards: a harness that bails before any stdout left
@@ -2397,10 +2445,7 @@ mod tests {
         let json = task_status_json(&failed, 0);
         assert_eq!(json["eventCount"], 0);
         assert!(
-            json["stderrTail"]
-                .as_str()
-                .unwrap()
-                .contains("no --model"),
+            json["stderrTail"].as_str().unwrap().contains("no --model"),
             "failed task must surface the stderr reason, got {json}"
         );
     }

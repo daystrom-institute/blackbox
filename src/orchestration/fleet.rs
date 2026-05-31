@@ -36,12 +36,12 @@ use super::{Task, TaskStore, spawn_task, spawn_task_interactive};
 // cockpit handles agents through the opaque [`AgentHandle`] and reads state via
 // [`TaskSnapshot`], so the crate-private `TaskInner` (and its private-typed
 // fields) never leak into the public API.
+pub use super::TaskStatus;
 pub use super::providers::Provider;
 pub use super::tail::TailEvent;
-pub use super::TaskStatus;
 
-/// TUI-local fleet config — `$XDG_CONFIG_HOME/blackbox/fleet.json`, alongside
-/// the daemon's `config.toml` but read entirely daemon-free. Deliberately
+/// TUI-local fleet config — `fleet.json` beside the selected blackbox
+/// `config.toml` but read entirely daemon-free. Deliberately
 /// **not** the bbox project registry or the daemon's `mcp.json`: those drag in
 /// the daemon plus per-project indexing, inappropriate for the cockpit.
 ///
@@ -103,7 +103,12 @@ impl ClassifierConfig {
     /// Bidi provider the classifier runs on (default Claude). Non-bidi or
     /// unknown names collapse to Claude — the classifier MUST be steerable.
     pub fn provider_resolved(&self) -> Provider {
-        match self.provider.as_deref().map(str::to_ascii_lowercase).as_deref() {
+        match self
+            .provider
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("glm") => Provider::Glm,
             Some("deepseek") | Some("ds") => Provider::Deepseek,
             Some("brodex") | Some("bdx") => Provider::Brodex,
@@ -167,10 +172,12 @@ disagree or ignore it. Turns without that prefix are your actual operator direct
 }
 
 impl FleetConfig {
-    /// `$XDG_CONFIG_HOME/blackbox/fleet.json`. `None` only when no config dir
-    /// resolves (matches `config::default_config_path`'s base).
+    /// `fleet.json` beside the selected `config.toml`. This intentionally
+    /// honors `BLACKBOX_CONFIG`; macOS' `dirs::config_dir()` points at
+    /// `~/Library/Application Support`, while many operators set
+    /// `BLACKBOX_CONFIG` or use a dot-config file.
     pub fn path() -> Option<PathBuf> {
-        dirs::config_dir().map(|d| d.join("blackbox").join("fleet.json"))
+        crate::config::selected_config_path().and_then(|p| p.parent().map(|d| d.join("fleet.json")))
     }
 
     /// Best-effort load: a missing file is an empty config; a malformed file is
@@ -241,18 +248,24 @@ pub struct ResumeSpec {
     pub prompt: String,
     pub cwd: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub name: Option<String>,
     pub env_overrides: Option<HashMap<String, String>>,
 }
 
 impl ResumeSpec {
-    pub fn new(provider: Provider, session_id: impl Into<String>, prompt: impl Into<String>) -> Self {
+    pub fn new(
+        provider: Provider,
+        session_id: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> Self {
         Self {
             provider,
             session_id: session_id.into(),
             prompt: prompt.into(),
             cwd: None,
             model: None,
+            effort: None,
             name: None,
             env_overrides: None,
         }
@@ -457,11 +470,13 @@ pub fn parse_transcript(events: &[Value]) -> Vec<TranscriptItem> {
 
 /// A `user` event is either an operator steer (string / text-block content) or
 /// a tool_result echo (tool_result blocks).
-fn parse_user_event(e: &Value, out: &mut Vec<TranscriptItem>, tool_names: &HashMap<String, String>) {
+fn parse_user_event(
+    e: &Value,
+    out: &mut Vec<TranscriptItem>,
+    tool_names: &HashMap<String, String>,
+) {
     match &e["message"]["content"] {
-        Value::String(s) if !s.trim().is_empty() => {
-            out.push(TranscriptItem::UserSteer(s.clone()))
-        }
+        Value::String(s) if !s.trim().is_empty() => out.push(TranscriptItem::UserSteer(s.clone())),
         Value::Array(blocks) => {
             let mut steer = String::new();
             for b in blocks {
@@ -727,7 +742,7 @@ impl FleetOrchestrator {
     /// reload these sessions. The cockpit calls this after each dispatch and on
     /// quit (spawn_task only persists at task-terminal on its own).
     pub fn persist(&self) {
-        self.task_store.read().persist(&self.store_dir);
+        self.task_store.read().persist_all_events(&self.store_dir);
     }
 
     /// Subscribe to the tail stream. Each call returns an independent receiver;
@@ -843,7 +858,7 @@ impl FleetOrchestrator {
         let task_id = uuid::Uuid::new_v4().to_string();
         let opts = ExecOpts {
             model: spec.model.clone(),
-            effort: None,
+            effort: spec.effort.clone(),
             provider_defaults: None,
         };
         let mut args = spec
@@ -875,9 +890,7 @@ impl FleetOrchestrator {
     /// Interrupted task, or on Ctrl+X delete, so a reload doesn't show it). The
     /// underlying provider session jsonl survives on disk regardless (§5).
     pub fn forget(&self, task_id: &str) {
-        self.task_store
-            .write()
-            .retain_drop(|t| t.id() != task_id);
+        self.task_store.write().retain_drop(|t| t.id() != task_id);
         self.persist();
     }
 
@@ -1158,7 +1171,9 @@ mod tests {
     fn transcript_parses_envelope() {
         let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
         let events = vec![
-            ev(r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"go fix it"}}"#),
+            ev(
+                r#"{"type":"user","isReplay":true,"message":{"role":"user","content":"go fix it"}}"#,
+            ),
             ev(r#"{"type":"assistant","message":{"content":[
                 {"type":"thinking","thinking":"hmm"},
                 {"type":"text","text":"on it"},
@@ -1168,7 +1183,9 @@ mod tests {
                 {"type":"tool_result","tool_use_id":"t1","content":"file.txt","is_error":false}
             ]}}"#),
             ev(r#"{"type":"report","report":{"message":"need a key","needs_input":true}}"#),
-            ev(r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"}}"#),
+            ev(
+                r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"auto"}}"#,
+            ),
             ev(r#"{"type":"result","subtype":"success","num_turns":2,"total_cost_usd":0.01}"#),
         ];
         let items = parse_transcript(&events);
@@ -1183,7 +1200,10 @@ mod tests {
         ));
         assert!(matches!(
             &items[5],
-            TranscriptItem::Report { needs_input: true, .. }
+            TranscriptItem::Report {
+                needs_input: true,
+                ..
+            }
         ));
         assert!(matches!(
             &items[6],
@@ -1191,7 +1211,10 @@ mod tests {
         ));
         assert!(matches!(
             items[7],
-            TranscriptItem::TurnFooter { num_turns: Some(2), cost_usd: Some(_) }
+            TranscriptItem::TurnFooter {
+                num_turns: Some(2),
+                cost_usd: Some(_)
+            }
         ));
     }
 
@@ -1216,6 +1239,23 @@ mod tests {
         assert_eq!(c.min_activity_resolved(), 10);
         // Empty prompt falls back to the calibrated default.
         assert_eq!(c.resolved_prompt(), DEFAULT_CLASSIFIER_PROMPT);
+    }
+
+    #[test]
+    fn fleet_config_path_sits_next_to_selected_config() {
+        let _guard = crate::util::test_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().canonicalize().unwrap().join("custom.toml");
+        unsafe {
+            std::env::set_var("BLACKBOX_CONFIG", &config_path);
+        }
+        assert_eq!(
+            FleetConfig::path().as_deref(),
+            Some(config_path.with_file_name("fleet.json").as_path())
+        );
+        unsafe {
+            std::env::remove_var("BLACKBOX_CONFIG");
+        }
     }
 
     #[test]

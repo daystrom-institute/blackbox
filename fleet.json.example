@@ -6,6 +6,7 @@
     }
   },
   "classifier": {
+    "_comment": "Classifier mode is enabled by the presence of this object. Copy this file to $XDG_CONFIG_HOME/blackbox/fleet.json to validate the classifier activity strip in bro fleet.",
     "provider": "claude",
     "model": "sonnet",
     "cadence_secs": 5,

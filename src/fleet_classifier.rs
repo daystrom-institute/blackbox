@@ -27,8 +27,6 @@ use blackbox::fleet::{
 /// One surfaced classifier suggestion, sent from a monitor task to the TUI loop.
 #[derive(Debug, Clone)]
 pub struct ClassifierNote {
-    /// Task id of the executor this suggestion is about (the roster key).
-    pub executor_id: String,
     /// The one-line suggestion text (without the `SUGGEST:` / `[INTERN]` tags).
     pub text: String,
     /// Whether it was also relayed into the executor (auto_send + executor idle).
@@ -47,7 +45,7 @@ pub fn spawn_monitor(
     executor_name: String,
     cfg: ClassifierConfig,
     note_tx: mpsc::Sender<ClassifierNote>,
-) {
+) -> AgentHandle {
     let cadence = Duration::from_secs(cfg.cadence_secs_resolved());
     let auto_send = cfg.auto_send_resolved();
     let min_activity = cfg.min_activity_resolved() as usize;
@@ -60,7 +58,7 @@ pub fn spawn_monitor(
     spec.cwd = executor.snapshot().cwd;
     spec.name = Some(format!("{CLASSIFIER_NAME_PREFIX}{executor_name}"));
     let classifier = orch.dispatch(spec);
-    let executor_id = executor.id();
+    let classifier_for_monitor = classifier.clone();
 
     rt.spawn(async move {
         let mut executor_items_seen = 0usize;
@@ -90,11 +88,11 @@ pub fn spawn_monitor(
             }
 
             // Hand the activity delta to the classifier and read its verdict.
-            let seen_before = classifier.transcript().len();
-            if classifier.send_user_turn(&delta).await.is_err() {
+            let seen_before = classifier_for_monitor.transcript().len();
+            if classifier_for_monitor.send_user_turn(&delta).await.is_err() {
                 break; // companion pipe gone
             }
-            let Some(reply) = wait_for_reply(&classifier, seen_before).await else {
+            let Some(reply) = wait_for_reply(&classifier_for_monitor, seen_before).await else {
                 continue;
             };
             let Some(suggestion) = parse_suggest(&reply) else {
@@ -121,7 +119,6 @@ pub fn spawn_monitor(
 
             if note_tx
                 .send(ClassifierNote {
-                    executor_id: executor_id.clone(),
                     text: suggestion,
                     auto_sent,
                     at_ms: now_ms(),
@@ -133,8 +130,10 @@ pub fn spawn_monitor(
         }
 
         // Stop the hidden companion when we stop watching.
-        let _ = orch.stop(&classifier);
+        let _ = orch.stop(&classifier_for_monitor);
     });
+
+    classifier
 }
 
 fn is_terminal(status: TaskStatus) -> bool {

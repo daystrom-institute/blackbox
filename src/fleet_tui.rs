@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, MouseEvent, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -47,8 +47,10 @@ use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
 /// Roster name = first N chars of the initial user turn (no LLM summarization,
 /// §5). Renamable via `Ctrl+R` (not yet wired in this skeleton).
 const NAME_LEN: usize = 36;
-const PROVIDER_SEL_WIDTH: u16 = 22;
+const PROVIDER_SEL_WIDTH: u16 = 38;
 const COMPOSER_HEIGHT: u16 = 3;
+const COMPOSER_MAX_HEIGHT: u16 = 10;
+const TOOL_CALL_GLYPH: &str = "▸";
 
 // ── Fleet state taxonomy (§5 state model) ────────────────────────────────
 
@@ -107,7 +109,11 @@ impl FleetState {
 /// so it holds the live `Arc<Task>` handle and derives display state from it.
 struct Agent {
     task: AgentHandle,
+    classifier: Option<AgentHandle>,
     provider: Provider,
+    selected_model: Option<String>,
+    selected_effort: Option<String>,
+    selected_cwd: Option<String>,
     /// Display name: first N chars of the initial prompt, renamable (§5).
     name: String,
     /// The initial dispatch prompt + every subsequent steer (§5.3). Recallable
@@ -118,9 +124,12 @@ struct Agent {
 /// Snapshot of a task's live fields, read under one lock per draw.
 struct AgentView {
     state: FleetState,
+    turn_active: bool,
+    needs_input: bool,
     model: Option<String>,
     cwd: Option<String>,
     cost: Option<f64>,
+    report_message: Option<String>,
     turns: Option<u64>,
     started_at: u64,
     last_activity_ms: Option<u64>,
@@ -130,20 +139,7 @@ struct AgentView {
 impl Agent {
     fn view(&self) -> AgentView {
         let snap = self.task.snapshot();
-        let state = match snap.status {
-            // While the process stays Running (the steady state for a persistent
-            // bidi session), the live distinction comes from the event stream:
-            // a turn in flight is Active; finished-but-blocked is Waiting;
-            // finished-and-free is Idle. Alerting (supervision loop/stall/burn)
-            // is a follow-on, not yet derived.
-            TaskStatus::Running if snap.turn_active => FleetState::Active,
-            TaskStatus::Running if snap.needs_input => FleetState::Waiting,
-            TaskStatus::Running => FleetState::Idle,
-            // Process exit: a one-shot agent or a closed session rests at Idle
-            // (an entrypoint agent never self-completes; §5 "No Done").
-            TaskStatus::Completed => FleetState::Idle,
-            TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
-        };
+        let state = fleet_state_from_snapshot(snap.status, snap.turn_active, snap.needs_input);
         let stderr_tail = if matches!(state, FleetState::Interrupted) && !snap.stderr.is_empty() {
             Some(last_line(&snap.stderr))
         } else {
@@ -151,14 +147,38 @@ impl Agent {
         };
         AgentView {
             state,
+            turn_active: snap.turn_active,
+            needs_input: snap.needs_input,
             model: snap.model,
             cwd: snap.cwd,
             cost: snap.cost_usd,
+            report_message: snap.report_message,
             turns: snap.num_turns,
             started_at: snap.started_at,
             last_activity_ms: snap.last_event_at_ms,
             stderr_tail,
         }
+    }
+}
+
+fn fleet_state_from_snapshot(
+    status: TaskStatus,
+    turn_active: bool,
+    needs_input: bool,
+) -> FleetState {
+    match status {
+        // While the process stays Running (the steady state for a persistent
+        // bidi session), the live distinction comes from the event stream:
+        // a turn in flight is Active; finished-but-blocked is Waiting;
+        // finished-and-free is Idle. Alerting (supervision loop/stall/burn)
+        // is a follow-on, not yet derived.
+        TaskStatus::Running if turn_active => FleetState::Active,
+        TaskStatus::Running if needs_input => FleetState::Waiting,
+        TaskStatus::Running => FleetState::Idle,
+        // Process exit: a one-shot agent or a closed session rests at Idle
+        // (an entrypoint agent never self-completes; §5 "No Done").
+        TaskStatus::Completed => FleetState::Idle,
+        TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
     }
 }
 
@@ -174,6 +194,7 @@ const FLEET_PROVIDERS: &[Provider] = &[
     Provider::Deepseek,
     Provider::Brodex,
 ];
+const DEFAULT_FLEET_PROVIDER: Provider = Provider::Brodex;
 
 // ── Zoom axis (§5.1) ──────────────────────────────────────────────────────
 
@@ -201,6 +222,9 @@ struct App {
     provider_cursor: usize,
     /// Sticky-next provider — applies to the next dispatch only (§4).
     next_provider: Provider,
+    /// Sticky-next model and effort, scoped to [`next_provider`].
+    next_model: Option<String>,
+    next_effort: Option<String>,
     /// Flash the title-bar `next:` value (yellow) until this instant, after the
     /// provider is cycled — instead of a duplicate status message.
     provider_flash_until: Option<Instant>,
@@ -221,6 +245,8 @@ struct App {
     /// 0 = pinned to bottom; >0 = N rows above bottom (single-agent view).
     scroll_from_bottom: usize,
     cached_total_lines: usize,
+    transcript_y_range: Option<(u16, u16)>,
+    last_transcript_height: u16,
 
     status: Option<String>,
     status_until: Option<Instant>,
@@ -230,13 +256,19 @@ struct App {
     /// methods are async; the TUI loop is sync) off the blocking loop.
     rt: tokio::runtime::Handle,
 
-    /// Surfaced classifier ("intern") suggestions, keyed by executor task id.
-    /// Empty unless `fleet.json` enabled the classifier companion.
-    classifier_notes: HashMap<String, Vec<ClassifierNote>>,
     /// Cloned per spawned monitor; monitors push suggestions here.
     classifier_tx: mpsc::Sender<ClassifierNote>,
-    /// Drained into `classifier_notes` each tick.
+    /// Drained each tick into a transient status flash.
     classifier_rx: mpsc::Receiver<ClassifierNote>,
+    /// Local clocks for the focused executor/classifier activity strip.
+    activity_clocks: HashMap<String, ActivityClock>,
+    activity_frame: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActivityClock {
+    active_since_ms: Option<u64>,
+    last_duration_ms: Option<u64>,
 }
 
 impl App {
@@ -246,13 +278,16 @@ impl App {
         rt: tokio::runtime::Handle,
     ) -> Self {
         let (classifier_tx, classifier_rx) = mpsc::channel();
+        let default_provider = DEFAULT_FLEET_PROVIDER;
         Self {
             orch,
             agents: Vec::new(),
             zone: Zone::Roster,
             roster_selected: 0,
-            provider_cursor: 0,
-            next_provider: Provider::Claude,
+            provider_cursor: default_fleet_provider_cursor(),
+            next_provider: default_provider,
+            next_model: default_model_for(default_provider).map(str::to_string),
+            next_effort: default_effort_for(default_provider).map(str::to_string),
             provider_flash_until: None,
             slash_cursor: 0,
             collapsed: HashSet::new(),
@@ -262,27 +297,30 @@ impl App {
             rename_target: None,
             scroll_from_bottom: 0,
             cached_total_lines: 0,
+            transcript_y_range: None,
+            last_transcript_height: 0,
             status: None,
             status_until: None,
             quit: false,
             rt,
-            classifier_notes: HashMap::new(),
             classifier_tx,
             classifier_rx,
+            activity_clocks: HashMap::new(),
+            activity_frame: 0,
         }
     }
 
-    /// Record a classifier suggestion against its executor and flash it.
+    /// Flash a classifier suggestion without retaining a noisy backlog.
     fn ingest_classifier_note(&mut self, note: ClassifierNote) {
-        let tag = if note.auto_sent { "✻ intern (sent)" } else { "✻ intern" };
+        let tag = if note.auto_sent {
+            "✻ intern (sent)"
+        } else {
+            "✻ intern"
+        };
         self.set_status(
             format!("{tag}: {}", truncate(&note.text, 60)),
             Duration::from_secs(6),
         );
-        self.classifier_notes
-            .entry(note.executor_id.clone())
-            .or_default()
-            .push(note);
     }
 
     fn set_status(&mut self, msg: impl Into<String>, ttl: Duration) {
@@ -352,12 +390,14 @@ impl App {
 
         let mut spec = DispatchSpec::new(self.next_provider, dispatch_prompt);
         spec.cwd = self.launch_cwd.clone();
+        spec.model = self.next_model.clone();
+        spec.effort = self.next_effort.clone();
         spec.name = Some(name.clone());
         let task = self.orch.dispatch(spec);
         let id = task.id();
 
         // Spawn the watching intern for this executor.
-        if let Some(cfg) = classifier_cfg {
+        let classifier = classifier_cfg.map(|cfg| {
             spawn_monitor(
                 &self.rt,
                 self.orch.clone(),
@@ -365,12 +405,16 @@ impl App {
                 name.clone(),
                 cfg,
                 self.classifier_tx.clone(),
-            );
-        }
+            )
+        });
 
         self.agents.push(Agent {
             task,
+            classifier,
             provider: self.next_provider,
+            selected_model: self.next_model.clone(),
+            selected_effort: self.next_effort.clone(),
+            selected_cwd: self.launch_cwd.clone().or_else(current_dir_string),
             name,
             // Display the operator's own prompt, not the rider-wrapped first turn.
             input_history: vec![prompt],
@@ -379,7 +423,11 @@ impl App {
         // Persist so the session is recoverable even before it terminates.
         self.orch.persist();
         self.set_status(
-            format!("dispatched {} agent {}", self.next_provider, &id[..8.min(id.len())]),
+            format!(
+                "dispatched {} agent {}",
+                self.next_provider,
+                &id[..8.min(id.len())]
+            ),
             Duration::from_secs(3),
         );
     }
@@ -391,6 +439,83 @@ fn bucket_rank(state: FleetState) -> usize {
         .iter()
         .position(|b| *b == state)
         .unwrap_or(usize::MAX)
+}
+
+fn default_model_for(provider: Provider) -> Option<&'static str> {
+    provider
+        .models()
+        .iter()
+        .find(|m| m.default)
+        .or_else(|| provider.models().first())
+        .map(|m| m.id)
+}
+
+fn default_effort_for(provider: Provider) -> Option<&'static str> {
+    provider
+        .efforts()
+        .iter()
+        .find(|e| e.id == "high")
+        .or_else(|| provider.efforts().iter().find(|e| e.default))
+        .or_else(|| provider.efforts().first())
+        .map(|e| e.id)
+}
+
+fn default_fleet_provider_cursor() -> usize {
+    FLEET_PROVIDERS
+        .iter()
+        .position(|p| *p == DEFAULT_FLEET_PROVIDER)
+        .unwrap_or(0)
+}
+
+fn set_next_provider(app: &mut App, provider: Provider) {
+    app.next_provider = provider;
+    app.next_model = default_model_for(provider).map(str::to_string);
+    app.next_effort = default_effort_for(provider).map(str::to_string);
+}
+
+fn cycle_value(current: &mut Option<String>, values: &[&'static str]) -> Option<String> {
+    if values.is_empty() {
+        *current = None;
+        return None;
+    }
+    let idx = current
+        .as_deref()
+        .and_then(|v| values.iter().position(|id| *id == v))
+        .unwrap_or(0);
+    let next = values[(idx + 1) % values.len()].to_string();
+    *current = Some(next.clone());
+    Some(next)
+}
+
+fn choose_catalog_value(
+    arg: &str,
+    values: &[&'static str],
+    current: &mut Option<String>,
+) -> Result<String, String> {
+    if values.is_empty() {
+        return Err("no selectable values for this provider".into());
+    }
+    let trimmed = arg.trim();
+    if trimmed.is_empty() {
+        return cycle_value(current, values).ok_or_else(|| "no selectable values".into());
+    }
+    if let Some(exact) = values.iter().copied().find(|id| *id == trimmed) {
+        current.replace(exact.to_string());
+        return Ok(exact.to_string());
+    }
+    let matches: Vec<&str> = values
+        .iter()
+        .copied()
+        .filter(|id| id.contains(trimmed))
+        .collect();
+    match matches.as_slice() {
+        [one] => {
+            current.replace((*one).to_string());
+            Ok((*one).to_string())
+        }
+        [] => Err(format!("unknown value: {trimmed}")),
+        many => Err(format!("ambiguous: {}", many.join(", "))),
+    }
 }
 
 // ── Slash-command autocomplete (§5.1 slash carveout) ─────────────────────────
@@ -406,6 +531,14 @@ fn zone_slash_commands(zone: Zone) -> &'static [SlashCmd] {
     match zone {
         Zone::SingleAgent => &[
             SlashCmd {
+                name: "/model",
+                desc: "select model for this agent",
+            },
+            SlashCmd {
+                name: "/effort",
+                desc: "select effort for this agent",
+            },
+            SlashCmd {
                 name: "/compact",
                 desc: "summarize & compact the conversation",
             },
@@ -414,7 +547,16 @@ fn zone_slash_commands(zone: Zone) -> &'static [SlashCmd] {
                 desc: "rename this agent (TUI-local)",
             },
         ],
-        _ => &[],
+        _ => &[
+            SlashCmd {
+                name: "/model",
+                desc: "select model for next dispatch",
+            },
+            SlashCmd {
+                name: "/effort",
+                desc: "select effort for next dispatch",
+            },
+        ],
     }
 }
 
@@ -474,7 +616,11 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
         }
         app.agents.push(Agent {
             task: handle,
+            classifier: None,
             provider: snap.provider,
+            selected_model: snap.model.clone(),
+            selected_effort: None,
+            selected_cwd: snap.cwd.clone(),
             name,
             input_history: Vec::new(),
         });
@@ -512,13 +658,15 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
             terminal.draw(|f| draw(f, app))?;
 
             if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key) = event::read()?
-                    && key.kind == KeyEventKind::Press
-                {
-                    handle_key(app, key);
-                    if app.quit {
-                        break;
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        handle_key(app, key);
+                        if app.quit {
+                            break;
+                        }
                     }
+                    Event::Mouse(mouse) => handle_mouse(app, mouse),
+                    _ => {}
                 }
             }
 
@@ -526,7 +674,7 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
                 handle_tail(app, ev);
             }
             // Drain classifier suggestions (collect first to avoid borrowing
-            // app.classifier_rx while mutating app.classifier_notes).
+            // app.classifier_rx while mutating app for the status flash).
             let mut notes = Vec::new();
             while let Ok(note) = app.classifier_rx.try_recv() {
                 notes.push(note);
@@ -535,6 +683,7 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
                 app.ingest_classifier_note(note);
             }
             app.maybe_clear_status();
+            app.activity_frame = app.activity_frame.wrapping_add(1);
         }
         Ok(())
     })();
@@ -548,6 +697,31 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
     result
 }
 
+fn handle_mouse(app: &mut App, mouse: MouseEvent) {
+    if app.zone != Zone::SingleAgent {
+        return;
+    }
+    let Some((top, bottom)) = app.transcript_y_range else {
+        return;
+    };
+    if mouse.row < top || mouse.row >= bottom {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::ScrollUp => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(3);
+        }
+        MouseEventKind::ScrollDown => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(3);
+        }
+        _ => {}
+    }
+}
+
+fn page_scroll_step(app: &App) -> usize {
+    app.last_transcript_height.saturating_sub(2).max(1) as usize
+}
+
 fn handle_tail(app: &mut App, ev: TailEvent) {
     match ev {
         TailEvent::TaskCompleted { cost, .. } => {
@@ -555,7 +729,10 @@ fn handle_tail(app: &mut App, ev: TailEvent) {
             app.set_status(format!("agent finished{c}"), Duration::from_secs(4));
         }
         TailEvent::TaskFailed { error, .. } => {
-            app.set_status(format!("agent failed: {}", first_line(&error)), Duration::from_secs(6));
+            app.set_status(
+                format!("agent failed: {}", first_line(&error)),
+                Duration::from_secs(6),
+            );
         }
         _ => {}
     }
@@ -565,6 +742,8 @@ fn handle_tail(app: &mut App, ev: TailEvent) {
 
 fn handle_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('q')) {
         app.quit = true;
@@ -621,18 +800,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 
         // Scroll the single-agent transcript when there's text in the composer
         // (arrows are claimed by editing, so scroll rides Ctrl).
-        KeyCode::Up if ctrl => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1)
+        KeyCode::Up if ctrl => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(1),
+        KeyCode::Down if ctrl => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1),
+        KeyCode::PageUp if app.zone == Zone::SingleAgent => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(page_scroll_step(app));
         }
-        KeyCode::Down if ctrl => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(1)
+        KeyCode::PageDown if app.zone == Zone::SingleAgent => {
+            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(page_scroll_step(app));
         }
-        KeyCode::PageUp => app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(10),
-        KeyCode::PageDown => app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(10),
+        KeyCode::Home if app.zone == Zone::SingleAgent => app.scroll_from_bottom = usize::MAX / 2,
+        KeyCode::End if app.zone == Zone::SingleAgent => app.scroll_from_bottom = 0,
 
-        KeyCode::Enter if !ctrl => submit(app),
+        KeyCode::Enter if shift || ctrl => app.input.push('\n'),
         KeyCode::Char('j') if ctrl => app.input.push('\n'),
-        KeyCode::Enter if ctrl => app.input.push('\n'),
+        KeyCode::Enter => submit(app),
+
+        KeyCode::Backspace if ctrl || alt => delete_previous_word(app),
+        KeyCode::Char('w') if ctrl => delete_previous_word(app),
 
         KeyCode::Backspace => {
             app.input.pop();
@@ -653,6 +837,23 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn delete_previous_word(app: &mut App) {
+    delete_previous_word_text(&mut app.input);
+    app.slash_cursor = 0;
+    if app.input.is_empty() {
+        app.history_cursor = None;
+    }
+}
+
+fn delete_previous_word_text(input: &mut String) {
+    while input.ends_with(char::is_whitespace) {
+        input.pop();
+    }
+    while input.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+        input.pop();
+    }
+}
+
 /// Ctrl+X on the selected agent: a live one is stopped (→ Interrupted); an
 /// already-Interrupted one is deleted from the roster. The provider session
 /// survives on disk either way (§5).
@@ -668,6 +869,9 @@ fn stop_or_delete_selected(app: &mut App) {
         // treated as non-live (a later steer resumes it).
         match app.orch.stop(&app.agents[idx].task) {
             Ok(()) => {
+                if let Some(classifier) = &app.agents[idx].classifier {
+                    let _ = app.orch.stop(classifier);
+                }
                 app.agents[idx].task = app.agents[idx].task.without_stdin();
                 app.set_status("stopped — Ctrl+X again to delete", Duration::from_secs(3));
             }
@@ -677,6 +881,14 @@ fn stop_or_delete_selected(app: &mut App) {
         // Delete: forget the cockpit's task record + drop the row. The provider
         // session jsonl persists for a future resume.
         let id = app.agents[idx].task.id();
+        if let Some(classifier) = &app.agents[idx].classifier {
+            let classifier_id = classifier.id();
+            let _ = app.orch.stop(classifier);
+            app.orch.forget(&classifier_id);
+            app.activity_clocks
+                .remove(&activity_key("classifier", &classifier_id));
+        }
+        app.activity_clocks.remove(&activity_key("agent", &id));
         app.orch.forget(&id);
         app.agents.remove(idx);
         let n = app.agents.len();
@@ -686,7 +898,10 @@ fn stop_or_delete_selected(app: &mut App) {
         if app.zone == Zone::SingleAgent {
             app.zone = Zone::Roster;
         }
-        app.set_status("deleted from roster (session kept on disk)", Duration::from_secs(3));
+        app.set_status(
+            "deleted from roster (session kept on disk)",
+            Duration::from_secs(3),
+        );
     }
 }
 
@@ -718,6 +933,9 @@ fn submit(app: &mut App) {
     if app.input.trim().is_empty() {
         return;
     }
+    if run_local_slash(app) {
+        return;
+    }
     match app.zone {
         // Single-agent view: `/rename <name>` is TUI-local; everything else
         // (including `/compact`) steers the live session — a user-turn into the
@@ -740,6 +958,115 @@ fn submit(app: &mut App) {
         // stays on the roster — you watch it surface in its bucket (§5).
         Zone::Roster | Zone::ProviderSelector => app.dispatch_current_input(),
     }
+}
+
+fn run_local_slash(app: &mut App) -> bool {
+    let input = app.input.trim().to_string();
+    let (cmd, arg) = input.split_once(' ').unwrap_or((input.as_str(), ""));
+    match cmd {
+        "/model" => {
+            select_model(app, arg);
+            true
+        }
+        "/effort" => {
+            select_effort(app, arg);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn select_model(app: &mut App, arg: &str) {
+    let provider = match app.zone {
+        Zone::SingleAgent => app
+            .selected_agent()
+            .map(|idx| app.agents[idx].provider)
+            .unwrap_or(app.next_provider),
+        _ => app.next_provider,
+    };
+    let values: Vec<&'static str> = provider.models().iter().map(|m| m.id).collect();
+    let mut current = match app.zone {
+        Zone::SingleAgent => app
+            .selected_agent()
+            .and_then(|idx| app.agents[idx].selected_model.clone()),
+        _ => app.next_model.clone(),
+    };
+    let selected = match choose_catalog_value(arg, &values, &mut current) {
+        Ok(value) => value,
+        Err(e) => {
+            app.set_status(format!("model: {e}"), Duration::from_secs(4));
+            return;
+        }
+    };
+
+    match app.zone {
+        Zone::SingleAgent => {
+            if let Some(idx) = app.selected_agent() {
+                app.agents[idx].selected_model = Some(selected.clone());
+                let handle = app.agents[idx].task.clone();
+                if handle.can_steer() {
+                    let model = selected.clone();
+                    app.rt.spawn(async move {
+                        if let Err(e) = handle.set_model(&model).await {
+                            tracing::warn!("fleet set_model failed: {e:#}");
+                        }
+                    });
+                    app.set_status(format!("model → {selected}"), Duration::from_secs(3));
+                } else {
+                    app.set_status(
+                        format!("model → {selected} (next resume)"),
+                        Duration::from_secs(3),
+                    );
+                }
+            }
+        }
+        _ => {
+            app.next_model = Some(selected.clone());
+            app.set_status(format!("next model → {selected}"), Duration::from_secs(3));
+        }
+    }
+    app.input.clear();
+}
+
+fn select_effort(app: &mut App, arg: &str) {
+    let provider = match app.zone {
+        Zone::SingleAgent => app
+            .selected_agent()
+            .map(|idx| app.agents[idx].provider)
+            .unwrap_or(app.next_provider),
+        _ => app.next_provider,
+    };
+    let values: Vec<&'static str> = provider.efforts().iter().map(|e| e.id).collect();
+    let mut current = match app.zone {
+        Zone::SingleAgent => app
+            .selected_agent()
+            .and_then(|idx| app.agents[idx].selected_effort.clone()),
+        _ => app.next_effort.clone(),
+    };
+    let selected = match choose_catalog_value(arg, &values, &mut current) {
+        Ok(value) => value,
+        Err(e) => {
+            app.set_status(format!("effort: {e}"), Duration::from_secs(4));
+            return;
+        }
+    };
+
+    match app.zone {
+        Zone::SingleAgent => {
+            if let Some(idx) = app.selected_agent() {
+                app.agents[idx].selected_effort = Some(selected.clone());
+            }
+            app.set_status(
+                format!("effort → {selected} (next launch/resume)"),
+                Duration::from_secs(3),
+            );
+        }
+        _ => {
+            app.next_effort = Some(selected.clone());
+            app.set_status(format!("next effort → {selected}"), Duration::from_secs(3));
+        }
+    }
+    app.input.clear();
 }
 
 /// Send the composer text into the focused agent. A live session takes it as a
@@ -788,12 +1115,14 @@ fn resume_selected(app: &mut App, idx: usize) {
 
     let mut spec = ResumeSpec::new(app.agents[idx].provider, snap.session_id, text.clone());
     spec.cwd = snap.cwd;
-    spec.model = snap.model;
+    spec.model = app.agents[idx].selected_model.clone().or(snap.model);
+    spec.effort = app.agents[idx].selected_effort.clone();
     spec.name = Some(app.agents[idx].name.clone());
     let handle = app.orch.resume(spec);
 
     app.orch.forget(&old_id); // drop the stale Interrupted task
     app.agents[idx].task = handle;
+    app.agents[idx].classifier = None;
     app.agents[idx].input_history.push(text);
     app.orch.persist();
     app.set_status("resumed session", Duration::from_secs(3));
@@ -829,7 +1158,7 @@ fn zoom_right(app: &mut App) {
     match app.zone {
         Zone::ProviderSelector => {
             // confirm sticky-next, return to roster
-            app.next_provider = FLEET_PROVIDERS[app.provider_cursor];
+            set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
             app.flash_provider();
             app.zone = Zone::Roster;
         }
@@ -850,6 +1179,7 @@ fn vertical(app: &mut App, delta: isize) {
             let n = FLEET_PROVIDERS.len() as isize;
             let cur = app.provider_cursor as isize;
             app.provider_cursor = (((cur + delta) % n + n) % n) as usize;
+            set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
         }
         Zone::Roster => {
             let n = app.agents.len();
@@ -867,7 +1197,7 @@ fn cycle_provider(app: &mut App, delta: isize) {
     let n = FLEET_PROVIDERS.len() as isize;
     let cur = app.provider_cursor as isize;
     app.provider_cursor = (((cur + delta) % n + n) % n) as usize;
-    app.next_provider = FLEET_PROVIDERS[app.provider_cursor];
+    set_next_provider(app, FLEET_PROVIDERS[app.provider_cursor]);
     // Flash the title-bar `next:` value instead of a duplicate status line.
     app.flash_provider();
 }
@@ -897,36 +1227,47 @@ fn recall_history(app: &mut App, delta: isize) {
 // ── Drawing ──────────────────────────────────────────────────────────────────
 
 fn draw(f: &mut Frame, app: &mut App) {
+    let single_agent = app.zone == Zone::SingleAgent;
+    let composer_height = composer_height(app, f.area());
+    let constraints = if single_agent {
+        vec![
+            Constraint::Min(0),                  // transcript
+            Constraint::Length(composer_height), // composer
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),               // title
+            Constraint::Min(0),                  // body
+            Constraint::Length(composer_height), // composer
+            Constraint::Length(1),               // help
+        ]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),                 // title
-            Constraint::Min(0),                    // body
-            Constraint::Length(COMPOSER_HEIGHT),   // composer
-            Constraint::Length(1),                 // help
-        ])
+        .constraints(constraints)
         .split(f.area());
 
     let (views, order) = app.ordered_agents();
-    draw_title(f, chunks[0], app, &views);
-    // Per-agent stats live on the help line, directly under the composer (not
-    // atop the transcript), in the single-agent view.
-    let stats = if app.zone == Zone::SingleAgent {
-        order
-            .get(app.roster_selected)
-            .map(|&idx| agent_stats_line(&app.agents[idx], &views[idx]))
+
+    if single_agent {
+        draw_single_agent(f, chunks[0], app, &views);
+        let activity_title = Line::from(selected_activity_spans(app, &views, &order));
+        let top_title = app.rename_target.is_none().then_some(activity_title);
+        let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
+        draw_composer(f, chunks[1], app, top_title, bottom_title);
+        if slash_active(app) {
+            draw_slash_menu(f, chunks[1], app);
+        }
     } else {
-        None
-    };
-    match app.zone {
-        Zone::SingleAgent => draw_single_agent(f, chunks[1], app, &views),
-        _ => draw_roster_body(f, chunks[1], app, &views, &order),
-    }
-    draw_composer(f, chunks[2], app);
-    draw_help(f, chunks[3], app, stats.as_deref());
-    // Slash-command menu overlays just above the composer when active (§5.1).
-    if slash_active(app) {
-        draw_slash_menu(f, chunks[2], app);
+        app.transcript_y_range = None;
+        app.last_transcript_height = 0;
+        draw_title(f, chunks[0], app, &views);
+        draw_roster_body(f, chunks[1], app, &views, &order);
+        draw_composer(f, chunks[2], app, None, None);
+        draw_help(f, chunks[3], app);
+        if slash_active(app) {
+            draw_slash_menu(f, chunks[2], app);
+        }
     }
 }
 
@@ -952,7 +1293,9 @@ fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
             ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{:<10}", c.name),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(c.desc.to_string(), Style::default().fg(Color::DarkGray)),
             ]))
@@ -974,22 +1317,6 @@ fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-/// One-line per-agent stats for the help row under the composer.
-fn agent_stats_line(a: &Agent, v: &AgentView) -> String {
-    let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
-    let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
-    let model = v.model.clone().unwrap_or_else(|| "—".into());
-    let cwd = v.cwd.as_deref().map(path_tail).unwrap_or_else(|| "—".into());
-    format!(
-        "{} · {} · {} · {} turns · {}",
-        provider_tag(a.provider),
-        model,
-        cost,
-        turns,
-        cwd
-    )
-}
-
 /// Last two path components (keeps the cwd readable on one line).
 fn path_tail(p: &str) -> String {
     let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
@@ -1001,29 +1328,271 @@ fn path_tail(p: &str) -> String {
     tail
 }
 
+fn current_dir_string() -> Option<String> {
+    std::env::current_dir()
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
 fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
-    let active = views.iter().filter(|v| v.state == FleetState::Active).count();
-    let waiting = views.iter().filter(|v| v.state == FleetState::Waiting).count();
-    let spend: f64 = views.iter().filter_map(|v| v.cost).sum();
+    let (active, waiting, spend) = fleet_counts(views);
     // The `next:` provider flashes yellow briefly when cycled (the only place it
     // is shown — no duplicate status line).
-    let flashing = app
-        .provider_flash_until
-        .is_some_and(|t| Instant::now() < t);
+    let flashing = app.provider_flash_until.is_some_and(|t| Instant::now() < t);
     let next_style = if flashing {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
     let line = Line::from(vec![
         Span::styled(
             "fleet",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!(" · {active} active · {waiting} waiting · spend ${spend:.4}")),
-        Span::styled(format!("   next: {}", app.next_provider), next_style),
+        Span::raw(format!(
+            " · {active} active · {waiting} waiting · spend ${spend:.4}"
+        )),
+        Span::styled(format!("   next: {}", next_tuple(app)), next_style),
     ]);
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn fleet_counts(views: &[AgentView]) -> (usize, usize, f64) {
+    let active = views
+        .iter()
+        .filter(|v| v.state == FleetState::Active)
+        .count();
+    let waiting = views
+        .iter()
+        .filter(|v| v.state == FleetState::Waiting)
+        .count();
+    let spend = views.iter().filter_map(|v| v.cost).sum();
+    (active, waiting, spend)
+}
+
+fn selected_activity_spans(
+    app: &mut App,
+    views: &[AgentView],
+    order: &[usize],
+) -> Vec<Span<'static>> {
+    let Some(&idx) = order.get(app.roster_selected) else {
+        return vec![Span::styled(
+            "  ○ Agent idle   ·   ○ Classifier off  ",
+            Style::default().fg(Color::DarkGray),
+        )];
+    };
+    let now = now_ms_ui();
+    let agent = &app.agents[idx];
+    let agent_id = agent.task.id();
+    let classifier = agent.classifier.clone();
+    let v = &views[idx];
+    let agent_key = activity_key("agent", &agent_id);
+    let agent_clock = sync_activity_clock(&mut app.activity_clocks, agent_key, v.turn_active, now);
+
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(activity_segment(
+        "Agent",
+        ActivityRole::Agent,
+        v.state,
+        v.turn_active,
+        v.needs_input,
+        v.last_activity_ms,
+        &agent_clock,
+        now,
+        app.activity_frame,
+    ));
+
+    spans.push(Span::styled(
+        "   ·   ",
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    if let Some(classifier) = classifier {
+        let classifier_id = classifier.id();
+        let snap = classifier.snapshot();
+        let state = fleet_state_from_snapshot(snap.status, snap.turn_active, snap.needs_input);
+        let classifier_key = activity_key("classifier", &classifier_id);
+        let classifier_clock = sync_activity_clock(
+            &mut app.activity_clocks,
+            classifier_key,
+            snap.turn_active,
+            now,
+        );
+        spans.extend(activity_segment(
+            "Classifier",
+            ActivityRole::Classifier,
+            state,
+            snap.turn_active,
+            snap.needs_input,
+            snap.last_event_at_ms,
+            &classifier_clock,
+            now,
+            app.activity_frame,
+        ));
+    } else {
+        spans.push(Span::styled(
+            "○ Classifier off",
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+
+    spans.push(Span::raw("  "));
+    spans
+}
+
+fn single_agent_status_spans(
+    app: &App,
+    views: &[AgentView],
+    order: &[usize],
+) -> Vec<Span<'static>> {
+    let (active, waiting, _) = fleet_counts(views);
+    let mut spans = Vec::new();
+    let byline = Style::default().fg(Color::White);
+
+    if let Some(&idx) = order.get(app.roster_selected) {
+        let a = &app.agents[idx];
+        let v = &views[idx];
+        spans.push(Span::styled(format!("({})", provider_tuple(a, v)), byline));
+        if let Some(cwd) = v
+            .cwd
+            .as_deref()
+            .or(a.selected_cwd.as_deref())
+            .map(path_tail)
+        {
+            spans.push(Span::styled(format!(" - {cwd}"), byline));
+        }
+        spans.push(Span::styled(" - ", byline));
+    }
+
+    spans.push(Span::styled(
+        format!("{active} active - {waiting} waiting"),
+        byline,
+    ));
+    if let Some(status) = &app.status {
+        spans.push(Span::styled(" - ", byline));
+        spans.push(Span::styled(status.clone(), byline));
+    }
+    spans
+}
+
+fn provider_tuple(a: &Agent, v: &AgentView) -> String {
+    let model = a
+        .selected_model
+        .as_deref()
+        .or(v.model.as_deref())
+        .or_else(|| default_model_for(a.provider))
+        .unwrap_or("—");
+    match a
+        .selected_effort
+        .as_deref()
+        .or_else(|| default_effort_for(a.provider))
+    {
+        Some(effort) => format!("{} {model} {effort}", a.provider),
+        None => format!("{} {model}", a.provider),
+    }
+}
+
+fn next_tuple(app: &App) -> String {
+    let model = app
+        .next_model
+        .as_deref()
+        .or_else(|| default_model_for(app.next_provider))
+        .unwrap_or("—");
+    match app
+        .next_effort
+        .as_deref()
+        .or_else(|| default_effort_for(app.next_provider))
+    {
+        Some(effort) => format!("{} {model} {effort}", app.next_provider),
+        None => format!("{} {model}", app.next_provider),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ActivityRole {
+    Agent,
+    Classifier,
+}
+
+fn activity_key(role: &str, id: &str) -> String {
+    format!("{role}:{id}")
+}
+
+fn sync_activity_clock(
+    clocks: &mut HashMap<String, ActivityClock>,
+    key: String,
+    active: bool,
+    now_ms: u64,
+) -> ActivityClock {
+    let clock = clocks.entry(key).or_default();
+    match (active, clock.active_since_ms) {
+        (true, None) => clock.active_since_ms = Some(now_ms),
+        (false, Some(started)) => {
+            clock.last_duration_ms = Some(now_ms.saturating_sub(started));
+            clock.active_since_ms = None;
+        }
+        _ => {}
+    }
+    clock.clone()
+}
+
+fn activity_segment(
+    label: &str,
+    role: ActivityRole,
+    state: FleetState,
+    turn_active: bool,
+    needs_input: bool,
+    last_activity_ms: Option<u64>,
+    clock: &ActivityClock,
+    now_ms: u64,
+    frame: usize,
+) -> Vec<Span<'static>> {
+    let style = match role {
+        ActivityRole::Agent => Style::default().fg(Color::Cyan),
+        ActivityRole::Classifier => Style::default().fg(Color::Magenta),
+    };
+    let text = if turn_active {
+        let started = clock.active_since_ms.unwrap_or(now_ms);
+        format!(
+            "{} {label} working {}",
+            activity_spinner(role, frame),
+            duration_compact(now_ms.saturating_sub(started))
+        )
+    } else if needs_input || state == FleetState::Waiting {
+        format!(
+            "? {label} waiting {}",
+            since_compact(last_activity_ms, now_ms).unwrap_or_default()
+        )
+    } else if state == FleetState::Interrupted {
+        format!("↻ {label} interrupted")
+    } else if let Some(duration) = clock.last_duration_ms {
+        format!("✓ {label} complete took {}", duration_compact(duration))
+    } else {
+        format!(
+            "○ {label} idle{}",
+            since_compact(last_activity_ms, now_ms)
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default()
+        )
+    };
+    vec![Span::styled(text, style)]
+}
+
+fn activity_spinner(role: ActivityRole, frame: usize) -> &'static str {
+    const AGENT: [&str; 4] = ["✽", "✣", "✢", "✣"];
+    const CLASSIFIER: [&str; 4] = ["✻", "✶", "✷", "✶"];
+    match role {
+        ActivityRole::Agent => AGENT[frame % AGENT.len()],
+        ActivityRole::Classifier => CLASSIFIER[frame % CLASSIFIER.len()],
+    }
+}
+
+fn since_compact(start_ms: Option<u64>, now_ms: u64) -> Option<String> {
+    start_ms.map(|start| duration_compact(now_ms.saturating_sub(start)))
 }
 
 fn draw_roster_body(
@@ -1066,21 +1635,21 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
         return;
     }
 
-    // Fixed-width columns: glyph · provider · name (flex) · model · cost ·
+    // Fixed-width columns: glyph · provider · name · model · report (flex) ·
     // turns · started · last. `started` = session age; `last` = time since the
     // last stream event.
     let widths = [
         Constraint::Length(1),
         Constraint::Length(4),
-        Constraint::Min(16),
+        Constraint::Length(30),
         Constraint::Length(13),
-        Constraint::Length(8),
+        Constraint::Min(18),
         Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(7),
     ];
     let header = Row::new([
-        "", "prov", "agent", "model", "cost", "turns", "started", "last",
+        "", "prov", "agent", "model", "report", "turns", "started", "last",
     ])
     .style(
         Style::default()
@@ -1114,9 +1683,8 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
         rows.push(Row::new(vec![
             Cell::from(""),
             Cell::from(""),
-            Cell::from(format!("{caret} {} ({})", bucket.label(), in_bucket.len())).style(
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
+            Cell::from(format!("{caret} {} ({})", bucket.label(), in_bucket.len()))
+                .style(Style::default().fg(color).add_modifier(Modifier::BOLD)),
         ]));
 
         if collapsed {
@@ -1130,28 +1698,30 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
             let v = &views[i];
             let a = &app.agents[i];
             let (glyph, gcolor) = v.state.glyph();
-            let cost = v.cost.map(|c| format!("${c:.4}")).unwrap_or_else(|| "—".into());
             let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
-            let model = v.model.clone().unwrap_or_else(|| "—".into());
+            let model = a
+                .selected_model
+                .clone()
+                .or_else(|| v.model.clone())
+                .unwrap_or_else(|| "—".into());
+            let report = v
+                .report_message
+                .as_deref()
+                .map(|m| truncate(m, 54))
+                .unwrap_or_else(|| "—".into());
             let started = age(v.started_at);
-            let last = v.last_activity_ms.map(age).unwrap_or_else(|| started.clone());
-            // Mark rows whose executor has intern suggestions waiting.
-            let display_name = if app
-                .classifier_notes
-                .get(&a.task.id())
-                .is_some_and(|n| !n.is_empty())
-            {
-                format!("✻ {}", a.name)
-            } else {
-                a.name.clone()
-            };
+            let last = v
+                .last_activity_ms
+                .map(age)
+                .unwrap_or_else(|| started.clone());
             rows.push(Row::new(vec![
                 Cell::from(glyph).style(Style::default().fg(gcolor)),
                 Cell::from(provider_tag(a.provider))
                     .style(Style::default().fg(provider_color(a.provider))),
-                Cell::from(display_name).style(Style::default().add_modifier(Modifier::BOLD)),
+                Cell::from(truncate(&a.name, 30))
+                    .style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(truncate(&model, 13)).style(Style::default().fg(Color::Gray)),
-                Cell::from(cost).style(Style::default().fg(Color::Gray)),
+                Cell::from(report).style(Style::default().fg(Color::LightYellow)),
                 Cell::from(turns).style(Style::default().fg(Color::Gray)),
                 Cell::from(started).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(last).style(Style::default().fg(Color::DarkGray)),
@@ -1173,7 +1743,7 @@ fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
         .borders(Borders::RIGHT | Borders::TOP)
         .border_style(Style::default().fg(Color::Cyan))
         .title(Span::styled(
-            " provider (→ confirm) ",
+            " provider · model · effort ",
             Style::default().fg(Color::Cyan),
         ));
     let inner = block.inner(area);
@@ -1190,9 +1760,30 @@ fn draw_provider_selector(f: &mut Frame, area: Rect, app: &App) {
         } else {
             Style::default().fg(provider_color(*p))
         };
+        let model = if *p == app.next_provider {
+            app.next_model
+                .as_deref()
+                .or_else(|| default_model_for(*p))
+                .unwrap_or("—")
+        } else {
+            default_model_for(*p).unwrap_or("—")
+        };
+        let effort = if *p == app.next_provider {
+            app.next_effort
+                .as_deref()
+                .or_else(|| default_effort_for(*p))
+        } else {
+            default_effort_for(*p)
+        };
         lines.push(Line::from(vec![
             Span::raw(marker),
-            Span::styled(format!("{p}"), style),
+            Span::styled(format!("{:<8}", p.as_str()), style),
+            Span::styled(truncate(model, 18), Style::default().fg(Color::Gray)),
+            Span::styled(" ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                effort.unwrap_or("—").to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
@@ -1202,6 +1793,8 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     // `order` indexes into `views` (both derived from app.agents, same indexing).
     let (_, order) = app.ordered_agents();
     let Some(&idx) = order.get(app.roster_selected) else {
+        app.transcript_y_range = None;
+        app.last_transcript_height = 0;
         app.zone = Zone::Roster;
         return;
     };
@@ -1227,27 +1820,6 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         width,
     ));
 
-    // Intern suggestions for this executor, pinned at the bottom (most recent
-    // last). Operator-visible scrutiny surface for classifier-enabled runs.
-    if let Some(notes) = app.classifier_notes.get(&a.task.id()) {
-        if !notes.is_empty() {
-            lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "── intern suggestions ──",
-                Style::default().fg(Color::Magenta),
-            )));
-            for n in notes.iter().rev().take(8).collect::<Vec<_>>().into_iter().rev() {
-                let tag = if n.auto_sent { "✻ intern › (sent)" } else { "✻ intern ›" };
-                lines.push(Line::from(Span::styled(
-                    format!("{tag} {}", n.text),
-                    Style::default()
-                        .fg(Color::Magenta)
-                        .add_modifier(Modifier::BOLD),
-                )));
-            }
-        }
-    }
-
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
     let total = para.line_count(area.width.saturating_sub(2));
     if app.scroll_from_bottom > 0 && total > app.cached_total_lines {
@@ -1260,7 +1832,11 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     let from_bottom = app.scroll_from_bottom.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(from_bottom) as u16;
 
-    let scrolled = if from_bottom == 0 { "" } else { " ↑ scrolled" };
+    let scrolled = if from_bottom == 0 {
+        ""
+    } else {
+        " ↑ scrolled"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
@@ -1270,9 +1846,13 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
                 a.name,
                 v.state.label()
             ),
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ));
     let inner = block.inner(area);
+    app.transcript_y_range = Some((inner.y, inner.y.saturating_add(inner.height)));
+    app.last_transcript_height = inner.height;
     f.render_widget(block, area);
     f.render_widget(
         Paragraph::new(lines)
@@ -1301,12 +1881,17 @@ fn render_transcript(
     const ARG_MAX_LINES: usize = 15;
     const RESULT_MAX_LINES: usize = 25;
 
-    let hr = || Line::from(Span::styled("─".repeat(width.max(1)), Style::default().fg(Color::DarkGray)));
+    let hr = || {
+        Line::from(Span::styled(
+            "─".repeat(width.max(1)),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !initial_prompt.is_empty() {
         // Rule sits between the user turn and the assistant response.
-        lines.extend(render_steer(initial_prompt));
+        lines.extend(render_steer(initial_prompt, width));
         lines.push(hr());
         lines.push(Line::from(""));
     }
@@ -1319,11 +1904,12 @@ fn render_transcript(
 
     for item in items {
         let before = lines.len();
+        let mut compact_tool_call = false;
         match item {
             // Each steer is followed by the turn rule (user → assistant
             // boundary); the assistant response renders after it.
             TranscriptItem::UserSteer(t) => {
-                lines.extend(render_steer(t));
+                lines.extend(render_steer(t, width));
                 lines.push(hr());
             }
             TranscriptItem::AssistantText(t) => lines.extend(render_markdown(t)),
@@ -1338,13 +1924,19 @@ fn render_transcript(
                 }
             }
             TranscriptItem::ToolCall { name, args } => {
-                lines.push(Line::from(Span::styled(
-                    format!("⏺ {name}"),
-                    Style::default()
-                        .fg(Color::LightGreen)
-                        .add_modifier(Modifier::BOLD),
-                )));
-                lines.extend(monospace_block(args, ARG_MAX_LINES, Color::DarkGray));
+                if is_internal_tool(name) {
+                    continue;
+                }
+                if let Some(line) = compact_tool_call_line(name, args, width) {
+                    compact_tool_call = true;
+                    lines.push(Line::from(Span::styled(line, tool_call_style())));
+                } else {
+                    lines.push(Line::from(Span::styled(
+                        format!("{TOOL_CALL_GLYPH} {name}"),
+                        tool_call_style(),
+                    )));
+                    lines.extend(monospace_block(args, ARG_MAX_LINES, Color::DarkGray));
+                }
             }
             TranscriptItem::ToolResult {
                 tool,
@@ -1352,15 +1944,20 @@ fn render_transcript(
                 is_error,
                 rider,
             } => {
+                if tool.as_deref().is_some_and(is_internal_tool) {
+                    continue;
+                }
                 // Errors always show. Otherwise, show the body only for
                 // change-making / opaque tools (Edit/Write/MCP) where the
                 // result matters; suppress noisy output (Bash, Read, Grep).
-                if *is_error {
+                if shell_result_tool(tool.as_deref()) {
+                    lines.extend(shell_result_block(content, *is_error, RESULT_MAX_LINES));
+                } else if *is_error {
                     lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Red));
                 } else if tool_result_is_verbose(tool.as_deref()) {
                     lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Gray));
                 }
-                // quiet success → nothing; the ⏺ call line above stands alone.
+                // quiet success → nothing; the tool call line above stands alone.
 
                 // Window-0 diagnostics ALWAYS surface, distinct from the tool
                 // body — summary bold-flagged, detail lines yellow — so the
@@ -1412,11 +2009,15 @@ fn render_transcript(
         }
         // Only space items that actually rendered (a suppressed quiet result
         // adds nothing — no blank line either).
-        if lines.len() > before {
+        if lines.len() > before && !compact_tool_call {
             lines.push(Line::from(""));
         }
     }
     lines
+}
+
+fn tool_call_style() -> Style {
+    Style::default().fg(Color::Rgb(118, 150, 124))
 }
 
 /// Show a tool's result body verbosely? Change-making and opaque tools
@@ -1436,25 +2037,435 @@ fn tool_result_is_verbose(name: Option<&str>) -> bool {
         || n.contains("notebook")
 }
 
-/// `▌ you ›` accented steer block (exact causal/temporal ordering, §5.4).
-fn render_steer(text: &str) -> Vec<Line<'static>> {
-    let accent = Style::default()
-        .fg(Color::LightBlue)
-        .add_modifier(Modifier::BOLD);
-    let mut out = vec![Line::from(Span::styled("▌ you ›", accent))];
-    for l in text.lines() {
+fn is_internal_tool(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    n == "tool_search" || n == "tool_search_tool" || n.starts_with("tool_search.")
+}
+
+fn shell_result_tool(name: Option<&str>) -> bool {
+    matches!(name, Some("shell_run" | "shell_poll" | "shell_kill"))
+}
+
+fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Line<'static>> {
+    let value = match serde_json::from_str::<serde_json::Value>(content) {
+        Ok(value) => value,
+        Err(_) => {
+            return monospace_block(
+                content,
+                max_lines,
+                if is_error { Color::Red } else { Color::Gray },
+            );
+        }
+    };
+    let Some(obj) = value.as_object() else {
+        return monospace_block(
+            content,
+            max_lines,
+            if is_error { Color::Red } else { Color::Gray },
+        );
+    };
+
+    let exit = obj
+        .get("exit_code")
+        .map(|v| {
+            if v.is_null() {
+                "exit=null".to_string()
+            } else {
+                format!("exit={}", v)
+            }
+        })
+        .unwrap_or_else(|| "exit=?".to_string());
+    let running = obj
+        .get("running")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let timed_out = obj
+        .get("timed_out")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut head = exit;
+    if running {
+        head.push_str(" running");
+    }
+    if timed_out {
+        head.push_str(" timed_out");
+    }
+    if let Some(id) = obj.get("session_id").and_then(|v| v.as_str()) {
+        head.push_str(&format!(" session={id}"));
+    }
+
+    let mut out = vec![Line::from(Span::styled(
+        format!("↳ {head}"),
+        Style::default().fg(if is_error {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }),
+    ))];
+    for (label, color) in [("stdout", Color::Gray), ("stderr", Color::Red)] {
+        if let Some(text) = obj.get(label).and_then(|v| v.as_str())
+            && !text.is_empty()
+        {
+            out.push(Line::from(Span::styled(
+                format!("{label}:"),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )));
+            out.extend(monospace_block(text, max_lines, color));
+        }
+    }
+    if let Some(register) = obj.get("stdout_register").and_then(|v| v.as_str()) {
         out.push(Line::from(Span::styled(
-            format!("▌ {l}"),
-            Style::default().fg(Color::LightBlue),
+            format!("stdout → {register}"),
+            Style::default().fg(Color::Gray),
         )));
     }
     out
 }
 
+fn compact_tool_call_line(name: &str, args: &str, width: usize) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(args).ok()?;
+    let rendered = compact_tool_args(name, &value)?;
+    let line = format!("{TOOL_CALL_GLYPH} {name}({rendered})");
+    let max_width = width.saturating_sub(1).min(140);
+    (max_width > 0 && line.chars().count() <= max_width).then_some(line)
+}
+
+fn compact_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(map) => {
+            if map.is_empty() {
+                return Some(String::new());
+            }
+            let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+            entries.sort_by_key(|(k, _)| tool_arg_rank(tool, k));
+            let positional_single = entries.len() == 1;
+            let parts: Option<Vec<String>> = entries
+                .into_iter()
+                .map(|(key, value)| {
+                    let rendered = compact_json_value(value)?;
+                    if positional_single || positional_arg_key(key) {
+                        Some(rendered)
+                    } else {
+                        Some(format!("{key}={rendered}"))
+                    }
+                })
+                .collect();
+            parts.map(|p| p.join(", "))
+        }
+        serde_json::Value::Array(items) => {
+            let parts: Option<Vec<String>> = items.iter().map(compact_json_value).collect();
+            parts.map(|p| p.join(", "))
+        }
+        serde_json::Value::Null => Some(String::new()),
+        _ => compact_json_value(value),
+    }
+}
+
+fn positional_arg_key(key: &str) -> bool {
+    matches!(
+        key,
+        "path"
+            | "file"
+            | "file_path"
+            | "command"
+            | "cmd"
+            | "query"
+            | "pattern"
+            | "text"
+            | "input"
+            | "register"
+    )
+}
+
+fn tool_arg_rank(tool: &str, key: &str) -> usize {
+    let key_rank = match key {
+        "path" | "file" | "file_path" => 0,
+        "command" | "cmd" => 0,
+        "query" | "pattern" => 0,
+        "text" | "input" => 0,
+        "register" => 0,
+        "old_string" | "new_string" | "replacement" => 1,
+        "line" | "line_start" | "line_end" | "limit" => 2,
+        "cwd" | "workdir" => 3,
+        _ => 10,
+    };
+    if tool.contains("shell") && matches!(key, "command" | "cmd") {
+        0
+    } else {
+        key_rank
+    }
+}
+
+fn compact_json_value(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(compact_string_arg(s)),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Null => Some("null".into()),
+        serde_json::Value::Array(items) if items.len() <= 3 => {
+            let parts: Option<Vec<String>> = items.iter().map(compact_json_value).collect();
+            parts.map(|p| format!("[{}]", p.join(", ")))
+        }
+        serde_json::Value::Object(map) if map.len() <= 2 => {
+            let mut parts = Vec::new();
+            for (key, value) in map {
+                parts.push(format!("{key}: {}", compact_json_value(value)?));
+            }
+            Some(format!("{{{}}}", parts.join(", ")))
+        }
+        _ => None,
+    }
+}
+
+fn compact_string_arg(s: &str) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return "\"\"".into();
+    }
+    let needs_quotes = flat.chars().any(char::is_whitespace)
+        || flat.contains('"')
+        || flat.contains('(')
+        || flat.contains(')');
+    if needs_quotes {
+        serde_json::to_string(&flat).unwrap_or_else(|_| format!("{flat:?}"))
+    } else {
+        flat
+    }
+}
+
+/// Accented user-turn block (exact causal/temporal ordering, §5.4).
+fn render_steer(text: &str, width: usize) -> Vec<Line<'static>> {
+    let user_bg = Color::Rgb(38, 42, 46);
+    let gutter = Style::default()
+        .fg(Color::LightBlue)
+        .bg(user_bg)
+        .add_modifier(Modifier::BOLD);
+    let bg = Style::default().bg(user_bg);
+    let content_width = width.saturating_sub(2).max(1);
+    render_markdown(text.trim_matches('\n'))
+        .into_iter()
+        .flat_map(|line| wrap_line_by_chars(line, content_width))
+        .map(|line| prepend_line_prefix(line, "▌ ", gutter, bg))
+        .collect()
+}
+
+fn wrap_line_by_chars(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut current = Vec::new();
+    let mut used = 0usize;
+
+    for span in line.spans {
+        let style = span.style;
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            if used >= width {
+                if !chunk.is_empty() {
+                    current.push(Span::styled(std::mem::take(&mut chunk), style));
+                }
+                out.push(Line::from(std::mem::take(&mut current)));
+                used = 0;
+            }
+            chunk.push(ch);
+            used += 1;
+        }
+        if !chunk.is_empty() {
+            current.push(Span::styled(chunk, style));
+        }
+    }
+
+    if current.is_empty() && out.is_empty() {
+        out.push(Line::from(""));
+    } else if !current.is_empty() {
+        out.push(Line::from(current));
+    }
+    out
+}
+
 fn render_markdown(text: &str) -> Vec<Line<'static>> {
-    let md = tui_markdown::from_str(text);
-    let owned: Vec<Line<'static>> = md.lines.into_iter().map(super::line_into_owned).collect();
-    super::stitch_ordered_list_markers(owned)
+    markdown_blocks_preserving_terminal_shapes(text)
+        .into_iter()
+        .flat_map(render_markdown_block)
+        .collect()
+}
+
+enum MarkdownBlock {
+    Markdown(String),
+    Table(Vec<String>),
+    Code {
+        language: Option<String>,
+        lines: Vec<String>,
+    },
+}
+
+fn render_markdown_block(block: MarkdownBlock) -> Vec<Line<'static>> {
+    match block {
+        MarkdownBlock::Markdown(text) => {
+            let md = tui_markdown::from_str(&text);
+            let owned: Vec<Line<'static>> =
+                md.lines.into_iter().map(super::line_into_owned).collect();
+            super::stitch_ordered_list_markers(owned)
+        }
+        MarkdownBlock::Table(lines) => render_table_block(lines),
+        MarkdownBlock::Code { language, lines } => render_code_block(language, lines),
+    }
+}
+
+fn markdown_blocks_preserving_terminal_shapes(text: &str) -> Vec<MarkdownBlock> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut blocks = Vec::new();
+    let mut markdown = String::new();
+    let mut i = 0usize;
+
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(language) = opening_fence_language(line) {
+            push_markdown_block(&mut blocks, &mut markdown);
+            let fence = fence_marker(line).unwrap_or("```");
+            i += 1;
+
+            let mut code = Vec::new();
+            while i < lines.len() && !is_closing_fence(lines[i], fence) {
+                code.push(lines[i].to_string());
+                i += 1;
+            }
+            if i < lines.len() {
+                i += 1;
+            }
+            blocks.push(MarkdownBlock::Code {
+                language,
+                lines: code,
+            });
+            continue;
+        }
+
+        if i + 1 < lines.len()
+            && is_table_header_line(line)
+            && is_table_separator_line(lines[i + 1])
+        {
+            push_markdown_block(&mut blocks, &mut markdown);
+            let mut table = Vec::new();
+            while i < lines.len() && !lines[i].trim().is_empty() && lines[i].contains('|') {
+                table.push(lines[i].to_string());
+                i += 1;
+            }
+            blocks.push(MarkdownBlock::Table(table));
+            continue;
+        }
+
+        markdown.push_str(line);
+        markdown.push('\n');
+        i += 1;
+    }
+
+    push_markdown_block(&mut blocks, &mut markdown);
+    blocks
+}
+
+fn push_markdown_block(blocks: &mut Vec<MarkdownBlock>, markdown: &mut String) {
+    if !markdown.is_empty() {
+        blocks.push(MarkdownBlock::Markdown(std::mem::take(markdown)));
+    }
+}
+
+fn fence_marker(line: &str) -> Option<&'static str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("```") {
+        Some("```")
+    } else if trimmed.starts_with("~~~") {
+        Some("~~~")
+    } else {
+        None
+    }
+}
+
+fn opening_fence_language(line: &str) -> Option<Option<String>> {
+    let marker = fence_marker(line)?;
+    let rest = line.trim_start().strip_prefix(marker)?.trim();
+    Some((!rest.is_empty()).then(|| rest.to_string()))
+}
+
+fn is_closing_fence(line: &str, marker: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty()
+}
+
+fn is_table_header_line(line: &str) -> bool {
+    let cells = table_cells(line);
+    cells.len() >= 2 && cells.iter().any(|cell| !cell.is_empty())
+}
+
+fn is_table_separator_line(line: &str) -> bool {
+    let cells = table_cells(line);
+    cells.len() >= 2
+        && cells.iter().all(|cell| {
+            let t = cell.trim();
+            t.chars().filter(|c| *c == '-').take(3).count() >= 3
+                && t.chars().all(|c| c == '-' || c == ':' || c.is_whitespace())
+        })
+}
+
+fn table_cells(line: &str) -> Vec<&str> {
+    line.trim()
+        .trim_matches('|')
+        .split('|')
+        .map(str::trim)
+        .collect()
+}
+
+fn render_table_block(lines: Vec<String>) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .enumerate()
+        .map(|(idx, line)| {
+            let style = match idx {
+                0 => Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+                1 => Style::default().fg(Color::DarkGray),
+                _ => Style::default().fg(Color::Gray),
+            };
+            Line::from(Span::styled(line, style))
+        })
+        .collect()
+}
+
+fn render_code_block(language: Option<String>, lines: Vec<String>) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let border = Style::default().fg(Color::DarkGray);
+    let body = Style::default().fg(Color::Gray);
+    let title = language
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| format!("┌─ {}", l.trim()))
+        .unwrap_or_else(|| "┌─ code".to_string());
+    out.push(Line::from(Span::styled(title, border)));
+    if lines.is_empty() {
+        out.push(Line::from(Span::styled("│", border)));
+    } else {
+        out.extend(
+            lines
+                .into_iter()
+                .map(|line| Line::from(vec![Span::styled("│ ", border), Span::styled(line, body)])),
+        );
+    }
+    out.push(Line::from(Span::styled("└─", border)));
+    out
+}
+
+fn prepend_line_prefix(
+    line: Line<'static>,
+    prefix: &'static str,
+    prefix_style: Style,
+    line_style: Style,
+) -> Line<'static> {
+    let mut spans = Vec::with_capacity(line.spans.len() + 1);
+    spans.push(Span::styled(prefix, prefix_style));
+    spans.extend(
+        line.spans
+            .into_iter()
+            .map(|span| Span::styled(span.content.into_owned(), line_style.patch(span.style))),
+    );
+    Line::from(spans)
 }
 
 /// A raw monospace block (tool args / results), indented, capped at `max` lines
@@ -1476,42 +2487,76 @@ fn monospace_block(text: &str, max: usize, color: Color) -> Vec<Line<'static>> {
     out
 }
 
-fn draw_composer(f: &mut Frame, area: Rect, app: &App) {
+fn composer_display_text(input: &str) -> String {
+    let mut buf = String::with_capacity(input.len() + 1);
+    buf.push_str(input);
+    buf.push('▏');
+    buf
+}
+
+fn composer_height(app: &App, area: Rect) -> u16 {
+    let max_height = (area.height / 3).clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT);
+    let inner_width = area.width.saturating_sub(4).max(1);
+    let wrapped = Paragraph::new(composer_display_text(&app.input))
+        .wrap(Wrap { trim: false })
+        .line_count(inner_width)
+        .min(u16::MAX as usize) as u16;
+    wrapped.saturating_add(4).clamp(COMPOSER_HEIGHT, max_height)
+}
+
+fn draw_composer(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    top_title: Option<Line<'static>>,
+    bottom_title: Option<Line<'static>>,
+) {
     let (title, color) = if app.rename_target.is_some() {
         (" rename (Enter=save · Esc=cancel) ", Color::Magenta)
     } else {
         match app.zone {
-            Zone::SingleAgent => (" steer (Enter=send · Ctrl+J=newline · /rename) ", Color::Yellow),
+            Zone::SingleAgent => ("", Color::Rgb(90, 110, 128)),
             _ => (
-                " dispatch (Enter=spawn · Ctrl+J=newline · Tab=provider · Ctrl+R=rename) ",
+                " dispatch (Enter=spawn · Shift+Enter=newline · Tab=provider · Ctrl+R=rename) ",
                 Color::Green,
             ),
         }
     };
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(color))
-        .title(Span::styled(title, Style::default().fg(color)));
+        .border_style(Style::default().fg(color));
+    if let Some(top_title) = top_title {
+        block = block.title(top_title);
+    } else if !title.is_empty() {
+        block = block.title(Span::styled(title, Style::default().fg(color)));
+    }
+    if let Some(bottom_title) = bottom_title {
+        block = block.title_bottom(bottom_title);
+    }
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let padded = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y.saturating_add(1),
+        width: inner.width.saturating_sub(2).max(1),
+        height: inner.height.saturating_sub(2).max(1),
+    };
 
-    let mut buf = String::with_capacity(app.input.len() + 1);
-    buf.push_str(&app.input);
-    buf.push('▏');
-    f.render_widget(Paragraph::new(buf).wrap(Wrap { trim: false }), inner);
+    let buf = composer_display_text(&app.input);
+    let lines = Paragraph::new(buf.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(padded.width.max(1));
+    let scroll_y = lines.saturating_sub(padded.height as usize) as u16;
+    f.render_widget(
+        Paragraph::new(buf)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll_y, 0)),
+        padded,
+    );
 }
 
-fn draw_help(f: &mut Frame, area: Rect, app: &App, stats: Option<&str>) {
+fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    // Per-agent stats (single-agent view) sit here, directly under the composer
-    // — readable, not on a border. Stats first (bright), nav hints dim.
-    if let Some(s) = stats {
-        spans.push(Span::styled(
-            s.to_string(),
-            Style::default().fg(Color::Gray),
-        ));
-        spans.push(Span::styled("   ·   ", Style::default().fg(Color::DarkGray)));
-    }
     let nav = match app.zone {
         Zone::ProviderSelector => "↑/↓ provider  →/Tab confirm",
         Zone::Roster => "↑/↓ agent  → open  ← provider  Ctrl+R rename  Ctrl+X stop/del",
@@ -1523,7 +2568,10 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App, stats: Option<&str>) {
     ));
     if let Some(s) = &app.status {
         spans.push(Span::raw("  "));
-        spans.push(Span::styled(s.clone(), Style::default().fg(Color::LightYellow)));
+        spans.push(Span::styled(
+            s.clone(),
+            Style::default().fg(Color::LightYellow),
+        ));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -1571,7 +2619,31 @@ fn first_line(s: &str) -> String {
 }
 
 fn last_line(s: &str) -> String {
-    s.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").trim().to_string()
+    s.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+fn now_ms_ui() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn duration_compact(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s")
+    } else if secs < 3600 {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    } else {
+        let mins = (secs % 3600) / 60;
+        format!("{}h{:02}m", secs / 3600, mins)
+    }
 }
 
 fn age(started_ms: u64) -> String {
@@ -1586,5 +2658,223 @@ fn age(started_ms: u64) -> String {
         format!("{}m", secs / 60)
     } else {
         format!("{}h", secs / 3600)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn line_text(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn compact_tool_call_line_uses_positional_single_arg() {
+        let line =
+            compact_tool_call_line("smart_read", r#"{"path":"src/knowledge.rs"}"#, 100).unwrap();
+        assert_eq!(line, "▸ smart_read(src/knowledge.rs)");
+    }
+
+    #[test]
+    fn fleet_defaults_to_brodex_high_effort() {
+        assert_eq!(DEFAULT_FLEET_PROVIDER, Provider::Brodex);
+        assert_eq!(
+            FLEET_PROVIDERS[default_fleet_provider_cursor()],
+            Provider::Brodex
+        );
+        assert_eq!(default_effort_for(Provider::Brodex), Some("high"));
+        assert_eq!(default_effort_for(Provider::Claude), Some("high"));
+    }
+
+    #[test]
+    fn compact_tool_call_line_quotes_shell_commands() {
+        let line =
+            compact_tool_call_line("shell_run", r#"{"cmd":"cargo test --lib"}"#, 100).unwrap();
+        assert_eq!(line, r#"▸ shell_run("cargo test --lib")"#);
+    }
+
+    #[test]
+    fn compact_tool_call_line_falls_back_for_large_args() {
+        let long = serde_json::json!({
+            "path": "src/lib.rs",
+            "content": "x".repeat(500),
+        });
+        assert!(
+            compact_tool_call_line("write", &serde_json::to_string_pretty(&long).unwrap(), 100)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn compact_tool_call_line_respects_actual_width() {
+        assert!(compact_tool_call_line("shell_run", r#"{"cmd":"cargo test --lib"}"#, 20).is_none());
+    }
+
+    #[test]
+    fn compact_tool_calls_render_without_blank_spacers() {
+        let items = vec![
+            TranscriptItem::ToolCall {
+                name: "smart_read".into(),
+                args: r#"{"path":"src/a.rs"}"#.into(),
+            },
+            TranscriptItem::ToolCall {
+                name: "shell_run".into(),
+                args: r#"{"cmd":"cargo test"}"#.into(),
+            },
+        ];
+        let rendered: Vec<String> = render_transcript(&items, "", 100)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert_eq!(rendered.len(), 2, "{rendered:?}");
+        assert_eq!(rendered[0], "▸ smart_read(src/a.rs)");
+        assert_eq!(rendered[1], r#"▸ shell_run("cargo test")"#);
+    }
+
+    #[test]
+    fn delete_previous_word_text_removes_trailing_word_and_space() {
+        let mut input = "ask the model   ".to_string();
+        delete_previous_word_text(&mut input);
+        assert_eq!(input, "ask the ");
+
+        delete_previous_word_text(&mut input);
+        assert_eq!(input, "ask ");
+    }
+
+    #[test]
+    fn activity_clock_records_last_completed_duration() {
+        let mut clocks = HashMap::new();
+        let key = activity_key("agent", "abc");
+        let c = sync_activity_clock(&mut clocks, key.clone(), true, 1_000);
+        assert_eq!(c.active_since_ms, Some(1_000));
+        let c = sync_activity_clock(&mut clocks, key, false, 8_500);
+        assert_eq!(c.active_since_ms, None);
+        assert_eq!(c.last_duration_ms, Some(7_500));
+    }
+
+    #[test]
+    fn duration_compact_formats_clock_like_values() {
+        assert_eq!(duration_compact(7_000), "7s");
+        assert_eq!(duration_compact(440_000), "7m20s");
+        assert_eq!(duration_compact(7_500_000), "2h05m");
+    }
+
+    #[test]
+    fn internal_tool_search_is_hidden() {
+        assert!(is_internal_tool("tool_search"));
+        assert!(is_internal_tool("tool_search_tool"));
+        assert!(!is_internal_tool("shell_run"));
+    }
+
+    #[test]
+    fn shell_result_renderer_unpacks_json_envelope() {
+        let lines = shell_result_block(
+            r#"{"exit_code":1,"stdout":"out\n","stderr":"err\n","running":false,"timed_out":false}"#,
+            false,
+            10,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().any(|l| l.contains("exit=1")),
+            "{rendered:?}"
+        );
+        assert!(rendered.iter().any(|l| l == "stdout:"), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("out")), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l == "stderr:"), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("err")), "{rendered:?}");
+        assert!(
+            !rendered.iter().any(|l| l.contains("exit_code")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_renderer_formats_common_transcript_shapes() {
+        let lines = render_markdown("# Plan\n\n1. First\n2. Second\n\n- bullet");
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(rendered.iter().any(|l| l == "Plan"), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|l| l.contains("1. First")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("2. Second")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("bullet")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_renderer_preserves_tables_as_rows() {
+        let lines = render_markdown("| Tool | Why |\n| --- | --- |\n| bbox | indexed search |\n");
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().any(|l| l == "| Tool | Why |"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l == "| --- | --- |"),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l == "| bbox | indexed search |"),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn markdown_renderer_preserves_fenced_code_blocks() {
+        let lines = render_markdown("```rust\nfn main() {\n    println!(\"hi\");\n}\n```");
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert_eq!(rendered.first().map(String::as_str), Some("┌─ rust"));
+        assert_eq!(rendered.last().map(String::as_str), Some("└─"));
+        assert!(
+            rendered.iter().any(|l| l.contains("fn main()")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("println!")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn steer_renderer_keeps_prefix_while_rendering_markdown() {
+        let lines = render_steer("## Heading\n\n- item", 80);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().all(|line| line.starts_with("▌ ")),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|line| line.contains("you ›")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("Heading")),
+            "{rendered:?}"
+        );
+        assert!(rendered.iter().any(|l| l.contains("item")), "{rendered:?}");
+    }
+
+    #[test]
+    fn steer_renderer_prefixes_multiline_and_wrapped_rows() {
+        let lines = render_steer("first line\nsecond line is longer", 12);
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(rendered.len() >= 3, "{rendered:?}");
+        assert!(
+            rendered.iter().all(|line| line.starts_with("▌ ")),
+            "{rendered:?}"
+        );
+        assert!(!rendered.iter().any(|line| line == "▌ "), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("first")), "{rendered:?}");
+        assert!(
+            rendered.iter().any(|l| l.contains("second")),
+            "{rendered:?}"
+        );
     }
 }
