@@ -905,7 +905,7 @@ fn claude_location(
     }
 }
 
-fn codex_location(path: &Path) -> TranscriptLocation {
+pub(crate) fn codex_location(path: &Path) -> TranscriptLocation {
     let session_id = extract_codex_session_id(path);
     let cwd = extract_codex_cwd(path);
     TranscriptLocation {

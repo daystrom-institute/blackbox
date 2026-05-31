@@ -13,6 +13,7 @@ pub mod supervision;
 pub mod tail;
 pub mod team;
 pub mod tmux;
+pub mod tmux_dispatch;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -98,12 +98,13 @@ pub trait TmuxBackend: Send + Sync {
     async fn tmux_available(&self) -> bool;
     /// Create the container session if absent; report whether it pre-existed.
     async fn ensure_session(&self, name: &str) -> Result<TmuxSession, TmuxError>;
-    /// Create a new window in `session` running `command` (fixed argv), and
-    /// return its window/pane handle.
+    /// Create a new window in `session` running `command` (fixed argv) with the
+    /// given working directory, and return its window/pane handle.
     async fn create_window(
         &self,
         session: &str,
         name: &str,
+        cwd: Option<&str>,
         command: &[String],
     ) -> Result<TmuxHandle, TmuxError>;
     /// Type `text` literally into the pane (no Enter, no key interpretation).
@@ -154,7 +155,12 @@ pub(crate) fn new_session_argv(session: &str) -> Vec<String> {
 /// (`container_session_name`), and window/pane ids never contain `:`.
 const NEW_WINDOW_FORMAT: &str = "#{session_name}:#{window_id}:#{pane_id}";
 
-pub(crate) fn new_window_argv(session: &str, name: &str, command: &[String]) -> Vec<String> {
+pub(crate) fn new_window_argv(
+    session: &str,
+    name: &str,
+    cwd: Option<&str>,
+    command: &[String],
+) -> Vec<String> {
     let mut argv = vec![
         "new-window".into(),
         "-d".into(),
@@ -166,6 +172,10 @@ pub(crate) fn new_window_argv(session: &str, name: &str, command: &[String]) -> 
         "-n".into(),
         name.into(),
     ];
+    if let Some(dir) = cwd {
+        argv.push("-c".into());
+        argv.push(dir.into());
+    }
     if !command.is_empty() {
         argv.push("--".into());
         argv.extend(command.iter().cloned());
@@ -276,10 +286,11 @@ impl TmuxBackend for CliTmuxBackend {
         &self,
         session: &str,
         name: &str,
+        cwd: Option<&str>,
         command: &[String],
     ) -> Result<TmuxHandle, TmuxError> {
         let out = self
-            .run(&new_window_argv(session, name, command))
+            .run(&new_window_argv(session, name, cwd, command))
             .await?;
         parse_new_window_output(&out)
     }
@@ -339,10 +350,18 @@ mod tests {
 
     #[test]
     fn new_window_argv_includes_format_and_command() {
-        let argv = new_window_argv("bb-actors-arc1", "implementer", &["codex".into(), "--no-alt-screen".into()]);
+        let argv = new_window_argv(
+            "bb-actors-arc1",
+            "implementer",
+            Some("/work/dir"),
+            &["codex".into(), "--no-alt-screen".into()],
+        );
         assert!(argv.contains(&"-P".to_string()));
         assert!(argv.contains(&NEW_WINDOW_FORMAT.to_string()));
         assert!(argv.contains(&"bb-actors-arc1:".to_string()));
+        // Working dir is passed via -c.
+        let c = argv.iter().position(|a| a == "-c").expect("-c present");
+        assert_eq!(argv[c + 1], "/work/dir");
         // Command follows a `--` separator.
         let sep = argv.iter().position(|a| a == "--").expect("-- present");
         assert_eq!(&argv[sep + 1..], &["codex", "--no-alt-screen"]);
@@ -350,8 +369,9 @@ mod tests {
 
     #[test]
     fn new_window_argv_omits_separator_when_no_command() {
-        let argv = new_window_argv("s", "w", &[]);
+        let argv = new_window_argv("s", "w", None, &[]);
         assert!(!argv.contains(&"--".to_string()));
+        assert!(!argv.contains(&"-c".to_string()));
     }
 
     #[test]
@@ -411,9 +431,14 @@ mod tests {
             &self,
             session: &str,
             name: &str,
+            cwd: Option<&str>,
             command: &[String],
         ) -> Result<TmuxHandle, TmuxError> {
-            self.record(format!("create_window:{session}:{name}:{}", command.join(" ")));
+            self.record(format!(
+                "create_window:{session}:{name}:{}:{}",
+                cwd.unwrap_or(""),
+                command.join(" ")
+            ));
             self.next_handle
                 .lock()
                 .unwrap()
@@ -455,7 +480,7 @@ mod tests {
         let sess = fake.ensure_session(&session).await.unwrap();
         assert!(!sess.existed);
         let handle = fake
-            .create_window(&session, "implementer", &["codex".into()])
+            .create_window(&session, "implementer", Some("/tmp/work"), &["codex".into()])
             .await
             .unwrap();
         assert_eq!(handle.pane_id, "%1");
