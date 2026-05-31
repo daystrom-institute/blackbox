@@ -38,6 +38,10 @@ Rust test isolation invariants (this repo, surfaced on macOS aarch64). Two conve
 
 2. Isolate to per-test tempdirs; never touch real `$HOME`/XDG/prod state. Tests that read/write `~/.config/blackbox`, `~/.local/state/blackbox`, `~/.claude*`, the real tantivy index, or the prod daemon on 127.0.0.1:7264 collide across parallel agents/worktrees. Use `SharedState::for_test(tempdir)` (`src/server/state.rs`). Any test mutating process env must also hold `crate::util::test_env_lock()` (non-reentrant — don't double-take it via a helper that already locks).
 
+**Share CARGO_TARGET_DIR across Cargo-workspace git worktrees**
+
+When spinning up a git worktree of this Cargo workspace ad hoc (outside orchestrated workflows), point it at a shared `CARGO_TARGET_DIR` before building. Git worktrees do NOT share build state — each sibling worktree cold-compiles into its own `target/`, and for this large workspace that silently accumulates tens of GB per worktree (43G + 16G observed). A shared target dir reuses the existing build cache, skips the cold compile, and keeps disk bounded. Caveat: cargo takes a build lock on the target dir, so two worktrees sharing one `CARGO_TARGET_DIR` serialize their builds; if you genuinely need parallel builds across worktrees, accept the duplication instead. Applies to both orchestrated WorktreeCreate flows and hand-rolled `git worktree add`.
+
 **bro-harness shares code with daemon, never runtime**
 
 bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share **code** via workspace crates (e.g. bro-tools), but bro-harness must never have a **runtime** dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it's going the wrong way. Corollary: shared capabilities the harness needs (e.g. LSP session management) are shared by extracting code into a workspace crate both link, not by the harness calling a daemon service.
