@@ -790,7 +790,12 @@ struct StreamState {
 /// ride the harness stdout but the daemon's claude parser ignores them, so the
 /// cockpit reads them here.
 fn derive_stream_state(events: &[serde_json::Value]) -> StreamState {
-    let mut turn_active = false;
+    // A freshly dispatched agent has zero events — treat it as Active (turn in
+    // flight) so it lands in the Active bucket instead of Idle until the first
+    // stream event arrives. When events are non-empty the loop below overrides
+    // this correctly; terminal statuses in fleet_state_from_snapshot ignore
+    // turn_active entirely.
+    let mut turn_active = events.is_empty();
     let mut needs_input = false;
     let mut report_message = None;
     let mut worktree_finished = false;
@@ -1383,6 +1388,16 @@ mod tests {
         let v: Value = serde_json::from_str(&set_model).unwrap();
         assert_eq!(v["subtype"], "set_model");
         assert_eq!(v["model"], "opus");
+    }
+
+    #[test]
+    fn stream_state_empty_events_means_active() {
+        // A freshly dispatched agent has zero events — it should appear Active
+        // (turn in flight) so the roster shows it in the Active bucket rather
+        // than Idle until the first stream event arrives.
+        let s = derive_stream_state(&[]);
+        assert!(s.turn_active, "empty events should mean turn_active=true");
+        assert!(!s.needs_input);
     }
 
     #[test]

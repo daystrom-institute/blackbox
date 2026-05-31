@@ -3492,6 +3492,16 @@ mod tests {
     }
 
     #[test]
+    fn fleet_state_running_empty_events_is_active() {
+        // When turn_active=true (as derive_stream_state returns for empty
+        // events), a Running task must land in the Active bucket — not Idle.
+        assert_eq!(
+            fleet_state_from_snapshot(TaskStatus::Running, true, false, false, None),
+            FleetState::Active
+        );
+    }
+
+    #[test]
     fn delete_previous_word_text_removes_trailing_word_and_space() {
         let mut input = "ask the model   ".to_string();
         delete_previous_word_text(&mut input);
