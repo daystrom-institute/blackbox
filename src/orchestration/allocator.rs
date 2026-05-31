@@ -415,7 +415,7 @@ pub fn built_in_config() -> AllocatorConfig {
     tier(
         "premium",
         vec![
-            (Claude, Some("claude-opus-4-7"), Some("xhigh"), None),
+            (Claude, Some("claude-opus-4-8"), Some("xhigh"), None),
             (Codex, Some("gpt-5.5"), Some("high"), None),
             (Glm, Some("glm-5.1"), Some("high"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("high"), None),

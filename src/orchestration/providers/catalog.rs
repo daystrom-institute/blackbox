@@ -98,9 +98,14 @@ static OPENCODE_VARIANTS: &[EffortInfo] = &[
 
 static CLAUDE_MODELS: &[ModelInfo] = &[
     ModelInfo {
-        id: "claude-opus-4-7",
+        id: "claude-opus-4-8",
         description: "Frontier model, 1M context built-in",
         default: true,
+    },
+    ModelInfo {
+        id: "claude-opus-4-7",
+        description: "Previous frontier, 1M context built-in",
+        default: false,
     },
     ModelInfo {
         id: "claude-opus-4-6[1m]",
@@ -304,9 +309,14 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
 
 static COPILOT_MODELS: &[ModelInfo] = &[
     ModelInfo {
+        id: "claude-opus-4-8",
+        description: "Anthropic Opus 4.8",
+        default: true,
+    },
+    ModelInfo {
         id: "claude-opus-4-7",
         description: "Anthropic Opus 4.7",
-        default: true,
+        default: false,
     },
     ModelInfo {
         id: "claude-opus-4-6",
