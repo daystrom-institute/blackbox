@@ -50,6 +50,7 @@ impl<'a> WorkflowRunner<'a> {
                 existing_session.as_deref(),
                 existing_task_id.as_deref(),
                 self.runtime_for_actor(actor),
+                &[],
             )
             .await
             .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?;

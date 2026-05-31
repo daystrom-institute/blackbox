@@ -79,6 +79,7 @@ Constraints:\n\
                 None,
                 None,
                 None,
+                &[],
             )
             .await
         {
@@ -117,6 +118,7 @@ Constraints:\n\
                         Some(&first_session_id),
                         Some(&first_task_id),
                         None,
+                        &[],
                     )
                     .await
                 {

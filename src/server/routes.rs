@@ -2235,6 +2235,7 @@ pub(crate) async fn admin_team_upsert(
             })
             .collect(),
         advisor: None,
+        diversity_floor: None,
     };
     orchestration::team::save_teamplate(&teamplate, "global", &state.store_dir, None);
     let team = orchestration::team::Team {
@@ -2257,6 +2258,7 @@ pub(crate) async fn admin_team_upsert(
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0),
+        diversity_floor: None,
     };
     let _lock = orchestration::team::lock_teams();
     orchestration::team::save_team(&team, &state.store_dir);

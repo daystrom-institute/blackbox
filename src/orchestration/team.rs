@@ -33,6 +33,14 @@ pub struct Teamplate {
     pub members: Vec<TeamplateMember>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advisor: Option<TeamAdvisorConfig>,
+    /// Cohort-diversity floor: the minimum number of distinct providers to
+    /// spread this team's members across when dispatched together as an
+    /// ensemble. `None`/`0` disables it (current behavior). The ensemble
+    /// dispatch loop honors it at first dispatch; the lease pins each lane
+    /// thereafter. Soft floor — never fails when the tier offers fewer
+    /// distinct providers than the floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diversity_floor: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -115,6 +123,9 @@ pub struct Team {
     pub advisor: Option<TeamAdvisor>,
     pub project_dir: Option<String>,
     pub created_at: u64,
+    /// Copied from the teamplate at instantiation. See `Teamplate::diversity_floor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diversity_floor: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +272,7 @@ pub fn instantiate_team(
         }),
         project_dir: project_dir.map(String::from),
         created_at: super::now_ms(),
+        diversity_floor: tp.diversity_floor,
     };
     save_team(&team, store_dir);
     team
@@ -448,6 +460,7 @@ mod tests {
                 },
             ],
             advisor: None,
+            diversity_floor: None,
         };
         save_teamplate(&tp, "global", dir.path(), None);
         let loaded = resolve_teamplate("review-panel", dir.path(), None);
@@ -475,6 +488,7 @@ mod tests {
                 },
             ],
             advisor: None,
+            diversity_floor: None,
         };
 
         let team = instantiate_team(&tp, "test-team", Some("/tmp/proj"), dir.path());
@@ -512,6 +526,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         }];
 
         let found = find_bro("alice", &teams);
@@ -540,6 +555,7 @@ mod tests {
                 advisor: None,
                 project_dir: None,
                 created_at: 0,
+                diversity_floor: None,
             },
             Team {
                 name: "blue".into(),
@@ -553,6 +569,7 @@ mod tests {
                 advisor: None,
                 project_dir: None,
                 created_at: 0,
+                diversity_floor: None,
             },
         ];
 
@@ -582,6 +599,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         }];
 
         let err = resolve_bro_selector("red::critic", &teams).unwrap_err();
@@ -603,6 +621,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         save_team(&team, dir.path());
 
@@ -635,6 +654,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         save_team(&team, dir.path());
 
@@ -672,6 +692,7 @@ mod tests {
             }),
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         save_team(&team, dir.path());
 
@@ -698,6 +719,7 @@ mod tests {
                 count: 1,
             }],
             advisor: None,
+            diversity_floor: None,
         };
         let _team = instantiate_team(&tp, "to-dissolve", None, dir.path());
         assert!(load_team("to-dissolve", dir.path()).is_some());

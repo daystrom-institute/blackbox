@@ -1558,6 +1558,51 @@ pub fn pin_static_provider_if_inert(
     Some(request)
 }
 
+/// Narrow a request's provider pool to exclude providers already taken by
+/// cohort siblings — the cohort-diversity-floor primitive. The ensemble
+/// dispatch loop accumulates the providers its earlier members resolved and
+/// passes them here for each subsequent member, so a tiered cohort spreads
+/// across distinct providers instead of all collapsing onto the same
+/// tiebreak winner. Reuses the existing `pool.providers` intersection in
+/// `resolve_provider_pool`; tier/pin/scoring are otherwise untouched.
+///
+/// Guarantees:
+/// - No-op when `runtime` is `None` (no allocation happens) or `exclude` is
+///   empty (floor already satisfied, or no floor configured).
+/// - Never empties the candidate pool: if every available provider is already
+///   taken (floor exceeds distinct providers), it allows repeats rather than
+///   failing allocation — a soft floor, not a hard refusal.
+pub fn exclude_providers_for_diversity(
+    runtime: Option<RuntimeRequest>,
+    exclude: &[Provider],
+) -> Option<RuntimeRequest> {
+    let mut request = runtime?;
+    if exclude.is_empty() {
+        return Some(request);
+    }
+    let excluded: HashSet<Provider> = exclude.iter().copied().collect();
+    // Candidate universe: an explicit pool if the request already carries one,
+    // otherwise the same Provider::ALL base resolve_provider_pool starts from.
+    let base: Vec<Provider> = match &request.pool {
+        Some(pool) if !pool.providers.is_empty() => pool.providers.clone(),
+        _ => Provider::ALL.to_vec(),
+    };
+    let allowed: Vec<Provider> = base
+        .into_iter()
+        .filter(|provider| !excluded.contains(provider))
+        .collect();
+    if allowed.is_empty() {
+        // Soft floor: don't strand the dispatch with an empty pool.
+        return Some(request);
+    }
+    let name = request.pool.as_ref().and_then(|pool| pool.name.clone());
+    request.pool = Some(PoolRef {
+        name,
+        providers: allowed,
+    });
+    Some(request)
+}
+
 pub fn provider_candidates_for_request(
     request: &RuntimeRequest,
     config: &AllocatorConfig,
@@ -2452,6 +2497,67 @@ mod tests {
 
         // No request at all stays None (never reaches the allocator).
         assert!(pin_static_provider_if_inert(None, Provider::Codex, None, None).is_none());
+    }
+
+    #[test]
+    fn exclude_providers_for_diversity_narrows_pool_and_resolves_distinct_lane() {
+        with_provider_bins(|| {
+            // Premium tiered request (the phase-decompose panel shape). On its
+            // own it would resolve to the tiebreak winner (brodex, sorts first).
+            let base = || RuntimeRequest {
+                tier: Some("premium".to_string()),
+                durable: true,
+                ..Default::default()
+            };
+            let cfg = built_in_config();
+            let ctx = AllocationContext {
+                in_flight: BTreeMap::new(),
+                ..Default::default()
+            };
+
+            // Member 1: no exclusion → tiebreak winner.
+            let first = allocate(base(), &cfg, &BroConfig::default(), &ctx);
+            assert!(first.trace.error.is_none());
+            let p1 = first.lane.provider;
+
+            // Member 2: exclude what member 1 took → a DIFFERENT premium lane.
+            let r2 = exclude_providers_for_diversity(Some(base()), &[p1]).unwrap();
+            assert!(
+                r2.pool.as_ref().is_some_and(|p| !p.providers.contains(&p1)),
+                "taken provider must be removed from the pool"
+            );
+            let second = allocate(r2, &cfg, &BroConfig::default(), &ctx);
+            assert!(second.trace.error.is_none());
+            assert_ne!(
+                second.lane.provider, p1,
+                "member 2 must spread off member 1's provider"
+            );
+            // Still a premium lane — tier is preserved, only the pool narrowed.
+            assert_eq!(second.lane.tier.as_deref(), Some("premium"));
+        });
+    }
+
+    #[test]
+    fn exclude_providers_for_diversity_is_soft_and_inert_safe() {
+        // No-op cases: None request, empty exclude.
+        assert!(exclude_providers_for_diversity(None, &[Provider::Codex]).is_none());
+        let untouched =
+            exclude_providers_for_diversity(Some(RuntimeRequest::default()), &[]).unwrap();
+        assert!(untouched.pool.is_none(), "empty exclude must not set a pool");
+
+        // Soft floor: excluding every provider does NOT empty the pool — it
+        // falls back to allowing repeats rather than stranding the dispatch.
+        let all: Vec<Provider> = Provider::ALL.to_vec();
+        let req = RuntimeRequest {
+            tier: Some("premium".to_string()),
+            ..Default::default()
+        };
+        let result = exclude_providers_for_diversity(Some(req), &all).unwrap();
+        // Pool left unset (no narrowing applied) since allowed would be empty.
+        assert!(
+            result.pool.is_none(),
+            "excluding all providers must not produce an empty pool"
+        );
     }
 
     /// Regression for the `try_lock`-fails-on-contention bug that used to

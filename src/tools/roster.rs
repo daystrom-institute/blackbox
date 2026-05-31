@@ -446,6 +446,7 @@ impl BlackboxServer {
                         })
                         .collect(),
                     advisor,
+                    diversity_floor: None,
                 };
                 team::save_teamplate(&tp, scope, store_dir, p.project_dir.as_deref());
                 Self::ok_json(&json!({"saved": name, "scope": scope}))
@@ -1337,6 +1338,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         let advisor = orchestration::team::TeamAdvisor {
             name: "lead-advisor".into(),
@@ -1395,6 +1397,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         let checkpoint = server.build_advisor_checkpoint(
             &team,
@@ -1500,6 +1503,7 @@ mod tests {
             advisor: None,
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         {
             let mut notes = server.state.notes.write();
@@ -1583,6 +1587,7 @@ mod tests {
             }),
             project_dir: None,
             created_at: 0,
+            diversity_floor: None,
         };
         let checkpoint = server.build_advisor_checkpoint(
             &team,

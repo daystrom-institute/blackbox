@@ -44,6 +44,7 @@ impl BlackboxServer {
         existing_session_id: Option<&str>,
         existing_task_id: Option<&str>,
         actor_runtime: Option<orchestration::allocator::RuntimeRequest>,
+        exclude_providers: &[Provider],
     ) -> Result<Arc<orch::Task>, String> {
         let store_dir = self.state.store_dir.clone();
         let is_resume = existing_session_id.is_some();
@@ -126,6 +127,13 @@ impl BlackboxServer {
                 provider,
                 exec_opts.as_ref().and_then(|o| o.model.clone()),
                 exec_opts.as_ref().and_then(|o| o.effort.clone()),
+            );
+            // Cohort-diversity floor: exclude providers already taken by this
+            // ensemble's earlier members so a tiered cohort spreads across
+            // distinct providers. Empty for single-executor dispatch.
+            let runtime = orchestration::allocator::exclude_providers_for_diversity(
+                runtime,
+                exclude_providers,
             );
             let dispatched =
                 self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
@@ -267,23 +275,34 @@ impl BlackboxServer {
         // team's current roster. Holding a parking_lot guard across
         // `.await` makes the resulting future `!Send`, which axum
         // handler bounds reject. Snapshot + drop.
-        let (members, project_dir_from_team): (Vec<_>, _) = {
+        let (members, project_dir_from_team, diversity_floor): (Vec<_>, _, _) = {
             let _lock = orchestration::team::lock_teams();
             let team = orchestration::team::load_team(team_name, &self.state.store_dir)
                 .ok_or_else(|| format!("Unknown team: {team_name}"))?;
             let project_dir_from_team = team.project_dir.clone();
+            let diversity_floor = team.diversity_floor.unwrap_or(0);
             let members = team
                 .members
                 .iter()
                 .map(|m| (m.name.clone(), m.brofile.clone()))
                 .collect();
-            (members, project_dir_from_team)
+            (members, project_dir_from_team, diversity_floor)
         };
         let cwd = project_dir.map(String::from).or(project_dir_from_team);
         let mut launched = Vec::new();
+        // Providers resolved by earlier members this dispatch. While we are
+        // below the diversity floor we exclude these from the next member's
+        // pool so the cohort spreads across distinct providers; once the floor
+        // is met (or the pool can't spread further) we stop excluding.
+        let mut taken: Vec<Provider> = Vec::new();
         for (member_name, brofile) in &members {
             let existing = existing_session_ids.get(member_name).cloned();
             let existing_task_id = existing_task_ids.get(member_name).cloned();
+            let exclude: Vec<Provider> = if diversity_floor > 0 && taken.len() < diversity_floor {
+                taken.clone()
+            } else {
+                Vec::new()
+            };
             let task = self
                 .workflow_dispatch_executor(
                     brofile,
@@ -292,9 +311,16 @@ impl BlackboxServer {
                     existing.as_deref(),
                     existing_task_id.as_deref(),
                     actor_runtime.clone(),
+                    &exclude,
                 )
                 .await
                 .map_err(|e| format!("member {member_name}: {e}"))?;
+            // Record the lane this member actually resolved to so subsequent
+            // members can spread off it.
+            let chosen = task.inner.lock().provider;
+            if !taken.contains(&chosen) {
+                taken.push(chosen);
+            }
             // Stamp the precise team::member label, overriding the
             // brofile fallback that workflow_dispatch_executor →
             // record_task_to_bro set. Two team members sharing a

@@ -2308,6 +2308,7 @@ mod tests {
                     advisor: None,
                     project_dir: None,
                     created_at: 0,
+                    diversity_floor: None,
                 },
                 &tmp.path().join("bro"),
             );
@@ -2341,6 +2342,7 @@ mod tests {
                     advisor: None,
                     project_dir: Some(format!("/tmp/{team_name}")),
                     created_at: 0,
+                    diversity_floor: None,
                 },
                 &tmp.path().join("bro"),
             );

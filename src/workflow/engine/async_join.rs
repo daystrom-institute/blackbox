@@ -44,6 +44,7 @@ impl<'a> WorkflowRunner<'a> {
                         existing.as_deref(),
                         existing_task_id.as_deref(),
                         self.runtime_for_actor(actor),
+                        &[],
                     )
                     .await
                     .map_err(|e| anyhow!("fire-and-forget dispatch '{target_id}': {e}"))?;
