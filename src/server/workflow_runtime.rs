@@ -32,6 +32,90 @@ impl BlackboxServer {
         })
     }
 
+    /// Dispatch an executor node turn through a provider's interactive TUI in
+    /// a tmux pane (`terminal_mode=tmux`). The turn is driven by
+    /// `tmux_dispatch::run_terminal_turn` and resolved from the transcript read
+    /// plane; this returns an already-terminal synthetic `Task` whose result is
+    /// the assistant text, so the engine's normal wait/result/session handling
+    /// applies unchanged. MVP: fresh session per visit (no durable resume yet);
+    /// the in-flight turn is not interrupted by arc cancel (bounded by the
+    /// turn timeout). See the tmux terminal-mode slice design.
+    pub(crate) async fn workflow_dispatch_executor_tmux(
+        &self,
+        brofile: &str,
+        prompt: &str,
+        project_dir: Option<&str>,
+        arc_id: &str,
+        actor_label: &str,
+    ) -> Result<Arc<orch::Task>, String> {
+        use crate::orchestration::tmux::CliTmuxBackend;
+        use crate::orchestration::tmux_dispatch::{
+            TerminalTurnConfig, TerminalTurnTiming, run_terminal_turn,
+        };
+        use crate::transcripts::adapters::TranscriptAdapterRegistry;
+
+        let (provider, _lens, exec_opts, _env, cwd, _filters, _coerce, _ctx) =
+            self.resolve_exec_target(Some(brofile), None, project_dir)?;
+        if !provider.tui_capable() {
+            return Err(format!(
+                "actor brofile '{brofile}' resolves to provider {provider}, which is not \
+                 TUI-capable; terminal_mode=tmux requires Claude or Codex"
+            ));
+        }
+        let cwd_path = cwd
+            .clone()
+            .or_else(|| project_dir.map(str::to_string))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+        let cfg = TerminalTurnConfig {
+            provider,
+            arc_id: arc_id.to_string(),
+            actor_label: actor_label.to_string(),
+            prompt: prompt.to_string(),
+            cwd: cwd_path,
+            model: exec_opts.as_ref().and_then(|o| o.model.clone()),
+            effort: exec_opts.as_ref().and_then(|o| o.effort.clone()),
+        };
+        let config = self.state.idx.read().reindex_config();
+        let registry = TranscriptAdapterRegistry::from_reindex_config(&config);
+        let backend = CliTmuxBackend::new();
+
+        let id = format!("tmux-{}", uuid::Uuid::new_v4());
+        let cwd_str = cfg.cwd.to_string_lossy().to_string();
+        let task = match run_terminal_turn(&backend, &registry, &cfg, &TerminalTurnTiming::default())
+            .await
+        {
+            Ok(outcome) => orch::synthetic_terminal_task(
+                id.clone(),
+                provider,
+                outcome.session_id,
+                orch::TaskStatus::Completed,
+                Some(outcome.assistant_text),
+                String::new(),
+                Some(cwd_str),
+                Some(outcome.location),
+            ),
+            Err(e) => orch::synthetic_terminal_task(
+                id.clone(),
+                provider,
+                String::new(),
+                orch::TaskStatus::Failed,
+                None,
+                format!("terminal-mode dispatch failed: {e}"),
+                Some(cwd_str),
+                None,
+            ),
+        };
+        self.state
+            .task_store
+            .write()
+            .insert(id.clone(), task.clone())
+            .map_err(|e| format!("insert terminal task: {e}"))?;
+        self.state.task_store.read().persist(&self.state.store_dir);
+        Ok(task)
+    }
+
     /// Dispatch an executor node's turn (new session or resume of an
     /// existing one). Returns the spawned `Task` so the caller can wait
     /// on it. Duplicates the core of `bro_exec` / `bro_resume` minus the

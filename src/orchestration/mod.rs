@@ -2149,6 +2149,51 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
     }
 }
 
+/// Build a synthetic terminal-state task (no child process) for dispatch paths
+/// that complete out-of-band — e.g. tmux terminal-mode actor turns, where tmux
+/// owns the process and the turn is resolved from the transcript read plane.
+/// The task is already terminal, so `wait_for_task*` returns immediately.
+#[allow(clippy::too_many_arguments)]
+pub fn synthetic_terminal_task(
+    id: String,
+    provider: Provider,
+    session_id: String,
+    status: TaskStatus,
+    result: Option<String>,
+    stderr: String,
+    cwd: Option<String>,
+    transcript_location: Option<crate::transcripts::types::TranscriptLocation>,
+) -> Arc<Task> {
+    let now = now_ms();
+    Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id,
+            provider,
+            session_id,
+            events: vec![],
+            last_assistant_message: result,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr,
+            status,
+            started_at: now,
+            completed_at: Some(now),
+            exit_code: None,
+            cwd,
+            bro_label: None,
+            agent_label: None,
+            report: None,
+            recoverable: false,
+            transcript_location,
+            transcript_cursor: None,
+            supervision: SupervisionState::default(),
+        }),
+        notify: Arc::new(Notify::new()),
+        child_id: Mutex::new(None),
+    })
+}
+
 pub fn task_result_json(task: &Task) -> Value {
     populate_transcript_handle(task);
     let inner = task.inner.lock();

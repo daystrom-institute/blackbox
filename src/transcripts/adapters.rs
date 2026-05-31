@@ -22,7 +22,7 @@ pub(crate) enum TranscriptScanTarget {
     History,
 }
 
-pub(crate) trait TranscriptReadAdapter {
+pub(crate) trait TranscriptReadAdapter: Send + Sync {
     fn provider(&self) -> Provider;
 
     fn locate(&self, session_id: &str) -> Result<Option<TranscriptLocation>, TranscriptReadError>;

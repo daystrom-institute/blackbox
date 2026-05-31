@@ -25,6 +25,16 @@ impl<'a> WorkflowRunner<'a> {
                 let brofile = actor.brofile.as_deref().ok_or_else(|| {
                     anyhow!("async target '{target_id}' executor missing brofile")
                 })?;
+                // Terminal mode runs the turn synchronously, which is
+                // incompatible with fork/fire-and-forget concurrency. Fail
+                // closed rather than silently downgrade to a headless dispatch.
+                if matches!(actor.terminal_mode, super::super::TerminalMode::Tmux) {
+                    bail!(
+                        "actor '{actor_name}' uses terminal_mode=tmux, which is not yet supported \
+                         in fork/fire-and-forget nodes (target '{target_id}'); use it on a \
+                         synchronous executor node"
+                    );
+                }
                 let existing = if actor.durable {
                     self.actor_sessions.get(&actor_name).cloned()
                 } else {
