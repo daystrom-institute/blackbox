@@ -86,16 +86,25 @@ impl BlackboxServer {
         let task = match run_terminal_turn(&backend, &registry, &cfg, &TerminalTurnTiming::default())
             .await
         {
-            Ok(outcome) => orch::synthetic_terminal_task(
-                id.clone(),
-                provider,
-                outcome.session_id,
-                orch::TaskStatus::Completed,
-                Some(outcome.assistant_text),
-                String::new(),
-                Some(cwd_str),
-                Some(outcome.location),
-            ),
+            Ok(outcome) => {
+                // MVP has no durable resume or portal, so the turn is the
+                // window's whole life: kill it on success so the provider TUI
+                // process does not linger. (Error paths already kill inside
+                // run_terminal_turn.) The empty container session is reaped by
+                // startup reconciliation — a documented follow-up.
+                use crate::orchestration::tmux::TmuxBackend;
+                let _ = backend.kill_window(&outcome.handle).await;
+                orch::synthetic_terminal_task(
+                    id.clone(),
+                    provider,
+                    outcome.session_id,
+                    orch::TaskStatus::Completed,
+                    Some(outcome.assistant_text),
+                    String::new(),
+                    Some(cwd_str),
+                    Some(outcome.location),
+                )
+            }
             Err(e) => orch::synthetic_terminal_task(
                 id.clone(),
                 provider,
