@@ -118,6 +118,8 @@ struct Agent {
     provider: Provider,
     selected_model: Option<String>,
     selected_effort: Option<String>,
+    /// Human-facing project cwd. For isolated fleet dispatches this is the
+    /// original repository, not the generated worktree path.
     selected_cwd: Option<String>,
     /// Display name: first N chars of the initial prompt, renamable (§5).
     name: String,
@@ -434,7 +436,7 @@ impl App {
             provider: self.next_provider,
             selected_model: self.next_model.clone(),
             selected_effort: self.next_effort.clone(),
-            selected_cwd: Some(worktree.cwd.clone()),
+            selected_cwd: Some(worktree.project_cwd.clone()),
             name,
             // Display the operator's own prompt, not the rider-wrapped first turn.
             input_history: vec![prompt],
@@ -457,6 +459,7 @@ impl App {
 #[derive(Debug, Clone)]
 struct DispatchWorktree {
     cwd: String,
+    project_cwd: String,
     grounding: String,
     env_overrides: Option<HashMap<String, String>>,
 }
@@ -572,6 +575,7 @@ Source worktree status at dispatch time:\n```text\n{}\n```",
 
     Ok(DispatchWorktree {
         cwd: worktree_path.display().to_string(),
+        project_cwd: git_root.display().to_string(),
         grounding,
         env_overrides,
     })
@@ -814,7 +818,7 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
             provider: snap.provider,
             selected_model: snap.model.clone(),
             selected_effort: None,
-            selected_cwd: snap.cwd.clone(),
+            selected_cwd: project_display_cwd(snap.cwd.as_deref()),
             name,
             input_history: Vec::new(),
         });
@@ -913,7 +917,7 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 }
 
 fn page_scroll_step(app: &App) -> usize {
-    app.last_transcript_height.saturating_sub(2).max(1) as usize
+    app.last_transcript_height.max(1) as usize
 }
 
 fn handle_tail(app: &mut App, ev: TailEvent) {
@@ -1446,10 +1450,12 @@ fn draw(f: &mut Frame, app: &mut App) {
 
     if single_agent {
         draw_single_agent(f, chunks[0], app, &views);
-        let activity_title = Line::from(selected_activity_spans(app, &views, &order));
-        let top_title = app.rename_target.is_none().then_some(activity_title);
+        let top_titles = app
+            .rename_target
+            .is_none()
+            .then(|| single_agent_composer_top_titles(app, &views, &order));
         let bottom_title = Some(Line::from(single_agent_status_spans(app, &views, &order)));
-        draw_composer(f, chunks[1], app, top_title, bottom_title);
+        draw_composer(f, chunks[1], app, top_titles, bottom_title);
         if slash_active(app) {
             draw_slash_menu(f, chunks[1], app);
         }
@@ -1512,7 +1518,7 @@ fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
-/// Last two path components (keeps the cwd readable on one line).
+/// Last two path components (keeps status flashes readable on one line).
 fn path_tail(p: &str) -> String {
     let parts: Vec<&str> = p.trim_end_matches('/').split('/').collect();
     let tail = if parts.len() > 2 {
@@ -1521,6 +1527,40 @@ fn path_tail(p: &str) -> String {
         p.to_string()
     };
     tail
+}
+
+/// Final path component for the compact composer trailer project label.
+fn path_name(p: &str) -> String {
+    p.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(p)
+        .to_string()
+}
+
+/// Human-facing project cwd for restored tasks. Fleet-spawned agents run inside
+/// isolated worktrees, but the composer trailer should name the source project.
+fn project_display_cwd(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?;
+    let path = Path::new(cwd);
+    let common_dir = git_capture(
+        path,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )
+    .ok()
+    .and_then(|raw| PathBuf::from(raw.trim()).canonicalize().ok());
+    common_dir
+        .as_deref()
+        .and_then(|p| {
+            if p.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                p.parent()
+            } else {
+                None
+            }
+        })
+        .map(|p| p.display().to_string())
+        .or_else(|| Some(cwd.to_string()))
 }
 
 fn draw_title(f: &mut Frame, area: Rect, app: &App, views: &[AgentView]) {
@@ -1584,7 +1624,7 @@ fn selected_activity_spans(
 
     let mut spans = vec![Span::raw("  ")];
     spans.extend(activity_segment(
-        "Agent",
+        "Agent activity",
         ActivityRole::Agent,
         v.state,
         v.turn_active,
@@ -1612,7 +1652,7 @@ fn selected_activity_spans(
             now,
         );
         spans.extend(activity_segment(
-            "Classifier",
+            "Classifier activity",
             ActivityRole::Classifier,
             state,
             snap.turn_active,
@@ -1633,6 +1673,26 @@ fn selected_activity_spans(
     spans
 }
 
+fn single_agent_composer_top_titles(
+    app: &mut App,
+    views: &[AgentView],
+    order: &[usize],
+) -> Vec<Line<'static>> {
+    let mut titles = vec![Line::from(selected_activity_spans(app, views, order))];
+    if let Some(&idx) = order.get(app.roster_selected) {
+        let a = &app.agents[idx];
+        let v = &views[idx];
+        titles.push(
+            Line::from(Span::styled(
+                format!(" ({}) ", provider_tuple(a, v)),
+                Style::default().fg(Color::White),
+            ))
+            .right_aligned(),
+        );
+    }
+    titles
+}
+
 fn single_agent_status_spans(
     app: &App,
     views: &[AgentView],
@@ -1641,29 +1701,32 @@ fn single_agent_status_spans(
     let (active, waiting, _) = fleet_counts(views);
     let mut spans = Vec::new();
     let byline = Style::default().fg(Color::White);
+    let dim = Style::default().fg(Color::DarkGray);
 
     if let Some(&idx) = order.get(app.roster_selected) {
         let a = &app.agents[idx];
-        let v = &views[idx];
-        spans.push(Span::styled(format!("({})", provider_tuple(a, v)), byline));
-        if let Some(cwd) = v
-            .cwd
+        let project = a
+            .selected_cwd
             .as_deref()
-            .or(a.selected_cwd.as_deref())
-            .map(path_tail)
-        {
-            spans.push(Span::styled(format!(" - {cwd}"), byline));
-        }
-        spans.push(Span::styled(" - ", byline));
+            .or(views[idx].cwd.as_deref())
+            .map(path_name)
+            .unwrap_or_else(|| "project".to_string());
+        let prompt = truncate(initial_prompt(a), 44);
+        spans.push(Span::styled(format!(" [{project}] "), byline));
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(format!(" [\"{prompt}\"] "), byline));
+        spans.push(Span::styled("──", dim));
     }
 
-    spans.push(Span::styled(
-        format!("{active} active - {waiting} waiting"),
-        byline,
-    ));
+    spans.push(Span::styled(format!(" [{active} active] "), byline));
+    spans.push(Span::styled("-", dim));
+    spans.push(Span::styled(format!(" [{waiting} waiting] "), byline));
     if let Some(status) = &app.status {
-        spans.push(Span::styled(" - ", byline));
-        spans.push(Span::styled(status.clone(), byline));
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(
+            format!(" [{}] ", truncate(status, 70)),
+            byline,
+        ));
     }
     spans
 }
@@ -1989,7 +2052,6 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     };
     let v = &views[idx];
     let a = &app.agents[idx];
-    let (glyph, _) = v.state.glyph();
     let transcript = a.task.transcript();
     let latest_todo = latest_todo_state(&transcript);
 
@@ -1998,16 +2060,16 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         let todo_h = todo_panel_height(todo, area.height);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(todo_h), Constraint::Min(3)])
+            .constraints([Constraint::Min(3), Constraint::Length(todo_h)])
             .split(area);
-        draw_todo_panel(f, chunks[0], todo);
-        transcript_area = chunks[1];
+        transcript_area = chunks[0];
+        draw_todo_panel(f, chunks[1], todo);
     }
 
-    // Identity in the block title; per-agent stats under the composer. The body
-    // opens straight into the transcript (only a failure tail leads, when the
-    // agent is interrupted).
-    let width = transcript_area.width.saturating_sub(2) as usize;
+    // The single-agent transcript is intentionally bare: no border and no
+    // header/title line. Identity and status live on the composer chrome so the
+    // transcript keeps every available row.
+    let width = transcript_area.width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     if let Some(err) = &v.stderr_tail {
         lines.push(Line::from(Span::styled(
@@ -2025,44 +2087,27 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
     ));
 
     let para = Paragraph::new(lines.clone()).wrap(Wrap { trim: false });
-    let total = para.line_count(transcript_area.width.saturating_sub(2));
+    let total = para.line_count(transcript_area.width.max(1));
     if app.scroll_from_bottom > 0 && total > app.cached_total_lines {
         let delta = total - app.cached_total_lines;
         app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(delta);
     }
     app.cached_total_lines = total;
-    let body_h = transcript_area.height.saturating_sub(2) as usize;
+    let body_h = transcript_area.height.max(1) as usize;
     let max_scroll = total.saturating_sub(body_h);
     let from_bottom = app.scroll_from_bottom.min(max_scroll);
     let scroll_y = max_scroll.saturating_sub(from_bottom) as u16;
 
-    let scrolled = if from_bottom == 0 {
-        ""
-    } else {
-        " ↑ scrolled"
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
-        .title(Span::styled(
-            format!(
-                " {glyph} {} · {} · ← roster{scrolled} ",
-                a.name,
-                v.state.label()
-            ),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    let inner = block.inner(transcript_area);
-    app.transcript_y_range = Some((inner.y, inner.y.saturating_add(inner.height)));
-    app.last_transcript_height = inner.height;
-    f.render_widget(block, transcript_area);
+    app.transcript_y_range = Some((
+        transcript_area.y,
+        transcript_area.y.saturating_add(transcript_area.height),
+    ));
+    app.last_transcript_height = transcript_area.height;
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll_y, 0)),
-        inner,
+        transcript_area,
     );
 }
 
@@ -2983,7 +3028,7 @@ fn draw_composer(
     f: &mut Frame,
     area: Rect,
     app: &App,
-    top_title: Option<Line<'static>>,
+    top_titles: Option<Vec<Line<'static>>>,
     bottom_title: Option<Line<'static>>,
 ) {
     let (title, color) = if app.rename_target.is_some() {
@@ -3000,8 +3045,10 @@ fn draw_composer(
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(color));
-    if let Some(top_title) = top_title {
-        block = block.title(top_title);
+    if let Some(top_titles) = top_titles {
+        for top_title in top_titles {
+            block = block.title_top(top_title);
+        }
     } else if !title.is_empty() {
         block = block.title(Span::styled(title, Style::default().fg(color)));
     }
