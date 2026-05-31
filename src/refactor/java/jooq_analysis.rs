@@ -1020,11 +1020,7 @@ fn top_level_comma_count(text: &str) -> usize {
         if !in_string {
             match ch {
                 '(' | '<' | '[' | '{' => depth += 1,
-                ')' | '>' | ']' | '}' => {
-                    if depth > 0 {
-                        depth -= 1;
-                    }
-                }
+                ')' | '>' | ']' | '}' if depth > 0 => depth -= 1,
                 ',' if depth == 0 => count += 1,
                 _ => {}
             }
