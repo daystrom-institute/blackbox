@@ -12,6 +12,7 @@ pub mod resume_lease;
 pub mod supervision;
 pub mod tail;
 pub mod team;
+pub mod tmux;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
