@@ -41,7 +41,7 @@ impl Tool for WebFetch {
         "web_fetch"
     }
     fn description(&self) -> &str {
-        "Fetch a web page and return its text content (HTML stripped). Client-side; no external dependency."
+        "Fetch a web page and return its text content (HTML stripped, truncated to max_chars). Client-side; no external dependency. Ref ABI (chaining): set `into=\"<reg>\"` to stash the FULL page text into a clipboard register INSTEAD of returning it (bypasses max_chars) — the page never costs context tokens, and you then narrow with clip_grep/clip_slice/clip_transform or consume with clip_paste / file_write{from} / shell_run{stdin_from}."
     }
     fn input_schema(&self) -> Value {
         schema_for::<WebFetchInput>()

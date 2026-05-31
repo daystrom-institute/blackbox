@@ -230,7 +230,7 @@ ordered by trigger quality:
 
 | Trigger (behavioral unless noted) | Steer toward |
 |---|---|
-| `file_read` output substring reappears in a later `file_write`/`file_edit` | `bbox_slice_*` (server-side move, no context round-trip). *As shipped, `copy-paste-to-slice` targets `bbox_slice_copy`/`bbox_slice_move` only — `clip_*` is designed but unbuilt, so the rule does not yet point at it.* |
+| `file_read` output substring reappears in a later `file_write`/`file_edit` | `clip_yank` → `clip_paste` (server-side move, no context round-trip). *As shipped, `copy-paste-to-slice` targets the harness-native `clip_*` ref ABI — `clip_yank`/`clip_paste`, plus `file_read{into}`/`file_write{from}` for whole-file moves — because those are built-in and pinned, unlike `bbox_slice_*` which must be loaded over MCP.* |
 | `shell_run` running `grep`/`rg`/`find` over the repo tree | `bbox_hybrid_search` / `bbox_code_query` / code_nav |
 | repeated `bro_status` polling, or sequential `bro_exec` calls | `bro_when_all` / `bro_when_any` / `bro_orchestrate_run` |
 | N structurally-similar `file_edit` diffs across files | `bbox_refactor_plan` / a refactor atom |

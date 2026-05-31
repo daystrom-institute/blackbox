@@ -637,7 +637,7 @@ impl Tool for ContentSearch {
         "content_search"
     }
     fn description(&self) -> &str {
-        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, and case_insensitive."
+        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, and case_insensitive. Ref ABI (chaining): set `into=\"<reg>\"` to stash a large match set into a clipboard register INSTEAD of returning it — the matches never cost context tokens, and you then narrow with clip_grep/clip_slice or consume with clip_paste / file_write{from} / shell_run{stdin_from}."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ContentSearchInput>()
@@ -1138,6 +1138,47 @@ mod tests {
             ToolResult::Text(t) => assert_eq!(t, "no matches", "case-sensitive default: {t}"),
             other => panic!("expected text, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn content_search_into_deposits_register_without_returning_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        // Enough matches that the 3-line preview_head is a strict subset of the
+        // full set — so the late match proves the body never round-trips.
+        let body_src: String = (1..=8).map(|n| format!("hit number {n}\n")).collect();
+        std::fs::write(dir.path().join("a.rs"), &body_src).unwrap();
+        let cx = cx_at(dir.path());
+
+        let r = ContentSearch
+            .call(json!({"pattern":"hit","mode":"content","into":"m"}), &cx)
+            .await;
+
+        // The response is metadata + bounded preview, NOT the full match set.
+        match r {
+            ToolResult::Json(v) => {
+                assert_eq!(v["register"], "m");
+                assert_eq!(v["kind"], "tool_result");
+                assert_eq!(v["line_count"], 8);
+                // A late match is past the 3-line preview, so it must be absent
+                // from the returned payload — the ref-ABI win.
+                assert!(
+                    !v.to_string().contains("hit number 8"),
+                    "full match set must not round-trip through the response: {v}"
+                );
+            }
+            other => panic!("expected json metadata, got {other:?}"),
+        }
+
+        // The full match set lives server-side in the register, addressable
+        // downstream by clip_grep/clip_paste/file_write{from}/etc.
+        let stored = cx
+            .clipboard
+            .lock()
+            .unwrap()
+            .consume_text("m")
+            .expect("register populated");
+        assert!(stored.contains("a.rs:1:hit number 1"), "got: {stored}");
+        assert!(stored.contains("a.rs:8:hit number 8"), "got: {stored}");
     }
 
     #[tokio::test]

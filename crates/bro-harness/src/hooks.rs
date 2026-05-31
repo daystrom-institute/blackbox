@@ -174,6 +174,7 @@ impl HookEngine {
         let hooks: Vec<Box<dyn Hook>> = if enabled {
             vec![
                 Box::new(CopyPasteHook::default()),
+                Box::new(UncapturedOutputHook),
                 Box::new(ShellGrepHook),
                 Box::new(RefactorSignpostHook),
                 Box::new(HedgedConventionHook),
@@ -376,9 +377,12 @@ impl Hook for CopyPasteHook {
                 vec![Candidate {
                     rule_id: "copy-paste-to-slice".into(),
                     message: "You wrote a verbatim copy of content you just read — that \
-                              round-trips the bytes through context twice. `bbox_slice_copy` / \
-                              `bbox_slice_move` perform the source→target move server-side \
-                              without inlining the content (sha-guarded, dry-runnable)."
+                              round-trips the bytes through context twice. `clip_yank` (source \
+                              slice → a register) then `clip_paste` (register → target) move the \
+                              bytes server-side without them ever entering your context — \
+                              clip_paste is dry-run by default and sha-guarded via expected_sha256. \
+                              For a whole-file move, `file_read{into}` then `file_write{from}` \
+                              chains the same way."
                         .into(),
                     delivery: Delivery::Rider,
                     kind: NudgeKind::Periodic { cooldown: 8 },
@@ -387,6 +391,59 @@ impl Hook for CopyPasteHook {
             }
             _ => Vec::new(),
         }
+    }
+}
+
+/// Missed-capture nudge: a large producer output (`shell_run` stdout, `web_fetch`
+/// page text) landed in context when the producer's ref-ABI capture param
+/// (`stdout_to` / `into`) was omitted. Steer toward routing the bytes into a
+/// register so they can be narrowed / reshaped / chained without the context
+/// cost. Stateless and conservative — fires only above a byte floor, only when
+/// the capture param was absent, and never on an error result (error output is
+/// signal the model needs to read, not relocate).
+struct UncapturedOutputHook;
+
+/// Post-dispatch content bytes above which capturing into a register is worth a
+/// nudge. Below this the context cost of the inline output is negligible.
+const UNCAPTURED_OUTPUT_FLOOR: usize = 2 * 1024;
+
+impl Hook for UncapturedOutputHook {
+    fn on_tool_result(&self, call: &ToolCall, result: &ToolResult) -> Vec<Candidate> {
+        if result.is_error || result.content.len() < UNCAPTURED_OUTPUT_FLOOR {
+            return Vec::new();
+        }
+        // A non-empty string capture param means the producer already used the
+        // ref ABI — its content is metadata, not a context dump. Nothing to nudge.
+        let used = |key: &str| {
+            call.args
+                .get(key)
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !s.is_empty())
+        };
+        let (rule_id, message) = match call.name.as_str() {
+            "shell_run" if !used("stdout_to") => (
+                "capture-shell-stdout",
+                "This command's stdout landed in your context. If you'll feed it to a file \
+                 or another command, pass `stdout_to=\"<reg>\"` to capture it server-side — \
+                 then `file_write{from}` / `shell_run{stdin_from}` / `clip_paste` move it \
+                 without the bytes re-entering context, and `clip_grep`/`clip_slice`/\
+                 `clip_transform` narrow it in place.",
+            ),
+            "web_fetch" if !used("into") => (
+                "capture-web-fetch",
+                "This page's text landed in your context. Pass `into=\"<reg>\"` to keep a \
+                 large page server-side, then `clip_grep`/`clip_slice`/`clip_transform` \
+                 narrow it to what you need without the full page costing context tokens.",
+            ),
+            _ => return Vec::new(),
+        };
+        vec![Candidate {
+            rule_id: rule_id.into(),
+            message: message.into(),
+            delivery: Delivery::Rider,
+            kind: NudgeKind::Periodic { cooldown: 8 },
+            priority: 14,
+        }]
     }
 }
 
@@ -647,6 +704,68 @@ mod tests {
                 &read_result("ok")
             )
             .is_empty()
+        );
+    }
+
+    #[test]
+    fn uncaptured_shell_stdout_fires_above_floor() {
+        let h = UncapturedOutputHook;
+        let big = "x".repeat(UNCAPTURED_OUTPUT_FLOOR + 1);
+        let fired = h.on_tool_result(&shell_call("cat big.json"), &read_result(&big));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule_id, "capture-shell-stdout");
+        assert_eq!(fired[0].delivery, Delivery::Rider);
+    }
+
+    #[test]
+    fn captured_shell_stdout_is_silent() {
+        let h = UncapturedOutputHook;
+        let big = "x".repeat(UNCAPTURED_OUTPUT_FLOOR + 1);
+        // Already routed into a register — content is metadata, not a dump.
+        let call = ToolCall {
+            id: "sh".into(),
+            name: "shell_run".into(),
+            args: json!({ "command": "cat big.json", "stdout_to": "r1" }),
+        };
+        assert!(h.on_tool_result(&call, &read_result(&big)).is_empty());
+    }
+
+    #[test]
+    fn uncaptured_small_output_is_silent() {
+        let h = UncapturedOutputHook;
+        let small = "x".repeat(UNCAPTURED_OUTPUT_FLOOR - 1);
+        assert!(
+            h.on_tool_result(&shell_call("echo hi"), &read_result(&small))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn uncaptured_web_fetch_fires_above_floor() {
+        let h = UncapturedOutputHook;
+        let big = "x".repeat(UNCAPTURED_OUTPUT_FLOOR + 1);
+        let call = ToolCall {
+            id: "wf".into(),
+            name: "web_fetch".into(),
+            args: json!({ "url": "https://example.com" }),
+        };
+        let fired = h.on_tool_result(&call, &read_result(&big));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule_id, "capture-web-fetch");
+    }
+
+    #[test]
+    fn uncaptured_error_output_is_silent() {
+        let h = UncapturedOutputHook;
+        let big = "x".repeat(UNCAPTURED_OUTPUT_FLOOR + 1);
+        let err = ToolResult {
+            id: "e".into(),
+            content: big,
+            is_error: true,
+        };
+        assert!(
+            h.on_tool_result(&shell_call("cat big.json"), &err)
+                .is_empty()
         );
     }
 

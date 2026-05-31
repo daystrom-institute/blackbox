@@ -734,6 +734,18 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
         for (name, desc) in pinned {
             stable.push_str(&format!("- `{name}` — {desc}\n"));
         }
+        stable.push_str(
+            "\nWorking with content server-side (the ref ABI). Moving content through your \
+             context costs tokens twice — once to read it in, once to write it back out — for \
+             bytes you often never need to reason about. Keep it server-side instead: producers \
+             stash output into a named register (`file_read{into}`, `shell_run{stdout_to}`, \
+             `web_fetch{into}`); consumers read from one (`file_write{from}`, \
+             `shell_run{stdin_from}`, `clip_paste`); and `clip_transform` (jq) / `clip_slice` / \
+             `clip_grep` narrow or reshape a register without its content entering your context. \
+             Registers persist across turns. Reach for these whenever you're relocating or \
+             reshaping content rather than reasoning about it — `clip_peek` is the explicit, \
+             bounded way to look when you do.\n",
+        );
     }
 
     let mut volatile = String::new();
