@@ -43,6 +43,9 @@ This page is the **nav waypoint** — start here, then follow a link.
 - [Window-0 roster badge + Alerting derivation](backlog-window0-roster-alerting.md)
   — Phases 2–3: per-agent outstanding-errors badge + the acting-vs-ignoring
   `FleetState::Alerting` signal.
+- [Ratatui snapshot preview](ratatui-snapshot-preview.md) — deterministic
+  fixed-size text/ANSI previews for roster, single-agent, and future component
+  style work.
 - [Standalone single-agent view (v2)](backlog-standalone-view.md) — launch the
   harness directly into the single-agent component, no roster/fleet chrome.
 
