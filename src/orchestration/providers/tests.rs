@@ -1664,3 +1664,112 @@ fn resolve_session_cwd_dispatches_per_provider() {
     assert!(Provider::Copilot.resolve_session_cwd("any").is_none());
     assert!(Provider::Vibe.resolve_session_cwd("any").is_none());
 }
+
+// ── Fleet MCP injection (normalized config → per-provider args) ───────────────
+
+fn fleet_servers() -> std::collections::BTreeMap<String, crate::orchestration::mcp::McpServerConfig>
+{
+    use crate::orchestration::mcp::McpServerConfig;
+    let mut m = std::collections::BTreeMap::new();
+    m.insert(
+        "context7".to_string(),
+        McpServerConfig::Http {
+            url: "https://ctx7.example/mcp".into(),
+            headers: Default::default(),
+            exclude_tools: Vec::new(),
+        },
+    );
+    m
+}
+
+#[test]
+fn fleet_mcp_args_family_emits_single_merged_mcp_config() {
+    // The --mcp-config family (Claude + the bro-harness providers) all get one
+    // flag carrying a {"mcpServers":{…}} blob built from the normalized map.
+    for p in [
+        Provider::Claude,
+        Provider::Glm,
+        Provider::Deepseek,
+        Provider::Brodex,
+    ] {
+        let args = p.build_fleet_mcp_args(&fleet_servers());
+        assert_eq!(args.len(), 2, "{p}: expected --mcp-config + json");
+        assert_eq!(args[0], "--mcp-config");
+        let v: serde_json::Value = serde_json::from_str(&args[1]).unwrap();
+        let srv = &v["mcpServers"]["context7"];
+        assert_eq!(srv["type"], "http", "{p}");
+        assert_eq!(srv["url"], "https://ctx7.example/mcp", "{p}");
+    }
+}
+
+#[test]
+fn fleet_mcp_args_unimplemented_providers_are_noops() {
+    // No per-dispatch MCP-injection seam in these CLIs yet — they must stay
+    // empty (not crash, not emit a bogus flag) until one is wired in.
+    for p in [
+        Provider::Codex,
+        Provider::Gemini,
+        Provider::Copilot,
+        Provider::Inception,
+        Provider::Vibe,
+    ] {
+        assert!(
+            p.build_fleet_mcp_args(&fleet_servers()).is_empty(),
+            "{p}: unimplemented provider must inject nothing"
+        );
+    }
+}
+
+#[test]
+fn fleet_mcp_args_empty_config_injects_nothing() {
+    let empty = std::collections::BTreeMap::new();
+    assert!(Provider::Claude.build_fleet_mcp_args(&empty).is_empty());
+}
+
+#[test]
+fn fleet_mcp_config_json_resolves_secret_headers_and_stdio() {
+    use crate::orchestration::mcp::{McpServerConfig, SecretString};
+    // SAFETY: test-only env mutation behind the shared test env lock.
+    let _guard = crate::util::test_env_lock();
+    unsafe { std::env::set_var("FLEET_TEST_TOKEN", "s3cr3t") };
+
+    let mut m = std::collections::BTreeMap::new();
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        SecretString::Secret {
+            name: "FLEET_TEST_TOKEN".into(),
+        },
+    );
+    m.insert(
+        "remote".to_string(),
+        McpServerConfig::Http {
+            url: "https://x.example/mcp".into(),
+            headers,
+            exclude_tools: Vec::new(),
+        },
+    );
+    let mut env = std::collections::BTreeMap::new();
+    env.insert("FOO".to_string(), SecretString::Plain("bar".into()));
+    m.insert(
+        "local".to_string(),
+        McpServerConfig::Stdio {
+            command: "my-mcp".into(),
+            args: vec!["--stdio".into()],
+            env,
+        },
+    );
+
+    let json = super::mcp_args::fleet_mcp_config_json(&m);
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        v["mcpServers"]["remote"]["headers"]["Authorization"], "s3cr3t",
+        "secret header resolved to concrete value"
+    );
+    assert_eq!(v["mcpServers"]["local"]["type"], "stdio");
+    assert_eq!(v["mcpServers"]["local"]["command"], "my-mcp");
+    assert_eq!(v["mcpServers"]["local"]["args"][0], "--stdio");
+    assert_eq!(v["mcpServers"]["local"]["env"]["FOO"], "bar");
+
+    unsafe { std::env::remove_var("FLEET_TEST_TOKEN") };
+}

@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use serde_json::Value;
+
 use crate::orchestration::mcp::{self, McpFilters};
 
 use super::Provider;
@@ -291,6 +293,89 @@ impl Provider {
                 | Provider::Vibe
         )
     }
+
+    /// Translate a normalized fleet MCP server map into provider-native dispatch
+    /// args. One config, every provider — the translation is the only
+    /// per-provider concern. Today only the `--mcp-config` family (Claude and
+    /// the bro-harness providers) is implemented; everything else returns empty
+    /// (no per-dispatch MCP-injection seam in its CLI yet). When a future
+    /// provider grows one, it slots in here against the same input map.
+    pub fn build_fleet_mcp_args(
+        &self,
+        servers: &BTreeMap<String, mcp::McpServerConfig>,
+    ) -> Vec<String> {
+        if servers.is_empty() {
+            return Vec::new();
+        }
+        match self {
+            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+                vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
+            }
+            Provider::Codex
+            | Provider::Gemini
+            | Provider::Copilot
+            | Provider::Inception
+            | Provider::Vibe
+            | Provider::Workflow => Vec::new(),
+        }
+    }
+}
+
+/// Build a Claude/harness `--mcp-config` JSON blob (`{"mcpServers":{…}}`) from a
+/// normalized fleet MCP server map. `$secret` header/env refs are resolved to
+/// concrete strings here — the wire form the CLIs expect. A server whose secret
+/// can't resolve is skipped with a warning rather than failing the whole
+/// dispatch; the rest still load.
+pub fn fleet_mcp_config_json(servers: &BTreeMap<String, mcp::McpServerConfig>) -> String {
+    use mcp::McpServerConfig as C;
+    let mut map = serde_json::Map::new();
+    for (name, cfg) in servers {
+        let resolved = match cfg.resolve_secrets() {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(server = %name,
+                    "fleet MCP: skipping server (secret resolve failed): {e:#}");
+                continue;
+            }
+        };
+        let mut entry = serde_json::Map::new();
+        match cfg {
+            C::Http { url, .. } => {
+                entry.insert("type".into(), "http".into());
+                entry.insert("url".into(), url.clone().into());
+                if !resolved.headers.is_empty() {
+                    entry.insert("headers".into(), to_json_object(&resolved.headers));
+                }
+            }
+            C::Sse { url, .. } => {
+                entry.insert("type".into(), "sse".into());
+                entry.insert("url".into(), url.clone().into());
+                if !resolved.headers.is_empty() {
+                    entry.insert("headers".into(), to_json_object(&resolved.headers));
+                }
+            }
+            C::Stdio { command, args, .. } => {
+                entry.insert("type".into(), "stdio".into());
+                entry.insert("command".into(), command.clone().into());
+                if !args.is_empty() {
+                    entry.insert("args".into(), args.clone().into());
+                }
+                if !resolved.env.is_empty() {
+                    entry.insert("env".into(), to_json_object(&resolved.env));
+                }
+            }
+        }
+        map.insert(name.clone(), Value::Object(entry));
+    }
+    serde_json::json!({ "mcpServers": Value::Object(map) }).to_string()
+}
+
+fn to_json_object(m: &BTreeMap<String, String>) -> Value {
+    Value::Object(
+        m.iter()
+            .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+            .collect(),
+    )
 }
 
 fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key: &str) {

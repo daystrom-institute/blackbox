@@ -16,15 +16,17 @@
 //! `spawn_task` path so the cockpit shell is buildable and runnable today; live
 //! steering lands once the bidirectional seam exists.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
 
+use super::mcp::McpServerConfig;
 use super::providers::ExecOpts;
 use super::{Task, TaskStore, spawn_task, spawn_task_interactive};
 
@@ -37,6 +39,55 @@ use super::{Task, TaskStore, spawn_task, spawn_task_interactive};
 pub use super::providers::Provider;
 pub use super::tail::TailEvent;
 pub use super::TaskStatus;
+
+/// TUI-local fleet config — `$XDG_CONFIG_HOME/blackbox/fleet.json`, alongside
+/// the daemon's `config.toml` but read entirely daemon-free. Deliberately
+/// **not** the bbox project registry or the daemon's `mcp.json`: those drag in
+/// the daemon plus per-project indexing, inappropriate for the cockpit.
+///
+/// v1 holds one thing — a normalized MCP server map injected into **every**
+/// dispatched agent regardless of provider (`fleet-tui.md` §5.2). The
+/// normalization is `McpServerConfig` (the same Http/Sse/Stdio shape the rest of
+/// the codebase uses); the only per-provider work is translating it to CLI args
+/// at dispatch (`Provider::build_fleet_mcp_args`). Future surfaces (e.g. the
+/// `@project` cwd map) hang off this same file.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct FleetConfig {
+    #[serde(default, rename = "mcpServers")]
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+impl FleetConfig {
+    /// `$XDG_CONFIG_HOME/blackbox/fleet.json`. `None` only when no config dir
+    /// resolves (matches `config::default_config_path`'s base).
+    pub fn path() -> Option<PathBuf> {
+        dirs::config_dir().map(|d| d.join("blackbox").join("fleet.json"))
+    }
+
+    /// Best-effort load: a missing file is an empty config; a malformed file is
+    /// logged and treated as empty. A broken `fleet.json` must never block the
+    /// cockpit from launching — agents just spawn without fleet MCP servers.
+    pub fn load() -> Self {
+        match Self::path() {
+            Some(p) => Self::load_from(&p),
+            None => Self::default(),
+        }
+    }
+
+    fn load_from(path: &Path) -> Self {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return Self::default(); // missing/unreadable → empty
+        };
+        match serde_json::from_str::<FleetConfig>(&text) {
+            Ok(cfg) => cfg,
+            Err(e) => {
+                tracing::warn!(path = %path.display(),
+                    "ignoring fleet.json (parse failed): {e:#}");
+                Self::default()
+            }
+        }
+    }
+}
 
 /// What to dispatch as a new top-level entrypoint agent. The cockpit's
 /// composer fills this in; cwd/model are optional and resolved per dispatch
@@ -508,6 +559,9 @@ pub struct FleetOrchestrator {
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf,
+    /// Normalized MCP servers from `fleet.json`, injected into every dispatched
+    /// agent via `Provider::build_fleet_mcp_args`. Empty when no config exists.
+    mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 impl FleetOrchestrator {
@@ -523,6 +577,7 @@ impl FleetOrchestrator {
             task_store: Arc::new(RwLock::new(store)),
             tail_tx,
             store_dir,
+            mcp_servers: BTreeMap::new(),
         }
     }
 
@@ -537,7 +592,10 @@ impl FleetOrchestrator {
         // No age-based eviction: the cockpit's model is manual cleanup (§5), so
         // historical sessions persist until explicitly deleted, not by TTL.
         let store = TaskStore::load(&store_dir, u64::MAX);
-        Ok(Self::with_store(store_dir, store))
+        let mut orch = Self::with_store(store_dir, store);
+        // TUI-local MCP servers injected into every dispatched agent (§5.2).
+        orch.mcp_servers = FleetConfig::load().mcp_servers;
+        Ok(orch)
     }
 
     /// Flush the current task store to disk so a later cockpit launch can
@@ -586,12 +644,14 @@ impl FleetOrchestrator {
             effort: None,
             provider_defaults: None,
         };
-        let args = spec.provider.build_exec_args(
+        let mut args = spec.provider.build_exec_args(
             &spec.prompt,
             &session_id,
             spec.cwd.as_deref(),
             Some(&opts),
         );
+        // One fleet-wide MCP set, translated to this provider's CLI flags.
+        args.extend(spec.provider.build_fleet_mcp_args(&self.mcp_servers));
 
         // The initial `-p <prompt>` from build_exec_args becomes the first user
         // turn; bidi providers add the input-format flags in launch_interactive
@@ -651,9 +711,10 @@ impl FleetOrchestrator {
             effort: None,
             provider_defaults: None,
         };
-        let args = spec
+        let mut args = spec
             .provider
             .build_resume_args(&spec.session_id, &spec.prompt, Some(&opts));
+        args.extend(spec.provider.build_fleet_mcp_args(&self.mcp_servers));
         let resolved_env = super::brofile::resolve_provider_env(
             spec.provider,
             None,
@@ -812,6 +873,36 @@ mod tests {
                 "{p} build_exec_args must not add --input-format"
             );
         }
+    }
+
+    #[test]
+    fn fleet_config_parses_normalized_mcp_servers() {
+        let cfg: FleetConfig = serde_json::from_str(
+            r#"{
+                "mcpServers": {
+                    "context7": { "type": "http", "url": "https://ctx7.example/mcp" },
+                    "fs": { "type": "stdio", "command": "fs-mcp", "args": ["--root", "/tmp"] }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 2);
+        assert!(matches!(
+            cfg.mcp_servers.get("context7"),
+            Some(McpServerConfig::Http { .. })
+        ));
+        assert!(matches!(
+            cfg.mcp_servers.get("fs"),
+            Some(McpServerConfig::Stdio { .. })
+        ));
+    }
+
+    #[test]
+    fn fleet_config_missing_mcp_servers_is_empty() {
+        // A bare/older fleet.json (e.g. one that only carries a future cwd map)
+        // must deserialize, not error — mcpServers defaults to empty.
+        let cfg: FleetConfig = serde_json::from_str("{}").unwrap();
+        assert!(cfg.mcp_servers.is_empty());
     }
 
     #[test]
