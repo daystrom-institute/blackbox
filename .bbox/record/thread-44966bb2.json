@@ -1,0 +1,10 @@
+{
+  "id": "thread-44966bb2",
+  "topic": "bro-harness oversized tool-response handling — current bad behaviors and the fix. Today tools self-truncate ad hoc and DISCARD overflow with no spill/retrieval path: shell render() caps ~10k tokens (crates/bro-tools/src/shell.rs:162), clipboard MAX_TOTAL_BYTES 256KB (clipboard.rs:37), file_read line caps; nothing in agent_loop.rs/tool.rs spills or preserves. Desired: uniform harness-loop rule — any tool result > N kB writes full payload to a harness-owned dump path and replaces the inline result with a head + rider (\"huge response (N kB) read from disk at /x/y/z\"), retrievable via file_read/smart_read; lossless, context-hygienic, uniform across all tools incl MCP results. Needs net-new dump machinery; N is a config knob. Designed in design/orchestration/fleet-tui.md §2.3 (fleet TUI surfaced it via verbose transcript rendering); general harness win, not fleet-specific.",
+  "status": "resolved",
+  "notes": [
+    "Resolved — desired uniform harness-loop overflow rule is fully implemented and wired. crates/bro-harness/src/bound.rs::bound_tool_result spills any tool result > cap to a harness-owned dump dir ($BRO_HOME/harness-dumps, else temp) and replaces the inline payload with a head (2KB) + rider (\"huge response (N kB) written to disk; read the full payload with file_read/smart_read at PATH\"). Applied at the loop dispatch seam (agent_loop.rs:513) uniformly across builtin AND MCP tools, before hooks/diagnostics. Lossless (full payload recoverable via file_read/smart_read), context-hygienic, with cap as config knob BRO_HARNESS_TOOL_RESULT_CAP_KB (default 16, 0 disables). Spill-write failure falls back to hard truncation so context is never flooded. 3 unit tests pass (pass-through, cap=0 disable, over-cap spill+rider+recovery). The pre-existing ad-hoc self-truncations (shell render cap, clipboard 256KB, file_read line caps) remain as first-line trims but are now backstopped by the uniform loop-level rule."
+  ],
+  "created_at": "2026-05-29T23:46:23Z",
+  "resolved_at": "2026-05-31T15:58:00Z"
+}
