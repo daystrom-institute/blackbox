@@ -230,6 +230,10 @@ impl Registry {
         v
     }
 
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
+
     pub async fn dispatch(&self, name: &str, input: Value, cx: &ToolCx) -> ToolResult {
         match self.tools.get(name) {
             Some(e) => e.tool.call(input, cx).await,

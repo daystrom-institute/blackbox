@@ -14,7 +14,6 @@ use tokio::time::{Duration, Instant};
 
 const DEFAULT_WAIT_MS: u64 = 30_000;
 const DEFAULT_MULTI_WAIT_MS: u64 = 30_000;
-const WAKE_MESSAGE_LIMIT: usize = 500;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PromiseState {
@@ -48,9 +47,7 @@ struct PromiseEntry {
     started_ms: u64,
     settled_ms: Option<u64>,
     cancel_tx: watch::Sender<bool>,
-    wake_requested: bool,
-    wake_delivered: bool,
-    wake_message: Option<String>,
+    completion_event_delivered: bool,
 }
 
 /// Shared promise table for one harness run. It is intentionally not persisted:
@@ -95,9 +92,7 @@ impl PromiseStore {
                 started_ms: now_ms(),
                 settled_ms: None,
                 cancel_tx,
-                wake_requested: false,
-                wake_delivered: false,
-                wake_message: None,
+                completion_event_delivered: false,
             },
         );
         (id, cancel_rx)
@@ -188,32 +183,14 @@ impl PromiseStore {
         Ok(None)
     }
 
-    pub fn wake(&mut self, id: &str, message: Option<String>) -> anyhow::Result<Value> {
-        let Some(entry) = self.map.get_mut(id) else {
-            anyhow::bail!("unknown promise_id: {id}");
-        };
-        entry.wake_requested = true;
-        entry.wake_delivered = false;
-        entry.wake_message = message.map(|m| truncate_chars(&m, WAKE_MESSAGE_LIMIT));
-        if entry.state.is_terminal() {
-            self.notify.notify_waiters();
-        }
-        Ok(json!({
-            "promise_id": id,
-            "wake_registered": true,
-            "state": entry.state.as_str(),
-            "running": !entry.state.is_terminal(),
-        }))
-    }
-
-    pub fn drain_wake_messages(&mut self) -> Vec<String> {
+    pub fn drain_completion_events(&mut self) -> Vec<String> {
         let mut out = Vec::new();
         for (id, entry) in &mut self.map {
-            if !entry.wake_requested || entry.wake_delivered || !entry.state.is_terminal() {
+            if entry.completion_event_delivered || !entry.state.is_terminal() {
                 continue;
             }
-            entry.wake_delivered = true;
-            out.push(render_wake(id, entry));
+            entry.completion_event_delivered = true;
+            out.push(render_completion_event(id, entry));
         }
         out
     }
@@ -228,25 +205,19 @@ fn snapshot(id: &str, entry: &PromiseEntry) -> Value {
         "detail": entry.detail,
         "started_ms": entry.started_ms,
         "settled_ms": entry.settled_ms,
-        "wake_requested": entry.wake_requested,
-        "wake_delivered": entry.wake_delivered,
+        "completion_event_delivered": entry.completion_event_delivered,
         "result": entry.result,
         "error": entry.error,
     })
 }
 
-fn render_wake(id: &str, entry: &PromiseEntry) -> String {
-    let mut msg = format!(
+fn render_completion_event(id: &str, entry: &PromiseEntry) -> String {
+    format!(
         "[HARNESS_EVENT promise_{}]\npromise_id: {id}\nproducer: {}\nstate: {}\nnext_step: call promise_status with promise_id=\"{id}\" to inspect the result.",
         entry.state.as_str(),
         entry.producer,
         entry.state.as_str(),
-    );
-    if let Some(note) = &entry.wake_message {
-        msg.push_str("\nnote: ");
-        msg.push_str(note);
-    }
-    msg
+    )
 }
 
 fn now_ms() -> u64 {
@@ -254,16 +225,6 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-fn truncate_chars(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(n.saturating_sub(3)).collect();
-        out.push_str("...");
-        out
-    }
 }
 
 async fn wait_until<F>(cx: &ToolCx, timeout_ms: u64, mut done: F) -> anyhow::Result<Value>
@@ -308,20 +269,12 @@ struct PromiseManyInput {
     timeout_ms: Option<u64>,
 }
 
-#[derive(Deserialize, JsonSchema)]
-struct PromiseWakeInput {
-    promise_id: String,
-    /// Optional bounded note echoed in the hidden completion event.
-    message: Option<String>,
-}
-
 pub struct PromiseStatus;
 pub struct PromiseWait;
 pub struct PromiseWhenAll;
 pub struct PromiseWhenAny;
 pub struct PromiseCancel;
 pub struct PromiseList;
-pub struct PromiseWake;
 
 #[async_trait]
 impl Tool for PromiseStatus {
@@ -329,7 +282,7 @@ impl Tool for PromiseStatus {
         "promise_status"
     }
     fn description(&self) -> &str {
-        "Inspect a harness-local promise by id. Returns state, producer, result/error when terminal, and wake metadata."
+        "Inspect a harness-local promise by id. Returns state, producer, result/error when terminal, and completion-event metadata."
     }
     fn input_schema(&self) -> Value {
         schema_for::<PromiseIdInput>()
@@ -484,31 +437,6 @@ impl Tool for PromiseList {
     }
 }
 
-#[async_trait]
-impl Tool for PromiseWake {
-    fn name(&self) -> &str {
-        "promise_wake"
-    }
-    fn description(&self) -> &str {
-        "Register a hidden HARNESS_EVENT user turn to be injected when a promise settles. Use when you want to keep working and be nudged to inspect completion later."
-    }
-    fn input_schema(&self) -> Value {
-        schema_for::<PromiseWakeInput>()
-    }
-    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
-        let args: PromiseWakeInput = match serde_json::from_value(input) {
-            Ok(a) => a,
-            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
-        };
-        ToolResult::from_result(
-            cx.promises
-                .lock()
-                .unwrap()
-                .wake(&args.promise_id, args.message),
-        )
-    }
-}
-
 pub fn promise_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(PromiseStatus),
@@ -517,6 +445,5 @@ pub fn promise_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(PromiseWhenAny),
         Arc::new(PromiseCancel),
         Arc::new(PromiseList),
-        Arc::new(PromiseWake),
     ]
 }
