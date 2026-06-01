@@ -2243,20 +2243,17 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         .unwrap_or_else(|| "fleet".to_string());
 
     let mut spans = vec![
-        Span::styled(format!(" [{project}] "), byline),
+        Span::styled(format!(" {project} "), byline),
         Span::styled("──", dim),
-        Span::styled(format!(" [{} agents] ", views.len()), byline),
+        Span::styled(format!(" {} agents ", views.len()), byline),
         Span::styled("──", dim),
-        Span::styled(format!(" [{active} active] "), byline),
+        Span::styled(format!(" {active} active "), byline),
         Span::styled("-", dim),
-        Span::styled(format!(" [{waiting} waiting] "), byline),
+        Span::styled(format!(" {waiting} waiting "), byline),
     ];
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(
-            format!(" [{}] ", truncate(status, 70)),
-            byline,
-        ));
+        spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
     }
     spans
 }
@@ -2300,21 +2297,18 @@ fn single_agent_status_spans(
             .map(path_name)
             .unwrap_or_else(|| "project".to_string());
         let prompt = truncate(initial_prompt(a), 44);
-        spans.push(Span::styled(format!(" [{project}] "), byline));
+        spans.push(Span::styled(format!(" {project} "), byline));
         spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(format!(" [\"{prompt}\"] "), byline));
+        spans.push(Span::styled(format!(" \"{prompt}\" "), byline));
         spans.push(Span::styled("──", dim));
     }
 
-    spans.push(Span::styled(format!(" [{active} active] "), byline));
+    spans.push(Span::styled(format!(" {active} active "), byline));
     spans.push(Span::styled("-", dim));
-    spans.push(Span::styled(format!(" [{waiting} waiting] "), byline));
+    spans.push(Span::styled(format!(" {waiting} waiting "), byline));
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(
-            format!(" [{}] ", truncate(status, 70)),
-            byline,
-        ));
+        spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
     }
     spans
 }
