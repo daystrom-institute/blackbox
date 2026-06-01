@@ -214,13 +214,21 @@ fn fleet_state_from_snapshot(
 }
 
 /// Providers offered in the cockpit's provider selector. Deliberately narrower
-/// than `Provider::ALL`: only the bidi/steerable set (Claude + the bro-harness
-/// providers) is surfaced here, since they're the providers fleet drives well
-/// (persistent sessions, `--mcp-config` injection). One-shot/under-supported
-/// providers (Codex, Gemini, Vibe, Inception, Copilot) are hidden from the list;
-/// they remain dispatchable elsewhere, just not pickable in the cockpit.
+/// than `Provider::ALL`: only the bidi/steerable bro-harness providers are
+/// surfaced here, since they're the ones fleet drives well (persistent sessions,
+/// `--mcp-config` injection, and — crucially for the named-agent peer mailbox —
+/// they execute `bro-tools` builtins like `fleet_send_message`).
+///
+/// Claude is intentionally excluded despite being bidi/steerable: the Claude
+/// Code CLI doesn't execute `bro-tools` builtins, so a Claude row can't
+/// participate in the fleet peer-mail surface as a sender and would need a
+/// bespoke MCP wrapper to fit. Rather than carry a half-citizen in the cockpit,
+/// Claude stays out of the fleet picker (and classifier default — see
+/// `ClassifierConfig::provider_resolved`). It remains a first-class provider
+/// dispatchable everywhere else (bro_exec, orchestration). One-shot/under-
+/// supported providers (Codex, Gemini, Vibe, Inception, Copilot) are likewise
+/// hidden; they remain dispatchable elsewhere, just not pickable in the cockpit.
 const FLEET_PROVIDERS: &[Provider] = &[
-    Provider::Claude,
     Provider::Glm,
     Provider::Deepseek,
     Provider::Brodex,
