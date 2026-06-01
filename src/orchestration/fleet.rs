@@ -1097,6 +1097,7 @@ impl FleetOrchestrator {
     /// `session_id`; the prompt is the first turn of the resumed conversation.
     /// Bidi-capable providers only.
     pub fn resume(&self, spec: ResumeSpec) -> AgentHandle {
+        let prior_events = self.events_for_session(&spec.session_id);
         let task_id = uuid::Uuid::new_v4().to_string();
         let opts = ExecOpts {
             model: spec.model.clone(),
@@ -1119,16 +1120,18 @@ impl FleetOrchestrator {
             spec.env_overrides,
         );
         let seed = bidi_seeds_turn1_via_stdin(spec.provider).then(|| spec.prompt.clone());
-        self.launch_interactive(
+        let handle = self.launch_interactive(
             task_id,
             spec.provider,
             args,
-            spec.session_id,
+            spec.session_id.clone(),
             spec.cwd,
             spec.name,
             env_overrides,
             seed,
-        )
+        );
+        seed_resumed_transcript(&handle, prior_events, &spec.session_id, &spec.prompt);
+        handle
     }
 
     /// Drop a task from the store (used after a resume supersedes the old
@@ -1205,6 +1208,42 @@ impl FleetOrchestrator {
             "BRO_HARNESS_PIN_TOOLS".to_string(),
             self.pin_tools.join(","),
         )]))
+    }
+
+    fn events_for_session(&self, session_id: &str) -> Vec<Value> {
+        self.task_store
+            .read()
+            .all_tasks()
+            .into_iter()
+            .filter_map(|task| {
+                let inner = task.inner.lock();
+                (inner.session_id == session_id).then(|| inner.events.clone())
+            })
+            .max_by_key(Vec::len)
+            .unwrap_or_default()
+    }
+}
+
+fn seed_resumed_transcript(
+    handle: &AgentHandle,
+    mut prior_events: Vec<Value>,
+    session_id: &str,
+    prompt: &str,
+) {
+    prior_events.push(serde_json::json!({
+        "type": "user",
+        "session_id": session_id,
+        "message": {
+            "role": "user",
+            "content": prompt,
+        },
+    }));
+    let mut inner = handle.task.inner.lock();
+    if inner.events.is_empty() {
+        inner.events = prior_events;
+    } else {
+        prior_events.extend(inner.events.drain(..));
+        inner.events = prior_events;
     }
 }
 
@@ -1391,6 +1430,31 @@ mod tests {
         assert_eq!(v["message"]["role"], "user");
         assert_eq!(v["message"]["content"], "hi there");
         assert!(!line.contains('\n'), "NDJSON line must be single-line");
+    }
+
+    #[test]
+    fn resumed_transcript_keeps_prior_events_before_resume_turn() {
+        let task = crate::orchestration::test_task("new", TaskStatus::Running, Provider::Glm);
+        let handle = AgentHandle {
+            task: task.clone(),
+            stdin: None,
+        };
+        seed_resumed_transcript(
+            &handle,
+            vec![serde_json::json!({
+                "type": "assistant",
+                "message": {"content": [{"type": "text", "text": "old answer"}]},
+            })],
+            "sid-1",
+            "next turn",
+        );
+
+        let events = task.inner.lock().events.clone();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "assistant");
+        assert_eq!(events[1]["type"], "user");
+        assert_eq!(events[1]["session_id"], "sid-1");
+        assert_eq!(events[1]["message"]["content"], "next turn");
     }
 
     #[test]

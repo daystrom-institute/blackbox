@@ -135,6 +135,10 @@ struct Agent {
     /// The initial dispatch prompt + every subsequent steer (§5.3). Recallable
     /// in the single-agent view.
     input_history: Vec<String>,
+    /// Prompt rendered above the transcript for a fresh dispatch. Resume turns
+    /// are synthesized into the event stream so they render after restored
+    /// history instead of pretending to be turn 1.
+    initial_prompt: Option<String>,
     /// Steers successfully written to stdin but not yet replayed by the harness.
     /// This is deliberately separate from recall history so queued rendering is
     /// per-agent and does not reconstruct state from old transcript text.
@@ -588,7 +592,8 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
         selected_cwd: Some(worktree.project_cwd.clone()),
         name,
         // Display the operator's own prompt, not the rider-wrapped first turn.
-        input_history: vec![prompt],
+        input_history: vec![prompt.clone()],
+        initial_prompt: Some(prompt.clone()),
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
@@ -642,7 +647,8 @@ fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: String) {
         selected_effort: app.next_effort.clone(),
         selected_cwd: cwd.clone(),
         name,
-        input_history: vec![prompt],
+        input_history: vec![prompt.clone()],
+        initial_prompt: pending_resume.is_none().then(|| prompt.clone()),
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
@@ -790,6 +796,54 @@ Source worktree status at dispatch time:\n```text\n{}\n```",
         grounding,
         env_overrides,
     })
+}
+
+fn resume_env_overrides(
+    app: &App,
+    idx: usize,
+    cwd: Option<&str>,
+) -> Option<HashMap<String, String>> {
+    let cwd_raw = cwd?;
+    let worktree = PathBuf::from(cwd_raw)
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from(cwd_raw));
+    let worktree_root_raw = app.orch.store_dir().join("worktrees");
+    let worktree_root = worktree_root_raw
+        .canonicalize()
+        .unwrap_or(worktree_root_raw);
+    if !worktree.starts_with(&worktree_root) {
+        return None;
+    }
+
+    let base_repo = app.agents[idx]
+        .selected_cwd
+        .as_deref()
+        .map(PathBuf::from)
+        .or_else(|| project_display_cwd(Some(cwd_raw)).map(PathBuf::from))?;
+    let base_repo = base_repo.canonicalize().unwrap_or(base_repo);
+    let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
+
+    let mut env = HashMap::new();
+    env.insert(
+        "BRO_FLEET_BASE_REPO".to_string(),
+        base_repo.display().to_string(),
+    );
+    env.insert(
+        "BRO_FLEET_WORKTREE_ROOT".to_string(),
+        worktree_root.display().to_string(),
+    );
+    env.insert(
+        "BRO_FLEET_PARENT_WORKTREE".to_string(),
+        base_repo.display().to_string(),
+    );
+    env.insert("BRO_FLEET_WORKTREE_BRANCH".to_string(), branch);
+    if base_repo.join("Cargo.toml").is_file() {
+        env.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            base_repo.join("target").display().to_string(),
+        );
+    }
+    Some(env)
 }
 
 fn git_capture(cwd: &Path, args: &[&str]) -> Result<String, String> {
@@ -1082,6 +1136,7 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
             selected_cwd: project_display_cwd(snap.cwd.as_deref()),
             name,
             input_history: Vec::new(),
+            initial_prompt: None,
             pending_inputs: VecDeque::new(),
             seen_user_steers: 0,
         });
@@ -1792,11 +1847,13 @@ fn resume_selected(app: &mut App, idx: usize) {
     app.history_cursor = None;
     let old_id = app.agents[idx].task.id();
 
+    let cwd = snap.cwd.clone();
     let mut spec = ResumeSpec::new(app.agents[idx].provider, snap.session_id, text.clone());
-    spec.cwd = snap.cwd;
+    spec.cwd = cwd.clone();
     spec.model = app.agents[idx].selected_model.clone().or(snap.model);
     spec.effort = app.agents[idx].selected_effort.clone();
     spec.name = Some(app.agents[idx].name.clone());
+    spec.env_overrides = resume_env_overrides(app, idx, cwd.as_deref());
     let handle = app.orch.resume(spec);
 
     app.orch.forget(&old_id); // drop the stale Interrupted task
@@ -2976,7 +3033,7 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
 /// echoed on the stream (only stdin steers are replayed), so the renderer
 /// prepends it.
 fn initial_prompt(a: &Agent) -> &str {
-    a.input_history.first().map(String::as_str).unwrap_or("")
+    a.initial_prompt.as_deref().unwrap_or("")
 }
 
 fn latest_todo_state(items: &[TranscriptItem]) -> Option<TodoState> {
