@@ -175,6 +175,7 @@ impl HookEngine {
             vec![
                 Box::new(CopyPasteHook::default()),
                 Box::new(UncapturedOutputHook),
+                Box::new(TodoAllDoneHook),
                 Box::new(ShellGrepHook),
                 Box::new(RefactorSignpostHook),
                 Box::new(HedgedConventionHook),
@@ -443,6 +444,43 @@ impl Hook for UncapturedOutputHook {
             delivery: Delivery::Rider,
             kind: NudgeKind::Periodic { cooldown: 8 },
             priority: 14,
+        }]
+    }
+}
+
+/// Todo hygiene nudge: when the model has marked every task complete but leaves
+/// the shared list populated, remind it that purely operational checklists can be
+/// cleared. Delivered on the todo_write result itself so the advice is
+/// contextual and reaches the model even though the fleet TUI summarizes todo
+/// results instead of showing their raw JSON.
+struct TodoAllDoneHook;
+
+impl Hook for TodoAllDoneHook {
+    fn on_tool_result(&self, call: &ToolCall, result: &ToolResult) -> Vec<Candidate> {
+        if call.name != "todo_write" || result.is_error {
+            return Vec::new();
+        }
+        let Some(items) = call.args.get("items").and_then(|v| v.as_array()) else {
+            return Vec::new();
+        };
+        if items.is_empty() {
+            return Vec::new();
+        }
+        let all_done = items.iter().all(|item| {
+            item.get("status")
+                .and_then(|s| s.as_str())
+                .is_some_and(|s| s.eq_ignore_ascii_case("completed"))
+        });
+        if !all_done {
+            return Vec::new();
+        }
+        vec![Candidate {
+            rule_id: "todo-all-done-clear-exhaust".into(),
+            message: "All todo tasks are marked completed. Consider clearing the task list by calling `todo_write` with `{\"items\": []}` if it is only operational exhaust and does not contain details the user may care about later."
+                .into(),
+            delivery: Delivery::Rider,
+            kind: NudgeKind::Periodic { cooldown: 3 },
+            priority: 16,
         }]
     }
 }
@@ -767,6 +805,53 @@ mod tests {
             h.on_tool_result(&shell_call("cat big.json"), &err)
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn todo_all_done_hook_suggests_clearing_operational_exhaust() {
+        let h = TodoAllDoneHook;
+        let call = ToolCall {
+            id: "todo".into(),
+            name: "todo_write".into(),
+            args: json!({"items":[
+                {"task":"implement","status":"completed"},
+                {"task":"validate","status":"completed"}
+            ]}),
+        };
+        let fired = h.on_tool_result(&call, &ok_result());
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].rule_id, "todo-all-done-clear-exhaust");
+        assert_eq!(fired[0].delivery, Delivery::Rider);
+        assert!(fired[0].message.contains("todo_write"));
+        assert!(fired[0].message.contains("operational exhaust"));
+    }
+
+    #[test]
+    fn todo_all_done_hook_ignores_incomplete_empty_or_error_results() {
+        let h = TodoAllDoneHook;
+        let incomplete = ToolCall {
+            id: "todo".into(),
+            name: "todo_write".into(),
+            args: json!({"items":[
+                {"task":"implement","status":"completed"},
+                {"task":"validate","status":"pending"}
+            ]}),
+        };
+        assert!(h.on_tool_result(&incomplete, &ok_result()).is_empty());
+
+        let empty = ToolCall {
+            id: "todo".into(),
+            name: "todo_write".into(),
+            args: json!({"items":[]}),
+        };
+        assert!(h.on_tool_result(&empty, &ok_result()).is_empty());
+
+        let error = ToolResult {
+            id: "todo".into(),
+            content: "bad input".into(),
+            is_error: true,
+        };
+        assert!(h.on_tool_result(&incomplete, &error).is_empty());
     }
 
     #[test]

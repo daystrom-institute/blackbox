@@ -593,7 +593,11 @@ fn parse_user_event(
 }
 
 fn parse_todo_state(content: &str) -> Option<TodoState> {
-    let value: Value = serde_json::from_str(content).ok()?;
+    let json_body = content
+        .find("<harness-note>")
+        .map(|idx| content[..idx].trim_end())
+        .unwrap_or(content);
+    let value: Value = serde_json::from_str(json_body).ok()?;
     if value.get("ok").and_then(|v| v.as_bool()) == Some(false) {
         return None;
     }
@@ -1500,6 +1504,25 @@ mod tests {
                     && items[0].status == TodoItemStatus::Completed
                     && items[1].status == TodoItemStatus::InProgress
                     && items[2].status == TodoItemStatus::Pending
+        ));
+    }
+
+    #[test]
+    fn transcript_parses_todo_write_result_with_harness_note_as_todo_state() {
+        let ev = |s: &str| -> Value { serde_json::from_str(s).unwrap() };
+        let events = vec![
+            ev(r#"{"type":"assistant","message":{"content":[
+                {"type":"tool_use","id":"todo1","name":"todo_write","input":{"items":[]}}
+            ]}}"#),
+            ev(r#"{"type":"user","message":{"role":"user","content":[
+                {"type":"tool_result","tool_use_id":"todo1","content":"{\"ok\":true,\"total\":2,\"completed\":2,\"list\":\"[x] Done\\n[x] Also done\"}\n\n<harness-note>consider clearing exhaust</harness-note>","is_error":false}
+            ]}}"#),
+        ];
+        let items = parse_transcript(&events);
+        assert!(matches!(
+            &items[1],
+            TranscriptItem::TodoState(TodoState { total: 2, completed: 2, items })
+                if items.len() == 2 && items.iter().all(|i| i.status == TodoItemStatus::Completed)
         ));
     }
 
