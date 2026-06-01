@@ -389,6 +389,7 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tui-markdown",
+ "unicode-width 0.2.0",
  "url",
  "uuid",
  "walkdir",

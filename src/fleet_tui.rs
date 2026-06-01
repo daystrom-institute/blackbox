@@ -40,6 +40,7 @@ use crossterm::terminal::{
 };
 use ratatui::prelude::*;
 use ratatui::widgets::*;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use blackbox::fleet::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, DispatchSpec, FleetOrchestrator, Provider, ResumeSpec,
@@ -3025,6 +3026,12 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
         transcript_area.y.saturating_add(transcript_area.height),
     ));
     app.last_transcript_height = transcript_area.height;
+    // The transcript is intentionally borderless, and Paragraph rendering can
+    // leave stale terminal cells visible when a scrolled viewport lands on blank
+    // rows. Clear the full transcript rect before painting the current slice so
+    // whitespace is real whitespace, not diff-buffer leftovers from a previous
+    // scroll position.
+    f.render_widget(Clear, transcript_area);
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -3172,7 +3179,7 @@ fn render_transcript(
                 ));
                 lines.push(hr());
             }
-            TranscriptItem::AssistantText(t) => lines.extend(render_markdown(t)),
+            TranscriptItem::AssistantText(t) => lines.extend(render_markdown_with_width(t, width)),
             TranscriptItem::Thinking(t) => {
                 for l in t.lines() {
                     lines.push(Line::from(Span::styled(
@@ -4184,11 +4191,12 @@ fn render_steer_with_status(
         .add_modifier(Modifier::BOLD);
     let bg = Style::default().bg(user_bg);
     let content_width = width.saturating_sub(2).max(1);
-    let mut out: Vec<Line<'static>> = render_markdown(text.trim_matches('\n'))
-        .into_iter()
-        .flat_map(|line| wrap_line_by_chars(line, content_width))
-        .map(|line| prepend_line_prefix(line, "▌ ", gutter, bg))
-        .collect();
+    let mut out: Vec<Line<'static>> =
+        render_markdown_with_width(text.trim_matches('\n'), content_width)
+            .into_iter()
+            .flat_map(|line| wrap_line_by_chars(line, content_width))
+            .map(|line| prepend_line_prefix(line, "▌ ", gutter, bg))
+            .collect();
     let Some(label) = turn_status_label(status) else {
         return out;
     };
@@ -4246,10 +4254,19 @@ fn wrap_line_by_chars(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+#[cfg(test)]
 fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    render_markdown_with_limit(text, None)
+}
+
+fn render_markdown_with_width(text: &str, width: usize) -> Vec<Line<'static>> {
+    render_markdown_with_limit(text, Some(width.max(1)))
+}
+
+fn render_markdown_with_limit(text: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
     markdown_blocks_preserving_terminal_shapes(text)
         .into_iter()
-        .flat_map(render_markdown_block)
+        .flat_map(|block| render_markdown_block(block, max_width))
         .collect()
 }
 
@@ -4264,7 +4281,7 @@ enum MarkdownBlock {
     Rule,
 }
 
-fn render_markdown_block(block: MarkdownBlock) -> Vec<Line<'static>> {
+fn render_markdown_block(block: MarkdownBlock, max_width: Option<usize>) -> Vec<Line<'static>> {
     match block {
         MarkdownBlock::Markdown(text) => {
             let text = rewrite_task_list_markers(&text);
@@ -4273,9 +4290,11 @@ fn render_markdown_block(block: MarkdownBlock) -> Vec<Line<'static>> {
                 md.lines.into_iter().map(super::line_into_owned).collect();
             super::stitch_list_markers(owned)
         }
-        MarkdownBlock::Table(lines) => render_table_block(lines),
+        MarkdownBlock::Table(lines) => render_table_block(lines, max_width),
         MarkdownBlock::Code { language, lines } => render_code_block(language, lines),
-        MarkdownBlock::Quote(lines) => render_quote_block(lines),
+        MarkdownBlock::Quote(lines) => {
+            render_quote_block(lines, max_width.map(|w| w.saturating_sub(2).max(1)))
+        }
         MarkdownBlock::Rule => render_rule_block(),
     }
 }
@@ -4306,7 +4325,10 @@ fn rewrite_task_list_line(line: &str) -> Option<String> {
     let body = after_bullet.strip_prefix(' ')?;
     let glyph = if let Some(r) = body.strip_prefix("[ ]") {
         (r.starts_with(' ') || r.is_empty()).then_some(("☐", r))
-    } else if let Some(r) = body.strip_prefix("[x]").or_else(|| body.strip_prefix("[X]")) {
+    } else if let Some(r) = body
+        .strip_prefix("[x]")
+        .or_else(|| body.strip_prefix("[X]"))
+    {
         (r.starts_with(' ') || r.is_empty()).then_some(("☑", r))
     } else {
         None
@@ -4485,10 +4507,41 @@ fn table_column_aligns(separator: &str) -> Vec<CellAlign> {
         .collect()
 }
 
-/// Pad `content` (already known to be `width` display columns wide) into a
+fn display_width(content: &str) -> usize {
+    UnicodeWidthStr::width(content)
+}
+
+fn truncate_display(content: &str, width: usize) -> String {
+    if display_width(content) <= width {
+        return content.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".to_string();
+    }
+
+    let target = width - 1;
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in content.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + ch_width > target {
+            break;
+        }
+        out.push(ch);
+        used += ch_width;
+    }
+    out.push('…');
+    out
+}
+
+/// Pad `content` (already clipped to fit at most `width` display columns) into a
 /// field of `width` columns according to `align`.
 fn pad_cell(content: &str, width: usize, align: CellAlign) -> String {
-    let len = content.chars().count();
+    let content = truncate_display(content, width);
+    let len = display_width(&content);
     let pad = width.saturating_sub(len);
     match align {
         CellAlign::Left => format!("{content}{}", " ".repeat(pad)),
@@ -4496,15 +4549,43 @@ fn pad_cell(content: &str, width: usize, align: CellAlign) -> String {
         CellAlign::Center => {
             let left = pad / 2;
             let right = pad - left;
-            format!("{}{content}{}", " ".repeat(left), " ".repeat(right))
+            format!("{}{}{}", " ".repeat(left), content, " ".repeat(right))
         }
     }
+}
+
+fn table_render_width(widths: &[usize]) -> usize {
+    widths.iter().sum::<usize>() + widths.len() * 3 + 1
+}
+
+fn fit_table_widths(widths: &mut [usize], max_width: usize) -> bool {
+    if table_render_width(widths) <= max_width {
+        return true;
+    }
+
+    let min_widths: Vec<usize> = widths.iter().map(|&w| if w == 0 { 0 } else { 1 }).collect();
+    if table_render_width(&min_widths) > max_width {
+        return false;
+    }
+
+    while table_render_width(widths) > max_width {
+        let Some((idx, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(idx, width)| **width > min_widths[*idx])
+            .max_by_key(|(idx, width)| **width - min_widths[*idx])
+        else {
+            break;
+        };
+        widths[idx] -= 1;
+    }
+    table_render_width(widths) <= max_width
 }
 
 /// Render a markdown table (header row, separator row, then data rows) as a
 /// box-drawn grid with aligned columns. Falls back to styling the raw lines if
 /// the block is malformed.
-fn render_table_block(lines: Vec<String>) -> Vec<Line<'static>> {
+fn render_table_block(lines: Vec<String>, max_width: Option<usize>) -> Vec<Line<'static>> {
     if lines.len() < 2 {
         return lines
             .into_iter()
@@ -4538,11 +4619,25 @@ fn render_table_block(lines: Vec<String>) -> Vec<Line<'static>> {
 
     let mut widths = vec![0usize; cols];
     for (c, slot) in widths.iter_mut().enumerate() {
-        let mut w = cell(&header, c).chars().count();
+        let mut w = display_width(cell(&header, c));
         for row in &body {
-            w = w.max(cell(row, c).chars().count());
+            w = w.max(display_width(cell(row, c)));
         }
         *slot = w;
+    }
+
+    if let Some(max_width) = max_width
+        && !fit_table_widths(&mut widths, max_width.max(1))
+    {
+        return lines
+            .into_iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    truncate_display(&line, max_width.max(1)),
+                    Style::default().fg(Color::Gray),
+                ))
+            })
+            .collect();
     }
 
     let border = Style::default().fg(Color::DarkGray);
@@ -4607,9 +4702,9 @@ fn render_code_block(language: Option<String>, lines: Vec<String>) -> Vec<Line<'
 /// Render a blockquote: recursively render the (prefix-stripped) inner markdown,
 /// then prepend a `▌ ` gutter to every produced line so multi-line quotes read
 /// as a quote rather than collapsing into one run-on line.
-fn render_quote_block(lines: Vec<String>) -> Vec<Line<'static>> {
+fn render_quote_block(lines: Vec<String>, max_width: Option<usize>) -> Vec<Line<'static>> {
     let gutter = Style::default().fg(Color::DarkGray);
-    let inner = render_markdown(&lines.join("\n"));
+    let inner = render_markdown_with_limit(&lines.join("\n"), max_width);
     inner
         .into_iter()
         .map(|line| {
@@ -4960,7 +5055,9 @@ mod tests {
             .map(line_text)
             .collect();
         assert!(
-            rendered.iter().any(|l| l.chars().all(|c| c == '─') && l.len() > 3),
+            rendered
+                .iter()
+                .any(|l| l.chars().all(|c| c == '─') && l.len() > 3),
             "{rendered:?}"
         );
         assert!(!rendered.iter().any(|l| l.contains("---")), "{rendered:?}");
@@ -4974,7 +5071,12 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(!rendered.iter().any(|l| l.chars().all(|c| c == '─') && l.len() > 3), "{rendered:?}");
+        assert!(
+            !rendered
+                .iter()
+                .any(|l| l.chars().all(|c| c == '─') && l.len() > 3),
+            "{rendered:?}"
+        );
         assert!(rendered.iter().any(|l| l.contains("Title")), "{rendered:?}");
     }
 
@@ -4984,17 +5086,43 @@ mod tests {
             .iter()
             .map(line_text)
             .collect();
-        assert!(rendered.iter().any(|l| l.contains("☐") && l.contains("todo")), "{rendered:?}");
-        assert!(rendered.iter().any(|l| l.contains("☑") && l.contains("done")), "{rendered:?}");
-        assert!(rendered.iter().any(|l| l.contains("☑") && l.contains("also")), "{rendered:?}");
-        assert!(!rendered.iter().any(|l| l.contains("[ ]") || l.contains("[x]")), "{rendered:?}");
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("☐") && l.contains("todo")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("☑") && l.contains("done")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered
+                .iter()
+                .any(|l| l.contains("☑") && l.contains("also")),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered
+                .iter()
+                .any(|l| l.contains("[ ]") || l.contains("[x]")),
+            "{rendered:?}"
+        );
     }
 
     #[test]
     fn rewrite_task_list_markers_leaves_non_tasks_alone() {
         // A bracket that is not a task-list checkbox must survive untouched.
-        assert_eq!(rewrite_task_list_markers("see [link] here"), "see [link] here");
-        assert_eq!(rewrite_task_list_markers("- regular item"), "- regular item");
+        assert_eq!(
+            rewrite_task_list_markers("see [link] here"),
+            "see [link] here"
+        );
+        assert_eq!(
+            rewrite_task_list_markers("- regular item"),
+            "- regular item"
+        );
         // Indented task items are still rewritten.
         assert_eq!(rewrite_task_list_markers("  - [x] nested"), "  - ☑ nested");
     }
@@ -5007,7 +5135,10 @@ mod tests {
             "| a | 1 |".to_string(),
             "| bbbb | 22 |".to_string(),
         ];
-        let rendered: Vec<String> = render_table_block(lines).iter().map(line_text).collect();
+        let rendered: Vec<String> = render_table_block(lines, None)
+            .iter()
+            .map(line_text)
+            .collect();
         assert_eq!(
             rendered,
             vec![
@@ -5019,6 +5150,52 @@ mod tests {
                 "│ bbbb │    22 │".to_string(),
                 "└──────┴───────┘".to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn render_table_block_clips_to_max_width() {
+        let lines = vec![
+            "| Feature | Example | Status |".to_string(),
+            "| --- | --- | --- |".to_string(),
+            "| Table rendering | aligned columns with a very long explanation | ✅ |".to_string(),
+        ];
+        let rendered: Vec<String> = render_table_block(lines, Some(32))
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered.iter().all(|line| display_width(line) <= 32),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains('…')),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with('┌')),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_with_width_caps_tables() {
+        let md = "| Feature | Example | Status |\n| --- | --- | --- |\n| Table rendering | aligned columns with a very long explanation | ✅ |\n";
+        let rendered: Vec<String> = render_markdown_with_width(md, 36)
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered.iter().all(|line| display_width(line) <= 36),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.contains('…')),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|line| line.starts_with('┌')),
+            "{rendered:?}"
         );
     }
 
@@ -5123,10 +5300,7 @@ mod tests {
             120,
         )
         .unwrap();
-        assert_eq!(
-            line,
-            "▸ content_search(compact.*tool, path=src)"
-        );
+        assert_eq!(line, "▸ content_search(compact.*tool, path=src)");
 
         // Without path: show only pattern
         let line2 = compact_tool_call_line(
@@ -5553,10 +5727,7 @@ mod tests {
         let lines = render_markdown("| Tool | Why |\n| --- | --- |\n| bbox | indexed search |\n");
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
         // The separator row must be consumed, not echoed as pipe-dash soup.
-        assert!(
-            !rendered.iter().any(|l| l.contains("---")),
-            "{rendered:?}"
-        );
+        assert!(!rendered.iter().any(|l| l.contains("---")), "{rendered:?}");
         // Header and data cells survive inside a box-drawn grid.
         assert!(
             rendered.iter().any(|l| l == "│ Tool │ Why            │"),
@@ -5566,8 +5737,14 @@ mod tests {
             rendered.iter().any(|l| l == "│ bbox │ indexed search │"),
             "{rendered:?}"
         );
-        assert_eq!(rendered.first().map(String::as_str), Some("┌──────┬────────────────┐"));
-        assert_eq!(rendered.last().map(String::as_str), Some("└──────┴────────────────┘"));
+        assert_eq!(
+            rendered.first().map(String::as_str),
+            Some("┌──────┬────────────────┐")
+        );
+        assert_eq!(
+            rendered.last().map(String::as_str),
+            Some("└──────┴────────────────┘")
+        );
     }
 
     #[test]
