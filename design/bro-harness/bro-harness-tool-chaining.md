@@ -51,8 +51,9 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 >   (prominent "always-available" callout); the utilities (`clip_set`/
 >   `clip_list`/`clip_peek`/`clip_clear`) are `Eager` — callable but off the
 >   callout. Override with `BRO_HARNESS_PIN_TOOLS`.
-> - **Stage 3 (pending refs = Task)** — not built; deferred until an in-harness
->   async producer (background shell / sub-agent dispatch) exists.
+> - **Stage 3 (pending refs = Task)** — not built; deferred until a harness-local
+>   async producer exists, starting with background shell. It is not a
+>   daemon-orchestration or `bro_exec` layer.
 >
 > **On transforms vs the "no DSL" non-goal.** The §Non-goals line rejects "a
 > general dataflow DSL — the harness does not plan or optimize a graph"; it does
@@ -162,11 +163,11 @@ tools declare which kinds each param accepts.
 
 Not built; extracted to
 [`backlog-tool-chaining-stage-3.md`](./backlog-tool-chaining-stage-3.md). In
-brief: when a producer is async (background `shell_run`, in-harness sub-dispatch),
-its output register can't settle within the turn — that pending register *is* the
-Task (`RegisterState::Pending { task_id, kind }`), and the resolver gains a
-`Pending` arm rather than a new subsystem. Gated on an async producer actually
-existing.
+brief: when a harness-local producer is async (first candidate: background
+`shell_run`), its output register can't settle within the turn — that pending
+register *is* the Task (`RegisterState::Pending { task_id, kind }`), and the
+resolver gains a `Pending` arm rather than a new subsystem. This layer must not
+call daemon orchestration (`bro_exec`/`bro_resume`) or depend on daemon runtime.
 
 ## Why this is the right shape
 
@@ -185,8 +186,8 @@ existing.
 2. **Stage 2** — add `kind` to `Register`; add `stdout_to` to `shell_run` and
    `into` to `file_read`; add `from`/`stdin_from` consumers. This delivers
    tool→tool chaining.
-3. **Stage 3** — defer until an async producer (background shell / sub-agent
-   dispatch from inside the harness) actually exists.
+3. **Stage 3** — defer until a harness-local async producer, starting with
+   background shell, actually exists.
 
 ## Non-goals
 

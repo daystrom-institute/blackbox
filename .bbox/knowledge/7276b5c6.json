@@ -1,7 +1,7 @@
 {
   "id": "7276b5c6",
   "title": "bro-harness shares code with daemon, never runtime",
-  "content": "bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share **code** via workspace crates (e.g. bro-tools), but bro-harness must never have a **runtime** dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it's going the wrong way. Corollary: shared capabilities the harness needs (e.g. LSP session management) are shared by extracting code into a workspace crate both link, not by the harness calling a daemon service.",
+  "content": "bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share code via workspace crates (e.g. bro-tools), but bro-harness must never have a runtime dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it is going the wrong way. Shared capabilities the harness needs must be extracted into a workspace crate both processes link, not implemented by having the harness call a daemon service. The bro-harness Task/pending-ref layer follows the same invariant: Task producers are harness-local, and `bro_exec`/`bro_resume`/daemon orchestration are not Task producers inside the harness.",
   "variants": {},
   "category": "convention",
   "scope": "project",
@@ -14,6 +14,6 @@
   "decay": true,
   "source": "user",
   "created_at": "2026-05-30T18:14:08Z",
-  "updated_at": "2026-05-30T18:14:08Z",
+  "updated_at": "2026-06-01T01:02:31Z",
   "recall_count": 0
 }
