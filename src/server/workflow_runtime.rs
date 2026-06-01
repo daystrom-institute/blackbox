@@ -51,7 +51,6 @@ impl BlackboxServer {
             TerminalTurnConfig, TerminalTurnTiming, run_terminal_turn,
         };
         use crate::transcripts::adapters::TranscriptAdapterRegistry;
-        use tokio_util::sync::CancellationToken;
 
         if !provider.tui_capable() {
             return Err(format!(
@@ -80,16 +79,17 @@ impl BlackboxServer {
             model,
             effort,
         };
+        // Register the turn's cancel token under the task id so bro_cancel can
+        // interrupt the in-flight turn (the generic arc-cancel registry is a
+        // string->token map; task ids never collide with arc ids).
+        let cancel = self.state.register_arc_cancel_token(&id);
         let state = self.state.clone();
         let task_bg = task.clone();
+        let task_id_bg = id.clone();
         tokio::spawn(async move {
             let backend = CliTmuxBackend::new();
             let config = state.idx.read().reindex_config();
             let registry = TranscriptAdapterRegistry::from_reindex_config(&config);
-            // bro_exec terminal turns are bounded by the turn timeout; wiring
-            // bro_cancel to trip this token is a follow-up (the workflow path
-            // already supports arc cancel).
-            let cancel = CancellationToken::new();
             match run_terminal_turn(
                 &backend,
                 &registry,
@@ -117,15 +117,24 @@ impl BlackboxServer {
                         Some(o.location),
                     );
                 }
-                Err(e) => orch::finalize_terminal_task(
-                    &task_bg,
-                    "pending".to_string(),
-                    None,
-                    orch::TaskStatus::Failed,
-                    format!("terminal-mode dispatch failed: {e}"),
-                    None,
-                ),
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        // bro_cancel already set status=Cancelled and the turn's
+                        // error path reaped the tmux session; don't clobber the
+                        // cancelled status with a failure.
+                    } else {
+                        orch::finalize_terminal_task(
+                            &task_bg,
+                            "pending".to_string(),
+                            None,
+                            orch::TaskStatus::Failed,
+                            format!("terminal-mode dispatch failed: {e}"),
+                            None,
+                        );
+                    }
+                }
             }
+            state.unregister_arc_cancel_token(&task_id_bg);
             state.task_store.read().persist(&state.store_dir);
         });
         Ok(task)

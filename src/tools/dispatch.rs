@@ -1691,6 +1691,11 @@ impl BlackboxServer {
                 let _ = self.state.cancel_arc(&inner.session_id);
             }
         }
+        // Terminal-mode (tmux) bro turns register their cancel token under the
+        // task id. Trip it so the in-flight turn is interrupted and its pane
+        // reaped; cancel_task below then records the cancelled status. No-op for
+        // non-terminal tasks (no token registered under their id).
+        let _ = self.state.cancel_arc(&p.task_id);
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
             Ok(()) => {
                 let inner = task.inner.lock();
