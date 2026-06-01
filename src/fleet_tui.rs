@@ -153,7 +153,6 @@ struct AgentView {
     model: Option<String>,
     cwd: Option<String>,
     report_message: Option<String>,
-    turns: Option<u64>,
     started_at: u64,
     last_activity_ms: Option<u64>,
     stderr_tail: Option<String>,
@@ -181,7 +180,6 @@ impl Agent {
             model: snap.model,
             cwd: snap.cwd,
             report_message: snap.report_message,
-            turns: snap.num_turns,
             started_at: snap.started_at,
             last_activity_ms: snap.last_event_at_ms,
             stderr_tail,
@@ -2209,7 +2207,7 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
     }
 
     // Fixed-width columns: glyph · provider · name · model · report (flex) ·
-    // turns · started · last. `started` = session age; `last` = time since the
+    // started · last. `started` = session age; `last` = time since the
     // last stream event.
     let widths = [
         Constraint::Length(1),
@@ -2217,12 +2215,11 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
         Constraint::Length(30),
         Constraint::Length(13),
         Constraint::Min(18),
-        Constraint::Length(5),
         Constraint::Length(7),
         Constraint::Length(7),
     ];
     let header = Row::new([
-        "", "prov", "agent", "model", "report", "turns", "started", "last",
+        "", "prov", "agent", "model", "report", "started", "last",
     ])
     .style(
         Style::default()
@@ -2271,7 +2268,6 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
             let v = &views[i];
             let a = &app.agents[i];
             let (glyph, gcolor) = v.state.glyph();
-            let turns = v.turns.map(|t| t.to_string()).unwrap_or_else(|| "—".into());
             let model = a
                 .selected_model
                 .clone()
@@ -2295,7 +2291,6 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
                     .style(Style::default().add_modifier(Modifier::BOLD)),
                 Cell::from(truncate(&model, 13)).style(Style::default().fg(Color::Gray)),
                 Cell::from(report).style(Style::default().fg(Color::LightYellow)),
-                Cell::from(turns).style(Style::default().fg(Color::Gray)),
                 Cell::from(started).style(Style::default().fg(Color::DarkGray)),
                 Cell::from(last).style(Style::default().fg(Color::DarkGray)),
             ]));
@@ -4256,7 +4251,6 @@ mod tests {
             model: None,
             cwd: None,
             report_message: None,
-            turns: None,
             started_at,
             last_activity_ms,
             stderr_tail: None,
