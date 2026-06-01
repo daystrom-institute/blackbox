@@ -661,10 +661,11 @@ impl Session {
             last_model_tool_call_count,
             turn_steps,
             &last_tool_results,
+            &final_text,
         );
         tracing::info!(turn_end = %turn_end, "turn ending");
         if turn_end["suspicious"].as_bool().unwrap_or(false) {
-            tracing::warn!(turn_end = %turn_end, "turn ending with outstanding async work");
+            tracing::warn!(turn_end = %turn_end, "suspicious turn end");
             self.emitter.turn_end_diagnostics(turn_end);
         }
 
@@ -702,6 +703,7 @@ impl Session {
         last_model_tool_call_count: usize,
         turn_steps: u64,
         last_tool_results: &[Value],
+        final_text: &str,
     ) -> Value {
         let shell_ids = self.cx.shell_sessions.lock().unwrap().ids();
         let promise_list = self.cx.promises.lock().unwrap().list();
@@ -710,7 +712,34 @@ impl Session {
         let last_tool_running = last_tool_results
             .iter()
             .any(|v| v["running"].as_bool() == Some(true));
-        let suspicious = !shell_ids.is_empty() || running_promises > 0 || last_tool_running;
+        let outstanding_async = !shell_ids.is_empty() || running_promises > 0 || last_tool_running;
+
+        // Empty-output stop: the model itself ended the turn (not max_turns /
+        // cancel / interrupt) having produced no assistant text AND no tool
+        // calls. This is the classic spurious-stop signature — the model
+        // returned nothing and the turn silently terminated — which the
+        // outstanding-async heuristic above does not catch. A `tool_calls_empty`
+        // break is abnormal by construction (stop=tool_calls yet zero calls);
+        // for it we flag regardless of text.
+        let produced_text = !final_text.trim().is_empty();
+        let model_ended = matches!(break_reason, "model_stop" | "tool_calls_empty");
+        let empty_output_stop =
+            model_ended && last_model_tool_call_count == 0 && !produced_text;
+
+        let mut suspicion_reasons: Vec<&str> = Vec::new();
+        if !shell_ids.is_empty() {
+            suspicion_reasons.push("outstanding_shell_sessions");
+        }
+        if running_promises > 0 {
+            suspicion_reasons.push("running_promises");
+        }
+        if last_tool_running {
+            suspicion_reasons.push("last_tool_running");
+        }
+        if empty_output_stop {
+            suspicion_reasons.push("empty_output_stop");
+        }
+        let suspicious = outstanding_async || empty_output_stop;
 
         json!({
             "break_reason": break_reason,
@@ -719,12 +748,16 @@ impl Session {
             "last_model_tool_call_count": last_model_tool_call_count,
             "turn_steps": turn_steps,
             "harness_turns_total": self.turns,
+            "final_text_len": final_text.len(),
+            "produced_text": produced_text,
+            "empty_output_stop": empty_output_stop,
             "outstanding_shell_sessions": {
                 "count": shell_ids.len(),
                 "ids": shell_ids,
             },
             "promises": promises,
             "last_tool_results": last_tool_results,
+            "suspicion_reasons": suspicion_reasons,
             "suspicious": suspicious,
         })
     }
@@ -1541,14 +1574,88 @@ mod tests {
             },
         );
 
-        let diag =
-            session.turn_end_diagnostics("model_stop", Some(&StopReason::Done), 0, 1, &[trace]);
+        // Non-empty final text proves the async path is flagged independently
+        // of the empty-output heuristic.
+        let diag = session.turn_end_diagnostics(
+            "model_stop",
+            Some(&StopReason::Done),
+            0,
+            1,
+            &[trace],
+            "all set, kicking off the build",
+        );
 
         assert_eq!(diag["break_reason"], "model_stop");
         assert_eq!(diag["last_model_stop"], "done");
         assert_eq!(diag["promises"]["running_count"], 1);
         assert_eq!(diag["last_tool_results"][0]["running"], true);
+        assert_eq!(diag["produced_text"], true);
+        assert_eq!(diag["empty_output_stop"], false);
         assert_eq!(diag["suspicious"], true);
+        assert!(
+            diag["suspicion_reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r == "running_promises"),
+            "{diag}"
+        );
+    }
+
+    #[test]
+    fn turn_end_diagnostics_flags_empty_output_model_stop() {
+        // The classic spurious stop: model ends the turn (end_turn → Done) with
+        // no text and no tool calls, and there is no outstanding async work.
+        let (session, _shared) = mk_session(vec![]);
+
+        let diag = session.turn_end_diagnostics(
+            "model_stop",
+            Some(&StopReason::Done),
+            0,
+            1,
+            &[],
+            "",
+        );
+
+        assert_eq!(diag["produced_text"], false);
+        assert_eq!(diag["final_text_len"], 0);
+        assert_eq!(diag["empty_output_stop"], true);
+        assert_eq!(diag["suspicious"], true);
+        assert_eq!(diag["suspicion_reasons"][0], "empty_output_stop");
+    }
+
+    #[test]
+    fn turn_end_diagnostics_normal_text_stop_is_not_suspicious() {
+        // A model that ends the turn with substantive text and no outstanding
+        // work is a normal answer, not a spurious stop.
+        let (session, _shared) = mk_session(vec![]);
+
+        let diag = session.turn_end_diagnostics(
+            "model_stop",
+            Some(&StopReason::Done),
+            0,
+            2,
+            &[],
+            "Here is the summary of what I changed.",
+        );
+
+        assert_eq!(diag["produced_text"], true);
+        assert_eq!(diag["empty_output_stop"], false);
+        assert_eq!(diag["suspicious"], false);
+        assert!(diag["suspicion_reasons"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn turn_end_diagnostics_empty_max_turns_is_not_empty_output_stop() {
+        // max_turns / cancel / interrupt are harness-driven ends, not the model
+        // returning nothing — they must not be laundered into empty_output_stop.
+        let (session, _shared) = mk_session(vec![]);
+
+        let diag =
+            session.turn_end_diagnostics("max_turns", Some(&StopReason::ToolCalls), 1, 50, &[], "");
+
+        assert_eq!(diag["empty_output_stop"], false);
+        assert_eq!(diag["suspicious"], false);
     }
 
     // ---- window-0 diagnostics: full seam (drain edits -> engine -> render -> rider) ----
