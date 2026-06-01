@@ -63,7 +63,7 @@ struct ExitWorktreeInput {
     /// Worktree path. Omit to target the current tool root.
     #[serde(default)]
     worktree: Option<String>,
-    /// keep, discard, or publish. Default keep.
+    /// keep, preflight, discard, or publish. Default keep.
     #[serde(default)]
     disposition: Option<String>,
     /// Commit message for publish.
@@ -87,7 +87,7 @@ impl Tool for ExitWorktree {
     }
 
     fn description(&self) -> &str {
-        "Finish a managed fleet worktree. disposition=keep reports status only. disposition=discard removes a clean/confirmed managed worktree. disposition=publish commits selected changes, fetches/rebases onto origin/main, fast-forwards main, pushes main, and removes the worktree. publish/discard require confirm=true."
+        "Finish a managed fleet worktree. disposition=keep reports status only. disposition=preflight reports the exact publish/discard readiness without mutating. disposition=discard removes a clean/confirmed managed worktree. disposition=publish commits selected changes, fetches/rebases onto origin/main, fast-forwards main, pushes main, and removes the worktree. publish/discard require confirm=true."
     }
 
     fn input_schema(&self) -> Value {
@@ -231,6 +231,7 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             "branch": branch,
             "status": status,
         })),
+        "preflight" => publish_preflight(&base_repo, &worktree, &branch, &status, &args.paths),
         "discard" => {
             if !args.confirm {
                 anyhow::bail!("discard requires confirm=true");
@@ -292,8 +293,76 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                 "removed_worktree": worktree,
             }))
         }
-        other => anyhow::bail!("disposition must be keep, discard, or publish; got {other}"),
+        other => {
+            anyhow::bail!("disposition must be keep, preflight, discard, or publish; got {other}")
+        }
     }
+}
+
+fn publish_preflight(
+    base_repo: &Path,
+    worktree: &Path,
+    branch: &str,
+    status: &str,
+    requested_paths: &[String],
+) -> anyhow::Result<Value> {
+    let changed = changed_paths(worktree)?;
+    let selected_paths = if requested_paths.is_empty() {
+        changed.clone()
+    } else {
+        requested_paths.to_vec()
+    };
+    let unsafe_paths: Vec<String> = selected_paths
+        .iter()
+        .filter(|p| !is_safe_pathspec(p))
+        .cloned()
+        .collect();
+    let base_branch = git_capture(base_repo, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .unwrap_or_else(|e| format!("unavailable: {e}"));
+    let base_dirty = git_capture(base_repo, &["status", "--porcelain=v1"])
+        .unwrap_or_else(|e| format!("unavailable: {e}"));
+    let base_ready = base_branch.trim() == "main" && base_dirty.trim().is_empty();
+    let origin_main = git_capture(
+        base_repo,
+        &["rev-parse", "--verify", "--short=12", "origin/main"],
+    )
+    .ok();
+    let main_head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"]).ok();
+    let main_vs_origin = git_capture(
+        base_repo,
+        &["rev-list", "--left-right", "--count", "HEAD...origin/main"],
+    )
+    .ok();
+
+    Ok(json!({
+        "ok": unsafe_paths.is_empty() && base_ready && !changed.is_empty(),
+        "disposition": "preflight",
+        "worktree": worktree,
+        "branch": branch,
+        "worktree_status": status,
+        "changed_paths": changed,
+        "selected_paths": selected_paths,
+        "unsafe_paths": unsafe_paths,
+        "base_repo": base_repo,
+        "base_branch": base_branch,
+        "base_dirty": base_dirty,
+        "base_ready": base_ready,
+        "main_head": main_head,
+        "origin_main_head": origin_main,
+        "main_vs_origin": main_vs_origin,
+        "publish_plan": [
+            "require confirm=true",
+            "ensure base repo is clean and on main",
+            "git fetch origin main",
+            "git merge --ff-only origin/main in base repo",
+            "git add -- selected paths in managed worktree",
+            "git commit in managed worktree",
+            "git rebase main in managed worktree",
+            "git merge --ff-only branch into main",
+            "git push origin main",
+            "git worktree remove and delete bro-fleet branch"
+        ],
+    }))
 }
 
 fn fleet_base_repo(cx_root: &Path) -> anyhow::Result<PathBuf> {
@@ -498,23 +567,31 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn enter_creates_managed_worktree() {
+    fn seed_repo() -> tempfile::TempDir {
         let repo = tempfile::tempdir().unwrap();
-        run_git(repo.path(), &["init"]);
+        run_git(repo.path(), &["init", "-b", "main"]);
         run_git(repo.path(), &["config", "user.email", "test@example.com"]);
         run_git(repo.path(), &["config", "user.name", "Test User"]);
         std::fs::write(repo.path().join("README.md"), "base\n").unwrap();
         run_git(repo.path(), &["add", "."]);
         run_git(repo.path(), &["commit", "-m", "init"]);
+        repo
+    }
 
+    async fn enter_test_worktree(repo: &Path) -> Value {
         let tool = EnterWorktree;
         let result = tool
-            .call(json!({"purpose":"isolated task"}), &cx(repo.path()))
+            .call(json!({"purpose":"isolated task"}), &cx(repo))
             .await;
         let (content, is_error) = result.into_content();
         assert!(!is_error, "{content}");
-        let value: Value = serde_json::from_str(&content).unwrap();
+        serde_json::from_str(&content).unwrap()
+    }
+
+    #[tokio::test]
+    async fn enter_creates_managed_worktree() {
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
         let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
         assert!(cwd.join("README.md").is_file());
         assert!(
@@ -523,6 +600,78 @@ mod tests {
                 .unwrap()
                 .starts_with("bro-fleet/isolated-task-")
         );
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_preflight_reports_publish_plan_without_mutating() {
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        std::fs::write(cwd.join("README.md"), "base\nchange\n").unwrap();
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "preflight",
+                    "paths": ["README.md"]
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(report["disposition"], "preflight");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["changed_paths"], json!(["README.md"]));
+        assert_eq!(report["selected_paths"], json!(["README.md"]));
+        assert!(report["publish_plan"].as_array().unwrap().len() >= 5);
+        assert!(cwd.join("README.md").is_file());
+        assert_eq!(
+            git_capture(&cwd, &["rev-list", "--count", "HEAD"]).unwrap(),
+            "1"
+        );
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_preflight_reports_unsafe_pathspecs() {
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        std::fs::write(cwd.join("README.md"), "base\nchange\n").unwrap();
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "preflight",
+                    "paths": ["../outside"]
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(report["ok"], false);
+        assert_eq!(report["unsafe_paths"], json!(["../outside"]));
 
         run_git(
             repo.path(),
