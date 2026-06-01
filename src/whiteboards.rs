@@ -81,12 +81,17 @@ impl Phase {
     }
 
     /// True if `target` is a legal direct transition from `self`.
-    /// Allows the canonical step OR `read → debate` (skip validate).
+    /// Allows the canonical step, OR `read → debate` (skip validate when
+    /// no validator round is run), OR `validate → resolve` (skip debate on
+    /// the conflict-free path — validation alone is dispositive).
     pub fn allows_transition_to(self, target: Phase) -> bool {
         if self.canonical_next() == Some(target) {
             return true;
         }
-        matches!((self, target), (Self::Read, Self::Debate))
+        matches!(
+            (self, target),
+            (Self::Read, Self::Debate) | (Self::Validate, Self::Resolve)
+        )
     }
 
     pub fn allows_post(self) -> bool {
@@ -313,6 +318,108 @@ impl Board {
         }
         tallies
     }
+
+    /// Validation standing of a single post, derived from the validator's
+    /// `Validation` annotations against it. Precedence (bridgecrew exclusion
+    /// teeth): any `refuted` → `Excluded`; else any `inconclusive` with no
+    /// `confirmed` → `Inconclusive`; else ≥1 `confirmed` → `Confirmed`; else
+    /// (no validation at all) → `Unvalidated`.
+    pub fn post_standing(&self, post_id: &str) -> PostStanding {
+        let mut confirmed = false;
+        let mut inconclusive = false;
+        for a in &self.annotations {
+            if a.post_id != post_id || a.annotation_type != AnnotationType::Validation {
+                continue;
+            }
+            match a.result {
+                Some(ValidationResult::Refuted) => return PostStanding::Excluded,
+                Some(ValidationResult::Confirmed) => confirmed = true,
+                Some(ValidationResult::Inconclusive) => inconclusive = true,
+                None => {}
+            }
+        }
+        if confirmed {
+            PostStanding::Confirmed
+        } else if inconclusive {
+            PostStanding::Inconclusive
+        } else {
+            PostStanding::Unvalidated
+        }
+    }
+
+    /// Count of posts that received NO cross-agent challenge or corroborate.
+    /// Self-annotation doesn't count (an author cannot review their own post).
+    /// A non-zero value means the panel left posts unscrutinised — the gate
+    /// uses this to reject the "zero challenges trivially ready" degenerate.
+    pub fn unreviewed_post_count(&self) -> u32 {
+        self.posts
+            .iter()
+            .filter(|p| {
+                !self.annotations.iter().any(|a| {
+                    a.post_id == p.id
+                        && a.agent != p.agent
+                        && matches!(
+                            a.annotation_type,
+                            AnnotationType::Challenge | AnnotationType::Corroborate
+                        )
+                })
+            })
+            .count() as u32
+    }
+
+    /// Validator-driven partition of posts into surviving vs excluded, plus
+    /// per-standing counts and review coverage. Refuted posts are excluded
+    /// from the correction plan; everything else survives (inconclusive is
+    /// flagged/severity-capped downstream, unvalidated proceeds with a warning).
+    pub fn validation_summary(&self) -> ValidationSummary {
+        let mut out = ValidationSummary::default();
+        for p in &self.posts {
+            match self.post_standing(&p.id) {
+                PostStanding::Excluded => {
+                    out.excluded_post_ids.push(p.id.clone());
+                    out.refuted_count += 1;
+                }
+                PostStanding::Confirmed => {
+                    out.surviving_post_ids.push(p.id.clone());
+                    out.confirmed_count += 1;
+                }
+                PostStanding::Inconclusive => {
+                    out.surviving_post_ids.push(p.id.clone());
+                    out.inconclusive_count += 1;
+                }
+                PostStanding::Unvalidated => {
+                    out.surviving_post_ids.push(p.id.clone());
+                    out.unvalidated_count += 1;
+                }
+            }
+        }
+        out.unreviewed_post_count = self.unreviewed_post_count();
+        out
+    }
+}
+
+/// Validation standing of a single post (see `Board::post_standing`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PostStanding {
+    Confirmed,
+    Inconclusive,
+    Unvalidated,
+    /// Validator refuted the claim — excluded from the correction plan.
+    Excluded,
+}
+
+/// Board-level validation partition + review coverage, surfaced by
+/// `whiteboard_summarize` for the gate packet and the plan-writer.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValidationSummary {
+    pub surviving_post_ids: Vec<String>,
+    pub excluded_post_ids: Vec<String>,
+    pub confirmed_count: u32,
+    pub refuted_count: u32,
+    pub inconclusive_count: u32,
+    pub unvalidated_count: u32,
+    pub unreviewed_post_count: u32,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1442,5 +1549,108 @@ mod tests {
         let scope = board_template_scope(&arc.read());
         assert_eq!(scope.get("phase").unwrap().as_str(), Some("blind"));
         assert_eq!(scope.get("post_count").unwrap().as_u64(), Some(1));
+    }
+
+    // ── Phase 1: validator exclusion teeth + review coverage ───────────
+
+    /// Board with three lens posts (post-001..003 by l1/l2/l3) plus a
+    /// validator `v`, advanced to the validate phase.
+    fn board_in_validate() -> WhiteboardRegistry {
+        let r = fresh_registry();
+        r.open("b1", "topic", "/proj", None, "fac").unwrap();
+        r.register("b1", "fac", Role::Facilitator, "ops").unwrap();
+        r.register("b1", "v", Role::Specialist, "validator").unwrap();
+        for lens in ["l1", "l2", "l3"] {
+            r.register("b1", lens, Role::Specialist, "lens").unwrap();
+            r.post(
+                "b1", lens, PostType::Claim, lens, "body", None, None, None, vec![], vec![],
+            )
+            .unwrap();
+        }
+        r.transition("b1", "fac", Phase::Read, None).unwrap();
+        r.transition("b1", "fac", Phase::Validate, None).unwrap();
+        r
+    }
+
+    #[test]
+    fn post_standing_precedence() {
+        let r = board_in_validate();
+        r.annotate(
+            "b1", "v", "post-001", AnnotationType::Validation, "ok",
+            Some(ValidationResult::Confirmed), None,
+        )
+        .unwrap();
+        r.annotate(
+            "b1", "v", "post-002", AnnotationType::Validation, "nope",
+            Some(ValidationResult::Refuted), None,
+        )
+        .unwrap();
+        let arc = r.get("b1").unwrap();
+        let b = arc.read();
+        assert_eq!(b.post_standing("post-001"), PostStanding::Confirmed);
+        assert_eq!(b.post_standing("post-002"), PostStanding::Excluded);
+        // No validation at all → unvalidated (survives with a warning).
+        assert_eq!(b.post_standing("post-003"), PostStanding::Unvalidated);
+    }
+
+    #[test]
+    fn post_standing_refuted_wins_and_confirmed_beats_inconclusive() {
+        let r = board_in_validate();
+        r.register("b1", "v2", Role::Specialist, "validator").unwrap();
+        // post-001: confirmed + refuted → Excluded (refuted is dispositive).
+        r.annotate("b1", "v", "post-001", AnnotationType::Validation, "c", Some(ValidationResult::Confirmed), None).unwrap();
+        r.annotate("b1", "v2", "post-001", AnnotationType::Validation, "r", Some(ValidationResult::Refuted), None).unwrap();
+        // post-002: confirmed + inconclusive → Confirmed.
+        r.annotate("b1", "v", "post-002", AnnotationType::Validation, "c", Some(ValidationResult::Confirmed), None).unwrap();
+        r.annotate("b1", "v2", "post-002", AnnotationType::Validation, "i", Some(ValidationResult::Inconclusive), None).unwrap();
+        // post-003: inconclusive only → Inconclusive.
+        r.annotate("b1", "v", "post-003", AnnotationType::Validation, "i", Some(ValidationResult::Inconclusive), None).unwrap();
+        let arc = r.get("b1").unwrap();
+        let b = arc.read();
+        assert_eq!(b.post_standing("post-001"), PostStanding::Excluded);
+        assert_eq!(b.post_standing("post-002"), PostStanding::Confirmed);
+        assert_eq!(b.post_standing("post-003"), PostStanding::Inconclusive);
+    }
+
+    #[test]
+    fn validation_summary_partitions_surviving_and_excluded() {
+        let r = board_in_validate();
+        r.annotate("b1", "v", "post-001", AnnotationType::Validation, "c", Some(ValidationResult::Confirmed), None).unwrap();
+        r.annotate("b1", "v", "post-002", AnnotationType::Validation, "r", Some(ValidationResult::Refuted), None).unwrap();
+        // post-003 left unvalidated.
+        let arc = r.get("b1").unwrap();
+        let vs = arc.read().validation_summary();
+        assert_eq!(vs.excluded_post_ids, vec!["post-002".to_string()]);
+        assert_eq!(
+            vs.surviving_post_ids,
+            vec!["post-001".to_string(), "post-003".to_string()]
+        );
+        assert_eq!(vs.confirmed_count, 1);
+        assert_eq!(vs.refuted_count, 1);
+        assert_eq!(vs.unvalidated_count, 1);
+        assert_eq!(vs.inconclusive_count, 0);
+    }
+
+    #[test]
+    fn unreviewed_post_count_requires_cross_agent_review() {
+        let r = board_in_validate();
+        // Conflict path: validate → debate (canonical). Self-annotation never counts.
+        r.transition("b1", "fac", Phase::Debate, None).unwrap();
+        let arc = r.get("b1").unwrap();
+        assert_eq!(arc.read().unreviewed_post_count(), 3);
+        // l2 challenges post-001, l3 corroborates post-002 → only post-003 unreviewed.
+        r.annotate("b1", "l2", "post-001", AnnotationType::Challenge, "disagree", None, None).unwrap();
+        r.annotate("b1", "l3", "post-002", AnnotationType::Corroborate, "agree", None, None).unwrap();
+        let arc = r.get("b1").unwrap();
+        assert_eq!(arc.read().unreviewed_post_count(), 1);
+    }
+
+    #[test]
+    fn validate_to_resolve_skip_is_legal() {
+        let r = board_in_validate();
+        // Conflict-free path skips debate entirely.
+        r.transition("b1", "fac", Phase::Resolve, None).unwrap();
+        let arc = r.get("b1").unwrap();
+        assert_eq!(arc.read().phase, Phase::Resolve);
     }
 }

@@ -1,8 +1,8 @@
 {
   "domain": "pathology-review/whiteboard-participation",
-  "version": 1,
+  "version": 2,
   "scope": "global",
-  "classification_lattice": ["invalid", "ready"],
+  "classification_lattice": ["ready_debate", "ready_skip", "ready", "invalid"],
   "prefix_inference": {},
   "rules": [
     {
@@ -23,14 +23,42 @@
       "consequent": "ready"
     },
     {
-      "id": "debate_resolved",
+      "id": "validation_complete_with_conflicts",
+      "classification": "ready_debate",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "vars.board_check.phase", "value": "validate" },
+          { "op": "Eq", "field": "vars.board_check.agents.validator.has_posted", "value": true },
+          { "op": "Eq", "field": "vars.board_check.unvalidated_count", "value": 0 },
+          { "op": "Ge", "field": "vars.board_check.conflict_count", "value": 1 }
+        ]
+      },
+      "consequent": "ready_debate"
+    },
+    {
+      "id": "validation_complete_no_conflicts",
+      "classification": "ready_skip",
+      "antecedent": {
+        "op": "All",
+        "args": [
+          { "op": "Eq", "field": "vars.board_check.phase", "value": "validate" },
+          { "op": "Eq", "field": "vars.board_check.agents.validator.has_posted", "value": true },
+          { "op": "Eq", "field": "vars.board_check.unvalidated_count", "value": 0 },
+          { "op": "Eq", "field": "vars.board_check.conflict_count", "value": 0 }
+        ]
+      },
+      "consequent": "ready_skip"
+    },
+    {
+      "id": "debate_participation_complete",
       "classification": "ready",
       "antecedent": {
         "op": "All",
         "args": [
           { "op": "Eq", "field": "vars.board_check.phase", "value": "debate" },
           { "op": "Ge", "field": "vars.board_check.post_count", "value": 5 },
-          { "op": "Eq", "field": "vars.board_check.unresolved_challenges", "value": 0 },
+          { "op": "Eq", "field": "vars.board_check.unreviewed_post_count", "value": 0 },
           { "op": "Ge", "field": "vars.board_check.vote_count", "value": 1 }
         ]
       },

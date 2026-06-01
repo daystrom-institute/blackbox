@@ -446,6 +446,7 @@ impl BlackboxServer {
             .filter(|a| a.annotation_type == whiteboards::AnnotationType::Challenge)
             .filter(|c| !resolved.contains(c.id.as_str()))
             .count();
+        let vs = board.validation_summary();
         Self::ok_json(&serde_json::json!({
             "board_id": board.id,
             "topic": board.topic,
@@ -459,7 +460,17 @@ impl BlackboxServer {
             "vote_tally": board.vote_tally(),
             "conflict_count": conflicts.len(),
             "challenge_count": challenges,
+            // Informational only — debate no longer gates on this reaching 0;
+            // surviving unresolved challenges flow into the plan's Contradictions.
             "unresolved_challenges": unresolved_challenges,
+            // Validator-driven exclusion teeth + review coverage.
+            "surviving_post_ids": vs.surviving_post_ids,
+            "excluded_post_ids": vs.excluded_post_ids,
+            "confirmed_count": vs.confirmed_count,
+            "refuted_count": vs.refuted_count,
+            "inconclusive_count": vs.inconclusive_count,
+            "unvalidated_count": vs.unvalidated_count,
+            "unreviewed_post_count": vs.unreviewed_post_count,
             "agents": agents_status,
         }))
     }

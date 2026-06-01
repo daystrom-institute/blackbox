@@ -935,6 +935,32 @@ mod tests {
     }
 
     #[test]
+    fn pathology_ensemble_workflows_compile() {
+        let cases: &[(&str, &str)] = &[
+            (
+                "arch-pathology-rust",
+                include_str!("../../system-defaults/workflows/refactor/arch-pathology-rust.json"),
+            ),
+            (
+                "arch-pathology-java",
+                include_str!("../../system-defaults/workflows/refactor/arch-pathology-java.json"),
+            ),
+            (
+                "perf-pathology-rust",
+                include_str!("../../system-defaults/workflows/refactor/perf-pathology-rust.json"),
+            ),
+            (
+                "perf-pathology-java",
+                include_str!("../../system-defaults/workflows/refactor/perf-pathology-java.json"),
+            ),
+        ];
+        for (name, src) in cases {
+            let spec = load_workflow(src).unwrap_or_else(|e| panic!("{name}: parse failed: {e:?}"));
+            compile(spec).unwrap_or_else(|e| panic!("{name}: compile failed: {e:?}"));
+        }
+    }
+
+    #[test]
     fn blind_workflow_loads_and_validates() {
         let json = include_str!("../../examples/workflows/blind.json");
         let spec = load_workflow(json).expect("parse blind spec");

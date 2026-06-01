@@ -1,5 +1,5 @@
 {
-  "name": "arch-pathology-rust",
+  "name": "perf-pathology-rust",
   "version": 2,
   "vars_schema": {
     "project_dir": {
@@ -17,14 +17,11 @@
     "operator_hints": {
       "kind": "array"
     },
-    "target_loci": {
+    "hot_paths": {
       "kind": "array"
     },
-    "layer_model_path": {
-      "kind": "string"
-    },
-    "whole_project_mode": {
-      "kind": "bool"
+    "baseline_refs": {
+      "kind": "array"
     },
     "baseline_result": {
       "kind": "object"
@@ -60,18 +57,18 @@
   "actors": {
     "facilitator": {
       "kind": "executor",
-      "brofile": "rust-architecture-pathologist",
+      "brofile": "rust-performance-pathologist",
       "durable": true,
       "compaction_anchor": true
     },
     "panel": {
       "kind": "ensemble",
-      "team": "rust-pathology-panel",
+      "team": "rust-perf-pathology-panel",
       "durable": true
     },
     "validator": {
       "kind": "executor",
-      "brofile": "arch-rust-pathology-validator",
+      "brofile": "perf-rust-pathology-validator",
       "durable": true
     }
   },
@@ -90,29 +87,22 @@
         {
           "op": "default_var",
           "args": {
-            "key": "target_loci",
+            "key": "hot_paths",
             "value": []
           }
         },
         {
           "op": "default_var",
           "args": {
-            "key": "layer_model_path",
-            "value": ""
-          }
-        },
-        {
-          "op": "default_var",
-          "args": {
-            "key": "whole_project_mode",
-            "value": false
+            "key": "baseline_refs",
+            "value": []
           }
         },
         {
           "op": "set_var",
           "args": {
             "key": "whiteboard_id",
-            "value": "arch-pathology-rust:${meta.arc_id}"
+            "value": "perf-pathology-rust:${meta.arc_id}"
           }
         },
         {
@@ -137,8 +127,8 @@
               "board_id": "${vars.whiteboard_id}",
               "opened_by": "facilitator",
               "project": "${vars.project_dir}",
-              "topic": "Rust architecture pathology review for ${vars.scope_filter}",
-              "domain": "rust-architecture-pathology"
+              "topic": "Rust performance pathology review for ${vars.scope_filter}",
+              "domain": "rust-performance-pathology"
             },
             "timeout_secs": 30
           },
@@ -153,7 +143,7 @@
             "arguments": {
               "agent_name": "soundness",
               "board_id": "${vars.whiteboard_id}",
-              "domain": "rust-architecture-pathology",
+              "domain": "rust-performance-pathology",
               "role": "specialist"
             },
             "timeout_secs": 30
@@ -168,7 +158,7 @@
             "arguments": {
               "agent_name": "precision",
               "board_id": "${vars.whiteboard_id}",
-              "domain": "rust-architecture-pathology",
+              "domain": "rust-performance-pathology",
               "role": "specialist"
             },
             "timeout_secs": 30
@@ -183,7 +173,7 @@
             "arguments": {
               "agent_name": "economy",
               "board_id": "${vars.whiteboard_id}",
-              "domain": "rust-architecture-pathology",
+              "domain": "rust-performance-pathology",
               "role": "specialist"
             },
             "timeout_secs": 30
@@ -198,7 +188,7 @@
             "arguments": {
               "agent_name": "resilience",
               "board_id": "${vars.whiteboard_id}",
-              "domain": "rust-architecture-pathology",
+              "domain": "rust-performance-pathology",
               "role": "specialist"
             },
             "timeout_secs": 30
@@ -213,7 +203,7 @@
             "arguments": {
               "agent_name": "corroboration",
               "board_id": "${vars.whiteboard_id}",
-              "domain": "rust-architecture-pathology",
+              "domain": "rust-performance-pathology",
               "role": "specialist"
             },
             "timeout_secs": 30
@@ -228,7 +218,7 @@
             "arguments": {
               "agent_name": "validator",
               "board_id": "${vars.whiteboard_id}",
-              "domain": "rust-architecture-pathology",
+              "domain": "rust-performance-pathology",
               "role": "specialist"
             },
             "timeout_secs": 30
@@ -243,7 +233,7 @@
     },
     "Survey": {
       "actor": "facilitator",
-      "prompt": "Run the cheap survey for Rust architecture pathology.\n\nProject: ${vars.project_dir}\nScope filter: ${vars.scope_filter}\nWhole-project mode: ${vars.whole_project_mode}\nTarget loci: ${vars.target_loci}\nOperator hints: ${vars.operator_hints}\nLayer model path: ${vars.layer_model_path}\nTarget context window: ${vars.target_context_window}\nWhiteboard id: ${vars.whiteboard_id}\n\nUse cheap measurement before LLM judgment: bbox_code_symbols, bbox_refactor_status, bbox_refactor_plan(kind=\"rust_impl_partition_analysis\") for concrete candidate impls, rust_public_api_guard when public surfaces may be touched, cargo metadata observations where available, cfg/macro density, tests, and bbox_hybrid_search/bbox_notes/bbox_search for transcript pressure when hints or history point there. Do not run every atom. Select a bounded top set of atom requests whose diagnostic question is justified by the survey. Do not post to the whiteboard yet; the lens panel posts blind diagnoses next.\n\nReturn strict JSON only with keys: survey_summary, pressure_map, target_loci, atom_requests, deferred_hotspots, limits. atom_requests must be an array of objects shaped {\"atom_ref\":\"atom:rust-architecture-impl-role-coherence@v1\",\"args\":{...}}. Each args object must include project_dir, scope_filter, target_loci, operator_hints, layer_model_path, survey_json, target_context_window, whole_project_mode, and whiteboard_id. Use only these atom refs: atom:rust-architecture-impl-role-coherence@v1, atom:rust-architecture-state-ownership-collapse@v1, atom:rust-architecture-construction-boundary-collapse@v1, atom:rust-architecture-trait-boundary-mismatch@v1, atom:rust-architecture-module-topology-drift@v1, atom:rust-architecture-error-contract-drift@v1, atom:rust-architecture-feature-cfg-matrix@v1, atom:rust-architecture-async-runtime-lifecycle@v1, atom:rust-architecture-test-implied-architecture@v1, atom:rust-architecture-unsafe-contract-opacity@v1, atom:rust-architecture-macro-generated-contract-opacity@v1, atom:rust-architecture-transcript-anchored-pressure@v1. If evidence is weak, return fewer atom_requests and explain the limit. First byte {, final byte }.",
+      "prompt": "Run the cheap survey for Rust performance pathology.\n\nProject: ${vars.project_dir}\nScope filter: ${vars.scope_filter}\nHot paths: ${vars.hot_paths}\nOperator hints: ${vars.operator_hints}\nBaseline / runtime evidence refs: ${vars.baseline_refs}\nTarget context window: ${vars.target_context_window}\nWhiteboard id: ${vars.whiteboard_id}\n\nUse cheap measurement before LLM judgment: bbox_code_symbols and bbox_refactor_status over hot_paths/scope_filter, bbox_code_refs / bbox_code_query / bbox_code_usages to find loops, fetch sites, async awaits, growing containers, and serialization round-trips, and bbox_hybrid_search/bbox_search/bbox_notes for prior performance pressure when hints or history point there. Attend to iterator laziness, per-element allocation, async await dependency chains, and cargo bench / criterion evidence. Read the baseline_refs (profiles, query logs, benchmarks, metrics) where present \u2014 runtime corroboration is the strongest signal. Do not run every atom. Select a bounded top set of atom requests whose diagnostic question is justified by the survey; strongly prefer cost centers with runtime corroboration or unambiguous hot-path context, and always include perf-runtime-evidence-corroboration when baseline_refs is non-empty. Do not post to the whiteboard yet; the lens panel posts blind diagnoses next.\n\nReturn strict JSON only with keys: survey_summary, cost_map, hot_paths, atom_requests, deferred_hotspots, limits. atom_requests must be an array of objects shaped {\"atom_ref\":\"atom:perf-n-plus-one-fetch@v1\",\"args\":{...}}. Each args object must include project_dir, scope_filter, hot_paths, operator_hints, baseline_refs, survey_json, target_context_window, and whiteboard_id. Use only these atom refs: atom:perf-nested-iteration-complexity@v1, atom:perf-eager-materialization@v1, atom:perf-n-plus-one-fetch@v1, atom:perf-blocking-and-sequential-async@v1, atom:perf-unbounded-growth@v1, atom:perf-runtime-evidence-corroboration@v1. If evidence is weak, return fewer atom_requests and explain the limit. First byte {, final byte }.",
       "on_exit": [
         {
           "op": "parse_json",
@@ -255,32 +245,25 @@
           "on_failure": "halt"
         },
         {
-          "op": "normalize_arch_pathology_atom_requests",
+          "op": "normalize_perf_pathology_atom_requests",
           "args": {
             "requests": "${vars.survey_json.atom_requests}",
             "allowed_atoms": [
-              "atom:rust-architecture-impl-role-coherence@v1",
-              "atom:rust-architecture-state-ownership-collapse@v1",
-              "atom:rust-architecture-construction-boundary-collapse@v1",
-              "atom:rust-architecture-trait-boundary-mismatch@v1",
-              "atom:rust-architecture-module-topology-drift@v1",
-              "atom:rust-architecture-error-contract-drift@v1",
-              "atom:rust-architecture-feature-cfg-matrix@v1",
-              "atom:rust-architecture-async-runtime-lifecycle@v1",
-              "atom:rust-architecture-test-implied-architecture@v1",
-              "atom:rust-architecture-unsafe-contract-opacity@v1",
-              "atom:rust-architecture-macro-generated-contract-opacity@v1",
-              "atom:rust-architecture-transcript-anchored-pressure@v1"
+              "atom:perf-nested-iteration-complexity@v1",
+              "atom:perf-eager-materialization@v1",
+              "atom:perf-n-plus-one-fetch@v1",
+              "atom:perf-blocking-and-sequential-async@v1",
+              "atom:perf-unbounded-growth@v1",
+              "atom:perf-runtime-evidence-corroboration@v1"
             ],
             "defaults": {
               "project_dir": "${vars.project_dir}",
               "scope_filter": "${vars.scope_filter}",
-              "target_loci": "${vars.target_loci}",
+              "hot_paths": "${vars.hot_paths}",
               "operator_hints": "${vars.operator_hints}",
-              "layer_model_path": "${vars.layer_model_path}",
+              "baseline_refs": "${vars.baseline_refs}",
               "survey_json": "${vars.survey_json}",
               "target_context_window": "${vars.target_context_window}",
-              "whole_project_mode": "${vars.whole_project_mode}",
               "whiteboard_id": "${vars.whiteboard_id}"
             }
           },
@@ -312,7 +295,7 @@
           "into_var": "atom_results"
         },
         "subworkflow": {
-          "name": "arch-pathology-rust-atom-child",
+          "name": "perf-pathology-rust-atom-child",
           "version": 1,
           "vars_schema": {
             "project_dir": {
@@ -417,7 +400,7 @@
     },
     "BlindPost": {
       "actor": "panel",
-      "prompt": "Whiteboard board_id=${vars.whiteboard_id}. This is the BLIND round of a Rust architecture-pathology review.\n\nScope: ${vars.scope_filter}\nSurvey JSON: ${vars.survey_json}\nAtom result collection: ${vars.atom_results}\n\nPost exactly ONE blind whiteboard_post using your registered alias as agent_name (exactly one of: soundness, precision, economy, resilience, corroboration \u2014 never your brofile name, never whiteboard_register). Apply your lens's single question to the atom-produced diagnosis candidates: challenge the candidates your lens would reject, corroborate the ones it would keep with concrete evidence, and flag any real defect the atoms missed. Set target_file / target_location / finding_refs / severity where you can, so conflict detection can pair overlapping claims. Do not edit files. Do not transition the board.",
+      "prompt": "Whiteboard board_id=${vars.whiteboard_id}. This is the BLIND round of a Rust performance-pathology review.\n\nScope: ${vars.scope_filter}\nSurvey JSON: ${vars.survey_json}\nAtom result collection: ${vars.atom_results}\n\nPost exactly ONE blind whiteboard_post using your registered alias as agent_name (exactly one of: soundness, precision, economy, resilience, corroboration \u2014 never your brofile name, never whiteboard_register). Apply your lens's single question to the atom-produced diagnosis candidates: challenge the candidates your lens would reject, corroborate the ones it would keep with concrete evidence, and flag any real defect the atoms missed. Set target_file / target_location / finding_refs / severity where you can, so conflict detection can pair overlapping claims. Do not edit files. Do not transition the board.",
       "next": {
         "type": "goto",
         "to": "ValidateBlind"
@@ -492,7 +475,7 @@
     },
     "Validate": {
       "actor": "validator",
-      "prompt": "Whiteboard board_id=${vars.whiteboard_id}. This is the VALIDATE phase. Read every lens post with whiteboard_state / whiteboard_summarize (agent_name=\"validator\"). For each lens post, isolate its single falsifiable claim, trace it to ground truth yourself (do not trust the lens's inference about rustc/clippy/rust-analyzer or library behavior), and post EXACTLY ONE whiteboard_annotate(post_id=<post>, type=\"validation\", result=\"confirmed\"|\"refuted\"|\"inconclusive\") with your trace in the body. A refuted post is EXCLUDED from the correction plan, so refute only on traced evidence; default to inconclusive when you cannot determine accuracy. Every post must receive exactly one validation. Do not post proposals, vote, transition, or edit files.",
+      "prompt": "Whiteboard board_id=${vars.whiteboard_id}. This is the VALIDATE phase. Read every lens post with whiteboard_state / whiteboard_summarize (agent_name=\"validator\"). For each lens post, isolate its single falsifiable claim, trace it to ground truth yourself (do not trust the lens's inference about iterator laziness, async scheduling, or a library's allocation behavior), and post EXACTLY ONE whiteboard_annotate(post_id=<post>, type=\"validation\", result=\"confirmed\"|\"refuted\"|\"inconclusive\") with your trace in the body. A refuted post is EXCLUDED from the correction plan, so refute only on traced evidence; default to inconclusive when you cannot determine accuracy. Every post must receive exactly one validation. Do not post proposals, vote, transition, or edit files.",
       "next": {
         "type": "goto",
         "to": "ValidateValidation"
@@ -627,7 +610,7 @@
     },
     "Synthesize": {
       "actor": "facilitator",
-      "prompt": "Write the reviewed Rust Architecture Correction Plan payload as strict JSON. Do not write files; the workflow writes markdown after parsing your JSON.\n\nProject: ${vars.project_dir}\nScope: ${vars.scope_filter}\nBaseline commit stdout: ${vars.baseline_result.stdout}\nTarget context window: ${vars.target_context_window}\nSurvey JSON: ${vars.survey_json}\nAtom results: ${vars.atom_results}\nBoard summary JSON: ${vars.board_summary}\n\nRead the resolved board with whiteboard_state / whiteboard_conflicts (agent_name=\"facilitator\"). board_summary.surviving_post_ids are the posts the validator did NOT refute; board_summary.excluded_post_ids were refuted and MUST NOT appear in remediation slices. Build the plan from surviving posts only. Carry every still-unresolved challenge on a surviving post into `contradictions` (each {title, tension}); cap and flag inconclusive findings. Put every refuted post into `refuted_findings` (each {title, trace} where trace is the validator's reasoning). The Atom Mapping section must label every slice with a shipped atom, a G-series gap ID, or PD-manual. Operator-authority flags (acknowledge_repr, acknowledge_public_api_change) must be surfaced as gates, never assumed.\n\nReturn strict JSON only with keys: slug, title, brief, diagnosis_summary, evidence, authority_grades, atom_mapping, remediation_plan, acceptance_criteria, contradictions, refuted_findings, deferred. Markdown strings are allowed in the prose keys; contradictions and refuted_findings are arrays of objects. First byte {, final byte }.",
+      "prompt": "Write the reviewed Rust Performance Correction Plan payload as strict JSON. Do not write files; the workflow writes markdown after parsing your JSON.\n\nProject: ${vars.project_dir}\nScope: ${vars.scope_filter}\nBaseline commit stdout: ${vars.baseline_result.stdout}\nTarget context window: ${vars.target_context_window}\nSurvey JSON: ${vars.survey_json}\nAtom results: ${vars.atom_results}\nBoard summary JSON: ${vars.board_summary}\n\nRead the resolved board with whiteboard_state / whiteboard_conflicts (agent_name=\"facilitator\"). board_summary.surviving_post_ids are the posts the validator did NOT refute; board_summary.excluded_post_ids were refuted and MUST NOT appear in remediation slices. Build the plan from surviving posts only. Carry every still-unresolved challenge on a surviving post into `contradictions` (each {title, tension}); cap and flag inconclusive findings. Put every refuted post into `refuted_findings` (each {title, trace} where trace is the validator's reasoning). The Atom Mapping section must label every slice with a shipped atom, a G-series gap ID, or PD-manual. Acceptance criteria must be delta-based (measured before/after). Surface any behavior-changing optimization for operator approval.\n\nReturn strict JSON only with keys: slug, title, brief, diagnosis_summary, evidence, authority_grades, atom_mapping, remediation_plan, acceptance_criteria, contradictions, refuted_findings, deferred. Markdown strings are allowed in the prose keys; contradictions and refuted_findings are arrays of objects. First byte {, final byte }.",
       "on_exit": [
         {
           "op": "parse_json",
@@ -648,15 +631,15 @@
       "actor": "",
       "on_enter": [
         {
-          "op": "write_arch_pathology_plan",
+          "op": "write_perf_pathology_plan",
           "args": {
             "project_dir": "${vars.project_dir}",
             "slug": "${vars.plan_json.slug}",
             "scope": "${vars.scope_filter}",
             "baseline_commit": "${vars.baseline_result.stdout}",
             "target_context_window": "${vars.target_context_window}",
-            "generated_by": "rust-arch-pathology",
-            "criteria_prefix": "RAP",
+            "generated_by": "rust-perf-pathology",
+            "criteria_prefix": "PP",
             "plan": "${vars.plan_json}"
           },
           "into_var": "write_result",

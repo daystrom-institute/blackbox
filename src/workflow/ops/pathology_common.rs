@@ -262,7 +262,9 @@ pub(super) fn write_pathology_plan(
             "{authority}{atom_mapping}",
             "## Remediation Plan\n\n{remediation}\n\n",
             "## Acceptance Criteria\n\n{criteria}\n\n",
+            "## Contradictions Requiring Human Judgment\n\n{contradictions}\n\n",
             "## Deferred\n\n{deferred}\n\n",
+            "{refuted}",
             "## Dispatch Payload\n\n{dispatch}\n",
         ),
         frontmatter = frontmatter,
@@ -279,6 +281,14 @@ pub(super) fn write_pathology_plan(
             "No remediation slices were retained."
         ),
         criteria = pathology_criteria_markdown(&criteria, criteria_prefix),
+        // Surviving unresolved challenges flow here instead of being force-resolved.
+        contradictions = pathology_findings_markdown(
+            plan.get("contradictions"),
+            "No unresolved contradictions surfaced — the panel reached consensus or every challenge was resolved during debate."
+        ),
+        // Validator-refuted findings are excluded from the remediation slices
+        // above and recorded here for audit (omitted when nothing was refuted).
+        refuted = pathology_optional_findings_section(plan.get("refuted_findings"), "Refuted Findings"),
         deferred = pathology_markdown(
             plan.get("deferred"),
             "No deferred candidates were recorded."
@@ -361,6 +371,65 @@ pub(super) fn pathology_optional_section(value: Option<&Value>, heading: &str) -
     }
 }
 
+/// Render a list of finding-shaped entries (contradictions, refuted findings)
+/// as markdown bullets. Strings and string arrays pass through like
+/// `pathology_markdown`; objects render as `**title** — detail`, pulling the
+/// header from `title`/`claim`/`finding`/`id` and the body from
+/// `detail`/`tension`/`positions`/`body`/`trace`/`reason`.
+pub(super) fn pathology_findings_markdown(value: Option<&Value>, fallback: &str) -> String {
+    match value {
+        Some(Value::String(s)) if !s.trim().is_empty() => s.trim().to_string(),
+        Some(Value::Array(items)) if !items.is_empty() => items
+            .iter()
+            .map(|item| match item {
+                Value::String(s) => format!("- {s}"),
+                Value::Object(obj) => {
+                    let title = obj
+                        .get("title")
+                        .or_else(|| obj.get("claim"))
+                        .or_else(|| obj.get("finding"))
+                        .or_else(|| obj.get("id"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("(untitled)");
+                    let detail = obj
+                        .get("detail")
+                        .or_else(|| obj.get("tension"))
+                        .or_else(|| obj.get("positions"))
+                        .or_else(|| obj.get("body"))
+                        .or_else(|| obj.get("trace"))
+                        .or_else(|| obj.get("reason"))
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty());
+                    match detail {
+                        Some(d) => format!("- **{title}** — {d}"),
+                        None => format!("- **{title}**"),
+                    }
+                }
+                other => format!("- `{}`", serde_json::to_string(other).unwrap_or_default()),
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => fallback.to_string(),
+    }
+}
+
+/// Like `pathology_optional_section` but for finding-shaped lists; renders a
+/// `## {heading}` block only when there is at least one entry.
+pub(super) fn pathology_optional_findings_section(value: Option<&Value>, heading: &str) -> String {
+    match value {
+        Some(Value::String(s)) if !s.trim().is_empty() => {
+            format!("## {heading}\n\n{}\n\n", pathology_findings_markdown(value, ""))
+        }
+        Some(Value::Array(items)) if !items.is_empty() => {
+            format!("## {heading}\n\n{}\n\n", pathology_findings_markdown(value, ""))
+        }
+        _ => String::new(),
+    }
+}
+
 pub(super) fn pathology_criteria_markdown(criteria: &Value, criteria_prefix: &str) -> String {
     let Some(items) = criteria.as_array() else {
         return format!(
@@ -422,4 +491,87 @@ pub(super) fn pathology_dispatch_payload(
         "```json\n{}\n```",
         serde_json::to_string_pretty(&payload).unwrap_or_default()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_shape() -> PlanShape {
+        PlanShape {
+            op_label: "test_write_plan",
+            out_subdir: &["design", "refactor", "plans"],
+            plan_kind: "correction-plan",
+            topic_tag: "architecture",
+            default_title_prefix: "Architecture Correction Plan",
+            default_brief: "test brief",
+            slug_fallback: "plan",
+            default_generated_by: "arch-pathology",
+            default_criteria_prefix: "AP",
+        }
+    }
+
+    fn write_and_read(args: &Value) -> String {
+        let eff = write_pathology_plan(args, Some("out"), &test_shape()).unwrap();
+        let path = match eff {
+            OpEffect::SetVar { value, .. } => value
+                .get("absolute_plan_path")
+                .and_then(Value::as_str)
+                .unwrap()
+                .to_string(),
+            other => panic!("expected SetVar, got {other:?}"),
+        };
+        fs::read_to_string(&path).unwrap()
+    }
+
+    #[test]
+    fn plan_render_includes_contradictions_and_refuted_appendix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let args = json!({
+            "project_dir": root.to_string_lossy(),
+            "slug": "demo-scope",
+            "scope": "src/demo",
+            "baseline_commit": "abc123",
+            "plan": {
+                "diagnosis_summary": "One surviving diagnosis.",
+                "evidence": "Concrete refs.",
+                "remediation_plan": "Slice 1: do the thing.",
+                "acceptance_criteria": [{ "id": "AP-1", "criterion_text": "thing done" }],
+                "contradictions": [
+                    { "title": "Ownership of SessionData", "tension": "soundness says extract; resilience says blast radius too high" }
+                ],
+                "refuted_findings": [
+                    { "title": "False n+1 in loader", "trace": "validator: batched via join, no per-row fetch" }
+                ]
+            }
+        });
+        let body = write_and_read(&args);
+        assert!(body.contains("## Contradictions Requiring Human Judgment"));
+        assert!(body.contains("Ownership of SessionData"));
+        assert!(body.contains("## Refuted Findings"));
+        assert!(body.contains("False n+1 in loader"));
+        // A refuted finding must never appear in the remediation slices.
+        let before_criteria = body.split("## Acceptance Criteria").next().unwrap();
+        assert!(!before_criteria.contains("False n+1 in loader"));
+    }
+
+    #[test]
+    fn plan_render_omits_refuted_section_and_shows_contradiction_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let args = json!({
+            "project_dir": root.to_string_lossy(),
+            "slug": "clean",
+            "scope": "src/clean",
+            "baseline_commit": "def456",
+            "plan": { "diagnosis_summary": "ok", "evidence": "ok", "remediation_plan": "ok" }
+        });
+        let body = write_and_read(&args);
+        // No refuted findings → appendix omitted entirely.
+        assert!(!body.contains("## Refuted Findings"));
+        // Contradictions section always present, with its consensus fallback.
+        assert!(body.contains("## Contradictions Requiring Human Judgment"));
+        assert!(body.contains("No unresolved contradictions surfaced"));
+    }
 }
