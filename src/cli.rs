@@ -1446,6 +1446,27 @@ fn print_stream_event(data: &str) {
     }
 }
 
+/// Capture each fleet harness session's stdout transcript + stderr (including
+/// the turn-end diagnostic) to `<state>/bro/fleet/logs/<task>.{stdout.jsonl,
+/// stderr.log}` so spurious-stop turns can be diagnosed postmortem. Honors an
+/// operator-set `BLACKBOX_HARNESS_TEE_DIR` (export it empty to disable).
+fn default_fleet_harness_tee() {
+    if std::env::var_os("BLACKBOX_HARNESS_TEE_DIR").is_some() {
+        return;
+    }
+    let base = std::env::var_os("BLACKBOX_STATE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".local/state/blackbox")
+        });
+    let dir = base.join("bro").join("fleet").join("logs");
+    // SAFETY: set once at CLI startup before the fleet dispatches any harness;
+    // no other thread reads the environment at this point.
+    unsafe { std::env::set_var("BLACKBOX_HARNESS_TEE_DIR", &dir) };
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = BroCli::parse();
     let rt = tokio::runtime::Runtime::new()?;
@@ -1463,11 +1484,13 @@ fn main() -> anyhow::Result<()> {
             return result;
         }
         BroCommand::Fleet(args) => {
+            default_fleet_harness_tee();
             let result = rt.block_on(fleet_tui::run(args.cwd));
             drop(rt);
             return result;
         }
         BroCommand::Agent(args) => {
+            default_fleet_harness_tee();
             let prompt = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
             let launch = fleet_tui::AgentLaunch {
                 cwd: args.cwd,

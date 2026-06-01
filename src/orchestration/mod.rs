@@ -1353,6 +1353,23 @@ fn claude_family_option_takes_value(arg: &str) -> bool {
     )
 }
 
+/// Open a per-session append file for tee-ing harness stdout/stderr, when
+/// `BLACKBOX_HARNESS_TEE_DIR` is set (`bro fleet` sets it by default so fleet
+/// spurious-stop turns are captured for postmortem). Returns None when disabled
+/// or on any IO error — tee-ing is best-effort diagnostics and must never fail a
+/// dispatch. `suffix` is e.g. "stdout.jsonl" / "stderr.log".
+fn open_harness_tee(id: &str, suffix: &str) -> Option<std::fs::File> {
+    let dir = std::env::var("BLACKBOX_HARNESS_TEE_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())?;
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(std::path::Path::new(&dir).join(format!("{id}.{suffix}")))
+        .ok()
+}
+
 fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask {
     let SpawnTaskParams {
         provider,
@@ -1659,15 +1676,21 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
 
     if is_streaming {
         // Line-by-line JSON parsing
+        let tee_id_out = id.clone();
         tokio::spawn(async move {
             let reader = tokio::io::BufReader::new(stdout);
             let mut lines = reader.lines();
+            let mut tee = open_harness_tee(&tee_id_out, "stdout.jsonl");
             let mut last_emitted_snippet: Option<String> = None;
             // Cooldown the lane the instant the provider returns a 429/overload,
             // so dispatch steers off it without waiting for the next probe tick.
             // Once per run is enough.
             let mut disruption_recorded = false;
             while let Ok(Some(line)) = lines.next_line().await {
+                if let Some(w) = tee.as_mut() {
+                    use std::io::Write as _;
+                    let _ = writeln!(w, "{line}");
+                }
                 if let Ok(evt) = serde_json::from_str::<Value>(&line) {
                     if !disruption_recorded {
                         if let Some(disruption) = provider.detect_disruption(&evt) {
@@ -1806,11 +1829,17 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     // exit (e.g. the harness bailing before any stdout) races the snapshot and
     // the task's `error` comes back empty, hiding the failure reason.
     let task_ref_err = task.clone();
+    let tee_id_err = id.clone();
     let (stderr_done_tx, stderr_done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let reader = tokio::io::BufReader::new(stderr_handle);
         let mut lines = reader.lines();
+        let mut tee = open_harness_tee(&tee_id_err, "stderr.log");
         while let Ok(Some(line)) = lines.next_line().await {
+            if let Some(w) = tee.as_mut() {
+                use std::io::Write as _;
+                let _ = writeln!(w, "{line}");
+            }
             let mut inner = task_ref_err.inner.lock();
             inner.stderr.push_str(&line);
             inner.stderr.push('\n');

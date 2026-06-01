@@ -336,6 +336,15 @@ impl OpenAiResponsesTransport {
                     };
                     if r["status"].as_str() == Some("incomplete") {
                         stop = StopReason::Length;
+                        // Otherwise-silent path: the model stopped short (e.g.
+                        // max_output_tokens, content filter). Surface the reason
+                        // so a spurious-stop turn is diagnosable from the log.
+                        tracing::warn!(
+                            reason = %r["incomplete_details"]["reason"]
+                                .as_str()
+                                .unwrap_or("unknown"),
+                            "responses turn incomplete; stopping short"
+                        );
                     }
                 }
                 "response.failed" | "error" => {
