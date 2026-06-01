@@ -746,6 +746,6 @@ fn render_post(p: &CouncilPost) -> Vec<Line<'static>> {
     ))];
     let md = tui_markdown::from_str(&p.body);
     let owned: Vec<Line<'static>> = md.lines.into_iter().map(super::line_into_owned).collect();
-    lines.extend(super::stitch_ordered_list_markers(owned));
+    lines.extend(super::stitch_list_markers(owned));
     lines
 }

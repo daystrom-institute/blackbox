@@ -4260,19 +4260,58 @@ enum MarkdownBlock {
         language: Option<String>,
         lines: Vec<String>,
     },
+    Quote(Vec<String>),
+    Rule,
 }
 
 fn render_markdown_block(block: MarkdownBlock) -> Vec<Line<'static>> {
     match block {
         MarkdownBlock::Markdown(text) => {
+            let text = rewrite_task_list_markers(&text);
             let md = tui_markdown::from_str(&text);
             let owned: Vec<Line<'static>> =
                 md.lines.into_iter().map(super::line_into_owned).collect();
-            super::stitch_ordered_list_markers(owned)
+            super::stitch_list_markers(owned)
         }
         MarkdownBlock::Table(lines) => render_table_block(lines),
         MarkdownBlock::Code { language, lines } => render_code_block(language, lines),
+        MarkdownBlock::Quote(lines) => render_quote_block(lines),
+        MarkdownBlock::Rule => render_rule_block(),
     }
+}
+
+/// Rewrite GitHub task-list syntax (`- [ ]` / `- [x]`) into checkbox glyphs so
+/// tui-markdown renders `☐` / `☑` instead of literal brackets. Operates only on
+/// list-item lines; other `[...]` text is left untouched.
+fn rewrite_task_list_markers(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (idx, line) in text.split('\n').enumerate() {
+        if idx > 0 {
+            out.push('\n');
+        }
+        out.push_str(&rewrite_task_list_line(line).unwrap_or_else(|| line.to_string()));
+    }
+    out
+}
+
+fn rewrite_task_list_line(line: &str) -> Option<String> {
+    let indent_len = line.len() - line.trim_start().len();
+    let (indent, rest) = line.split_at(indent_len);
+    let mut chars = rest.chars();
+    let bullet = chars.next()?;
+    if !matches!(bullet, '-' | '*' | '+') {
+        return None;
+    }
+    let after_bullet = chars.as_str();
+    let body = after_bullet.strip_prefix(' ')?;
+    let glyph = if let Some(r) = body.strip_prefix("[ ]") {
+        (r.starts_with(' ') || r.is_empty()).then_some(("☐", r))
+    } else if let Some(r) = body.strip_prefix("[x]").or_else(|| body.strip_prefix("[X]")) {
+        (r.starts_with(' ') || r.is_empty()).then_some(("☑", r))
+    } else {
+        None
+    }?;
+    Some(format!("{indent}{bullet} {}{}", glyph.0, glyph.1))
 }
 
 fn markdown_blocks_preserving_terminal_shapes(text: &str) -> Vec<MarkdownBlock> {
@@ -4317,6 +4356,27 @@ fn markdown_blocks_preserving_terminal_shapes(text: &str) -> Vec<MarkdownBlock> 
             continue;
         }
 
+        if is_blockquote_line(line) {
+            push_markdown_block(&mut blocks, &mut markdown);
+            let mut quote = Vec::new();
+            while i < lines.len() && is_blockquote_line(lines[i]) {
+                quote.push(strip_blockquote_prefix(lines[i]).to_string());
+                i += 1;
+            }
+            blocks.push(MarkdownBlock::Quote(quote));
+            continue;
+        }
+
+        // A standalone thematic break (`---`, `***`, `___`). Guard against
+        // setext heading underlines by requiring a preceding blank line so
+        // `Title\n---` stays a heading rather than becoming a rule.
+        if is_horizontal_rule_line(line) && (i == 0 || lines[i - 1].trim().is_empty()) {
+            push_markdown_block(&mut blocks, &mut markdown);
+            blocks.push(MarkdownBlock::Rule);
+            i += 1;
+            continue;
+        }
+
         markdown.push_str(line);
         markdown.push('\n');
         i += 1;
@@ -4354,6 +4414,29 @@ fn is_closing_fence(line: &str, marker: &str) -> bool {
     trimmed.starts_with(marker) && trimmed[marker.len()..].trim().is_empty()
 }
 
+fn is_blockquote_line(line: &str) -> bool {
+    line.trim_start().starts_with('>')
+}
+
+/// Strip one level of blockquote prefix (`>` with an optional following space),
+/// preserving any deeper nesting for recursive rendering.
+fn strip_blockquote_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('>').unwrap_or(trimmed);
+    rest.strip_prefix(' ').unwrap_or(rest)
+}
+
+/// True if the line is a thematic break: three or more of the same marker
+/// (`-`, `*`, `_`), ignoring interior spaces and nothing else.
+fn is_horizontal_rule_line(line: &str) -> bool {
+    let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+    if compact.len() < 3 {
+        return false;
+    }
+    let first = compact.chars().next().unwrap();
+    matches!(first, '-' | '*' | '_') && compact.chars().all(|c| c == first)
+}
+
 fn is_table_header_line(line: &str) -> bool {
     let cells = table_cells(line);
     cells.len() >= 2 && cells.iter().any(|cell| !cell.is_empty())
@@ -4377,21 +4460,126 @@ fn table_cells(line: &str) -> Vec<&str> {
         .collect()
 }
 
-fn render_table_block(lines: Vec<String>) -> Vec<Line<'static>> {
-    lines
+#[derive(Clone, Copy, PartialEq)]
+enum CellAlign {
+    Left,
+    Center,
+    Right,
+}
+
+/// Derive per-column alignment from a markdown separator row (`:---`, `:--:`,
+/// `---:`). Columns past the separator's width default to left-aligned.
+fn table_column_aligns(separator: &str) -> Vec<CellAlign> {
+    table_cells(separator)
         .into_iter()
-        .enumerate()
-        .map(|(idx, line)| {
-            let style = match idx {
-                0 => Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-                1 => Style::default().fg(Color::DarkGray),
-                _ => Style::default().fg(Color::Gray),
-            };
-            Line::from(Span::styled(line, style))
+        .map(|cell| {
+            let t = cell.trim();
+            let left = t.starts_with(':');
+            let right = t.ends_with(':');
+            match (left, right) {
+                (true, true) => CellAlign::Center,
+                (false, true) => CellAlign::Right,
+                _ => CellAlign::Left,
+            }
         })
         .collect()
+}
+
+/// Pad `content` (already known to be `width` display columns wide) into a
+/// field of `width` columns according to `align`.
+fn pad_cell(content: &str, width: usize, align: CellAlign) -> String {
+    let len = content.chars().count();
+    let pad = width.saturating_sub(len);
+    match align {
+        CellAlign::Left => format!("{content}{}", " ".repeat(pad)),
+        CellAlign::Right => format!("{}{content}", " ".repeat(pad)),
+        CellAlign::Center => {
+            let left = pad / 2;
+            let right = pad - left;
+            format!("{}{content}{}", " ".repeat(left), " ".repeat(right))
+        }
+    }
+}
+
+/// Render a markdown table (header row, separator row, then data rows) as a
+/// box-drawn grid with aligned columns. Falls back to styling the raw lines if
+/// the block is malformed.
+fn render_table_block(lines: Vec<String>) -> Vec<Line<'static>> {
+    if lines.len() < 2 {
+        return lines
+            .into_iter()
+            .map(|line| Line::from(Span::styled(line, Style::default().fg(Color::Gray))))
+            .collect();
+    }
+
+    let aligns = table_column_aligns(&lines[1]);
+    let header = table_cells(&lines[0])
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let body: Vec<Vec<String>> = lines
+        .iter()
+        .skip(2)
+        .map(|line| table_cells(line).into_iter().map(str::to_string).collect())
+        .collect();
+
+    let cols = std::iter::once(header.len())
+        .chain(body.iter().map(Vec::len))
+        .max()
+        .unwrap_or(0);
+    if cols == 0 {
+        return Vec::new();
+    }
+
+    fn cell(row: &[String], c: usize) -> &str {
+        row.get(c).map(String::as_str).unwrap_or("")
+    }
+    let align_at = |c: usize| aligns.get(c).copied().unwrap_or(CellAlign::Left);
+
+    let mut widths = vec![0usize; cols];
+    for (c, slot) in widths.iter_mut().enumerate() {
+        let mut w = cell(&header, c).chars().count();
+        for row in &body {
+            w = w.max(cell(row, c).chars().count());
+        }
+        *slot = w;
+    }
+
+    let border = Style::default().fg(Color::DarkGray);
+    let head_style = Style::default()
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let body_style = Style::default().fg(Color::Gray);
+
+    let rule = |left: &str, mid: &str, right: &str| -> Line<'static> {
+        let mut s = String::from(left);
+        for (c, w) in widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push_str(if c + 1 == cols { right } else { mid });
+        }
+        Line::from(Span::styled(s, border))
+    };
+
+    let data_row = |row: &[String], style: Style| -> Line<'static> {
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(cols * 2 + 1);
+        spans.push(Span::styled("│", border));
+        for (c, &w) in widths.iter().enumerate() {
+            let padded = pad_cell(cell(row, c), w, align_at(c));
+            spans.push(Span::styled(format!(" {padded} "), style));
+            spans.push(Span::styled("│", border));
+        }
+        Line::from(spans)
+    };
+
+    let mut out = Vec::with_capacity(body.len() + 4);
+    out.push(rule("┌", "┬", "┐"));
+    out.push(data_row(&header, head_style));
+    out.push(rule("├", "┼", "┤"));
+    for row in &body {
+        out.push(data_row(row, body_style));
+    }
+    out.push(rule("└", "┴", "┘"));
+    out
 }
 
 fn render_code_block(language: Option<String>, lines: Vec<String>) -> Vec<Line<'static>> {
@@ -4414,6 +4602,34 @@ fn render_code_block(language: Option<String>, lines: Vec<String>) -> Vec<Line<'
     }
     out.push(Line::from(Span::styled("└─", border)));
     out
+}
+
+/// Render a blockquote: recursively render the (prefix-stripped) inner markdown,
+/// then prepend a `▌ ` gutter to every produced line so multi-line quotes read
+/// as a quote rather than collapsing into one run-on line.
+fn render_quote_block(lines: Vec<String>) -> Vec<Line<'static>> {
+    let gutter = Style::default().fg(Color::DarkGray);
+    let inner = render_markdown(&lines.join("\n"));
+    inner
+        .into_iter()
+        .map(|line| {
+            let mut spans = Vec::with_capacity(line.spans.len() + 1);
+            spans.push(Span::styled("▌ ", gutter));
+            spans.extend(line.spans);
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Width of a rendered thematic break. Fixed rather than terminal-derived
+/// because this layer produces width-agnostic lines.
+const HORIZONTAL_RULE_WIDTH: usize = 48;
+
+fn render_rule_block() -> Vec<Line<'static>> {
+    vec![Line::from(Span::styled(
+        "─".repeat(HORIZONTAL_RULE_WIDTH),
+        Style::default().fg(Color::DarkGray),
+    ))]
 }
 
 fn prepend_line_prefix(
@@ -4688,6 +4904,132 @@ mod tests {
 
     fn line_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn render_markdown_loose_bullet_marker_stitched_to_content() {
+        // A loose list item (bullet followed by a paragraph) must not leave the
+        // `-` marker orphaned on its own line.
+        let rendered: Vec<String> =
+            render_markdown("- item with **bold**\n\n  paragraph under item\n")
+                .iter()
+                .map(line_text)
+                .collect();
+        assert!(
+            rendered.iter().any(|l| l.contains("item with")),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.iter().any(|l| l.trim() == "-"),
+            "orphaned bullet marker: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_blockquote_gets_gutter() {
+        let rendered: Vec<String> = render_markdown("> quoted one\n> quoted two\n")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered.iter().all(|l| l.is_empty() || l.starts_with("▌ ")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("quoted one")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_nested_blockquote_nests_gutter() {
+        let rendered: Vec<String> = render_markdown("> outer\n>> inner\n")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered.iter().any(|l| l.starts_with("▌ ▌ ")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn render_markdown_horizontal_rule_is_drawn() {
+        let rendered: Vec<String> = render_markdown("above\n\n---\n\nbelow\n")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(
+            rendered.iter().any(|l| l.chars().all(|c| c == '─') && l.len() > 3),
+            "{rendered:?}"
+        );
+        assert!(!rendered.iter().any(|l| l.contains("---")), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_markdown_setext_heading_not_treated_as_rule() {
+        // `Title` followed immediately by `---` is a setext heading underline,
+        // not a thematic break — it must not become a drawn rule.
+        let rendered: Vec<String> = render_markdown("Title\n---\nbody\n")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(!rendered.iter().any(|l| l.chars().all(|c| c == '─') && l.len() > 3), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("Title")), "{rendered:?}");
+    }
+
+    #[test]
+    fn render_markdown_task_list_uses_checkbox_glyphs() {
+        let rendered: Vec<String> = render_markdown("- [ ] todo\n- [x] done\n- [X] also\n")
+            .iter()
+            .map(line_text)
+            .collect();
+        assert!(rendered.iter().any(|l| l.contains("☐") && l.contains("todo")), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("☑") && l.contains("done")), "{rendered:?}");
+        assert!(rendered.iter().any(|l| l.contains("☑") && l.contains("also")), "{rendered:?}");
+        assert!(!rendered.iter().any(|l| l.contains("[ ]") || l.contains("[x]")), "{rendered:?}");
+    }
+
+    #[test]
+    fn rewrite_task_list_markers_leaves_non_tasks_alone() {
+        // A bracket that is not a task-list checkbox must survive untouched.
+        assert_eq!(rewrite_task_list_markers("see [link] here"), "see [link] here");
+        assert_eq!(rewrite_task_list_markers("- regular item"), "- regular item");
+        // Indented task items are still rewritten.
+        assert_eq!(rewrite_task_list_markers("  - [x] nested"), "  - ☑ nested");
+    }
+
+    #[test]
+    fn render_table_block_draws_aligned_grid() {
+        let lines = vec![
+            "| Name | Count |".to_string(),
+            "|:-----|------:|".to_string(),
+            "| a | 1 |".to_string(),
+            "| bbbb | 22 |".to_string(),
+        ];
+        let rendered: Vec<String> = render_table_block(lines).iter().map(line_text).collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "┌──────┬───────┐".to_string(),
+                "│ Name │ Count │".to_string(),
+                "├──────┼───────┤".to_string(),
+                // left-aligned name column, right-aligned count column
+                "│ a    │     1 │".to_string(),
+                "│ bbbb │    22 │".to_string(),
+                "└──────┴───────┘".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn render_markdown_renders_table_not_pipe_soup() {
+        let md = "intro\n\n| H1 | H2 |\n| --- | --- |\n| x | y |\n";
+        let rendered: Vec<String> = render_markdown(md).iter().map(line_text).collect();
+        // The separator row must not survive as raw pipe-dash soup.
+        assert!(!rendered.iter().any(|l| l.contains("---")));
+        assert!(rendered.iter().any(|l| l.starts_with('┌')));
+        assert!(rendered.iter().any(|l| l.contains("│ H1 │ H2 │")));
     }
 
     #[test]
@@ -5207,21 +5549,25 @@ mod tests {
     }
 
     #[test]
-    fn markdown_renderer_preserves_tables_as_rows() {
+    fn markdown_renderer_renders_tables_as_grid() {
         let lines = render_markdown("| Tool | Why |\n| --- | --- |\n| bbox | indexed search |\n");
         let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        // The separator row must be consumed, not echoed as pipe-dash soup.
         assert!(
-            rendered.iter().any(|l| l == "| Tool | Why |"),
+            !rendered.iter().any(|l| l.contains("---")),
+            "{rendered:?}"
+        );
+        // Header and data cells survive inside a box-drawn grid.
+        assert!(
+            rendered.iter().any(|l| l == "│ Tool │ Why            │"),
             "{rendered:?}"
         );
         assert!(
-            rendered.iter().any(|l| l == "| --- | --- |"),
+            rendered.iter().any(|l| l == "│ bbox │ indexed search │"),
             "{rendered:?}"
         );
-        assert!(
-            rendered.iter().any(|l| l == "| bbox | indexed search |"),
-            "{rendered:?}"
-        );
+        assert_eq!(rendered.first().map(String::as_str), Some("┌──────┬────────────────┐"));
+        assert_eq!(rendered.last().map(String::as_str), Some("└──────┴────────────────┘"));
     }
 
     #[test]

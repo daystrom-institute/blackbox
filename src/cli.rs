@@ -2143,7 +2143,7 @@ fn render_event(ev: &TranscriptEvent) -> Vec<Line<'static>> {
             ))];
             let md = tui_markdown::from_str(text);
             let owned: Vec<Line<'static>> = md.lines.into_iter().map(line_into_owned).collect();
-            lines.extend(stitch_ordered_list_markers(owned));
+            lines.extend(stitch_list_markers(owned));
             lines
         }
         EventDetail::Thinking { text } => {
@@ -2266,12 +2266,12 @@ fn is_heading_marker_span(s: &str) -> bool {
 }
 
 /// True if the line is ONLY a numbered-list marker like "1. ", "42. "
-/// (optional trailing whitespace, no other content). tui-markdown emits
+/// (optional surrounding whitespace, no other content). tui-markdown emits
 /// such markers on their own line and puts the content on the next one,
 /// which looks like a bug to the eye.
 fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
     let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let t = joined.trim_end();
+    let t = joined.trim();
     if t.is_empty() {
         return false;
     }
@@ -2284,14 +2284,23 @@ fn is_ordered_list_marker_only(line: &Line<'_>) -> bool {
     t[..dot_pos].chars().all(|c| c.is_ascii_digit())
 }
 
-/// Merge lines emitted by tui-markdown where an ordered-list marker has
-/// been split from its content: `"1. "` on one line followed by the item
-/// text on the next. Returns the post-processed line vec.
-pub(crate) fn stitch_ordered_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+/// True if the line is ONLY a bullet-list marker (`-`, `*`, or `+`), with
+/// optional surrounding whitespace and no other content. tui-markdown splits
+/// the marker from its content the same way it does for ordered lists when the
+/// item is "loose" (has a following paragraph).
+fn is_bullet_marker_only(line: &Line<'_>) -> bool {
+    let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    matches!(joined.trim(), "-" | "*" | "+")
+}
+
+/// Merge lines emitted by tui-markdown where a list marker has been split from
+/// its content: `"1. "` / `"- "` on one line followed by the item text on the
+/// next. Returns the post-processed line vec.
+pub(crate) fn stitch_list_markers(lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
     let mut iter = lines.into_iter().peekable();
     while let Some(line) = iter.next() {
-        if is_ordered_list_marker_only(&line)
+        if (is_ordered_list_marker_only(&line) || is_bullet_marker_only(&line))
             && let Some(next) = iter.next()
         {
             let mut spans = line.spans;
