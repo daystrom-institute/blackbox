@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::{Value, json};
 
 use super::super::context::resolve_arg_value;
-use super::super::{ActorFailureMode, ActorSpec, AtomBinding, NodeSpec, TerminalMode};
+use super::super::{ActorFailureMode, ActorSpec, AtomBinding, NodeSpec};
 use super::WorkflowRunner;
 use crate::orchestration as orch;
 use crate::tools::bro_params::{AtomInvokeParams, AtomResumeParams, AtomStatusParams};
@@ -41,7 +41,10 @@ impl<'a> WorkflowRunner<'a> {
                 "visit": self.visit_counts.get(node_id).copied().unwrap_or(0),
             }),
         );
-        let task = if matches!(actor.terminal_mode, TerminalMode::Tmux) {
+        let task = if self
+            .server
+            .brofile_is_terminal(brofile, self.project_dir.as_deref())
+        {
             // Terminal mode: run the provider TUI in a tmux pane and resolve the
             // turn from the transcript. Returns an already-completed synthetic
             // task. For a durable actor, `existing_session` resumes the same

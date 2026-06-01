@@ -15,6 +15,36 @@ use super::providers::{Capability, Provider};
 // Brofile
 // ---------------------------------------------------------------------------
 
+/// How dispatches using a brofile are hosted.
+///
+/// `Native` (default) is the existing headless dispatch: the provider CLI runs
+/// as a child process whose stdout stream-json is the dispatch channel.
+///
+/// `Tmux` runs the provider's interactive TUI inside a tmux pane and resolves
+/// the turn from the transcript read plane. Only valid for
+/// `Provider::tui_capable()` providers (Claude/Codex). It is a brofile attribute
+/// so every dispatch path — workflow executor actors, `bro_exec`, `bro_resume`
+/// — picks it up from the resolved brofile without per-call flags. See
+/// `design/orchestration/workflows/tmux-terminal-mode-slice.md`.
+#[derive(
+    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalMode {
+    #[default]
+    Native,
+    Tmux,
+}
+
+impl TerminalMode {
+    pub fn is_native(&self) -> bool {
+        matches!(self, TerminalMode::Native)
+    }
+    pub fn is_tmux(&self) -> bool {
+        matches!(self, TerminalMode::Tmux)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Brofile {
     pub name: String,
@@ -51,6 +81,17 @@ pub struct Brofile {
     /// context-producer fields are not part of v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<BrofileContext>,
+    /// How dispatches using this brofile are hosted (headless vs tmux TUI).
+    /// Picked up by every dispatch path; only valid for TUI-capable providers.
+    #[serde(default, skip_serializing_if = "TerminalMode::is_native")]
+    pub terminal_mode: TerminalMode,
+}
+
+impl Brofile {
+    /// True iff dispatches using this brofile run the provider TUI in tmux.
+    pub fn is_terminal(&self) -> bool {
+        self.terminal_mode.is_tmux()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -683,6 +724,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -712,6 +754,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -740,6 +783,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
@@ -754,6 +798,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(
             &project_bf,
@@ -787,6 +832,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
+                terminal_mode: TerminalMode::Native,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -810,6 +856,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -859,6 +906,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -1011,6 +1059,50 @@ mod tests {
     }
 
     #[test]
+    fn terminal_mode_defaults_native_and_parses_tmux() {
+        // Absent -> Native (back-compat for every existing brofile).
+        let bf: Brofile = serde_json::from_str(
+            r#"{"name":"x","provider":"codex"}"#,
+        )
+        .unwrap();
+        assert_eq!(bf.terminal_mode, TerminalMode::Native);
+        assert!(!bf.is_terminal());
+
+        // Explicit tmux.
+        let bf: Brofile = serde_json::from_str(
+            r#"{"name":"x","provider":"codex","terminal_mode":"tmux"}"#,
+        )
+        .unwrap();
+        assert_eq!(bf.terminal_mode, TerminalMode::Tmux);
+        assert!(bf.is_terminal());
+
+        // Native is skipped on serialize (keeps existing brofile JSON stable).
+        let json = serde_json::to_string(&Brofile {
+            name: "x".into(),
+            provider: Provider::Codex,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: None,
+            coerce_workspace: None,
+            runtime: None,
+            context: None,
+            terminal_mode: TerminalMode::Native,
+        })
+        .unwrap();
+        assert!(!json.contains("terminal_mode"), "{json}");
+
+        // Unknown value rejected.
+        assert!(
+            serde_json::from_str::<Brofile>(
+                r#"{"name":"x","provider":"codex","terminal_mode":"screen"}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn phase_decomposer_edit_implementer_parses() {
         let src =
             include_str!("../../system-defaults/brofiles/phase-decompose/edit-implementer.json");
@@ -1134,6 +1226,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
@@ -1155,6 +1248,7 @@ mod tests {
             coerce_workspace: Some(true),
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
@@ -1171,6 +1265,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
         let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();

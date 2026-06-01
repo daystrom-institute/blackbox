@@ -2209,6 +2209,7 @@ pub(crate) async fn admin_brofile_upsert(
         coerce_workspace: None,
         runtime: None,
         context: None,
+        terminal_mode: orchestration::brofile::TerminalMode::Native,
     };
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (

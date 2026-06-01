@@ -2194,6 +2194,65 @@ pub fn synthetic_terminal_task(
     })
 }
 
+/// Build a `Running` terminal-mode task (no child process). Used by `bro_exec`/
+/// `bro_resume` terminal dispatch, which returns immediately while a background
+/// task drives the tmux turn and finalizes this record on completion.
+pub fn running_terminal_task(
+    id: String,
+    provider: Provider,
+    cwd: Option<String>,
+    bro_label: Option<String>,
+) -> Arc<Task> {
+    Arc::new(Task {
+        inner: Mutex::new(TaskInner {
+            id,
+            provider,
+            session_id: "pending".to_string(),
+            events: vec![],
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: now_ms(),
+            completed_at: None,
+            exit_code: None,
+            cwd,
+            bro_label,
+            agent_label: None,
+            report: None,
+            recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
+            supervision: SupervisionState::default(),
+        }),
+        notify: Arc::new(Notify::new()),
+        child_id: Mutex::new(None),
+    })
+}
+
+/// Finalize a running terminal task in place from a completed turn outcome.
+pub fn finalize_terminal_task(
+    task: &Arc<Task>,
+    session_id: String,
+    result: Option<String>,
+    status: TaskStatus,
+    stderr: String,
+    transcript_location: Option<crate::transcripts::types::TranscriptLocation>,
+) {
+    {
+        let mut inner = task.inner.lock();
+        inner.session_id = session_id;
+        inner.last_assistant_message = result;
+        inner.status = status;
+        inner.completed_at = Some(now_ms());
+        inner.stderr = stderr;
+        inner.transcript_location = transcript_location;
+    }
+    task.notify.notify_waiters();
+}
+
 pub fn task_result_json(task: &Task) -> Value {
     populate_transcript_handle(task);
     let inner = task.inner.lock();

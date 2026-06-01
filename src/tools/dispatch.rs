@@ -432,6 +432,33 @@ impl BlackboxServer {
                 "Provide either bro, provider, or runtime allocation parameters",
             );
         };
+        // Terminal-mode brofiles run the provider TUI in tmux instead of the
+        // headless allocator path. Branch before allocation; the turn runs as a
+        // background task and the caller polls the returned task.
+        if let Some(bro) = p.bro.as_deref()
+            && self.brofile_is_terminal(bro, p.project_dir.as_deref())
+        {
+            let task = match self.dispatch_terminal_bro_task(
+                provider,
+                exec_opts.as_ref().and_then(|o| o.model.clone()),
+                exec_opts.as_ref().and_then(|o| o.effort.clone()),
+                cwd.clone(),
+                p.prompt.clone(),
+                None,
+                Some(bro.to_string()),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Self::err_text(&e),
+            };
+            let inner = task.inner.lock();
+            return Self::ok_json(&json!({
+                "taskId": inner.id,
+                "sessionId": inner.session_id,
+                "status": "running",
+                "terminalMode": "tmux",
+            }));
+        }
+
         let brofile_runtime = p
             .bro
             .as_deref()
@@ -546,6 +573,31 @@ impl BlackboxServer {
             }
             None => cwd,
         };
+
+        // A session first dispatched in terminal (tmux) mode is remembered, so
+        // resuming it continues in tmux transparently — the resume surface keys
+        // on session_id+provider, not a brofile.
+        if orchestration::tmux_dispatch::is_terminal_session(&self.state.store_dir, &session_id) {
+            let task = match self.dispatch_terminal_bro_task(
+                provider,
+                exec_opts.as_ref().and_then(|o| o.model.clone()),
+                exec_opts.as_ref().and_then(|o| o.effort.clone()),
+                cwd.clone(),
+                p.prompt.clone(),
+                Some(session_id.clone()),
+                p.bro.clone(),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Self::err_text(&e),
+            };
+            let inner = task.inner.lock();
+            return Self::ok_json(&json!({
+                "taskId": inner.id,
+                "sessionId": session_id,
+                "status": "running",
+                "terminalMode": "tmux",
+            }));
+        }
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -2164,6 +2216,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
+                terminal_mode: orchestration::brofile::TerminalMode::Native,
             },
             "global",
             &tmp.path().join("bro"),

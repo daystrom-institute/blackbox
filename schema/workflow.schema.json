@@ -57,8 +57,7 @@
           "type": "array",
           "items": { "$ref": "#/definitions/Capability" }
         },
-        "runtime": { "type": ["object", "null"] },
-        "terminal_mode": { "enum": ["native", "tmux"], "default": "native" }
+        "runtime": { "type": ["object", "null"] }
       }
     },
 

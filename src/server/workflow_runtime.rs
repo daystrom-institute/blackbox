@@ -32,6 +32,115 @@ impl BlackboxServer {
         })
     }
 
+    /// Dispatch a terminal-mode (tmux) bro turn for `bro_exec`/`bro_resume`.
+    /// Returns immediately with a `Running` task; a background task drives the
+    /// tmux turn via `run_terminal_turn` and finalizes the record on completion.
+    /// `existing_session` resumes that provider session (durable continuity).
+    pub(crate) fn dispatch_terminal_bro_task(
+        &self,
+        provider: Provider,
+        model: Option<String>,
+        effort: Option<String>,
+        cwd: Option<String>,
+        prompt: String,
+        existing_session: Option<String>,
+        bro_label: Option<String>,
+    ) -> Result<std::sync::Arc<orch::Task>, String> {
+        use crate::orchestration::tmux::{CliTmuxBackend, TmuxBackend};
+        use crate::orchestration::tmux_dispatch::{
+            TerminalTurnConfig, TerminalTurnTiming, run_terminal_turn,
+        };
+        use crate::transcripts::adapters::TranscriptAdapterRegistry;
+        use tokio_util::sync::CancellationToken;
+
+        if !provider.tui_capable() {
+            return Err(format!(
+                "provider {provider} is not TUI-capable; terminal_mode=tmux requires Claude or Codex"
+            ));
+        }
+        let id = format!("tmux-{}", uuid::Uuid::new_v4());
+        let cwd_path = cwd
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let task = orch::running_terminal_task(id.clone(), provider, cwd, bro_label.clone());
+        self.state
+            .task_store
+            .write()
+            .insert(id.clone(), task.clone())
+            .map_err(|e| format!("insert terminal task: {e}"))?;
+        self.state.task_store.read().persist(&self.state.store_dir);
+
+        let cfg = TerminalTurnConfig {
+            provider,
+            arc_id: format!("exec-{id}"),
+            actor_label: bro_label.unwrap_or_else(|| "bro".to_string()),
+            prompt,
+            cwd: cwd_path,
+            model,
+            effort,
+        };
+        let state = self.state.clone();
+        let task_bg = task.clone();
+        tokio::spawn(async move {
+            let backend = CliTmuxBackend::new();
+            let config = state.idx.read().reindex_config();
+            let registry = TranscriptAdapterRegistry::from_reindex_config(&config);
+            // bro_exec terminal turns are bounded by the turn timeout; wiring
+            // bro_cancel to trip this token is a follow-up (the workflow path
+            // already supports arc cancel).
+            let cancel = CancellationToken::new();
+            match run_terminal_turn(
+                &backend,
+                &registry,
+                &cfg,
+                &TerminalTurnTiming::default(),
+                existing_session.as_deref(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(o) => {
+                    let _ = backend.kill_session(&o.handle.session).await;
+                    // Remember this session is terminal so bro_resume continues
+                    // it in tmux transparently.
+                    crate::orchestration::tmux_dispatch::record_terminal_session(
+                        &state.store_dir,
+                        &o.session_id,
+                    );
+                    orch::finalize_terminal_task(
+                        &task_bg,
+                        o.session_id,
+                        Some(o.assistant_text),
+                        orch::TaskStatus::Completed,
+                        String::new(),
+                        Some(o.location),
+                    );
+                }
+                Err(e) => orch::finalize_terminal_task(
+                    &task_bg,
+                    "pending".to_string(),
+                    None,
+                    orch::TaskStatus::Failed,
+                    format!("terminal-mode dispatch failed: {e}"),
+                    None,
+                ),
+            }
+            state.task_store.read().persist(&state.store_dir);
+        });
+        Ok(task)
+    }
+
+    /// Whether the named brofile dispatches in terminal (tmux) mode. Read from
+    /// the resolved brofile so every dispatch path picks it up uniformly.
+    /// Unknown/unresolvable brofiles are treated as non-terminal (the normal
+    /// resolution path reports the real error later).
+    pub(crate) fn brofile_is_terminal(&self, brofile: &str, project_dir: Option<&str>) -> bool {
+        orchestration::brofile::resolve_brofile(brofile, &self.state.store_dir, project_dir)
+            .map(|bf| bf.is_terminal())
+            .unwrap_or(false)
+    }
+
     /// Dispatch an executor node turn through a provider's interactive TUI in
     /// a tmux pane (`terminal_mode=tmux`). The turn is driven by
     /// `tmux_dispatch::run_terminal_turn` and resolved from the transcript read

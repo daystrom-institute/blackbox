@@ -28,11 +28,14 @@ impl<'a> WorkflowRunner<'a> {
                 // Terminal mode runs the turn synchronously, which is
                 // incompatible with fork/fire-and-forget concurrency. Fail
                 // closed rather than silently downgrade to a headless dispatch.
-                if matches!(actor.terminal_mode, super::super::TerminalMode::Tmux) {
+                if self
+                    .server
+                    .brofile_is_terminal(brofile, self.project_dir.as_deref())
+                {
                     bail!(
-                        "actor '{actor_name}' uses terminal_mode=tmux, which is not yet supported \
-                         in fork/fire-and-forget nodes (target '{target_id}'); use it on a \
-                         synchronous executor node"
+                        "actor '{actor_name}' uses a terminal_mode=tmux brofile ('{brofile}'), \
+                         which is not supported in fork/fire-and-forget nodes (target \
+                         '{target_id}'); use it on a synchronous executor node"
                     );
                 }
                 let existing = if actor.durable {

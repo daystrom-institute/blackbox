@@ -537,6 +537,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
+                terminal_mode: orchestration::brofile::TerminalMode::Native,
             },
             "global",
             &tmp.path().join("bro"),

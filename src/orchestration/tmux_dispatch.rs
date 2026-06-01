@@ -710,6 +710,38 @@ fn wall_ms() -> u128 {
         .unwrap_or(0)
 }
 
+fn terminal_sessions_path(store_dir: &Path) -> PathBuf {
+    store_dir.join("terminal_sessions.txt")
+}
+
+/// Record that `session_id` was dispatched in terminal (tmux) mode, so a later
+/// `bro_resume` of that session continues in tmux transparently (the resume
+/// surface keys on session_id+provider, not a brofile). Append-only; dedup is
+/// done on read.
+pub fn record_terminal_session(store_dir: &Path, session_id: &str) {
+    if session_id.is_empty() || session_id == "pending" {
+        return;
+    }
+    if is_terminal_session(store_dir, session_id) {
+        return;
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(terminal_sessions_path(store_dir))
+    {
+        use std::io::Write as _;
+        let _ = writeln!(f, "{session_id}");
+    }
+}
+
+/// Whether `session_id` was previously dispatched in terminal (tmux) mode.
+pub fn is_terminal_session(store_dir: &Path, session_id: &str) -> bool {
+    std::fs::read_to_string(terminal_sessions_path(store_dir))
+        .map(|s| s.lines().any(|line| line.trim() == session_id))
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

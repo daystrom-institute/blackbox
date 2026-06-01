@@ -1541,6 +1541,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            terminal_mode: crate::orchestration::brofile::TerminalMode::Native,
         };
         let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
         let manifest = serde_json::json!({

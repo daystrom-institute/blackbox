@@ -594,6 +594,10 @@ pub(crate) struct BrofileParams {
     /// suppression for providers that support it.
     #[serde(default)]
     pub(crate) context: Option<orchestration::brofile::BrofileContext>,
+    /// How dispatches using this brofile are hosted: "native" (headless,
+    /// default) or "tmux" (interactive TUI in a tmux pane; Claude/Codex only).
+    #[serde(default)]
+    pub(crate) terminal_mode: Option<orchestration::brofile::TerminalMode>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
