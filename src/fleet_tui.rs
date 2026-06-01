@@ -921,7 +921,24 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
     let mut terminal = Terminal::new(backend)?;
 
     let result = (|| -> anyhow::Result<()> {
+        // `None` forces a clear on the first iteration. Updated only when we
+        // clear, so any later divergence — from handle_key (e.g. zoom_left) or
+        // from an in-draw fallback (draw_single_agent dropping to Roster) —
+        // triggers a clear on the next iteration.
+        let mut drawn_zone: Option<Zone> = None;
         loop {
+            // Force a full repaint on a zone transition. Ratatui only repaints
+            // cells it diffs as changed; transcript text can contain glyphs
+            // whose terminal width disagrees with ratatui's unicode-width model,
+            // which desyncs the real terminal from the cell model. The roster
+            // paints only a short table over a large blank body, so it never
+            // overwrites the desynced region — leaving single-agent remnants in
+            // the blank space. terminal.clear() resets the back buffer so the
+            // next draw repaints every cell.
+            if drawn_zone != Some(app.zone) {
+                terminal.clear()?;
+                drawn_zone = Some(app.zone);
+            }
             terminal.draw(|f| draw(f, app))?;
 
             if event::poll(Duration::from_millis(100))? {
