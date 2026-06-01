@@ -116,6 +116,10 @@ pub trait TmuxBackend: Send + Sync {
     async fn capture_pane(&self, pane_id: &str, lines: usize) -> Result<String, TmuxError>;
     /// Kill the window identified by `handle` (tears down the actor TUI).
     async fn kill_window(&self, handle: &TmuxHandle) -> Result<(), TmuxError>;
+    /// Kill an entire container session (the actor window plus tmux's default
+    /// placeholder window), reaping it completely. The next turn recreates the
+    /// session via `ensure_session`.
+    async fn kill_session(&self, name: &str) -> Result<(), TmuxError>;
 }
 
 /// Deterministic container-session name for an arc's actor TUIs.
@@ -241,6 +245,10 @@ pub(crate) fn kill_window_argv(window_id: &str) -> Vec<String> {
     vec!["kill-window".into(), "-t".into(), window_id.into()]
 }
 
+pub(crate) fn kill_session_argv(name: &str) -> Vec<String> {
+    vec!["kill-session".into(), "-t".into(), name.into()]
+}
+
 /// Parse the `new-window -P -F` line `session:@window:%pane` into a handle.
 pub(crate) fn parse_new_window_output(out: &str) -> Result<TmuxHandle, TmuxError> {
     let line = out.lines().next().unwrap_or("").trim();
@@ -337,6 +345,10 @@ impl TmuxBackend for CliTmuxBackend {
             .await
             .map(|_| ())
     }
+
+    async fn kill_session(&self, name: &str) -> Result<(), TmuxError> {
+        self.run(&kill_session_argv(name)).await.map(|_| ())
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +391,14 @@ mod tests {
     #[test]
     fn paste_buffer_name_is_per_pane() {
         assert_eq!(paste_buffer_name("%14"), "bbox-14");
+    }
+
+    #[test]
+    fn kill_session_targets_session_by_name() {
+        assert_eq!(
+            kill_session_argv("bb-actors-arc1"),
+            vec!["kill-session", "-t", "bb-actors-arc1"]
+        );
     }
 
     #[test]
@@ -499,6 +519,10 @@ mod tests {
         }
         async fn kill_window(&self, handle: &TmuxHandle) -> Result<(), TmuxError> {
             self.record(format!("kill_window:{}", handle.window_id));
+            Ok(())
+        }
+        async fn kill_session(&self, name: &str) -> Result<(), TmuxError> {
+            self.record(format!("kill_session:{name}"));
             Ok(())
         }
     }

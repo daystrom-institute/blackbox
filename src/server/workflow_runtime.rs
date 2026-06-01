@@ -96,13 +96,13 @@ impl BlackboxServer {
         .await
         {
             Ok(outcome) => {
-                // No portal yet, so a non-durable turn's window is dead weight
-                // after completion; kill it so the provider TUI process does not
-                // linger. (run_terminal_turn already kills on the error path.)
-                // The empty container session is reaped by startup
-                // reconciliation — a documented follow-up.
+                // No portal yet, so the turn's window is dead weight after
+                // completion. Reap the whole container session (actor window +
+                // tmux's default placeholder) so nothing lingers; the next
+                // durable turn recreates it via ensure_session. (The error path
+                // inside run_terminal_turn reaps too.)
                 use crate::orchestration::tmux::TmuxBackend;
-                let _ = backend.kill_window(&outcome.handle).await;
+                let _ = backend.kill_session(&outcome.handle.session).await;
                 orch::synthetic_terminal_task(
                     id.clone(),
                     provider,

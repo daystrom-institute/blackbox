@@ -251,7 +251,9 @@ pub async fn run_terminal_turn(
     match result {
         Ok(outcome) => Ok(outcome),
         Err(e) => {
-            let _ = backend.kill_window(&handle).await;
+            // Reap the whole container session (actor window + tmux's default
+            // placeholder), not just the window, so nothing lingers.
+            let _ = backend.kill_session(&session).await;
             Err(e)
         }
     }
@@ -756,6 +758,9 @@ mod tests {
             Ok(String::new()) // never ready
         }
         async fn kill_window(&self, _handle: &TmuxHandle) -> Result<(), TmuxError> {
+            Ok(())
+        }
+        async fn kill_session(&self, _name: &str) -> Result<(), TmuxError> {
             *self.killed.lock().unwrap() = true;
             Ok(())
         }
@@ -793,7 +798,10 @@ mod tests {
         );
         let err = res.expect_err("cancel should abort the turn");
         assert!(err.to_string().contains("cancel"), "{err}");
-        assert!(*backend.killed.lock().unwrap(), "window must be killed on cancel");
+        assert!(
+            *backend.killed.lock().unwrap(),
+            "container session must be reaped on cancel"
+        );
     }
 
     fn cfg(provider: Provider) -> TerminalTurnConfig {
