@@ -360,14 +360,21 @@ per-language perf workflows; `docs/perf-pathology-dispatch.md` should be updated
 to point at them.
 
 **Installation note (verified during the live smoke).** The `kind: ensemble`
-actor resolves its `team` from the **bro teamplate registry**, not the artifact
-catalog. The daemon loads installed `team` artifacts into that registry at
-**startup**, so a panel teamplate installed via `bbox_artifact_install` into a
-*running* daemon is not yet live — `bro_orchestrate_run` fails the BlindPost
-dispatch with `Unknown team: <panel>`. Fix either way: restart the daemon after
-installing the panel team artifacts, or register each panel immediately with
-`bro_team(action="save_template", name=<panel>, members=[…])`. The five lens
-brofiles must be installed before the panel is registered.
+actor resolves its `team` via `load_team` (`src/orchestration/team.rs`), which
+reads an **instantiated team** from the teams store — NOT a teamplate, and with
+no teamplate fallback. So installing the panel as a `team` *artifact* or saving
+it as a *teamplate* is not enough; `bro_orchestrate_run` fails the BlindPost
+dispatch with `Unknown team: <panel>` until the team is instantiated. Required
+per-flow adoption sequence:
+
+1. Install the five lens brofiles + the validator brofile + the facilitator.
+2. Save the panel teamplate (`bro_team save_template`, or install the team
+   artifact).
+3. **Instantiate the team:** `bro_team(action="create", name=<panel>,
+   template=<panel>)` — this writes the team into the teams store that
+   `load_team` reads. Without this step the ensemble cannot dispatch.
+
+Neither a `save_template` nor a daemon restart substitutes for step 3.
 
 ## Acceptance criteria
 
