@@ -361,6 +361,7 @@ impl OpenAiResponsesTransport {
         );
 
         let mut text = String::new();
+        let mut thinking = String::new();
         let mut tool_calls = Vec::new();
         for item in &output_items {
             match item["type"].as_str().unwrap_or("") {
@@ -371,6 +372,19 @@ impl OpenAiResponsesTransport {
                                 && let Some(t) = p["text"].as_str()
                             {
                                 text.push_str(t);
+                            }
+                        }
+                    }
+                }
+                // Reasoning items carry summary/content text — surface for
+                // display only (not replayed; `store:false` drops them server-side).
+                "reasoning" => {
+                    for key in ["summary", "content"] {
+                        if let Some(parts) = item[key].as_array() {
+                            for p in parts {
+                                if let Some(t) = p["text"].as_str() {
+                                    thinking.push_str(t);
+                                }
                             }
                         }
                     }
@@ -397,6 +411,7 @@ impl OpenAiResponsesTransport {
 
         Ok(TurnOutput {
             text,
+            thinking,
             tool_calls,
             stop,
             usage,
@@ -620,5 +635,18 @@ mod tests {
         assert_eq!(responses_split(&input, 3), Some(1));
         // Cutting only the final item is never offered (limit 1 → empty range).
         assert_eq!(responses_split(&input, 1), None);
+    }
+
+    #[test]
+    fn parse_sse_surfaces_reasoning_as_thinking() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"pondering\"}]}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+        );
+        let out = transport().parse_sse(sse).unwrap();
+        assert_eq!(out.text, "answer");
+        // Reasoning surfaced for display…
+        assert_eq!(out.thinking, "pondering");
     }
 }

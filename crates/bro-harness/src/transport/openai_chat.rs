@@ -345,6 +345,8 @@ impl Transport for OpenAiChatTransport {
 
         Ok(TurnOutput {
             text: text_out,
+            // Chat Completions exposes no separate reasoning channel here.
+            thinking: String::new(),
             tool_calls,
             stop,
             usage,

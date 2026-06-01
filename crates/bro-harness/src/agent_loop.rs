@@ -565,9 +565,14 @@ impl Session {
                 }
             }
 
-            // Full assistant turn (text + tool_use) for the daemon tail / fleet
-            // transcript; the daemon dedupes text against streamed deltas.
+            // Full assistant turn (thinking + text + tool_use) for the daemon
+            // tail / fleet transcript; the daemon dedupes text against streamed
+            // deltas. The thinking block is display-only — it is emitted here for
+            // client rendering but never enters the transport replay buffer.
             let mut assistant_content: Vec<Value> = Vec::new();
+            if !out.thinking.is_empty() {
+                assistant_content.push(json!({"type": "thinking", "thinking": out.thinking}));
+            }
             if !out.text.is_empty() {
                 assistant_content.push(json!({"type": "text", "text": out.text}));
                 final_text = out.text.clone();
@@ -1247,6 +1252,7 @@ mod tests {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
                         text: String::new(),
+                        thinking: String::new(),
                         tool_calls: vec![transport::ToolCall {
                             id: "tool-1".into(),
                             name: "slow_tool".into(),
@@ -1260,6 +1266,7 @@ mod tests {
                     self.shared.completed.fetch_add(1, Ordering::SeqCst);
                     Ok(transport::TurnOutput {
                         text: t,
+                        thinking: String::new(),
                         tool_calls: vec![],
                         stop: StopReason::Done,
                         usage: Usage::default(),

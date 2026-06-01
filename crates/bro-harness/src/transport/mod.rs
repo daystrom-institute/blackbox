@@ -95,6 +95,11 @@ pub enum StopReason {
 /// Normalized result of one assistant turn.
 pub struct TurnOutput {
     pub text: String,
+    /// Reasoning/thinking text for this turn, surfaced for display only. NOT
+    /// replayed into the transport buffer (no persisted signature), so it never
+    /// affects the next request — but it lets the agent loop emit a thinking
+    /// block in the turn-boundary `assistant` event so clients can render it.
+    pub thinking: String,
     pub tool_calls: Vec<ToolCall>,
     pub stop: StopReason,
     pub usage: Usage,

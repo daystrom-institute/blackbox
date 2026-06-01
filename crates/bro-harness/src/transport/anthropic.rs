@@ -452,12 +452,20 @@ impl Transport for AnthropicTransport {
             // Reconstruct the assistant turn from the accumulated blocks.
             let mut content: Vec<Value> = Vec::new();
             let mut text_out = String::new();
+            let mut thinking_out = String::new();
             let mut tool_calls: Vec<super::ToolCall> = Vec::new();
             for b in &blocks {
                 match b.kind.as_str() {
                     "text" if !b.text.is_empty() => {
                         content.push(json!({"type": "text", "text": b.text}));
                         text_out.push_str(&b.text);
+                    }
+                    // Capture thinking for display (returned in TurnOutput), but
+                    // do NOT push it into `content` — the replay buffer stays
+                    // thinking-free (Anthropic needs a matching signature to
+                    // replay a thinking block, which we don't persist).
+                    "thinking" if !b.text.is_empty() => {
+                        thinking_out.push_str(&b.text);
                     }
                     "tool_use" => {
                         let args: Value = serde_json::from_str(if b.tool_json.is_empty() {
@@ -478,10 +486,6 @@ impl Transport for AnthropicTransport {
                             args,
                         });
                     }
-                    // `thinking` blocks are intentionally NOT replayed: Anthropic
-                    // requires a matching signature to send a thinking block back,
-                    // and we don't persist one. The live thinking already streamed
-                    // to the sink; dropping it from the buffer keeps resume valid.
                     _ => {}
                 }
             }
@@ -500,6 +504,7 @@ impl Transport for AnthropicTransport {
 
             return Ok(TurnOutput {
                 text: text_out,
+                thinking: thinking_out,
                 tool_calls,
                 stop,
                 usage,
