@@ -63,7 +63,7 @@ struct ExitWorktreeInput {
     /// Worktree path. Omit to target the current tool root.
     #[serde(default)]
     worktree: Option<String>,
-    /// keep, preflight, discard, or publish. Default keep.
+    /// keep, preflight, discard, publish, merge, or adopt. Default keep.
     #[serde(default)]
     disposition: Option<String>,
     /// Commit message for publish.
@@ -87,7 +87,7 @@ impl Tool for ExitWorktree {
     }
 
     fn description(&self) -> &str {
-        "Finish a managed fleet worktree. disposition=keep reports status only. disposition=preflight reports the exact publish/discard readiness without mutating. disposition=discard removes a clean/confirmed managed worktree. disposition=publish commits selected changes, fetches/rebases onto origin/main, fast-forwards main, pushes main, and removes the worktree. publish/discard require confirm=true."
+        "Finish a managed fleet worktree. disposition=keep reports status only. disposition=preflight reports the exact closeout readiness without mutating. disposition=discard removes a clean/confirmed managed worktree. disposition=publish commits selected changes, fetches/rebases onto origin/main, fast-forwards main, pushes main, and removes the worktree. disposition=merge/adopt folds down an already-committed clean worktree branch, pushes main, and removes the worktree. Mutating dispositions require confirm=true."
     }
 
     fn input_schema(&self) -> Value {
@@ -293,10 +293,55 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
                 "removed_worktree": worktree,
             }))
         }
+        "merge" | "adopt" => {
+            merge_committed_worktree(&base_repo, &worktree, &branch, disposition, args.confirm)
+        }
         other => {
-            anyhow::bail!("disposition must be keep, preflight, discard, or publish; got {other}")
+            anyhow::bail!(
+                "disposition must be keep, preflight, discard, publish, merge, or adopt; got {other}"
+            )
         }
     }
+}
+
+fn merge_committed_worktree(
+    base_repo: &Path,
+    worktree: &Path,
+    branch: &str,
+    disposition: &str,
+    confirm: bool,
+) -> anyhow::Result<Value> {
+    if !confirm {
+        anyhow::bail!("{disposition} requires confirm=true");
+    }
+    let changed = changed_paths(worktree)?;
+    if !changed.is_empty() {
+        anyhow::bail!(
+            "{disposition} requires a clean worktree; use publish to commit dirty paths first. Dirty paths: {}",
+            changed.join(", ")
+        );
+    }
+    ensure_base_ready_for_publish(base_repo)?;
+    git_run(base_repo, &["fetch", "origin", "main"])?;
+    git_run(base_repo, &["merge", "--ff-only", "origin/main"])?;
+    git_run(worktree, &["rebase", "main"])?;
+    let branch_commits = branch_ahead_count(base_repo, branch)?;
+    if branch_commits == 0 {
+        anyhow::bail!("{disposition} found no branch commits to merge into main");
+    }
+    git_run(base_repo, &["merge", "--ff-only", branch])?;
+    git_run(base_repo, &["push", "origin", "main"])?;
+    let head = git_capture(base_repo, &["rev-parse", "--short=12", "HEAD"])?;
+    git_run(base_repo, &["worktree", "remove", path_str(worktree)?])?;
+    let _ = git_run(base_repo, &["branch", "-D", branch]);
+    Ok(json!({
+        "ok": true,
+        "disposition": disposition,
+        "published_head": head,
+        "branch": branch,
+        "merged_commits": branch_commits,
+        "removed_worktree": worktree,
+    }))
 }
 
 fn publish_preflight(
@@ -322,6 +367,9 @@ fn publish_preflight(
     let base_dirty = git_capture(base_repo, &["status", "--porcelain=v1"])
         .unwrap_or_else(|e| format!("unavailable: {e}"));
     let base_ready = base_branch.trim() == "main" && base_dirty.trim().is_empty();
+    let branch_commits = branch_ahead_count(base_repo, branch).ok();
+    let merge_ready = base_ready && changed.is_empty() && branch_commits.unwrap_or(0) > 0;
+    let publish_ready = base_ready && unsafe_paths.is_empty() && !changed.is_empty();
     let origin_main = git_capture(
         base_repo,
         &["rev-parse", "--verify", "--short=12", "origin/main"],
@@ -335,7 +383,7 @@ fn publish_preflight(
     .ok();
 
     Ok(json!({
-        "ok": unsafe_paths.is_empty() && base_ready && !changed.is_empty(),
+        "ok": publish_ready || merge_ready,
         "disposition": "preflight",
         "worktree": worktree,
         "branch": branch,
@@ -343,6 +391,9 @@ fn publish_preflight(
         "changed_paths": changed,
         "selected_paths": selected_paths,
         "unsafe_paths": unsafe_paths,
+        "publish_ready": publish_ready,
+        "merge_ready": merge_ready,
+        "branch_commits_ahead_main": branch_commits,
         "base_repo": base_repo,
         "base_branch": base_branch,
         "base_dirty": base_dirty,
@@ -357,6 +408,17 @@ fn publish_preflight(
             "git merge --ff-only origin/main in base repo",
             "git add -- selected paths in managed worktree",
             "git commit in managed worktree",
+            "git rebase main in managed worktree",
+            "git merge --ff-only branch into main",
+            "git push origin main",
+            "git worktree remove and delete bro-fleet branch"
+        ],
+        "merge_plan": [
+            "require confirm=true",
+            "require clean managed worktree",
+            "ensure base repo is clean and on main",
+            "git fetch origin main",
+            "git merge --ff-only origin/main in base repo",
             "git rebase main in managed worktree",
             "git merge --ff-only branch into main",
             "git push origin main",
@@ -427,6 +489,14 @@ fn changed_paths(repo: &Path) -> anyhow::Result<Vec<String>> {
         .filter(|p| !p.is_empty())
         .map(|p| p.trim_matches('"').to_string())
         .collect())
+}
+
+fn branch_ahead_count(base_repo: &Path, branch: &str) -> anyhow::Result<usize> {
+    let raw = git_capture(
+        base_repo,
+        &["rev-list", "--count", &format!("main..{branch}")],
+    )?;
+    Ok(raw.trim().parse()?)
 }
 
 fn git_toplevel(cwd: &Path) -> anyhow::Result<PathBuf> {
@@ -635,6 +705,8 @@ mod tests {
         assert_eq!(report["ok"], true);
         assert_eq!(report["changed_paths"], json!(["README.md"]));
         assert_eq!(report["selected_paths"], json!(["README.md"]));
+        assert_eq!(report["publish_ready"], true);
+        assert_eq!(report["merge_ready"], false);
         assert!(report["publish_plan"].as_array().unwrap().len() >= 5);
         assert!(cwd.join("README.md").is_file());
         assert_eq!(
@@ -646,6 +718,91 @@ mod tests {
             repo.path(),
             &["worktree", "remove", "--force", cwd.to_str().unwrap()],
         );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_preflight_reports_merge_ready_for_committed_branch() {
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "preflight"
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(report["disposition"], "preflight");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["changed_paths"], json!([]));
+        assert_eq!(report["publish_ready"], false);
+        assert_eq!(report["merge_ready"], true);
+        assert_eq!(report["branch_commits_ahead_main"], 1);
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_merge_folds_down_committed_branch_and_removes_worktree() {
+        let repo = seed_repo();
+        let origin = tempfile::tempdir().unwrap();
+        run_git(origin.path(), &["init", "--bare"]);
+        run_git(
+            repo.path(),
+            &["remote", "add", "origin", origin.path().to_str().unwrap()],
+        );
+        run_git(repo.path(), &["push", "-u", "origin", "main"]);
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        let branch = value["branch"].as_str().unwrap().to_string();
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "merge",
+                    "confirm": true
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let report: Value = serde_json::from_str(&content).unwrap();
+
+        assert_eq!(report["disposition"], "merge");
+        assert_eq!(report["merged_commits"], 1);
+        assert!(!cwd.exists());
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("README.md")).unwrap(),
+            "base\ncommitted\n"
+        );
+        assert_eq!(
+            git_capture(repo.path(), &["rev-parse", "main"]).unwrap(),
+            git_capture(origin.path(), &["rev-parse", "main"]).unwrap()
+        );
+        assert!(!git_ok(repo.path(), &["rev-parse", "--verify", &branch]));
+
         std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
     }
 
