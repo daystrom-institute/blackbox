@@ -781,9 +781,10 @@ Worktree branch: {branch}\n\
 Base repository: {}\n\
 Base branch/ref: {base_branch} @ {base_sha}{cargo_line}\n\
 Make code changes only inside the worktree path above unless the operator explicitly redirects you.\n\
-For project-scoped bbox calls (bbox_thread, bbox_thread_list, bbox_code_*, slice tools), pass THIS \
-worktree path as project/project_dir — the daemon resolves it to the registered base for scope and \
-keeps the worktree for committed artifacts, so records/edits travel with this branch.\n\
+For project-scoped bbox calls (bbox_thread/_list, bbox_code_*, bbox_learn/decide/remember, \
+bbox_render, slice tools), pass THIS worktree path as project/project_dir — committed artifacts \
+(thread records, knowledge entries, rendered memory) then land in the worktree and travel with this \
+branch instead of the base checkout; the daemon keys durable scope to the registered base.\n\
 \n\
 Initial worktree git status:\n```text\n{}\n```\n\
 Source worktree status at dispatch time:\n```text\n{}\n```",

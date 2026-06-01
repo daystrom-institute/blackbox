@@ -3260,6 +3260,66 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
     }
 
     #[test]
+    fn project_scoped_learn_writes_into_the_worktree_not_the_registered_base() {
+        // gap note-edc1b61d follow-up: a fleet agent inside a managed worktree
+        // that passes its worktree path as `project` must have the committed
+        // .bbox/knowledge/ entry written into the WORKTREE — so it travels with
+        // the agent's branch and merges to base via adopt/publish — not into the
+        // registered base checkout. Knowledge writes follow `entry.project` and
+        // `project` is re-stamped from the loading root, so base-scope is
+        // recovered automatically once the entry merges into the base. No
+        // scope/write-dir split (as threads needed) is required — only the path
+        // the agent passes. This guards that the write path stays project-driven.
+        let central = tempfile::tempdir().unwrap();
+        let base = tempfile::tempdir().unwrap();
+        let worktree = tempfile::tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        let worktree_root = worktree.path().canonicalize().unwrap();
+        // Both repo-owned: the base has committed .bbox/knowledge/, and a real
+        // worktree (a checkout of the base) therefore has it too.
+        std::fs::create_dir_all(base_root.join(".bbox").join("knowledge")).unwrap();
+        std::fs::create_dir_all(worktree_root.join(".bbox").join("knowledge")).unwrap();
+
+        let kb_path = central.path().join("kb.json");
+        let mut kb = Knowledge::open(&kb_path).unwrap();
+        // Only the BASE is a registered project root; the worktree is ephemeral.
+        kb.set_project_roots(vec![base_root.clone()]).unwrap();
+
+        let id = kb
+            .learn_result(
+                &LearnParams {
+                    content: "prefer rustls over openssl".into(),
+                    category: "convention".into(),
+                    format: None,
+                    title: Some("tls backend".into()),
+                    scope: Some("project".into()),
+                    project: Some(worktree_root.to_string_lossy().into_owned()),
+                    providers: None,
+                    priority: None,
+                    weight: None,
+                    expires_at: None,
+                    cluster: None,
+                    id: None,
+                },
+                false,
+            )
+            .unwrap()
+            .id;
+
+        let in_worktree = worktree_root.join(".bbox").join("knowledge").join(format!("{id}.json"));
+        let in_base = base_root.join(".bbox").join("knowledge").join(format!("{id}.json"));
+        assert!(in_worktree.exists(), "entry should be written into the worktree: {}", in_worktree.display());
+        assert!(!in_base.exists(), "entry must NOT be written into the registered base");
+
+        // Rider is repo-relative — actionable from the worktree cwd, no absolute leak.
+        let rider = kb.repo_record_rider(&id).expect("committed entry should rider");
+        assert!(
+            rider.contains(&format!("git add .bbox/knowledge/{id}.json")),
+            "rider should be worktree-relative and actionable: {rider}"
+        );
+    }
+
+    #[test]
     fn repo_record_rider_fires_for_committed_project_entries_only() {
         let central = tempfile::tempdir().unwrap();
         let repo = tempfile::tempdir().unwrap();
