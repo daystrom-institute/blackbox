@@ -1240,6 +1240,9 @@ mod tests {
             shell_sessions: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::shell::ShellSessions::default(),
             )),
+            promises: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::promise::PromiseStore::default(),
+            )),
             clipboard: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::clipboard::Registers::default(),
             )),

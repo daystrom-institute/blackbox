@@ -38,7 +38,8 @@ in `builtin_tools()` and how each tool's arg surface should look.
 ## What bro-harness has today (design-time baseline, 2026-05-29)
 
 > This table captures the surface **as of the design**, to motivate the adopt
-> list. `builtin_tools()` now returns **27 tools** (18 base + the 9 `clip_*`),
+> list. `builtin_tools()` now returns **36 tools** (20 base + the 9 `clip_*` +
+> the 7 `promise_*` lifecycle tools),
 > not the 14 below; the "No X" limit notes annotated **[shipped]** were the gaps
 > this doc scoped and have since been filled. The registry also pins the daemon's
 > `bbox_slice_*` (MCP) and adds the `tool_search` meta-tool.
@@ -52,7 +53,8 @@ in `builtin_tools()` and how each tool's arg surface should look.
 | `list_dir` | `path?` | Immediate entries. |
 | `content_search` | `pattern (regex), path?, glob?, max_results?=200 (cap 5000)` | gitignore-aware; returns `relpath:line:text`. ~~No output_mode / context-lines / count~~ **[shipped]** now takes `mode` (content/files/count), `context_lines`, `case_insensitive`. |
 | `glob` | `pattern, path?` | gitignore-aware; **mtime sort by default** (`GlobSort::Mtime`), `name` opt-in; cap 2000. |
-| `shell_run` (+ `shell_poll`/`shell_kill`/`shell_list`) | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. ~~No timeout / background / stdin / session~~ **[shipped]** — the full quartet now exists (Codex yield-poll: `timeout_ms`, `yield_time_ms`, `max_output_tokens`, `stdin`, `close_stdin`, `env`, session cap). |
+| `shell_run` (+ `shell_poll`/`shell_kill`/`shell_list`) | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. ~~No timeout / background / stdin / session~~ **[shipped]** — the full quartet now exists (Codex yield-poll: `timeout_ms`, `yield_time_ms`, `max_output_tokens`, `stdin`, `close_stdin`, `env`, session cap). `shell_run(mode="promise")` starts async and returns a `promise_id`. |
+| `promise_*` | `promise_id` / `promise_ids` | **[shipped]** same-dispatch lifecycle for async built-ins: `promise_status`, `promise_wait`, `promise_when_all`, `promise_when_any`, `promise_cancel`, `promise_list`, `promise_wake`. |
 | `todo_write` | `todos[]` | **[shipped]** durable across `exec → resume` via the `side` cell. |
 | `clip_*` (×9) | (see `clipboard.rs`) | **[shipped]** register store: `clip_yank/set/paste/list/peek/clear` + `clip_transform`/`clip_slice`/`clip_grep`. |
 | `git_status/log/diff` | — | `log` = `--oneline -20`. |
@@ -111,11 +113,14 @@ Operator-confirmed for v1:
   `escalated_to_sigkill` (the latter means the requested signal was ignored and
   we force-killed after grace — NOT merely "SIGKILL was requested").
 
-  Cooperative, synchronous from the loop; true-background + wake stays deferred
-  to Stage 3 of the chaining design. Sessions are in-memory, single-`run()`
-  lifetime (live children can't serialize into `side`), `kill_on_drop`, capped at
-  32 concurrent. Output capped tail-first (errors trail); `timed_out` always
-  present; `exit_code` null until termination.
+  Cooperative, synchronous from the loop by default. `mode="promise"` is the
+  same-dispatch background path: it returns `promise_id`, supports
+  wait/all/any/cancel/list/status/wake, and injects hidden `[HARNESS_EVENT ...]`
+  wake turns at safe boundaries. Live shell sessions and promises are in-memory,
+  single-`run()` lifetime (live children can't serialize into `side`),
+  `kill_on_drop`, capped at 32 concurrent for shell sessions. Output capped
+  tail-first (errors trail); `timed_out` always present; `exit_code` null until
+  termination.
 
   **Correctness fixes found during the hunt (beyond verbatim Codex parity):**
   - *Reader-hang bug:* a command that backgrounds a pipe-inheriting process
@@ -184,10 +189,10 @@ shell_run {
 ```
 
 Rationale: `yield_time_ms` + `session_id` polling is the pragmatic middle path
-between block-forever and a full background Task registry — it covers builds,
-servers-that-need-a-poke, and REPLs without the async/wake machinery. The
-true-background + wake form (CC `run_in_background`) is deferred to Stage 3 of
-the chaining design, when the harness has a Task abstraction.
+between block-forever and a full async layer — it covers builds,
+servers-that-need-a-poke, and REPLs without forcing every tool into lifecycle
+machinery. `mode="promise"` adds the true-background + wake form for shell only,
+through the harness-local Promise table.
 
 `escalate`/`justification` are intentionally **not** in this shape — per-call
 escalation is deferred (see Resolved decisions). The static `SafetyPolicy` gate

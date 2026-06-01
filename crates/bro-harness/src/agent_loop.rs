@@ -99,20 +99,35 @@ async fn session_loop(
     loop {
         let prompt = match pending.pop_front() {
             Some(p) => p,
-            None => match input_rx.recv().await {
-                Some(Input::User(p)) => p,
-                Some(Input::Control {
-                    subtype,
-                    req_id,
-                    raw,
-                }) => {
-                    // Control while idle: apply any mutation, ack success.
-                    session.apply_control(&subtype, &raw);
-                    ctrl_emitter.control_response_success(req_id.as_deref());
-                    continue;
+            None => {
+                if let Some(wake) = session.promise_wake_prompt() {
+                    wake
+                } else {
+                    let promise_notify = session.promise_notifier();
+                    tokio::select! {
+                        maybe = input_rx.recv() => match maybe {
+                            Some(Input::User(p)) => p,
+                            Some(Input::Control {
+                                subtype,
+                                req_id,
+                                raw,
+                            }) => {
+                                // Control while idle: apply any mutation, ack success.
+                                session.apply_control(&subtype, &raw);
+                                ctrl_emitter.control_response_success(req_id.as_deref());
+                                continue;
+                            }
+                            None => break, // stdin closed and nothing pending
+                        },
+                        _ = promise_notify.notified() => {
+                            match session.promise_wake_prompt() {
+                                Some(wake) => wake,
+                                None => continue,
+                            }
+                        }
+                    }
                 }
-                None => break, // stdin closed and nothing pending
-            },
+            }
         };
 
         // `/compact` is an in-stream slash command, not a model turn.
@@ -302,6 +317,7 @@ impl Session {
             http: reqwest::Client::new(),
             todos: todos.clone(),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
+            promises: Arc::new(std::sync::Mutex::new(bro_tools::PromiseStore::default())),
             clipboard: clipboard.clone(),
             edits: edits.clone(),
         };
@@ -430,6 +446,9 @@ impl Session {
             }
             if *cancel.borrow() {
                 break;
+            }
+            if let Some(wake) = self.promise_wake_prompt() {
+                self.push_user_text(&wake);
             }
 
             // Compact before composing when the previous prompt crossed the
@@ -596,6 +615,15 @@ impl Session {
             }
             self.push_user_text(&prompt);
         }
+    }
+
+    fn promise_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.cx.promises.lock().unwrap().notifier()
+    }
+
+    fn promise_wake_prompt(&mut self) -> Option<String> {
+        let wakes = self.cx.promises.lock().unwrap().drain_wake_messages();
+        (!wakes.is_empty()).then(|| wakes.join("\n\n"))
     }
 
     /// Window-0 diagnostics seam: drain the per-dispatch edit sink, run the
@@ -789,7 +817,9 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
             "\nShell sessions: if `shell_run` or `shell_poll` returns `running=true`, the command \
              is still active. Do not treat the command as complete or stop the turn there; call \
              `shell_poll` with the returned `session_id` until `running=false`, or `shell_kill` \
-             if you are abandoning it.\n",
+             if you are abandoning it. For work you want to start and then continue past, call \
+             `shell_run` with `mode=\"promise\"`, then use `promise_wait`, `promise_when_all`, \
+             `promise_when_any`, or `promise_wake`.\n",
         );
     }
 
@@ -996,6 +1026,7 @@ mod tests {
             http: reqwest::Client::new(),
             todos: todos.clone(),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
             clipboard: clipboard.clone(),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
         };
@@ -1192,6 +1223,35 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.base_opts.model, "new-model");
+    }
+
+    #[tokio::test]
+    async fn settled_promise_wake_injects_hidden_turn() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("wake handled".into())]);
+        let (pid, _cancel_rx) = session
+            .cx
+            .promises
+            .lock()
+            .unwrap()
+            .start("shell_run", json!({"command": "echo done"}));
+        {
+            let mut promises = session.cx.promises.lock().unwrap();
+            promises.wake(&pid, Some("inspect shell".into())).unwrap();
+            promises.settle_completed(&pid, json!({"exit_code": 0, "stdout": "done\n"}));
+        }
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(tx);
+        let ctrl = Emitter::new("ctrl".into());
+        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+            .await
+            .unwrap();
+
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(users.len(), 1, "{users:?}");
+        assert!(users[0].contains("[HARNESS_EVENT promise_completed]"));
+        assert!(users[0].contains(&pid));
+        assert!(users[0].contains("inspect shell"));
     }
 
     // ---- window-0 diagnostics: full seam (drain edits -> engine -> render -> rider) ----

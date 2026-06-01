@@ -13,6 +13,7 @@ pub mod clipboard;
 pub mod edits;
 pub mod fleet_worktree;
 pub mod jq;
+pub mod promise;
 pub mod safety;
 pub mod shell;
 pub mod slice_core;
@@ -23,6 +24,7 @@ pub mod workspace;
 
 pub use clipboard::Registers;
 pub use edits::{EditEvent, EditSink};
+pub use promise::{PromiseStore, promise_tools};
 pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
@@ -61,5 +63,6 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
     ];
     let mut tools = tools;
     tools.extend(crate::clipboard::clip_tools());
+    tools.extend(crate::promise::promise_tools());
     tools
 }

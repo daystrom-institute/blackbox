@@ -6,14 +6,13 @@ corpus: blackbox-design
 topic:
   - bro-harness
   - surfaces
-brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, server-held value cells that tools produce and consume by handle instead of marshalling full content through the model context. A clipboard register is a settled ref; a Task is a pending ref. Chainability is built at the settled layer with zero async machinery; Tasks enter only when a producer can't finish within the turn."
+brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, server-held value cells that tools produce and consume by handle instead of marshalling full content through the model context. A clipboard register is a settled ref; a Promise is a pending async handle. Chainability is built at the settled layer with zero async machinery; Promises enter only for selected async producers."
 ---
 
 > **As-built record.** Stages 1–2 (settled refs: the clipboard, plus
 > `kind`-tagged producers/consumers for tool→tool chaining) are built. Stage 3
-> (pending refs = Task, the async arm) was excised to
-> [`backlog-tool-chaining-stage-3.md`](./backlog-tool-chaining-stage-3.md); it is
-> gated on an async producer existing to need it.
+> has an MVP in [`backlog-tool-chaining-stage-3.md`](./backlog-tool-chaining-stage-3.md):
+> harness-local `shell_run(mode="promise")` plus `promise_*` lifecycle tools.
 
 # bro-harness tool chaining (the ref ABI)
 
@@ -43,17 +42,17 @@ brief: "A uniform reference ABI for the bro-harness tool loop: named, typed, ser
 >   next hop, a string becomes `Text` (raw prose).
 > - **Handle namespace** — register handles tolerate an optional `clip:` prefix
 >   (`clip:a` ≡ `a`), normalized at the `Registers` API
->   (`clipboard::normalize_register`) wherever a register is named. `task:` is
->   left literal — reserved for the pending-ref arm so it routes differently when
->   Stage 3 lands rather than silently aliasing a clipboard register.
+>   (`clipboard::normalize_register`) wherever a register is named. `promise:` is
+>   left literal — reserved for the async Promise arm so it routes differently
+>   rather than silently aliasing a clipboard register.
 > - **Pinning** — the clipboard ACTION verbs (`clip_yank`/`clip_paste`/
 >   `clip_transform`/`clip_slice`/`clip_grep`) plus `bbox_slice_*` are `Pinned`
 >   (prominent "always-available" callout); the utilities (`clip_set`/
 >   `clip_list`/`clip_peek`/`clip_clear`) are `Eager` — callable but off the
 >   callout. Override with `BRO_HARNESS_PIN_TOOLS`.
-> - **Stage 3 (pending refs = Task)** — not built; deferred until a harness-local
->   async producer exists, starting with background shell. It is not a
->   daemon-orchestration or `bro_exec` layer.
+> - **Stage 3 (Promises)** — MVP built for harness-local background shell:
+>   `shell_run(mode="promise")` returns a `promise_id`, managed by `promise_*`
+>   tools. It is not a daemon-orchestration or `bro_exec` layer.
 >
 > **On transforms vs the "no DSL" non-goal.** The §Non-goals line rejects "a
 > general dataflow DSL — the harness does not plan or optimize a graph"; it does
@@ -95,17 +94,17 @@ tool_B(input = "r1")           # tool_B consumes the handle server-side
 
 A **ref** is a typed, named slot the harness owns. Tools declare which
 parameters *accept* a ref and which outputs *produce* one. The model addresses
-refs by handle in a single uniform namespace:
+settled refs by handle:
 
 ```
 clip:@      clip:a       # clipboard registers   (settled)
-task:abc.output          # an async unit's output (pending → settled)
 ```
 
-One **resolver** in `ToolCx` turns a handle into bytes:
+One **resolver** in `ToolCx` turns a settled handle into bytes:
 
 - **settled** → return the bytes now.
-- **pending** → block until it settles, or defer the consuming call (Stage 3).
+- **promise** → v1 uses explicit `promise_*` lifecycle tools; a future
+  `promise:<id>.output` ref resolver can be added once a consumer needs it.
 
 The clipboard (`ToolCx.clipboard: Arc<Mutex<Registers>>`) is the resolver's
 first and simplest backing store. This is the same cross-turn shared-cell
@@ -116,11 +115,12 @@ outlives the turn" from *tool availability* to *tool data*.
 
 ## The decomposition: settled ref vs pending ref
 
-> **A clipboard register is a *settled* ref. A `Task` is a *pending* ref.**
-> "Everything is a Task" is too strong. The precise statement is: **every
-> chainable value is a ref, and a Task is a ref whose bytes haven't arrived
-> yet.** Chainability is built entirely at the settled layer — Tasks enter only
-> when a producer cannot settle within the turn.
+> **A clipboard register is a *settled* ref. A `Promise` is a pending async
+> handle.** "Everything is a Promise" is too strong. The precise statement is:
+> **every chainable value is a ref, and a Promise is work whose bytes haven't
+> arrived yet.** Chainability is built entirely at the settled layer — Promises
+> enter only when a producer cannot settle within the turn and is explicitly
+> promise-shaped.
 
 This matches the harness's actual control flow: `agent_loop::run` dispatches
 each tool call synchronously (`reg.dispatch(name, args, &cx)`,
@@ -139,7 +139,7 @@ is [`bro-harness-clipboard.md`](./bro-harness-clipboard.md).
 ### Stage 2 — settled refs, any tool (the actual tool→tool chaining)
 
 Let *other* tools speak the ref ABI via the same `ToolCx.clipboard` cell. **No
-Task machinery — all synchronous, all settled when the call returns.**
+Promise machinery — all synchronous, all settled when the call returns.**
 
 Producers (write into a register, return a digest + handle, not the content):
 
@@ -159,26 +159,25 @@ The only addition over Stage 1 is a `kind` tag on the ref
 mismatch. **That tag is the "typed" in "typed ref"** — the ref is typed, and
 tools declare which kinds each param accepts.
 
-### Stage 3 — pending refs = Task (only now does Task appear)
+### Stage 3 — Promises (only now does async appear)
 
-Not built; extracted to
+MVP built; extracted to
 [`backlog-tool-chaining-stage-3.md`](./backlog-tool-chaining-stage-3.md). In
-brief: when a harness-local producer is async (first candidate: background
-`shell_run`), its output register can't settle within the turn — that pending
-register *is* the Task (`RegisterState::Pending { task_id, kind }`), and the
-resolver gains a `Pending` arm rather than a new subsystem. This layer must not
-call daemon orchestration (`bro_exec`/`bro_resume`) or depend on daemon runtime.
+brief: when a harness-local producer is async, `shell_run(mode="promise")`
+returns a `promise_id`. The model can inspect, wait, join, race, cancel, list, or
+wake via `promise_*` tools. This layer must not call daemon orchestration
+(`bro_exec`/`bro_resume`) or depend on daemon runtime.
 
 ## Why this is the right shape
 
-- **Chainability ≠ Tasks.** You get the entire "stop context-copy-pasting" win
+- **Chainability ≠ Promises.** You get the entire "stop context-copy-pasting" win
   at Stage 2 with zero lifecycle, zero event loop — just more tools reading and
   writing one shared cell.
-- **Tasks are forward-compatible by construction.** The handle namespace and
-  resolver already admit a `Pending` arm; adding async producers later does not
-  reshape the ABI.
-- **One uniform handle space.** `clip:*` and `task:*` resolve through the same
-  code path; a param documented "accepts a ref" accepts either.
+- **Promises are forward-compatible by construction.** Adding more async
+  built-in producers later does not reshape the settled-ref ABI.
+- **Promise refs can be bridged later.** The `promise:*` prefix remains reserved,
+  but the MVP deliberately uses explicit lifecycle tools instead of pretending
+  every ref consumer already accepts pending output.
 
 ## Recommended build order
 
@@ -186,12 +185,13 @@ call daemon orchestration (`bro_exec`/`bro_resume`) or depend on daemon runtime.
 2. **Stage 2** — add `kind` to `Register`; add `stdout_to` to `shell_run` and
    `into` to `file_read`; add `from`/`stdin_from` consumers. This delivers
    tool→tool chaining.
-3. **Stage 3** — defer until a harness-local async producer, starting with
-   background shell, actually exists.
+3. **Stage 3** — add a harness-local Promise producer. The first is now
+   `shell_run(mode="promise")`.
 
 ## Non-goals
 
-- Building Task/async infrastructure ahead of an async producer that needs it.
+- Wrapping every tool in Promise machinery. Only selected built-ins should be
+  promise-shaped.
 - A general dataflow DSL. The model wires refs one tool call at a time; the
   harness does not plan or optimize a graph.
 - Refs as a cross-session or cross-bro IPC channel. Refs are session-scoped,

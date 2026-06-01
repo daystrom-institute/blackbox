@@ -1,60 +1,62 @@
 ---
-title: "bro-harness tool chaining — Stage 3 (pending refs = Task)"
+title: "bro-harness tool chaining — Stage 3 (pending refs = Promise)"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
   - surfaces
-brief: "The async arm of the ref ABI: when a producer cannot settle its output register within the turn, that pending register IS the Task. The ref resolver gains a Pending arm rather than a new subsystem. Gated on a harness-local async producer, starting with background shell, actually existing to need it."
+brief: "The async arm of the ref ABI: when a producer cannot settle within the turn, the harness returns a Promise handle. MVP is harness-local shell_run(mode=\"promise\") plus promise_* lifecycle tools and hidden wake events."
 ---
 
-# bro-harness tool chaining — Stage 3 (pending refs = Task)
+# bro-harness tool chaining — Stage 3 (pending refs = Promise)
 
 > **Provenance.** Extracted from [`bro-harness-tool-chaining.md`](./bro-harness-tool-chaining.md)
 > (Stages 1–2 are built; this is the deferred async arm).
 
 ## Status / gate
 
-**Not built, intentionally.** Stages 1–2 (settled refs: the clipboard, plus
-`kind`-tagged producers/consumers) deliver the entire "stop context-copy-pasting"
-win with zero async machinery. Stage 3 enters **only once a harness-local async
-producer exists** — first candidate: background `shell_run` output that cannot
-settle within the current turn. Do not build Task/async infrastructure ahead of a
-producer that needs it (non-goal carried from the parent doc).
+**MVP built.** Stages 1–2 (settled refs: the clipboard, plus `kind`-tagged
+producers/consumers) deliver the "stop context-copy-pasting" win with zero async
+machinery. Stage 3 now has the first harness-local async producer:
+`shell_run(mode="promise")`, backed by a same-dispatch Promise table and
+`promise_status` / `promise_wait` / `promise_when_all` / `promise_when_any` /
+`promise_cancel` / `promise_list` / `promise_wake`.
 
 `bro_exec`, `bro_resume`, daemon MCP/RPC calls, or daemon-owned orchestration are
-not Task producers for this layer. bro-harness may share code with the daemon,
-but the Task/ref implementation must remain usable with the daemon stopped.
+not Promise producers for this layer. bro-harness may share code with the daemon,
+but the Promise/ref implementation must remain usable with the daemon stopped.
 
 ## The shape
 
-A pending register *is* the Task:
+A pending handle is a Promise:
 
 ```rust
-enum RegisterState {
-    Settled(Register),
-    Pending { task_id: String, kind: RefKind },
+enum PromiseState {
+    Running,
+    Completed { result: Value },
+    Failed { error: String },
+    Cancelled { result: Value },
 }
 ```
 
-A consumer of `task:abc.output` either blocks until the ref settles, or returns a
-typed "pending" result so the model can poll or cancel the Task explicitly. So
-Stage 3 is not a broad background framework; it is the ref resolver gaining a
-`Pending` arm plus the smallest harness-owned Task table needed by the async
-producer.
+A consumer either waits for the Promise to settle (`promise_wait`), joins/races
+several (`promise_when_all` / `promise_when_any`), polls (`promise_status`), or
+registers a wake (`promise_wake`). Stage 3 is not a broad background framework;
+it is the smallest harness-owned Promise table needed by selected async
+producers.
 
-**Durability.** The first implementation should keep Tasks process-local and
+**Durability.** The MVP keeps Promises process-local and
 same-dispatch, matching today's live `shell_run` sessions. Session-durable
 pending refs are a later opt-in only if a harness-owned producer can be safely
 re-bound on resume without depending on the daemon.
 
 ## Acceptance
 
-- A harness-local async producer deposits a `Pending` register; a consumer can
-  poll/block to settlement or cancel the Task explicitly.
-- `clip:*` and `task:*` resolve through the same code path; a param documented
-  "accepts a ref" accepts either.
+- A harness-local async producer returns a `promise_id`; a consumer can
+  poll/block to settlement or cancel the Promise explicitly.
+- `promise_wake` injects a hidden `[HARNESS_EVENT promise_<state>]` user turn at
+  a safe boundary with a next step to inspect status.
 - The MVP has no daemon runtime dependency and no `bro_exec`/`bro_resume`
   producer path.
 

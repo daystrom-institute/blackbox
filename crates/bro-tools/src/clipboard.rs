@@ -10,8 +10,8 @@
 //! This is the **settled-ref layer** (Stage 1) of the broader ref ABI: the same
 //! [`Registers`] cell is the substrate other tools read/write for general
 //! tool→tool chaining (Stage 2 — see `file_read{into}`, `file_write{from}`,
-//! `shell_run{stdout_to,stdin_from}`). A `Task` would be the *pending*-ref
-//! specialization (Stage 3, not built). See
+//! `shell_run{stdout_to,stdin_from}`). A `Promise` is the async/pending
+//! specialization for selected built-ins. See
 //! `design/bro-harness/bro-harness-{clipboard,tool-chaining}.md`.
 //!
 //! The store rides the session `side` cell exactly like `todos`/`nudges`, so it
@@ -157,9 +157,9 @@ pub struct Registers {
 /// Canonicalize a register handle. A bare name (`"@"`, `"a"`) and its
 /// `clip:`-prefixed form (`"clip:@"`, `"clip:a"`) address the same register, so
 /// the model can use either spelling in any `register`/`into`/`from`/`stdout_to`
-/// param. Other prefixes are left intact — notably `task:`, reserved for the
-/// pending-ref (async Task) arm of the ref ABI, so those route differently when
-/// Stage 3 lands rather than silently aliasing a clipboard register.
+/// param. Other prefixes are left intact — notably `promise:`, reserved for the
+/// async Promise arm of the ref ABI, so those route differently rather than
+/// silently aliasing a clipboard register.
 pub fn normalize_register(raw: &str) -> &str {
     raw.strip_prefix("clip:").unwrap_or(raw)
 }
@@ -1145,8 +1145,8 @@ mod tests {
     fn clip_prefix_aliases_bare_register() {
         assert_eq!(normalize_register("clip:x"), "x");
         assert_eq!(normalize_register("clip:@"), "@");
-        // task: is reserved for pending refs — left literal, never aliased.
-        assert_eq!(normalize_register("task:abc"), "task:abc");
+        // promise: is reserved for pending refs — left literal, never aliased.
+        assert_eq!(normalize_register("promise:abc"), "promise:abc");
         assert_eq!(normalize_register("a"), "a");
 
         let mut regs = Registers::default();
@@ -1179,6 +1179,7 @@ mod tool_tests {
             http: reqwest::Client::new(),
             todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
+            promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
             clipboard: Arc::new(Mutex::new(Registers::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
         }
