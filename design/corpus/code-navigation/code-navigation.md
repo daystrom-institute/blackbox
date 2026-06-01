@@ -22,6 +22,7 @@ symbolic lookup and syntax-grounded exploration surfaces.
 - [Code Navigation And Symbolic Exploration - Implementation Skeleton](code-nav-symbolic-exploration-impl.md)
 - [Code Navigation Depth - Axis 1 (Symbol Resolution)](code-nav-depth-axis1.md)
 - [Language/Depth-Aware Chunker Symbol Emission](code-nav-chunker-symbol-emission.md)
+- [Semantic UI Component Locator](semantic-ui-component-locator.md)
 
 ## Crosscuts
 
