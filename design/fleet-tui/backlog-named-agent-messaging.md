@@ -221,11 +221,19 @@ Tool behavior:
 5. Return a compact receipt to the sender; do not block on target delivery.
 
 Add `fleet_send_message` to `DEFAULT_FLEET_PIN_TOOLS` so Brodex/GLM/DeepSeek
-fleet agents see it in their hot tool surface. Claude Code does **not** execute
-`bro-tools` builtins directly in the current architecture; its row can still be
-addressable as a recipient, but making Claude a sender likely requires a small
-fleet MCP/stdout wrapper or moving this tool behind an MCP surface. Track that as
-an explicit provider-coverage follow-up, not an implicit promise.
+fleet agents see it in their hot tool surface. These are the only providers the
+cockpit surfaces (see `FLEET_PROVIDERS` in `src/fleet_tui.rs`).
+
+> **Decision (operator, 2026-06-01): Claude is out of fleet entirely.** Claude
+> Code does **not** execute `bro-tools` builtins directly, so a Claude row could
+> only ever be a recipient, never a sender — a half-citizen in the mailbox model
+> that would need a bespoke MCP/stdout wrapper to fit. Rather than carry that
+> awkwardness, Claude was removed from the fleet provider picker
+> (`FLEET_PROVIDERS`) and from the classifier default
+> (`ClassifierConfig::provider_resolved`, which now defaults to GLM). Claude
+> remains a first-class provider everywhere else (`bro_exec`, orchestration); it
+> is simply not a fleet-cockpit participant. This design therefore assumes a
+> Brodex/GLM/DeepSeek roster only — no recipient-only Claude path.
 
 A read-only `fleet_roster` tool is optional but useful:
 
@@ -353,10 +361,13 @@ Single-agent view additions:
 2. **Operator-delegated semantics:** is a sender's `operator_delegated_claim`
    useful enough, or should peer messages never mention delegation unless the TUI
    directly observed a `/tell` command?
-3. **Tool visibility for Claude Code:** if Claude fleet sessions do not consume
+3. **Tool visibility for Claude Code:** ~~if Claude fleet sessions do not consume
    `bro-tools` builtins the same way Brodex-family sessions do, do we need a tiny
    MCP stdio wrapper for `fleet_send_message`, or is recipient-only support enough
-   until the harness path is universal?
+   until the harness path is universal?~~ **Resolved (2026-06-01):** Claude is no
+   longer a fleet participant (see §5 decision note), so no wrapper is needed and
+   there is no recipient-only Claude path to support. Revisit only if Claude is
+   ever re-added to `FLEET_PROVIDERS`.
 4. **Delivery while target is active:** current harness behavior queues mid-turn
    user inputs at the next model-call boundary, not necessarily only after the
    entire turn. That is usually desirable for urgent handoffs, but if peer mail

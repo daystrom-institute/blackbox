@@ -169,6 +169,19 @@ impl Emitter {
         }));
     }
 
+    /// Diagnostic marker emitted immediately before a terminal `result` when the
+    /// turn is ending with outstanding async work or other suspicious state. The
+    /// daemon ignores unknown `system` subtypes; fleet transcripts can retain it
+    /// as evidence for premature turn-end investigations.
+    pub fn turn_end_diagnostics(&self, metadata: Value) {
+        self.write_line(json!({
+            "type": "system",
+            "subtype": "turn_end_diagnostics",
+            "session_id": self.session_id,
+            "turn_end": metadata,
+        }));
+    }
+
     /// Terminal `result` event with usage/turns/cost.
     pub fn result(&self, text: &str, usage: &Usage, num_turns: u64, cost_usd: Option<f64>) {
         // Emit the Anthropic-native usage shape (fresh `input_tokens` plus

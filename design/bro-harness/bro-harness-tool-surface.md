@@ -54,7 +54,7 @@ in `builtin_tools()` and how each tool's arg surface should look.
 | `content_search` | `pattern (regex), path?, glob?, max_results?=200 (cap 5000)` | gitignore-aware; returns `relpath:line:text`. ~~No output_mode / context-lines / count~~ **[shipped]** now takes `mode` (content/files/count), `context_lines`, `case_insensitive`. |
 | `glob` | `pattern, path?` | gitignore-aware; **mtime sort by default** (`GlobSort::Mtime`), `name` opt-in; cap 2000. |
 | `shell_run` (+ `shell_poll`/`shell_kill`/`shell_list`) | `command, cwd?` | `bash -lc`; `SafetyPolicy::deny_command` gate. ~~No timeout / background / stdin / session~~ **[shipped]** — the full quartet now exists (Codex yield-poll: `timeout_ms`, `yield_time_ms`, `max_output_tokens`, `stdin`, `close_stdin`, `env`, session cap). `shell_run(mode="promise")` starts async and returns a `promise_id`. |
-| `promise_*` | `promise_id` / `promise_ids` | **[shipped]** same-dispatch lifecycle for async built-ins: `promise_status`, `promise_wait`, `promise_when_all`, `promise_when_any`, `promise_cancel`, `promise_list`, `promise_wake`. |
+| `promise_*` | `promise_id` / `promise_ids` | **[shipped]** same-dispatch lifecycle for async built-ins: `promise_status`, `promise_wait`, `promise_when_all`, `promise_when_any`, `promise_cancel`, `promise_list`; terminal promises automatically inject a hidden `HARNESS_EVENT` turn at a safe boundary. |
 | `todo_write` | `todos[]` | **[shipped]** durable across `exec → resume` via the `side` cell. |
 | `clip_*` (×9) | (see `clipboard.rs`) | **[shipped]** register store: `clip_yank/set/paste/list/peek/clear` + `clip_transform`/`clip_slice`/`clip_grep`. |
 | `git_status/log/diff` | — | `log` = `--oneline -20`. |

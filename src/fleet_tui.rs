@@ -214,17 +214,21 @@ fn fleet_state_from_snapshot(
 }
 
 /// Providers offered in the cockpit's provider selector. Deliberately narrower
-/// than `Provider::ALL`: only the bidi/steerable set (Claude + the bro-harness
-/// providers) is surfaced here, since they're the providers fleet drives well
-/// (persistent sessions, `--mcp-config` injection). One-shot/under-supported
-/// providers (Codex, Gemini, Vibe, Inception, Copilot) are hidden from the list;
-/// they remain dispatchable elsewhere, just not pickable in the cockpit.
-const FLEET_PROVIDERS: &[Provider] = &[
-    Provider::Claude,
-    Provider::Glm,
-    Provider::Deepseek,
-    Provider::Brodex,
-];
+/// than `Provider::ALL`: only the bidi/steerable bro-harness providers are
+/// surfaced here, since they're the ones fleet drives well (persistent sessions,
+/// `--mcp-config` injection, and — crucially for the named-agent peer mailbox —
+/// they execute `bro-tools` builtins like `fleet_send_message`).
+///
+/// Claude is intentionally excluded despite being bidi/steerable: the Claude
+/// Code CLI doesn't execute `bro-tools` builtins, so a Claude row can't
+/// participate in the fleet peer-mail surface as a sender and would need a
+/// bespoke MCP wrapper to fit. Rather than carry a half-citizen in the cockpit,
+/// Claude stays out of the fleet picker (and classifier default — see
+/// `ClassifierConfig::provider_resolved`). It remains a first-class provider
+/// dispatchable everywhere else (bro_exec, orchestration). One-shot/under-
+/// supported providers (Codex, Gemini, Vibe, Inception, Copilot) are likewise
+/// hidden; they remain dispatchable elsewhere, just not pickable in the cockpit.
+const FLEET_PROVIDERS: &[Provider] = &[Provider::Glm, Provider::Deepseek, Provider::Brodex];
 const DEFAULT_FLEET_PROVIDER: Provider = Provider::Brodex;
 
 // ── Zoom axis (§5.1) ──────────────────────────────────────────────────────
@@ -316,6 +320,9 @@ struct App {
     launch_cwd: Option<String>,
 
     input: String,
+    /// Cursor position within `input` (0..=input.len()) for text editing
+    /// with arrow keys, word-jump, Home/End.
+    cursor_pos: usize,
     /// Single-agent input-history recall cursor (§5.3); None = live edit.
     history_cursor: Option<usize>,
     /// When set, the composer is renaming this agent (Ctrl+R from the roster);
@@ -397,6 +404,7 @@ impl App {
             collapsed: HashSet::new(),
             launch_cwd,
             input: String::new(),
+            cursor_pos: 0,
             history_cursor: None,
             rename_target: None,
             scroll_from_bottom: 0,
@@ -479,6 +487,16 @@ impl App {
 
     fn dispatch_current_input(&mut self) {
         dispatch_current_input_for_mode(self, DispatchMode::Fleet)
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor_pos = 0;
+    }
+
+    fn set_input(&mut self, text: String) {
+        self.input = text;
+        self.cursor_pos = self.input.len();
     }
 }
 
@@ -569,7 +587,7 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
-    app.input.clear();
+    app.clear_input();
     // Persist so the session is recoverable even before it terminates.
     app.orch.persist();
     app.set_status(
@@ -625,7 +643,7 @@ fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: String) {
     });
     app.focused_agent_id = Some(id.clone());
     app.zone = Zone::SingleAgent;
-    app.input.clear();
+    app.clear_input();
     app.history_cursor = None;
     app.scroll_from_bottom = 0;
     app.orch.persist();
@@ -1018,7 +1036,7 @@ fn complete_slash(app: &mut App) {
         return;
     }
     let name = cmds[app.slash_cursor.min(cmds.len() - 1)].name;
-    app.input = format!("{name} ");
+    app.set_input(format!("{name} "));
     app.slash_cursor = 0;
 }
 
@@ -1092,7 +1110,7 @@ pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
     app.zone = Zone::SingleAgent;
     app.focused_agent_id = None;
     if let Some(prompt) = launch.prompt {
-        app.input = prompt;
+        app.set_input(prompt);
         launch_standalone_current_input(&mut app);
     }
 
@@ -1288,13 +1306,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let in_history_mode = app.zone == Zone::SingleAgent && app.history_cursor.is_some();
     let nav = app.input.is_empty() || in_history_mode;
     let zoom = app.input.is_empty();
+    let editing = !app.input.is_empty();
 
     match key.code {
         // Esc cancels a pending rename, else interrupts the running turn in the
         // single-agent view (§1.1), else quits. Ctrl+Q/Ctrl+C always quit.
         KeyCode::Esc if app.rename_target.is_some() => {
             app.rename_target = None;
-            app.input.clear();
+            app.clear_input();
         }
         KeyCode::Esc if app.zone == Zone::SingleAgent => interrupt_selected(app),
         KeyCode::Esc => app.quit = true,
@@ -1303,6 +1322,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up if slash => slash_move(app, -1),
         KeyCode::Down if slash => slash_move(app, 1),
 
+        // ── Text-editing cursor movement (when input is non-empty) ──
+        // These sit above navigation so arrow keys edit text when present.
+        KeyCode::Left if editing && ctrl => move_cursor_word_left(app),
+        KeyCode::Right if editing && ctrl => move_cursor_word_right(app),
+        KeyCode::Left if editing => move_cursor_left(app),
+        KeyCode::Right if editing => move_cursor_right(app),
+        KeyCode::Home if editing => app.cursor_pos = 0,
+        KeyCode::End if editing => app.cursor_pos = app.input.len(),
+
+        // ── Navigation (only when composer is empty) ──
         KeyCode::Left if zoom => zoom_left(app),
         KeyCode::Right if zoom => zoom_right(app),
         KeyCode::Up if nav => vertical(app, -1),
@@ -1321,8 +1350,14 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Home if app.zone == Zone::SingleAgent => app.scroll_from_bottom = usize::MAX / 2,
         KeyCode::End if app.zone == Zone::SingleAgent => app.scroll_from_bottom = 0,
 
-        KeyCode::Enter if shift || ctrl => app.input.push('\n'),
-        KeyCode::Char('j') if ctrl => app.input.push('\n'),
+        KeyCode::Enter if shift || ctrl => {
+            app.input.push('\n');
+            app.cursor_pos = app.input.len();
+        }
+        KeyCode::Char('j') if ctrl => {
+            app.input.push('\n');
+            app.cursor_pos = app.input.len();
+        }
         // Enter/Space in sub-selectors: commit selection and jump home to roster.
         KeyCode::Enter | KeyCode::Char(' ')
             if matches!(
@@ -1339,7 +1374,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('w') if ctrl => delete_previous_word(app),
 
         KeyCode::Backspace => {
-            app.input.pop();
+            if app.cursor_pos > 0 {
+                app.cursor_pos -= 1;
+                app.input.remove(app.cursor_pos);
+            }
             app.slash_cursor = 0;
             if app.input.is_empty() {
                 app.history_cursor = None;
@@ -1348,7 +1386,8 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Typing exits history-recall mode (you're now editing the line) and
         // resets the slash selection to the top match.
         KeyCode::Char(c) => {
-            app.input.push(c);
+            app.input.insert(app.cursor_pos, c);
+            app.cursor_pos += c.len_utf8();
             app.history_cursor = None;
             app.slash_cursor = 0;
         }
@@ -1358,7 +1397,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
 }
 
 fn delete_previous_word(app: &mut App) {
+    let old_len = app.input.len();
     delete_previous_word_text(&mut app.input);
+    let removed = old_len - app.input.len();
+    app.cursor_pos = app.cursor_pos.saturating_sub(removed);
     app.slash_cursor = 0;
     if app.input.is_empty() {
         app.history_cursor = None;
@@ -1436,7 +1478,7 @@ fn start_rename(app: &mut App) {
         return;
     };
     app.rename_target = Some(idx);
-    app.input.clear();
+    app.clear_input();
     app.set_status("rename: edit + Enter (Esc cancels)", Duration::from_secs(4));
 }
 
@@ -1448,7 +1490,7 @@ fn submit(app: &mut App) {
         if !new.is_empty() {
             app.agents[idx].name = truncate(new, NAME_LEN);
         }
-        app.input.clear();
+        app.clear_input();
         return;
     }
     if app.input.trim().is_empty() {
@@ -1469,7 +1511,7 @@ fn submit(app: &mut App) {
                         app.agents[idx].name = truncate(&name, NAME_LEN);
                     }
                 }
-                app.input.clear();
+                app.clear_input();
                 app.set_status("renamed", Duration::from_secs(2));
             } else if app.mode.is_standalone() && app.agents.is_empty() {
                 launch_standalone_current_input(app);
@@ -1524,7 +1566,7 @@ fn clear_standalone(app: &mut App) {
     app.agents.clear();
     app.focused_agent_id = None;
     app.mode.set_pending_resume(None);
-    app.input.clear();
+    app.clear_input();
     app.history_cursor = None;
     app.scroll_from_bottom = 0;
     app.orch.persist();
@@ -1538,7 +1580,7 @@ fn resume_standalone(app: &mut App, arg: &str) {
     let arg = arg.trim();
     if arg.is_empty() {
         app.set_status("usage: /resume <session_id> [turn]", Duration::from_secs(4));
-        app.input.clear();
+        app.clear_input();
         return;
     }
     let (session_id, prompt) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
@@ -1547,14 +1589,14 @@ fn resume_standalone(app: &mut App, arg: &str) {
         forget_standalone_agents(app, true);
         app.agents.clear();
         app.focused_agent_id = None;
-        app.input.clear();
+        app.clear_input();
         app.history_cursor = None;
         app.set_status(
             format!("resume target set: {session_id}; type a turn to open it"),
             Duration::from_secs(5),
         );
     } else {
-        app.input = prompt.trim().to_string();
+        app.set_input(prompt.trim().to_string());
         launch_standalone_current_input(app);
     }
 }
@@ -1608,7 +1650,7 @@ fn select_model(app: &mut App, arg: &str) {
             app.set_status(format!("next model → {selected}"), Duration::from_secs(3));
         }
     }
-    app.input.clear();
+    app.clear_input();
 }
 
 fn select_effort(app: &mut App, arg: &str) {
@@ -1649,7 +1691,7 @@ fn select_effort(app: &mut App, arg: &str) {
             app.set_status(format!("next effort → {selected}"), Duration::from_secs(3));
         }
     }
-    app.input.clear();
+    app.clear_input();
 }
 
 /// Send the composer text into the focused agent. A live session takes it as a
@@ -1666,6 +1708,7 @@ fn steer_selected(app: &mut App) {
         let transcript = app.agents[idx].task.transcript();
         let _ = queued_user_turns(&mut app.agents[idx], &transcript);
         let text = std::mem::take(&mut app.input);
+        app.cursor_pos = 0;
         app.history_cursor = None;
         match run_agent_write(app, handle.send_user_turn(&text)) {
             Ok(()) => {
@@ -1674,7 +1717,7 @@ fn steer_selected(app: &mut App) {
                 app.set_status("steer queued to stdin", Duration::from_secs(2));
             }
             Err(e) => {
-                app.input = text;
+                app.set_input(text);
                 if is_broken_pipe_error(&e) {
                     app.agents[idx].task = handle.without_stdin();
                     if provider_supports_bidi(provider) {
@@ -1710,6 +1753,7 @@ fn resume_selected(app: &mut App, idx: usize) {
         return;
     }
     let text = std::mem::take(&mut app.input);
+    app.cursor_pos = 0;
     app.history_cursor = None;
     let old_id = app.agents[idx].task.id();
 
@@ -1966,7 +2010,7 @@ fn recall_history(app: &mut App, delta: isize) {
         Some(c) => Some(c + 1),
     };
     app.history_cursor = new_cursor;
-    app.input = new_cursor.map(|c| hist[c].clone()).unwrap_or_default();
+    app.set_input(new_cursor.map(|c| hist[c].clone()).unwrap_or_default());
 }
 
 // ── Drawing ──────────────────────────────────────────────────────────────────
@@ -2235,20 +2279,17 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         .unwrap_or_else(|| "fleet".to_string());
 
     let mut spans = vec![
-        Span::styled(format!(" [{project}] "), byline),
+        Span::styled(format!(" {project} "), byline),
         Span::styled("──", dim),
-        Span::styled(format!(" [{} agents] ", views.len()), byline),
+        Span::styled(format!(" {} agents ", views.len()), byline),
         Span::styled("──", dim),
-        Span::styled(format!(" [{active} active] "), byline),
+        Span::styled(format!(" {active} active "), byline),
         Span::styled("-", dim),
-        Span::styled(format!(" [{waiting} waiting] "), byline),
+        Span::styled(format!(" {waiting} waiting "), byline),
     ];
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(
-            format!(" [{}] ", truncate(status, 70)),
-            byline,
-        ));
+        spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
     }
     spans
 }
@@ -2292,21 +2333,18 @@ fn single_agent_status_spans(
             .map(path_name)
             .unwrap_or_else(|| "project".to_string());
         let prompt = truncate(initial_prompt(a), 44);
-        spans.push(Span::styled(format!(" [{project}] "), byline));
+        spans.push(Span::styled(format!(" {project} "), byline));
         spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(format!(" [\"{prompt}\"] "), byline));
+        spans.push(Span::styled(format!(" \"{prompt}\" "), byline));
         spans.push(Span::styled("──", dim));
     }
 
-    spans.push(Span::styled(format!(" [{active} active] "), byline));
+    spans.push(Span::styled(format!(" {active} active "), byline));
     spans.push(Span::styled("-", dim));
-    spans.push(Span::styled(format!(" [{waiting} waiting] "), byline));
+    spans.push(Span::styled(format!(" {waiting} waiting "), byline));
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
-        spans.push(Span::styled(
-            format!(" [{}] ", truncate(status, 70)),
-            byline,
-        ));
+        spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
     }
     spans
 }
@@ -2495,10 +2533,7 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], or
         Constraint::Length(7),
         Constraint::Length(7),
     ];
-    let header = Row::new([
-        "", "prov", "agent", "model", "report", "started", "last",
-    ])
-    .style(
+    let header = Row::new(["", "prov", "agent", "model", "report", "started", "last"]).style(
         Style::default()
             .fg(Color::DarkGray)
             .add_modifier(Modifier::BOLD),
@@ -3177,7 +3212,20 @@ fn is_internal_tool(name: &str) -> bool {
 }
 
 fn shell_result_tool(name: Option<&str>) -> bool {
-    matches!(name, Some("shell_run" | "shell_poll" | "shell_kill"))
+    matches!(
+        name,
+        Some(
+            "shell_run"
+                | "shell_poll"
+                | "shell_kill"
+                | "promise_wait"
+                | "promise_status"
+                | "promise_when_all"
+                | "promise_when_any"
+                | "promise_cancel"
+                | "promise_list"
+        )
+    )
 }
 
 fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Line<'static>> {
@@ -3212,6 +3260,15 @@ fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Li
             if is_error { Color::Red } else { Color::Gray },
         );
     };
+    if obj.contains_key("promise_id") && obj.contains_key("state") {
+        return promise_snapshot_block(obj, is_error, max_lines);
+    }
+    if let Some(promises) = obj.get("promises").and_then(|v| v.as_array()) {
+        return promise_many_block("promises", promises, is_error, max_lines);
+    }
+    if let Some(promise) = obj.get("promise").and_then(|v| v.as_object()) {
+        return promise_snapshot_block(promise, is_error, max_lines);
+    }
 
     let exit = obj
         .get("exit_code")
@@ -3277,6 +3334,135 @@ fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Li
         )));
     }
     out
+}
+
+fn promise_many_block(
+    label: &str,
+    promises: &[serde_json::Value],
+    is_error: bool,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let mut out = vec![Line::from(Span::styled(
+        format!("↳ {label}: {}", promises.len()),
+        Style::default().fg(if is_error {
+            Color::Red
+        } else {
+            Color::DarkGray
+        }),
+    ))];
+    for promise in promises.iter().take(max_lines) {
+        if let Some(obj) = promise.as_object() {
+            out.extend(promise_snapshot_block(obj, is_error, max_lines));
+        }
+    }
+    if promises.len() > max_lines {
+        out.push(Line::from(Span::styled(
+            format!("… {} more promises", promises.len() - max_lines),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    out
+}
+
+fn promise_snapshot_block(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    is_error: bool,
+    max_lines: usize,
+) -> Vec<Line<'static>> {
+    let id = obj
+        .get("promise_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let state = obj.get("state").and_then(|v| v.as_str()).unwrap_or("?");
+    let mut head = format!("promise {id} {state}");
+    if let Some(producer) = obj.get("producer").and_then(|v| v.as_str()) {
+        head.push_str(&format!(" producer={producer}"));
+    }
+    if let Some(command) = obj
+        .get("detail")
+        .and_then(|v| v.get("command"))
+        .and_then(|v| v.as_str())
+    {
+        head.push_str(&format!(" cmd: {}", quote_flat_string(command)));
+    }
+
+    let state_color = match state {
+        "failed" => Color::Red,
+        "cancelled" => Color::Yellow,
+        "running" => Color::Yellow,
+        _ if is_error => Color::Red,
+        _ => Color::DarkGray,
+    };
+    let mut out = vec![Line::from(Span::styled(
+        format!("↳ {head}"),
+        Style::default().fg(state_color),
+    ))];
+    if let Some(next_step) = obj.get("next_step").and_then(|v| v.as_str())
+        && !next_step.is_empty()
+    {
+        out.push(Line::from(Span::styled(
+            format!("next: {next_step}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if let Some(error) = obj.get("error").and_then(|v| v.as_str())
+        && !error.is_empty()
+    {
+        out.push(Line::from(Span::styled(
+            format!("error: {error}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    if let Some(result) = obj.get("result").and_then(|v| v.as_object()) {
+        append_shell_like_result(&mut out, result, max_lines);
+    }
+    out
+}
+
+fn append_shell_like_result(
+    out: &mut Vec<Line<'static>>,
+    obj: &serde_json::Map<String, serde_json::Value>,
+    max_lines: usize,
+) {
+    if obj.contains_key("exit_code") || obj.contains_key("stdout") || obj.contains_key("stderr") {
+        let mut head = obj
+            .get("exit_code")
+            .map(|v| {
+                if v.is_null() {
+                    "exit=null".to_string()
+                } else {
+                    format!("exit={}", v)
+                }
+            })
+            .unwrap_or_else(|| "exit=?".to_string());
+        if obj.get("timed_out").and_then(|v| v.as_bool()) == Some(true) {
+            head.push_str(" timed_out");
+        }
+        if obj.get("cancelled").and_then(|v| v.as_bool()) == Some(true) {
+            head.push_str(" cancelled");
+        }
+        out.push(Line::from(Span::styled(
+            format!("result: {head}"),
+            Style::default().fg(Color::DarkGray),
+        )));
+        for (label, color) in [("stdout", Color::Gray), ("stderr", Color::Red)] {
+            if let Some(text) = obj.get(label).and_then(|v| v.as_str())
+                && !text.is_empty()
+            {
+                out.push(Line::from(Span::styled(
+                    format!("{label}:"),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )));
+                out.extend(monospace_block(text, max_lines, color));
+            }
+        }
+        if let Some(register) = obj.get("stdout_register").and_then(|v| v.as_str()) {
+            out.push(Line::from(Span::styled(
+                format!("stdout → {register}"),
+                Style::default().fg(Color::Gray),
+            )));
+        }
+    }
 }
 
 fn render_file_edit_call(name: &str, args: &str, width: usize) -> Option<Vec<Line<'static>>> {
@@ -4131,17 +4317,78 @@ fn bytes_compact(bytes: usize) -> String {
     }
 }
 
-fn composer_display_text(input: &str) -> String {
-    let mut buf = String::with_capacity(input.len() + 1);
-    buf.push_str(input);
+fn composer_display_text(input: &str, cursor_pos: usize) -> String {
+    let pos = cursor_pos.min(input.len());
+    let mut buf = String::with_capacity(input.len() + 4);
+    buf.push_str(&input[..pos]);
     buf.push('▏');
+    buf.push_str(&input[pos..]);
     buf
+}
+
+fn move_cursor_left(app: &mut App) {
+    if app.cursor_pos > 0 {
+        app.cursor_pos -= 1;
+    }
+}
+
+fn move_cursor_right(app: &mut App) {
+    if app.cursor_pos < app.input.len() {
+        app.cursor_pos += 1;
+    }
+}
+
+fn move_cursor_word_left(app: &mut App) {
+    // Skip trailing whitespace, then skip word characters.
+    let mut pos = app.cursor_pos.min(app.input.len());
+    // Skip whitespace before cursor
+    while pos > 0
+        && app.input[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_whitespace())
+    {
+        pos -= 1;
+    }
+    // Skip non-whitespace (the word)
+    while pos > 0
+        && app.input[..pos]
+            .chars()
+            .next_back()
+            .is_some_and(|c| !c.is_whitespace())
+    {
+        pos -= 1;
+    }
+    app.cursor_pos = pos;
+}
+
+fn move_cursor_word_right(app: &mut App) {
+    let mut pos = app.cursor_pos.min(app.input.len());
+    // Skip non-whitespace (current word)
+    while pos < app.input.len()
+        && app.input[pos..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+    {
+        pos += app.input[pos..].chars().next().unwrap().len_utf8();
+    }
+    // Skip whitespace
+    while pos < app.input.len()
+        && app.input[pos..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace())
+    {
+        pos += app.input[pos..].chars().next().unwrap().len_utf8();
+    }
+    app.cursor_pos = pos;
 }
 
 fn composer_height(app: &App, area: Rect) -> u16 {
     let max_height = (area.height / 3).clamp(COMPOSER_HEIGHT, COMPOSER_MAX_HEIGHT);
     let inner_width = area.width.saturating_sub(4).max(1);
-    let wrapped = Paragraph::new(composer_display_text(&app.input))
+    let wrapped = Paragraph::new(composer_display_text(&app.input, app.cursor_pos))
         .wrap(Wrap { trim: false })
         .line_count(inner_width)
         .min(u16::MAX as usize) as u16;
@@ -4188,7 +4435,7 @@ fn draw_composer(
         height: inner.height.saturating_sub(2).max(1),
     };
 
-    let buf = composer_display_text(&app.input);
+    let buf = composer_display_text(&app.input, app.cursor_pos);
     let lines = Paragraph::new(buf.clone())
         .wrap(Wrap { trim: false })
         .line_count(padded.width.max(1));

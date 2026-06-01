@@ -83,7 +83,7 @@ pub struct FleetConfig {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ClassifierConfig {
     /// Provider for the classifier session. Must be bidi-capable (it's steered
-    /// with executor activity each pass). Lowercase name; default `claude`.
+    /// with executor activity each pass). Lowercase name; default `glm`.
     #[serde(default)]
     pub provider: Option<String>,
     /// Model override for the classifier session (cheap models recommended).
@@ -111,8 +111,12 @@ pub struct ClassifierConfig {
 }
 
 impl ClassifierConfig {
-    /// Bidi provider the classifier runs on (default Claude). Non-bidi or
-    /// unknown names collapse to Claude — the classifier MUST be steerable.
+    /// Bidi provider the classifier runs on (default GLM). Non-bidi or unknown
+    /// names — including `claude` — collapse to GLM: the classifier MUST be
+    /// steerable, and Claude is intentionally not a fleet participant (it can't
+    /// execute the `bro-tools` fleet builtins; see `FLEET_PROVIDERS`). GLM is the
+    /// default because it's the cheapest steady-state option for the ~4s
+    /// observation cadence.
     pub fn provider_resolved(&self) -> Provider {
         match self
             .provider
@@ -123,7 +127,7 @@ impl ClassifierConfig {
             Some("glm") => Provider::Glm,
             Some("deepseek") | Some("ds") => Provider::Deepseek,
             Some("brodex") | Some("bdx") => Provider::Brodex,
-            _ => Provider::Claude,
+            _ => Provider::Glm,
         }
     }
 
@@ -1614,10 +1618,11 @@ mod tests {
     }
 
     #[test]
-    fn classifier_provider_defaults_to_claude_and_stays_bidi() {
-        // Unknown / non-bidi names collapse to Claude — the classifier must be
-        // steerable, so it can never resolve to a one-shot provider.
-        for name in [None, Some("codex"), Some("gemini"), Some("nonsense")] {
+    fn classifier_provider_defaults_to_glm_and_stays_bidi() {
+        // Unknown / non-bidi names — and `claude`, which is no longer a fleet
+        // participant — collapse to GLM. The classifier must stay steerable, so
+        // it can never resolve to a one-shot (or non-fleet) provider.
+        for name in [None, Some("claude"), Some("codex"), Some("gemini"), Some("nonsense")] {
             let c = ClassifierConfig {
                 provider: name.map(str::to_string),
                 model: None,
@@ -1627,6 +1632,7 @@ mod tests {
                 auto_send: None,
                 min_activity: None,
             };
+            assert_eq!(c.provider_resolved(), Provider::Glm);
             assert!(provider_supports_bidi(c.provider_resolved()));
         }
     }

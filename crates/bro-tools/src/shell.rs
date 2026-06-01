@@ -102,6 +102,18 @@ pub struct ShellSessions {
 }
 
 impl ShellSessions {
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
+    }
+
     /// Insert a retained session, or hand it back (boxed; the session is large)
     /// if at the live cap so the caller can kill it and surface an error.
     fn insert(&mut self, s: ShellSession) -> Result<String, Box<ShellSession>> {
@@ -463,7 +475,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. Set mode=\"promise\" to start immediately and return a promise_id; then use promise_status/wait/when_all/when_any/cancel/wake. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. Set mode=\"promise\" to start immediately and return a promise_id; then use promise_status/wait/when_all/when_any/cancel. Promise completion automatically injects a hidden HARNESS_EVENT turn at a safe boundary. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -579,7 +591,7 @@ impl Tool for ShellRun {
                 "promise_id": promise_id,
                 "state": "running",
                 "running": true,
-                "next_step": format!("Use promise_status or promise_wait with promise_id={promise_id}; optionally promise_wake to be notified when it settles."),
+                "next_step": format!("Use promise_status or promise_wait with promise_id={promise_id}; completion automatically injects a hidden HARNESS_EVENT turn when it settles."),
             }));
         }
 
@@ -948,7 +960,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promise_wake_drains_hidden_event_after_completion() {
+    async fn promise_completion_drains_hidden_event_after_completion() {
         let c = cx();
         let v = as_json(
             ShellRun
@@ -956,12 +968,6 @@ mod tests {
                 .await,
         );
         let pid = v["promise_id"].as_str().unwrap().to_string();
-        let wake = as_json(
-            crate::promise::PromiseWake
-                .call(json!({"promise_id": pid, "message": "check shell"}), &c)
-                .await,
-        );
-        assert_eq!(wake["wake_registered"], true, "{wake}");
 
         let waited = as_json(
             crate::promise::PromiseWait
@@ -969,11 +975,19 @@ mod tests {
                 .await,
         );
         assert_eq!(waited["state"], "completed", "{waited}");
-        let events = c.promises.lock().unwrap().drain_wake_messages();
+        let events = c.promises.lock().unwrap().drain_completion_events();
         assert_eq!(events.len(), 1, "{events:?}");
         assert!(events[0].contains("[HARNESS_EVENT promise_completed]"));
         assert!(events[0].contains("promise_id:"));
-        assert!(events[0].contains("check shell"));
+        assert!(events[0].contains(&pid));
+        assert!(events[0].contains("call promise_status"));
+        assert!(
+            c.promises
+                .lock()
+                .unwrap()
+                .drain_completion_events()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
