@@ -262,19 +262,76 @@ impl HookEngine {
 struct ShellGrepHook;
 
 impl ShellGrepHook {
-    /// True when the first token of a shell command is a known repo-search tool.
+    /// True when the effective command (after peeling wrappers) is a known
+    /// repo-search tool.
     fn is_manual_search(command: &str) -> bool {
-        // Look past leading env assignments / `time` etc. only minimally: take
-        // the first bare word. Conservative on purpose — false positives are
-        // worse than misses for a nudge.
-        let first = command.split_whitespace().next().unwrap_or("");
-        // Strip a leading path (e.g. /usr/bin/grep) to the basename.
-        let base = first.rsplit('/').next().unwrap_or(first);
+        let base = effective_command_basename(command).unwrap_or("");
         matches!(
             base,
             "grep" | "rg" | "egrep" | "fgrep" | "ag" | "ack" | "find"
         )
     }
+}
+
+/// Operator command-proxy wrappers that this host requires in front of every
+/// shell command (see `dispatch_extra_path_entries` in the daemon's
+/// `providers::exec_args`). A wrapper doesn't change which underlying tool runs,
+/// so first-token matchers must peel it off — otherwise `rtk grep foo` hides the
+/// `grep` and the nudge never fires.
+const COMMAND_PROXY_WRAPPERS: &[&str] = &["rtk"];
+
+/// Leading no-op prefixes that delegate to the command that follows them,
+/// without consuming flag arguments of their own. Conservative on purpose:
+/// prefixes like `nice`/`nohup`/`env -i` take options that would make naive
+/// peeling wrong, so they're deliberately excluded.
+const PASSTHROUGH_PREFIXES: &[&str] = &["time", "command", "exec"];
+
+/// Basename of a token, stripping any leading path (`/usr/bin/grep` → `grep`).
+fn token_basename(tok: &str) -> &str {
+    tok.rsplit('/').next().unwrap_or(tok)
+}
+
+/// `VAR=value` shell env assignment that precedes the actual command word.
+fn is_env_assignment(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) if !name.is_empty() => name
+            .chars()
+            .enumerate()
+            .all(|(i, c)| c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())),
+        _ => false,
+    }
+}
+
+/// Basename of the *effective* command after peeling shell prefixes that don't
+/// change which tool runs: leading `VAR=val` env assignments, passthrough
+/// prefixes (`time`/`command`/`exec`), and operator proxy wrappers (`rtk`, and
+/// the `rtk proxy <cmd>` escape-hatch form). Returns `None` for an empty or
+/// fully-consumed command. Conservative — anything unrecognized stops peeling,
+/// since a false-positive nudge is worse than a miss.
+fn effective_command_basename(command: &str) -> Option<&str> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let mut i = 0;
+    while let Some(&tok) = tokens.get(i) {
+        if is_env_assignment(tok) {
+            i += 1;
+            continue;
+        }
+        let base = token_basename(tok);
+        if PASSTHROUGH_PREFIXES.contains(&base) {
+            i += 1;
+            continue;
+        }
+        if COMMAND_PROXY_WRAPPERS.contains(&base) {
+            i += 1;
+            // `rtk proxy <cmd>` runs <cmd> raw; skip the `proxy` subcommand too.
+            if tokens.get(i).map(|t| token_basename(t)) == Some("proxy") {
+                i += 1;
+            }
+            continue;
+        }
+        return Some(base);
+    }
+    None
 }
 
 impl Hook for ShellGrepHook {
@@ -596,6 +653,13 @@ mod tests {
             "rg foo",
             "find . -name '*.rs'",
             "/usr/bin/grep x",
+            // proxy-wrapped forms still fire (host prefixes commands with rtk)
+            "rtk grep -r foo .",
+            "rtk rg foo",
+            "rtk proxy grep x",
+            // peel env assignments / passthrough prefixes too
+            "RUST_LOG=debug rtk rg foo",
+            "time grep foo",
         ] {
             assert_eq!(
                 h.on_tool_result(&shell_call(cmd), &ok_result()).len(),
@@ -603,7 +667,15 @@ mod tests {
                 "{cmd}"
             );
         }
-        for cmd in ["cargo build", "ls -la", "echo grep"] {
+        for cmd in [
+            "cargo build",
+            "ls -la",
+            "echo grep",
+            // wrappers in front of a non-search command must NOT fire
+            "rtk cargo build",
+            "rtk proxy bash -lc 'sed -n 1,5p f'",
+            "rtk",
+        ] {
             assert!(
                 h.on_tool_result(&shell_call(cmd), &ok_result()).is_empty(),
                 "{cmd}"
