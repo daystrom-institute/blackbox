@@ -614,4 +614,18 @@ mod tests {
         assert_eq!(blocks[2].tool_name, "file_read");
         assert_eq!(blocks[2].tool_json, "{\"path\":\"a\"}");
     }
+
+    #[test]
+    fn fold_sse_maps_end_turn_to_done_without_tooluse() {
+        let mut blocks: Vec<SseBlock> = Vec::new();
+        let mut usage = Usage::default();
+        let mut stop = StopReason::ToolCalls;
+        fold_sse(
+            &json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+            &mut blocks,
+            &mut usage,
+            &mut stop,
+        );
+        assert_eq!(stop, StopReason::Done);
+    }
 }

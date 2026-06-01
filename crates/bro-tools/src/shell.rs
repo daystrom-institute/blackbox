@@ -102,8 +102,16 @@ pub struct ShellSessions {
 }
 
 impl ShellSessions {
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.map.is_empty()
+    }
+
+    pub fn ids(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
     }
 
     /// Insert a retained session, or hand it back (boxed; the session is large)

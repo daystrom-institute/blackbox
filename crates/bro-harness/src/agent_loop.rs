@@ -484,14 +484,17 @@ impl Session {
 
         let mut final_text = String::new();
         let mut turn_steps = 0u64;
+        let mut last_model_stop: Option<StopReason> = None;
+        let mut last_model_tool_call_count = 0usize;
+        let mut last_tool_results: Vec<Value> = Vec::new();
 
-        loop {
+        let break_reason = loop {
             if turn_steps >= self.max_turns {
                 tracing::warn!(max_turns = self.max_turns, "hit max turns; stopping");
-                break;
+                break "max_turns";
             }
             if *cancel.borrow() {
-                break;
+                break "cancelled";
             }
             if let Some(event) = self.promise_completion_event_prompt() {
                 self.push_user_text(&event);
@@ -540,13 +543,17 @@ impl Session {
 
             let out = tokio::select! {
                 biased;
-                _ = cancel.changed() => break,
+                _ = cancel.changed() => {
+                    break "cancelled";
+                }
                 r = self.tx.run_turn(&tool_specs, &opts, &self.emitter) => r?,
             };
             turn_steps += 1;
             self.turns += 1;
             self.total_usage.add(&out.usage);
             self.last_prompt_tokens = out.usage.total_input_tokens();
+            last_model_stop = Some(out.stop.clone());
+            last_model_tool_call_count = out.tool_calls.len();
 
             for n in self.hooks.on_assistant_turn(&out.text, &out.tool_calls) {
                 if n.delivery == Delivery::SystemTail {
@@ -574,13 +581,18 @@ impl Session {
             }
 
             if out.stop != StopReason::ToolCalls || out.tool_calls.is_empty() {
-                break;
+                break if out.stop == StopReason::ToolCalls {
+                    "tool_calls_empty"
+                } else {
+                    "model_stop"
+                };
             }
 
             // Dispatch tool calls, interruptibly. On interrupt mid-dispatch, pad
             // every not-yet-resolved call with an interrupted marker so the
             // assistant(tool_use) message keeps a matching tool_result.
             let mut results: Vec<transport::ToolResult> = Vec::with_capacity(out.tool_calls.len());
+            last_tool_results.clear();
             let mut interrupted = false;
             'dispatch: for tc in &out.tool_calls {
                 tracing::info!(tool = %tc.name, "dispatch");
@@ -610,6 +622,7 @@ impl Session {
                                 Delivery::SystemTail => self.tail_nudge = Some(n.message),
                             }
                         }
+                        last_tool_results.push(tool_result_trace(tc, &result));
                         results.push(result);
                     }
                 }
@@ -623,17 +636,36 @@ impl Session {
                             content: INTERRUPTED_TOOL_RESULT.to_string(),
                             is_error: true,
                         });
+                        last_tool_results.push(json!({
+                            "id": tc.id,
+                            "name": tc.name,
+                            "is_error": true,
+                            "interrupted": true,
+                        }));
                     }
                 }
                 self.emitter.tool_results(&results);
                 self.tx.push_tool_results(results);
-                break;
+                break "interrupted_dispatch";
             }
 
             self.emitter.tool_results(&results);
             self.tx.push_tool_results(results);
             self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
             self.hooks.tick();
+        };
+
+        let turn_end = self.turn_end_diagnostics(
+            break_reason,
+            last_model_stop.as_ref(),
+            last_model_tool_call_count,
+            turn_steps,
+            &last_tool_results,
+        );
+        tracing::info!(turn_end = %turn_end, "turn ending");
+        if turn_end["suspicious"].as_bool().unwrap_or(false) {
+            tracing::warn!(turn_end = %turn_end, "turn ending with outstanding async work");
+            self.emitter.turn_end_diagnostics(turn_end);
         }
 
         self.emitter
@@ -661,6 +693,40 @@ impl Session {
             }
             self.push_user_text(&prompt);
         }
+    }
+
+    fn turn_end_diagnostics(
+        &self,
+        break_reason: &str,
+        last_model_stop: Option<&StopReason>,
+        last_model_tool_call_count: usize,
+        turn_steps: u64,
+        last_tool_results: &[Value],
+    ) -> Value {
+        let shell_ids = self.cx.shell_sessions.lock().unwrap().ids();
+        let promise_list = self.cx.promises.lock().unwrap().list();
+        let promises = promise_summary(&promise_list);
+        let running_promises = promises["running_count"].as_u64().unwrap_or(0);
+        let last_tool_running = last_tool_results
+            .iter()
+            .any(|v| v["running"].as_bool() == Some(true));
+        let suspicious = !shell_ids.is_empty() || running_promises > 0 || last_tool_running;
+
+        json!({
+            "break_reason": break_reason,
+            "transport": self.tx.name(),
+            "last_model_stop": stop_reason_label(last_model_stop),
+            "last_model_tool_call_count": last_model_tool_call_count,
+            "turn_steps": turn_steps,
+            "harness_turns_total": self.turns,
+            "outstanding_shell_sessions": {
+                "count": shell_ids.len(),
+                "ids": shell_ids,
+            },
+            "promises": promises,
+            "last_tool_results": last_tool_results,
+            "suspicious": suspicious,
+        })
     }
 
     fn promise_notifier(&self) -> Arc<tokio::sync::Notify> {
@@ -736,6 +802,70 @@ impl Session {
             side,
         })
     }
+}
+
+fn stop_reason_label(stop: Option<&StopReason>) -> Value {
+    match stop {
+        Some(StopReason::ToolCalls) => json!("tool_calls"),
+        Some(StopReason::Done) => json!("done"),
+        Some(StopReason::Length) => json!("length"),
+        Some(StopReason::Other(other)) => json!({"other": other}),
+        None => Value::Null,
+    }
+}
+
+fn promise_summary(list: &Value) -> Value {
+    let Some(entries) = list.as_array() else {
+        return json!({
+            "count": 0,
+            "running_count": 0,
+            "running_ids": [],
+            "terminal_count": 0,
+        });
+    };
+    let running_ids: Vec<Value> = entries
+        .iter()
+        .filter(|entry| entry["running"].as_bool() == Some(true))
+        .filter_map(|entry| entry["promise_id"].as_str().map(|id| json!(id)))
+        .collect();
+    json!({
+        "count": entries.len(),
+        "running_count": running_ids.len(),
+        "running_ids": running_ids,
+        "terminal_count": entries.len().saturating_sub(running_ids.len()),
+    })
+}
+
+fn tool_result_trace(call: &transport::ToolCall, result: &transport::ToolResult) -> Value {
+    let parsed = serde_json::from_str::<Value>(&result.content).ok();
+    let mut trace = json!({
+        "id": call.id,
+        "name": call.name,
+        "is_error": result.is_error,
+    });
+
+    if let Some(body) = parsed {
+        if let Some(running) = body["running"].as_bool() {
+            trace["running"] = json!(running);
+        }
+        if let Some(session_id) = body["session_id"].as_str() {
+            trace["session_id"] = json!(session_id);
+        }
+        if let Some(promise_id) = body["promise_id"].as_str() {
+            trace["promise_id"] = json!(promise_id);
+        }
+        if let Some(timed_out) = body["timed_out"].as_bool() {
+            trace["timed_out"] = json!(timed_out);
+        }
+        if body.get("exit_code").is_some() {
+            trace["exit_code"] = body["exit_code"].clone();
+        }
+        if let Some(state) = body["state"].as_str() {
+            trace["state"] = json!(state);
+        }
+    }
+
+    trace
 }
 
 // ---------------------------------------------------------------------------
@@ -1381,6 +1511,44 @@ mod tests {
         assert!(users[0].contains("[HARNESS_EVENT promise_completed]"));
         assert!(users[0].contains(&pid));
         assert!(users[0].contains("call promise_status"));
+    }
+
+    #[test]
+    fn turn_end_diagnostics_flags_running_async_work() {
+        let (session, _shared) = mk_session(vec![]);
+        let (pid, _cancel_rx) = session
+            .cx
+            .promises
+            .lock()
+            .unwrap()
+            .start("shell_run", json!({"command": "cargo test"}));
+
+        let trace = tool_result_trace(
+            &transport::ToolCall {
+                id: "tc-1".into(),
+                name: "shell_run".into(),
+                args: json!({}),
+            },
+            &transport::ToolResult {
+                id: "tc-1".into(),
+                content: json!({
+                    "promise_id": pid,
+                    "state": "running",
+                    "running": true,
+                })
+                .to_string(),
+                is_error: false,
+            },
+        );
+
+        let diag =
+            session.turn_end_diagnostics("model_stop", Some(&StopReason::Done), 0, 1, &[trace]);
+
+        assert_eq!(diag["break_reason"], "model_stop");
+        assert_eq!(diag["last_model_stop"], "done");
+        assert_eq!(diag["promises"]["running_count"], 1);
+        assert_eq!(diag["last_tool_results"][0]["running"], true);
+        assert_eq!(diag["suspicious"], true);
     }
 
     // ---- window-0 diagnostics: full seam (drain edits -> engine -> render -> rider) ----
