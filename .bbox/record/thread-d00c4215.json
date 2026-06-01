@@ -1,0 +1,12 @@
+{
+  "id": "thread-d00c4215",
+  "topic": "Investigate apparent bro fleet managed worktree setup/exit mismatch: session handoff reported isolated worktree path `~/.local/state/blackbox/bro/fleet/worktrees/transcript-search/i-think-for-fleet-tui-we-should-take-24895b4b`, but during closeout the active tool root was `~/repos/transcript-search`, `git worktree list` did not include the reported fleet worktree, and `exit_worktree` failed with `No such file or directory (os error 2)` both with the explicit handoff path and with default current tool root.",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Opened at operator request after Promise/shell consolidation. Evidence: `exit_worktree` could not find the reported managed worktree; `rtk pwd` and `git rev-parse --show-toplevel` showed the main repo, not the fleet worktree. Related user-visible symptom: apparent worktree setup failure with bro fleet.",
+    "Resolved for now at operator request. Current assessment: the observed symptom was likely stale fleet worktree/task metadata after the referenced managed worktree was manually cleaned up, not a confirmed setup failure. Another agent is already working on worktree functions; reopen or create a follow-up if fresh evidence appears."
+  ],
+  "created_at": "2026-06-01T06:00:56Z",
+  "resolved_at": "2026-06-01T21:05:22Z"
+}
