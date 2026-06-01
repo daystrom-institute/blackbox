@@ -33,7 +33,11 @@ use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::AsyncBufReadExt as _;
 use tokio::sync::{mpsc, watch};
 
-const DEFAULT_MAX_TOKENS: u32 = 8192;
+// Output ceiling per turn. 32000 mirrors Claude Code's flat `max_tokens` for the
+// Anthropic-compatible endpoints; with server-managed adaptive thinking the
+// reasoning budget is not carved out of this, so output is no longer starved.
+// Override with `BRO_HARNESS_MAX_TOKENS`.
+const DEFAULT_MAX_TOKENS: u32 = 32000;
 /// Hard backstop on loop iterations *per user turn*; the daemon's supervision is
 /// the outer guard. Override with `BRO_HARNESS_MAX_TURNS`.
 const DEFAULT_MAX_TURNS: u64 = 50;

@@ -76,7 +76,7 @@ impl AnthropicTransport {
         let mut body = json!({
             "model": opts.model,
             "max_tokens": opts.max_tokens,
-            "messages": self.messages,
+            "messages": messages_with_cache_breakpoint(&self.messages),
             "stream": true,
         });
         // System is up to two blocks: a cache-stable prefix (carries the
@@ -97,8 +97,16 @@ impl AnthropicTransport {
         if !tool_defs.is_empty() {
             body["tools"] = json!(tool_defs);
         }
-        if let Some(t) = effort_to_thinking(opts.effort.as_deref()) {
-            body["thinking"] = t;
+        // Reasoning: mirror the Claude Code wire shape for these Anthropic-
+        // compatible endpoints (glm/deepseek). Thinking budget is server-managed
+        // (`adaptive`) rather than a fixed `budget_tokens`, which previously
+        // starved output when budget >= max_tokens and produced empty,
+        // spurious-stop turns. Effort is the categorical `output_config.effort`
+        // knob (gated by the `effort` beta in the request header). Only emitted
+        // when an effort is requested, preserving "no effort ⇒ no thinking".
+        if let Some(effort) = opts.effort.as_deref() {
+            body["thinking"] = json!({"type": "adaptive"});
+            body["output_config"] = json!({"effort": effort});
         }
         body
     }
@@ -342,7 +350,10 @@ impl Transport for AnthropicTransport {
     ) -> Result<TurnOutput> {
         let body = self.build_body(tools, opts);
 
-        let url = format!("{}/v1/messages", self.base_url);
+        // `?beta=true` + the `anthropic-beta` header gate adaptive-thinking
+        // effort and the 1M window on these endpoints (mirrors Claude Code).
+        let url = format!("{}/v1/messages?beta=true", self.base_url);
+        let betas = anthropic_betas();
         let max_inband = super::http::max_retries();
         let mut inband_attempt = 0u32;
         loop {
@@ -354,6 +365,9 @@ impl Transport for AnthropicTransport {
                     .header("content-type", "application/json")
                     .header("anthropic-version", &self.version)
                     .timeout(super::http::request_timeout());
+                if !betas.is_empty() {
+                    rb = rb.header("anthropic-beta", &betas);
+                }
                 rb = match &self.auth {
                     Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
                     Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
@@ -546,14 +560,36 @@ impl Transport for AnthropicTransport {
     }
 }
 
-fn effort_to_thinking(effort: Option<&str>) -> Option<Value> {
-    let budget = match effort?.to_ascii_lowercase().as_str() {
-        "low" => 2048,
-        "medium" => 8192,
-        "high" | "max" => 16384,
-        _ => return None,
-    };
-    Some(json!({"type": "enabled", "budget_tokens": budget}))
+/// Default `anthropic-beta` features for the Anthropic-compatible endpoints
+/// (glm/deepseek). `effort-*` honors `output_config.effort`; `context-1m-*`
+/// opens the 1M context window (both endpoints accept it). Deliberately omits
+/// `interleaved-thinking`/`context-management` — those impose thinking-block
+/// replay/management obligations handled separately. Override via
+/// `BRO_HARNESS_ANTHROPIC_BETAS` (empty string disables the header).
+const DEFAULT_ANTHROPIC_BETAS: &str = "effort-2025-11-24,context-1m-2025-08-07";
+
+fn anthropic_betas() -> String {
+    std::env::var("BRO_HARNESS_ANTHROPIC_BETAS")
+        .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BETAS.to_string())
+}
+
+/// Return a clone of the conversation with an ephemeral cache breakpoint on the
+/// final content block of the last message, so the growing history prefix is
+/// served from cache on subsequent turns (Anthropic matches the longest cached
+/// prefix). Combined with the system-block breakpoint this uses 2 of the 4
+/// allowed breakpoints. No-op when there are no array-content messages.
+fn messages_with_cache_breakpoint(messages: &[Value]) -> Vec<Value> {
+    let mut msgs = messages.to_vec();
+    if let Some(content) = msgs
+        .last_mut()
+        .and_then(|m| m.get_mut("content"))
+        .and_then(|c| c.as_array_mut())
+        && let Some(block) = content.last_mut()
+        && block.is_object()
+    {
+        block["cache_control"] = json!({"type": "ephemeral"});
+    }
+    msgs
 }
 
 #[cfg(test)]
@@ -639,6 +675,60 @@ mod tests {
     fn empty_system_is_omitted() {
         let body = transport().build_body(&[], &opts(SystemPrompt::default()));
         assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn effort_emits_adaptive_thinking_and_output_config() {
+        let mut o = opts(SystemPrompt::default());
+        o.effort = Some("high".into());
+        let body = transport().build_body(&[], &o);
+        // Server-managed budget — never a fixed budget_tokens that can starve output.
+        assert_eq!(body["thinking"], json!({"type": "adaptive"}));
+        assert!(body["thinking"].get("budget_tokens").is_none());
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn no_effort_omits_thinking_and_output_config() {
+        let body = transport().build_body(&[], &opts(SystemPrompt::default()));
+        assert!(body.get("thinking").is_none(), "no effort ⇒ no thinking");
+        assert!(body.get("output_config").is_none());
+    }
+
+    #[test]
+    fn last_message_gets_rolling_cache_breakpoint() {
+        let msgs = vec![
+            json!({"role": "user", "content": [{"type": "text", "text": "a"}]}),
+            json!({"role": "assistant", "content": [{"type": "text", "text": "b"}]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "r"},
+            ]}),
+        ];
+        let out = messages_with_cache_breakpoint(&msgs);
+        // Breakpoint lands on the final block of the last message.
+        let last = out.last().unwrap()["content"].as_array().unwrap();
+        assert_eq!(last.last().unwrap()["cache_control"]["type"], "ephemeral");
+        // Earlier messages are untouched (the prefix stays stable across turns).
+        assert!(out[0]["content"][0].get("cache_control").is_none());
+        assert!(out[1]["content"][0].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn cache_breakpoint_noop_on_string_content() {
+        // String-content messages (legacy shape) must not panic or mutate.
+        let msgs = vec![json!({"role": "user", "content": "hi"})];
+        let out = messages_with_cache_breakpoint(&msgs);
+        assert_eq!(out[0]["content"], "hi");
+    }
+
+    #[test]
+    fn default_betas_carry_effort_and_1m() {
+        // No env override ⇒ the verified default feature set.
+        assert!(DEFAULT_ANTHROPIC_BETAS.contains("effort-"));
+        assert!(DEFAULT_ANTHROPIC_BETAS.contains("context-1m-"));
+        // Intentionally NOT interleaved-thinking / context-management (Tier 3).
+        assert!(!DEFAULT_ANTHROPIC_BETAS.contains("interleaved-thinking"));
+        assert!(!DEFAULT_ANTHROPIC_BETAS.contains("context-management"));
     }
 
     #[test]
