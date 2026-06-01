@@ -320,10 +320,12 @@ catch-all:
 
 - `blind_all_lenses_posted` → `ready` when phase=blind, post_count≥5, and all five
   lens aliases `has_posted` (participation).
-- `validation_complete_with_conflicts` → `ready_debate` when phase=validate, the
-  validator `has_posted`, `unvalidated_count=0`, and `conflict_count≥1`.
-- `validation_complete_no_conflicts` → `ready_skip` when phase=validate, validator
-  posted, `unvalidated_count=0`, and `conflict_count=0`.
+- `validation_complete_with_conflicts` → `ready_debate` when phase=validate,
+  post_count≥5, `unvalidated_count=0` (every post validated — the validator
+  annotates rather than posts, so completeness is proven by zero unvalidated
+  posts), and `conflict_count≥1`.
+- `validation_complete_no_conflicts` → `ready_skip` when phase=validate,
+  post_count≥5, `unvalidated_count=0`, and `conflict_count=0`.
 - `debate_participation_complete` → `ready` when phase=debate, post_count≥5,
   **`unreviewed_post_count=0`** (every post got a cross-agent challenge or
   corroborate — closes the "zero challenges trivially ready" hole) and
