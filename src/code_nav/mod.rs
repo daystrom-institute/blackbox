@@ -1070,7 +1070,7 @@ pub fn code_symbols(
     //   Indexed (fast path).
     // - Caller left `mode` unset and we have no index (test path):
     //   default to Live.
-    let mode = match p.mode.as_deref() {
+    let mut mode = match p.mode.as_deref() {
         Some(raw) => match CodeSymbolMode::from_param(Some(raw)) {
             Ok(m) => m,
             Err(_) => return err_invalid_code_symbols_mode(raw),
@@ -1078,14 +1078,37 @@ pub fn code_symbols(
         None if idx.is_some() => CodeSymbolMode::Indexed,
         None => CodeSymbolMode::Live,
     };
+
+    // A managed fleet worktree lives outside the registered repo root, so the
+    // registration gate would reject its path. Resolve it to its registered base
+    // and add the synthesized alias to the effective project list so both lanes
+    // accept the worktree path. The worktree's files are NOT indexed under the
+    // base project_id, so the indexed lane would return base-repo-pathed, base-
+    // state results — force the live lane instead, which walks the worktree's
+    // actual files. This is a more-accurate route, not a degraded fallback, so
+    // it overrides an explicit mode=indexed.
+    let worktree_alias =
+        crate::projects::managed_fleet_worktree_project(Some(&p.project_dir), registered);
+    let effective: Vec<ProjectRecord> = match &worktree_alias {
+        Some(alias) => registered
+            .iter()
+            .cloned()
+            .chain(std::iter::once(alias.clone()))
+            .collect(),
+        None => registered.to_vec(),
+    };
+    if worktree_alias.is_some() {
+        mode = CodeSymbolMode::Live;
+    }
+
     match mode {
         CodeSymbolMode::Indexed => match idx {
-            Some(index) => code_symbols_indexed(p, registered, index),
+            Some(index) => code_symbols_indexed(p, &effective, index),
             None => Err(anyhow!(
                 "mode=\"indexed\" requires a TranscriptIndex; pass one via the MCP handler or use mode=\"live\""
             )),
         },
-        CodeSymbolMode::Live => code_symbols_live(p, registered),
+        CodeSymbolMode::Live => code_symbols_live(p, &effective),
     }
 }
 

@@ -1406,3 +1406,95 @@ fn java_record_resolves_as_refactor_item() {
     assert_eq!(status.kind, "record_declaration");
     assert_eq!(status.name.as_deref(), Some("Point"));
 }
+
+fn run_git(cwd: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A managed fleet worktree lives OUTSIDE the registered repo root (under the
+/// daemon state dir), so it is not a descendant of any registered project and
+/// the bare registration gate rejects it. code_symbols must resolve it to its
+/// registered base via the shared git-common-dir alias and accept it. Because
+/// the worktree's files are not indexed under the base project_id, it must also
+/// force the live lane — proven here by passing mode="indexed" with no index:
+/// without the resolution that returns the "requires a TranscriptIndex" error;
+/// with it, force-live routes to the walk and succeeds.
+#[test]
+fn test_code_symbols_resolves_managed_fleet_worktree_to_base() {
+    let base = TempDir::new().unwrap();
+    run_git(base.path(), &["init", "-b", "main"]);
+    run_git(base.path(), &["config", "user.email", "test@example.com"]);
+    run_git(base.path(), &["config", "user.name", "Test User"]);
+    fs::write(base.path().join("README.md"), "base\n").unwrap();
+    run_git(base.path(), &["add", "."]);
+    run_git(base.path(), &["commit", "-m", "init"]);
+
+    // Linked worktree on a bro-fleet branch, located outside the base root so it
+    // is NOT a descendant of the registered project.
+    let wt_parent = TempDir::new().unwrap();
+    let worktree = wt_parent.path().join("managed-wt");
+    run_git(
+        base.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "bro-fleet/code-nav-test",
+            worktree.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+    let worktree = worktree.canonicalize().unwrap();
+    fs::write(
+        worktree.join("Test.java"),
+        "class Test { void run() {} }\n",
+    )
+    .unwrap();
+
+    // Register only the base repo.
+    let registered = vec![ProjectRecord {
+        project_id: "base-project".to_string(),
+        repo_id: None,
+        canonical_path: base.path().canonicalize().unwrap().to_string_lossy().into_owned(),
+        registered_at: "2026-01-01T00:00:00Z".to_string(),
+        is_git_repo: true,
+        languages: BTreeSet::new(),
+    }];
+
+    let params = CodeSymbolSearchParams {
+        project_dir: worktree.to_string_lossy().into_owned(),
+        query: None,
+        languages: Some(vec!["java".to_string()]),
+        item_kinds: None,
+        path_contains: None,
+        limit: None,
+        file_limit: None,
+        include_attributes: None,
+        // Explicit indexed + no index: only force-live makes this succeed.
+        mode: Some("indexed".to_string()),
+    };
+    let response_json = code_symbols(&params, &registered, None).unwrap();
+    let response: CodeSymbolSearchResponse = serde_json::from_str(&response_json)
+        .unwrap_or_else(|_| panic!("expected ok response, got: {response_json}"));
+    assert_eq!(response.status, "ok");
+    assert!(
+        response.matching_items >= 1,
+        "live walk of the worktree should find the Java method"
+    );
+
+    run_git(
+        base.path(),
+        &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+    );
+}

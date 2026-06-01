@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 use rmcp::schemars;
@@ -554,71 +553,10 @@ fn effective_slice_projects(
     projects: &[ProjectRecord],
 ) -> Vec<ProjectRecord> {
     let mut out = projects.to_vec();
-    if let Some(record) = managed_fleet_worktree_project(project_dir, projects) {
+    if let Some(record) = crate::projects::managed_fleet_worktree_project(project_dir, projects) {
         out.push(record);
     }
     out
-}
-
-fn managed_fleet_worktree_project(
-    project_dir: Option<&str>,
-    projects: &[ProjectRecord],
-) -> Option<ProjectRecord> {
-    let project_dir = project_dir?;
-    let worktree = fs::canonicalize(project_dir).ok()?;
-    if projects.iter().any(|project| {
-        let root = Path::new(&project.canonical_path);
-        worktree == root || worktree.starts_with(root)
-    }) {
-        return None;
-    }
-    let branch = git_capture(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]).ok()?;
-    if !branch.trim().starts_with("bro-fleet/") {
-        return None;
-    }
-    let worktree_common = git_common_dir(&worktree).ok()?;
-    let base = projects.iter().find(|project| {
-        git_common_dir(Path::new(&project.canonical_path))
-            .ok()
-            .is_some_and(|common| common == worktree_common)
-    })?;
-    Some(ProjectRecord {
-        project_id: format!("{}:fleet-worktree", base.project_id),
-        repo_id: base.repo_id.clone(),
-        canonical_path: path_string(&worktree),
-        registered_at: "fleet-managed".to_string(),
-        is_git_repo: true,
-        languages: base.languages.clone(),
-    })
-}
-
-fn git_common_dir(cwd: &Path) -> Result<PathBuf> {
-    let raw = git_capture(cwd, &["rev-parse", "--git-common-dir"])?;
-    let path = PathBuf::from(raw.trim());
-    let path = if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    };
-    fs::canonicalize(path)
-        .with_context(|| format!("canonicalizing git common dir for {}", cwd.display()))
-}
-
-fn git_capture(cwd: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(cwd)
-        .args(args)
-        .output()
-        .with_context(|| format!("running git {}", args.join(" ")))?;
-    if !out.status.success() {
-        bail!(
-            "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn plan_from_edits(
@@ -1042,6 +980,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     fn lines(start_line: usize, end_line: usize) -> SliceRangeSelector {
         SliceRangeSelector::Lines {

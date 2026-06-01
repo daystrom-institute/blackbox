@@ -115,6 +115,28 @@ pub(crate) fn current_branch(root: &Path) -> Option<String> {
     }
 }
 
+/// Resolve the shared git common directory for `cwd` — the `.git` directory of
+/// the repository's main worktree. A linked worktree's common dir points back at
+/// the base repo's git dir, so two worktrees of the same repository share one
+/// common dir. That shared identity is the basis for resolving a managed fleet
+/// worktree (which lives outside the registered repo root) to its registered
+/// base project. Returns `None` when `cwd` is not in a git repo or the path can't
+/// be canonicalized.
+pub(crate) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
+    let output = git_output(cwd, &["rev-parse", "--git-common-dir"], "resolving git common dir")?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    let path = if path.is_absolute() { path } else { cwd.join(path) };
+    std::fs::canonicalize(path).ok()
+}
+
 pub(crate) fn commit_log(root: &Path, since_exclusive: Option<&str>) -> Result<Vec<GitCommit>> {
     let mut args = vec![
         "log".to_string(),

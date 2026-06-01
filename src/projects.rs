@@ -409,6 +409,56 @@ fn canonical_project_path(path: impl AsRef<Path>) -> Result<PathBuf> {
     Ok(entity_ref::canonical_input_path(path)?)
 }
 
+/// If `project_dir` is a managed fleet worktree, synthesize a [`ProjectRecord`]
+/// aliasing it to its registered base project. A managed fleet worktree is one
+/// whose checked-out branch is `bro-fleet/*` and whose git common dir matches a
+/// registered project — fleet dispatch creates these outside the registered
+/// repo root (under the daemon state dir), so the literal worktree path is not a
+/// descendant of any registered root and project-scoped tools would otherwise
+/// reject it.
+///
+/// Returns `None` when the path is already a registered root or descendant (no
+/// aliasing needed), is not on a `bro-fleet/*` branch, or no registered project
+/// shares its git common dir. The synthesized record carries a `:fleet-worktree`
+/// project_id suffix and the worktree's own canonical path, so a registration
+/// check accepts the worktree while callers can still tell it apart from a
+/// first-class registered root.
+///
+/// Shared by the slice tools ([`crate::slices`]) and code navigation
+/// ([`crate::code_nav`]) so a fleet-dispatched agent working inside an isolated
+/// worktree can use project-scoped tools without registering each ephemeral
+/// worktree.
+pub(crate) fn managed_fleet_worktree_project(
+    project_dir: Option<&str>,
+    projects: &[ProjectRecord],
+) -> Option<ProjectRecord> {
+    let project_dir = project_dir?;
+    let worktree = fs::canonicalize(project_dir).ok()?;
+    if projects.iter().any(|project| {
+        let root = Path::new(&project.canonical_path);
+        worktree == root || worktree.starts_with(root)
+    }) {
+        return None;
+    }
+    let branch = crate::git::current_branch(&worktree)?;
+    if !branch.starts_with("bro-fleet/") {
+        return None;
+    }
+    let worktree_common = crate::git::git_common_dir(&worktree)?;
+    let base = projects.iter().find(|project| {
+        crate::git::git_common_dir(Path::new(&project.canonical_path))
+            .is_some_and(|common| common == worktree_common)
+    })?;
+    Some(ProjectRecord {
+        project_id: format!("{}:fleet-worktree", base.project_id),
+        repo_id: base.repo_id.clone(),
+        canonical_path: worktree.to_string_lossy().into_owned(),
+        registered_at: "fleet-managed".to_string(),
+        is_git_repo: true,
+        languages: base.languages.clone(),
+    })
+}
+
 /// Walk a project root (capped at depth 4) collecting language
 /// fingerprints. Skips heavy build/output directories so a polyglot
 /// monorepo doesn't pay an O(everything) cost on registration.
