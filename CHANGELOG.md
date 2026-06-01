@@ -10,6 +10,19 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- Terminal mode (`terminal_mode: "tmux"` brofile attribute): TUI-capable
+  providers (Claude, vanilla Codex) run their real interactive TUI inside a tmux
+  pane instead of as a headless child, and the turn's output is resolved from
+  the provider transcript read plane — never from pane scraping. It is a brofile
+  attribute, so every dispatch path picks it up uniformly with no per-call flags:
+  workflow executor actors, `bro_exec`, and `bro_resume`. Harness-backed
+  providers (brodex/glm/deepseek) and fork/fire-and-forget nodes fail closed.
+  Durable actors and `bro_resume` continue the same provider session across
+  turns (`codex resume` / `claude --resume`), so a durable terminal node keeps
+  context instead of cold-starting. `bro_arc_cancel` (workflow) and `bro_cancel`
+  (`bro_exec`) interrupt an in-flight turn and reap its pane. Requires `tmux` on
+  `PATH`; headless dispatch is unchanged and remains the default. See
+  `design/orchestration/workflows/tmux-terminal-mode-slice.md`.
 - `bro agent` standalone single-agent cockpit: a one-agent shell that reuses the
   Fleet TUI transcript/composer component without roster chrome, with provider /
   model / effort / cwd launch flags plus standalone `/clear` and `/resume`.
