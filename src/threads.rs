@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 // than in `main.rs` so the server crate can own the schema alongside
 // the behavior it drives.
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ThreadParams {
     /// get, open, continue, link, resolve, promote, rename
     pub action: String,
@@ -57,7 +57,7 @@ pub struct ThreadParams {
     pub origin: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ThreadListParams {
     /// Filter by lifecycle status: open, active, resolved, promoted.
     #[serde(default)]
@@ -170,6 +170,14 @@ pub struct Thread {
     pub name: Option<String>,
     pub topic: String,
     pub project: String,
+    /// Directory the committed `.bbox/record/` snapshot is written into. When a
+    /// project-scoped thread is opened from a managed fleet worktree, `project`
+    /// holds the registered base (durable scope) while this holds the worktree
+    /// path, so the record travels with the agent's branch. `None` → write into
+    /// `project` (the common, non-worktree case). Internal: not a `ThreadParams`
+    /// input; set by the `bbox_thread` adapter via worktree resolution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_dir: Option<String>,
     pub status: ThreadStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<ThreadKind>,
@@ -250,21 +258,27 @@ fn scrub_host_identity_with(s: &str, home: Option<&Path>) -> String {
     }
 }
 
-/// Snapshot a settled thread into its owning repo's `.bbox/record/`. No-op when
-/// the thread isn't project-scoped or its repo isn't present on this host.
-/// Write a durable, host-scrubbed snapshot of a settled thread into the
-/// project's committed `.bbox/record/`. Returns the path written so callers can
-/// surface a commit-this rider; `Ok(None)` when no project is bound (nothing
-/// written).
-fn write_thread_record(thread: &Thread) -> Result<Option<PathBuf>> {
-    if thread.project.trim().is_empty() {
+/// Write a durable, host-scrubbed snapshot of a settled thread into the owning
+/// repo's committed `.bbox/record/`. The write target is the first existing dir
+/// of [`record_dir`, `project`]: a worktree-opened thread writes into the
+/// worktree (so the record travels with the agent's branch), falling back to the
+/// base `project` when the worktree is gone (e.g. removed before resolve) so the
+/// record is never silently lost. Returns `(selected_root, record_path)` so the
+/// caller can build a commit-this rider relative to the root actually used;
+/// `Ok(None)` when no bound path exists on this host (nothing written).
+fn write_thread_record(thread: &Thread) -> Result<Option<(PathBuf, PathBuf)>> {
+    let candidates = [thread.record_dir.as_deref(), Some(thread.project.as_str())];
+    let root = candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .find(|p| p.is_dir());
+    let Some(root) = root else {
         return Ok(None);
-    }
-    let project_dir = Path::new(&thread.project);
-    if !project_dir.is_dir() {
-        return Ok(None);
-    }
-    let dir = project_dir.join(".bbox").join("record");
+    };
+    let dir = root.join(".bbox").join("record");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     let home = dirs::home_dir();
@@ -281,7 +295,7 @@ fn write_thread_record(thread: &Thread) -> Result<Option<PathBuf>> {
     };
     let path = dir.join(format!("{}.json", thread.id));
     crate::json_store::atomic_write_json_locked(&path, &record)?;
-    Ok(Some(path))
+    Ok(Some((root, path)))
 }
 
 /// Load every committed thread record under `<project_dir>/.bbox/record/`.
@@ -394,10 +408,20 @@ impl Threads {
     // ── blackbox_thread (CRUD) ─────────────────────────────────────
 
     pub fn thread(&mut self, p: &ThreadParams) -> Result<String> {
-        Ok(self.thread_mutation(p)?.message)
+        Ok(self.thread_mutation(p, None)?.message)
     }
 
-    pub fn thread_mutation(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
+    /// `write_dir` is the committed-record write target resolved by the MCP
+    /// adapter when `p.project` is a managed fleet worktree (the worktree path;
+    /// `p.project` having been normalized to the registered base for scope). It
+    /// is honored by open/resolve/promote so the record travels with the agent's
+    /// branch. `None` for every non-worktree caller (the `thread()` wrapper and
+    /// its many internal callers), preserving today's base-write behavior.
+    pub fn thread_mutation(
+        &mut self,
+        p: &ThreadParams,
+        write_dir: Option<&str>,
+    ) -> Result<ThreadMutation> {
         if p.action == "get" {
             return Ok(ThreadMutation {
                 message: self.thread_get(p)?,
@@ -409,11 +433,11 @@ impl Threads {
         crate::json_store::with_store_lock(&path, || {
             self.reload()?;
             match p.action.as_str() {
-                "open" => self.thread_open(p),
+                "open" => self.thread_open(p, write_dir),
                 "continue" => self.thread_continue(p),
                 "link" => self.thread_link(p),
-                "resolve" => self.thread_resolve(p),
-                "promote" => self.thread_promote(p),
+                "resolve" => self.thread_resolve(p, write_dir),
+                "promote" => self.thread_promote(p, write_dir),
                 "rename" => self.thread_rename(p),
                 other => anyhow::bail!(
                     "Unknown action: {other}. Use: get, open, continue, link, resolve, promote, rename"
@@ -422,7 +446,7 @@ impl Threads {
         })
     }
 
-    fn thread_open(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
+    fn thread_open(&mut self, p: &ThreadParams, write_dir: Option<&str>) -> Result<ThreadMutation> {
         let topic = p.topic.as_deref().context("'topic' is required")?;
         let project = p.project.as_deref().unwrap_or("");
 
@@ -464,6 +488,7 @@ impl Threads {
             name: p.name.clone(),
             topic: topic.to_string(),
             project: project.to_string(),
+            record_dir: write_dir.map(str::to_string),
             status: ThreadStatus::Open,
             kind,
             origin,
@@ -756,7 +781,7 @@ impl Threads {
         })
     }
 
-    fn thread_resolve(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
+    fn thread_resolve(&mut self, p: &ThreadParams, write_dir: Option<&str>) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
 
         let thread = self
@@ -772,6 +797,13 @@ impl Threads {
             thread.notes.push(note.to_string());
         }
 
+        // (Re)point the committed-record write target at the worktree the agent
+        // is resolving from, so a thread opened from the base still snapshots
+        // into the worktree branch at close-out.
+        if let Some(wd) = write_dir {
+            thread.record_dir = Some(wd.to_string());
+        }
+
         thread.status = ThreadStatus::Resolved;
         thread.last_activity = now.clone();
         thread.resolved_at = Some(now);
@@ -780,10 +812,9 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(
-                &thread_for_embed.project,
-                &path,
-            )),
+            Ok(Some((root, path))) => {
+                Some(crate::util::repo_artifact_rider(&root.to_string_lossy(), &path))
+            }
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -803,7 +834,7 @@ impl Threads {
         })
     }
 
-    fn thread_promote(&mut self, p: &ThreadParams) -> Result<ThreadMutation> {
+    fn thread_promote(&mut self, p: &ThreadParams, write_dir: Option<&str>) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
         let promoted_to = p
             .promoted_to
@@ -823,6 +854,12 @@ impl Threads {
             thread.notes.push(note.to_string());
         }
 
+        // (Re)point the committed-record write target at the worktree the agent
+        // is promoting from (see thread_resolve).
+        if let Some(wd) = write_dir {
+            thread.record_dir = Some(wd.to_string());
+        }
+
         thread.status = ThreadStatus::Promoted;
         thread.promoted_to = Some(promoted_to.to_string());
         thread.last_activity = now.clone();
@@ -832,10 +869,9 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some(path)) => Some(crate::util::repo_artifact_rider(
-                &thread_for_embed.project,
-                &path,
-            )),
+            Ok(Some((root, path))) => {
+                Some(crate::util::repo_artifact_rider(&root.to_string_lossy(), &path))
+            }
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -1254,6 +1290,76 @@ mod tests {
             !msg.contains(".bbox/record"),
             "no rider when the repo record was not written: {msg}"
         );
+    }
+
+    #[test]
+    fn resolve_from_worktree_writes_record_into_worktree_not_base() {
+        // A thread opened from the base (no write-dir) but resolved from a
+        // worktree (write-dir set at close-out) must snapshot into the worktree —
+        // so the record travels with the agent's branch — not the base repo.
+        let dir = tempdir().unwrap();
+        let base = tempdir().unwrap();
+        let worktree = tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        let worktree_root = worktree.path().canonicalize().unwrap();
+        let wt = worktree_root.to_string_lossy().into_owned();
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+
+        let id = open_thread_id(&mut threads, "audit the dispatch path", &base_root.to_string_lossy());
+        let msg = threads
+            .thread_mutation(
+                &ThreadParams {
+                    id: Some(id.clone()),
+                    note: Some("found the bug".into()),
+                    ..params("resolve")
+                },
+                Some(wt.as_str()),
+            )
+            .unwrap()
+            .message;
+
+        let in_worktree = worktree_root.join(".bbox").join("record").join(format!("{id}.json"));
+        let in_base = base_root.join(".bbox").join("record").join(format!("{id}.json"));
+        assert!(in_worktree.exists(), "record should land in the worktree: {}", in_worktree.display());
+        assert!(!in_base.exists(), "record must NOT land in the base repo");
+        // Rider is worktree-relative and actionable from the worktree cwd.
+        assert!(
+            msg.contains("git add .bbox/record/") && msg.contains(&format!("{id}.json")),
+            "rider should be worktree-relative: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_base_when_worktree_record_dir_is_gone() {
+        // Opened from a worktree (record_dir stored), worktree later removed,
+        // resolved with no write-dir → fall back to base rather than silent loss.
+        let dir = tempdir().unwrap();
+        let base = tempdir().unwrap();
+        let base_root = base.path().canonicalize().unwrap();
+        let gone = base_root.join("removed-worktree"); // never created → not a dir
+        let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
+
+        // Open WITH a (now-absent) worktree write-dir, base also bound as scope.
+        let open_msg = threads
+            .thread_mutation(
+                &ThreadParams {
+                    topic: Some("x".into()),
+                    project: Some(base_root.to_string_lossy().into_owned()),
+                    ..params("open")
+                },
+                Some(gone.to_string_lossy().as_ref()),
+            )
+            .unwrap();
+        let id = open_msg.message.split_whitespace().nth(2).unwrap().to_string();
+
+        let msg = threads
+            .thread(&ThreadParams { id: Some(id.clone()), ..params("resolve") })
+            .unwrap();
+        assert!(
+            base_root.join(".bbox").join("record").join(format!("{id}.json")).exists(),
+            "stale worktree record_dir should fall back to base, not silently drop"
+        );
+        assert!(msg.contains(".bbox/record/"), "rider expected on fallback write: {msg}");
     }
 
     #[test]

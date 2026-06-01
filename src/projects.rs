@@ -432,6 +432,48 @@ pub(crate) fn managed_fleet_worktree_project(
     project_dir: Option<&str>,
     projects: &[ProjectRecord],
 ) -> Option<ProjectRecord> {
+    let (base, worktree) = resolve_managed_fleet_worktree(project_dir, projects)?;
+    Some(ProjectRecord {
+        project_id: format!("{}:fleet-worktree", base.project_id),
+        repo_id: base.repo_id.clone(),
+        canonical_path: worktree.to_string_lossy().into_owned(),
+        registered_at: "fleet-managed".to_string(),
+        is_git_repo: true,
+        languages: base.languages.clone(),
+    })
+}
+
+/// For a path that is a managed fleet worktree of a registered project, return
+/// `(base_canonical_path, worktree_canonical_path)`. The base is the worktree's
+/// durable scope (host-local thread keying, project-scoped queries) while the
+/// worktree is where repo-owned artifacts (e.g. committed thread records) should
+/// be written so they travel with the agent's branch. `None` when the path is
+/// not a managed fleet worktree (already registered/descendant, not `bro-fleet/*`,
+/// or no registered base shares its git common dir).
+pub(crate) fn fleet_worktree_scope_and_dir(
+    project_dir: &str,
+    projects: &[ProjectRecord],
+) -> Option<(String, String)> {
+    let (base, worktree) = resolve_managed_fleet_worktree(Some(project_dir), projects)?;
+    Some((
+        base.canonical_path.clone(),
+        worktree.to_string_lossy().into_owned(),
+    ))
+}
+
+/// Shared core: resolve a path to `(base_record, canonical_worktree)` when it is
+/// a managed fleet worktree of a registered project. A managed fleet worktree is
+/// one whose checked-out branch is `bro-fleet/*` and whose git common dir matches
+/// a registered project — fleet dispatch creates these outside the registered
+/// repo root (under the daemon state dir), so the literal worktree path is not a
+/// descendant of any registered root. Returns `None` when the path is already a
+/// registered root/descendant (no resolution needed — early-returns before any
+/// git call), is not on a `bro-fleet/*` branch, or no registered project shares
+/// its git common dir.
+fn resolve_managed_fleet_worktree<'a>(
+    project_dir: Option<&str>,
+    projects: &'a [ProjectRecord],
+) -> Option<(&'a ProjectRecord, PathBuf)> {
     let project_dir = project_dir?;
     let worktree = fs::canonicalize(project_dir).ok()?;
     if projects.iter().any(|project| {
@@ -449,14 +491,7 @@ pub(crate) fn managed_fleet_worktree_project(
         crate::git::git_common_dir(Path::new(&project.canonical_path))
             .is_some_and(|common| common == worktree_common)
     })?;
-    Some(ProjectRecord {
-        project_id: format!("{}:fleet-worktree", base.project_id),
-        repo_id: base.repo_id.clone(),
-        canonical_path: worktree.to_string_lossy().into_owned(),
-        registered_at: "fleet-managed".to_string(),
-        is_git_repo: true,
-        languages: base.languages.clone(),
-    })
+    Some((base, worktree))
 }
 
 /// Walk a project root (capped at depth 4) collecting language
@@ -833,6 +868,66 @@ mod tests {
                 .unwrap()
                 .status
                 .success()
+        );
+    }
+
+    #[test]
+    fn fleet_worktree_scope_and_dir_resolves_bro_fleet_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        fs::create_dir_all(&base).unwrap();
+        init_git_repo(&base);
+        let base_canon = base.canonicalize().unwrap();
+
+        // Linked worktree on a bro-fleet branch, OUTSIDE the registered base root.
+        let worktree = tmp.path().join("wt");
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&base)
+            .args([
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/test",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let worktree_canon = worktree.canonicalize().unwrap();
+
+        let registered = vec![ProjectRecord {
+            project_id: "base-project".into(),
+            repo_id: None,
+            canonical_path: base_canon.to_string_lossy().into_owned(),
+            registered_at: "2026-01-01T00:00:00Z".into(),
+            is_git_repo: true,
+            languages: BTreeSet::new(),
+        }];
+
+        // Managed worktree → (base scope, worktree write-dir).
+        let (scope, dir) =
+            fleet_worktree_scope_and_dir(worktree_canon.to_string_lossy().as_ref(), &registered)
+                .expect("managed fleet worktree should resolve");
+        assert_eq!(scope, base_canon.to_string_lossy());
+        assert_eq!(dir, worktree_canon.to_string_lossy());
+
+        // The registered base itself is not a worktree alias.
+        assert!(
+            fleet_worktree_scope_and_dir(base_canon.to_string_lossy().as_ref(), &registered)
+                .is_none()
+        );
+
+        // A plain (non-fleet) dir does not resolve.
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert!(
+            fleet_worktree_scope_and_dir(
+                plain.canonicalize().unwrap().to_string_lossy().as_ref(),
+                &registered
+            )
+            .is_none()
         );
     }
 }
