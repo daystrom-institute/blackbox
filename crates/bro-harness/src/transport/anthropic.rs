@@ -181,6 +181,24 @@ fn map_stop(reason: &str) -> StopReason {
 }
 
 /// Fold one raw Anthropic SSE event into the running accumulators.
+/// True when an in-band SSE `error` event is a transient provider failure worth
+/// retrying the turn for (overload, rate limit, network/server hiccup) rather
+/// than a permanent error (bad request, auth).
+fn inband_error_retryable(ev: &Value) -> bool {
+    let ty = ev["error"]["type"].as_str().unwrap_or("");
+    if matches!(
+        ty,
+        "overloaded_error" | "rate_limit_error" | "api_error" | "timeout_error"
+    ) {
+        return true;
+    }
+    let m = ev["error"]["message"]
+        .as_str()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    m.contains("network error") || m.contains("overloaded") || m.contains("try again")
+}
+
 fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mut StopReason) {
     let ensure = |blocks: &mut Vec<SseBlock>, idx: usize| {
         while blocks.len() <= idx {
@@ -325,115 +343,154 @@ impl Transport for AnthropicTransport {
         let body = self.build_body(tools, opts);
 
         let url = format!("{}/v1/messages", self.base_url);
-        let resp = super::http::send_with_retry("anthropic/messages", || {
-            let mut rb = self
-                .http
-                .post(&url)
-                .header("content-type", "application/json")
-                .header("anthropic-version", &self.version)
-                .timeout(super::http::request_timeout());
-            rb = match &self.auth {
-                Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
-                Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
-            };
-            rb.json(&body).send()
-        })
-        .await
-        .context("messages request")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("anthropic messages {status}: {text}");
-        }
-
-        // Parse the SSE stream incrementally: forward each event to the sink and
-        // fold it into the normalized turn output. Buffer raw bytes and decode
-        // only complete lines so a multibyte char split across chunks is safe.
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut blocks: Vec<SseBlock> = Vec::new();
-        let mut usage = Usage::default();
-        let mut stop = StopReason::Done;
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("read messages SSE chunk")?;
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let raw: Vec<u8> = buf.drain(..=pos).collect();
-                let line = String::from_utf8_lossy(&raw);
-                let line = line.trim_end();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue; // `event:` lines and blanks: the data JSON carries `type`
+        let max_inband = super::http::max_retries();
+        let mut inband_attempt = 0u32;
+        loop {
+            inband_attempt += 1;
+            let resp = super::http::send_with_retry("anthropic/messages", || {
+                let mut rb = self
+                    .http
+                    .post(&url)
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", &self.version)
+                    .timeout(super::http::request_timeout());
+                rb = match &self.auth {
+                    Auth::Bearer(t) => rb.header("authorization", format!("Bearer {t}")),
+                    Auth::ApiKey(k) => rb.header("x-api-key", k.clone()),
                 };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
+                rb.json(&body).send()
+            })
+            .await
+            .context("messages request")?;
+            let status = resp.status();
+            if !status.is_success() {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("anthropic messages {status}: {text}");
+            }
+
+            // Parse the SSE stream incrementally: forward each event to the sink and
+            // fold it into the normalized turn output. Buffer raw bytes and decode
+            // only complete lines so a multibyte char split across chunks is safe.
+            // An in-band `error` event (e.g. overloaded_error after the 200 stream
+            // opened) is NOT a content event — capture it and stop folding, so a
+            // provider failure can never be laundered into an empty "success" turn.
+            let mut stream = resp.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut blocks: Vec<SseBlock> = Vec::new();
+            let mut usage = Usage::default();
+            let mut stop = StopReason::Done;
+            let mut inband_error: Option<(String, bool)> = None;
+
+            'consume: while let Some(chunk) = stream.next().await {
+                let chunk = chunk.context("read messages SSE chunk")?;
+                buf.extend_from_slice(&chunk);
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let raw: Vec<u8> = buf.drain(..=pos).collect();
+                    let line = String::from_utf8_lossy(&raw);
+                    let line = line.trim_end();
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue; // `event:` lines and blanks: the data JSON carries `type`
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    match serde_json::from_str::<Value>(data) {
+                        Ok(ev) => {
+                            if ev["type"].as_str() == Some("error") {
+                                sink.stream_event(ev.clone());
+                                let code = ev["error"]["type"].as_str().unwrap_or("error");
+                                let msg =
+                                    ev["error"]["message"].as_str().unwrap_or("stream error");
+                                inband_error = Some((
+                                    format!("{code}: {msg}"),
+                                    inband_error_retryable(&ev),
+                                ));
+                                break 'consume;
+                            }
+                            sink.stream_event(ev.clone());
+                            fold_sse(&ev, &mut blocks, &mut usage, &mut stop);
+                        }
+                        Err(e) => tracing::warn!("anthropic SSE parse error: {e}"),
+                    }
+                }
+            }
+
+            // In-band provider error: retry the whole turn on a transient one
+            // (overload / rate-limit / network), else surface it as a failure
+            // instead of returning an empty success.
+            if let Some((msg, retryable)) = inband_error {
+                if retryable && inband_attempt <= max_inband {
+                    let wait = super::http::backoff(inband_attempt);
+                    tracing::warn!(
+                        label = "anthropic/messages",
+                        attempt = inband_attempt,
+                        error = %msg,
+                        wait_ms = wait.as_millis() as u64,
+                        "transient in-band stream error; retrying turn"
+                    );
+                    tokio::time::sleep(wait).await;
                     continue;
                 }
-                match serde_json::from_str::<Value>(data) {
-                    Ok(ev) => {
-                        sink.stream_event(ev.clone());
-                        fold_sse(&ev, &mut blocks, &mut usage, &mut stop);
+                anyhow::bail!("anthropic stream error ({msg})");
+            }
+
+            // Reconstruct the assistant turn from the accumulated blocks.
+            let mut content: Vec<Value> = Vec::new();
+            let mut text_out = String::new();
+            let mut tool_calls: Vec<super::ToolCall> = Vec::new();
+            for b in &blocks {
+                match b.kind.as_str() {
+                    "text" if !b.text.is_empty() => {
+                        content.push(json!({"type": "text", "text": b.text}));
+                        text_out.push_str(&b.text);
                     }
-                    Err(e) => tracing::warn!("anthropic SSE parse error: {e}"),
+                    "tool_use" => {
+                        let args: Value = serde_json::from_str(if b.tool_json.is_empty() {
+                            "{}"
+                        } else {
+                            &b.tool_json
+                        })
+                        .unwrap_or_else(|_| json!({}));
+                        content.push(json!({
+                            "type": "tool_use",
+                            "id": b.tool_id,
+                            "name": b.tool_name,
+                            "input": args.clone(),
+                        }));
+                        tool_calls.push(super::ToolCall {
+                            id: b.tool_id.clone(),
+                            name: b.tool_name.clone(),
+                            args,
+                        });
+                    }
+                    // `thinking` blocks are intentionally NOT replayed: Anthropic
+                    // requires a matching signature to send a thinking block back,
+                    // and we don't persist one. The live thinking already streamed
+                    // to the sink; dropping it from the buffer keeps resume valid.
+                    _ => {}
                 }
             }
-        }
 
-        // Reconstruct the assistant turn from the accumulated blocks.
-        let mut content: Vec<Value> = Vec::new();
-        let mut text_out = String::new();
-        let mut tool_calls: Vec<super::ToolCall> = Vec::new();
-        for b in &blocks {
-            match b.kind.as_str() {
-                "text" if !b.text.is_empty() => {
-                    content.push(json!({"type": "text", "text": b.text}));
-                    text_out.push_str(&b.text);
-                }
-                "tool_use" => {
-                    let args: Value = serde_json::from_str(if b.tool_json.is_empty() {
-                        "{}"
-                    } else {
-                        &b.tool_json
-                    })
-                    .unwrap_or_else(|_| json!({}));
-                    content.push(json!({
-                        "type": "tool_use",
-                        "id": b.tool_id,
-                        "name": b.tool_name,
-                        "input": args.clone(),
-                    }));
-                    tool_calls.push(super::ToolCall {
-                        id: b.tool_id.clone(),
-                        name: b.tool_name.clone(),
-                        args,
-                    });
-                }
-                // `thinking` blocks are intentionally NOT replayed: Anthropic
-                // requires a matching signature to send a thinking block back,
-                // and we don't persist one. The live thinking already streamed
-                // to the sink; dropping it from the buffer keeps resume valid.
-                _ => {}
+            // Record the assistant turn for the next request. Always store the
+            // assistant message (even if empty) so the conversation alternates
+            // correctly when only tool calls were produced.
+            self.messages
+                .push(json!({"role": "assistant", "content": content}));
+
+            // Safety: if tool calls were produced, ensure the loop continues even
+            // if the stop_reason event was missed.
+            if !tool_calls.is_empty() {
+                stop = StopReason::ToolCalls;
             }
+
+            return Ok(TurnOutput {
+                text: text_out,
+                tool_calls,
+                stop,
+                usage,
+            });
         }
-
-        // Record the assistant turn for the next request. Always store the
-        // assistant message (even if empty) so the conversation alternates
-        // correctly when only tool calls were produced.
-        self.messages
-            .push(json!({"role": "assistant", "content": content}));
-
-        // Safety: if tool calls were produced, ensure the loop continues even
-        // if the stop_reason event was missed.
-        if !tool_calls.is_empty() {
-            stop = StopReason::ToolCalls;
-        }
-
-        Ok(TurnOutput {
-            text: text_out,
-            tool_calls,
-            stop,
-            usage,
-        })
     }
 
     fn snapshot(&self) -> Value {
@@ -582,6 +639,29 @@ mod tests {
     fn empty_system_is_omitted() {
         let body = transport().build_body(&[], &opts(SystemPrompt::default()));
         assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn inband_error_retryable_classifies_transient_vs_permanent() {
+        // The glm/Z.AI overloaded_error that silently no-showed a lens.
+        assert!(inband_error_retryable(&json!({
+            "type": "error",
+            "error": {"type": "overloaded_error", "message": "[1234][Network error, please try again later]"}
+        })));
+        assert!(inband_error_retryable(&json!({
+            "type": "error", "error": {"type": "rate_limit_error", "message": "slow down"}
+        })));
+        // Message-based fallback when the type is unknown.
+        assert!(inband_error_retryable(&json!({
+            "type": "error", "error": {"type": "weird", "message": "transient Network error, try again"}
+        })));
+        // Permanent errors must NOT retry.
+        assert!(!inband_error_retryable(&json!({
+            "type": "error", "error": {"type": "invalid_request_error", "message": "bad tool schema"}
+        })));
+        assert!(!inband_error_retryable(&json!({
+            "type": "error", "error": {"type": "authentication_error", "message": "bad key"}
+        })));
     }
 
     #[test]

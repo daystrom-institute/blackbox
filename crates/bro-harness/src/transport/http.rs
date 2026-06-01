@@ -21,14 +21,14 @@ pub fn request_timeout() -> Duration {
     Duration::from_secs(secs)
 }
 
-fn max_retries() -> u32 {
+pub fn max_retries() -> u32 {
     std::env::var("BRO_HARNESS_MAX_RETRIES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_RETRIES)
 }
 
-fn backoff(attempt: u32) -> Duration {
+pub fn backoff(attempt: u32) -> Duration {
     // attempt is 1-based; 500ms, 1s, 2s, 4s … capped.
     let ms = BASE_BACKOFF_MS
         .saturating_mul(1u64 << attempt.min(5).saturating_sub(1))
