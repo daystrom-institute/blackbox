@@ -1406,7 +1406,20 @@ fn steer_selected(app: &mut App) {
             }
             Err(e) => {
                 app.input = text;
-                app.set_status(format!("steer: {e:#}"), Duration::from_secs(4));
+                if is_broken_pipe_error(&e) {
+                    app.agents[idx].task = handle.without_stdin();
+                    if provider_supports_bidi(provider) {
+                        app.set_status("stdin closed; resuming session", Duration::from_secs(2));
+                        resume_selected(app, idx);
+                    } else {
+                        app.set_status(
+                            "stdin closed; session is no longer steerable",
+                            Duration::from_secs(4),
+                        );
+                    }
+                } else {
+                    app.set_status(format!("steer: {e:#}"), Duration::from_secs(4));
+                }
             }
         }
     } else if provider_supports_bidi(provider) {
@@ -1460,8 +1473,30 @@ fn interrupt_selected(app: &mut App) {
     }
     match run_agent_write(app, handle.interrupt()) {
         Ok(()) => app.set_status("interrupt sent", Duration::from_secs(2)),
-        Err(e) => app.set_status(format!("interrupt: {e:#}"), Duration::from_secs(4)),
+        Err(e) => {
+            if is_broken_pipe_error(&e) {
+                app.agents[idx].task = handle.without_stdin();
+                app.set_status(
+                    "stdin closed; session will resume on next steer",
+                    Duration::from_secs(4),
+                );
+            } else {
+                app.set_status(format!("interrupt: {e:#}"), Duration::from_secs(4));
+            }
+        }
     }
+}
+
+fn is_broken_pipe_error(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
+            || {
+                let text = cause.to_string();
+                text.contains("Broken pipe") || text.contains("os error 32")
+            }
+    })
 }
 
 fn run_agent_write<F>(app: &App, fut: F) -> anyhow::Result<()>
@@ -2915,6 +2950,15 @@ fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Li
             Color::DarkGray
         }),
     ))];
+    if running
+        && let Some(next_step) = obj.get("next_step").and_then(|v| v.as_str())
+        && !next_step.is_empty()
+    {
+        out.push(Line::from(Span::styled(
+            format!("next: {next_step}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
     for (label, color) in [("stdout", Color::Gray), ("stderr", Color::Red)] {
         if let Some(text) = obj.get(label).and_then(|v| v.as_str())
             && !text.is_empty()
@@ -3985,6 +4029,18 @@ mod tests {
     }
 
     #[test]
+    fn broken_pipe_error_is_detected() {
+        let io_err = anyhow::Error::new(io::Error::from(io::ErrorKind::BrokenPipe));
+        assert!(is_broken_pipe_error(&io_err));
+
+        let wrapped = anyhow::anyhow!("steer: Broken pipe (os error 32)");
+        assert!(is_broken_pipe_error(&wrapped));
+
+        let other = anyhow::anyhow!("permission denied");
+        assert!(!is_broken_pipe_error(&other));
+    }
+
+    #[test]
     fn compact_tool_call_line_quotes_shell_commands() {
         let line =
             compact_tool_call_line("shell_run", r#"{"cmd":"cargo test --lib"}"#, 100).unwrap();
@@ -4405,6 +4461,24 @@ mod tests {
         assert!(rendered.iter().any(|l| l.contains("err")), "{rendered:?}");
         assert!(
             !rendered.iter().any(|l| l.contains("exit_code")),
+            "{rendered:?}"
+        );
+    }
+
+    #[test]
+    fn shell_result_renderer_shows_running_next_step() {
+        let lines = shell_result_block(
+            r#"{"exit_code":null,"stdout":"","stderr":"","running":true,"timed_out":false,"session_id":"sh-7","next_step":"Call shell_poll with session_id=sh-7 until running=false."}"#,
+            false,
+            10,
+        );
+        let rendered: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().any(|l| l.contains("running session=sh-7")),
+            "{rendered:?}"
+        );
+        assert!(
+            rendered.iter().any(|l| l.contains("Call shell_poll")),
             "{rendered:?}"
         );
     }

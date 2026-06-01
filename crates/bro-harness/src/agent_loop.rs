@@ -785,6 +785,12 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
              reshaping content rather than reasoning about it — `clip_peek` is the explicit, \
              bounded way to look when you do.\n",
         );
+        stable.push_str(
+            "\nShell sessions: if `shell_run` or `shell_poll` returns `running=true`, the command \
+             is still active. Do not treat the command as complete or stop the turn there; call \
+             `shell_poll` with the returned `session_id` until `running=false`, or `shell_kill` \
+             if you are abandoning it.\n",
+        );
     }
 
     let mut volatile = String::new();

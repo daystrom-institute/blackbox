@@ -35,6 +35,9 @@ use tokio::time::{Instant, sleep_until};
 const MAX_BUF_BYTES: usize = 8 * 1024 * 1024;
 /// Default returned-output budget (~40 KB at a 4-bytes/token heuristic).
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+/// Default cooperative yield. Long commands should not make the whole agent
+/// turn look hung just because the model forgot to set `yield_time_ms`.
+const DEFAULT_YIELD_MS: u64 = 1_000;
 /// Max concurrently-retained (still-running) sessions per dispatch. A blocking
 /// command never counts; only yielded sessions are retained. Prevents a loop
 /// from accumulating unbounded live children.
@@ -318,10 +321,11 @@ struct ShellRunInput {
     /// Hard-kill deadline in milliseconds. When set, the process is killed if
     /// it runs longer than this (honored across subsequent shell_poll calls).
     timeout_ms: Option<u64>,
-    /// Cooperative yield in milliseconds. When set and the command hasn't
-    /// finished by then, returns partial output plus a `session_id` (the
-    /// process keeps running); resume with shell_poll. When omitted, blocks
-    /// until the command finishes (or timeout_ms).
+    /// Cooperative yield in milliseconds. If the command has not finished by
+    /// then, returns partial output plus a `session_id` (the process keeps
+    /// running); resume with shell_poll. When omitted, defaults to a short
+    /// cooperative yield so long commands do not stall the agent loop. Set to
+    /// 0 only when you deliberately want to block until completion/timeout.
     yield_time_ms: Option<u64>,
     /// Cap on returned stdout/stderr, in approximate tokens (~4 bytes each;
     /// default 10000). The TAIL is kept so trailing errors survive.
@@ -360,7 +364,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Blocks until completion by default; set yield_time_ms to get a session_id back for a still-running command and resume with shell_poll. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -431,7 +435,8 @@ impl Tool for ShellRun {
         }
 
         let now = Instant::now();
-        let yield_at = args.yield_time_ms.map(|ms| now + Duration::from_millis(ms));
+        let yield_ms = args.yield_time_ms.unwrap_or(DEFAULT_YIELD_MS);
+        let yield_at = (yield_ms > 0).then(|| now + Duration::from_millis(yield_ms));
         let kill_at = args.timeout_ms.map(|ms| now + Duration::from_millis(ms));
 
         let mut session = ShellSession {
@@ -460,6 +465,7 @@ impl Tool for ShellRun {
                     Ok(id) => ToolResult::Json(json!({
                         "exit_code": Value::Null, "stdout": so, "stderr": se,
                         "running": true, "timed_out": false, "session_id": id,
+                        "next_step": format!("Call shell_poll with session_id={id} until running=false before interpreting this command as complete."),
                     })),
                     Err(mut overflow) => {
                         let _ = overflow.child.start_kill();
@@ -575,6 +581,7 @@ impl Tool for ShellPoll {
                 ToolResult::Json(json!({
                     "exit_code": Value::Null, "stdout": so, "stderr": se,
                     "running": true, "timed_out": false, "session_id": args.session_id,
+                    "next_step": format!("Call shell_poll again with session_id={} until running=false before interpreting this command as complete.", args.session_id),
                 }))
             }
         }
@@ -742,6 +749,40 @@ mod tests {
         assert_eq!(v["stdout"], "hi\n");
     }
 
+    #[tokio::test]
+    async fn default_yield_returns_session_for_long_command() {
+        let c = cx();
+        let v = as_json(ShellRun.call(json!({"command": "sleep 2"}), &c).await);
+        assert_eq!(v["running"], true, "default yield should return early: {v}");
+        assert!(v["exit_code"].is_null(), "running command has no exit: {v}");
+        assert!(
+            v["next_step"]
+                .as_str()
+                .is_some_and(|s| s.contains("shell_poll")),
+            "missing poll guidance: {v}"
+        );
+
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let _ = ShellKill
+            .call(json!({"session_id": sid, "signal": "term"}), &c)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn yield_time_zero_blocks_until_completion() {
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "sleep 0.1; echo done", "yield_time_ms": 0}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(v["running"], false, "{v}");
+        assert_eq!(v["exit_code"], 0, "{v}");
+        assert_eq!(v["stdout"], "done\n");
+    }
+
     #[test]
     fn shell_path_env_prepends_user_local_bins() {
         let tmp = tempfile::tempdir().unwrap();
@@ -783,6 +824,12 @@ mod tests {
                 .await,
         );
         assert_eq!(v["running"], true, "slow cmd should yield: {v}");
+        assert!(
+            v["next_step"]
+                .as_str()
+                .is_some_and(|s| s.contains("shell_poll")),
+            "missing poll guidance: {v}"
+        );
         let sid = v["session_id"].as_str().unwrap().to_string();
 
         let p = as_json(
