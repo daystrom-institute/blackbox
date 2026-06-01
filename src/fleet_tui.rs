@@ -3156,6 +3156,8 @@ fn render_transcript(
                     lines.extend(shell_result_block(content, *is_error, RESULT_MAX_LINES));
                 } else if *is_error {
                     lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Red));
+                } else if tool_result_suppress_ok(tool.as_deref()) {
+                    // quiet success → nothing; the diff block already shows the edit.
                 } else if tool_result_is_verbose(tool.as_deref()) {
                     lines.extend(monospace_block(content, RESULT_MAX_LINES, Color::Gray));
                 }
@@ -3286,6 +3288,13 @@ fn tool_call_style() -> Style {
 /// (Edit/Write/MultiEdit, MCP) → yes (we want to see what changed). Noisy
 /// command/query output (Bash, Read, Grep, …) → no (operator feedback). Errors
 /// bypass this entirely.
+/// Tools whose successful result JSON (e.g. `{"ok":true,"replacements":1}`) is
+/// noise — the compact call rendering already shows what changed. Only
+/// suppress on success; errors still surface.
+fn tool_result_suppress_ok(name: Option<&str>) -> bool {
+    matches!(name, Some("file_edit"))
+}
+
 fn tool_result_is_verbose(name: Option<&str>) -> bool {
     let Some(n) = name else {
         return false;
@@ -3592,15 +3601,7 @@ fn render_file_edit_call(name: &str, args: &str, width: usize) -> Option<Vec<Lin
         ),
         tool_call_style(),
     ))];
-    out.push(Line::from(Span::styled(
-        "--- old_string",
-        Style::default().fg(Color::DarkGray),
-    )));
     out.extend(diff_side_lines(old, '-', Color::Red, content_width));
-    out.push(Line::from(Span::styled(
-        "+++ new_string",
-        Style::default().fg(Color::DarkGray),
-    )));
     out.extend(diff_side_lines(new, '+', Color::Green, content_width));
     Some(out)
 }
@@ -3795,19 +3796,8 @@ fn compact_content_search_args(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     let mut parts = Vec::new();
     push_string_arg(obj, &mut parts, "pattern", "", true);
-    append_present_args(
-        obj,
-        &mut parts,
-        &[
-            "path",
-            "glob",
-            "mode",
-            "max_results",
-            "context_lines",
-            "case_insensitive",
-            "into",
-        ],
-    );
+    // Only show path when explicitly present (i.e. not cwd)
+    push_string_arg(obj, &mut parts, "path", "path", false);
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
@@ -3815,7 +3805,8 @@ fn compact_glob_args(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     let mut parts = Vec::new();
     push_string_arg(obj, &mut parts, "pattern", "", true);
-    append_present_args(obj, &mut parts, &["path", "sort", "max_results"]);
+    // Only show path when explicitly present (i.e. not cwd)
+    push_string_arg(obj, &mut parts, "path", "path", false);
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
@@ -4722,6 +4713,7 @@ mod tests {
 
     #[test]
     fn compact_tool_call_line_summarizes_content_search() {
+        // With path present: show pattern + path
         let line = compact_tool_call_line(
             "content_search",
             r#"{"pattern":"compact.*tool","path":"src","glob":"*.rs","max_results":20}"#,
@@ -4730,8 +4722,17 @@ mod tests {
         .unwrap();
         assert_eq!(
             line,
-            "▸ content_search(compact.*tool, path=src, glob=*.rs, max_results=20)"
+            "▸ content_search(compact.*tool, path=src)"
         );
+
+        // Without path: show only pattern
+        let line2 = compact_tool_call_line(
+            "content_search",
+            r#"{"pattern":"fn main","glob":"*.rs"}"#,
+            120,
+        )
+        .unwrap();
+        assert_eq!(line2, r#"▸ content_search("fn main")"#);
     }
 
     #[test]
@@ -4813,10 +4814,8 @@ mod tests {
             rendered,
             vec![
                 "▸ file_edit(src/a.rs)",
-                "--- old_string",
                 "- let x = 1;",
                 "- let y = 2;",
-                "+++ new_string",
                 "+ let x = 9;",
                 "+ let y = 2;",
             ]
