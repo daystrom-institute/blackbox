@@ -1109,8 +1109,14 @@ mod tests {
         let bf: Brofile = serde_json::from_str(src).expect("phase-decomposer edit brofile parses");
         assert_eq!(bf.name, "phase-decomposer-edit-implementer");
         assert_eq!(bf.provider, Provider::Codex);
-        assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
-        assert_eq!(bf.effort.as_deref(), Some("high"));
+        // Retiered to runtime allocation (commit 6ae3437): model/effort are no
+        // longer hardcoded; the brofile selects a "premium" runtime tier.
+        assert_eq!(bf.model, None);
+        assert_eq!(bf.effort, None);
+        assert_eq!(
+            bf.runtime.as_ref().and_then(|r| r.tier.as_deref()),
+            Some("premium")
+        );
         assert_eq!(
             bf.context.as_ref().and_then(|c| c.provider_defaults),
             Some(ProviderDefaultsMode::SuppressWhenSupported)
