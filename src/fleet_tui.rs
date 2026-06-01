@@ -1200,8 +1200,8 @@ fn stop_or_delete_selected(app: &mut App) {
     }
 }
 
-/// Begin renaming the selected roster agent: prefill the composer with the
-/// current name; Enter commits, Esc cancels (§5).
+/// Begin renaming the selected roster agent with a blank composer; Enter
+/// commits, Esc cancels (§5).
 fn start_rename(app: &mut App) {
     if app.zone == Zone::ProviderSelector {
         return;
@@ -1210,7 +1210,7 @@ fn start_rename(app: &mut App) {
         return;
     };
     app.rename_target = Some(idx);
-    app.input = app.agents[idx].name.clone();
+    app.input.clear();
     app.set_status("rename: edit + Enter (Esc cancels)", Duration::from_secs(4));
 }
 
