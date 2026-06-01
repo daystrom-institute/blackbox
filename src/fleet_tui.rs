@@ -335,6 +335,10 @@ struct App {
     transcript_y_range: Option<(u16, u16)>,
     last_transcript_height: u16,
 
+    /// True while the /help overlay is visible. Toggled by typing `/help`+Enter
+    /// or `?`; dismissed by Esc / any key.
+    help_visible: bool,
+
     status: Option<String>,
     status_until: Option<Instant>,
     quit: bool,
@@ -414,6 +418,7 @@ impl App {
             status: None,
             status_until: None,
             quit: false,
+            help_visible: false,
             rt,
             classifier_tx,
             classifier_rx,
@@ -970,6 +975,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 name: "/resume",
                 desc: "open an existing provider session id",
             },
+            SlashCmd {
+                name: "/help",
+                desc: "show keyboard shortcuts",
+            },
         ],
         Zone::SingleAgent => &[
             SlashCmd {
@@ -988,6 +997,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
                 name: "/rename",
                 desc: "rename this agent (TUI-local)",
             },
+            SlashCmd {
+                name: "/help",
+                desc: "show keyboard shortcuts",
+            },
         ],
         _ => &[
             SlashCmd {
@@ -997,6 +1010,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
             SlashCmd {
                 name: "/effort",
                 desc: "select effort for next dispatch",
+            },
+            SlashCmd {
+                name: "/help",
+                desc: "show keyboard shortcuts",
             },
         ],
     }
@@ -1260,6 +1277,11 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.quit = true;
         return;
     }
+    // Any key dismisses the /help overlay.
+    if app.help_visible {
+        app.help_visible = false;
+        return;
+    }
     // Ctrl+R renames the selected roster agent (§5).
     if ctrl && key.code == KeyCode::Char('r') {
         start_rename(app);
@@ -1309,6 +1331,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
     let editing = !app.input.is_empty();
 
     match key.code {
+        // `?` toggles the help overlay (when not typing).
+        KeyCode::Char('?') if app.input.is_empty() => {
+            app.help_visible = !app.help_visible;
+        }
         // Esc cancels a pending rename, else interrupts the running turn in the
         // single-agent view (§1.1), else quits. Ctrl+Q/Ctrl+C always quit.
         KeyCode::Esc if app.rename_target.is_some() => {
@@ -1547,8 +1573,17 @@ fn run_local_slash(app: &mut App) -> bool {
             resume_standalone(app, arg);
             true
         }
+        "/help" => {
+            show_help_overlay(app);
+            true
+        }
         _ => false,
     }
+}
+
+/// Toggle the `/help` overlay on.
+fn show_help_overlay(app: &mut App) {
+    app.help_visible = true;
 }
 
 fn forget_standalone_agents(app: &mut App, stop_running: bool) {
@@ -2027,7 +2062,6 @@ fn draw(f: &mut Frame, app: &mut App) {
         vec![
             Constraint::Min(0),                  // body
             Constraint::Length(composer_height), // composer
-            Constraint::Length(1),               // footer
         ]
     };
     let chunks = Layout::default()
@@ -2058,10 +2092,13 @@ fn draw(f: &mut Frame, app: &mut App) {
             .then(|| roster_composer_top_titles(app));
         let bottom_title = Some(Line::from(roster_status_spans(app, &views)));
         draw_composer(f, chunks[1], app, top_titles, bottom_title);
-        draw_help(f, chunks[2], app);
         if slash_active(app) {
             draw_slash_menu(f, chunks[1], app);
         }
+    }
+
+    if app.help_visible {
+        draw_help_overlay(f, app);
     }
 }
 
@@ -2109,6 +2146,66 @@ fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
     f.render_widget(block, area);
     let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     f.render_stateful_widget(list, inner, &mut state);
+}
+
+/// Centered popup overlay showing context-aware keyboard shortcuts.
+fn draw_help_overlay(f: &mut Frame, app: &App) {
+    let shortcut_lines: Vec<Line<'static>> = match app.zone {
+        Zone::Roster => vec![
+            Line::from("  ↑/↓           navigate agents"),
+            Line::from("  →             open agent (zoom in)"),
+            Line::from("  ←             provider selector"),
+            Line::from("  Ctrl+R        rename agent"),
+            Line::from("  Ctrl+X        stop / delete agent"),
+            Line::from("  Ctrl+Q        quit"),
+        ],
+        Zone::SingleAgent => vec![
+            Line::from("  ←             back to roster"),
+            Line::from("  Esc           interrupt running turn"),
+            Line::from("  Ctrl+X        stop / delete agent"),
+            Line::from("  ↑/↓           recall input history"),
+            Line::from("  Ctrl+Q        quit"),
+        ],
+        Zone::ProviderSelector => vec![
+            Line::from("  ↑/↓           cycle providers"),
+            Line::from("  Enter         confirm + home"),
+            Line::from("  →             confirm + home"),
+            Line::from("  ←             back (model selector)"),
+        ],
+        Zone::ModelSelector => vec![
+            Line::from("  ↑/↓           cycle models"),
+            Line::from("  Enter         confirm + home"),
+            Line::from("  →             confirm + home"),
+            Line::from("  ←             effort selector"),
+        ],
+        Zone::EffortSelector => vec![
+            Line::from("  ↑/↓           cycle efforts"),
+            Line::from("  Enter         confirm + home"),
+            Line::from("  →             back"),
+        ],
+    };
+    let h = (shortcut_lines.len() as u16 + 2).min(f.area().height);
+    let w = 42u16.min(f.area().width);
+    let area = centered_rect(w, h, f.area());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(Span::styled(
+            " shortcuts — Esc to dismiss ",
+            Style::default().fg(Color::Cyan),
+        ));
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let para = Paragraph::new(shortcut_lines).style(Style::default().fg(Color::White));
+    f.render_widget(para, inner);
+}
+
+/// Return a `Rect` centered in `r` with the given width and height.
+fn centered_rect(width: u16, height: u16, r: Rect) -> Rect {
+    let x = r.x + (r.width.saturating_sub(width)) / 2;
+    let y = r.y + (r.height.saturating_sub(height)) / 2;
+    Rect::new(x, y, width, height)
 }
 
 /// Last two path components (keeps status flashes readable on one line).
@@ -2276,7 +2373,7 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         .launch_cwd
         .as_deref()
         .map(path_name)
-        .unwrap_or_else(|| "fleet".to_string());
+        .unwrap_or_else(|| "agents".to_string());
 
     let mut spans = vec![
         Span::styled(format!(" {project} "), byline),
@@ -4446,22 +4543,6 @@ fn draw_composer(
             .scroll((scroll_y, 0)),
         padded,
     );
-}
-
-fn draw_help(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let nav = match app.zone {
-        Zone::EffortSelector => "↑/↓ effort  Enter confirm  → back",
-        Zone::ModelSelector => "↑/↓ model  Enter confirm  ← effort  → back",
-        Zone::ProviderSelector => "↑/↓ provider  Enter confirm  ← model  → confirm",
-        Zone::Roster => "↑/↓ agent  → open  ← provider  Ctrl+R rename  Ctrl+X stop/del",
-        Zone::SingleAgent => "← roster  Esc interrupt  Ctrl+X stop/del  ↑/↓ history",
-    };
-    spans.push(Span::styled(
-        format!("{nav}  ·  Ctrl+Q quit"),
-        Style::default().fg(Color::DarkGray),
-    ));
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
