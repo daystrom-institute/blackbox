@@ -247,15 +247,27 @@ fn exit_worktree(cx_root: &Path, args: ExitWorktreeInput) -> anyhow::Result<Valu
             if !args.confirm {
                 anyhow::bail!("publish requires confirm=true");
             }
+            let changed = changed_paths(&worktree)?;
+            if changed.is_empty() {
+                // A clean worktree whose branch already carries commits is the
+                // commit-then-close-out path: publish has nothing to stage, but
+                // the work is not lost — adopt folds the existing branch commits
+                // into main. Signpost it rather than dead-ending the agent.
+                let ahead = branch_ahead_count(&base_repo, &branch).unwrap_or(0);
+                if ahead > 0 {
+                    anyhow::bail!(
+                        "publish found no uncommitted changes, but branch {branch} is already \
+                         {ahead} commit(s) ahead of main; use disposition=adopt (or merge) to fold \
+                         the committed branch into main and close out the worktree"
+                    );
+                }
+                anyhow::bail!("publish found no changed paths to commit");
+            }
             let message = args
                 .commit_message
                 .as_deref()
                 .filter(|m| !m.trim().is_empty())
                 .ok_or_else(|| anyhow::anyhow!("publish requires commit_message"))?;
-            let changed = changed_paths(&worktree)?;
-            if changed.is_empty() {
-                anyhow::bail!("publish found no changed paths to commit");
-            }
             ensure_base_ready_for_publish(&base_repo)?;
             git_run(&base_repo, &["fetch", "origin", "main"])?;
             git_run(&base_repo, &["merge", "--ff-only", "origin/main"])?;
@@ -830,6 +842,48 @@ mod tests {
 
         assert_eq!(report["ok"], false);
         assert_eq!(report["unsafe_paths"], json!(["../outside"]));
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(value["worktree_root"].as_str().unwrap())).ok();
+    }
+
+    #[tokio::test]
+    async fn exit_publish_on_clean_committed_branch_signposts_adopt() {
+        let repo = seed_repo();
+        let value = enter_test_worktree(repo.path()).await;
+        let cwd = PathBuf::from(value["cwd"].as_str().unwrap());
+        // Commit-then-close-out: a clean worktree whose branch is ahead of main.
+        std::fs::write(cwd.join("README.md"), "base\ncommitted\n").unwrap();
+        run_git(&cwd, &["add", "README.md"]);
+        run_git(&cwd, &["commit", "-m", "worktree commit"]);
+
+        let tool = ExitWorktree;
+        let result = tool
+            .call(
+                json!({
+                    "worktree": cwd,
+                    "disposition": "publish",
+                    "confirm": true,
+                    "commit_message": "ignored — nothing left to commit"
+                }),
+                &cx(&cwd),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(is_error, "publish should refuse a clean committed branch");
+        assert!(
+            content.contains("adopt"),
+            "error should signpost disposition=adopt; got: {content}"
+        );
+        assert!(
+            content.contains("ahead of main"),
+            "error should report the branch is ahead of main; got: {content}"
+        );
+        // Refusal must not mutate: the worktree is still on disk.
+        assert!(cwd.exists());
 
         run_git(
             repo.path(),
