@@ -1,12 +1,12 @@
 ---
 title: "Fleet TUI — standalone single-agent view (v2, backlog)"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - fleet-tui
   - surfaces
-brief: "A standalone shell that launches the harness directly into the reusable single-agent view component (transcript + steering composer + header) with no roster and no fleet chrome. The only context where /clear (fresh session) and a dedicated-view /resume are meaningful. Reuses the §5.4 component with no new model; deferred to v2 because the v1 win is multi-agent management."
+brief: "A standalone shell that launches the harness directly into the reusable single-agent view component (transcript + steering composer + header) with no roster and no fleet chrome. The only context where /clear (fresh session) and a dedicated-view /resume are meaningful. Reuses the §5.4 component with no new model; partially implemented as bro agent, pending runtime UX soak before promotion to as-built."
 ---
 
 # Fleet TUI — standalone single-agent view (v2, backlog)
@@ -16,9 +16,16 @@ brief: "A standalone shell that launches the harness directly into the reusable 
 
 ## Status / gate
 
-**Deferred to v2.** The v1 win is **multi-agent management** (the fleet). The
-standalone single-agent shell is a secondary surface; it reuses the same view
-component, so it adds no new model — just a different entry/launch shape.
+**Partially implemented.** `bro agent` now opens the reusable single-agent TUI
+component with no roster/fleet chrome, supports launch-time provider / model /
+effort / cwd / resume flags, and implements standalone `/clear` + `/resume`.
+The remaining gate is runtime UX soak against real provider sessions before
+promoting this from backlog to an as-built record.
+
+Historical note: this was originally deferred to v2 because the v1 win was
+**multi-agent management** (the fleet). The standalone single-agent shell is a
+secondary surface; it reuses the same view component, so it adds no new model —
+just a different entry/launch shape.
 
 ## The shape
 

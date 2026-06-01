@@ -31,6 +31,12 @@ This page is the **nav waypoint** — start here, then follow a link.
 - [Window-0 diagnostics surfacing — Phase 1](fleet-window0-diagnostics-surfacing.md)
   — distinct rider rendering in the single-agent transcript.
 
+## In flight / partial
+
+- [Standalone single-agent view](backlog-standalone-view.md) — `bro agent` now
+  launches directly into the single-agent component with no roster/fleet chrome;
+  remaining work is runtime UX soak before promoting to as-built.
+
 ## Backlog (proposed — pick this up)
 
 - [Builtin-tool rendering & roster UX polish](backlog-ux-polish.md) — animated

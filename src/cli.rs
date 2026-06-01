@@ -24,6 +24,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use blackbox::config;
+use blackbox::fleet::Provider;
 
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{
@@ -92,6 +93,8 @@ enum BroCommand {
     Council(CouncilArgs),
     /// Fleet cockpit — dispatch and live-drive many top-level agents
     Fleet(FleetArgs),
+    /// Single-agent cockpit — launch one agent into the Fleet transcript view
+    Agent(AgentArgs),
 }
 
 #[derive(Debug, Args)]
@@ -100,6 +103,29 @@ struct FleetArgs {
     /// cockpit's launch cwd.
     #[arg(long, value_name = "DIR")]
     cwd: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct AgentArgs {
+    /// Working directory for the agent. Defaults to the shell's launch cwd.
+    #[arg(long, value_name = "DIR")]
+    cwd: Option<String>,
+    /// Provider to launch. Defaults to brodex, matching bro fleet.
+    #[arg(long, default_value = "brodex")]
+    provider: Provider,
+    /// Provider model id/alias. Defaults to the provider catalog default.
+    #[arg(long)]
+    model: Option<String>,
+    /// Provider effort/thinking level. Defaults to the provider catalog default.
+    #[arg(long)]
+    effort: Option<String>,
+    /// Resume an existing provider session id instead of starting a fresh one.
+    #[arg(long, value_name = "SESSION_ID")]
+    resume: Option<String>,
+    /// Optional first prompt / resume turn. If omitted, the TUI opens empty and
+    /// dispatches or resumes when you submit the first composer line.
+    #[arg(value_name = "PROMPT", trailing_var_arg = true)]
+    prompt: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1441,6 +1467,20 @@ fn main() -> anyhow::Result<()> {
             drop(rt);
             return result;
         }
+        BroCommand::Agent(args) => {
+            let prompt = (!args.prompt.is_empty()).then(|| args.prompt.join(" "));
+            let launch = fleet_tui::AgentLaunch {
+                cwd: args.cwd,
+                provider: args.provider,
+                model: args.model,
+                effort: args.effort,
+                resume: args.resume,
+                prompt,
+            };
+            let result = rt.block_on(fleet_tui::run_agent(launch));
+            drop(rt);
+            return result;
+        }
     };
 
     let roster = match rt.block_on(fetch_roster(sel.clone())) {
@@ -2384,5 +2424,41 @@ mod tests {
         };
         let sel = TailSelectors::from(args);
         assert_eq!(sel.bros, vec!["red::reviewer"]);
+    }
+
+    #[test]
+    fn clap_parses_agent_launch_args() {
+        let cli = BroCli::parse_from([
+            "bro",
+            "agent",
+            "--provider",
+            "claude",
+            "--model",
+            "sonnet",
+            "--effort",
+            "high",
+            "--cwd",
+            "/tmp/project",
+            "write",
+            "tests",
+        ]);
+        let BroCommand::Agent(args) = cli.command else {
+            panic!("expected Agent command");
+        };
+        assert_eq!(args.provider, Provider::Claude);
+        assert_eq!(args.model.as_deref(), Some("sonnet"));
+        assert_eq!(args.effort.as_deref(), Some("high"));
+        assert_eq!(args.cwd.as_deref(), Some("/tmp/project"));
+        assert_eq!(args.prompt, vec!["write", "tests"]);
+    }
+
+    #[test]
+    fn clap_agent_defaults_to_brodex() {
+        let cli = BroCli::parse_from(["bro", "agent"]);
+        let BroCommand::Agent(args) = cli.command else {
+            panic!("expected Agent command");
+        };
+        assert_eq!(args.provider, Provider::Brodex);
+        assert!(args.prompt.is_empty());
     }
 }

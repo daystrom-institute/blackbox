@@ -10,6 +10,9 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bro agent` standalone single-agent cockpit: a one-agent shell that reuses the
+  Fleet TUI transcript/composer component without roster chrome, with provider /
+  model / effort / cwd launch flags plus standalone `/clear` and `/resume`.
 - `bro-harness` custom provider harness (`crates/bro-harness`,
   `crates/bro-tools`): a headless coding agent that speaks provider APIs
   directly behind one `Transport` interface (Anthropic Messages, OpenAI

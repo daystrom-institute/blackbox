@@ -244,11 +244,49 @@ enum Zone {
     SingleAgent,
 }
 
+#[derive(Debug, Clone)]
+enum AppMode {
+    Fleet,
+    Standalone { pending_resume: Option<String> },
+}
+
+impl AppMode {
+    fn is_standalone(&self) -> bool {
+        matches!(self, AppMode::Standalone { .. })
+    }
+
+    fn pending_resume(&self) -> Option<&str> {
+        match self {
+            AppMode::Standalone { pending_resume } => pending_resume.as_deref(),
+            AppMode::Fleet => None,
+        }
+    }
+
+    fn set_pending_resume(&mut self, session_id: Option<String>) {
+        if let AppMode::Standalone { pending_resume } = self {
+            *pending_resume = session_id;
+        }
+    }
+}
+
+/// Launch settings for `bro agent`, the standalone single-agent shell extracted
+/// from the Fleet TUI's reusable single-agent view component.
+#[derive(Debug, Clone)]
+pub struct AgentLaunch {
+    pub cwd: Option<String>,
+    pub provider: Provider,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub resume: Option<String>,
+    pub prompt: Option<String>,
+}
+
 // ── App state ──────────────────────────────────────────────────────────────
 
 struct App {
     orch: Arc<FleetOrchestrator>,
     agents: Vec<Agent>,
+    mode: AppMode,
 
     zone: Zone,
     /// Index into the bucket-ordered agent list (see [`ordered_agents`]).
@@ -319,6 +357,15 @@ impl App {
         launch_cwd: Option<String>,
         rt: tokio::runtime::Handle,
     ) -> Self {
+        Self::new_with_mode(orch, launch_cwd, rt, AppMode::Fleet)
+    }
+
+    fn new_with_mode(
+        orch: Arc<FleetOrchestrator>,
+        launch_cwd: Option<String>,
+        rt: tokio::runtime::Handle,
+        mode: AppMode,
+    ) -> Self {
         let (classifier_tx, classifier_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
         let provider_cursor = default_fleet_provider_cursor();
@@ -335,6 +382,7 @@ impl App {
         Self {
             orch,
             agents: Vec::new(),
+            mode,
             zone: Zone::Roster,
             roster_selected: 0,
             focused_agent_id: None,
@@ -408,11 +456,15 @@ impl App {
     }
 
     fn selected_agent(&self) -> Option<usize> {
-        if self.zone == Zone::SingleAgent
-            && let Some(id) = &self.focused_agent_id
-            && let Some(idx) = self.agents.iter().position(|a| a.task.id() == *id)
-        {
-            return Some(idx);
+        if self.zone == Zone::SingleAgent {
+            if let Some(id) = &self.focused_agent_id
+                && let Some(idx) = self.agents.iter().position(|a| a.task.id() == *id)
+            {
+                return Some(idx);
+            }
+            if self.mode.is_standalone() && self.agents.len() == 1 {
+                return Some(0);
+            }
         }
         let (_, order) = self.ordered_agents();
         order.get(self.roster_selected).copied()
@@ -426,88 +478,170 @@ impl App {
     }
 
     fn dispatch_current_input(&mut self) {
-        let prompt = self.input.trim().to_string();
-        if prompt.is_empty() {
+        dispatch_current_input_for_mode(self, DispatchMode::Fleet)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DispatchMode {
+    Fleet,
+    Standalone,
+}
+
+fn dispatch_current_input_for_mode(app: &mut App, mode: DispatchMode) {
+    let prompt = app.input.trim().to_string();
+    if prompt.is_empty() {
+        return;
+    }
+    let name = truncate(&prompt, NAME_LEN);
+
+    match mode {
+        DispatchMode::Fleet => dispatch_fleet_prompt(app, prompt, name),
+        DispatchMode::Standalone => dispatch_standalone_prompt(app, prompt, name),
+    }
+}
+
+fn launch_standalone_current_input(app: &mut App) {
+    dispatch_current_input_for_mode(app, DispatchMode::Standalone);
+}
+
+fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
+    let worktree = match prepare_dispatch_worktree(&app.orch, app.launch_cwd.as_deref(), &prompt) {
+        Ok(worktree) => worktree,
+        Err(e) => {
+            app.set_status(
+                format!("worktree isolation failed: {e}"),
+                Duration::from_secs(8),
+            );
             return;
         }
-        let name = truncate(&prompt, NAME_LEN);
-        let worktree =
-            match prepare_dispatch_worktree(&self.orch, self.launch_cwd.as_deref(), &prompt) {
-                Ok(worktree) => worktree,
-                Err(e) => {
-                    self.set_status(
-                        format!("worktree isolation failed: {e}"),
-                        Duration::from_secs(8),
-                    );
-                    return;
-                }
-            };
+    };
 
-        // Classifier companion: if enabled, prepend the intern rider to the
-        // executor's first turn ONLY when suggestions will actually be relayed
-        // (classifier present AND auto_send). Gating on both keeps observe-only
-        // runs from telling the executor about an intern whose voice never
-        // appears — which would confuse a future agent reading the transcript.
-        let classifier_cfg = self.orch.classifier().cloned();
-        let frame_executor = classifier_cfg
-            .as_ref()
-            .is_some_and(|c| c.auto_send_resolved());
-        let mut dispatch_prompt = String::new();
-        dispatch_prompt.push_str(&worktree.grounding);
+    // Classifier companion: if enabled, prepend the intern rider to the
+    // executor's first turn ONLY when suggestions will actually be relayed
+    // (classifier present AND auto_send). Gating on both keeps observe-only
+    // runs from telling the executor about an intern whose voice never
+    // appears — which would confuse a future agent reading the transcript.
+    let classifier_cfg = app.orch.classifier().cloned();
+    let frame_executor = classifier_cfg
+        .as_ref()
+        .is_some_and(|c| c.auto_send_resolved());
+    let mut dispatch_prompt = String::new();
+    dispatch_prompt.push_str(&worktree.grounding);
+    dispatch_prompt.push_str("\n\n");
+    if frame_executor {
+        dispatch_prompt.push_str(&intern_rider());
         dispatch_prompt.push_str("\n\n");
-        if frame_executor {
-            dispatch_prompt.push_str(&intern_rider());
-            dispatch_prompt.push_str("\n\n");
-        }
-        dispatch_prompt.push_str(&prompt);
-
-        let mut spec = DispatchSpec::new(self.next_provider, dispatch_prompt);
-        spec.cwd = Some(worktree.cwd.clone());
-        spec.model = self.next_model.clone();
-        spec.effort = self.next_effort.clone();
-        spec.env_overrides = worktree.env_overrides.clone();
-        spec.name = Some(name.clone());
-        let task = self.orch.dispatch(spec);
-        let id = task.id();
-
-        // Spawn the watching intern for this executor.
-        let classifier = classifier_cfg.map(|cfg| {
-            spawn_monitor(
-                &self.rt,
-                self.orch.clone(),
-                task.clone(),
-                name.clone(),
-                cfg,
-                self.classifier_tx.clone(),
-            )
-        });
-
-        self.agents.push(Agent {
-            task,
-            classifier,
-            provider: self.next_provider,
-            selected_model: self.next_model.clone(),
-            selected_effort: self.next_effort.clone(),
-            selected_cwd: Some(worktree.project_cwd.clone()),
-            name,
-            // Display the operator's own prompt, not the rider-wrapped first turn.
-            input_history: vec![prompt],
-            pending_inputs: VecDeque::new(),
-            seen_user_steers: 0,
-        });
-        self.input.clear();
-        // Persist so the session is recoverable even before it terminates.
-        self.orch.persist();
-        self.set_status(
-            format!(
-                "dispatched {} agent {} in {}",
-                self.next_provider,
-                &id[..8.min(id.len())],
-                path_tail(&worktree.cwd)
-            ),
-            Duration::from_secs(3),
-        );
     }
+    dispatch_prompt.push_str(&prompt);
+
+    let mut spec = DispatchSpec::new(app.next_provider, dispatch_prompt);
+    spec.cwd = Some(worktree.cwd.clone());
+    spec.model = app.next_model.clone();
+    spec.effort = app.next_effort.clone();
+    spec.env_overrides = worktree.env_overrides.clone();
+    spec.name = Some(name.clone());
+    let task = app.orch.dispatch(spec);
+    let id = task.id();
+
+    // Spawn the watching intern for this executor.
+    let classifier = classifier_cfg.map(|cfg| {
+        spawn_monitor(
+            &app.rt,
+            app.orch.clone(),
+            task.clone(),
+            name.clone(),
+            cfg,
+            app.classifier_tx.clone(),
+        )
+    });
+
+    app.agents.push(Agent {
+        task,
+        classifier,
+        provider: app.next_provider,
+        selected_model: app.next_model.clone(),
+        selected_effort: app.next_effort.clone(),
+        selected_cwd: Some(worktree.project_cwd.clone()),
+        name,
+        // Display the operator's own prompt, not the rider-wrapped first turn.
+        input_history: vec![prompt],
+        pending_inputs: VecDeque::new(),
+        seen_user_steers: 0,
+    });
+    app.input.clear();
+    // Persist so the session is recoverable even before it terminates.
+    app.orch.persist();
+    app.set_status(
+        format!(
+            "dispatched {} agent {} in {}",
+            app.next_provider,
+            &id[..8.min(id.len())],
+            path_tail(&worktree.cwd)
+        ),
+        Duration::from_secs(3),
+    );
+}
+
+fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: String) {
+    let cwd = app.launch_cwd.clone().or_else(|| {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.display().to_string())
+    });
+    let pending_resume = app.mode.pending_resume().map(str::to_string);
+    forget_standalone_agents(app, true);
+
+    let task = if let Some(session_id) = pending_resume.clone() {
+        let mut spec = ResumeSpec::new(app.next_provider, session_id, prompt.clone());
+        spec.cwd = cwd.clone();
+        spec.model = app.next_model.clone();
+        spec.effort = app.next_effort.clone();
+        spec.name = Some(name.clone());
+        app.orch.resume(spec)
+    } else {
+        let mut spec = DispatchSpec::new(app.next_provider, prompt.clone());
+        spec.cwd = cwd.clone();
+        spec.model = app.next_model.clone();
+        spec.effort = app.next_effort.clone();
+        spec.name = Some(name.clone());
+        app.orch.dispatch(spec)
+    };
+    let id = task.id();
+
+    app.mode.set_pending_resume(None);
+    app.agents.clear();
+    app.agents.push(Agent {
+        task,
+        classifier: None,
+        provider: app.next_provider,
+        selected_model: app.next_model.clone(),
+        selected_effort: app.next_effort.clone(),
+        selected_cwd: cwd.clone(),
+        name,
+        input_history: vec![prompt],
+        pending_inputs: VecDeque::new(),
+        seen_user_steers: 0,
+    });
+    app.focused_agent_id = Some(id.clone());
+    app.zone = Zone::SingleAgent;
+    app.input.clear();
+    app.history_cursor = None;
+    app.scroll_from_bottom = 0;
+    app.orch.persist();
+    let verb = if pending_resume.is_some() {
+        "resumed"
+    } else {
+        "started"
+    };
+    app.set_status(
+        format!(
+            "{verb} {} agent {}",
+            app.next_provider,
+            &id[..8.min(id.len())]
+        ),
+        Duration::from_secs(3),
+    );
 }
 
 #[derive(Debug, Clone)]
@@ -788,10 +922,37 @@ struct SlashCmd {
     desc: &'static str,
 }
 
-/// Slash commands available in a given zone. Single-agent has the steering
-/// commands; the dispatch composer has none (a leading `/` is a literal prompt).
-fn zone_slash_commands(zone: Zone) -> &'static [SlashCmd] {
-    match zone {
+/// Slash commands available in the current surface. Single-agent has steering
+/// commands; standalone single-agent adds lifecycle commands; the dispatch
+/// composer has none (a leading `/` is a literal prompt).
+fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
+    match app.zone {
+        Zone::SingleAgent if app.mode.is_standalone() => &[
+            SlashCmd {
+                name: "/model",
+                desc: "select model for this agent",
+            },
+            SlashCmd {
+                name: "/effort",
+                desc: "select effort for this agent",
+            },
+            SlashCmd {
+                name: "/compact",
+                desc: "summarize & compact the conversation",
+            },
+            SlashCmd {
+                name: "/rename",
+                desc: "rename this agent (TUI-local)",
+            },
+            SlashCmd {
+                name: "/clear",
+                desc: "clear this shell and start a fresh session",
+            },
+            SlashCmd {
+                name: "/resume",
+                desc: "open an existing provider session id",
+            },
+        ],
         Zone::SingleAgent => &[
             SlashCmd {
                 name: "/model",
@@ -825,7 +986,7 @@ fn zone_slash_commands(zone: Zone) -> &'static [SlashCmd] {
 
 /// Completions whose name has the current composer token as a prefix.
 fn filtered_slash(app: &App) -> Vec<&'static SlashCmd> {
-    zone_slash_commands(app.zone)
+    zone_slash_commands(app)
         .iter()
         .filter(|c| c.name.starts_with(app.input.as_str()))
         .collect()
@@ -911,7 +1072,57 @@ pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
     result
 }
 
+pub async fn run_agent(launch: AgentLaunch) -> anyhow::Result<()> {
+    let orch = Arc::new(FleetOrchestrator::from_agent_config()?);
+    let mut app = App::new_with_mode(
+        orch.clone(),
+        launch.cwd.clone(),
+        tokio::runtime::Handle::current(),
+        AppMode::Standalone {
+            pending_resume: launch.resume,
+        },
+    );
+    set_next_provider(&mut app, launch.provider);
+    if let Some(model) = launch.model {
+        app.next_model = Some(model);
+    }
+    if let Some(effort) = launch.effort {
+        app.next_effort = Some(effort);
+    }
+    app.zone = Zone::SingleAgent;
+    app.focused_agent_id = None;
+    if let Some(prompt) = launch.prompt {
+        app.input = prompt;
+        launch_standalone_current_input(&mut app);
+    }
+
+    let (tx, rx) = mpsc::channel::<TailEvent>();
+    let mut sub = orch.subscribe();
+    let forward = tokio::spawn(async move {
+        while let Ok(ev) = sub.recv().await {
+            if tx.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+
+    let result = run_tui(&mut app, rx);
+    forward.abort();
+    orch.persist();
+    result
+}
+
 fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
+    let result = run_tui_inner(app, signals);
+    if app.mode.is_standalone() {
+        forget_standalone_agents(app, true);
+        app.agents.clear();
+        app.orch.persist();
+    }
+    result
+}
+
+fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -1260,6 +1471,8 @@ fn submit(app: &mut App) {
                 }
                 app.input.clear();
                 app.set_status("renamed", Duration::from_secs(2));
+            } else if app.mode.is_standalone() && app.agents.is_empty() {
+                launch_standalone_current_input(app);
             } else {
                 steer_selected(app);
             }
@@ -1284,7 +1497,65 @@ fn run_local_slash(app: &mut App) -> bool {
             select_effort(app, arg);
             true
         }
+        "/clear" if app.mode.is_standalone() => {
+            clear_standalone(app);
+            true
+        }
+        "/resume" if app.mode.is_standalone() => {
+            resume_standalone(app, arg);
+            true
+        }
         _ => false,
+    }
+}
+
+fn forget_standalone_agents(app: &mut App, stop_running: bool) {
+    for agent in &app.agents {
+        let id = agent.task.id();
+        if stop_running && agent.task.snapshot().status == TaskStatus::Running {
+            let _ = app.orch.stop(&agent.task);
+        }
+        app.orch.forget(&id);
+    }
+}
+
+fn clear_standalone(app: &mut App) {
+    forget_standalone_agents(app, true);
+    app.agents.clear();
+    app.focused_agent_id = None;
+    app.mode.set_pending_resume(None);
+    app.input.clear();
+    app.history_cursor = None;
+    app.scroll_from_bottom = 0;
+    app.orch.persist();
+    app.set_status(
+        "cleared — next input starts a fresh session",
+        Duration::from_secs(4),
+    );
+}
+
+fn resume_standalone(app: &mut App, arg: &str) {
+    let arg = arg.trim();
+    if arg.is_empty() {
+        app.set_status("usage: /resume <session_id> [turn]", Duration::from_secs(4));
+        app.input.clear();
+        return;
+    }
+    let (session_id, prompt) = arg.split_once(char::is_whitespace).unwrap_or((arg, ""));
+    app.mode.set_pending_resume(Some(session_id.to_string()));
+    if prompt.trim().is_empty() {
+        forget_standalone_agents(app, true);
+        app.agents.clear();
+        app.focused_agent_id = None;
+        app.input.clear();
+        app.history_cursor = None;
+        app.set_status(
+            format!("resume target set: {session_id}; type a turn to open it"),
+            Duration::from_secs(5),
+        );
+    } else {
+        app.input = prompt.trim().to_string();
+        launch_standalone_current_input(app);
     }
 }
 
@@ -1505,6 +1776,9 @@ where
 }
 
 fn zoom_left(app: &mut App) {
+    if app.mode.is_standalone() && app.zone == Zone::SingleAgent {
+        return;
+    }
     if app.zone == Zone::SingleAgent {
         if let Some(id) = app.focused_agent_id.as_deref()
             && let Some(pos) = app.roster_position_for_agent_id(id)
@@ -1572,6 +1846,9 @@ fn sync_effort_cursor(app: &mut App) {
 }
 
 fn zoom_right(app: &mut App) {
+    if app.mode.is_standalone() && app.zone == Zone::SingleAgent {
+        return;
+    }
     match app.zone {
         Zone::EffortSelector => {
             // Commit effort + model + provider and jump home.
@@ -2469,6 +2746,34 @@ fn draw_effort_selector(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView]) {
     let Some(idx) = app.selected_agent() else {
+        app.transcript_y_range = Some((area.y, area.y.saturating_add(area.height)));
+        app.last_transcript_height = area.height;
+        if app.mode.is_standalone() {
+            let target = app
+                .mode
+                .pending_resume()
+                .map(|id| format!("resume session {id}"))
+                .unwrap_or_else(|| "start a fresh session".to_string());
+            let provider = next_tuple(app);
+            let lines = vec![
+                Line::from(Span::styled(
+                    "bro agent",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(format!("Type a prompt and press Enter to {target}.")),
+                Line::from(format!("Next: {provider}")),
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Slash commands: /model, /effort, /resume <session_id> [turn], /clear",
+                    Style::default().fg(Color::DarkGray),
+                )),
+            ];
+            f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+            return;
+        }
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
         app.focused_agent_id = None;

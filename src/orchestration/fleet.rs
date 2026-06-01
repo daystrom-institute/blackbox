@@ -941,8 +941,19 @@ impl FleetOrchestrator {
     /// `Running` tasks come back as recoverable (Interrupted, §5). This is why
     /// historical sessions survive a cockpit reload.
     pub fn from_config() -> anyhow::Result<Self> {
+        Self::from_config_store("fleet")
+    }
+
+    /// Build from the resolved blackbox config for the standalone `bro agent`
+    /// shell. It uses a separate task-store subdirectory so one-off single-agent
+    /// sessions do not appear in the fleet roster.
+    pub fn from_agent_config() -> anyhow::Result<Self> {
+        Self::from_config_store("agent")
+    }
+
+    fn from_config_store(store_name: &str) -> anyhow::Result<Self> {
         let cfg = crate::config::load()?;
-        let store_dir = cfg.paths.bro_home.join("fleet");
+        let store_dir = cfg.paths.bro_home.join(store_name);
         // No age-based eviction: the cockpit's model is manual cleanup (§5), so
         // historical sessions persist until explicitly deleted, not by TTL.
         let store = TaskStore::load(&store_dir, u64::MAX);
