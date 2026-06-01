@@ -2997,8 +2997,8 @@ fn compact_tool_call_line(name: &str, args: &str, width: usize) -> Option<String
 }
 
 fn compact_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
-    if tool == "shell_run" {
-        return compact_shell_run_args(value);
+    if let Some(rendered) = compact_builtin_tool_args(tool, value) {
+        return Some(rendered);
     }
     match value {
         serde_json::Value::Object(map) => {
@@ -3030,6 +3030,41 @@ fn compact_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
     }
 }
 
+fn compact_builtin_tool_args(tool: &str, value: &serde_json::Value) -> Option<String> {
+    match tool {
+        "shell_run" => compact_shell_run_args(value),
+        "shell_poll" => compact_shell_poll_args(value),
+        "shell_kill" => compact_shell_kill_args(value),
+        "file_write" => compact_file_write_args(value),
+        "content_search" => compact_content_search_args(value),
+        "glob" => compact_glob_args(value),
+        "web_fetch" => compact_web_fetch_args(value),
+        "git_diff" => compact_named_args(value, &["include_untracked"]),
+        "git_show" => compact_named_args(value, &["rev"]),
+        "git_commit" => compact_named_args(value, &["paths", "message"]),
+        "clip_yank" => compact_clip_yank_args(value),
+        "clip_paste" => compact_clip_paste_args(value),
+        "clip_set" => compact_clip_set_args(value),
+        "clip_peek" => compact_named_args(value, &["register", "max_lines"]),
+        "clip_clear" => compact_named_args(value, &["register"]),
+        "clip_transform" => compact_clip_transform_args(value),
+        "clip_slice" => compact_clip_slice_args(value),
+        "clip_grep" => compact_clip_grep_args(value),
+        "enter_worktree" => compact_named_args(value, &["purpose", "base", "branch_prefix"]),
+        "exit_worktree" => compact_named_args(
+            value,
+            &[
+                "worktree",
+                "disposition",
+                "paths",
+                "commit_message",
+                "confirm",
+            ],
+        ),
+        _ => None,
+    }
+}
+
 fn compact_shell_run_args(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     let cmd = obj
@@ -3042,9 +3077,315 @@ fn compact_shell_run_args(value: &serde_json::Value) -> Option<String> {
         .or_else(|| obj.get("workdir"))
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty());
-    match cwd {
-        Some(cwd) => Some(format!("cwd: {}, cmd: {cmd}", compact_string_arg(cwd))),
-        None => Some(format!("cmd: {cmd}")),
+    let mut parts = Vec::new();
+    if let Some(cwd) = cwd {
+        parts.push(format!("cwd: {}", compact_string_arg(cwd)));
+    }
+    parts.push(format!("cmd: {cmd}"));
+    append_present_args(
+        obj,
+        &mut parts,
+        &[
+            "timeout_ms",
+            "yield_time_ms",
+            "max_output_tokens",
+            "stdout_to",
+            "stdin_from",
+        ],
+    );
+    if let Some(stdin) = obj.get("stdin").and_then(|v| v.as_str()) {
+        parts.push(format!("stdin={}", compact_text_summary(stdin)));
+    }
+    if let Some(env) = obj.get("env").and_then(|v| v.as_object())
+        && !env.is_empty()
+    {
+        parts.push(format!("env={} vars", env.len()));
+    }
+    Some(parts.join(", "))
+}
+
+fn compact_shell_poll_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "session_id", "session", false);
+    append_present_args(
+        obj,
+        &mut parts,
+        &[
+            "signal",
+            "yield_time_ms",
+            "max_output_tokens",
+            "close_stdin",
+        ],
+    );
+    if let Some(stdin) = obj.get("stdin").and_then(|v| v.as_str()) {
+        parts.push(format!("stdin={}", compact_text_summary(stdin)));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_shell_kill_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "session_id", "session", false);
+    append_present_args(
+        obj,
+        &mut parts,
+        &["signal", "grace_ms", "max_output_tokens"],
+    );
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_file_write_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "file_path", "", true);
+    if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+        parts.push(format!("content={}", compact_text_summary(content)));
+    }
+    push_string_arg(obj, &mut parts, "from", "from", false);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_content_search_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "pattern", "", true);
+    append_present_args(
+        obj,
+        &mut parts,
+        &[
+            "path",
+            "glob",
+            "mode",
+            "max_results",
+            "context_lines",
+            "case_insensitive",
+            "into",
+        ],
+    );
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_glob_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "pattern", "", true);
+    append_present_args(obj, &mut parts, &["path", "sort", "max_results"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_web_fetch_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "url", "", true);
+    append_present_args(obj, &mut parts, &["max_chars", "into"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_clip_yank_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "source", "", true);
+    push_range_arg(obj, &mut parts, "source_range", "range");
+    append_present_args(obj, &mut parts, &["register", "append"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_clip_paste_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_string_arg(obj, &mut parts, "target", "", true);
+    push_insert_arg(obj, &mut parts, "insert");
+    append_present_args(
+        obj,
+        &mut parts,
+        &["register", "count", "confirm", "expected_sha256"],
+    );
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_clip_set_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
+        parts.push(format!("text={}", compact_text_summary(text)));
+    }
+    append_present_args(obj, &mut parts, &["register", "append"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_clip_transform_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_source_arg(obj, &mut parts);
+    push_string_arg(obj, &mut parts, "jq", "jq", false);
+    append_present_args(obj, &mut parts, &["into"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_clip_slice_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_source_arg(obj, &mut parts);
+    push_range_arg(obj, &mut parts, "range", "range");
+    append_present_args(obj, &mut parts, &["into"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_clip_grep_args(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    push_source_arg(obj, &mut parts);
+    push_string_arg(obj, &mut parts, "pattern", "", true);
+    append_present_args(obj, &mut parts, &["case_insensitive", "invert", "into"]);
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+fn compact_named_args(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    let obj = value.as_object()?;
+    let mut parts = Vec::new();
+    append_present_args(obj, &mut parts, keys);
+    Some(parts.join(", "))
+}
+
+fn push_source_arg(obj: &serde_json::Map<String, serde_json::Value>, parts: &mut Vec<String>) {
+    if push_string_arg(obj, parts, "file", "file", false) {
+        return;
+    }
+    push_string_arg(obj, parts, "from", "from", false);
+}
+
+fn append_present_args(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    parts: &mut Vec<String>,
+    keys: &[&str],
+) {
+    for key in keys {
+        if matches!(obj.get(*key), None | Some(serde_json::Value::Null)) {
+            continue;
+        }
+        if *key == "paths" {
+            if let Some(paths) = obj.get(*key).and_then(|v| v.as_array()) {
+                parts.push(format!("paths={}", compact_array_summary(paths, "path")));
+                continue;
+            }
+        }
+        if let Some(value) = obj.get(*key).and_then(compact_json_value) {
+            parts.push(format!("{key}={value}"));
+        }
+    }
+}
+
+fn push_string_arg(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    parts: &mut Vec<String>,
+    key: &str,
+    label: &str,
+    positional: bool,
+) -> bool {
+    let Some(value) = obj.get(key).and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let rendered = compact_string_arg(value);
+    if positional || label.is_empty() {
+        parts.push(rendered);
+    } else {
+        parts.push(format!("{label}={rendered}"));
+    }
+    true
+}
+
+fn push_range_arg(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    parts: &mut Vec<String>,
+    key: &str,
+    label: &str,
+) -> bool {
+    let Some(value) = obj.get(key).and_then(compact_range_value) else {
+        return false;
+    };
+    parts.push(format!("{label}={value}"));
+    true
+}
+
+fn push_insert_arg(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    parts: &mut Vec<String>,
+    key: &str,
+) -> bool {
+    let Some(value) = obj.get(key).and_then(compact_insert_value) else {
+        return false;
+    };
+    parts.push(format!("insert={value}"));
+    true
+}
+
+fn compact_range_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(raw) = value.as_str()
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
+    {
+        return compact_range_value(&parsed);
+    }
+    let obj = value.as_object()?;
+    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("range");
+    match ty {
+        "lines" => Some(format!(
+            "lines:{}-{}",
+            compact_field(obj, "start_line")?,
+            compact_field(obj, "end_line")?
+        )),
+        "bytes" => Some(format!(
+            "bytes:{}-{}",
+            compact_field(obj, "start")?,
+            compact_field(obj, "end")?
+        )),
+        "markers" => Some("markers".into()),
+        "exact_text" => Some("exact_text".into()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn compact_insert_value(value: &serde_json::Value) -> Option<String> {
+    if let Some(raw) = value.as_str()
+        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
+    {
+        return compact_insert_value(&parsed);
+    }
+    let obj = value.as_object()?;
+    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("insert");
+    match ty {
+        "line" => Some(format!(
+            "{} line {}",
+            obj.get("placement")
+                .and_then(|v| v.as_str())
+                .unwrap_or("at"),
+            compact_field(obj, "line")?
+        )),
+        "before_marker" | "after_marker" => Some(ty.replace('_', " ")),
+        "prepend" | "append" => Some(ty.to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn compact_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    obj.get(key).and_then(compact_json_value)
+}
+
+fn compact_array_summary(items: &[serde_json::Value], noun: &str) -> String {
+    match items {
+        [] => "[]".into(),
+        [single] => compact_json_value(single).unwrap_or_else(|| format!("1 {noun}")),
+        _ => format!("{} {noun}s", items.len()),
+    }
+}
+
+fn compact_text_summary(text: &str) -> String {
+    let lines = text.lines().count().max(usize::from(!text.is_empty()));
+    if lines > 1 {
+        format!("{}, {lines} lines", bytes_compact(text.len()))
+    } else {
+        bytes_compact(text.len())
     }
 }
 
@@ -3054,6 +3395,9 @@ fn positional_arg_key(key: &str) -> bool {
         "path"
             | "file"
             | "file_path"
+            | "source"
+            | "target"
+            | "url"
             | "command"
             | "cmd"
             | "query"
@@ -3061,19 +3405,21 @@ fn positional_arg_key(key: &str) -> bool {
             | "text"
             | "input"
             | "register"
+            | "session_id"
     )
 }
 
 fn tool_arg_rank(tool: &str, key: &str) -> usize {
     let key_rank = match key {
-        "path" | "file" | "file_path" => 0,
-        "command" | "cmd" => 0,
+        "path" | "file" | "file_path" | "source" | "target" | "url" => 0,
+        "command" | "cmd" | "session_id" => 0,
         "query" | "pattern" => 0,
         "text" | "input" => 0,
         "register" => 0,
-        "old_string" | "new_string" | "replacement" => 1,
-        "line" | "line_start" | "line_end" | "limit" => 2,
-        "cwd" | "workdir" => 3,
+        "source_range" | "range" | "insert" => 1,
+        "old_string" | "new_string" | "replacement" | "content" => 2,
+        "line" | "line_start" | "line_end" | "limit" | "max_results" | "max_lines" => 3,
+        "cwd" | "workdir" => 4,
         _ => 10,
     };
     if tool.contains("shell") && matches!(key, "command" | "cmd") {
@@ -3646,6 +3992,67 @@ mod tests {
     fn compact_tool_call_line_shell_run_hides_null_cwd() {
         let line = compact_tool_call_line("shell_run", r#"{"cmd":"pwd","cwd":null}"#, 100).unwrap();
         assert_eq!(line, r#"▸ shell_run(cmd: "pwd")"#);
+    }
+
+    #[test]
+    fn compact_tool_call_line_summarizes_shell_poll() {
+        let line = compact_tool_call_line(
+            "shell_poll",
+            r#"{"session_id":"sh-2","signal":"int","stdin":"continue\n","yield_time_ms":1000}"#,
+            120,
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "▸ shell_poll(session=sh-2, signal=int, yield_time_ms=1000, stdin=9 B)"
+        );
+    }
+
+    #[test]
+    fn compact_tool_call_line_summarizes_file_write_content() {
+        let line = compact_tool_call_line(
+            "file_write",
+            r#"{"file_path":"src/a.rs","content":"hello\nworld\n"}"#,
+            100,
+        )
+        .unwrap();
+        assert_eq!(line, "▸ file_write(src/a.rs, content=12 B, 2 lines)");
+    }
+
+    #[test]
+    fn compact_tool_call_line_summarizes_content_search() {
+        let line = compact_tool_call_line(
+            "content_search",
+            r#"{"pattern":"compact.*tool","path":"src","glob":"*.rs","max_results":20}"#,
+            120,
+        )
+        .unwrap();
+        assert_eq!(
+            line,
+            "▸ content_search(compact.*tool, path=src, glob=*.rs, max_results=20)"
+        );
+    }
+
+    #[test]
+    fn compact_tool_call_line_summarizes_clip_ranges_and_inserts() {
+        let yank = compact_tool_call_line(
+            "clip_yank",
+            r#"{"source":"src/a.rs","source_range":{"type":"lines","start_line":10,"end_line":20},"register":"x"}"#,
+            120,
+        )
+        .unwrap();
+        assert_eq!(yank, "▸ clip_yank(src/a.rs, range=lines:10-20, register=x)");
+
+        let paste = compact_tool_call_line(
+            "clip_paste",
+            r#"{"target":"src/a.rs","insert":{"type":"line","line":12,"placement":"after"},"register":"x","confirm":true}"#,
+            120,
+        )
+        .unwrap();
+        assert_eq!(
+            paste,
+            "▸ clip_paste(src/a.rs, insert=after line 12, register=x, confirm=true)"
+        );
     }
 
     #[test]
