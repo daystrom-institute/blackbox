@@ -241,7 +241,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "whiteboard_transition",
-        description = "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate is a legal skip. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes."
+        description = "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate and validate → resolve are legal skips. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes."
     )]
     pub(crate) async fn whiteboard_transition(
         &self,

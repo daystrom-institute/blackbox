@@ -359,6 +359,16 @@ The language-agnostic `perf-pathology.json` (v1) is superseded by the two
 per-language perf workflows; `docs/perf-pathology-dispatch.md` should be updated
 to point at them.
 
+**Installation note (verified during the live smoke).** The `kind: ensemble`
+actor resolves its `team` from the **bro teamplate registry**, not the artifact
+catalog. The daemon loads installed `team` artifacts into that registry at
+**startup**, so a panel teamplate installed via `bbox_artifact_install` into a
+*running* daemon is not yet live — `bro_orchestrate_run` fails the BlindPost
+dispatch with `Unknown team: <panel>`. Fix either way: restart the daemon after
+installing the panel team artifacts, or register each panel immediately with
+`bro_team(action="save_template", name=<panel>, members=[…])`. The five lens
+brofiles must be installed before the panel is registered.
+
 ## Acceptance criteria
 
 `PE-2` (the consensus-gate criterion) is **superseded** by `PE-2′` below.

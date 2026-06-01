@@ -1372,7 +1372,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "whiteboard_transition",
         category: ToolCategory::Whiteboards,
-        summary: "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate is a legal skip. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes.",
+        summary: "Advance the board to a new phase. Facilitator or operator role required. Sequence: blind → read → validate → debate → resolve → archived; read → debate and validate → resolve are legal skips. Transition emits a `board-transitioned` signal correlated to (board_id, target_phase) so any wait node observing the board resumes.",
         when_to_use: "Use to advance the deliberation when ready. Check `whiteboard_state.ready_for_transition` first as an advisory. Workflows can define a wait-on-phase node that resumes when the transition fires — this is how the engine drives multi-phase arcs through the board.",
         example: Some(
             r#"whiteboard_transition(board_id="adr-2026-04-27", agent_name="facilitator", target_phase="debate", summary="all specialists posted; advancing")"#,
