@@ -247,11 +247,36 @@ facilitator is not a debate participant.
 The load-bearing addition over the old single-actor design is a dedicated
 **validator** that runs *after* the blind lens round and *before* debate, in the
 whiteboard's `validate` phase. It is one read-only actor per flow
-(`{arch,perf}-{java,rust}-pathology-validator`). Its job, ported from bridgecrew
-`R10.5`: for each lens post, isolate the single falsifiable claim, **trace it to
-ground truth itself** (it does not trust the lens's inference about the
-compiler / framework / library — it reads the actual source), and post exactly
-one `whiteboard_annotate(type=validation, result=confirmed|refuted|inconclusive)`.
+(`{arch,perf}-{java,rust}-pathology-validator`, `brodex`/`gpt-5.5`).
+
+It is **not** bridgecrew's prose claim-tracer (`R10.5`), and deliberately so:
+re-deriving every finding from scratch is redundant with the lenses (which already
+run `rust_impl_partition_analysis` etc. themselves) and unbounded — a v1 prose-tracer
+validator ground for 25 minutes on one file and posted nothing. We have what the
+donor lacked — the typed graph, refactor dry-runs, and **evidence bundles** — so the
+validator is reframed as an **evidence-prover with a divided labor**:
+
+- **Lenses (actors)** make a claim, cite the evidence they ran, and self-assign an
+  authority/evidence grade (`syntax_only`/`indexed_hints`/`lsp_verified`/
+  `compiler-confirmed` for arch; `static_only_hypothesis`/`runtime_corroborated` for
+  perf).
+- **Validator (critic)** does not re-derive everything. Per finding it (1) **audits
+  the cited grade** — an overclaimed grade (e.g. `lsp_verified` asserted on
+  `indexed_hints` evidence) is refuted/downgraded cheaply; (2) **escalates only where
+  the grade is weak AND the finding would drive a remediation slice**, running the one
+  operation that settles it (an LSP-verified partition, `rust_public_api_guard`, an
+  object-safety report, an `extract` dry-run; for perf, the call-path fetch/await/
+  materialization check plus `baseline_refs` corroboration); (3) **bundles** what it
+  touched with `bbox_bundle_evidence` and (4) **posts one verdict per finding
+  immediately** (`confirmed`/`refuted`/`inconclusive`) with the bundle id in the body.
+
+Posting per finding is also the **convergence mechanism** — the validator can't
+silently burn time investigating without emitting, so no node timeout is needed (a
+timeout would just mask a real hang). The bundle persists in bbox, re-queryable by
+id; only the id rides the annotation (a first-class `evidence_ref` annotation field
+is a queued fast-follow over carrying it in the body). This makes the exclusion teeth
+**evidence-backed**: a refuted finding is dropped because a reproducible operation
+shows the claim false, not because an LLM asserted it.
 
 The exclusion is **engine-computed**, not prompt-enforced. `Board::post_standing`
 (`src/whiteboards.rs`) derives each post's standing from its validation
