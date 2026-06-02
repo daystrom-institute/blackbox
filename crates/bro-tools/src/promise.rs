@@ -241,8 +241,24 @@ impl PromiseStore {
         )
     }
 
-    pub fn all_terminal(&self, ids: &[String]) -> anyhow::Result<Option<Vec<Value>>> {
-        let mut out = Vec::new();
+    pub fn terminal_consuming_completion_event(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<Option<Value>> {
+        let Some(entry) = self.map.get_mut(id) else {
+            anyhow::bail!("unknown promise_id: {id}");
+        };
+        if !entry.state.is_terminal() {
+            return Ok(None);
+        }
+        entry.completion_event_delivered = true;
+        Ok(Some(snapshot(id, entry)))
+    }
+
+    pub fn all_terminal_consuming_completion_events(
+        &mut self,
+        ids: &[String],
+    ) -> anyhow::Result<Option<Vec<Value>>> {
         for id in ids {
             let Some(entry) = self.map.get(id) else {
                 anyhow::bail!("unknown promise_id: {id}");
@@ -250,17 +266,28 @@ impl PromiseStore {
             if !entry.state.is_terminal() {
                 return Ok(None);
             }
-            out.push(snapshot(id, entry));
+        }
+
+        let mut out = Vec::new();
+        for id in ids {
+            if let Some(entry) = self.map.get_mut(id) {
+                entry.completion_event_delivered = true;
+                out.push(snapshot(id, entry));
+            }
         }
         Ok(Some(out))
     }
 
-    pub fn any_terminal(&self, ids: &[String]) -> anyhow::Result<Option<Value>> {
+    pub fn any_terminal_consuming_completion_event(
+        &mut self,
+        ids: &[String],
+    ) -> anyhow::Result<Option<Value>> {
         for id in ids {
-            let Some(entry) = self.map.get(id) else {
+            let Some(entry) = self.map.get_mut(id) else {
                 anyhow::bail!("unknown promise_id: {id}");
             };
             if entry.state.is_terminal() {
+                entry.completion_event_delivered = true;
                 return Ok(Some(snapshot(id, entry)));
             }
         }
@@ -320,12 +347,16 @@ pub(crate) fn now_ms() -> u64 {
 
 async fn wait_until<F>(cx: &ToolCx, timeout_ms: u64, mut done: F) -> anyhow::Result<Value>
 where
-    F: FnMut(&PromiseStore) -> anyhow::Result<Option<Value>>,
+    F: FnMut(&mut PromiseStore) -> anyhow::Result<Option<Value>>,
 {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let notify = cx.promises.lock().unwrap().notifier();
     loop {
-        if let Some(value) = done(&cx.promises.lock().unwrap())? {
+        let ready = {
+            let mut promises = cx.promises.lock().unwrap();
+            done(&mut promises)?
+        };
+        if let Some(value) = ready {
             return Ok(value);
         }
         let now = Instant::now();
@@ -399,7 +430,7 @@ impl Tool for PromiseWait {
         "promise_wait"
     }
     fn description(&self) -> &str {
-        "Wait for one promise to settle, up to timeout_ms. Returns the terminal promise snapshot, or {timed_out:true}."
+        "Wait for one promise to settle, up to timeout_ms. Returns the terminal promise snapshot, or {timed_out:true}. A terminal wait consumes that promise's auto-injected completion wake."
     }
     fn input_schema(&self) -> Value {
         schema_for::<PromiseWaitInput>()
@@ -412,12 +443,7 @@ impl Tool for PromiseWait {
         let id = args.promise_id;
         ToolResult::from_result(
             wait_until(cx, args.timeout_ms.unwrap_or(DEFAULT_WAIT_MS), |store| {
-                let status = store.status(&id)?;
-                if status["running"].as_bool() == Some(false) {
-                    Ok(Some(status))
-                } else {
-                    Ok(None)
-                }
+                store.terminal_consuming_completion_event(&id)
             })
             .await,
         )
@@ -430,7 +456,7 @@ impl Tool for PromiseWhenAll {
         "promise_when_all"
     }
     fn description(&self) -> &str {
-        "Wait until every listed promise settles, up to timeout_ms. Returns {promises:[...]} or {timed_out:true}."
+        "Wait until every listed promise settles, up to timeout_ms. Returns {promises:[...]} or {timed_out:true}. A terminal wait consumes those promises' auto-injected completion wakes."
     }
     fn input_schema(&self) -> Value {
         schema_for::<PromiseManyInput>()
@@ -445,7 +471,7 @@ impl Tool for PromiseWhenAll {
             wait_until(
                 cx,
                 args.timeout_ms.unwrap_or(DEFAULT_MULTI_WAIT_MS),
-                |store| match store.all_terminal(&ids)? {
+                |store| match store.all_terminal_consuming_completion_events(&ids)? {
                     Some(promises) => Ok(Some(json!({"promises": promises}))),
                     None => Ok(None),
                 },
@@ -461,7 +487,7 @@ impl Tool for PromiseWhenAny {
         "promise_when_any"
     }
     fn description(&self) -> &str {
-        "Wait until any listed promise settles, up to timeout_ms. Returns {promise:...} or {timed_out:true}."
+        "Wait until any listed promise settles, up to timeout_ms. Returns {promise:...} or {timed_out:true}. A terminal wait consumes the returned promise's auto-injected completion wake."
     }
     fn input_schema(&self) -> Value {
         schema_for::<PromiseManyInput>()
@@ -476,7 +502,7 @@ impl Tool for PromiseWhenAny {
             wait_until(
                 cx,
                 args.timeout_ms.unwrap_or(DEFAULT_MULTI_WAIT_MS),
-                |store| match store.any_terminal(&ids)? {
+                |store| match store.any_terminal_consuming_completion_event(&ids)? {
                     Some(promise) => Ok(Some(json!({"promise": promise}))),
                     None => Ok(None),
                 },

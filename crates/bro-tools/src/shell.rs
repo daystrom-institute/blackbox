@@ -500,7 +500,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. Set mode=\"promise\" to start immediately and return a promise_id; then use promise_status/wait/when_all/when_any/cancel. Promise completion automatically injects a hidden HARNESS_EVENT turn at a safe boundary. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. Set mode=\"promise\" to start immediately and return a promise_id; then use promise_status/wait/when_all/when_any/cancel. Promise completion automatically injects a hidden HARNESS_EVENT turn at a safe boundary unless a terminal wait already returned the result. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -1036,7 +1036,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promise_completion_drains_hidden_event_after_completion() {
+    async fn promise_status_does_not_consume_hidden_event() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "echo wake", "mode": "promise"}), &c)
+                .await,
+        );
+        let pid = v["promise_id"].as_str().unwrap().to_string();
+
+        let mut status = json!({"running": true});
+        for _ in 0..50 {
+            status = c.promises.lock().unwrap().status(&pid).unwrap();
+            if status["running"].as_bool() == Some(false) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(status["state"], "completed", "{status}");
+        assert_eq!(status["completion_event_delivered"], false, "{status}");
+
+        let events = c.promises.lock().unwrap().drain_completion_events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(events[0].contains("[HARNESS_EVENT promise_completed]"));
+        assert!(events[0].contains(&pid));
+        assert!(events[0].contains("call promise_status"));
+    }
+
+    #[tokio::test]
+    async fn promise_wait_timeout_does_not_consume_hidden_event() {
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "sleep 0.05; echo wake", "mode": "promise"}),
+                    &c,
+                )
+                .await,
+        );
+        let pid = v["promise_id"].as_str().unwrap().to_string();
+
+        let timed_out = as_json(
+            crate::promise::PromiseWait
+                .call(json!({"promise_id": pid, "timeout_ms": 1}), &c)
+                .await,
+        );
+        assert_eq!(timed_out["timed_out"], true, "{timed_out}");
+
+        let waited = as_json(
+            crate::promise::PromiseWait
+                .call(json!({"promise_id": pid, "timeout_ms": 3000}), &c)
+                .await,
+        );
+        assert_eq!(waited["state"], "completed", "{waited}");
+        assert_eq!(waited["completion_event_delivered"], true, "{waited}");
+    }
+
+    #[tokio::test]
+    async fn promise_wait_completion_consumes_hidden_event() {
         let c = cx();
         let v = as_json(
             ShellRun
@@ -1051,18 +1108,11 @@ mod tests {
                 .await,
         );
         assert_eq!(waited["state"], "completed", "{waited}");
+        assert_eq!(waited["completion_event_delivered"], true, "{waited}");
         let events = c.promises.lock().unwrap().drain_completion_events();
-        assert_eq!(events.len(), 1, "{events:?}");
-        assert!(events[0].contains("[HARNESS_EVENT promise_completed]"));
-        assert!(events[0].contains("promise_id:"));
-        assert!(events[0].contains(&pid));
-        assert!(events[0].contains("call promise_status"));
         assert!(
-            c.promises
-                .lock()
-                .unwrap()
-                .drain_completion_events()
-                .is_empty()
+            events.is_empty(),
+            "promise_wait returned the terminal result, so no stale wake should remain: {events:?}"
         );
     }
 
@@ -1091,7 +1141,9 @@ mod tests {
                 .await,
         );
         assert_eq!(waited["state"], "cancelled", "{waited}");
+        assert_eq!(waited["completion_event_delivered"], true, "{waited}");
         assert_eq!(waited["result"]["cancelled"], true, "{waited}");
+        assert!(c.promises.lock().unwrap().drain_completion_events().is_empty());
     }
 
     #[test]

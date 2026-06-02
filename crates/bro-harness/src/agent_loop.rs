@@ -65,7 +65,7 @@ impl Tool for FleetShellRun {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in fleet mode as a harness-local Promise. Starts immediately and returns {promise_id,state,running,next_step}; use promise_wait, promise_status, promise_when_all, promise_when_any, or promise_cancel for lifecycle. Completion automatically injects a hidden HARNESS_EVENT turn. The blocking/yield-poll shell_run path and shell_poll sessions are intentionally unavailable in fleet mode."
+        "Run a shell command in fleet mode as a harness-local Promise. Starts immediately and returns {promise_id,state,running,next_step}; use promise_wait, promise_status, promise_when_all, promise_when_any, or promise_cancel for lifecycle. Completion automatically injects a hidden HARNESS_EVENT turn unless a terminal wait already returned the result. The blocking/yield-poll shell_run path and shell_poll sessions are intentionally unavailable in fleet mode."
     }
 
     fn input_schema(&self) -> Value {
@@ -1109,7 +1109,8 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
                  the blocking/yield-poll path and `shell_poll` sessions are unavailable. Use \
                  `promise_wait`, `promise_status`, `promise_when_all`, `promise_when_any`, \
                  or `promise_cancel` with the returned `promise_id`. Promise completion \
-                 automatically injects a hidden HARNESS_EVENT turn at a safe boundary.\n",
+                 automatically injects a hidden HARNESS_EVENT turn at a safe boundary unless a \
+                 terminal wait already returned the result.\n",
             );
         } else if reg.contains("shell_poll") {
             stable.push_str(
@@ -1119,7 +1120,8 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
                  if you are abandoning it. For work you want to start and then continue past, call \
                  `shell_run` with `mode=\"promise\"`, then use `promise_wait`, `promise_status`, \
                  `promise_when_all`, or `promise_when_any`; promise completion automatically injects \
-                 a hidden HARNESS_EVENT turn at a safe boundary.\n",
+                 a hidden HARNESS_EVENT turn at a safe boundary unless a terminal wait already \
+                 returned the result.\n",
             );
         }
     }

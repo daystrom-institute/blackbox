@@ -1,0 +1,19 @@
+{
+  "id": "gap-e2fb024c",
+  "title": "Harness self-validation should run against the rebuilt local harness binary",
+  "gap_kind": "workflow",
+  "domain": "harness/dev-validation",
+  "wanted_capability": "When editing bro-harness turn machinery, developers should have a narrow workflow or tool hook to rebuild and exercise a nested/local harness session from the current worktree, so behavior changes can be smoke-tested against the new binary without replacing or restarting the active fleet session.",
+  "missing_primitive": "local rebuilt harness smoke workflow",
+  "fallback_used": "Relied on unit tests and noted that the live fleet session kept using the pre-change harness binary, so repeated HARNESS_EVENT messages during validation were expected until reinstall/restart.",
+  "evidence": [
+    "RETRO_HARNESS.md:11-15",
+    "current session: terminal promise_wait results were followed by stale HARNESS_EVENT messages because the running harness process was pre-change"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "workflow/harness/live-harness-self-validation-after-code-change",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T06:11:09Z",
+  "updated_at": "2026-06-02T06:11:09Z"
+}
