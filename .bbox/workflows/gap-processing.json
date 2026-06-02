@@ -1,0 +1,151 @@
+{
+  "name": "gap-processing",
+  "version": 3,
+  "vars_schema": {
+    "project_dir": { "kind": "string", "required": true },
+    "cluster_result": { "kind": "object" },
+    "verdicts": { "kind": "array" },
+    "sieve": { "kind": "object" },
+    "_structured_exit": { "kind": "object" }
+  },
+  "actors": {
+    "orchestrator": {
+      "kind": "executor",
+      "brofile": "gap-processing",
+      "durable": true,
+      "compaction_anchor": true
+    }
+  },
+  "start": "Cluster",
+  "nodes": {
+    "Cluster": {
+      "actor": "orchestrator",
+      "prompt": "You are the CLUSTER node of the gap-processing workflow. Project: ${vars.project_dir}.\n\nGround first per the agentic opening sequence, then pull the active substrate gap queue with bbox_gaps(include_addressed=false, project=\"transcript-search\", json=true) and group the gaps by SEMANTIC THEME — cluster gaps that would be investigated against the same code / commits / subsystem (use code-nav and the graph to judge, not gap_kind). A cluster of one is fine.\n\nReturn strict JSON only, no markdown fences, first byte { and last byte }:\n{\"clusters\":[{\"theme\":\"<short label>\",\"gaps\":[<full gap records: id, gap_kind, domain, dedupe_key, wanted_capability, impact, blocking_level, created_at, evidence>]}]}",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Cluster.output}", "repair_missing_closing_delimiters": true },
+          "into_var": "cluster_result",
+          "on_failure": "halt"
+        }
+      ],
+      "next": { "type": "goto", "to": "Validate" }
+    },
+    "Validate": {
+      "actor": "",
+      "foreach": {
+        "items": "${vars.cluster_result.clusters}",
+        "as_var": "cluster",
+        "index_as": "cluster_index",
+        "key": "cluster-${vars.cluster_index}",
+        "imports": ["project_dir"],
+        "exports": ["atom_result"],
+        "parallelism": 4,
+        "on_item_failure": "collect_then_halt",
+        "collect": { "into_var": "verdicts" },
+        "subworkflow": {
+          "name": "gap-processing-validate-child",
+          "version": 1,
+          "vars_schema": {
+            "project_dir": { "kind": "string", "required": true },
+            "cluster": { "kind": "object", "required": true },
+            "atom_handle": { "kind": "object" },
+            "atom_wait": { "kind": "object" },
+            "atom_status": { "kind": "object" },
+            "atom_result": { "kind": "object" }
+          },
+          "actors": {},
+          "start": "InvokeAtom",
+          "nodes": {
+            "InvokeAtom": {
+              "actor": "",
+              "on_enter": [
+                {
+                  "op": "mcp_call",
+                  "args": {
+                    "server": "blackbox",
+                    "tool": "atom_invoke",
+                    "arguments": {
+                      "atom": "atom:gap-cluster-validator@v1",
+                      "args": {
+                        "project_dir": "${vars.project_dir}",
+                        "cluster_theme": "${vars.cluster.theme}",
+                        "gaps": "${vars.cluster.gaps}"
+                      },
+                      "project_dir": "${vars.project_dir}",
+                      "owner": "workflow:${meta.arc_id}"
+                    },
+                    "timeout_secs": 120
+                  },
+                  "into_var": "atom_handle",
+                  "on_failure": "halt"
+                }
+              ],
+              "next": { "type": "goto", "to": "WaitAtom" }
+            },
+            "WaitAtom": {
+              "actor": "",
+              "on_enter": [
+                {
+                  "op": "mcp_call",
+                  "args": {
+                    "server": "blackbox",
+                    "tool": "bro_wait",
+                    "arguments": { "task_id": "${vars.atom_handle.task_id}", "timeout_seconds": 900 },
+                    "timeout_secs": 920
+                  },
+                  "into_var": "atom_wait",
+                  "on_failure": "halt"
+                },
+                {
+                  "op": "mcp_call",
+                  "args": {
+                    "server": "blackbox",
+                    "tool": "atom_status",
+                    "arguments": { "invocation_id": "${vars.atom_handle.invocation_id}", "owner": "workflow:${meta.arc_id}" },
+                    "timeout_secs": 30
+                  },
+                  "into_var": "atom_status",
+                  "on_failure": "halt"
+                },
+                {
+                  "op": "set_var",
+                  "args": {
+                    "key": "atom_result",
+                    "value": {
+                      "provenance": {
+                        "validator_task_id": "${vars.atom_handle.task_id}",
+                        "validator_invocation_id": "${vars.atom_handle.invocation_id}"
+                      },
+                      "cluster_theme": "${vars.cluster.theme}",
+                      "output": "${vars.atom_wait.result}"
+                    }
+                  }
+                }
+              ],
+              "next": { "type": "terminal" }
+            }
+          }
+        }
+      },
+      "next": { "type": "goto", "to": "Sieve" }
+    },
+    "Sieve": {
+      "actor": "orchestrator",
+      "prompt": "You are the SIEVE node. Project: ${vars.project_dir}.\n\nThe per-cluster validator results are collected here — one entry per cluster, each shaped {\"provenance\":{\"validator_task_id\":...,\"validator_invocation_id\":...},\"cluster_theme\":...,\"output\":\"<JSON string the validator atom returned: {status, cluster_theme, verdicts:[...]}>\"}:\n${vars.verdicts}\n\nFor EACH collected entry: JSON-parse its \"output\" string to get that cluster's verdict list, and stamp EVERY one of those verdicts with that same entry's \"provenance\" object (the workflow-captured runtime handle — this is the reliable provenance; do not invent ids).\n\nThen merge all verdicts across clusters, GROUP BY class in order landed → dupe → externality → stale → actionable, and SORT BY criticality descending (critical > high > medium > low) within each group.\n\nReturn strict JSON only, no markdown fences, first byte { and last byte }:\n{\"sieve\":{\"landed\":[...],\"dupe\":[...],\"externality\":[...],\"stale\":[...],\"actionable\":[...]}}\nEach verdict keeps its fields plus the stamped \"provenance\".",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": { "from": "${Sieve.output}", "repair_missing_closing_delimiters": true },
+          "into_var": "sieve",
+          "on_failure": "halt"
+        },
+        {
+          "op": "set_var",
+          "args": { "key": "_structured_exit", "value": "${vars.sieve}" }
+        }
+      ],
+      "next": { "type": "terminal" }
+    }
+  }
+}

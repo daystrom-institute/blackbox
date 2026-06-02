@@ -21,7 +21,7 @@ Parent: [Prompts](../README.md)
 
 | Lens | Paired brofile | Role |
 |------|----------------|------|
-| [gap-processing-orchestrator.md](gap-processing-orchestrator.md) | `.bbox/brofiles/gap-processing.json` | Layer 2 of the gap sieve: pull → cluster (semantic theme) → dispatch validators → reassemble → sieve → return. Launched by the interactive layer with `allow_recursion=true` (see [../gap-processing.md](../gap-processing.md)). |
-| [gap-cluster-validator.md](gap-cluster-validator.md) | `.bbox/brofiles/gap-cluster-validator.json` | Layer 3 (leaf): classify each gap in a cluster as landed/dupe/externality/stale/actionable with evidence + criticality. Read-only; propose-only. |
+| [gap-processing-orchestrator.md](gap-processing-orchestrator.md) | `.bbox/brofiles/gap-processing.json` (codex) | The gap-processing **workflow** orchestrator actor: runs as the Cluster node (pull → cluster by semantic theme) and the Sieve node (merge verdicts → group/sort). No dispatch — the workflow `foreach` fans out the validators. Launched via [../gap-processing.md](../gap-processing.md). |
+| [gap-cluster-validator.md](gap-cluster-validator.md) | `.bbox/brofiles/gap-cluster-validator.json` (deepseek) + atom `gap-cluster-validator` (`gap-validation/v1`) | Per-cluster judge: classify each gap landed/dupe/externality/stale/actionable with evidence + criticality. Read-only; propose-only. Invoked by the workflow as a typed atom (`atom_invoke`). |
 | [MINE_CLI.md](MINE_CLI.md) | — (dispatched by [`../REFRESH_ALL_CLIS.md`](../REFRESH_ALL_CLIS.md)) | Forward-mine one CLI version against the harness research corpus's 15 axes; write/refresh that subject's cells + snapshot. |
 | [CLI_INVESTIGATOR.md](CLI_INVESTIGATOR.md) | — (operator/orchestrator-pointed) | Backward-discover agent-facing dimensions the research axes MISS; produce a candidate-new-axes report. |

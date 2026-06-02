@@ -6,107 +6,89 @@ audience: interactive
 topic:
   - prompts
   - gaps
-brief: "Interactive-facing launch doc: how YOU (a live interactive agent) dispatch the gap-processing orchestrator bro, monitor it, and act on its sieved output. Three-layer design — interactive → orchestrator bro → per-cluster validator bros. The heavy logic lives in the two agent contracts under prompts/agents/; this doc is only the launch + close-the-loop layer."
+brief: "Interactive-facing launch doc: how YOU launch the gap-processing WORKFLOW (bro_orchestrate_run), monitor it, and act on its sieved output. The workflow is a deterministic 3-node arc — Cluster (codex actor) → Validate (foreach atom_invoke of the gap-cluster-validator atom, deepseek) → Sieve (codex actor). The daemon runtime owns the fan-out; no recursive-bro dispatch."
 ---
 
 # Gap Processing
 
 The substrate gap queue (`bbox_gaps`) accumulates faster than it clears. This
-prompt drives a **three-layer sieve** that filters noise (already-landed, dupe,
-externality, stale) before surfacing what is genuinely actionable, priority-ordered.
+prompt drives a **deterministic workflow** that sieves it: filters the noise
+(already-landed, dupe, externality, stale) before surfacing what is genuinely
+actionable, priority-ordered.
 
 ```
-[Interactive]  ── you, reading THIS doc; launches + closes the loop
-     │  bro_exec(allow_recursion=true)
+[Interactive]  ── you, reading THIS doc; launch the workflow + close the loop
+     │  bro_orchestrate_run(workflow=gap-processing)
      ▼
-[Orchestrator] ── the `gap-processing` bro; lens → prompts/agents/gap-processing-orchestrator.md
-     │  bro_exec per cluster (leaf, no recursion)
-     ▼
-[Validator×N] ── `gap-cluster-validator` bros; lens → prompts/agents/gap-cluster-validator.md
+[Workflow arc] ── daemon-owned state machine:
+     Cluster   (actor=orchestrator, codex gpt-5.5)   pull gaps → cluster by theme → vars.clusters
+     Validate  (foreach over clusters → atom_invoke gap-cluster-validator, deepseek)   one atom per cluster, dynamic-N
+     Sieve     (actor=orchestrator, codex gpt-5.5)   merge verdicts → group/sort → vars.sieve
 ```
 
-You are **Layer 1**. You do **not** pull or classify gaps yourself — you launch
-the orchestrator, wait, and act on its report. The orchestrator clusters and
-fans out; the validators investigate. Heavy prose lives in the two agent
-contracts so it can be tuned without editing brofile JSON.
+> **Why a workflow, not a recursive bro.** A dispatched bro cannot reach
+> `bro_exec` (only `bro_agent_dispatch`, which hardcodes `allow_recursion=false`),
+> so the original "orchestrator bro fans out validator sub-bros" design dead-ends
+> on this build (confirmed live — see `gap-a5e152fb`). The workflow runtime owns
+> the `foreach` fan-out instead, sidestepping the dispatch limitation entirely and
+> giving deterministic state, schema-enforced validator output, and runtime
+> provenance. Heavy prose still lives in `prompts/agents/` so it stays tweakable.
 
 ## Preconditions
 
-- `blackboxd` is running and this project is registered (`bbox_project_list`).
-- Both brofiles are installed: check `bbox_artifact_list(kind="brofile")` for
-  `gap-processing` and `gap-cluster-validator`; if absent, install from
-  `.bbox/brofiles/gap-processing.json` and
-  `.bbox/brofiles/gap-cluster-validator.json`.
+Check `bbox_artifact_list` for all four, install from the repo if absent:
+- brofile `gap-processing` (`.bbox/brofiles/gap-processing.json`) — codex `gpt-5.5` `high`, the Cluster+Sieve actor.
+- brofile `gap-cluster-validator` (`.bbox/brofiles/gap-cluster-validator.json`) — deepseek `deepseek-v4-pro` `high`, wrapped by the atom.
+- atom `gap-cluster-validator` (`.bbox/atoms/gap-cluster-validator.json`, `subcontract gap-validation/v1`) — typed cluster-in / verdict-out.
+- workflow `gap-processing` (`.bbox/workflows/gap-processing.json`).
 
-## Launch the orchestrator
+(Artifact install, render, and `bro_orchestrate_run` live on the **blackbox-ops** MCP surface; load with `ToolSearch` if deferred.)
 
-The orchestrator dispatches sub-bros, so it **must** be launched with
-`allow_recursion=true` — without it the recursion guard blocks every `bro_*`
-dispatch and the orchestrator dead-ends. `bro_agent_dispatch` hardcodes
-`allow_recursion=false`, so you **cannot** use it here; launch via `bro_exec`:
+## Launch the workflow
 
 ```
-bro_exec(
-  bro="gap-processing",                       # the orchestrator brofile/persona
+bro_orchestrate_run(
+  workflow=<the gap-processing spec from .bbox/workflows/gap-processing.json>,
   project_dir="/home/invidious/repos/transcript-search",
-  allow_recursion=true,                       # REQUIRED — the load-bearing arg
-  prompt="Process the active gap queue for this project per your contract. "
-         "Cluster by semantic theme, dispatch one gap-cluster-validator per "
-         "cluster, sieve the verdicts, and return the grouped/sorted action "
-         "lists with full validator provenance."
+  initial_vars={"project_dir": "/home/invidious/repos/transcript-search"}
 )
 ```
 
-> **FIRST-RUN VERIFY.** Confirm `bro_exec` resolves `bro="gap-processing"` to the
-> brofile persona. If brofile-by-name targeting isn't supported on this build,
-> the fallback is to instantiate the brofile as a bro instance (`bro_team`) then
-> `bro_exec(bro=<instance>, allow_recursion=true, …)`, or pass `provider="claude"`
-> + the brofile lens inline. This is the one mechanic to nail on the first live
-> run (refinement was intentionally deferred until the prompt set was authored).
-
-Record the returned `{taskId, sessionId}` — that is the orchestrator's handle.
+Pass `dry_run=true` first to validate the spec without dispatching. The MCP tool
+takes the spec **inline** (`workflow=`), not by id — read it from the installed
+`.bbox/workflows/gap-processing.json`. It returns `{taskId, arcId}`.
 
 ## Monitor
 
 ```
-bro_status(task_id="<taskId>", tail=40)     # evidence before judging liveness
-bro_wait(task_id="<taskId>", timeout_seconds=900)
+bro_arc_status(arc_id="<arcId>")          # compact: current_node / completed_nodes
+bro_wait(task_id="<taskId>", timeout_seconds=290)   # repeat until completed
 ```
 
-A timeout is not death — clustering + N validator dispatches take real time. Tail
-before concluding anything is stuck.
+Cluster ~2min, the deepseek validator fan-out is the long pole (~4–6min), Sieve
+~1–2min. A `bro_wait` timeout is just a snapshot — re-check `bro_arc_status`.
 
-## Act on the report (close the loop)
+## Read the result + close the loop
 
-The orchestrator returns the sieve: action lists **grouped by class** in
-clear-the-noise order — `landed → dupe → externality → stale → actionable` —
-and **sorted by criticality descending** within each group. Every verdict line
-carries the **leaf validator's `{task_id, session_id}`**.
+The sieve lands in arc var `_structured_exit` (= `vars.sieve`). Retrieving it is
+currently awkward (`gap-55be3518`): `bro_wait` returns a large multi-escaped
+envelope that spills to a file — slice it with python and locate the `sieve`
+object. It is grouped `landed → dupe → externality → stale → actionable`, sorted
+by criticality desc, and **every verdict carries `provenance.{validator_task_id,
+validator_invocation_id}`** — the real runtime handle of the validator atom that
+judged it.
 
 Your job at Layer 1:
+1. **Present** the grouped/sorted lists to the operator — cheap clears first,
+   priority-ranked actionable last.
+2. **Resolve only on operator approval, one gap at a time** (`bbox_gap_resolve`,
+   using each verdict's `proposed_resolution_args`). Never bulk-resolve. The
+   workflow **proposes only**.
+3. **Answer provenance questions by resuming the leaf** — `bro_resume(session_id=
+   <provenance from the verdict>, provider="deepseek", prompt="re-justify …")`.
 
-1. **Present** the grouped/sorted lists to the operator as-is. Lead with the
-   cheap clears (landed/dupe/externality/stale), close with the priority-ranked
-   actionable list.
-2. **Resolve only on operator approval, one gap at a time.** Each
-   `bbox_gap_resolve` is its own approval — never bulk-resolve a whole class off
-   one "proceed." Use the validator's proposed `resolution` + `note` (and
-   `superseded_by` for dupes). The orchestrator and validators **propose only**;
-   the actual resolution call is yours, gated.
-3. **Answer provenance questions by resuming the leaf.** If the operator asks
-   "why did we stale X?", resume the exact validator that made the call:
+## Contracts
 
-   ```
-   bro_resume(session_id="<validator session_id from the verdict>",
-              provider="claude",
-              prompt="Re-justify your STALE verdict on gap-XXXX with evidence.")
-   ```
-
-   The leaf agent holds the investigation context; the orchestrator only relayed it.
-
-## Contracts (restate to the operator if asked)
-
-- **Provenance is preserved end-to-end.** Interactive → orchestrator → validator
-  ids all survive in the report; any node in the decision chain is resumable.
-- **Nothing is mutated without you.** No gap is resolved, filed, or edited by any
-  bro. The sieve is advisory until the operator approves each clear.
+- **Provenance is preserved end-to-end**, captured from the workflow runtime (not
+  model self-report) — any verdict's validator atom is resumable.
+- **Nothing is mutated without you** — no gap is resolved by any node.

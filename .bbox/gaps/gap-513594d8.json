@@ -1,0 +1,21 @@
+{
+  "id": "gap-513594d8",
+  "title": "Workflow foreach/atom fan-out lacks per-child task/session/output capture (ensemble has it)",
+  "gap_kind": "workflow",
+  "domain": "workflow/foreach-provenance",
+  "wanted_capability": "A declarative foreach primitive that captures each dynamic-N fan-out child's {task_id, session_id, invocation_id} AND its retrievable output into the collected results — parity with ensemble nodes, which already build per-member member_tasks/member_sessions + output maps (src/workflow/engine/ensemble_nodes.rs:76-108) and a terminal actor→session_id map (engine.rs:79). Today foreach.collect gathers only a child-exported var, with no per-child dispatch-id capture; and atom_invoke children return a content-addressed output_digest + output_shape via atom_status (NOT inline output), so a downstream synthesis/sieve node receives neither reliable provenance nor the actual payload. Either foreach should expose ensemble-style per-child provenance, or there needs to be an inline atom-output retrieval (deref the output_digest) usable in workflow context.",
+  "missing_primitive": "foreach per-child {task_id,session_id,invocation_id}+output capture (ensemble-parity), or atom output_digest deref in workflow vars",
+  "fallback_used": "v1 used an actor-node foreach whose inline ${Node.output} the foreach could export (worked, but no output-schema enforcement); v2 switched to atom_invoke for schema enforcement and LOST inline output → empty sieve, provenance=0. Pathology workflows avoid this by using a whiteboard as the fan-out→synthesis data bus.",
+  "evidence": [
+    "file:src/workflow/engine/ensemble_nodes.rs:76-108",
+    "file:src/workflow/engine.rs:79",
+    "arc-efbbea05600e44f48317aed9ef9d5a39 produced empty sieve; atom_status returned output_digest sha256 + output_shape{schema_ref:outputs.schema,valid} with no inline output",
+    "file:.bbox/workflows/gap-processing.json"
+  ],
+  "impact": "high",
+  "blocking_level": "blocks_class_of_work",
+  "dedupe_key": "workflow/foreach/child-provenance-output-capture",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T20:09:58Z",
+  "updated_at": "2026-06-02T20:09:58Z"
+}

@@ -1,0 +1,20 @@
+{
+  "id": "gap-55be3518",
+  "title": "No clean surface to read a workflow's structured result (_structured_exit / arc vars); bro_wait returns an oversized escaped envelope",
+  "gap_kind": "mcp_surface",
+  "domain": "workflow/result-retrieval",
+  "wanted_capability": "A direct way to read a completed workflow arc's structured output — the `_structured_exit` value and/or named arc vars (e.g. vars.sieve) — without parsing the full bro_wait envelope. Today bro_arc_status returns a snapshot WITHOUT vars, and bro_wait on a workflow task returns an ~81k-char result envelope where the events + node outputs + structured_exit are multi-level JSON-escaped (and it spills to a file over the token cap), so extracting the actual result requires bracket-matching and repeated unescaping. A `bro_arc_result(arc_id)` / `bro_arc_vars(arc_id, keys=[...])` accessor, or having bro_orchestrate_run(await_completion=true) return _structured_exit as a first-class field, would make workflow outputs consumable.",
+  "missing_primitive": "bro_arc_result / bro_arc_vars accessor, or _structured_exit surfaced as a first-class field on the run/wait result",
+  "fallback_used": "Parsed the spilled bro_wait tool-result file with python — bracket-matching the sieve object and unescaping multiple levels — to recover the result; hit this 3x this session across the v1/v2/v3 gap-processing runs.",
+  "evidence": [
+    "bro_wait on arc-c60058fe… → 81656-char escaped envelope spilled to file",
+    "bro_arc_status snapshot omits vars",
+    "set_var _structured_exit in .bbox/workflows/gap-processing.json is not directly readable post-run"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/workflow/arc-structured-result-accessor",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T20:26:50Z",
+  "updated_at": "2026-06-02T20:26:50Z"
+}

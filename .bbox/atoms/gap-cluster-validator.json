@@ -1,0 +1,69 @@
+{
+  "_contract": "atom/v1",
+  "kind": "atom",
+  "name": "gap-cluster-validator",
+  "version": 1,
+  "subcontract": "gap-validation/v1",
+  "manifest": {
+    "description": "Validate one themed cluster of substrate gaps against the live code, git history, and gap store. Classifies each gap landed | dupe | externality | stale | actionable with concrete evidence and a criticality estimate. Read-only; proposes resolutions but never executes them.",
+    "when_to_use": [
+      "pre-validating a cluster of open substrate gaps before an operator triages them",
+      "the gap-processing workflow's per-cluster fan-out step",
+      "deciding whether a gap is already solved by a landed commit, a dupe, an externality, stale, or genuinely actionable"
+    ],
+    "anti_patterns": [
+      "do not use to RESOLVE gaps — this atom proposes only; the operator pulls every trigger",
+      "do not classify a gap into a clearing class without concrete evidence (a commit SHA, file:line, canonical gap id, or owning project)",
+      "do not use for a single gap when a direct bbox_gaps lookup answers the question"
+    ],
+    "inputs": {
+      "prompt_template": "You are the gap-cluster-validator atom. Follow your contract at prompts/agents/gap-cluster-validator.md (Read it first).\n\nProject: {{project_dir}}\nCluster theme: {{cluster_theme}}\nGaps (full records):\n{{gaps}}\n\nGround per the agentic opening sequence, then for EACH gap classify it landed | dupe | externality | stale | actionable with CONCRETE evidence (commit SHA + file:line for landed; canonical gap id for dupe; owning project/service for externality; absent component + removing commit for stale) and an initial criticality estimate {critical|high|medium|low} with a one-line rationale. Default to actionable when a clearing class is not solidly proven. You are READ-ONLY — emit proposed_resolution args, never execute them. Return strict JSON only matching your output schema (first byte {, last byte }, no markdown fences).",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "project_dir": { "type": "string" },
+          "cluster_theme": { "type": "string" },
+          "gaps": { "type": "array", "items": { "type": "object", "additionalProperties": true } }
+        },
+        "required": ["project_dir", "cluster_theme", "gaps"],
+        "additionalProperties": true
+      }
+    },
+    "outputs": {
+      "evidence_density": "high",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "status": { "enum": ["complete", "blocked", "errored"] },
+          "cluster_theme": { "type": "string" },
+          "verdicts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "gap_id": { "type": "string" },
+                "class": { "enum": ["landed", "dupe", "externality", "stale", "actionable"] },
+                "evidence": { "type": "array", "items": { "type": "string" } },
+                "justification": { "type": "string" },
+                "criticality": { "enum": ["critical", "high", "medium", "low"] },
+                "criticality_rationale": { "type": "string" },
+                "proposed_resolution": { "type": "string" },
+                "proposed_resolution_args": { "type": "object", "additionalProperties": true }
+              },
+              "required": ["gap_id", "class", "evidence", "justification", "criticality"]
+            }
+          },
+          "block_reason": { "type": "string" }
+        },
+        "required": ["status", "cluster_theme", "verdicts"]
+      }
+    },
+    "effects": { "writes_files": false, "dispatches_runs": 1, "max_depth": 0, "uses_network": false },
+    "composition": { "may_invoke_atoms": { "kind": "none" } },
+    "implementation": { "kind": "profile", "brofile_ref": "brofile:gap-cluster-validator@v3" },
+    "supervision": { "oracle": "default" },
+    "trace": { "retain": "summary", "portal_focus": "on_attention" },
+    "cost_class": "normal",
+    "provenance": { "kind": "hand_authored", "author": "gap-processing", "created_at": "2026-06-02T00:00:00Z" }
+  }
+}
