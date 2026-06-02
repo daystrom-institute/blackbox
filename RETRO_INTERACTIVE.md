@@ -90,10 +90,14 @@ interactive operating experience, not more product work.
 > `mcp_surface`, `tooling`, `workflow`, `agent`, `docs_runbook`,
 > `refactor_primitive`, `ontology`, `eval_coverage`, `packet_ast`.
 >
-> If something is more like durable local/project knowledge than a gap, report
-> it as a candidate for operator review instead of calling `bbox_learn` or
-> changing memory yourself. The operator can decide whether it belongs in
-> project knowledge, global instructions, repo docs, or nowhere.
+> If something is more like durable local/project knowledge, operator/process
+> feedback, or environment follow-up than a gap, file it as a regular Blackbox
+> follow-up note with `bbox_note(kind="followup")` when that tool is available.
+> Do not call `bbox_learn` or change memory yourself. The note should be concise
+> and should say why it is worth follow-up and where it might belong if obvious:
+> project knowledge, global instructions, repo docs, local runbook, or nowhere.
+> If `bbox_note` is unavailable, report only that you had non-gap follow-up
+> feedback but no filing surface, not the full feedback body.
 >
 > If nothing in-scope stands out, that is a completely normal way for a session
 > to end. Say so in one line and file nothing. No quota, no expectation; a quiet
@@ -156,7 +160,7 @@ Do not file a gap for:
 
 In addition to substrate gaps, explicitly ask what the operator or environment
 could do better next time. This section is intentionally not a direct memory
-write. It produces candidates the operator can review.
+write. It produces Blackbox follow-up notes the operator can review.
 
 Ask:
 
@@ -171,8 +175,22 @@ Ask:
 - What local environment surprise should future agents know before starting?
 - What worked well enough that it may deserve durable documentation?
 
-Output these as "operator/environment candidates", not as automatic
-`bbox_learn` calls.
+For each legitimate non-gap follow-up, file a `bbox_note(kind="followup")`
+instead of returning the feedback body to the operator. Use one note per
+distinct follow-up so it can be acknowledged, addressed, or promoted later.
+Keep the note body short and operational:
+
+```text
+bbox_note(
+  kind="followup",
+  project="/absolute/project/root",
+  body="Interactive retro: <what needs follow-up>. Suggested destination: <repo doc|project knowledge|global instruction|local runbook|none>."
+)
+```
+
+Do not use `bbox_note` for substrate gaps; those belong in `bbox_gap`. Do not
+use `bbox_learn` directly from the retro; learning/promotion remains an
+operator decision.
 
 ## Process
 
@@ -184,8 +202,12 @@ Output these as "operator/environment candidates", not as automatic
    session or project would plausibly hit it.
 5. Dedupe real substrate gaps with `bbox_gaps` before filing `bbox_gap`, when
    those tools are available.
-6. List operator/environment candidates separately for human review.
-7. Note candidates deliberately not filed, with the reason.
+6. File legitimate non-gap retrospectives as `bbox_note(kind="followup")`, when
+   that tool is available.
+7. Do not emit the full retrospective feedback body to the operator. Return
+   record IDs and a minimal accounting of what was filed or omitted.
+8. Note categories deliberately not filed, with the reason, but keep that
+   accounting high-level unless the operator asks for details.
 
 ## Gap-Filing Call
 
@@ -219,14 +241,16 @@ Return a short summary:
 
 - Gaps filed: gap ids plus titles.
 - Existing gaps reused or referenced: gap ids plus dedupe keys.
-- Operator/environment candidates: one line each, with suggested destination
-  if obvious (repo doc, project knowledge, global instruction, local runbook).
-- Interactive tool assessment: what was missing, hidden, awkward, or effective.
-- MCP/config assessment: whether routing, server setup, and validation were
-  clear.
-- Candidates not filed: one line each, with the reason.
-- Follow-up risk: anything likely to keep hurting interactive agents if left
-  untriaged.
+- Follow-up notes filed: note ids plus short titles or one-line summaries.
+- Existing follow-up notes reused or referenced: note ids, when applicable.
+- Not filed: high-level categories only, with the reason (for example,
+  "too host-local" or "already covered by a gap").
+- Filing-surface gaps: if `bbox_note` or `bbox_gap` was unavailable, say which
+  surface was missing.
+
+Do not include the full operator/environment retrospective in the chat reply by
+default. The durable records are the output; the operator can inspect them with
+`bbox_notes` or `bbox_gaps`.
 
 ## Tone
 

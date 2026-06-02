@@ -1,0 +1,20 @@
+{
+  "id": "gap-a0fb95a3",
+  "title": "Tmux execute_command references unsurfaced result polling tool",
+  "gap_kind": "mcp_surface",
+  "domain": "interactive/tmux-mcp",
+  "wanted_capability": "When tmux MCP execute_command is exposed to an interactive agent, the paired command-result polling primitive should also be surfaced or the tool guidance should name an available validation path.",
+  "missing_primitive": "tmux get-command-result tool surface",
+  "fallback_used": "Captured the pane and inspected the TMUX_MCP_DONE marker instead of polling the command id.",
+  "evidence": [
+    "interactive retrospective",
+    "file:RETRO_INTERACTIVE.md",
+    "session: tmux MCP smoke used execute_command then capture_pane because get-command-result was not exposed"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/interactive-tmux-mcp/execute-command-result-polling",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T05:09:08Z",
+  "updated_at": "2026-06-02T05:09:08Z"
+}
