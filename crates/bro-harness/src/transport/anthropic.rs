@@ -356,6 +356,7 @@ impl Transport for AnthropicTransport {
         let url = format!("{}/v1/messages?beta=true", self.base_url);
         let betas = anthropic_betas();
         let max_inband = super::http::max_retries();
+        let idle = super::http::stream_idle_timeout();
         let mut inband_attempt = 0u32;
         loop {
             inband_attempt += 1;
@@ -395,9 +396,37 @@ impl Transport for AnthropicTransport {
             let mut usage = Usage::default();
             let mut stop = StopReason::Done;
             let mut inband_error: Option<(String, bool)> = None;
+            // Once any content delta has been forwarded to the sink, retrying the
+            // turn would re-stream it and the daemon would render it twice — so a
+            // mid-stream fault is only retryable while nothing has streamed yet
+            // (mirrors the Responses transport's dedup-safe retry guard).
+            let mut streamed_content = false;
 
-            'consume: while let Some(chunk) = stream.next().await {
-                let chunk = chunk.context("read messages SSE chunk")?;
+            'consume: loop {
+                // The request-level timeout can't catch a connection that stays
+                // open but stops emitting events; bound the gap between events too.
+                // An idle gap is transient — retryable like a network hiccup.
+                let next = match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        inband_error = Some((
+                            "SSE idle timeout (no event within idle window)".to_string(),
+                            true,
+                        ));
+                        break 'consume;
+                    }
+                };
+                let Some(chunk) = next else { break 'consume };
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // A mid-stream read error (e.g. connection reset) is
+                        // transient — capture it for retry rather than failing the
+                        // turn outright (the old `?` hard-failed with no retry).
+                        inband_error = Some((format!("read SSE chunk: {e}"), true));
+                        break 'consume;
+                    }
+                };
                 buf.extend_from_slice(&chunk);
                 while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     let raw: Vec<u8> = buf.drain(..=pos).collect();
@@ -423,6 +452,9 @@ impl Transport for AnthropicTransport {
                                 ));
                                 break 'consume;
                             }
+                            if ev["type"].as_str() == Some("content_block_delta") {
+                                streamed_content = true;
+                            }
                             sink.stream_event(ev.clone());
                             fold_sse(&ev, &mut blocks, &mut usage, &mut stop);
                         }
@@ -431,18 +463,21 @@ impl Transport for AnthropicTransport {
                 }
             }
 
-            // In-band provider error: retry the whole turn on a transient one
-            // (overload / rate-limit / network), else surface it as a failure
-            // instead of returning an empty success.
+            // In-band fault (provider error event, idle timeout, or mid-stream
+            // read error): retry the whole turn on a transient one (overload /
+            // rate-limit / network / idle) — but only while nothing has streamed
+            // yet, so the retry can't duplicate already-emitted content. Otherwise
+            // surface it as a failure instead of returning a silent partial/empty
+            // success.
             if let Some((msg, retryable)) = inband_error {
-                if retryable && inband_attempt <= max_inband {
+                if retryable && !streamed_content && inband_attempt <= max_inband {
                     let wait = super::http::backoff(inband_attempt);
                     tracing::warn!(
                         label = "anthropic/messages",
                         attempt = inband_attempt,
                         error = %msg,
                         wait_ms = wait.as_millis() as u64,
-                        "transient in-band stream error; retrying turn"
+                        "transient in-band stream fault; retrying turn"
                     );
                     tokio::time::sleep(wait).await;
                     continue;

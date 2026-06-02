@@ -66,6 +66,21 @@ correct fix needs the transport to recognize "the last buffered message is a
 paused assistant turn" and **continue** it on the next request rather than append
 a fresh one.
 
+**Deeper prerequisite — server-tool block preservation.** CC's binary clarifies
+the trigger: pause_turn fires when a *server* tool "reaches its default limit of
+10 iterations … re-send the user message and assistant response … the server will
+resume where it left off." Resuming therefore means re-sending the paused
+assistant's **full content blocks**, including the `server_tool_use` and
+`web_search_tool_result` blocks. But `fold_sse` only reconstructs `text` /
+`thinking` / `tool_use` and **discards** everything else (`anthropic.rs` block
+reconstruction, the `_ => {}` arm), so those server blocks never enter the replay
+buffer. A correct resume thus depends on first **capturing and replaying the
+server-tool blocks** — a larger change than the loop wiring alone. Frequency is
+further bounded by `max_uses:5` on the harness's `web_search` tool
+(`anthropic.rs:69-74`), which usually completes within a single response before
+the 10-iteration pause. Net: real, but low-urgency and a two-part change (server
+block capture, then resume loop).
+
 **Proposed design.**
 - Add `StopReason::Paused` to the normalized enum (`mod.rs:86-95`); map
   `"pause_turn"` to it in `anthropic.rs` (and, defensively, in the OpenAI
@@ -182,12 +197,23 @@ Recorded here so the review is a complete ledger.
 - **Backoff jitter `[cross-transport]`** — `backoff()` now applies ±20%
   dependency-free jitter over a deterministic `backoff_base()`, re-capped at the
   ceiling (`http.rs`), so a fleet tripping a shared 429 doesn't retry in lockstep.
+- **SSE idle timeout on the Anthropic transport `[anthropic]`** — `run_turn`'s
+  consume loop now wraps `stream.next()` in `tokio::time::timeout(idle, …)`
+  (`stream_idle_timeout()`, default 300s), which the OpenAI Responses transports
+  already had but the Anthropic one lacked — so a half-open stream (connection up,
+  no events) failed over only at the 600s request timeout. Same pass made a
+  **mid-stream read error retryable** (it previously hard-failed via `?`), and
+  both new retry paths are gated on a `streamed_content` flag so a retry can never
+  re-stream already-emitted content (the same dedup-safe guard the Responses
+  transport uses). This guard now also covers the pre-existing overloaded-error
+  retry, closing a latent duplicate-text window when an overload arrived
+  mid-content.
 
 ## 7. Priority roadmap
 
 | # | Item | Severity | Effort | Status |
 | --- | --- | --- | --- | --- |
-| 1 | `pause_turn` continuation (§2) | 🔴 correctness | M (transport) | proposed |
+| 1 | `pause_turn` continuation + server-block capture (§2) | 🔴 correctness | L (2-part) | proposed |
 | 2 | Blocking floor before compose (§3.1) | 🟡 robustness | S | proposed |
 | 3 | Volatile tail → trailing on Anthropic (§5.2) | 🔵 polish | S–M | proposed |
 | 4 | Tool-def cache breakpoint fallback (§5.1) | 🔵 polish | S | proposed |
@@ -196,6 +222,7 @@ Recorded here so the review is a complete ledger.
 | 7 | interleaved-thinking replay (§4.1) | 🟢 feature | L | gated |
 | — | Extended cache TTL (§6) | 🟡 cost | S | **landed** |
 | — | Backoff jitter (§6) | 🔵 robustness | S | **landed** |
+| — | Anthropic SSE idle timeout + retryable read error (§6) | 🟡 robustness | S | **landed** |
 
 Suggested next slice: **#1 (pause_turn)** as its own focused change, then **#2
 (blocking floor)** folded with the structured-prompt work (#5) since both live in
