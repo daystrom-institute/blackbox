@@ -1,3 +1,13 @@
+---
+title: "Design Document Review"
+kind: operator-prompt
+corpus: blackbox-prompts
+audience: interactive
+topic:
+  - prompts
+brief: "Dispatch the heterogeneous 5-lens blackbox-review ensemble against a design document and return a structured review verdict in ~10 minutes."
+---
+
 # Design Document Review
 
 Dispatch a heterogeneous 5-lens review ensemble against a design document

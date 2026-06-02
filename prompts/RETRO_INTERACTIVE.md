@@ -1,3 +1,13 @@
+---
+title: "Interactive Retro"
+kind: operator-prompt
+corpus: blackbox-prompts
+audience: interactive
+topic:
+  - prompts
+brief: "End-of-session retro for a live interactive agent (tools, MCP, instructions, operator steering). Files gaps + follow-up notes."
+---
+
 # Interactive Retro
 
 A retrospective pass for an **outbound interactive agent session**: Codex,

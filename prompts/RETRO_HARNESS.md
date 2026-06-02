@@ -1,3 +1,13 @@
+---
+title: "Retro Harness"
+kind: operator-prompt
+corpus: blackbox-prompts
+audience: interactive
+topic:
+  - prompts
+brief: "End-of-session retro for a bro fleet / bro-harness session (built-in tools, injected context, intern, turn machinery). Files substrate gaps."
+---
+
 # Retro Harness
 
 A retrospective pass for an agent session, focused on **the harness the agent ran inside** — the built-in tools, the injected context, the side-channel intern, and the turn machinery of `bro-harness`. Use it to turn harness friction into reusable Blackbox substrate feedback instead of letting it dissolve into chat history.
