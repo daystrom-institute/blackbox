@@ -186,10 +186,37 @@ fn default_entries() -> BTreeMap<String, Entry> {
 }
 
 /// The summarization directive sent to the model when compacting.
-pub const COMPACTION_INSTRUCTION: &str = "The conversation above is being compacted to free context. \
-Write a thorough summary that preserves everything needed to continue the task without the original: \
-the user's goal and constraints, key decisions and their rationale, files/paths/symbols touched, \
-commands run and their outcomes, open questions, and the immediate next step. Be specific; omit pleasantries.";
+///
+/// Structured after the canonical coding-agent compaction prompt (see
+/// `design/bro-harness/compaction-canonical-anthropic.md` §3): an `<analysis>`
+/// scratchpad to force a chronological pass, then a durable `<summary>` block
+/// with fixed sections. Only the `<summary>` block is retained — the transports'
+/// `summarize_text` runs the result through [`crate::transport::extract_summary`]
+/// to drop the scratchpad. Verbatim preservation of security-relevant
+/// instructions is a correctness requirement: a "never touch X" rule the user
+/// gave must survive compaction or it silently stops applying.
+pub const COMPACTION_INSTRUCTION: &str = "The conversation above is being compacted to free up context. \
+It will be replaced by your summary, and the session will continue with new messages appended after it — \
+so capture everything needed to continue the work without the original transcript.\n\n\
+First, think in an <analysis> block: go through the conversation chronologically and note the user's \
+explicit requests, your approach, key decisions and their rationale, files/paths/symbols touched (with the \
+important code), commands run and their outcomes, errors and how they were resolved (including any user \
+feedback), and what remains open. Pay special attention to the most recent messages. Preserve any \
+security-relevant instructions or constraints the user gave (files or data to avoid, operations that must \
+not be performed, secret-handling rules) VERBATIM so they still apply after compaction.\n\n\
+Then write the durable summary inside a single <summary> block with these sections:\n\
+1. Primary request and intent — the user's explicit goals and constraints, in detail.\n\
+2. Key technical concepts — technologies, frameworks, and patterns in play.\n\
+3. Files and code — specific files/symbols examined or changed, why each matters, with important snippets.\n\
+4. Errors and fixes — what went wrong and how it was resolved, plus any user feedback.\n\
+5. Problem solving — what is solved and what troubleshooting is ongoing.\n\
+6. All user messages — every non-tool-result user message, so intent and feedback are not lost; keep any \
+security-relevant instructions verbatim.\n\
+7. Pending tasks — what remains to do.\n\
+8. Current work — precisely what was being done immediately before this point, with file names and snippets.\n\
+9. Next step — the immediate next step, only if it directly continues the most recent work; quote the \
+relevant request or task text so the intent does not drift.\n\n\
+Output the durable result in the <summary> block. Be specific and omit pleasantries.";
 
 #[cfg(test)]
 mod tests {

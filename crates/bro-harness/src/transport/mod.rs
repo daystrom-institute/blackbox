@@ -340,3 +340,73 @@ pub(super) fn truncate(s: &str, max: usize) -> String {
     let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
     format!("{}… [truncated]", &s[..end])
 }
+
+/// Extract the durable `<summary>` block from a structured compaction response.
+///
+/// The summarizer (`COMPACTION_INSTRUCTION`) is asked to reason in an
+/// `<analysis>` scratchpad and then emit the durable summary in a `<summary>`
+/// block; only the latter should be stored — keeping the scratchpad would waste
+/// the context the compaction is meant to free. Tolerant by construction so it
+/// can never blank a real summary: if a `<summary>` block is present (even
+/// unterminated, e.g. truncated at the token budget) its content is returned; if
+/// not, a leading `<analysis>…</analysis>` scratchpad is stripped; otherwise the
+/// trimmed input is returned unchanged. Shared by every transport's
+/// `summarize_text`.
+pub(super) fn extract_summary(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    if let Some(start) = lower.find("<summary>") {
+        let after = start + "<summary>".len();
+        let end = lower[after..]
+            .find("</summary>")
+            .map(|e| after + e)
+            .unwrap_or(raw.len());
+        return raw[after..end].trim().to_string();
+    }
+    if let Some(a_start) = lower.find("<analysis>")
+        && let Some(a_end_rel) = lower[a_start..].find("</analysis>")
+    {
+        let a_end = a_start + a_end_rel + "</analysis>".len();
+        let tail = raw[a_end..].trim();
+        if !tail.is_empty() {
+            return tail.to_string();
+        }
+    }
+    raw.trim().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_summary_keeps_only_summary_block() {
+        let raw = "<analysis>\nstep through it\n</analysis>\n<summary>\n1. Intent: do X\n</summary>";
+        assert_eq!(extract_summary(raw), "1. Intent: do X");
+    }
+
+    #[test]
+    fn extract_summary_handles_unterminated_summary() {
+        // Truncated at the token budget mid-summary — still recover the content.
+        let raw = "<analysis>x</analysis>\n<summary>\npartial section that got cut";
+        assert_eq!(extract_summary(raw), "partial section that got cut");
+    }
+
+    #[test]
+    fn extract_summary_strips_leading_analysis_when_no_summary_tag() {
+        let raw = "<analysis>\nreasoning\n</analysis>\n\nThe actual summary text.";
+        assert_eq!(extract_summary(raw), "The actual summary text.");
+    }
+
+    #[test]
+    fn extract_summary_passes_through_plain_text() {
+        // A model that ignored the tags must not be blanked.
+        let raw = "Just a plain summary with no tags.";
+        assert_eq!(extract_summary(raw), "Just a plain summary with no tags.");
+    }
+
+    #[test]
+    fn extract_summary_is_case_insensitive_on_tags() {
+        let raw = "<SUMMARY>tagged</SUMMARY>";
+        assert_eq!(extract_summary(raw), "tagged");
+    }
+}

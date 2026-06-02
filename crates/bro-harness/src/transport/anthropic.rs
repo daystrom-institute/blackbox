@@ -160,10 +160,13 @@ impl AnthropicTransport {
             .filter_map(|b| b["text"].as_str())
             .collect::<Vec<_>>()
             .join("");
-        if out.trim().is_empty() {
+        // Keep only the durable `<summary>` block, dropping the `<analysis>`
+        // scratchpad the structured prompt asks for.
+        let summary = super::extract_summary(&out);
+        if summary.is_empty() {
             anyhow::bail!("compaction summary was empty");
         }
-        Ok(out)
+        Ok(summary)
     }
 }
 
