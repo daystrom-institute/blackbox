@@ -1,5 +1,5 @@
 ---
-title: "Antigravity · MCP Tooling"
+title: "Antigravity - MCP Tooling"
 kind: research-finding
 corpus: blackbox-research
 track: harness
@@ -13,21 +13,30 @@ topic:
   - harness
   - antigravity
   - mcp
-brief: "agy MCP: config at ~/.gemini/antigravity/mcp_config.json (+ legacy settings.json mcpServers); McpServerConfig local(command/args/env) + remote(url/headers); full resource/prompt surface; PER-TOOL disabling (disabledTools); team AllowMcpServers; marketplace McpServerTemplate; Claude Code MCP import bridge; parallelized init (v1.0.4)."
+brief: "SDK supports MCP stdio, SSE, and streamable HTTP servers with per-server enabled_tools/disabled_tools filtering; McpBridge connects servers and extends the ToolRunner. Current host has ~/.gemini/config/mcp_config.json present but empty, so older populated-config claims are not live-confirmed here."
 ---
 
-# Antigravity · MCP Tooling
+# Antigravity - MCP Tooling
 
-> Mined from the `agy` v1.0.4 Go binary (`strings` ~500K lines) + `~/.gemini/` config + docs/CHANGELOG by DeepSeek-v4-pro bros, 2026-06-02. **Caveat:** agy is a THIN gRPC client to Google's server-side "cortex" engine — tools/loop/compaction run server-side, so confidence is capped at *medium* for anything not a verbatim binary string or a live config file.
-See axis: [MCP Tooling](../mcp.md) · snapshot: [Antigravity 1.0.4](antigravity-1.0.4.md).
+> Evidence: public google-antigravity SDK source at f74a23fc5f4026129a5b4498ce652d7d6018e23f, installed agy 1.0.4 binary strings/changelog, and current ~/.gemini host state. SDK claims are high confidence for the SDK/localharness surface; CLI/cortex claims remain medium unless backed by live state or verbatim binary strings.
+See axis: [MCP Tooling](../mcp.md) - snapshot: [Antigravity 1.0.4](antigravity-1.0.4.md).
 
-**Finding.** Config lives in `~/.gemini/antigravity/mcp_config.json` (and legacy `~/.gemini/settings.json` `mcpServers` — a v1.0.3 migration target). `McpLocalServer{command,args,env}` and `McpRemoteServer{type,url,headers}`; full `McpResourceItem`/`McpPromptMessage`/`McpPromptArgument` surface. **Per-tool disabling** via `disabledTools` (live config disables 63 tools on the `blackbox` server; `daystrom` fully disabled). Team-level `AllowMcpServers`; marketplace `McpServerTemplate`; Claude Code MCP import via the plugin bridge; parallelized server init (v1.0.4).
+## Finding
 
-**Evidence.**
-- `~/.gemini/antigravity/mcp_config.json`: `{"blackbox":{"serverUrl":…,"disabledTools":[…63…]},"daystrom":{"disabled":true}}`
-- `McpRemoteServer{GetType,GetUrl,GetHeaders}`; CHANGELOG v1.0.4 "Parallelized the MCP server initialization"
+The SDK exposes MCP as a first-class tool source. It defines McpStdioServer, McpSseServer, and McpStreamableHttpServer. Each server config accepts enabled_tools and disabled_tools, so MCP tool visibility can be narrowed before tools enter model context. During Agent startup, McpBridge connects the configured servers and extends the ToolRunner with server-provided tools.
 
-**Vs the axis.** Confirms full MCP (resources+prompts), and adds **per-tool disabling** + team allowlists (finer than Claude's native MCP). No client-side tool-search/deferral observed (server dispatches).
+The SDK references cover stdio and SSE. The source type surface also includes streamable HTTP. Policy helpers are overloaded for MCP server config objects, letting the same allow/deny/ask policy layer apply to MCP tools after context-level filtering has already happened.
+
+CLI evidence is thinner. Binary strings and changelog text show McpRemoteServer accessors, MCP resource/prompt vocabulary, import/migration paths, team allowlist concepts, marketplace template vocabulary, and v1.0.4 parallelized MCP server initialization. On this host the only live MCP config found is ~/.gemini/config/mcp_config.json, and it is zero bytes. Earlier claims about a populated ~/.gemini/antigravity/mcp_config.json are not current live evidence here.
+
+## Design Takeaways
+
+- Antigravity separates MCP tool selection from policy. enabled_tools/disabled_tools trim context; policy decides whether a visible tool call is allowed.
+- MCP tools are not a side channel in the SDK. They are merged into the same ToolRunner path as builtins and Python callables.
+- The SDK offers no observed deferred MCP discovery/tool-search layer. If cortex does server-side tiering, that remains unconfirmed.
 
 ## Open
-<!-- Whether deferred tiering exists server-side; tool_search vs MCP tools/list. -->
+
+- Populated CLI MCP schema and migration behavior.
+- Whether CLI/cortex defers MCP tools or sends all enabled server tools to the model.
+- Whether streamable HTTP is exposed in standalone agy config or only in the SDK type layer.

@@ -1,11 +1,11 @@
 ---
-title: "Antigravity CLI (agy) — 1.0.4 (snapshot)"
+title: "Antigravity CLI (agy) - 1.0.4 (snapshot)"
 kind: research-subject
 corpus: blackbox-research
 track: harness
 harness: antigravity
 version: "1.0.4"
-platform: linux-x86_64
+platform: macos-aarch64
 captured: "2026-06-02"
 supersedes: null
 replaces: gemini
@@ -13,100 +13,91 @@ status: enriched
 topic:
   - harness
   - antigravity
-brief: "Point-in-time snapshot for Antigravity CLI (agy) 1.0.4 — Google's terminal coding agent, replacing the deprecated Gemini CLI subject. Records provenance (a mineable Go-native binary) and recon-level signals from the public README + CHANGELOG that already triangulate several axes, ahead of the deep string-mine. Findings are stubs."
+brief: "Point-in-time snapshot for Antigravity CLI (agy) 1.0.4, enriched with the public google-antigravity SDK/localharness source at f74a23f plus local CLI state/logs. The SDK makes the loop, tools, hooks, policies, MCP, skills, persistence, and subagent contract inspectable; the standalone CLI still has opaque server-side cortex behavior."
 ---
 
-# Antigravity CLI (agy) — 1.0.4 (snapshot)
+# Antigravity CLI (agy) - 1.0.4 (snapshot)
 
-> **Replaces the deprecated Gemini CLI subject.** Gemini CLI is deprecated;
-> `agy` is Google's terminal coding agent going forward. It still uses the
-> `~/.gemini/` config namespace (the deprecation lineage). The former `gemini/`
-> folder (empty stubs) was removed.
->
-> **This snapshot is recon-level, not mined.** Provenance below is verified;
-> the "recon signals" are read from the public README + CHANGELOG (confidence
-> low/medium) and are *not* code-confirmed. The deep mine is open per leaf.
+> **Replaces the deprecated Gemini CLI subject.** agy is Google's terminal
+> coding agent going forward. It still uses the ~/.gemini/ namespace, so the
+> lineage remains visible in config/state paths.
 
-## Provenance
+This snapshot is no longer just README/changelog reconnaissance. It combines:
 
-- **Subject:** Antigravity CLI (`agy`) — Google's terminal coding agent; shares
-  a "Core Agent Engine" with the Antigravity 2.0 IDE (session export bridges
-  CLI↔IDE; settings/permissions sync).
-- **Version:** 1.0.4 (`agy --version`).
-- **Binary:** `~/.local/bin/agy` — ELF 64-bit LSB pie, Go-native, ~177 MB,
-  ~495K printable strings → **mineable via `strings -n8` + grep** (same approach
-  as the claude binary; closed source). Self-updates in the background.
-- **Config namespace:** `~/.gemini/` — `settings.json`, `hooks/`, `GEMINI.md`,
-  `projects.json`, `oauth_creds.json`, MCP config, `rules.json`. (Inherited from
-  Gemini CLI.)
-- **Install:** `curl -fsSL https://antigravity.google/cli/install.sh | bash`
-  (SHA512-verified flat native build from Google's auto-updater service). Docs
-  repo cloned to `~/repos/antigravity-cli` (README + CHANGELOG +
-  examples/{statusline,title}); the repo is docs-only, not source.
-- **Sibling:** Antigravity 2.0 IDE (`/usr/bin/antigravity`, 1.107.0) — same
-  engine, GUI surface.
-- **Auth:** system keyring → Google Sign-In; SSH-aware. **Telemetry:**
-  Interactions data collected by Google by default (opt-out in settings).
+- Installed CLI: /Users/invidious/.local/bin/agy, agy --version = 1.0.4,
+  Mach-O 64-bit arm64, about 135 MB.
+- Public SDK: google-antigravity/antigravity-sdk-python, cloned at
+  f74a23fc5f4026129a5b4498ce652d7d6018e23f on 2026-06-02. The SDK is the
+  strongest evidence for the local harness API: Agent, Conversation,
+  LocalConnection, hooks, policies, built-in tools, MCP adapters, triggers,
+  skills paths, and generated localharness_pb2 message types.
+- Local CLI state: ~/.gemini/antigravity-cli/ includes settings, keybindings,
+  cache/project mapping, SQLite conversation stores, brain JSONL transcripts,
+  implicit trajectory protos, and logs. Current ~/.gemini/config/mcp_config.json
+  is present but empty on this host.
+- Binary strings: the closed agy binary exposes Google-internal package names,
+  protobuf names, prompt template paths, local store code paths, subagent labels,
+  cortex/trajectory vocabulary, and Cloud Code endpoint names. These are
+  high-signal but not source-level proof of remote server behavior.
 
-## Recon signals (pre-mine — confidence low/medium, NOT code-confirmed)
+## Architecture Split
 
-From README + CHANGELOG. Each is a hypothesis to confirm in the mine; several
-already triangulate the codex-derived axes on a third harness:
+There are two related surfaces:
 
-- **privilege-approvals †** — `proceed-in-sandbox` tool permission mode
-  (auto-approves commands inside the sandbox, prompts on bypass); "Sandbox Mode";
-  `rules.json` allowlists/exclusions. *(confirms axis)*
-- **session-lifecycle †** — SQLite (`.db`) conversation persistence; `/resume`;
-  session export to the IDE; import from 2.0. *(confirms axis)*
-- **subagents** — "specialized agents"; a 60s interaction timeout scoped to
-  subagents.
-- **mcp** — custom MCP servers (`mcp_config.json`), parallelized init, TUI
-  enable/disable.
-- **skills** — skill-derived slash commands; **plugin** discovery for skills +
-  agents (plugins install to `~/.gemini/config/`).
-- **builtin-tools** — `AskQuestion` structured elicitation (options, write-in
-  values, multi-question dialogs). *(confirms the builtin-tools I/O-contract
-  extension)*
-- **hooks** — statusline + title hooks: a JSON payload of `agent_state` / `vcs` /
-  context-window usage / terminal dims is piped to a shell script on stdin.
-- **context-management** — `.md` rule-file discovery via `rules.json`; `GEMINI.md`
-  overlay.
-- **modes-personas †** — "Review Mode" (statusline state).
-- **transport** — G1 credits / `/usage` / `/quota` quota surfaces.
+- **CLI/cortex surface.** The standalone agy binary behaves as a thin client
+  around Google's backend. Local logs show model discovery against
+  daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels,
+  propagation of a selected model label, creation of a cascade trajectory, and a
+  streamed conversation update. The exact remote turn scheduler, compactor,
+  retry loop, prompt assembler, and model router remain opaque.
+- **SDK/localharness surface.** The Python SDK launches a Go local harness and
+  talks to it over WebSocket. It exposes the agent loop as Python classes and
+  generated proto messages. For SDK-backed axes, confidence can be high because
+  the source declares the tool list, hook dispatch, policy precedence, MCP
+  bridge, conversation lifecycle, compaction markers, and subagent accounting.
 
-## Update (2026-06-02 · mining pass)
+## Local State
 
-All 15 axis cells for agy are now populated — mined from the Go binary
-(`strings`) + `~/.gemini/` config + docs by DeepSeek-v4-pro bros. Confidence is
-**medium** for server-side behaviors (agy is a thin gRPC client to the cortex
-engine) and **high** for verbatim binary strings + live config (e.g. the
-two-tier `run_command` sandbox prompt, the 7 hook types, the SQLite session
-transition). Per-cell frontmatter is authoritative; the table below predates this
-pass and is not re-statused.
+- ~/.gemini/antigravity-cli/settings.json currently only sets
+  enableTelemetry=false.
+- ~/.gemini/antigravity-cli/keybindings.json includes subagent actions such as
+  subagent.approve_fast and subagent.jump_to_waiting, plus view toggles.
+- ~/.gemini/antigravity-cli/conversations/<uuid>.db contains SQLite tables
+  trajectory_meta, steps, gen_metadata, executor_metadata, parent_references,
+  trajectory_metadata_blob, and battle_mode_infos.
+- ~/.gemini/antigravity-cli/brain/<uuid>/.system_generated/logs/ contains typed
+  JSONL transcripts. The observed transcript used USER_INPUT,
+  CONVERSATION_HISTORY, PLANNER_RESPONSE, LIST_DIRECTORY, and VIEW_FILE events
+  with tool call names such as list_dir and view_file.
 
-## Axis checklist
+## Axis Checklist
 
-| Axis | Leaf | Status | Confidence |
+| Axis | Leaf | Status | Confidence posture |
 |---|---|---|---|
-| Transport & Feature Flags | [antigravity-transport](antigravity-transport.md) | stub | unknown |
-| Robustness | [antigravity-robustness](antigravity-robustness.md) | stub | unknown |
-| Compaction | [antigravity-compaction](antigravity-compaction.md) | stub | unknown |
-| Agent Loop | [antigravity-agent-loop](antigravity-agent-loop.md) | stub | unknown |
-| Context Management | [antigravity-context-management](antigravity-context-management.md) | stub | unknown |
-| Built-in Tools | [antigravity-builtin-tools](antigravity-builtin-tools.md) | stub | unknown |
-| MCP Tooling | [antigravity-mcp](antigravity-mcp.md) | stub | unknown |
-| Subagents | [antigravity-subagents](antigravity-subagents.md) | stub | unknown |
-| Hooks | [antigravity-hooks](antigravity-hooks.md) | stub | unknown |
-| Skills | [antigravity-skills](antigravity-skills.md) | stub | unknown |
+| Transport & Feature Flags | [antigravity-transport](antigravity-transport.md) | enriched | high for SDK/localharness, medium for CLI/cortex |
+| Robustness | [antigravity-robustness](antigravity-robustness.md) | enriched | high for SDK client error handling, medium for remote retry semantics |
+| Compaction | [antigravity-compaction](antigravity-compaction.md) | enriched | high for SDK markers/hooks, medium for CLI compactor internals |
+| Agent Loop | [antigravity-agent-loop](antigravity-agent-loop.md) | enriched | high for SDK loop plumbing, medium for CLI server loop |
+| Context Management | [antigravity-context-management](antigravity-context-management.md) | enriched | high for SDK instruction/tool filtering, medium for CLI prompt templates |
+| Built-in Tools | [antigravity-builtin-tools](antigravity-builtin-tools.md) | enriched | high for SDK built-ins/protos, medium for closed CLI tool docs |
+| MCP Tooling | [antigravity-mcp](antigravity-mcp.md) | enriched | high for SDK MCP bridge/filtering, medium for CLI config migration |
+| Subagents | [antigravity-subagents](antigravity-subagents.md) | enriched | high for SDK lifecycle, medium for server-side specialization |
+| Hooks | [antigravity-hooks](antigravity-hooks.md) | enriched | high for SDK hook API, medium for extra CLI hook runners |
+| Skills | [antigravity-skills](antigravity-skills.md) | enriched | high for SDK Agent Skills paths, medium for CLI plugin schema |
+| Privilege Approvals | [antigravity-privilege-approvals](antigravity-privilege-approvals.md) | enriched | high for SDK policies, medium for standalone CLI sandbox internals |
+| Session Lifecycle | [antigravity-session-lifecycle](antigravity-session-lifecycle.md) | enriched | high for SDK persistence and local SQLite shape |
+| Memory Persistence | [antigravity-memory-persistence](antigravity-memory-persistence.md) | enriched | high for session persistence, medium for CLI knowledge/memory semantics |
+| Modes & Personas | [antigravity-modes-personas](antigravity-modes-personas.md) | enriched | high for SDK instruction/persona API, medium for CLI modes |
+| Planning & Goals | [antigravity-planning-goals](antigravity-planning-goals.md) | enriched | medium; planning artifacts visible, durable goal contract not proven |
 
-(New-axis cells — the five † axes — are seeded when mined, per the charter.)
+## Remaining Gaps
 
-## Next on this subject
-
-- String-mine `~/.local/bin/agy` (`strings -n8` + grep) for system prompts,
-  tooldoc language, `<system-reminder>`-equivalents, and the sandbox/approval
-  messaging. Confirm the recon signals above.
-- Inspect `~/.gemini/` (settings.json, hooks/, rules.json, mcp_config) for the
-  config-side agent-facing surfaces.
-- Read the [claude exemplar snapshot](../claude/claude-2.1.160.md) for target
-  shape/tone.
+- The exact CLI/cortex wire contract is still not source-confirmed beyond local
+  logs, strings, and generated proto names.
+- Binary strings reveal prompt template names and some embedded guidance, but the
+  research corpus should summarize idioms rather than copy proprietary prompt
+  prose into design or shipped code.
+- CLI plugin, rules.json, hooks, and MCP schemas need live populated examples
+  from a configured host or official schema docs.
+- The SDK and standalone CLI likely share concepts but are not identical
+  surfaces. Leaves below call out where a claim is SDK-only versus CLI-observed.
