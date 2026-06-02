@@ -1,0 +1,19 @@
+{
+  "id": "cfefddba",
+  "title": "research/ corpus + harness research charter",
+  "content": "The `research/` corpus (sibling of `design/`, mapped by `research/research-corpus.md`) is a point-in-time, evidence-graded study of the external problem space — reference harnesses, provider APIs, protocols — that feeds the `design/` corpus. It is a distinct corpus: `corpus: blackbox-research`, its own kinds (`research-hub`/`research-axis`/`research-subject`/`research-finding`), a research `status` lifecycle (`stub → researching → enriched → verified`) with inline per-claim confidence tiers, and version-snapshot supersession (a new `<harness>-<version>.md` snapshot supersedes the prior and re-mines only changed axes). The first track, `research/harness/`, studies agentic coding CLIs across a matrix of subject × axis. Before doing harness research or adding any research doc, read the charter `research/harness/harness-tracks.md` — it defines the axes, the matrix ontology, the frontmatter schema, the mining shape, and the researcher pickup contract. Adopt mined idioms into `design/`; never paste proprietary prompt prose into shipped code.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-02T11:14:24Z",
+  "updated_at": "2026-06-02T11:14:24Z",
+  "recall_count": 0
+}

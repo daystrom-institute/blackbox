@@ -229,6 +229,11 @@ or system memories and link/pointer from here.
 - `docs/agent-system.md`, `docs/atoms.md`, `docs/badgey.md`,
   `docs/councils-whiteboards.md` - agentic coordination surfaces.
 - `design/design-corpus.md` - Obsidian-friendly map for the design corpus.
+- `research/research-corpus.md` - map for the research corpus: a point-in-time,
+  evidence-graded study of the external problem space (reference harnesses,
+  provider APIs, protocols) that feeds `design/`. Sibling of `design/`, distinct
+  `corpus: blackbox-research`. First track + charter:
+  `research/harness/harness-tracks.md`.
 - `design/list-design-docs.sh` - list design docs whose frontmatter lifecycle
   is `proposed` or `partial`.
 - `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,
