@@ -25,6 +25,11 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 futures-util = "0.3"
 async-trait = "0.1"
+# WebSocket Responses transport (codex's responses_websockets path). rustls is a
+# direct dep only to install a process-default crypto provider (rustls 0.23
+# requires one before a ClientConfig can be built); see openai_responses_ws.rs.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }

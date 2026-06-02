@@ -55,6 +55,19 @@ pub(super) fn http_endpoint(auth: &Auth) -> String {
     }
 }
 
+/// The WebSocket `/responses` URL — the HTTP endpoint with the scheme swapped to
+/// `wss`/`ws` (codex's `websocket_url_for_path`).
+pub(super) fn ws_endpoint(auth: &Auth) -> String {
+    let http = http_endpoint(auth);
+    if let Some(rest) = http.strip_prefix("https://") {
+        format!("wss://{rest}")
+    } else if let Some(rest) = http.strip_prefix("http://") {
+        format!("ws://{rest}")
+    } else {
+        http
+    }
+}
+
 /// The codex-style identity + auth headers shared by every Responses request —
 /// HTTP body POST and WS handshake alike. `session-id` is the stable per-session
 /// id; `thread-id` is the current turn. `OpenAI-Beta: responses=experimental` is
