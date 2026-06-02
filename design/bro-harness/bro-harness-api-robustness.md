@@ -174,9 +174,11 @@ Recorded here so the review is a complete ledger.
   multi-minute gaps (tool runs, human steering) that expire the default 5-minute
   ephemeral cache and re-pay full prefix processing; 1h keeps it warm. Tunable via
   `BRO_HARNESS_CACHE_TTL` (empty → plain ephemeral, no beta) as a per-provider
-  escape hatch. **Live-verify on GLM/DeepSeek** that the extended-TTL shape is
-  accepted (real-Claude is known-good); fall back to the empty-TTL knob if a
-  provider 400s.
+  escape hatch. **Verified live 2026-06-02** on GLM (z.ai) and DeepSeek: both
+  accept the `extended-cache-ttl` beta + `ttl:"1h"` shape (HTTP 200) and engage
+  prompt caching — a warm request returned `cache_read_input_tokens=1792` on both
+  (input dropped from ~1.8k to ~20). Real-Claude is known-good. No fallback
+  needed; the empty-TTL knob remains for any future provider that rejects it.
 - **Backoff jitter `[cross-transport]`** — `backoff()` now applies ±20%
   dependency-free jitter over a deterministic `backoff_base()`, re-capped at the
   ceiling (`http.rs`), so a fleet tripping a shared 429 doesn't retry in lockstep.

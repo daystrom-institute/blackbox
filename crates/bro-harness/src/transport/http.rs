@@ -42,12 +42,38 @@ pub fn max_retries() -> u32 {
         .unwrap_or(DEFAULT_MAX_RETRIES)
 }
 
-pub fn backoff(attempt: u32) -> Duration {
-    // attempt is 1-based; 500ms, 1s, 2s, 4s … capped.
+/// Deterministic capped exponential backoff: 500ms, 1s, 2s, 4s, 8s … capped at
+/// `MAX_BACKOFF_MS`. `attempt` is 1-based. The public [`backoff`] adds jitter on
+/// top of this.
+fn backoff_base(attempt: u32) -> Duration {
     let ms = BASE_BACKOFF_MS
         .saturating_mul(1u64 << attempt.min(5).saturating_sub(1))
         .min(MAX_BACKOFF_MS);
     Duration::from_millis(ms)
+}
+
+/// Capped exponential backoff with ±20% jitter. Without jitter, a fleet that
+/// trips a shared rate limit (429) at the same instant retries in lockstep and
+/// re-thunders the provider on every wave. The jitter source is wall-clock
+/// sub-second nanos — its only job is to decorrelate concurrent retriers, so
+/// cryptographic quality is irrelevant and no `rand` dependency is needed. The
+/// jittered value is re-capped at `MAX_BACKOFF_MS` so the hard ceiling holds.
+pub fn backoff(attempt: u32) -> Duration {
+    let base = backoff_base(attempt).as_millis() as f64;
+    let factor = 0.8 + 0.4 * jitter_frac(); // [0.8, 1.2)
+    let ms = ((base * factor) as u64).min(MAX_BACKOFF_MS);
+    Duration::from_millis(ms)
+}
+
+/// A `[0.0, 1.0)` spread from wall-clock sub-second nanos — a dependency-free
+/// jitter source for [`backoff`]. Not suitable for anything needing real
+/// randomness; adjacent calls within the same nanosecond collide harmlessly.
+fn jitter_frac() -> f64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    (nanos % 1_000) as f64 / 1_000.0
 }
 
 fn status_retryable(status: reqwest::StatusCode) -> bool {
@@ -128,11 +154,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_is_capped_and_monotonic() {
-        assert_eq!(backoff(1), Duration::from_millis(500));
-        assert_eq!(backoff(2), Duration::from_millis(1000));
-        assert_eq!(backoff(3), Duration::from_millis(2000));
-        assert!(backoff(20) <= Duration::from_millis(MAX_BACKOFF_MS));
+    fn backoff_base_is_capped_and_monotonic() {
+        assert_eq!(backoff_base(1), Duration::from_millis(500));
+        assert_eq!(backoff_base(2), Duration::from_millis(1000));
+        assert_eq!(backoff_base(3), Duration::from_millis(2000));
+        assert_eq!(backoff_base(4), Duration::from_millis(4000));
+        assert!(backoff_base(20) <= Duration::from_millis(MAX_BACKOFF_MS));
+    }
+
+    #[test]
+    fn backoff_jitter_stays_within_bounds_and_under_cap() {
+        // Every jittered draw lands within ±20% of the base and never above the
+        // hard ceiling. Sampled repeatedly since the jitter source is the clock.
+        for attempt in 1..=6u32 {
+            let base = backoff_base(attempt).as_millis() as u64;
+            let lo = (base * 8) / 10; // 0.8x
+            let hi = (base * 12) / 10; // 1.2x
+            for _ in 0..50 {
+                let b = backoff(attempt).as_millis() as u64;
+                assert!(b >= lo.min(MAX_BACKOFF_MS), "attempt {attempt}: {b} < {lo}");
+                assert!(b <= hi, "attempt {attempt}: {b} > {hi}");
+                assert!(b <= MAX_BACKOFF_MS, "attempt {attempt}: {b} over cap");
+            }
+        }
     }
 
     #[test]

@@ -85,7 +85,7 @@ impl AnthropicTransport {
         let mut system_blocks: Vec<Value> = Vec::new();
         if let Some(stable) = opts.system.stable_text() {
             system_blocks.push(json!({
-                "type": "text", "text": stable, "cache_control": {"type": "ephemeral"},
+                "type": "text", "text": stable, "cache_control": cache_control(),
             }));
         }
         if let Some(volatile) = opts.system.volatile_text() {
@@ -586,15 +586,35 @@ impl Transport for AnthropicTransport {
 
 /// Default `anthropic-beta` features for the Anthropic-compatible endpoints
 /// (glm/deepseek). `effort-*` honors `output_config.effort`; `context-1m-*`
-/// opens the 1M context window (both endpoints accept it). Deliberately omits
-/// `interleaved-thinking`/`context-management` — those impose thinking-block
-/// replay/management obligations handled separately. Override via
+/// opens the 1M context window; `extended-cache-ttl-*` enables the 1-hour
+/// prompt-cache TTL (see [`cache_control`]) so a multi-minute gap between turns
+/// — long tool runs, human steering — doesn't expire the cached prefix at the
+/// default 5-minute ephemeral window (all three accepted by both endpoints).
+/// Deliberately omits `interleaved-thinking`/`context-management` — those impose
+/// thinking-block replay/management obligations handled separately. Override via
 /// `BRO_HARNESS_ANTHROPIC_BETAS` (empty string disables the header).
-const DEFAULT_ANTHROPIC_BETAS: &str = "effort-2025-11-24,context-1m-2025-08-07";
+const DEFAULT_ANTHROPIC_BETAS: &str =
+    "effort-2025-11-24,context-1m-2025-08-07,extended-cache-ttl-2025-04-11";
 
 fn anthropic_betas() -> String {
     std::env::var("BRO_HARNESS_ANTHROPIC_BETAS")
         .unwrap_or_else(|_| DEFAULT_ANTHROPIC_BETAS.to_string())
+}
+
+/// `cache_control` block for prompt-cache breakpoints. Defaults to a **1-hour
+/// TTL** (gated by the `extended-cache-ttl-2025-04-11` beta in
+/// [`DEFAULT_ANTHROPIC_BETAS`]); agent turns routinely have multi-minute gaps
+/// (tool execution, waiting on promises, human steering) that would expire the
+/// default 5-minute ephemeral cache and re-pay full prefix processing on the
+/// next turn. Tunable via `BRO_HARNESS_CACHE_TTL`: any value (`"5m"`) sets that
+/// TTL; an **empty** value emits plain `{"type":"ephemeral"}` (no TTL field, no
+/// beta needed) for a provider that rejects the extended-TTL shape.
+fn cache_control() -> Value {
+    match std::env::var("BRO_HARNESS_CACHE_TTL") {
+        Ok(t) if t.is_empty() => json!({"type": "ephemeral"}),
+        Ok(t) => json!({"type": "ephemeral", "ttl": t}),
+        Err(_) => json!({"type": "ephemeral", "ttl": "1h"}),
+    }
 }
 
 /// Return a clone of the conversation with an ephemeral cache breakpoint on the
@@ -611,7 +631,7 @@ fn messages_with_cache_breakpoint(messages: &[Value]) -> Vec<Value> {
         && let Some(block) = content.last_mut()
         && block.is_object()
     {
-        block["cache_control"] = json!({"type": "ephemeral"});
+        block["cache_control"] = cache_control();
     }
     msgs
 }
@@ -747,13 +767,27 @@ mod tests {
     }
 
     #[test]
-    fn default_betas_carry_effort_and_1m() {
+    fn default_betas_carry_effort_1m_and_cache_ttl() {
         // No env override ⇒ the verified default feature set.
         assert!(DEFAULT_ANTHROPIC_BETAS.contains("effort-"));
         assert!(DEFAULT_ANTHROPIC_BETAS.contains("context-1m-"));
+        // Extended cache TTL gates the 1h `cache_control` ttl on the breakpoints.
+        assert!(DEFAULT_ANTHROPIC_BETAS.contains("extended-cache-ttl-"));
         // Intentionally NOT interleaved-thinking / context-management (Tier 3).
         assert!(!DEFAULT_ANTHROPIC_BETAS.contains("interleaved-thinking"));
         assert!(!DEFAULT_ANTHROPIC_BETAS.contains("context-management"));
+    }
+
+    #[test]
+    fn cache_control_defaults_to_extended_ttl() {
+        // Default (no BRO_HARNESS_CACHE_TTL) → 1-hour extended TTL so a
+        // multi-minute gap between turns can't expire the cached prefix.
+        // Guarded so a host that exports the var doesn't fail the strict check.
+        if std::env::var_os("BRO_HARNESS_CACHE_TTL").is_none() {
+            let cc = cache_control();
+            assert_eq!(cc["type"], "ephemeral");
+            assert_eq!(cc["ttl"], "1h");
+        }
     }
 
     #[test]
