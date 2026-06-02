@@ -137,6 +137,18 @@ enum Outcome {
     TimedOut,
 }
 
+/// Running-progress metadata for a yielded session, drawn from the same
+/// [`PromiseProgress`] the pipe readers heartbeat into. Surfaces elapsed
+/// runtime, last-output recency, and stdout/stderr byte counts so an agent
+/// polling a silent-but-healthy long command (a quiet `cargo build`) sees it is
+/// still making progress. Mirrors the `progress` field on promise snapshots.
+fn session_progress(session: &ShellSession) -> Option<Value> {
+    let progress = session.progress.as_ref()?;
+    let started_ms =
+        crate::promise::now_ms().saturating_sub(session.started.elapsed().as_millis() as u64);
+    Some(progress.snapshot(started_ms))
+}
+
 enum PromiseOutcome {
     Exited(Option<i32>),
     TimedOut,
@@ -248,7 +260,7 @@ fn settle_from_tool_result(cx: &ToolCx, promise_id: &str, result: ToolResult) {
 }
 
 fn spawn_reader<R>(
-    r: R,
+    mut r: R,
     buf: Arc<Mutex<OutBuf>>,
     progress: Option<(StreamKind, Arc<PromiseProgress>)>,
 ) -> JoinHandle<()>
@@ -629,12 +641,19 @@ impl Tool for ShellRun {
             }
             Outcome::Yielded => {
                 let (so, se) = snapshot(&session, max_tokens);
+                let progress = session_progress(&session);
                 match cx.shell_sessions.lock().unwrap().insert(session) {
-                    Ok(id) => ToolResult::Json(json!({
-                        "exit_code": Value::Null, "stdout": so, "stderr": se,
-                        "running": true, "timed_out": false, "session_id": id,
-                        "next_step": format!("Call shell_poll with session_id={id} until running=false before interpreting this command as complete."),
-                    })),
+                    Ok(id) => {
+                        let mut out = json!({
+                            "exit_code": Value::Null, "stdout": so, "stderr": se,
+                            "running": true, "timed_out": false, "session_id": id,
+                            "next_step": format!("Call shell_poll with session_id={id} until running=false before interpreting this command as complete."),
+                        });
+                        if let Some(p) = progress {
+                            out["progress"] = p;
+                        }
+                        ToolResult::Json(out)
+                    }
                     Err(mut overflow) => {
                         let _ = overflow.child.start_kill();
                         ToolResult::Error(format!(
@@ -740,17 +759,22 @@ impl Tool for ShellPoll {
             }
             Outcome::Yielded => {
                 let (so, se) = snapshot(&session, max_tokens);
+                let progress = session_progress(&session);
                 // Re-insert directly (we already own the slot; can't overflow).
                 cx.shell_sessions
                     .lock()
                     .unwrap()
                     .map
                     .insert(args.session_id.clone(), session);
-                ToolResult::Json(json!({
+                let mut out = json!({
                     "exit_code": Value::Null, "stdout": so, "stderr": se,
                     "running": true, "timed_out": false, "session_id": args.session_id,
                     "next_step": format!("Call shell_poll again with session_id={} until running=false before interpreting this command as complete.", args.session_id),
-                }))
+                });
+                if let Some(p) = progress {
+                    out["progress"] = p;
+                }
+                ToolResult::Json(out)
             }
         }
     }
@@ -929,6 +953,35 @@ mod tests {
                 .as_str()
                 .is_some_and(|s| s.contains("shell_poll")),
             "missing poll guidance: {v}"
+        );
+
+        let sid = v["session_id"].as_str().unwrap().to_string();
+        let _ = ShellKill
+            .call(json!({"session_id": sid, "signal": "term"}), &c)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn yielded_session_reports_running_progress() {
+        // A long command that emits output up front then goes quiet should yield
+        // with a `progress` block reflecting the bytes already read — the
+        // session-mode counterpart to promise progress (gap note-330f1485).
+        let c = cx();
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "echo hi; sleep 2"}), &c)
+                .await,
+        );
+        assert_eq!(v["running"], true, "should yield: {v}");
+        let progress = &v["progress"];
+        assert!(progress.is_object(), "yielded response carries progress: {v}");
+        assert!(
+            progress["stdout_bytes"].as_u64().unwrap_or(0) >= 3,
+            "early `hi\\n` output should be counted: {v}"
+        );
+        assert!(
+            progress["elapsed_ms"].as_u64().is_some(),
+            "progress reports elapsed: {v}"
         );
 
         let sid = v["session_id"].as_str().unwrap().to_string();

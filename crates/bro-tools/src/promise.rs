@@ -76,8 +76,10 @@ impl PromiseProgress {
         }
     }
 
-    /// Build a json! snapshot of progress suitable for inclusion in a promise
-    /// status response. Returns None when no output has been written yet.
+    /// Build a json! snapshot of progress suitable for inclusion in a running
+    /// promise / shell-session status response, given the producer's wall-clock
+    /// start. Before any output, byte counters read 0 and `last_output_at_ms`
+    /// is 0 (rendered as "no output yet" by consumers).
     pub fn snapshot(&self, started_ms: u64) -> Value {
         let now = now_ms();
         let elapsed = now.saturating_sub(started_ms);
@@ -309,7 +311,7 @@ fn render_completion_event(id: &str, entry: &PromiseEntry) -> String {
     )
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
