@@ -1,13 +1,13 @@
-//! MCP client: connect to the MCP server(s) the daemon injects via
-//! `--mcp-config` and expose their tools as `bro_tools::Tool` impls, merged
-//! into the registry alongside the built-in workspace/web tools.
+//! MCP client: connect to the MCP server(s) injected via `--mcp-config` and
+//! expose their tools as `bro_tools::Tool` impls, merged into the registry
+//! alongside the built-in workspace/web tools.
 //!
 //! Transport + call pattern mirror the daemon's own outbound client
-//! (`src/mcp_client.rs`): rmcp 1.4 `StreamableHttpClientTransport::from_uri`
-//! with `().serve(transport)`. Connections are per-operation (one to list at
-//! startup, one per tool call) — simple and correct for a short-lived
-//! harness against a loopback server; a pooled/persistent connection is a
-//! later optimization.
+//! (`src/mcp_client.rs`): streamable HTTP uses
+//! `StreamableHttpClientTransport::from_uri`, and stdio uses rmcp's
+//! `TokioChildProcess`. Connections are per-operation (one to list at startup,
+//! one per tool call) — simple and correct for short-lived harness sessions; a
+//! pooled/persistent connection is a later optimization.
 //!
 //! Failures are best-effort: a server that can't be reached or listed is
 //! logged (to stderr) and skipped — MCP unavailability never aborts the
@@ -17,15 +17,16 @@ use async_trait::async_trait;
 use bro_tools::{Tool, ToolCx, ToolResult};
 use rmcp::ServiceExt;
 use rmcp::model::{CallToolRequestParams, CallToolResult, Content, RawContent};
-use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioChildProcess};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Parse `--mcp-config` (`{"mcpServers":{name:{"type":"http","url":...}}}`),
-/// connect to each server, list its tools, and return those admitted by
-/// `filter`. Denied tools are dropped here so they never enter the registry —
-/// not listed to the model, not loadable via tool_search, not dispatchable.
+/// Parse `--mcp-config` (`{"mcpServers":{name:{...}}}`), connect to each
+/// server, list its tools, and return those admitted by `filter`. Denied tools
+/// are dropped here so they never enter the registry — not listed to the model,
+/// not loadable via tool_search, not dispatchable.
 pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Vec<Arc<dyn Tool>> {
     let Some(cfg) = mcp_config else {
         return Vec::new();
@@ -39,8 +40,8 @@ pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Ve
     };
 
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
-    for (name, url) in servers {
-        match list_server_tools(&name, &url).await {
+    for (name, transport) in servers {
+        match list_server_tools(&transport).await {
             Ok(listed) => {
                 let total = listed.len();
                 let mut admitted = 0;
@@ -121,30 +122,95 @@ fn pattern_matches(pattern: &str, name: &str) -> bool {
     }
 }
 
-fn parse_servers(cfg: &str) -> anyhow::Result<Vec<(String, String)>> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum McpTransportConfig {
+    Http {
+        url: String,
+    },
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+}
+
+fn parse_servers(cfg: &str) -> anyhow::Result<Vec<(String, McpTransportConfig)>> {
     let v: Value = serde_json::from_str(cfg)?;
     let mut out = Vec::new();
     if let Some(obj) = v["mcpServers"].as_object() {
         for (name, sc) in obj {
-            if let Some(url) = sc["url"].as_str() {
-                out.push((name.clone(), url.to_string()));
+            let transport_type = sc
+                .get("type")
+                .and_then(|t| t.as_str())
+                .or_else(|| sc.get("command").and_then(|_| Some("stdio")))
+                .or_else(|| sc.get("url").and_then(|_| Some("http")));
+            let Some(transport_type) = transport_type else {
+                tracing::warn!(server = %name, "ignoring MCP server with no transport fields");
+                continue;
+            };
+            match transport_type {
+                "http" | "sse" => {
+                    if let Some(url) = sc["url"].as_str() {
+                        out.push((
+                            name.clone(),
+                            McpTransportConfig::Http {
+                                url: url.to_string(),
+                            },
+                        ));
+                    } else {
+                        tracing::warn!(server = %name, "ignoring MCP server with no url");
+                    }
+                }
+                "stdio" => {
+                    if let Some(command) = sc["command"].as_str() {
+                        out.push((
+                            name.clone(),
+                            McpTransportConfig::Stdio {
+                                command: command.to_string(),
+                                args: parse_string_array(sc.get("args")),
+                                env: parse_string_map(sc.get("env")),
+                            },
+                        ));
+                    } else {
+                        tracing::warn!(server = %name, "ignoring stdio MCP server with no command");
+                    }
+                }
+                other => {
+                    tracing::warn!(server = %name, transport = %other, "ignoring unsupported MCP transport");
+                }
             }
         }
     }
     Ok(out)
 }
 
-async fn list_server_tools(_server: &str, url: &str) -> anyhow::Result<Vec<McpTool>> {
-    let transport = StreamableHttpClientTransport::from_uri(url.to_string());
-    let client = ().serve(transport).await?;
-    let listed = client.list_all_tools().await;
-    let mut client = client;
-    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
-    let listed = listed?;
+fn parse_string_array(v: Option<&Value>) -> Vec<String> {
+    v.and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str().map(str::to_string))
+        .collect()
+}
+
+fn parse_string_map(v: Option<&Value>) -> BTreeMap<String, String> {
+    v.and_then(|v| v.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+        .collect()
+}
+
+async fn list_server_tools(transport: &McpTransportConfig) -> anyhow::Result<Vec<McpTool>> {
+    let listed = match transport {
+        McpTransportConfig::Http { url } => list_http_server_tools(url).await?,
+        McpTransportConfig::Stdio { command, args, env } => {
+            list_stdio_server_tools(command, args, env).await?
+        }
+    };
     Ok(listed
         .into_iter()
         .map(|t| McpTool {
-            url: url.to_string(),
+            transport: transport.clone(),
             name: t.name.to_string(),
             description: t.description.map(|d| d.to_string()).unwrap_or_default(),
             schema: Value::Object((*t.input_schema).clone()),
@@ -152,9 +218,34 @@ async fn list_server_tools(_server: &str, url: &str) -> anyhow::Result<Vec<McpTo
         .collect())
 }
 
+async fn list_http_server_tools(url: &str) -> anyhow::Result<Vec<rmcp::model::Tool>> {
+    let transport = StreamableHttpClientTransport::from_uri(url.to_string());
+    let client = ().serve(transport).await?;
+    let listed = client.list_all_tools().await;
+    let mut client = client;
+    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
+    Ok(listed?)
+}
+
+async fn list_stdio_server_tools(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> anyhow::Result<Vec<rmcp::model::Tool>> {
+    let mut command_builder = tokio::process::Command::new(command);
+    command_builder.args(args);
+    command_builder.envs(env);
+    let transport = TokioChildProcess::new(command_builder.configure(|_| {}))?;
+    let client = ().serve(transport).await?;
+    let listed = client.list_all_tools().await;
+    let mut client = client;
+    let _ = client.close_with_timeout(Duration::from_secs(2)).await;
+    Ok(listed?)
+}
+
 /// A single MCP tool, dispatched by re-dialing its server per call.
 struct McpTool {
-    url: String,
+    transport: McpTransportConfig,
     name: String,
     description: String,
     schema: Value,
@@ -181,8 +272,6 @@ impl Tool for McpTool {
 
 impl McpTool {
     async fn call_inner(&self, input: Value) -> anyhow::Result<ToolResult> {
-        let transport = StreamableHttpClientTransport::from_uri(self.url.clone());
-        let client = ().serve(transport).await?;
         // Always send an arguments object (even empty) — some servers reject a
         // missing `arguments` field with -32602.
         let args = match input {
@@ -191,9 +280,27 @@ impl McpTool {
         };
         let params = CallToolRequestParams::new(self.name.clone())
             .with_arguments(args.into_iter().collect());
-        let resp = client.call_tool(params).await;
-        let mut client = client;
-        let _ = client.close_with_timeout(Duration::from_secs(2)).await;
+        let resp = match &self.transport {
+            McpTransportConfig::Http { url } => {
+                let transport = StreamableHttpClientTransport::from_uri(url.clone());
+                let client = ().serve(transport).await?;
+                let resp = client.call_tool(params).await;
+                let mut client = client;
+                let _ = client.close_with_timeout(Duration::from_secs(2)).await;
+                resp
+            }
+            McpTransportConfig::Stdio { command, args, env } => {
+                let mut command_builder = tokio::process::Command::new(command);
+                command_builder.args(args);
+                command_builder.envs(env);
+                let transport = TokioChildProcess::new(command_builder.configure(|_| {}))?;
+                let client = ().serve(transport).await?;
+                let resp = client.call_tool(params).await;
+                let mut client = client;
+                let _ = client.close_with_timeout(Duration::from_secs(2)).await;
+                resp
+            }
+        };
         Ok(to_tool_result(resp?))
     }
 }
@@ -229,6 +336,7 @@ fn collect_text(content: &[Content]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn tool_filter_deny_blocks_recursion_guard_patterns() {
@@ -259,5 +367,144 @@ mod tests {
         let f = ToolFilter::from_csv(None, None);
         assert!(f.permits("mcp__blackbox__bro_exec"));
         assert!(f.permits("anything"));
+    }
+
+    #[test]
+    fn parse_servers_accepts_stdio_entries() {
+        let parsed = parse_servers(
+            r#"{
+                "mcpServers": {
+                    "tmux": {
+                        "type": "stdio",
+                        "command": "/opt/bin/tmux-mcp-rs",
+                        "args": ["--socket", "fleet-test"],
+                        "env": {"TMUX_MCP_SOCKET": "fleet-test"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            vec![(
+                "tmux".to_string(),
+                McpTransportConfig::Stdio {
+                    command: "/opt/bin/tmux-mcp-rs".to_string(),
+                    args: vec!["--socket".to_string(), "fleet-test".to_string()],
+                    env: BTreeMap::from([(
+                        "TMUX_MCP_SOCKET".to_string(),
+                        "fleet-test".to_string()
+                    )]),
+                },
+            )]
+        );
+    }
+
+    #[test]
+    fn parse_servers_preserves_url_entries() {
+        let parsed = parse_servers(
+            r#"{
+                "mcpServers": {
+                    "blackbox": {
+                        "type": "http",
+                        "url": "http://127.0.0.1:7264/mcp"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed,
+            vec![(
+                "blackbox".to_string(),
+                McpTransportConfig::Http {
+                    url: "http://127.0.0.1:7264/mcp".to_string(),
+                },
+            )]
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires BRO_HARNESS_TEST_TMUX_MCP pointing at a local tmux MCP binary"]
+    async fn live_stdio_tmux_plugin_lists_creates_and_cleans_up() {
+        let command = std::env::var("BRO_HARNESS_TEST_TMUX_MCP")
+            .expect("BRO_HARNESS_TEST_TMUX_MCP must point at tmux-mcp-rs");
+        let transport = McpTransportConfig::Stdio {
+            command,
+            args: vec!["--shell-type".to_string(), "zsh".to_string()],
+            env: BTreeMap::new(),
+        };
+        let tools = list_server_tools(&transport).await.unwrap();
+        let socket = format!("bro-harness-stdio-smoke-{}", std::process::id());
+        let session_name = format!("bro-harness-stdio-smoke-{}", std::process::id());
+
+        // List before create: this validates the stdio transport and prevents
+        // colliding with a leftover session on the isolated socket.
+        let before = call_named_tool(&tools, "list-sessions", json!({ "socket": socket })).await;
+        match before {
+            ToolResult::Error(e) => assert!(
+                e.contains("No such file or directory"),
+                "unexpected list-sessions error before create: {e}"
+            ),
+            ok => assert!(
+                !tool_result_text(&ok).contains(&session_name),
+                "unique smoke session should not exist before create: {:?}",
+                ok
+            ),
+        }
+
+        let create = call_named_tool(
+            &tools,
+            "create-session",
+            json!({ "socket": socket, "name": session_name }),
+        )
+        .await;
+        assert_tool_ok(create);
+
+        let found = call_named_tool(
+            &tools,
+            "find-session",
+            json!({ "socket": socket, "name": session_name }),
+        )
+        .await;
+        assert!(
+            tool_result_text(&found).contains(&session_name),
+            "session should be findable after create: {:?}",
+            found
+        );
+
+        let cleanup = call_named_tool(
+            &tools,
+            "kill-session",
+            json!({ "socket": socket, "sessionId": session_name }),
+        )
+        .await;
+        assert_tool_ok(cleanup);
+    }
+
+    async fn call_named_tool(tools: &[McpTool], name: &str, input: Value) -> ToolResult {
+        tools
+            .iter()
+            .find(|t| t.name == name)
+            .unwrap_or_else(|| panic!("tool {name} not listed"))
+            .call_inner(input)
+            .await
+            .unwrap_or_else(|e| panic!("{name} failed: {e:#}"))
+    }
+
+    fn assert_tool_ok(result: ToolResult) {
+        if let ToolResult::Error(e) = result {
+            panic!("tool returned error: {e}");
+        }
+    }
+
+    fn tool_result_text(result: &ToolResult) -> String {
+        match result {
+            ToolResult::Text(t) => t.clone(),
+            ToolResult::Json(v) => v.to_string(),
+            ToolResult::Error(e) => e.clone(),
+        }
     }
 }

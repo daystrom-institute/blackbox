@@ -60,9 +60,9 @@ pub struct Cli {
     #[arg(long = "system-prompt")]
     pub system_prompt: Option<String>,
 
-    /// Transient blackbox MCP config (`{"mcpServers":{name:{url}}}`). The URL
-    /// carries the surface as a query param (`?surface=…`); the daemon picks
-    /// it and the server enforces it. The harness just connects and lists.
+    /// Transient MCP config (`{"mcpServers":{name:{...}}}`). HTTP URLs may
+    /// carry a server-enforced surface as a query param (`?surface=…`); stdio
+    /// entries carry command/args/env. The harness just connects and lists.
     #[arg(long = "mcp-config")]
     pub mcp_config: Option<String>,
 

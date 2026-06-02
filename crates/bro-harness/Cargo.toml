@@ -39,6 +39,7 @@ base64 = "0.22"
 chrono = "0.4"
 rmcp = { version = "1.4", features = [
     "client",
+    "transport-child-process",
     "transport-streamable-http-client-reqwest",
     "reqwest",
 ] }

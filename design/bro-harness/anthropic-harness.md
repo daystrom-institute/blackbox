@@ -369,7 +369,7 @@ The harness must accept (and may ignore) each of these:
 | `--resume <id>` | load prior transcript and continue |
 | `--model <m>` | model id (already normalized by `normalize_model_for_provider`: GLM strips `zai-coding-plan/`, DeepSeek strips `deepseek/`) |
 | `--effort <e>` | mapped to `thinking` budget if the model supports it, else no-op |
-| `--mcp-config <json>` | the transient blackbox MCP config (`{mcpServers:{name:{url}}}`); connect and merge its tools |
+| `--mcp-config <json>` | transient MCP config (`{mcpServers:{name:{type,url|command,args,env}}}`); connect and merge HTTP/stdio tools |
 
 No new daemon argv code is needed — the harness conforms to the bytes the
 daemon already emits.
