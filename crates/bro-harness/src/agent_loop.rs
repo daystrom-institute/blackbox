@@ -469,11 +469,13 @@ impl Session {
     /// Manual `/compact`: summarize-and-replace the prefix and emit a manual
     /// `compact_boundary`. A no-op (logged) when there isn't enough history.
     async fn compact_manual(&mut self) -> Result<()> {
+        let tool_specs = self.reg.wire_specs();
         match self
             .tx
             .compact(
                 self.compaction.keep_tail(),
                 crate::compaction::COMPACTION_INSTRUCTION,
+                &tool_specs,
                 &self.base_opts,
             )
             .await?
@@ -521,8 +523,11 @@ impl Session {
                 self.push_user_text(&event);
             }
 
+            let tool_specs = self.reg.wire_specs();
+
             // Compact before composing when the previous prompt crossed the
-            // model's window threshold.
+            // model's window threshold. Tools are forwarded so the server-side
+            // compaction path (brodex) can faithfully process tool-call history.
             if let Some(thresh) = self.compact_threshold
                 && self.last_prompt_tokens > thresh
             {
@@ -531,6 +536,7 @@ impl Session {
                     .compact(
                         self.compaction.keep_tail(),
                         crate::compaction::COMPACTION_INSTRUCTION,
+                        &tool_specs,
                         &self.base_opts,
                     )
                     .await
@@ -547,8 +553,6 @@ impl Session {
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
                 }
             }
-
-            let tool_specs = self.reg.wire_specs();
             let mut sys = compose_system(self.system.as_deref(), &self.reg);
             if let Some(t) = self.tail_nudge.take() {
                 let v = sys.volatile.get_or_insert_with(String::new);
@@ -592,6 +596,7 @@ impl Session {
                             .compact(
                                 self.compaction.keep_tail(),
                                 crate::compaction::COMPACTION_INSTRUCTION,
+                                &tool_specs,
                                 &self.base_opts,
                             )
                             .await
@@ -1355,6 +1360,7 @@ mod tests {
             &mut self,
             _keep_tail: usize,
             _instruction: &str,
+            _tools: &[transport::ToolSpec],
             _opts: &TurnOpts,
         ) -> Result<Option<String>> {
             self.shared.compact_calls.fetch_add(1, Ordering::SeqCst);

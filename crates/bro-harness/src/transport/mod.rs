@@ -265,6 +265,7 @@ pub trait Transport: Send {
         &mut self,
         _keep_tail: usize,
         _instruction: &str,
+        _tools: &[ToolSpec],
         _opts: &TurnOpts,
     ) -> Result<Option<String>> {
         Ok(None)

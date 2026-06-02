@@ -302,6 +302,94 @@ impl OpenAiResponsesTransport {
         }
         Ok(out)
     }
+
+    /// Headers for the unary `responses/compact` request: like `apply_headers`
+    /// but `accept: application/json` (the compact endpoint returns a single JSON
+    /// object, not an SSE stream). Carries the same identity/auth + sticky
+    /// `x-codex-turn-state` so it routes to the same backend as turns.
+    fn apply_compact_headers(&self, rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut rb = rb
+            .header("content-type", "application/json")
+            .header("accept", "application/json")
+            .timeout(super::http::request_timeout());
+        for (name, value) in self.state.identity_auth_headers() {
+            rb = rb.header(name, value);
+        }
+        if let Some(ts) = &self.ws_turn_state {
+            rb = rb.header("x-codex-turn-state", ts.clone());
+        }
+        rb
+    }
+
+    /// Canonical OAI-idiomatic compaction: POST the full structured history to the
+    /// backend's unary `responses/compact` endpoint and replace the buffer with
+    /// the returned replacement `input[]` (retained user/developer/system messages
+    /// plus one encrypted `compaction_summary` item). The server does retention and
+    /// summarization; nothing is rendered to plaintext or capped client-side.
+    /// Contract validated live — see design/bro-harness/brodex-compaction.md §5.
+    /// Returns the encrypted summary blob (for the `compact_boundary` size signal)
+    /// or `None` when there is nothing to compact / the server returned no output.
+    async fn remote_compact(
+        &mut self,
+        tools: &[super::ToolSpec],
+        opts: &TurnOpts,
+    ) -> Result<Option<String>> {
+        // Need at least one item beyond the just-pushed turn to be worth a call.
+        if self.state.input.len() < 2 {
+            return Ok(None);
+        }
+        let url = format!("{}/compact", self.http_endpoint);
+        let body = responses_common::build_compaction_input(&self.state.input, tools, opts);
+
+        let mut resp = super::http::send_with_retry("openai-responses/compact", || {
+            self.apply_compact_headers(self.http.post(&url)).json(&body).send()
+        })
+        .await
+        .context("responses compact request")?;
+        // Single 401 recovery, mirroring `send_with_auth_recovery`.
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            && matches!(self.state.auth, Auth::ChatGpt { .. })
+        {
+            tracing::warn!("responses/compact 401; refreshing codex token and retrying once");
+            let fresh = super::codex_auth::force_refresh(&self.http)
+                .await
+                .context("responses/compact 401; codex token refresh failed")?;
+            self.state.auth = Auth::ChatGpt {
+                access_token: fresh.access_token,
+                account_id: fresh.account_id,
+            };
+            resp = super::http::send_with_retry("openai-responses/compact", || {
+                self.apply_compact_headers(self.http.post(&url)).json(&body).send()
+            })
+            .await
+            .context("responses compact retry")?;
+        }
+        let status = resp.status();
+        let text = resp.text().await.context("read compact body")?;
+        if !status.is_success() {
+            anyhow::bail!("openai responses compact {status}: {text}");
+        }
+        let v: Value = serde_json::from_str(&text).context("parse compact response")?;
+        let output = v["output"].as_array().cloned().unwrap_or_default();
+        if output.is_empty() {
+            tracing::warn!("responses/compact returned no output; leaving history unchanged");
+            return Ok(None);
+        }
+        // The encrypted summary blob — its size is the `compact_boundary` signal.
+        let summary = output
+            .iter()
+            .find(|it| it["type"] == "compaction_summary")
+            .and_then(|it| it["encrypted_content"].as_str())
+            .map(str::to_string)
+            .unwrap_or_default();
+        self.state.input = output;
+        // A compaction rewrites history out from under the WS delta baseline;
+        // force the next WS turn to full-replay.
+        if let Some(ws) = self.ws.as_mut() {
+            ws.invalidate();
+        }
+        Ok(Some(summary))
+    }
 }
 
 #[async_trait]
@@ -366,8 +454,16 @@ impl Transport for OpenAiResponsesTransport {
         &mut self,
         keep_tail: usize,
         instruction: &str,
+        tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<Option<String>> {
+        // Canonical OAI path: the ChatGPT backend supports server-side compaction
+        // (the unary `responses/compact` endpoint). Generic API-key vendors do
+        // not, so they fall through to the client-side summarizer below. This
+        // gate mirrors codex's `supports_remote_compaction()`.
+        if matches!(self.state.auth, Auth::ChatGpt { .. }) {
+            return self.remote_compact(tools, opts).await;
+        }
         let n = self.state.input.len();
         if n <= keep_tail + 1 {
             return Ok(None);
@@ -392,5 +488,78 @@ impl Transport for OpenAiResponsesTransport {
             ws.invalidate();
         }
         Ok(Some(summary))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{SystemPrompt, Transport};
+    use serde_json::json;
+
+    /// LIVE e2e (ignored, double-gated): drives the real `compact()` →
+    /// `remote_compact()` path — `build_compaction_input` + POST
+    /// `/responses/compact` + splice — against the ChatGPT backend. Needs codex
+    /// OAuth (no `OPENAI_API_KEY`). Run with:
+    ///   `BRO_HARNESS_LIVE_PROBE=1 [BRO_HARNESS_PROBE_MODEL=gpt-5.5]
+    ///    cargo test -p bro-harness --bins probe_remote_compact_e2e -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "live backend probe; set BRO_HARNESS_LIVE_PROBE=1"]
+    async fn probe_remote_compact_e2e() {
+        if std::env::var("BRO_HARNESS_LIVE_PROBE").is_err() {
+            eprintln!("skip: set BRO_HARNESS_LIVE_PROBE=1");
+            return;
+        }
+        if std::env::var("OPENAI_API_KEY").is_ok() {
+            eprintln!("skip: OPENAI_API_KEY set; this e2e needs the ChatGPT-OAuth path");
+            return;
+        }
+        let model = std::env::var("BRO_HARNESS_PROBE_MODEL").unwrap_or_else(|_| "gpt-5.5".into());
+        let mut tx = OpenAiResponsesTransport::from_env().await.expect("from_env (OAuth)");
+        tx.set_session_id("probe-compact-e2e".into());
+        tx.push_user_text("Remember the magic token KIWI-9. Acknowledge briefly.");
+        tx.state.input.push(json!({
+            "type": "message", "role": "assistant",
+            "content": [{"type": "output_text", "text": "Acknowledged — KIWI-9 noted."}]
+        }));
+        tx.push_user_text("Now compute 8 * 8 and explain in one line.");
+        let before = tx.state.input.len();
+
+        let opts = TurnOpts {
+            model,
+            max_tokens: 256,
+            system: SystemPrompt {
+                stable: Some("You are a helpful assistant.".into()),
+                volatile: None,
+            },
+            effort: None,
+            web_search: false,
+            service_tier: None,
+        };
+        let summary = tx.compact(6, "compact", &[], &opts).await.expect("compact call");
+
+        let kinds: Vec<&str> = tx
+            .state
+            .input
+            .iter()
+            .map(|i| i["type"].as_str().unwrap_or("?"))
+            .collect();
+        eprintln!(
+            "[e2e] before={before} after={} summary_some={} types={kinds:?}",
+            tx.state.input.len(),
+            summary.is_some()
+        );
+        assert!(summary.is_some(), "remote_compact should return a summary");
+        assert!(
+            tx.state.input.iter().any(|i| i["type"] == "compaction_summary"),
+            "compacted history must contain a compaction_summary item"
+        );
+        assert!(
+            tx.state
+                .input
+                .iter()
+                .any(|i| i["type"] == "message" && i["role"] == "user"),
+            "compacted history should retain user messages"
+        );
     }
 }

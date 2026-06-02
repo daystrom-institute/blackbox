@@ -532,6 +532,7 @@ impl Transport for OpenAiChatTransport {
         &mut self,
         keep_tail: usize,
         instruction: &str,
+        _tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<Option<String>> {
         let n = self.messages.len();

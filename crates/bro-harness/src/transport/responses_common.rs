@@ -256,6 +256,38 @@ pub(super) fn build_body(
     body
 }
 
+/// Build the unary `responses/compact` request body (`CompactionInput`). The
+/// backend applies retention server-side and returns the replacement `input[]`
+/// (retained user/developer/system messages + one encrypted `compaction_summary`
+/// item), so this is just the current history + tools + instructions — no
+/// streaming, no `store`, no plaintext rendering. Codex-faithful minimal shape,
+/// validated live (design/bro-harness/brodex-compaction.md §5).
+pub(super) fn build_compaction_input(input: &[Value], tools: &[ToolSpec], opts: &TurnOpts) -> Value {
+    let tool_defs: Vec<Value> = tools
+        .iter()
+        .map(|t| {
+            json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.schema,
+                "strict": false,
+            })
+        })
+        .collect();
+    let instructions = opts
+        .system
+        .stable_text()
+        .unwrap_or("You are a helpful coding assistant operating non-interactively.");
+    json!({
+        "model": opts.model,
+        "input": input,
+        "instructions": instructions,
+        "tools": tool_defs,
+        "parallel_tool_calls": false,
+    })
+}
+
 /// Parse the SSE body: accumulate completed output items, append them to the
 /// `input` buffer (so the next turn carries context), and normalize. Shared by
 /// every Responses transport — the downstream event vocabulary is identical
@@ -778,6 +810,35 @@ mod tests {
     }
 
     #[test]
+    fn build_compaction_input_is_codex_faithful() {
+        let input = vec![json!({
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}]
+        })];
+        let tools = vec![ToolSpec {
+            name: "do_thing".into(),
+            description: "does a thing".into(),
+            schema: json!({"type": "object"}),
+        }];
+        let body = build_compaction_input(
+            &input,
+            &tools,
+            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("VOL".into()) }),
+        );
+        assert_eq!(body["model"], "gpt-5-codex");
+        // Stable instructions only; the volatile developer item is NOT appended
+        // (unlike a normal turn) — the server compacts the literal history.
+        assert_eq!(body["instructions"], "BASE");
+        assert_eq!(body["input"].as_array().unwrap().len(), 1);
+        assert_eq!(body["parallel_tool_calls"], false);
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "do_thing");
+        // Unary endpoint: no stream / store fields.
+        assert!(body.get("stream").is_none());
+        assert!(body.get("store").is_none());
+    }
+
+    #[test]
     fn parse_sse_context_window_error_is_typed_recoverable() {
         // A context-window rejection must surface as the typed, recoverable
         // ContextWindowExceeded cause so the agent loop can compact + retry.
@@ -801,5 +862,130 @@ mod tests {
             !crate::transport::is_context_window_exceeded(&err),
             "overload must not be classified as context-window: {err:#}"
         );
+    }
+
+    /// LIVE PROBE (ignored, double-gated). Answers the open questions in
+    /// design/bro-harness/brodex-compaction.md §5 against the real ChatGPT
+    /// backend: does our account honor (a) the unary `responses/compact`
+    /// endpoint and (b) the streaming `compaction_trigger` item? Self-validating:
+    /// a normal `/responses` call first proves model+auth, so a compaction
+    /// failure is attributable to the compaction surface, not setup.
+    ///
+    /// Run with:
+    ///   BRO_HARNESS_LIVE_PROBE=1 [BRO_HARNESS_PROBE_MODEL=gpt-5.1-codex] \
+    ///     cargo test -p bro-harness --bins probe_responses_compaction \
+    ///     -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live backend probe; set BRO_HARNESS_LIVE_PROBE=1"]
+    async fn probe_responses_compaction() {
+        if std::env::var("BRO_HARNESS_LIVE_PROBE").is_err() {
+            eprintln!("skip: set BRO_HARNESS_LIVE_PROBE=1 to run the live probe");
+            return;
+        }
+        let model = std::env::var("BRO_HARNESS_PROBE_MODEL")
+            .unwrap_or_else(|_| "gpt-5.1-codex".to_string());
+        let http = reqwest::Client::new();
+        let auth = resolve_auth(&http).await.expect("resolve auth (refreshes token)");
+        let endpoint = http_endpoint(&auth);
+        let compact_url = format!("{endpoint}/compact");
+        let session_id = new_id();
+        let thread_id = new_id();
+        let headers = identity_auth_headers(&session_id, &thread_id, &auth);
+        eprintln!("[probe] model={model} endpoint={endpoint}");
+
+        let convo = json!([
+            {"type":"message","role":"user","content":[{"type":"input_text",
+                "text":"Step 1: remember the magic token BANANA-7. Acknowledge briefly."}]},
+            {"type":"message","role":"assistant","content":[{"type":"output_text",
+                "text":"Acknowledged — magic token BANANA-7 noted."}]},
+            {"type":"message","role":"user","content":[{"type":"input_text",
+                "text":"Step 2: now compute 17 * 3 and explain in one line."}]}
+        ]);
+        let send = |url: String, body: serde_json::Value, sse: bool| {
+            let http = http.clone();
+            let headers = headers.clone();
+            async move {
+                let mut rb = http.post(&url).header("content-type", "application/json");
+                rb = rb.header("accept", if sse { "text/event-stream" } else { "application/json" });
+                for (n, v) in &headers {
+                    rb = rb.header(*n, v);
+                }
+                let resp = rb.json(&body).send().await.expect("send");
+                let status = resp.status();
+                let text = resp.text().await.unwrap_or_default();
+                (status, text)
+            }
+        };
+        let head = |s: &str, n: usize| s.chars().take(n).collect::<String>();
+
+        // 1. Normal /responses — proves model + auth + headers.
+        let (st, body) = send(
+            endpoint.clone(),
+            json!({"model": model, "input": convo, "instructions": "You are a helpful assistant.",
+                   "stream": true, "store": false, "tool_choice": "auto", "parallel_tool_calls": false}),
+            true,
+        )
+        .await;
+        eprintln!("\n[probe 1] NORMAL /responses -> {st}\n{}", head(&body, 800));
+
+        // 2. Unary /responses/compact — CompactionInput shape.
+        let (st, body2) = send(
+            compact_url.clone(),
+            json!({"model": model, "input": convo, "instructions": "You are a helpful assistant.",
+                   "tools": [], "parallel_tool_calls": false}),
+            false,
+        )
+        .await;
+        eprintln!("\n[probe 2] UNARY /responses/compact -> {st}\n{}", head(&body2, 1500));
+
+        // 3. Streaming compaction_trigger on /responses.
+        let mut trig = convo.as_array().unwrap().clone();
+        trig.push(json!({"type": "compaction_trigger"}));
+        let (st, body3) = send(
+            endpoint.clone(),
+            json!({"model": model, "input": trig, "instructions": "You are a helpful assistant.",
+                   "stream": true, "store": false}),
+            true,
+        )
+        .await;
+        eprintln!("\n[probe 3] STREAM compaction_trigger -> {st}\n{}", head(&body3, 1200));
+
+        // 4. REPLAY: feed the unary-compacted output (incl. the encrypted
+        // compaction_summary) back as input + a fresh user turn. Proves the
+        // canonical loop: does the backend accept the encrypted summary on
+        // replay under store:false, and does the model answer from it?
+        let parsed: serde_json::Value = serde_json::from_str(&body2).unwrap_or_else(|_| json!({}));
+        match parsed["output"].as_array() {
+            Some(out) if !out.is_empty() => {
+                let kinds: Vec<String> = out
+                    .iter()
+                    .map(|i| i["type"].as_str().unwrap_or("?").to_string())
+                    .collect();
+                eprintln!("\n[probe 4] compacted output item types: {kinds:?}");
+                let mut replay = out.clone();
+                replay.push(json!({"type":"message","role":"user","content":[{"type":"input_text",
+                    "text":"Using only the prior context, answer in one short line: what magic token did I give you, and what is 17*3?"}]}));
+                let (st, body4) = send(
+                    endpoint.clone(),
+                    json!({"model": model, "input": replay, "instructions": "You are a helpful assistant.",
+                           "stream": true, "store": false}),
+                    true,
+                )
+                .await;
+                eprintln!("[probe 4] REPLAY compacted history -> {st}");
+                // Surface only the output_text deltas so we can see the answer.
+                let answer: String = body4
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .filter_map(|d| serde_json::from_str::<serde_json::Value>(d.trim()).ok())
+                    .filter(|e| e["type"] == "response.output_text.delta")
+                    .filter_map(|e| e["delta"].as_str().map(str::to_string))
+                    .collect();
+                eprintln!("[probe 4] model answer: {}", head(&answer, 400));
+                eprintln!("[probe 4] mentions BANANA-7: {}", answer.contains("BANANA-7"));
+                eprintln!("[probe 4] mentions 51: {}", answer.contains("51"));
+            }
+            _ => eprintln!("\n[probe 4] skipped: no output array in unary compact body"),
+        }
     }
 }
