@@ -186,18 +186,16 @@ deferred; it is not a substitute for it.
 
 ### Brick 3 — the eval harness *(proposed; do before/with Brick 2)*
 
-Port the Daystrom measurement discipline so Brick 2 is measured, not asserted.
-Minimum viable:
-- A small query suite (question → expected answer entity/runbook).
-- **Mode decomposition**: does the seed rank (retrieval) vs does the known
-  answer surface given the seed (traversal/bundling).
-- **`MissStage`-style classification** of every miss, so we know whether a
-  question-shaped memory query fails because the memory is *not indexed*, *not
-  ranked*, or *not selected*.
-- A bounded LLM-spend budget; structured JSON out, human summary to stderr.
+Port the Daystrom measurement discipline so Brick 2 is measured, not asserted:
+mode decomposition (retrieval vs traversal), a precedence-ordered miss funnel
+that classifies *where* an expected answer was dropped, and a bundle A/B that
+quantifies the consolidation win. The `NotIndexed` bucket of that funnel *is*
+the Brick 2 thesis, quantified — which is why the harness should land before or
+alongside Brick 2.
 
-This is what let Daystrom iterate on tiering and descriptions with evidence. It
-should land before or alongside Brick 2 so the structural change is graded.
+Full layout — the blackbox-specific stage funnel, the trace hook the retrieval
+code needs, suite format, corpus isolation, and run surface — is its own design:
+[Retrieval Eval Harness](retrieval-eval-harness.md).
 
 ## Design principles (distilled)
 

@@ -32,6 +32,7 @@ edges, storage, and corpus-facing assistants.
 ## Retrieval And Storage
 
 - [Locate-Information Coherence Path](agentic-corpus/locate-information-coherence.md)
+- [Retrieval Eval Harness](agentic-corpus/retrieval-eval-harness.md)
 - [Code Navigation](code-navigation/code-navigation.md)
 - [Storage And Performance](storage/storage-and-performance.md)
 
