@@ -43,9 +43,9 @@ use ratatui::widgets::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use blackbox::fleet::{
-    AgentHandle, CLASSIFIER_NAME_PREFIX, DispatchSpec, FleetOrchestrator, Provider, ResumeSpec,
-    TailEvent, TaskStatus, TodoItemStatus, TodoState, TranscriptItem, intern_rider,
-    provider_supports_bidi,
+    AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetConfig,
+    FleetOrchestrator, Provider, ResumeSpec, TailEvent, TaskStatus, TodoItemStatus, TodoState,
+    TranscriptItem, intern_rider, provider_supports_bidi,
 };
 
 use crate::fleet_classifier::{ClassifierNote, spawn_monitor};
@@ -256,6 +256,8 @@ enum Zone {
     Roster,
     /// `→` from roster: fullscreen transcript; `←` back, ↑/↓ recall history.
     SingleAgent,
+    /// Fleet-local config panel opened by `/config`; arrow keys edit fields.
+    Config,
 }
 
 #[derive(Debug, Clone)]
@@ -326,6 +328,10 @@ struct App {
     slash_cursor: usize,
     /// Buckets the user has collapsed.
     collapsed: HashSet<FleetState>,
+    /// Fleet-local config state displayed and edited by `/config`.
+    config: FleetConfig,
+    config_cursor: usize,
+    config_return_zone: Zone,
 
     launch_cwd: Option<String>,
 
@@ -400,6 +406,7 @@ impl App {
             .iter()
             .position(|e| e.default)
             .unwrap_or(0);
+        let config = orch.fleet_config();
         Self {
             orch,
             agents: Vec::new(),
@@ -416,6 +423,9 @@ impl App {
             provider_flash_until: None,
             slash_cursor: 0,
             collapsed: HashSet::new(),
+            config,
+            config_cursor: 0,
+            config_return_zone: Zone::Roster,
             launch_cwd,
             input: String::new(),
             cursor_pos: 0,
@@ -555,7 +565,7 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
     // (classifier present AND auto_send). Gating on both keeps observe-only
     // runs from telling the executor about an intern whose voice never
     // appears — which would confuse a future agent reading the transcript.
-    let classifier_cfg = app.orch.classifier().cloned();
+    let classifier_cfg = app.orch.classifier();
     let frame_executor = classifier_cfg
         .as_ref()
         .is_some_and(|c| c.auto_send_resolved());
@@ -1016,6 +1026,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
     match app.zone {
         Zone::SingleAgent if app.mode.is_standalone() => &[
             SlashCmd {
+                name: "/config",
+                desc: "open fleet config",
+            },
+            SlashCmd {
                 name: "/model",
                 desc: "select model for this agent",
             },
@@ -1046,6 +1060,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
         ],
         Zone::SingleAgent => &[
             SlashCmd {
+                name: "/config",
+                desc: "open fleet config",
+            },
+            SlashCmd {
                 name: "/model",
                 desc: "select model for this agent",
             },
@@ -1067,6 +1085,10 @@ fn zone_slash_commands(app: &App) -> &'static [SlashCmd] {
             },
         ],
         _ => &[
+            SlashCmd {
+                name: "/config",
+                desc: "open fleet config",
+            },
             SlashCmd {
                 name: "/model",
                 desc: "select model for next dispatch",
@@ -1347,6 +1369,10 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         app.help_visible = false;
         return;
     }
+    if app.zone == Zone::Config {
+        handle_config_key(app, key);
+        return;
+    }
     // Ctrl+R renames the selected roster agent (§5).
     if ctrl && key.code == KeyCode::Char('r') {
         start_rename(app);
@@ -1381,6 +1407,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                         app.effort_cursor = (app.effort_cursor + 1) % n;
                     }
                 }
+                Zone::Config => {}
                 _ => cycle_provider(app, 1),
             }
         }
@@ -1615,6 +1642,7 @@ fn submit(app: &mut App) {
         Zone::Roster | Zone::ProviderSelector | Zone::ModelSelector | Zone::EffortSelector => {
             app.dispatch_current_input()
         }
+        Zone::Config => {}
     }
 }
 
@@ -1642,8 +1670,270 @@ fn run_local_slash(app: &mut App) -> bool {
             show_help_overlay(app);
             true
         }
+        "/config" => {
+            open_config(app);
+            true
+        }
         _ => false,
     }
+}
+
+fn open_config(app: &mut App) {
+    app.config = app.orch.fleet_config();
+    app.config_cursor = app
+        .config_cursor
+        .min(ConfigField::ALL.len().saturating_sub(1));
+    app.config_return_zone = match app.zone {
+        Zone::SingleAgent => Zone::SingleAgent,
+        _ => Zone::Roster,
+    };
+    app.zone = Zone::Config;
+    app.clear_input();
+    app.history_cursor = None;
+    app.set_status("config: arrows edit, Esc returns", Duration::from_secs(3));
+}
+
+fn close_config(app: &mut App) {
+    let return_zone = app.config_return_zone;
+    app.zone = match return_zone {
+        Zone::SingleAgent if app.focused_agent_id.is_some() || app.mode.is_standalone() => {
+            Zone::SingleAgent
+        }
+        _ => Zone::Roster,
+    };
+    app.clear_input();
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConfigField {
+    ClassifierEnabled,
+    ClassifierProvider,
+    ClassifierAutoSend,
+    ClassifierCadence,
+    ClassifierMinActivity,
+}
+
+impl ConfigField {
+    const ALL: [ConfigField; 5] = [
+        ConfigField::ClassifierEnabled,
+        ConfigField::ClassifierProvider,
+        ConfigField::ClassifierAutoSend,
+        ConfigField::ClassifierCadence,
+        ConfigField::ClassifierMinActivity,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            ConfigField::ClassifierEnabled => "Classifier",
+            ConfigField::ClassifierProvider => "Intern provider",
+            ConfigField::ClassifierAutoSend => "Relay suggestions",
+            ConfigField::ClassifierCadence => "Cadence",
+            ConfigField::ClassifierMinActivity => "Min activity",
+        }
+    }
+
+    fn value(self, cfg: &FleetConfig) -> String {
+        let Some(c) = cfg.classifier.as_ref() else {
+            return match self {
+                ConfigField::ClassifierEnabled => "off".to_string(),
+                ConfigField::ClassifierProvider => "glm".to_string(),
+                ConfigField::ClassifierAutoSend => "on".to_string(),
+                ConfigField::ClassifierCadence => "4s".to_string(),
+                ConfigField::ClassifierMinActivity => "10 items".to_string(),
+            };
+        };
+        match self {
+            ConfigField::ClassifierEnabled => {
+                if c.enabled_resolved() {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            ConfigField::ClassifierProvider => c.provider_resolved().as_str().to_string(),
+            ConfigField::ClassifierAutoSend => {
+                if c.auto_send_resolved() {
+                    "on".to_string()
+                } else {
+                    "observe only".to_string()
+                }
+            }
+            ConfigField::ClassifierCadence => format!("{}s", c.cadence_secs_resolved()),
+            ConfigField::ClassifierMinActivity => {
+                format!("{} items", c.min_activity_resolved())
+            }
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            ConfigField::ClassifierEnabled => "Start or stop intern companions for fleet agents.",
+            ConfigField::ClassifierProvider => "Classifier session provider; must be steerable.",
+            ConfigField::ClassifierAutoSend => {
+                "Send suggestions into the executor as [INTERN] turns."
+            }
+            ConfigField::ClassifierCadence => "Seconds between classifier observation passes.",
+            ConfigField::ClassifierMinActivity => {
+                "New transcript items before a mid-turn check-in."
+            }
+        }
+    }
+}
+
+fn handle_config_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => close_config(app),
+        KeyCode::Enter => {
+            apply_config_change(app);
+            close_config(app);
+        }
+        KeyCode::Up => config_vertical(app, -1),
+        KeyCode::Down => config_vertical(app, 1),
+        KeyCode::Left => config_change_selected(app, -1),
+        KeyCode::Right | KeyCode::Char(' ') => config_change_selected(app, 1),
+        KeyCode::Char('?') => app.help_visible = true,
+        _ => {}
+    }
+}
+
+fn config_vertical(app: &mut App, delta: isize) {
+    let n = ConfigField::ALL.len() as isize;
+    let cur = app.config_cursor as isize;
+    app.config_cursor = (((cur + delta) % n + n) % n) as usize;
+}
+
+fn ensure_classifier_config(app: &mut App) -> &mut ClassifierConfig {
+    app.config
+        .classifier
+        .get_or_insert_with(|| ClassifierConfig {
+            enabled: Some(false),
+            provider: Some("glm".to_string()),
+            model: None,
+            effort: None,
+            prompt: None,
+            cadence_secs: Some(4),
+            auto_send: Some(true),
+            min_activity: Some(10),
+        })
+}
+
+fn config_change_selected(app: &mut App, delta: isize) {
+    let field = ConfigField::ALL[app.config_cursor];
+    match field {
+        ConfigField::ClassifierEnabled => {
+            let c = ensure_classifier_config(app);
+            c.enabled = Some(!c.enabled.unwrap_or(false));
+        }
+        ConfigField::ClassifierProvider => {
+            const PROVIDERS: [&str; 3] = ["glm", "deepseek", "brodex"];
+            let c = ensure_classifier_config(app);
+            c.provider = Some(cycle_str_value(c.provider.as_deref(), &PROVIDERS, delta));
+        }
+        ConfigField::ClassifierAutoSend => {
+            let c = ensure_classifier_config(app);
+            c.auto_send = Some(!c.auto_send_resolved());
+        }
+        ConfigField::ClassifierCadence => {
+            const VALUES: [u64; 6] = [1, 2, 4, 8, 15, 30];
+            let c = ensure_classifier_config(app);
+            c.cadence_secs = Some(cycle_u64_value(c.cadence_secs_resolved(), &VALUES, delta));
+        }
+        ConfigField::ClassifierMinActivity => {
+            const VALUES: [u32; 6] = [1, 5, 10, 20, 50, 100];
+            let c = ensure_classifier_config(app);
+            c.min_activity = Some(cycle_u32_value(c.min_activity_resolved(), &VALUES, delta));
+        }
+    }
+    apply_config_change(app);
+}
+
+fn cycle_str_value(current: Option<&str>, values: &[&str], delta: isize) -> String {
+    let idx = current
+        .and_then(|v| values.iter().position(|candidate| *candidate == v))
+        .unwrap_or(0) as isize;
+    let n = values.len() as isize;
+    values[(((idx + delta) % n + n) % n) as usize].to_string()
+}
+
+fn cycle_u64_value(current: u64, values: &[u64], delta: isize) -> u64 {
+    let idx = values.iter().position(|v| *v == current).unwrap_or(0) as isize;
+    let n = values.len() as isize;
+    values[(((idx + delta) % n + n) % n) as usize]
+}
+
+fn cycle_u32_value(current: u32, values: &[u32], delta: isize) -> u32 {
+    let idx = values.iter().position(|v| *v == current).unwrap_or(0) as isize;
+    let n = values.len() as isize;
+    values[(((idx + delta) % n + n) % n) as usize]
+}
+
+fn apply_config_change(app: &mut App) {
+    match app.orch.set_classifier(app.config.classifier.clone()) {
+        Ok(path) => {
+            let sync = sync_classifier_monitors(app);
+            app.set_status(
+                format!(
+                    "saved {}{}",
+                    path_tail(&path.display().to_string()),
+                    if sync.started > 0 && sync.stopped > 0 {
+                        format!(
+                            "; restarted {} intern(s)",
+                            sync.started.max(sync.stopped)
+                        )
+                    } else if sync.started > 0 {
+                        format!("; started {} intern(s)", sync.started)
+                    } else if sync.stopped > 0 {
+                        format!("; stopped {} intern(s)", sync.stopped)
+                    } else {
+                        String::new()
+                    }
+                ),
+                Duration::from_secs(4),
+            );
+        }
+        Err(e) => app.set_status(format!("config save failed: {e:#}"), Duration::from_secs(6)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ClassifierSync {
+    stopped: usize,
+    started: usize,
+}
+
+fn sync_classifier_monitors(app: &mut App) -> ClassifierSync {
+    if app.mode.is_standalone() {
+        return ClassifierSync::default();
+    }
+    let cfg = app.orch.classifier();
+    let mut sync = ClassifierSync::default();
+    for i in 0..app.agents.len() {
+        if let Some(old) = app.agents[i].classifier.take() {
+            let old_id = old.id();
+            let _ = app.orch.stop(&old);
+            app.orch.forget(&old_id);
+            app.activity_clocks
+                .remove(&activity_key("classifier", &old_id));
+            sync.stopped += 1;
+        }
+        let Some(cfg) = cfg.clone() else {
+            continue;
+        };
+        if app.agents[i].task.snapshot().status != TaskStatus::Running {
+            continue;
+        }
+        let classifier = spawn_monitor(
+            &app.rt,
+            app.orch.clone(),
+            app.agents[i].task.clone(),
+            app.agents[i].name.clone(),
+            cfg,
+            app.classifier_tx.clone(),
+        );
+        app.agents[i].classifier = Some(classifier);
+        sync.started += 1;
+    }
+    sync
 }
 
 /// Toggle the `/help` overlay on.
@@ -1868,7 +2158,16 @@ fn resume_selected(app: &mut App, idx: usize) {
 
     app.orch.forget(&old_id); // drop the stale Interrupted task
     app.agents[idx].task = handle;
-    app.agents[idx].classifier = None;
+    app.agents[idx].classifier = app.orch.classifier().map(|cfg| {
+        spawn_monitor(
+            &app.rt,
+            app.orch.clone(),
+            app.agents[idx].task.clone(),
+            app.agents[idx].name.clone(),
+            cfg,
+            app.classifier_tx.clone(),
+        )
+    });
     app.agents[idx].input_history.push(text);
     app.agents[idx].pending_inputs.clear();
     app.agents[idx].seen_user_steers = 0;
@@ -1951,6 +2250,7 @@ fn zoom_left(app: &mut App) {
             Zone::EffortSelector
         }
         Zone::EffortSelector => Zone::EffortSelector,
+        Zone::Config => Zone::Config,
     };
 }
 
@@ -2021,6 +2321,7 @@ fn zoom_right(app: &mut App) {
             }
         }
         Zone::SingleAgent => {}
+        Zone::Config => {}
     }
 }
 
@@ -2081,6 +2382,7 @@ fn vertical(app: &mut App, delta: isize) {
             app.roster_selected = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
         }
         Zone::SingleAgent => recall_history(app, delta),
+        Zone::Config => config_vertical(app, delta),
     }
 }
 
@@ -2119,6 +2421,7 @@ fn recall_history(app: &mut App, delta: isize) {
 
 fn draw(f: &mut Frame, app: &mut App) {
     let single_agent = app.zone == Zone::SingleAgent;
+    let config = app.zone == Zone::Config;
     let composer_height = composer_height(app, f.area());
     let constraints = if single_agent {
         vec![
@@ -2149,6 +2452,12 @@ fn draw(f: &mut Frame, app: &mut App) {
         if slash_active(app) {
             draw_slash_menu(f, chunks[1], app);
         }
+    } else if config {
+        app.transcript_y_range = None;
+        app.last_transcript_height = 0;
+        draw_config_body(f, chunks[0], app);
+        let bottom_title = Some(Line::from(roster_status_spans(app, &views)));
+        draw_composer(f, chunks[1], app, None, bottom_title);
     } else {
         app.transcript_y_range = None;
         app.last_transcript_height = 0;
@@ -2232,6 +2541,13 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
             Line::from("  Ctrl+X        stop / delete agent"),
             Line::from("  ↑/↓           recall input history"),
             Line::from("  Ctrl+Q        quit"),
+        ],
+        Zone::Config => vec![
+            Line::from("  ↑/↓           navigate config fields"),
+            Line::from("  ←/→           change selected option"),
+            Line::from("  Space         toggle / advance option"),
+            Line::from("  Enter         save and return"),
+            Line::from("  Esc           return"),
         ],
         Zone::ProviderSelector => vec![
             Line::from("  ↑/↓           cycle providers"),
@@ -2667,6 +2983,71 @@ fn draw_roster_body(
     }
 }
 
+fn draw_config_body(f: &mut Frame, area: Rect, app: &App) {
+    let path = FleetConfig::path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "fleet.json path unavailable".to_string());
+    let enabled = app
+        .config
+        .classifier
+        .as_ref()
+        .is_some_and(ClassifierConfig::enabled_resolved);
+    let title_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(vec![
+            Span::styled(" fleet config", title_style),
+            Span::styled("  ", Style::default()),
+            Span::styled(path_tail(&path), Style::default().fg(Color::DarkGray)),
+        ]),
+        Line::from(""),
+    ];
+
+    for (idx, field) in ConfigField::ALL.iter().copied().enumerate() {
+        let selected = idx == app.config_cursor;
+        let marker = if selected { "▶ " } else { "  " };
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else if !enabled && !matches!(field, ConfigField::ClassifierEnabled) {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+        lines.push(Line::from(vec![
+            Span::raw(marker),
+            Span::styled(format!("{:<20}", field.label()), style),
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                field.value(&app.config),
+                if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::LightYellow)
+                },
+            ),
+        ]));
+        if selected {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(field.hint(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ fields   ←/→ options   Space toggles   Enter saves + returns   Esc returns",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+}
+
 fn draw_roster(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentView], order: &[usize]) {
     // Full-width, borderless — the roster is the focus (the title bar and
     // composer frame it). In provider-selector mode the selector to the left
@@ -2966,7 +3347,7 @@ fn draw_single_agent(f: &mut Frame, area: Rect, app: &mut App, views: &[AgentVie
                 Line::from(format!("Next: {provider}")),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "Slash commands: /model, /effort, /resume <session_id> [turn], /clear",
+                    "Slash commands: /config, /model, /effort, /resume <session_id> [turn], /clear",
                     Style::default().fg(Color::DarkGray),
                 )),
             ];
@@ -4900,6 +5281,10 @@ fn draw_composer(
     } else {
         match app.zone {
             Zone::SingleAgent => ("", COMPOSER_CHROME_COLOR),
+            Zone::Config => (
+                " config (↑/↓ fields · ←/→ options · Enter=save · Esc=back) ",
+                Color::Cyan,
+            ),
             _ => (
                 " dispatch (Enter=spawn · Shift+Enter=newline · Tab=provider · Ctrl+R=rename) ",
                 COMPOSER_CHROME_COLOR,

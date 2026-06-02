@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Mutex as AsyncMutex, broadcast};
@@ -51,9 +51,10 @@ pub use super::tail::TailEvent;
 /// the codebase uses); the only per-provider work is translating it to CLI args
 /// at dispatch (`Provider::build_fleet_mcp_args`). Future surfaces (e.g. the
 /// `@project` cwd map) hang off this same file.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FleetConfig {
     #[serde(default, rename = "mcpServers")]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 
     /// Extra harness tools to pin into the hot tool surface for every fleet
@@ -65,14 +66,16 @@ pub struct FleetConfig {
         alias = "pinnedTools",
         alias = "pin_tools"
     )]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pin_tools: Vec<String>,
 
-    /// Experimental classifier-companion ("intern") config. When present, every
+    /// Experimental classifier-companion ("intern") config. When enabled, every
     /// executor dispatched from the cockpit gets a paired classifier session
     /// that watches its activity and suggests tools/atoms/skills/strategies. See
     /// [`ClassifierConfig`]. Absent → the feature is off and the cockpit behaves
     /// exactly as before.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub classifier: Option<ClassifierConfig>,
 }
 
@@ -80,37 +83,54 @@ pub struct FleetConfig {
 /// assistant". All fields are optional so a bare `{"classifier": {}}` enables it
 /// with built-in defaults; the JSON surface is the refinement knob (prompt,
 /// model, cadence) the research vehicle is built around.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct ClassifierConfig {
+    /// Explicit enablement for the classifier companion. Presence of a
+    /// `classifier` object alone is configuration, not enablement; the config
+    /// panel writes this field explicitly.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     /// Provider for the classifier session. Must be bidi-capable (it's steered
     /// with executor activity each pass). Lowercase name; default `glm`.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     /// Model override for the classifier session (cheap models recommended).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Effort/thinking level for the classifier session, passed to the CLI's
     /// `--effort` (e.g. "medium"). Threaded through fleet dispatch.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
     /// System framing + domain knowledge. Empty → [`DEFAULT_CLASSIFIER_PROMPT`].
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     /// Seconds between observation passes. Default 4, floored at 1.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cadence_secs: Option<u64>,
     /// Relay suggestions into the executor as `[INTERN]` turns. Default true.
     /// When false, suggestions are still surfaced in the TUI (observe-only).
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub auto_send: Option<bool>,
     /// Minimum new transcript items (tool calls / messages) accrued before the
     /// monitor digests again. This is what lets long turns get periodic mid-turn
     /// check-ins instead of a single end-of-turn look. Default 10.
     #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_activity: Option<u32>,
 }
 
 impl ClassifierConfig {
+    pub fn enabled_resolved(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
     /// Bidi provider the classifier runs on (default GLM). Non-bidi or unknown
     /// names — including `claude` — collapse to GLM: the classifier MUST be
     /// steerable, and Claude is intentionally not a fleet participant (it can't
@@ -225,7 +245,7 @@ impl FleetConfig {
         }
     }
 
-    fn load_from(path: &Path) -> Self {
+    pub fn load_from(path: &Path) -> Self {
         let Ok(text) = std::fs::read_to_string(path) else {
             return Self::default(); // missing/unreadable → empty
         };
@@ -237,6 +257,22 @@ impl FleetConfig {
                 Self::default()
             }
         }
+    }
+
+    /// Persist this fleet config next to the selected blackbox config.
+    pub fn save(&self) -> anyhow::Result<PathBuf> {
+        let path = Self::path().ok_or_else(|| anyhow::anyhow!("cannot resolve fleet.json path"))?;
+        self.save_to(&path)?;
+        Ok(path)
+    }
+
+    pub fn save_to(&self, path: &Path) -> anyhow::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = serde_json::to_string_pretty(self)?;
+        std::fs::write(path, format!("{text}\n"))?;
+        Ok(())
     }
 }
 
@@ -915,7 +951,7 @@ pub struct FleetOrchestrator {
     mcp_servers: BTreeMap<String, McpServerConfig>,
     /// Experimental classifier-companion config from `fleet.json`; `None` when
     /// the feature is off.
-    classifier: Option<ClassifierConfig>,
+    classifier: RwLock<Option<ClassifierConfig>>,
     /// Resolved fleet-level hot tools injected into Brodex-family harness
     /// children through `BRO_HARNESS_PIN_TOOLS`.
     pin_tools: Vec<String>,
@@ -935,7 +971,7 @@ impl FleetOrchestrator {
             tail_tx,
             store_dir,
             mcp_servers: BTreeMap::new(),
-            classifier: None,
+            classifier: RwLock::new(None),
             pin_tools: Vec::new(),
         }
     }
@@ -968,14 +1004,40 @@ impl FleetOrchestrator {
         let cfg = FleetConfig::load();
         orch.pin_tools = cfg.resolved_pin_tools();
         orch.mcp_servers = cfg.mcp_servers;
-        orch.classifier = cfg.classifier;
+        *orch.classifier.write() = cfg.classifier.filter(ClassifierConfig::enabled_resolved);
         Ok(orch)
     }
 
     /// The classifier-companion config, if `fleet.json` enabled it. The cockpit
     /// reads this at dispatch time to spawn an intern session per executor.
-    pub fn classifier(&self) -> Option<&ClassifierConfig> {
-        self.classifier.as_ref()
+    pub fn classifier(&self) -> Option<ClassifierConfig> {
+        self.classifier.read().clone()
+    }
+
+    /// Current fleet config as the config panel should display and save it.
+    pub fn fleet_config(&self) -> FleetConfig {
+        let mut cfg = FleetConfig::load();
+        if cfg.classifier.is_none() {
+            cfg.classifier = self.classifier.read().clone().map(|mut c| {
+                c.enabled = Some(true);
+                c
+            });
+        }
+        cfg
+    }
+
+    /// Update classifier config in-memory immediately and persist it to
+    /// `fleet.json`. This does not restart existing executor sessions; the TUI
+    /// starts/stops companions for live agents after calling this.
+    pub fn set_classifier(&self, classifier: Option<ClassifierConfig>) -> anyhow::Result<PathBuf> {
+        let mut cfg = FleetConfig::load();
+        cfg.classifier = classifier.clone().map(|mut c| {
+            c.enabled = Some(c.enabled_resolved());
+            c
+        });
+        let path = cfg.save()?;
+        *self.classifier.write() = classifier.filter(ClassifierConfig::enabled_resolved);
+        Ok(path)
     }
 
     /// Flush the current task store to disk so a later cockpit launch can
@@ -1659,7 +1721,7 @@ mod tests {
     #[test]
     fn fleet_config_parses_classifier() {
         let cfg: FleetConfig = serde_json::from_str(
-            r#"{ "classifier": { "provider": "glm", "cadence_secs": 8, "auto_send": false } }"#,
+            r#"{ "classifier": { "enabled": true, "provider": "glm", "cadence_secs": 8, "auto_send": false } }"#,
         )
         .unwrap();
         let c = cfg.classifier.expect("classifier present");
@@ -1669,6 +1731,36 @@ mod tests {
         assert_eq!(c.min_activity_resolved(), 10);
         // Empty prompt falls back to the calibrated default.
         assert_eq!(c.resolved_prompt(), DEFAULT_CLASSIFIER_PROMPT);
+    }
+
+    #[test]
+    fn fleet_config_classifier_presence_alone_is_not_enabled() {
+        let cfg: FleetConfig =
+            serde_json::from_str(r#"{ "classifier": { "provider": "glm" } }"#).unwrap();
+        let c = cfg.classifier.expect("classifier config stays available");
+        assert!(!c.enabled_resolved());
+    }
+
+    #[test]
+    fn fleet_config_persists_explicit_classifier_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("fleet.json");
+        let cfg = FleetConfig {
+            classifier: Some(ClassifierConfig {
+                enabled: Some(false),
+                provider: Some("glm".into()),
+                ..ClassifierConfig::default()
+            }),
+            ..FleetConfig::default()
+        };
+
+        cfg.save_to(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""enabled": false"#), "{text}");
+
+        let loaded = FleetConfig::load_from(&path);
+        let c = loaded.classifier.expect("classifier object stays present");
+        assert!(!c.enabled_resolved());
     }
 
     #[test]
@@ -1693,8 +1785,15 @@ mod tests {
         // Unknown / non-bidi names — and `claude`, which is no longer a fleet
         // participant — collapse to GLM. The classifier must stay steerable, so
         // it can never resolve to a one-shot (or non-fleet) provider.
-        for name in [None, Some("claude"), Some("codex"), Some("gemini"), Some("nonsense")] {
+        for name in [
+            None,
+            Some("claude"),
+            Some("codex"),
+            Some("gemini"),
+            Some("nonsense"),
+        ] {
             let c = ClassifierConfig {
+                enabled: None,
                 provider: name.map(str::to_string),
                 model: None,
                 effort: None,
