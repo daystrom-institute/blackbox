@@ -13,14 +13,14 @@ brief: "Ground-truth spec for how context compaction SHOULD work on the brodex (
 
 # Canonical compaction for brodex (OAI Responses), per codex reference
 
-> **Status: partial (phases 0 + 2 landed on `brodex-compaction`).** Landed:
-> the context-window overflow recovery (`77d0514`, on `main`) and the canonical
-> **server-side `responses/compact`** for the ChatGPT-OAuth path (`35eb59c`),
-> live-validated on `gpt-5.5` (§5). Remaining: phase 1 (inline-fallback fidelity
-> for API-key vendors) and phase 3 (proactive trigger / model-downshift). Ground
-> truth is `openai/codex` `main` as vendored at `/home/invidious/repos/codex`
-> (`codex-rs/…`). Citations are `file:line` into that tree and into
-> `crates/bro-harness/`.
+> **Status: partial (phases 0, 1, 2 landed).** Landed: the context-window
+> overflow recovery (`77d0514`), the canonical **server-side `responses/compact`**
+> for the ChatGPT-OAuth path (live-validated on `gpt-5.5`, §5), and **phase 1
+> inline-summarizer fidelity** (lifted the 2048 cap → tunable knobs; helps
+> GLM/DeepSeek on the Anthropic inline path). Remaining: **phase 3** (proactive
+> pre-send trigger / model-downshift). Ground truth is `openai/codex` `main` as
+> vendored at `/home/invidious/repos/codex` (`codex-rs/…`). Citations are
+> `file:line` into that tree and into `crates/bro-harness/`.
 
 ## 1. Why this doc exists
 
@@ -328,10 +328,13 @@ history that itself already exceeds the window (fit-trim parity).
 
 - **Phase 0 — landed.** Context-window overflow → compact + retry safety net
   (commit `77d0514`).
-- **Phase 1 — inline fidelity (no backend dependency, fully testable).**
-  Token-budgeted retained tail; lift/parameterize the summary cap; transcript
-  budgeting instead of flat 2000-char truncation; verbatim recent-user retention;
-  model-keyed knobs in `compaction.rs`. Applies to all three transports.
+- **Phase 1 — LANDED (`5038ab8`).** Lifted the inline summary cap (2048 → 8192
+  default) and made it + the per-tool-result render cap tunable via
+  `CompactionParams` / env, sourced from `CompactionPolicy::params()`. Applies to
+  all three transports' inline path (server-side `responses/compact` ignores
+  them). Still open as phase 1b if needed: a true transcript **token** budget
+  (vs flat char cap) and token-budgeted verbatim-tail retention (vs `keep_tail`
+  message count).
 - **Phase 2 — LANDED (`35eb59c`), live-validated.** Unary `responses/compact`:
   `build_compaction_input` → POST → replace `state.input` with the returned
   `output` (retained msgs + encrypted `compaction_summary`), gated on
