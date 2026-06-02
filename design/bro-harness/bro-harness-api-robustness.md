@@ -1,13 +1,13 @@
 ---
 title: "bro-harness API interaction review & robustness roadmap"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
   - providers
   - api
-brief: "A graded review of bro-harness's Anthropic-transport API interactions against Claude Code's idioms (mined from the 2.1.160 binary), plus a prioritized roadmap to make the harness robust and SOTA. Captures one real latent bug (pause_turn), the deliberate beta opt-outs and when to revisit them, predictive-vs-reactive compaction, and two caching edge cases. The two cheap wins (extended cache TTL, backoff jitter) are already landed and recorded here as a complete ledger."
+brief: "A graded review of bro-harness's Anthropic-transport API interactions against Claude Code's idioms (mined from the 2.1.160 binary), with the correctness/robustness work now landed and live-validated: extended 1h cache TTL, backoff jitter, SSE idle timeout + retryable mid-stream read, server-tool (web_search) block preservation + pause_turn resume, and a structured compaction summary prompt with <summary> extraction. The predictive compaction trigger landed separately as brodex phase 3. Remaining items (R1–R5: optional blocking floor, volatile-tail placement, tool-def breakpoint, interleaved-thinking, live pause repro) are deliberate residuals consolidated in bro-harness-residuals.md. §4 records the deliberate beta opt-outs and when to revisit them."
 ---
 
 > **Scope.** The deep read was the **Anthropic transport** (`transport/anthropic.rs`,
@@ -46,81 +46,60 @@ After the §6 landings, bro-harness ships `effort`, `context-1m`,
 `extended-cache-ttl`. The remaining three are addressed below — two as
 deliberate opt-outs, one as not-applicable.
 
-## 2. 🔴 Real latent bug — `pause_turn` not handled `[anthropic]`
+## 2. ✅ LANDED — server-tool block preservation + `pause_turn` resume `[anthropic]`
 
-**Symptom.** `map_stop` (`anthropic.rs:182-188`) maps any unknown stop reason,
-including `pause_turn`, to `StopReason::Other`. The loop treats any non-`ToolCalls`
-stop as terminal (`agent_loop.rs:609`), so the turn ends as `"model_stop"`.
+**The original bug.** The Anthropic block reconstruction handled only
+`text`/`thinking`/`tool_use` and dropped everything else via the `_ => {}` arm.
+So a server-side web_search turn lost its `server_tool_use` and result blocks
+from the replay buffer entirely — the model could not see its own search results
+on any later turn — and a `pause_turn` (server tool hitting its iteration limit)
+was mapped to a generic stop and silently terminated the turn instead of resuming.
 
-**Why it matters.** bro-harness enables the server-side `web_search_20250305`
-tool (`anthropic.rs:69-74`). CC's own docs (verbatim in the binary): *"the
-response will have `stop_reason: "pause_turn"`. To continue, re-send the user
-message and assistant response."* A long server-tool turn that pauses would
-**silently truncate** instead of resuming. Low frequency (only server tools, only
-long operations), but a correctness hole whenever `web_search` is on.
+**Ground truth (live capture).** A GLM web_search turn streams
+`[text, server_tool_use, text, tool_result, text]`: `server_tool_use` streams its
+input via `input_json_delta` (like `tool_use`); the `tool_result` carries its
+content inline in `content_block_start` (no deltas). This removed the earlier
+speculation — the wire shape is confirmed, not assumed.
 
-**Why it's not a one-liner.** `run_turn` already appended the partial assistant
-message to the buffer (`anthropic.rs:496-497`) before returning. Naively looping
-again would push a *second* assistant message and 400 on strict alternation. A
-correct fix needs the transport to recognize "the last buffered message is a
-paused assistant turn" and **continue** it on the next request rather than append
-a fresh one.
+**Implemented (`anthropic.rs`).**
+- `SseBlock` gains a `raw` field; `fold_sse` captures `server_tool_use` id/name
+  (+ streamed input) and the inline result block (`tool_result` /
+  `web_search_tool_result`) verbatim. `reconstruct_segment` emits them back into
+  the assistant `content` for faithful replay, but does **not** surface them as
+  client `tool_calls` (the server already ran them).
+- `run_turn` is now a single loop that handles in-band retry **and** `pause_turn`
+  resume: on a pause it appends the partial assistant, rebuilds the body (which
+  re-sends it so the server continues), and merges every segment into ONE
+  assistant message so the buffer stays alternation-valid. Bounded by
+  `MAX_PAUSE_RESUMES`; the in-band retry budget resets per segment. No
+  `StopReason` or agent-loop change — fully encapsulated in the transport.
 
-**Deeper prerequisite — server-tool block preservation.** CC's binary clarifies
-the trigger: pause_turn fires when a *server* tool "reaches its default limit of
-10 iterations … re-send the user message and assistant response … the server will
-resume where it left off." Resuming therefore means re-sending the paused
-assistant's **full content blocks**, including the `server_tool_use` and
-`web_search_tool_result` blocks. But `fold_sse` only reconstructs `text` /
-`thinking` / `tool_use` and **discards** everything else (`anthropic.rs` block
-reconstruction, the `_ => {}` arm), so those server blocks never enter the replay
-buffer. A correct resume thus depends on first **capturing and replaying the
-server-tool blocks** — a larger change than the loop wiring alone. Frequency is
-further bounded by `max_uses:5` on the harness's `web_search` tool
-(`anthropic.rs:69-74`), which usually completes within a single response before
-the 10-iteration pause. Net: real, but low-urgency and a two-part change (server
-block capture, then resume loop).
+**Validation.** Unit tests cover the SSE capture and reconstruction. Validated
+end-to-end against GLM: replaying `[user, assistant(with server blocks), user]`
+returns **HTTP 200** and the model answers from the preserved `tool_result`
+content (it restated the version it had searched) — proving the provider accepts
+the replayed server blocks, which is the same acceptance the resume path relies
+on. *Residual:* a real `pause_turn` was not force-triggered live (GLM completed
+within `max_uses`), so the resume *loop* is covered by the documented protocol +
+the validated replay-acceptance rather than a live pause repro. Tracked in the
+residuals doc.
 
-**Proposed design.**
-- Add `StopReason::Paused` to the normalized enum (`mod.rs:86-95`); map
-  `"pause_turn"` to it in `anthropic.rs` (and, defensively, in the OpenAI
-  transports' stop mapping, which have their own long-tool semantics).
-- In the loop, treat `Paused` like `ToolCalls` for *continuation* (don't break)
-  but with **no tool dispatch** — just re-enter `run_turn`.
-- Give the transport a `resume_paused: bool` turn flag (or detect "last message
-  is assistant" inside `run_turn`) so the paused assistant content is re-sent and
-  extended in place, preserving alternation. The Messages API resumes by
-  re-sending the partial assistant turn as the trailing message.
-- Bound resumes (e.g. ≤ 3 consecutive `pause_turn`s) to avoid a pathological
-  pause loop; surface a turn-end diagnostic if exceeded.
-- Test: a synthetic SSE sequence ending in `message_delta.stop_reason:"pause_turn"`
-  drives one continuation, and the rebuilt buffer stays alternation-valid.
+## 3. 🟢 Predictive compaction — addressed on main (brodex phase 3) `[cross-transport]`
 
-## 3. 🟡 Predictive vs reactive compaction `[cross-transport]`
+The reactive-lag concern this section originally raised is **largely addressed by
+landed work**: the brodex compaction phase-3 *proactive trigger* now compacts on
+a *projected* size — `projected_tokens = last_prompt_tokens + pending_input_estimate`
+(`agent_loop.rs`) — so an appended tool result / user message that would overflow
+the *next* request triggers compaction **before** it is sent, not a turn late.
+Combined with `bound_tool_result` (oversized results spill to disk before
+entering the buffer), the single-step-blowup window is small.
 
-**Today.** The compaction trigger reads the *previous* turn's usage
-(`agent_loop.rs:575` sets `last_prompt_tokens`; the check at `526` runs at the top
-of the next turn). So compaction lags by one turn, and the over-threshold request
-has already been sent. A single large step can cross from under-threshold to
-over-window before compaction fires.
-
-**Mitigation already present.** `bound_tool_result` (`agent_loop.rs:632-638`)
-spills oversized tool results to disk and inlines a head+rider, so the most common
-blowup vector (a giant file read) is capped before it enters the buffer. This
-makes the reactive lag tolerable in practice.
-
-**CC's approach.** Pre-counts with `/v1/messages/count_tokens` and keeps a
-*blocking floor* — it refuses to compose a turn that would overflow even
-post-compaction (see `compaction-canonical-anthropic.md` §4).
-
-**Proposed (small, ordered).**
-1. **Blocking floor** — before `run_turn`, if `last_prompt_tokens` already exceeds
-   a hard `window − reserved` floor, compact *first* (already the path) and, if
-   still over, refuse with a clear error rather than send an over-window request.
-   This is the highest-value robustness add and is shared with the compaction doc.
-2. **(Optional) Pre-count** — a `count_tokens` probe before composing when the
-   buffer grew sharply, to catch a single-step blowup the `bound` cap didn't.
-   Worth it only if blocking-floor refusals are observed in practice.
+**Remaining (optional, low-priority residual).** A hard *blocking floor* — refuse
+to compose a request that would still overflow even after compaction — and a
+`count_tokens` pre-probe would close the last gap (a single step that jumps from
+under-threshold to over-window). Worth it only if over-window 400s are actually
+observed; the proactive estimate covers the common case. See
+`compaction-canonical-anthropic.md` §4 and the residuals doc.
 
 ## 4. 🟢 Deliberate beta opt-outs — keep, but document the trigger to revisit
 
@@ -208,25 +187,38 @@ Recorded here so the review is a complete ledger.
   transport uses). This guard now also covers the pre-existing overloaded-error
   retry, closing a latent duplicate-text window when an overload arrived
   mid-content.
+- **Server-tool block preservation + `pause_turn` resume `[anthropic]`** (§2) —
+  web_search `server_tool_use`/`tool_result` blocks are now captured and replayed,
+  and `pause_turn` resumes the server-tool turn. Live-validated against GLM.
+- **Structured compaction summary prompt + `<summary>` extraction
+  `[anthropic / cross-transport]`** — `COMPACTION_INSTRUCTION` is now the canonical
+  9-section structured prompt with an `<analysis>` scratchpad and mandatory
+  verbatim security-constraint preservation; a shared `transport::extract_summary`
+  keeps only the durable `<summary>` block across all three inline transports.
+  Live-validated on GLM + DeepSeek: both returned all 9 sections, a clean
+  extractable summary, and preserved the security constraint verbatim. The
+  per-tool-result render cap and 8192-token summary budget were already lifted by
+  brodex compaction phase 1 (`CompactionParams`).
 
 ## 7. Priority roadmap
 
 | # | Item | Severity | Effort | Status |
 | --- | --- | --- | --- | --- |
-| 1 | `pause_turn` continuation + server-block capture (§2) | 🔴 correctness | L (2-part) | proposed |
-| 2 | Blocking floor before compose (§3.1) | 🟡 robustness | S | proposed |
-| 3 | Volatile tail → trailing on Anthropic (§5.2) | 🔵 polish | S–M | proposed |
-| 4 | Tool-def cache breakpoint fallback (§5.1) | 🔵 polish | S | proposed |
-| 5 | Structured compaction prompt (compaction doc) | 🟡 quality | S | proposed |
-| 6 | `count_tokens` pre-probe (§3.2) | 🔵 optional | S | deferred |
-| 7 | interleaved-thinking replay (§4.1) | 🟢 feature | L | gated |
-| — | Extended cache TTL (§6) | 🟡 cost | S | **landed** |
-| — | Backoff jitter (§6) | 🔵 robustness | S | **landed** |
-| — | Anthropic SSE idle timeout + retryable read error (§6) | 🟡 robustness | S | **landed** |
+| — | Extended cache TTL | 🟡 cost | S | **landed** |
+| — | Backoff jitter | 🔵 robustness | S | **landed** |
+| — | Anthropic SSE idle timeout + retryable read error | 🟡 robustness | S | **landed** |
+| — | Server-tool block preservation + `pause_turn` resume (§2) | 🔴 correctness | L | **landed** |
+| — | Structured compaction prompt + `<summary>` extraction | 🟡 quality | M | **landed** |
+| — | Predictive compaction trigger (§3) | 🟡 robustness | — | **landed (brodex ph3)** |
+| R1 | Hard blocking floor + `count_tokens` pre-probe (§3) | 🔵 optional | S | residual |
+| R2 | Volatile tail → trailing on Anthropic (§5.2) | 🔵 polish | S–M | residual |
+| R3 | Tool-def cache breakpoint fallback (§5.1) | 🔵 polish | S | residual (skip) |
+| R4 | interleaved-thinking replay (§4.1) | 🟢 feature | L | gated |
+| R5 | Live `pause_turn` resume-loop repro | 🔵 validation | S | residual |
 
-Suggested next slice: **#1 (pause_turn)** as its own focused change, then **#2
-(blocking floor)** folded with the structured-prompt work (#5) since both live in
-the compaction seam.
+Open residuals (R1–R5) are consolidated with rationale in
+**`bro-harness-residuals.md`**. Everything correctness-critical for the Anthropic
+transport and agent loop is landed and live-validated.
 
 ## 8. Validation notes
 

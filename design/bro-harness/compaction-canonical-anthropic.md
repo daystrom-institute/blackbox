@@ -1,7 +1,7 @@
 ---
 title: "Canonical compaction model — Anthropic-shaped consumers"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -256,26 +256,32 @@ tool_result).
 - **`emit.rs::compact_boundary` is shared** and transport-neutral; both impls
   should emit it with their own `trigger`/`pre_tokens`.
 
-## 7. Recommended changes (Anthropic path)
+## 7. Recommended changes (Anthropic path) — status
 
-In rough priority order — all Anthropic-scoped, none touching the OAI seam:
+Reconciled against landed work (this lane + the brodex compaction phases on
+`main`). All Anthropic-scoped; none touch the OAI seam.
 
-1. **Replace `COMPACTION_INSTRUCTION` with the structured prompt** (Variant A
-   framing, 9-section skeleton, `<analysis>` scratchpad, mandatory verbatim
-   preservation of security-relevant user instructions). Highest value, lowest
-   risk.
-2. **Reserve output tokens before thresholding** — make the policy compute
-   against `window − reserved` rather than raw `window * ratio`, optionally with
-   a fixed-headroom mode mirroring CC's 13k.
-3. **Add a blocking floor** so the harness refuses to compose a turn that would
-   overflow even post-compaction, instead of sending an over-window request.
-4. **Anti-thrash guard** — skip/escalate if the previous turn already compacted
-   and the budget is still over (don't loop on a single oversized turn;
-   escalate to strip-non-essential or surface to the operator).
-5. **Strip-non-essential tier** (optional) — drop stale tool-result bodies
-   before summarizing, as a cheaper first pass.
-6. **Precompute-and-swap** (optional, larger) — only worth it if the
-   synchronous summarization stall is observably hurting the fleet TUI UX.
+1. ✅ **LANDED — structured `COMPACTION_INSTRUCTION`** (Variant A framing,
+   9-section skeleton, `<analysis>` scratchpad, mandatory verbatim preservation
+   of security-relevant user instructions) plus a shared `transport::extract_summary`
+   that keeps only the `<summary>` block. Live-validated on GLM + DeepSeek (all
+   9 sections, clean extraction, security constraint preserved verbatim).
+2. 〜 **Partially landed — summary budget.** brodex phase 1 lifted the summary cap
+   (2048 → 8192, tunable) and added a per-tool-result render cap (`CompactionParams`).
+   The deeper *token-budgeted* transcript + verbatim tail (vs char cap / message
+   count) is tracked in `brodex-compaction-followons.md` (1b) — the shared/OAI lane.
+3. ✅ **Predictive trigger — LANDED as brodex phase 3.** The proactive trigger
+   compacts on `last_prompt_tokens + pending_input_estimate` before an overflowing
+   request is sent. A hard *blocking floor* + `count_tokens` pre-probe remain an
+   optional residual (R1 in `bro-harness-residuals.md`).
+4. 〜 **Anti-thrash** — partly covered: a genuine post-compaction buffer is small
+   by construction (`[summary] + tail`), so re-compaction rarely retriggers (see
+   the brodex follow-ons 1b.3 assessment). No dedicated guard yet; revisit only if
+   thrash is observed.
+5. ○ **Strip-non-essential tier** (optional) — not implemented; the structured
+   summarizer + render cap cover the need today.
+6. ○ **Precompute-and-swap** (optional, larger) — not implemented; only worth it
+   if the synchronous summarization stall is observably hurting the Fleet TUI UX.
 
 ## 8. Validation
 

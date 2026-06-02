@@ -298,8 +298,12 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
 const MAX_PAUSE_RESUMES: u32 = 8;
 
 fn parse_tool_input(tool_json: &str) -> Value {
-    serde_json::from_str(if tool_json.is_empty() { "{}" } else { tool_json })
-        .unwrap_or_else(|_| json!({}))
+    serde_json::from_str(if tool_json.is_empty() {
+        "{}"
+    } else {
+        tool_json
+    })
+    .unwrap_or_else(|_| json!({}))
 }
 
 /// Reconstruct one assistant segment from the SSE accumulators: the `content`
@@ -540,12 +544,9 @@ impl Transport for AnthropicTransport {
                             if ev["type"].as_str() == Some("error") {
                                 sink.stream_event(ev.clone());
                                 let code = ev["error"]["type"].as_str().unwrap_or("error");
-                                let msg =
-                                    ev["error"]["message"].as_str().unwrap_or("stream error");
-                                inband_error = Some((
-                                    format!("{code}: {msg}"),
-                                    inband_error_retryable(&ev),
-                                ));
+                                let msg = ev["error"]["message"].as_str().unwrap_or("stream error");
+                                inband_error =
+                                    Some((format!("{code}: {msg}"), inband_error_retryable(&ev)));
                                 break 'consume;
                             }
                             if ev["type"].as_str() == Some("content_block_delta") {
