@@ -22,6 +22,7 @@ pub mod codex_auth;
 pub mod http;
 pub mod openai_chat;
 pub mod openai_responses;
+pub mod responses_common;
 
 use anyhow::Result;
 use async_trait::async_trait;
