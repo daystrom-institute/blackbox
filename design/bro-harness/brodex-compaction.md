@@ -1,7 +1,7 @@
 ---
 title: "Canonical compaction for brodex (OAI Responses), per codex reference"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -13,11 +13,12 @@ brief: "Ground-truth spec for how context compaction SHOULD work on the brodex (
 
 # Canonical compaction for brodex (OAI Responses), per codex reference
 
-> **Status: proposed.** This is the north-star spec, not as-built. The only
-> compaction change landed so far is the context-window overflow recovery
-> (`fix(brodex): recover from context-window overflow via compact+retry`,
-> commit `77d0514`); everything else here is the target. Ground truth is
-> `openai/codex` `main` as vendored at `/home/invidious/repos/codex`
+> **Status: partial (phases 0 + 2 landed on `brodex-compaction`).** Landed:
+> the context-window overflow recovery (`77d0514`, on `main`) and the canonical
+> **server-side `responses/compact`** for the ChatGPT-OAuth path (`35eb59c`),
+> live-validated on `gpt-5.5` (§5). Remaining: phase 1 (inline-fallback fidelity
+> for API-key vendors) and phase 3 (proactive trigger / model-downshift). Ground
+> truth is `openai/codex` `main` as vendored at `/home/invidious/repos/codex`
 > (`codex-rs/…`). Citations are `file:line` into that tree and into
 > `crates/bro-harness/`.
 
@@ -331,11 +332,13 @@ history that itself already exceeds the window (fit-trim parity).
   Token-budgeted retained tail; lift/parameterize the summary cap; transcript
   budgeting instead of flat 2000-char truncation; verbatim recent-user retention;
   model-keyed knobs in `compaction.rs`. Applies to all three transports.
-- **Phase 2 — server-side compaction for the OAuth path (contract validated, §5).**
-  Wire the unary `responses/compact` endpoint: POST `CompactionInput`, replace
-  `state.input` with the returned `output` (retained msgs + encrypted
-  `compaction_summary`), gated on `Auth::ChatGpt`. The streaming
-  `compaction_trigger` path is a documented future option, not required.
+- **Phase 2 — LANDED (`35eb59c`), live-validated.** Unary `responses/compact`:
+  `build_compaction_input` → POST → replace `state.input` with the returned
+  `output` (retained msgs + encrypted `compaction_summary`), gated on
+  `Auth::ChatGpt`; `tools` threaded through `Transport::compact`; client-side
+  summarizer kept as the API-key fallback. Two double-gated live probes verify
+  the endpoint and the real `compact()` path. The streaming `compaction_trigger`
+  path remains a documented future option, not required.
 - **Phase 3 — proactive trigger + model-downshift + multi-compaction warning.**
 - **Phase 4 — optional parity: pre/post-compact hooks, analytics, rollout trace.**
 
