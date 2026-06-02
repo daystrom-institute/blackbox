@@ -60,9 +60,10 @@ Ownership is clean and non-duplicating:
 
 ## 3. The axes (what we study)
 
-Fifteen axes in four clusters. The first ten were defined top-down in the
+Sixteen axes in four clusters. The first ten were defined top-down in the
 initial pass; five (marked **†**) were added from a bottom-up **codex-lens
-discovery pass** — see [§3.1](#31-provenance-of-the-axis-set). Each axis has an
+discovery pass**; one (marked **‡**) was added from a **comparative probe** of
+Codex code-mode and Claude Code Workflows — see [§3.1](#31-provenance-of-the-axis-set). Each axis has an
 invariant doc (the column header, elaborated) and one finding per subject (the
 cells).
 
@@ -117,6 +118,11 @@ cells).
   and how hook output is injected back into context.
 - **[Skills](skills.md)** — skills/slash-commands: discovery, invocation,
   progressive disclosure, argument passing.
+- **[Metatools](metatools.md)** ‡ — programmable tool composition: scriptable
+  runtimes (JS in V8/Bun) that call tools, capture results in variables, apply
+  logic (loops, conditionals, fan-out), and return only the final answer to
+  context. The composition layer above the flat tool surface. Distinct from
+  subagents (agent-spawns-agent) — metatools compose *tools* directly.
 
 ### Autonomy & governance † — long-horizon, bidirectional
 
@@ -139,7 +145,7 @@ cells).
   config layer). Distinct from context injection — these are behavior contracts.
 
 > **The "agent-facing suite" is the union of these axes.** When a new capability
-> none of the fifteen captures cleanly appears, propose a new axis here rather
+> none of the sixteen captures cleanly appears, propose a new axis here rather
 > than wedging it into an ill-fitting cell — and record how it was surfaced
 > (§3.1).
 
@@ -158,11 +164,25 @@ The axis set is itself a versioned, evolving artifact — not a fixed truth.
   (session-lifecycle), and confirmed two pass-1 axes (deferred tiering in `mcp`,
   channel fallback in `transport`) as genuine cross-harness invariants. Several
   existing axes also gained **Codex-lens extensions** sections.
+- **Pass 3 (comparative probe, +1 axis ‡).** A live probe of Codex code-mode
+  (`--enable code_mode --enable code_mode_only`, V8 `exec`/`wait` + `await
+  tools.<name>(...)`) and a documentation review of Claude Code Workflows
+  (`CLAUDE_CODE_WORKFLOWS=1`, JS orchestration scripts with `agent()`/
+  `parallel()`/`pipeline()`) revealed a shared design pattern neither the
+  pass-1 nor pass-2 axis set captured: a **programmable tool-composition
+  layer** between the model and the flat tool surface. Codex composes raw tools
+  from JS (fine grain); Claude Code composes subagents from JS (coarse grain);
+  both converge on "keep intermediate results in script variables, not context."
+  The **metatools** axis captures this dimension. Surfaced 2026-06-02 during a
+  follow-on probe after the codex-lens discovery pass.
 - **The meta-lesson.** The pass-1 framing (per-turn request→response) structurally
   under-weighted the **session-spanning, bidirectional-governance** region —
-  exactly the "Autonomy & governance" cluster. Future passes should keep
-  triangulating against multiple harnesses (e.g. antigravity, mistral-vibe)
-  before treating the axis set as settled.
+  exactly the "Autonomy & governance" cluster. Pass 3 reinforces the lesson from
+  a different angle: the pass-1 and pass-2 axes captured *individual* tool
+  surfaces but missed the **composition layer above them** — the programmable
+  runtime that calls tools without round-tripping through the model. Future
+  passes should keep triangulating against multiple harnesses (e.g. antigravity,
+  mistral-vibe) before treating the axis set as settled.
 
 ## 4. Subjects
 
