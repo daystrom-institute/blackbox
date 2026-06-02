@@ -1,7 +1,7 @@
 ---
 title: "Canonical compaction for brodex (OAI Responses), per codex reference"
 kind: design
-lifecycle: partial
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -13,18 +13,21 @@ brief: "Ground-truth spec for how context compaction SHOULD work on the brodex (
 
 # Canonical compaction for brodex (OAI Responses), per codex reference
 
-> **Status: the canonical set (phases 0–3) is landed.** Landed: the
-> context-window overflow recovery (`77d0514`); the canonical **server-side
-> `responses/compact`** for the ChatGPT-OAuth path (live-validated on `gpt-5.5`,
-> §5); **phase 1** inline-summarizer fidelity (lifted the 2048 cap → tunable
-> knobs); and **phase 3** the **proactive pre-send trigger** (projected =
-> last-observed + estimate of items appended since, so an appended item that
-> would overflow the next request compacts before it's sent — codex's
-> `get_total_token_usage` shape). Model-downshift is covered structurally by the
-> existing threshold-on-`set_model` + the reactive check. Only **phase 1b**
-> refinements remain (a true transcript *token* budget vs char cap; the
-> `BodyAfterPrefix` window scope — likely N/A since brodex compaction genuinely
-> shrinks the buffer). Ground truth is `openai/codex` `main` as vendored at
+> **Status: ARCHIVED — canonical set (phases 0–3) landed; this is the as-built
+> record.** Landed: the context-window overflow recovery (`77d0514`); the
+> canonical **server-side `responses/compact`** for the ChatGPT-OAuth path
+> (live-validated on `gpt-5.5`, §5); **phase 1** inline-summarizer fidelity
+> (lifted the 2048 cap → tunable knobs); and **phase 3** the **proactive pre-send
+> trigger** (projected = last-observed + estimate of items appended since —
+> codex's `get_total_token_usage` shape), with model-downshift covered
+> structurally by threshold-on-`set_model` + the reactive check.
+>
+> **Optional follow-ons (phase 1b transcript token budget / token-budgeted tail /
+> BodyAfterPrefix assessment, and phase 4 hooks/analytics/trace parity) are split
+> out to `design/bro-harness/brodex-compaction-followons.md` (proposed).** None
+> are gaps in the canonical mechanism.
+>
+> Ground truth is `openai/codex` `main` as vendored at
 > `/home/invidious/repos/codex` (`codex-rs/…`). Citations are `file:line` into
 > that tree and into `crates/bro-harness/`.
 
@@ -359,11 +362,11 @@ history that itself already exceeds the window (fit-trim parity).
   estimate of items after the last model turn). Model-downshift is covered
   structurally: `set_model` re-derives the threshold and the reactive check
   compacts on the next turn if the carried history exceeds the new window.
-- **Phase 1b (open, optional)** — true transcript *token* budget (vs flat char
-  cap) and token-budgeted verbatim-tail retention (vs `keep_tail` count); the
-  `BodyAfterPrefix` window scope (likely N/A — brodex compaction genuinely
-  shrinks the buffer, so re-compaction thrash isn't a real risk).
-- **Phase 4 (optional) — parity: pre/post-compact hooks, analytics, rollout trace.**
+- **Phase 1b + Phase 4 (optional follow-ons)** — split out to
+  `design/bro-harness/brodex-compaction-followons.md` (proposed): a true
+  transcript *token* budget, token-budgeted verbatim-tail retention, the
+  `BodyAfterPrefix` assessment, and hooks/analytics/rollout-trace parity. None
+  are gaps in the canonical mechanism.
 
 ## 7. Reference index
 
