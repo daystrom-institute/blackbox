@@ -26,6 +26,18 @@ fn has_runtime_knowledge_filter(p: &KnowledgeListParams) -> bool {
         || p.approval.is_some()
 }
 
+/// Extract the top knowledge entry id from a `kb.list` entries block for the
+/// response breadcrumb. The block opens with `N entries:\n\n[<id>] …`, so the
+/// first bracketed token is the highest-ranked entry. Returns None for the
+/// "No entries found." sentinel (no `[`), so a packet-only or memory-only
+/// response does not emit a spurious entry pointer.
+fn first_entry_id(entries_block: &str) -> Option<String> {
+    let start = entries_block.find('[')? + 1;
+    let end = entries_block[start..].find(']')? + start;
+    let id = entries_block[start..end].trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
 fn matches_system_memory_catalog(category: Option<&str>) -> bool {
     matches!(
         category,
@@ -181,6 +193,9 @@ impl BlackboxServer {
             }
 
             let mut combined = self.state.kb.write().list(&p)?;
+            // Captured before packets/memories are appended, so it reflects the
+            // top knowledge entry (not a packet/memory line).
+            let top_entry_id = first_entry_id(&combined);
 
             // Surface matching packets. Uses the same match semantics as
             // bbox_packet_list so the two tools agree on what "matches" means.
@@ -252,6 +267,22 @@ impl BlackboxServer {
                     "  (signposts only — query an exact sm-* id for the full runbook body)\n",
                 );
             }
+
+            // Top-level breadcrumb: pull the highest-ranked knowledge entry into
+            // the graph funnel. Packets and memories carry their own pointers
+            // above; this completes the response-breadcrumb plane for entries.
+            if let Some(id) = &top_entry_id {
+                if !combined.ends_with('\n') {
+                    combined.push('\n');
+                }
+                combined.push_str("\n── Next steps ───────────────────────────────\n");
+                combined.push_str(&format!(
+                    "  → Inspect the top entry's edges + provenance: bbox_inspect_entity(entity_ref=\"knowledge:{id}\")\n"
+                ));
+                combined.push_str(&format!(
+                    "  → Package an answer: bbox_bundle_evidence(question=<q>, entity_refs=[\"knowledge:{id}\"])\n"
+                ));
+            }
             Ok(combined)
         })
     }
@@ -291,6 +322,15 @@ mod tests {
 
     fn init_system_memory() {
         system_memory::init_for_tests();
+    }
+
+    #[test]
+    fn first_entry_id_extracts_top_and_handles_sentinel() {
+        let block = "2 entries:\n\n[abc123] Convention/project | all | title\n  \
+                     content_bytes=10\n  body [with brackets]\n\n[def456] ...";
+        assert_eq!(first_entry_id(block).as_deref(), Some("abc123"));
+        assert_eq!(first_entry_id("No entries found."), None);
+        assert_eq!(first_entry_id(""), None);
     }
 
     #[test]

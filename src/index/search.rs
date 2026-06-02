@@ -286,6 +286,9 @@ impl TranscriptIndex {
         let snippet_gen = SnippetGenerator::create(&searcher, &*text_query, self.fields.content)?;
 
         let mut results = Vec::new();
+        // Top hit's coordinates, captured for the response breadcrumb so the
+        // agent can paste them into the read tools (bbox_context / bbox_messages).
+        let mut top_hit: Option<(String, String, u64)> = None;
         for (score, addr) in &top_docs {
             let doc: TantivyDocument = searcher.doc(*addr)?;
             let snippet = snippet_gen.snippet_from_doc(&doc);
@@ -296,6 +299,16 @@ impl TranscriptIndex {
             let ts = self.doc_text(&doc, self.fields.timestamp);
             let project = self.doc_text(&doc, self.fields.project);
             let account = self.doc_text(&doc, self.fields.account);
+            let byte_offset = doc
+                .get_first(self.fields.byte_offset)
+                .and_then(|value| match value {
+                    tantivy::schema::OwnedValue::U64(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            if top_hit.is_none() {
+                top_hit = Some((session_id.clone(), file_path.clone(), byte_offset));
+            }
 
             let excerpt = snippet.to_html().replace("<b>", "**").replace("</b>", "**");
 
@@ -313,11 +326,24 @@ impl TranscriptIndex {
             ));
         }
 
-        Ok(format!(
+        let mut out = format!(
             "{} results:\n\n{}",
             results.len(),
             results.join("\n\n---\n\n")
-        ))
+        );
+        if let Some((session_id, file_path, byte_offset)) = top_hit {
+            out.push_str("\n\nNext steps:\n");
+            out.push_str(&format!(
+                "  → Surrounding conversation: bbox_context(file_path=\"{file_path}\", byte_offset={byte_offset})\n"
+            ));
+            out.push_str(&format!(
+                "  → Read the whole session: bbox_messages(session_id=\"{session_id}\")\n"
+            ));
+            out.push_str(
+                "  → Trace a specific claim to its origin: bbox_cite(claim=\"<exact phrase>\")\n",
+            );
+        }
+        Ok(out)
     }
 
     pub(crate) fn hybrid_bm25_hits(
