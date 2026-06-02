@@ -1,0 +1,11 @@
+{
+  "name": "design-doc-review-panel",
+  "version": 1,
+  "members": [
+    { "brofile": "design-doc-review-snd", "alias": "soundness", "count": 1 },
+    { "brofile": "design-doc-review-prc", "alias": "precision", "count": 1 },
+    { "brofile": "design-doc-review-eco", "alias": "economy", "count": 1 },
+    { "brofile": "design-doc-review-res", "alias": "resilience", "count": 1 },
+    { "brofile": "design-doc-review-cor", "alias": "corroboration", "count": 1 }
+  ]
+}

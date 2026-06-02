@@ -1,0 +1,31 @@
+{
+  "name": "blackbox-review-panel",
+  "version": 1,
+  "members": [
+    {
+      "brofile": "blackbox-review-snd",
+      "alias": "soundness",
+      "count": 1
+    },
+    {
+      "brofile": "blackbox-review-prc",
+      "alias": "precision",
+      "count": 1
+    },
+    {
+      "brofile": "blackbox-review-eco",
+      "alias": "economy",
+      "count": 1
+    },
+    {
+      "brofile": "blackbox-review-res",
+      "alias": "resilience",
+      "count": 1
+    },
+    {
+      "brofile": "blackbox-review-cor",
+      "alias": "corroboration",
+      "count": 1
+    }
+  ]
+}

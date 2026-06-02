@@ -1,0 +1,490 @@
+{
+  "name": "design-doc-review",
+  "version": 1,
+  "vars_schema": {
+    "project_dir": {
+      "kind": "string",
+      "required": true
+    },
+    "design_doc_path": {
+      "kind": "string",
+      "required": true
+    },
+    "design_doc_text": {
+      "kind": "string",
+      "required": true
+    },
+    "operator_hints": {
+      "kind": "array"
+    },
+    "whiteboard_id": {
+      "kind": "string"
+    },
+    "whiteboard_open": {
+      "kind": "object"
+    },
+    "board_check": {
+      "kind": "object"
+    },
+    "board_summary": {
+      "kind": "object"
+    },
+    "review_json": {
+      "kind": "object"
+    },
+    "write_result": {
+      "kind": "object"
+    }
+  },
+  "actors": {
+    "facilitator": {
+      "kind": "executor",
+      "brofile": "design-doc-review-facilitator",
+      "durable": true,
+      "compaction_anchor": true
+    },
+    "panel": {
+      "kind": "ensemble",
+      "team": "design-doc-review-panel",
+      "durable": true
+    },
+    "validator": {
+      "kind": "executor",
+      "brofile": "design-doc-review-validator",
+      "durable": true
+    }
+  },
+  "start": "Setup",
+  "nodes": {
+    "Setup": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "default_var",
+          "args": {
+            "key": "operator_hints",
+            "value": []
+          }
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "whiteboard_id",
+            "value": "design-doc-review:${meta.arc_id}"
+          }
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_open",
+            "arguments": {
+              "board_id": "${vars.whiteboard_id}",
+              "opened_by": "facilitator",
+              "project": "${vars.project_dir}",
+              "topic": "Design document review: ${vars.design_doc_path}",
+              "domain": "design-review"
+            },
+            "timeout_secs": 30
+          },
+          "into_var": "whiteboard_open",
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "agent_name": "soundness",
+              "board_id": "${vars.whiteboard_id}",
+              "domain": "design-review",
+              "role": "specialist"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "agent_name": "precision",
+              "board_id": "${vars.whiteboard_id}",
+              "domain": "design-review",
+              "role": "specialist"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "agent_name": "economy",
+              "board_id": "${vars.whiteboard_id}",
+              "domain": "design-review",
+              "role": "specialist"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "agent_name": "resilience",
+              "board_id": "${vars.whiteboard_id}",
+              "domain": "design-review",
+              "role": "specialist"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "agent_name": "corroboration",
+              "board_id": "${vars.whiteboard_id}",
+              "domain": "design-review",
+              "role": "specialist"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "whiteboard_register",
+            "arguments": {
+              "agent_name": "validator",
+              "board_id": "${vars.whiteboard_id}",
+              "domain": "design-review",
+              "role": "specialist"
+            },
+            "timeout_secs": 30
+          },
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "BlindPost"
+      }
+    },
+    "BlindPost": {
+      "actor": "panel",
+      "prompt": "Review this design document from your lens's unique perspective.\n\nProject: ${vars.project_dir}\nDesign doc path: ${vars.design_doc_path}\nDesign document:\n${vars.design_doc_text}\n\nOperator hints: ${vars.operator_hints}\nWhiteboard id: ${vars.whiteboard_id}\n\nRead the design document above. Ground your review in cheap evidence from the codebase using your allowed tools. Post exactly ONE whiteboard_post under your agent_name (soundness, precision, economy, resilience, or corroboration — use your assigned name). Your post should contain your dimension-specific findings: challenges (with evidence), corroboration of sound claims, and any dimension-specific concern the other lenses would miss. Set target_file to the design doc path. Set severity per finding (critical/high/medium/low). Defer findings owned by other dimensions. Do not register or transition the board.",
+      "next": {
+        "type": "goto",
+        "to": "ValidateBlind"
+      }
+    },
+    "ValidateBlind": {
+      "actor": "",
+      "gate": "domain:design-doc-review/whiteboard-participation",
+      "next": {
+        "cases": {
+          "invalid": "BoardInvalid",
+          "ready": "TransitionToValidate"
+        },
+        "default": "BoardInvalid",
+        "type": "branch"
+      },
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_summarize"
+          },
+          "into_var": "board_check",
+          "on_failure": "halt",
+          "op": "mcp_call"
+        }
+      ]
+    },
+    "TransitionToValidate": {
+      "actor": "",
+      "next": {
+        "to": "Validate",
+        "type": "goto"
+      },
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}",
+              "summary": "Blind review posts submitted. Making posts visible for validation.",
+              "target_phase": "read"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_transition"
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}",
+              "summary": "Read phase opened. Moving to validate for evidence-backed verification.",
+              "target_phase": "validate"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_transition"
+          },
+          "on_failure": "halt"
+        }
+      ]
+    },
+    "Validate": {
+      "actor": "validator",
+      "prompt": "Validate the design-document review findings on this whiteboard.\n\nWhiteboard id: ${vars.whiteboard_id}\nProject: ${vars.project_dir}\nDesign doc path: ${vars.design_doc_path}\nDesign document:\n${vars.design_doc_text}\n\nRead the full board state with whiteboard_state. For each lens post, audit the cited evidence and post one validation annotation (confirmed/refuted/inconclusive) per finding. Work one finding at a time. Be decisive: audit cheaply, escalate only where weakness meets consequence. Post per finding. Emit bbox_note(kind=\"done\") with a one-line summary when complete.",
+      "next": {
+        "type": "goto",
+        "to": "ValidateValidation"
+      }
+    },
+    "ValidateValidation": {
+      "actor": "",
+      "gate": "domain:design-doc-review/whiteboard-participation",
+      "next": {
+        "cases": {
+          "invalid": "BoardInvalid",
+          "ready_debate": "TransitionToDebate",
+          "ready_skip": "TransitionToResolve"
+        },
+        "default": "BoardInvalid",
+        "type": "branch"
+      },
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_summarize"
+          },
+          "into_var": "board_check",
+          "on_failure": "halt",
+          "op": "mcp_call"
+        }
+      ]
+    },
+    "TransitionToDebate": {
+      "actor": "",
+      "next": {
+        "to": "Debate",
+        "type": "goto"
+      },
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}",
+              "summary": "Validation complete with conflicts. Moving to debate for resolution.",
+              "target_phase": "debate"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_transition"
+          },
+          "on_failure": "halt"
+        }
+      ]
+    },
+    "Debate": {
+      "actor": "panel",
+      "prompt": "Debate the design-document review findings on this whiteboard.\n\nWhiteboard id: ${vars.whiteboard_id}\nProject: ${vars.project_dir}\n\nRead the full board state with whiteboard_state. Review the validation annotations. For findings where you disagree with the validator or another lens: post targeted challenges (whiteboard_annotate type=\"challenge\") or corroboration (type=\"corroborate\"). Vote on findings that affect your dimension. Resolve challenges you raised (whiteboard_annotate type=\"resolve\" resolves=<id>). Genuine disagreement is acceptable — unresolved challenges survive into the review for human judgment. Do not force-resolve disagreements. Ensure every surviving post gets cross-agent review.",
+      "next": {
+        "type": "goto",
+        "to": "ValidateDebate"
+      }
+    },
+    "ValidateDebate": {
+      "actor": "",
+      "gate": "domain:design-doc-review/whiteboard-participation",
+      "next": {
+        "cases": {
+          "invalid": "Debate",
+          "ready": "TransitionToResolve"
+        },
+        "default": "Debate",
+        "type": "branch"
+      },
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_summarize"
+          },
+          "into_var": "board_check",
+          "on_failure": "halt",
+          "op": "mcp_call"
+        },
+        {
+          "op": "set_var",
+          "args": {
+            "key": "board_summary",
+            "value": "${vars.board_check}"
+          }
+        }
+      ],
+      "retry": {
+        "max_generations": 3
+      }
+    },
+    "TransitionToResolve": {
+      "actor": "",
+      "next": {
+        "to": "SynthesizeReview",
+        "type": "goto"
+      },
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}",
+              "summary": "Debate complete. Resolving whiteboard for synthesis.",
+              "target_phase": "resolve"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_transition"
+          },
+          "on_failure": "halt"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}"
+            },
+            "server": "blackbox",
+            "timeout_secs": 60,
+            "tool": "whiteboard_summarize"
+          },
+          "into_var": "board_summary",
+          "on_failure": "warn",
+          "op": "mcp_call"
+        }
+      ]
+    },
+    "SynthesizeReview": {
+      "actor": "facilitator",
+      "prompt": "Synthesize the design-document review from the whiteboard.\n\nWhiteboard id: ${vars.whiteboard_id}\nBoard summary: ${vars.board_summary}\nProject: ${vars.project_dir}\nDesign doc path: ${vars.design_doc_path}\n\nRead the full board state. Build the review from SURVIVING posts only (those not refuted by the validator). Organize findings by dimension (Soundness, Precision, Economy, Resilience, Corroboration). Carry unresolved challenges into a \"Contradictions Requiring Human Judgment\" section — do NOT force-resolve them. List refuted findings in a \"Refuted Claims\" appendix. Produce an actionable verdict: one of approve / approve-with-concerns / revise / reject. The review document must contain: YAML frontmatter (kind: design-review, lifecycle: proposed, generated_by: design-doc-review-ensemble, design_doc: <path>), Summary, Findings by Dimension, Contradictions Requiring Human Judgment (omit if none), Refuted Claims (omit if none), Verdict, and Actionable Next Steps. Return strict JSON only: {review_document: \"<full markdown>\", verdict: \"<verdict>\", finding_count: <N>, contradiction_count: <N>, refuted_count: <N>}. First byte {, final byte }.",
+      "on_exit": [
+        {
+          "op": "parse_json",
+          "args": {
+            "from": "${SynthesizeReview.output}",
+            "repair_missing_closing_delimiters": true
+          },
+          "into_var": "review_json",
+          "on_failure": "halt"
+        }
+      ],
+      "next": {
+        "type": "goto",
+        "to": "WriteReview"
+      }
+    },
+    "WriteReview": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "work_bash",
+            "arguments": {
+              "command": "mkdir -p \"${vars.project_dir}/design/review\"",
+              "cwd": "${vars.project_dir}"
+            },
+            "timeout_secs": 10
+          },
+          "on_failure": "warn"
+        },
+        {
+          "op": "mcp_call",
+          "args": {
+            "server": "blackbox",
+            "tool": "work_bash",
+            "arguments": {
+              "command": "cat > \"${vars.project_dir}/design/review/$(basename ${vars.design_doc_path} .md)-review.md\" << 'ENSEMBLE_REVIEW_EOF'\n${vars.review_json.review_document}\nENSEMBLE_REVIEW_EOF",
+              "cwd": "${vars.project_dir}"
+            },
+            "timeout_secs": 15
+          },
+          "into_var": "write_result",
+          "on_failure": "warn"
+        }
+      ],
+      "next": {
+        "type": "terminal"
+      }
+    },
+    "BoardInvalid": {
+      "actor": "",
+      "on_enter": [
+        {
+          "op": "mcp_call",
+          "args": {
+            "arguments": {
+              "agent_name": "facilitator",
+              "board_id": "${vars.whiteboard_id}",
+              "summary": "Board state invalid — insufficient participation. Halting review."
+            },
+            "server": "blackbox",
+            "timeout_secs": 30,
+            "tool": "whiteboard_summarize"
+          },
+          "on_failure": "warn"
+        }
+      ],
+      "next": {
+        "type": "terminal"
+      }
+    }
+  }
+}
