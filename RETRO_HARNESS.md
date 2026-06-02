@@ -1,44 +1,50 @@
 # Retro Harness
 
-This is a retrospective harness for the end of an agent session. Use it to turn the session's tool friction into Blackbox substrate feedback instead of letting it disappear into chat history.
+A retrospective pass for an agent session, focused on **the harness the agent ran inside** — the built-in tools, the injected context, the side-channel intern, and the turn machinery of `bro-harness`. Use it to turn harness friction into reusable Blackbox substrate feedback instead of letting it dissolve into chat history.
 
-## Prompt
+This is a manual, human-steered pass. When you finish a session in `bro fleet` where real tool-calling happened and the harness behavior is worth reflecting on, point the agent at this document and have it file gap notes. It is deliberately not wired into the dispatch pipeline — you invoke it with judgment, on the sessions that warrant it. (`bro_retro` is the separate automated path for completed dispatched tasks; this doc is the hand-driven counterpart for live TUI sessions.)
 
-Run this as a non-compelling retrospective: it asks for reflection, not for code changes.
+## What this reflects on
 
-> This is a retrospective. In this session, what tool gaps did you encounter? Which surfaces felt wrong, too narrow, too broad, or missing? What did you reach for that was not there? What manual workaround did you use instead?
+The subject is the harness, not the broader Blackbox daemon. Concretely:
+
+- **Built-in tools** — the harness's own tool surface: `shell_run` (in a fleet session it starts a harness-local promise — the blocking yield/`shell_poll` path is deliberately unavailable here), the promise lifecycle tools (`promise_status`/`promise_wait`/`promise_when_all`/`promise_when_any`/`promise_cancel`), file read/edit/write, the clipboard registers, the todo list, `web_search`, `report`. Was any of them too narrow, too broad, awkward to compose, or simply missing?
+- **Injected context** — the system-prompt overlay (AGENTS.md discovery), hook nudges (riders and system-tail messages), tail nudges, and tool-result bounding/spill. Did an injection fire at the wrong time, say the wrong thing, crowd the window, or fail to surface when it should have?
+- **The intern** — the side-channel classifier/advisor companion, when one was active. Did it help (caught an error, flagged a gap, suggested a better path) or was it noise (distracting, ill-timed, wrong model for the role, awkward format)?
+- **Turn machinery** — steering, interrupt, replay, compaction (automatic and `/compact`), and the MCP tool admission/deny surface. Did the loop behave when you steered or interrupted? Did compaction drop something it shouldn't have? Was the admitted tool set the right one?
+- **The promise model** — in a fleet session every `shell_run` is a harness-local promise: it starts immediately and its completion auto-injects a hidden `HARNESS_EVENT` wake turn instead of making you poll. Reflect on that shape: did the auto-wake fire at a good boundary, or cut in at a bad one? Did `promise_wait`/`promise_when_all`/`promise_when_any`/`promise_cancel` compose for the work you had? Did running-progress metadata (elapsed, last-output, byte counts) give enough signal that a quiet command was still healthy, or did you feel blind between start and wake?
+
+## The prompt
+
+Run this as a non-compelling retrospective — it asks for reflection on the harness, not for code changes.
+
+> This is a retrospective on the harness you just ran inside — its built-in tools, its injected context, the intern (if one was active), and its turn machinery. Where did the harness get in your way? What built-in tool was missing, too narrow, or awkward to compose? Did an injected nudge or system message fire at the wrong moment or say the wrong thing? If an intern was advising you, did it help or was it noise? Did steering, interrupt, or compaction misbehave? Every `shell_run` here is a promise that wakes you on completion instead of making you poll — did that auto-wake model fit the work, or did you fight it? What did you reach for that the harness did not give you, and what did you do instead?
 >
-> File real Blackbox substrate gaps and wishlist items as gap notes. Use the `blackbox.gap_note.v1` JSON envelope in `bbox_note(kind="followup")`, and dedupe first with `bbox_notes(kind="followup", query="blackbox.gap_note.v1", include_addressed=false)`.
+> File real harness or substrate gaps as gap notes using the `blackbox.gap_note.v1` JSON envelope via `bbox_note(kind="followup")`. Dedupe first with `bbox_notes(kind="followup", query="blackbox.gap_note.v1", include_addressed=false)`.
 
 ## What counts as a gap
 
-File a gap note when the missing capability is in the shared Blackbox substrate or agent workflow and agents in unrelated projects would plausibly hit it too.
+File a gap note when the missing or wrong-shaped capability is in the harness (or the shared substrate it exposes) and an agent in another session or project would plausibly hit it too.
 
 Good examples:
 
-- A tool primitive, refactor atom, or MCP surface was missing for a recurring task.
-- A surface existed but had the wrong shape for the role: too much authority, not enough authority, poor discoverability, or awkward composition.
-- A workflow shape was missing: fork, wait, cancel, resume, review, summarize, or close-out behavior had to be hand-rolled.
-- The corpus ontology could not represent a relationship you needed to cite or bundle.
-- A runbook, rendered instruction, or system memory was missing for a recurring agent decision.
-- An eval or packet surface could not express the case you needed to verify.
+- A built-in tool was missing for a recurring move, or had the wrong shape — too much output with no way to scope it, awkward to chain into the next call.
+- An injected nudge or system-tail message was mistimed, redundant, or wrong, and steered the agent off course.
+- Compaction dropped context that was still needed, or fired too late to help.
+- The intern's signal-to-noise was poor: wrong model for the role, interjections that broke flow, an awkward side-channel format.
+- The MCP admission surface hid a tool that was needed, or admitted noise the agent had to wade through.
+- Steering or interrupt did not behave as expected at a turn boundary.
 
-Do not file a gap note for ordinary product TODOs, one-off cleanup, or a user-stated standing rule. Standing rules belong in the durable knowledge lanes; task-local state belongs in threads or pins.
-
-## Existing automation
-
-If you are reflecting on a completed dispatched bro task and the `bro_retro` tool is available, prefer that primitive: it resumes the task's own provider session with a non-compelling retrospective prompt and lets the agent self-file gap notes when warranted.
-
-Use this document when you need a portable prompt, a review checklist, or a manual fallback outside that exact `bro_retro(task_id=...)` path.
+Do not file a gap note for ordinary product TODOs, one-off cleanup, or a user-stated standing rule. Standing rules belong in the durable knowledge lanes; task-local state belongs in threads or pins. Feedback that is purely about one intern instance (rather than a reusable capability) belongs in the summary, not a note.
 
 ## Process
 
-1. Review the session and list every moment where you thought, "I wish there were a tool/surface for this."
-2. Group similar moments by reusable capability, not by individual annoyance.
-3. For each candidate, ask: would this matter in another project or for another agent role?
+1. Walk the session and list every moment of "I wish the harness did X" or "why did the harness do Y."
+2. Group by reusable capability, not by individual annoyance.
+3. For each candidate, ask: would this bite another agent, in another session or project?
 4. Dedupe against open gap notes before filing.
-5. File each real substrate gap with a stable `dedupe_key`.
-6. Mention any candidates you intentionally did not file and why.
+5. File each real gap with a stable `dedupe_key`.
+6. Note any candidates you deliberately did not file, and why.
 
 ## Gap-note template
 
@@ -47,9 +53,9 @@ Use this document when you need a portable prompt, a review checklist, or a manu
   "type": "blackbox.gap_note.v1",
   "title": "Short human-readable gap title",
   "gap_kind": "tooling",
-  "domain": "retro-harness",
-  "wanted_capability": "Describe the reusable capability the agent wanted.",
-  "missing_primitive": "Optional concrete primitive or surface name.",
+  "domain": "harness/shell-tools",
+  "wanted_capability": "Describe the reusable harness/substrate capability the agent wanted.",
+  "missing_primitive": "Optional concrete tool, injection, or surface name.",
   "fallback_used": "What the agent did manually instead.",
   "impact": "medium",
   "blocking_level": "workaround_available",
@@ -57,13 +63,13 @@ Use this document when you need a portable prompt, a review checklist, or a manu
     "session retrospective",
     "file:RETRO_HARNESS.md"
   ],
-  "dedupe_key": "tooling/retro-harness/capability-slug",
+  "dedupe_key": "tooling/harness/capability-slug",
   "suggested_owner": "blackbox",
   "notes": "Any extra context useful for triage."
 }
 ```
 
-Advisory `gap_kind` values include `packet_ast`, `tooling`, `agent`, `workflow`, `refactor_primitive`, `mcp_surface`, `ontology`, `eval_coverage`, and `docs_runbook`.
+`gap_kind` names the *type of capability* that is missing, not the subsystem it lives in. Use one of the existing values — `tooling`, `agent`, `workflow`, `mcp_surface`, `docs_runbook`, `ontology`, `refactor_primitive`, `eval_coverage`, `packet_ast` — and do not coin new ones. There is deliberately **no `harness` kind**: the harness is a *domain*, not a capability type, so it goes in the `domain` field (`harness`, or a scoped `harness/<area>` such as `harness/shell-tools`, `harness/intern`, `harness/compaction`) while the kind stays the capability type. For a harness retro the common kinds are `tooling` (built-in tools), `agent` (the intern, or the harness's own loop behavior), `mcp_surface` (the admitted tool set), and `workflow` (steering / interrupt / compaction shape). Likewise, an aspirational "would be nice" item is not its own kind — file it under the matching capability kind with `blocking_level: "not_blocking"` and let `fallback_used` say what you did instead.
 
 ## Retrospective output shape
 
@@ -71,9 +77,10 @@ When you run this harness, return a short summary:
 
 - Gap notes filed: note ids plus titles.
 - Existing notes reused or referenced: note ids plus dedupe keys.
+- Intern assessment, when one was active: helped / noise / mixed, in one sentence.
 - Wishlist candidates not filed: one line each, with the reason.
 - Follow-up risk: anything likely to keep hurting agents if left untriaged.
 
 ## Tone
 
-Be concrete and operational. Prefer "I reached for X, found Y, and worked around it by Z" over broad complaints. The goal is not to criticize the current task; it is to preserve reusable substrate feedback for the next iteration of Blackbox.
+Be concrete and operational. Prefer "I reached for X, the harness gave me Y, I worked around it with Z" over broad complaints. The goal is not to criticize the task; it is to preserve reusable harness feedback for the next iteration of Blackbox.
