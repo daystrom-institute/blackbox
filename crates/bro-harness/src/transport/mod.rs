@@ -173,6 +173,12 @@ pub trait TurnSink: Send + Sync {
     fn stream_event(&self, event: Value);
 }
 
+/// Synthetic assistant text appended to repair role alternation after a turn is
+/// interrupted (see [`Transport::note_interrupted`]). Matches the
+/// `INTERRUPTED_TOOL_RESULT` marker the loop already uses for interrupted tool
+/// dispatches, so the buffer reads consistently.
+pub const INTERRUPT_ASSISTANT_MARKER: &str = "[Request interrupted by user]";
+
 #[async_trait]
 pub trait Transport: Send {
     /// Stable transport id (for logging / persistence tag).
@@ -199,6 +205,20 @@ pub trait Transport: Send {
     fn snapshot(&self) -> Value;
     /// Restore a previously snapshotted buffer.
     fn restore(&mut self, snapshot: Value);
+
+    /// Repair the replay buffer after a user turn was cancelled (interrupt)
+    /// before the assistant reply was committed.
+    ///
+    /// On cancel the turn future is dropped mid-`run_turn`, so the assistant
+    /// message is never appended — the buffer is left ending on a user-role
+    /// message (the prompt, or a tool_result block). The next turn's
+    /// `push_user_text` would then place two user messages in a row, which
+    /// strict role-alternation providers (Anthropic, OpenAI chat) reject with a
+    /// 400. Implementations append a synthetic assistant message recording the
+    /// interruption so alternation stays valid and the model sees that the prior
+    /// turn was cut short. Default: no-op (transports with no alternation
+    /// constraint).
+    fn note_interrupted(&mut self) {}
 
     /// Compact the conversation when the context window is filling: summarize
     /// the older prefix via a model call and replace it with a single synthetic

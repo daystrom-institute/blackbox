@@ -362,6 +362,20 @@ impl Transport for OpenAiChatTransport {
         }
     }
 
+    fn note_interrupted(&mut self) {
+        // A turn cancelled mid-stream leaves a trailing user message with no
+        // assistant reply; the next turn would then send two user messages in a
+        // row. Append a synthetic assistant turn to keep alternation valid. (A
+        // trailing `tool` message is left as-is — OpenAI accepts a user message
+        // after tool output.)
+        if self.messages.last().and_then(|m| m["role"].as_str()) == Some("user") {
+            self.messages.push(json!({
+                "role": "assistant",
+                "content": super::INTERRUPT_ASSISTANT_MARKER,
+            }));
+        }
+    }
+
     async fn compact(
         &mut self,
         keep_tail: usize,

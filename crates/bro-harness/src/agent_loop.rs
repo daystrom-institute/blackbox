@@ -242,6 +242,15 @@ async fn session_loop(
                 pending.push_front(p);
             }
         }
+        // Persist after every turn, not just at clean session exit. A bidi
+        // session is routinely killed (SIGTERM on fleet stop / cockpit close)
+        // before the end-of-`run_session` persist runs; without this, every
+        // completed turn is lost and a `--resume` finds no session file and
+        // starts cold. Per-turn persistence bounds the loss to at most the
+        // single in-flight turn.
+        if let Err(e) = session.persist() {
+            tracing::warn!("failed to persist session after turn: {e:#}");
+        }
         if stdin_closed && pending.is_empty() {
             break;
         }
@@ -663,6 +672,14 @@ impl Session {
             self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
             self.hooks.tick();
         };
+
+        // An interrupted turn (cancelled model call, or cancelled tool dispatch)
+        // leaves the buffer ending on a user-role message with no assistant
+        // reply. Repair alternation now so the next turn — a steer, or a
+        // `--resume` continuation — does not stack two user messages and 400.
+        if matches!(break_reason, "cancelled" | "interrupted_dispatch") {
+            self.tx.note_interrupted();
+        }
 
         let turn_end = self.turn_end_diagnostics(
             break_reason,

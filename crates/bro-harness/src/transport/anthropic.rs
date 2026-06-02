@@ -521,6 +521,20 @@ impl Transport for AnthropicTransport {
         }
     }
 
+    fn note_interrupted(&mut self) {
+        // A cancelled turn leaves the buffer ending on a user message — the just
+        // -pushed prompt, or a tool_result block (Anthropic carries tool results
+        // as `role: "user"`). Anthropic requires alternation, so append a
+        // synthetic assistant turn; otherwise the next `push_user_text` produces
+        // two consecutive user messages and the next request 400s.
+        if self.messages.last().and_then(|m| m["role"].as_str()) == Some("user") {
+            self.messages.push(json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": super::INTERRUPT_ASSISTANT_MARKER}],
+            }));
+        }
+    }
+
     async fn compact(
         &mut self,
         keep_tail: usize,
