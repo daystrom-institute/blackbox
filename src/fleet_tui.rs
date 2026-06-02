@@ -3538,6 +3538,19 @@ fn promise_many_block(
     out
 }
 
+/// Human-readable byte count: "128B", "4.2KB", "1.3MB".
+fn fmt_bytes(n: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    if n >= (MIB as u64) {
+        format!("{:.1}MB", n as f64 / MIB)
+    } else if n >= (KIB as u64) {
+        format!("{:.1}KB", n as f64 / KIB)
+    } else {
+        format!("{}B", n)
+    }
+}
+
 fn promise_snapshot_block(
     obj: &serde_json::Map<String, serde_json::Value>,
     is_error: bool,
@@ -3577,6 +3590,35 @@ fn promise_snapshot_block(
         out.push(Line::from(Span::styled(
             format!("next: {next_step}"),
             Style::default().fg(Color::Yellow),
+        )));
+    }
+    // Render progress metadata for running promises that have a heartbeat.
+    if let Some(progress) = obj.get("progress").and_then(|v| v.as_object()) {
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(elapsed) = progress.get("elapsed_ms").and_then(|v| v.as_u64()) {
+            parts.push(format!("elapsed={:.1}s", elapsed as f64 / 1000.0));
+        }
+        if let Some(last) = progress.get("last_output_elapsed_ms").and_then(|v| v.as_u64())
+            && last > 0
+        {
+            parts.push(format!("last_out={:.1}s ago", last as f64 / 1000.0));
+        }
+        let so = progress
+            .get("stdout_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let se = progress
+            .get("stderr_bytes")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        parts.push(format!(
+            "stdout={} stderr={}",
+            fmt_bytes(so),
+            fmt_bytes(se)
+        ));
+        out.push(Line::from(Span::styled(
+            format!("  {}", parts.join("  ")),
+            Style::default().fg(Color::DarkGray),
         )));
     }
     if let Some(error) = obj.get("error").and_then(|v| v.as_str())

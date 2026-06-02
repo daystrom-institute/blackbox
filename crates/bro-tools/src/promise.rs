@@ -7,6 +7,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
@@ -38,6 +39,77 @@ impl PromiseState {
     }
 }
 
+/// Progress tracking shared between a promise's producer (e.g. shell readers)
+/// and the promise snapshot so `promise_status`/`promise_list` can expose
+/// running-progress heartbeat metadata without polling the producer.
+#[derive(Debug)]
+pub struct PromiseProgress {
+    /// Timestamp (ms) of the last output write from the producer, or 0.
+    pub last_output_at_ms: AtomicU64,
+    /// Cumulative bytes written to stdout.
+    pub stdout_bytes: AtomicU64,
+    /// Cumulative bytes written to stderr.
+    pub stderr_bytes: AtomicU64,
+}
+
+impl PromiseProgress {
+    pub fn new() -> Self {
+        Self {
+            last_output_at_ms: AtomicU64::new(0),
+            stdout_bytes: AtomicU64::new(0),
+            stderr_bytes: AtomicU64::new(0),
+        }
+    }
+
+    pub fn heartbeat(&self, kind: StreamKind, n: usize) {
+        self.last_output_at_ms
+            .store(now_ms(), Ordering::Relaxed);
+        match kind {
+            StreamKind::Stdout => {
+                self.stdout_bytes
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
+            StreamKind::Stderr => {
+                self.stderr_bytes
+                    .fetch_add(n as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Build a json! snapshot of progress suitable for inclusion in a promise
+    /// status response. Returns None when no output has been written yet.
+    pub fn snapshot(&self, started_ms: u64) -> Value {
+        let now = now_ms();
+        let elapsed = now.saturating_sub(started_ms);
+        let last_at = self.last_output_at_ms.load(Ordering::Relaxed);
+        let last_elapsed = if last_at > 0 {
+            now.saturating_sub(last_at)
+        } else {
+            0
+        };
+        json!({
+            "elapsed_ms": elapsed,
+            "last_output_at_ms": last_at,
+            "last_output_elapsed_ms": last_elapsed,
+            "stdout_bytes": self.stdout_bytes.load(Ordering::Relaxed),
+            "stderr_bytes": self.stderr_bytes.load(Ordering::Relaxed),
+        })
+    }
+}
+
+impl Default for PromiseProgress {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Which output stream a reader belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Stdout,
+    Stderr,
+}
+
 struct PromiseEntry {
     producer: String,
     detail: Value,
@@ -48,6 +120,10 @@ struct PromiseEntry {
     settled_ms: Option<u64>,
     cancel_tx: watch::Sender<bool>,
     completion_event_delivered: bool,
+    /// Optional shared progress for producers (e.g. shell) to heartbeat into
+    /// while running, so `promise_status` can expose elapsed/last-output/byte-
+    /// count without polling the producer.
+    progress: Option<Arc<PromiseProgress>>,
 }
 
 /// Shared promise table for one harness run. It is intentionally not persisted:
@@ -77,7 +153,12 @@ impl PromiseStore {
         self.notify.clone()
     }
 
-    pub fn start(&mut self, producer: &str, detail: Value) -> (String, watch::Receiver<bool>) {
+    pub fn start(
+        &mut self,
+        producer: &str,
+        detail: Value,
+        progress: Option<Arc<PromiseProgress>>,
+    ) -> (String, watch::Receiver<bool>) {
         self.counter += 1;
         let id = format!("pr-{}", self.counter);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -93,6 +174,7 @@ impl PromiseStore {
                 settled_ms: None,
                 cancel_tx,
                 completion_event_delivered: false,
+                progress,
             },
         );
         (id, cancel_rx)
@@ -197,7 +279,7 @@ impl PromiseStore {
 }
 
 fn snapshot(id: &str, entry: &PromiseEntry) -> Value {
-    json!({
+    let mut obj = json!({
         "promise_id": id,
         "producer": entry.producer,
         "state": entry.state.as_str(),
@@ -208,7 +290,14 @@ fn snapshot(id: &str, entry: &PromiseEntry) -> Value {
         "completion_event_delivered": entry.completion_event_delivered,
         "result": entry.result,
         "error": entry.error,
-    })
+    });
+    if let Some(ref progress) = entry.progress {
+        let p = progress.snapshot(entry.started_ms);
+        if let Some(obj_map) = obj.as_object_mut() {
+            obj_map.insert("progress".to_string(), p);
+        }
+    }
+    obj
 }
 
 fn render_completion_event(id: &str, entry: &PromiseEntry) -> String {

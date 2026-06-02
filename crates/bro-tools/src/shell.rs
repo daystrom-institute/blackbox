@@ -15,6 +15,7 @@
 //! can't be serialized into the persisted `side` cell. Children are spawned
 //! `kill_on_drop`, so abandoned sessions die when the `ToolCx` drops.
 
+use crate::promise::{PromiseProgress, StreamKind};
 use crate::tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -92,6 +93,9 @@ struct ShellSession {
     command: String,
     /// When the session was spawned, for an elapsed readout in `shell_list`.
     started: Instant,
+    /// Shared progress for promise mode — the readers heartbeat into this so
+    /// `promise_status` can expose running-progress metadata.
+    progress: Option<Arc<PromiseProgress>>,
 }
 
 /// Session table hung off `ToolCx`. In-memory, single-`run()` lifetime.
@@ -243,7 +247,11 @@ fn settle_from_tool_result(cx: &ToolCx, promise_id: &str, result: ToolResult) {
     }
 }
 
-fn spawn_reader<R>(mut r: R, buf: Arc<Mutex<OutBuf>>) -> JoinHandle<()>
+fn spawn_reader<R>(
+    r: R,
+    buf: Arc<Mutex<OutBuf>>,
+    progress: Option<(StreamKind, Arc<PromiseProgress>)>,
+) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
 {
@@ -252,7 +260,12 @@ where
         loop {
             match r.read(&mut chunk).await {
                 Ok(0) | Err(_) => break,
-                Ok(n) => buf.lock().unwrap().push(&chunk[..n]),
+                Ok(n) => {
+                    buf.lock().unwrap().push(&chunk[..n]);
+                    if let Some((kind, ref p)) = progress {
+                        p.heartbeat(kind, n);
+                    }
+                }
             }
         }
     })
@@ -520,12 +533,21 @@ impl Tool for ShellRun {
 
         let stdout = Arc::new(Mutex::new(OutBuf::default()));
         let stderr = Arc::new(Mutex::new(OutBuf::default()));
+        let progress = Arc::new(PromiseProgress::new());
         let mut readers = Vec::new();
         if let Some(o) = child.stdout.take() {
-            readers.push(spawn_reader(o, stdout.clone()));
+            readers.push(spawn_reader(
+                o,
+                stdout.clone(),
+                Some((StreamKind::Stdout, progress.clone())),
+            ));
         }
         if let Some(e) = child.stderr.take() {
-            readers.push(spawn_reader(e, stderr.clone()));
+            readers.push(spawn_reader(
+                e,
+                stderr.clone(),
+                Some((StreamKind::Stderr, progress.clone())),
+            ));
         }
         // Ref ABI: resolve a stdin-feeding register before touching the child.
         let stdin_from_data = match &args.stdin_from {
@@ -564,6 +586,7 @@ impl Tool for ShellRun {
             kill_at,
             command: args.command.clone(),
             started: now,
+            progress: Some(progress.clone()),
         };
 
         if promise_mode {
@@ -572,7 +595,7 @@ impl Tool for ShellRun {
                 "cwd": cwd.to_string_lossy(),
                 "timeout_ms": args.timeout_ms,
             });
-            let (promise_id, cancel_rx) = cx.promises.lock().unwrap().start("shell_run", detail);
+            let (promise_id, cancel_rx) = cx.promises.lock().unwrap().start("shell_run", detail, Some(progress));
             let cx_bg = cx.clone();
             let promise_id_bg = promise_id.clone();
             let stdout_to = args.stdout_to.clone();

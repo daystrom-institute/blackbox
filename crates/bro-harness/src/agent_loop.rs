@@ -1535,7 +1535,7 @@ mod tests {
             .promises
             .lock()
             .unwrap()
-            .start("shell_run", json!({"command": "echo done"}));
+            .start("shell_run", json!({"command": "echo done"}), None);
         session
             .cx
             .promises
@@ -1565,7 +1565,7 @@ mod tests {
             .promises
             .lock()
             .unwrap()
-            .start("shell_run", json!({"command": "cargo test"}));
+            .start("shell_run", json!({"command": "cargo test"}), None);
 
         let trace = tool_result_trace(
             &transport::ToolCall {
