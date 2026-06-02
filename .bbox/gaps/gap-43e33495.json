@@ -1,0 +1,20 @@
+{
+  "id": "gap-43e33495",
+  "title": "No runbook for narrow live wire-shape probes of Anthropic-compatible providers (GLM/DeepSeek)",
+  "gap_kind": "docs_runbook",
+  "domain": "bro-harness/provider-validation",
+  "wanted_capability": "A documented procedure for safely curl-probing the Anthropic-compatible provider endpoints (GLM z.ai, DeepSeek) to validate bro-harness transport wire shapes — where credentials live, how to capture/parse the SSE stream, and token hygiene — so an agent validating Anthropic-transport changes doesn't rediscover the mechanics each time.",
+  "missing_primitive": "A runbook (or small helper) covering: creds at ~/.claude-{zai,ds}/settings.json under env.ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN (per brofile.rs default_claude_compatible_env); base URLs api.z.ai/api/anthropic and api.deepseek.com/anthropic; POST /v1/messages?beta=true with the anthropic-beta header; incremental SSE parse; and reading the token into a shell var without echoing it.",
+  "fallback_used": "Read brofile.rs to find credential locations + base URLs; hand-rolled curl + jq + python SSE parsing; sourced tokens into shell vars without printing them.",
+  "evidence": [
+    "file:src/orchestration/brofile.rs:512",
+    "interactive retrospective",
+    "file:RETRO_INTERACTIVE.md"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/bro-harness/live-provider-wire-probe",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T07:46:44Z",
+  "updated_at": "2026-06-02T07:46:44Z"
+}
