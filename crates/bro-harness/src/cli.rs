@@ -47,6 +47,12 @@ pub struct Cli {
     #[arg(long = "effort")]
     pub effort: Option<String>,
 
+    /// Service tier — the latency/priority lever. `priority` is codex's `/fast`;
+    /// `flex` and `default` are also accepted. Forwarded on the OpenAI Responses
+    /// body (`default` is dropped). Env fallback: `BRO_HARNESS_SERVICE_TIER`.
+    #[arg(long = "service-tier")]
+    pub service_tier: Option<String>,
+
     /// System prompt. Non-empty ⇒ explicit override used verbatim. Empty string
     /// ⇒ suppress (no system prompt). Absent ⇒ Codex-style AGENTS.md overlay
     /// discovery (global `$CODEX_HOME/AGENTS.md` + repo `AGENTS.md`, project

@@ -38,11 +38,28 @@ fn codex_home() -> PathBuf {
 /// Load auth, refreshing the access token if near expiry, and return the
 /// (possibly refreshed) access token + account id.
 pub async fn load_fresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
+    with_auth_lock(|auth_path| load_and_maybe_refresh(http, auth_path, /*force*/ false)).await
+}
+
+/// Force a token refresh regardless of expiry skew, and return the rotated
+/// credentials. Called by the transport after a `401` so a token the proactive
+/// skew check thought was still valid (clock skew, server-side revocation) can
+/// recover in-band instead of failing the turn. Mirrors codex's
+/// `UnauthorizedRecovery` reload→refresh step.
+pub async fn force_refresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
+    with_auth_lock(|auth_path| load_and_maybe_refresh(http, auth_path, /*force*/ true)).await
+}
+
+/// Run `f` under an exclusive advisory lock on the auth.json sidecar so
+/// concurrent harness/codex refreshes serialize without contending on the file
+/// we rewrite.
+async fn with_auth_lock<F, Fut>(f: F) -> Result<ChatGptAuth>
+where
+    F: FnOnce(std::path::PathBuf) -> Fut,
+    Fut: std::future::Future<Output = Result<ChatGptAuth>>,
+{
     let dir = codex_home();
     let auth_path = dir.join("auth.json");
-
-    // Advisory lock on a sidecar so concurrent harness/codex refreshes
-    // serialize without contending on the file we rewrite.
     let lock_path = dir.join("auth.json.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -51,30 +68,29 @@ pub async fn load_fresh(http: &reqwest::Client) -> Result<ChatGptAuth> {
         .open(&lock_path)
         .with_context(|| format!("open lock {}", lock_path.display()))?;
     lock.lock_exclusive().context("acquire auth lock")?;
-
-    let result = load_and_maybe_refresh(http, &auth_path).await;
+    let result = f(auth_path.clone()).await;
     let _ = FileExt::unlock(&lock);
     result
 }
 
 async fn load_and_maybe_refresh(
     http: &reqwest::Client,
-    auth_path: &std::path::Path,
+    auth_path: std::path::PathBuf,
+    force: bool,
 ) -> Result<ChatGptAuth> {
-    let body = std::fs::read_to_string(auth_path)
+    let body = std::fs::read_to_string(&auth_path)
         .with_context(|| format!("read {}", auth_path.display()))?;
     let mut v: Value = serde_json::from_str(&body).context("parse auth.json")?;
 
-    let account_id = v["tokens"]["account_id"]
-        .as_str()
-        .context("auth.json missing tokens.account_id")?
-        .to_string();
+    let account_id = account_id_from(&v).context(
+        "auth.json missing tokens.account_id and id_token carried no chatgpt_account_id claim",
+    )?;
     let access_token = v["tokens"]["access_token"]
         .as_str()
         .context("auth.json missing tokens.access_token")?
         .to_string();
 
-    if !needs_refresh(&access_token) {
+    if !force && !needs_refresh(&access_token) {
         return Ok(ChatGptAuth {
             access_token,
             account_id,
@@ -86,10 +102,10 @@ async fn load_and_maybe_refresh(
         .context("token near expiry but auth.json has no refresh_token")?
         .to_string();
 
-    tracing::info!("codex access token near expiry; refreshing");
+    tracing::info!(force, "refreshing codex access token");
     let refreshed = refresh(http, &refresh_token).await?;
     merge_refresh(&mut v, &refreshed);
-    write_back(auth_path, &v)?;
+    write_back(&auth_path, &v)?;
 
     let access_token = v["tokens"]["access_token"]
         .as_str()
@@ -122,10 +138,30 @@ fn needs_refresh(access_token: &str) -> bool {
 
 /// Decode a JWT's `exp` claim without verifying the signature.
 fn jwt_exp(token: &str) -> Option<i64> {
+    decode_jwt_claims(token)?["exp"].as_i64()
+}
+
+/// Decode a JWT's payload claims without verifying the signature.
+fn decode_jwt_claims(token: &str) -> Option<Value> {
     let payload = token.split('.').nth(1)?;
     let bytes = URL_SAFE_NO_PAD.decode(payload).ok()?;
-    let claims: Value = serde_json::from_slice(&bytes).ok()?;
-    claims["exp"].as_i64()
+    serde_json::from_slice(&bytes).ok()
+}
+
+/// Resolve the ChatGPT account id: prefer the explicit `tokens.account_id`
+/// field, else decode it from the `id_token` JWT's
+/// `https://api.openai.com/auth.chatgpt_account_id` claim — the same fallback
+/// codex uses (`login/src/token_data.rs`), so a stripped/older auth.json that
+/// omits the bare field still resolves.
+fn account_id_from(v: &Value) -> Option<String> {
+    if let Some(id) = v["tokens"]["account_id"].as_str() {
+        return Some(id.to_string());
+    }
+    let id_token = v["tokens"]["id_token"].as_str()?;
+    let claims = decode_jwt_claims(id_token)?;
+    claims["https://api.openai.com/auth"]["chatgpt_account_id"]
+        .as_str()
+        .map(str::to_string)
 }
 
 #[derive(Debug)]
@@ -212,6 +248,23 @@ mod tests {
         let token = format!("h.{payload}.sig");
         assert_eq!(jwt_exp(&token), Some(9999999999));
         assert_eq!(jwt_exp("not-a-jwt"), None);
+    }
+
+    #[test]
+    fn account_id_prefers_field_then_falls_back_to_id_token() {
+        // Explicit field wins.
+        let v = json!({"tokens": {"account_id": "acct-field"}});
+        assert_eq!(account_id_from(&v).as_deref(), Some("acct-field"));
+
+        // No field → decode from id_token's chatgpt_account_id claim.
+        let claims = URL_SAFE_NO_PAD
+            .encode(br#"{"https://api.openai.com/auth":{"chatgpt_account_id":"acct-jwt"}}"#);
+        let id_token = format!("h.{claims}.sig");
+        let v = json!({"tokens": {"id_token": id_token}});
+        assert_eq!(account_id_from(&v).as_deref(), Some("acct-jwt"));
+
+        // Neither → None.
+        assert_eq!(account_id_from(&json!({"tokens": {}})), None);
     }
 
     #[test]

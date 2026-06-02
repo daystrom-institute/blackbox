@@ -146,6 +146,10 @@ impl SystemPrompt {
 /// Per-turn knobs. `web_search` requests the transport's *server-side* search
 /// tool when it has one (Anthropic `web_search_20250305`, Responses
 /// `web_search`); transports without one ignore it.
+///
+/// `service_tier` is the latency/priority lever — codex's `/fast` maps to
+/// `service_tier:"priority"` on the Responses body. When `Some` and not the
+/// literal `"default"`, the OpenAI transports forward it; others ignore it.
 #[derive(Debug, Clone)]
 pub struct TurnOpts {
     pub model: String,
@@ -153,6 +157,7 @@ pub struct TurnOpts {
     pub system: SystemPrompt,
     pub effort: Option<String>,
     pub web_search: bool,
+    pub service_tier: Option<String>,
 }
 
 /// Sink for incremental, in-turn streaming events.
@@ -183,6 +188,12 @@ pub const INTERRUPT_ASSISTANT_MARKER: &str = "[Request interrupted by user]";
 pub trait Transport: Send {
     /// Stable transport id (for logging / persistence tag).
     fn name(&self) -> &'static str;
+
+    /// Set the stable per-session id, used to populate the codex-style
+    /// `session-id` request header and the `prompt_cache_key`. Called once after
+    /// construction with the harness session id. Default: no-op (transports that
+    /// don't carry a session identity on the wire).
+    fn set_session_id(&mut self, _id: String) {}
 
     /// Append the user's turn to the (transport-native) conversation.
     fn push_user_text(&mut self, text: &str);

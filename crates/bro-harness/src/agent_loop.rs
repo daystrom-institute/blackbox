@@ -327,6 +327,10 @@ impl Session {
         let mut tx = transport::build_transport(kind).await?;
 
         let store = SessionStore::open(cli.session_id.as_deref(), cli.resume.as_deref())?;
+        // Hand the transport the stable session id, so it can populate the
+        // codex-style `session-id` header + `prompt_cache_key` (vs a random
+        // per-request id).
+        tx.set_session_id(store.id.clone());
         let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
         // Loop-level side cells restored from a prior turn. Each cell
         // deserializes its own slot tolerantly (absent/garbage → empty).
@@ -403,6 +407,10 @@ impl Session {
             system: SystemPrompt::default(),
             effort: cli.effort.clone(),
             web_search,
+            service_tier: cli
+                .service_tier
+                .clone()
+                .or_else(|| std::env::var("BRO_HARNESS_SERVICE_TIER").ok()),
         };
 
         let emitter = Emitter::new(store.id.clone());
@@ -1373,6 +1381,7 @@ mod tests {
                 system: SystemPrompt::default(),
                 effort: None,
                 web_search: false,
+                service_tier: None,
             },
             system: None,
             max_turns: 50,

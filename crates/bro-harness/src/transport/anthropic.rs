@@ -632,6 +632,7 @@ mod tests {
             system,
             effort: None,
             web_search: false,
+            service_tier: None,
         }
     }
 

@@ -51,7 +51,18 @@ out explicitly under `Changed` or `Removed`.
   `codex` CLI path is unchanged. Includes ChatGPT-OAuth token refresh,
   HTTP retry/backoff/timeout, client-side deferred tooling with a pinned-tier
   carve-out (`tool_search`), and client-side allow/deny recursion-guard
-  enforcement.
+  enforcement. The OpenAI Responses transport tracks the modern codex CLI wire
+  contract (verified live against the ChatGPT backend): a stable `session-id` +
+  per-turn `thread-id` (no random-per-request id), the defunct
+  `OpenAI-Beta: responses=experimental` dropped, a stable `prompt_cache_key`,
+  `service_tier` as the `/fast`→`priority` latency lever (`--service-tier` /
+  `BRO_HARNESS_SERVICE_TIER`), reasoning continuity via
+  `include:["reasoning.encrypted_content"]` with encrypted reasoning items
+  replayed across turns, model-gated reasoning effort (`minimal`…`xhigh`) plus
+  `reasoning.summary`, an SSE per-event idle timeout
+  (`BRO_HARNESS_STREAM_IDLE_SECS`), stream/HTTP error-code classification, and a
+  one-shot `401`→token-refresh→retry. See
+  `design/bro-harness/brodex-responses-deep-dive.md`.
 - bro-harness built-in tool surface (`crates/bro-tools`): file read (line-range
   + token cap + optional line numbers), content search (content/files/count
   modes, context lines, case-insensitive), glob (mtime/name sort + result cap),
