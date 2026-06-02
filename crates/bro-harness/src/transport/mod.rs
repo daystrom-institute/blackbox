@@ -64,6 +64,28 @@ impl Usage {
     }
 }
 
+/// A transport error meaning the request was rejected because the conversation
+/// exceeds the model's context window (OpenAI `context_window_exceeded` /
+/// `context_length_exceeded`). Carried as an `anyhow` cause so the agent loop
+/// can recover — compact the buffer and retry — instead of failing the turn.
+/// Mirrors codex's `context_length_exceeded → drives compaction` behaviour
+/// (see design/bro-harness/brodex-responses-deep-dive.md, Axis 5).
+#[derive(Debug)]
+pub(crate) struct ContextWindowExceeded(pub String);
+
+impl std::fmt::Display for ContextWindowExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for ContextWindowExceeded {}
+
+/// True when `err` or any cause in its chain is a [`ContextWindowExceeded`].
+pub(crate) fn is_context_window_exceeded(err: &anyhow::Error) -> bool {
+    err.chain().any(|c| c.is::<ContextWindowExceeded>())
+}
+
 /// A client tool the model asked us to run. `id` is the transport-native
 /// correlation id (Anthropic `tool_use.id`, OpenAI `tool_call.id` /
 /// Responses `call_id`) and must round-trip back in the result.

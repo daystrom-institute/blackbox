@@ -325,6 +325,18 @@ pub(super) fn parse_sse(input: &mut Vec<Value>, sse: &str) -> Result<TurnOutput>
                     .as_str()
                     .or_else(|| ev["message"].as_str())
                     .unwrap_or(data);
+                // A context-window rejection is recoverable: surface a typed
+                // cause so the agent loop can compact + retry rather than fail
+                // the turn. Flows through both the HTTP path and the WS path
+                // (WsOutcome::Api), since both classify via this parser.
+                if matches!(
+                    code,
+                    "context_length_exceeded" | "context_window_exceeded"
+                ) {
+                    return Err(anyhow::Error::new(super::ContextWindowExceeded(
+                        classify_stream_error(code, message),
+                    )));
+                }
                 anyhow::bail!(classify_stream_error(code, message));
             }
             _ => {}
@@ -763,5 +775,31 @@ mod tests {
         );
         assert!(classify_stream_error("server_is_overloaded", "busy").contains("overloaded"));
         assert!(classify_stream_error("", "boom").contains("boom"));
+    }
+
+    #[test]
+    fn parse_sse_context_window_error_is_typed_recoverable() {
+        // A context-window rejection must surface as the typed, recoverable
+        // ContextWindowExceeded cause so the agent loop can compact + retry.
+        let sse = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_window_exceeded\",\"message\":\"too big\"}}}\n";
+        let err = match state().parse_sse(sse) {
+            Ok(_) => panic!("must error on response.failed"),
+            Err(e) => e,
+        };
+        assert!(
+            crate::transport::is_context_window_exceeded(&err),
+            "context_window_exceeded should be the typed recoverable error, got: {err:#}"
+        );
+
+        // Any other failure code stays a plain (non-recoverable) error.
+        let other = "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"busy\"}}}\n";
+        let err = match state().parse_sse(other) {
+            Ok(_) => panic!("must error on response.failed"),
+            Err(e) => e,
+        };
+        assert!(
+            !crate::transport::is_context_window_exceeded(&err),
+            "overload must not be classified as context-window: {err:#}"
+        );
     }
 }

@@ -509,7 +509,7 @@ impl Session {
         let mut last_model_tool_call_count = 0usize;
         let mut last_tool_results: Vec<Value> = Vec::new();
 
-        let break_reason = loop {
+        let break_reason = 'turn: loop {
             if turn_steps >= self.max_turns {
                 tracing::warn!(max_turns = self.max_turns, "hit max turns; stopping");
                 break "max_turns";
@@ -562,12 +562,58 @@ impl Session {
                 ..self.base_opts.clone()
             };
 
-            let out = tokio::select! {
-                biased;
-                _ = cancel.changed() => {
-                    break "cancelled";
+            // Run the model call, recovering once from a context-window
+            // rejection by compacting and retrying. This is the reactive safety
+            // net for the case the proactive threshold check above misses: a
+            // single step (e.g. a large tool result) jumping over the window in
+            // one shot. Without it, the typed `ContextWindowExceeded` would fail
+            // the whole turn instead of self-healing.
+            let mut overflow_compacted = false;
+            let out = 'attempt: loop {
+                let r = tokio::select! {
+                    biased;
+                    _ = cancel.changed() => {
+                        break 'turn "cancelled";
+                    }
+                    r = self.tx.run_turn(&tool_specs, &opts, &self.emitter) => r,
+                };
+                match r {
+                    Ok(out) => break 'attempt out,
+                    Err(e)
+                        if !overflow_compacted
+                            && crate::transport::is_context_window_exceeded(&e) =>
+                    {
+                        overflow_compacted = true;
+                        tracing::warn!(
+                            "context window exceeded mid-turn; compacting and retrying"
+                        );
+                        match self
+                            .tx
+                            .compact(
+                                self.compaction.keep_tail(),
+                                crate::compaction::COMPACTION_INSTRUCTION,
+                                &self.base_opts,
+                            )
+                            .await
+                        {
+                            Ok(Some(summary)) => self.emitter.compact_boundary(
+                                "overflow",
+                                self.last_prompt_tokens,
+                                summary.len(),
+                            ),
+                            // Nothing compactible, or compaction itself failed:
+                            // a retry would just re-overflow — surface the
+                            // original error.
+                            Ok(None) => return Err(e),
+                            Err(ce) => {
+                                tracing::warn!("overflow compaction failed: {ce:#}");
+                                return Err(e);
+                            }
+                        }
+                        // Loop to retry run_turn against the compacted buffer.
+                    }
+                    Err(e) => return Err(e),
                 }
-                r = self.tx.run_turn(&tool_specs, &opts, &self.emitter) => r?,
             };
             turn_steps += 1;
             self.turns += 1;
