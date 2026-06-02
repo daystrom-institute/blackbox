@@ -339,12 +339,18 @@ mod tests {
 
     #[test]
     fn test_mixed_items_one_accepted_one_refused() {
-        let source_path = Path::new("test_source.rs");
-        let target_path = Path::new("test_target.rs");
+        // Per-test tempdir (canonicalized) — never write fixtures into the cwd
+        // / crate root, which races parallel tests that walk the source tree
+        // (e.g. rust_public_api::analyze_public_api reads every .rs under
+        // CARGO_MANIFEST_DIR and would hit these transient files mid-flight).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let source_path = root.join("test_source.rs");
+        let target_path = root.join("test_target.rs");
 
         // Create test files
         fs::write(
-            source_path,
+            &source_path,
             r#"
 impl MyStruct {
     pub fn pure_method(&self) -> String {
@@ -359,7 +365,7 @@ impl MyStruct {
         )
         .unwrap();
 
-        fs::write(target_path, "").unwrap();
+        fs::write(&target_path, "").unwrap();
 
         let params = RefactorPlanParams {
             kind: "lift_rust_inherent_to_free".to_string(),
@@ -401,10 +407,8 @@ impl MyStruct {
         };
 
         let result = plan_lift_to_free(&params);
-
-        // Clean up test files
-        fs::remove_file(source_path).unwrap();
-        fs::remove_file(target_path).unwrap();
+        // tempdir auto-removes on drop — no manual cleanup, and nothing is left
+        // in the crate root for parallel source-tree walkers to trip over.
 
         assert!(result.is_ok());
         let plan_json = result.unwrap();
