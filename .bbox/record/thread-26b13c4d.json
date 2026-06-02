@@ -1,0 +1,11 @@
+{
+  "id": "thread-26b13c4d",
+  "topic": "workflow arc: phase-decompose-discovery (v9)",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Cleaned up workflow-origin scaffolding thread after operator requested workflow thread cleanup; no sessions were attached in the continuity scan."
+  ],
+  "created_at": "2026-05-31T01:40:25Z",
+  "resolved_at": "2026-06-02T21:27:36Z"
+}

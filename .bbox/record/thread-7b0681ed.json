@@ -1,0 +1,11 @@
+{
+  "id": "thread-7b0681ed",
+  "topic": "workflow arc: arch-pathology-rust-atom-child (v1)",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Cleaned up workflow-origin scaffolding thread after operator requested workflow thread cleanup; no sessions were attached in the continuity scan."
+  ],
+  "created_at": "2026-06-01T06:11:42Z",
+  "resolved_at": "2026-06-02T21:27:20Z"
+}

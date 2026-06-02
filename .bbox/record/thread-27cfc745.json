@@ -1,0 +1,13 @@
+{
+  "id": "thread-27cfc745",
+  "topic": "Brodex harness/tooling smoothness",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Capture and fix rough edges observed while Brodex executed the grounding/update/design-summary flow: absolute instruction-doc read ergonomics, huge orientation/tool outputs, shell workaround/dump discoverability, structured git state, and right-sized evidence/grounding for docs-only questions.",
+    "Operator added TODOs for the Brodex smoothness package: make the TodoWrite/todo_write list visible in the Fleet/Brodex UI; hide report() tool-call chrome because the report message is already visible in transcript view; reconsider @ containment as harness-side preloading rather than an LLM-followed carveout, including recursive @ mention expansion where @AGENTS.md can cite @PROJECT.md and the merged instruction text is handed directly to the harness.",
+    "Recent commit grounding shows this smoothness thread is no longer the right active continuity item. Landed coverage includes: Codex-style AGENTS overlay and recursive @ instruction-doc expansion (4193752); @/absolute instruction-doc and harness dump read carveouts plus smart_read large-file outlining (4193752); compact bbox_describe_schema default and targeted graph/evidence tool guidance (4193752); Fleet todo_write parsing + visible todo panel and internal-tool hiding for report/todo_write (4193752); completed-todo cleanup nudge (4e261cb); worktree/git status grounding in Fleet dispatch (4193752); harness dump spill/readability machinery present in bro-harness/bro-tools. Remaining Brodex work is now better tracked by narrower follow-on design docs/gaps (e.g. compaction/API robustness and agent-loop learnings) rather than this broad rough-edge thread."
+  ],
+  "created_at": "2026-05-31T20:02:17Z",
+  "resolved_at": "2026-06-02T21:29:33Z"
+}

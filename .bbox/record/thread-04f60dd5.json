@@ -1,0 +1,11 @@
+{
+  "id": "thread-04f60dd5",
+  "topic": "workflow arc: phase-decompose-scout-child (v1)",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Cleaned up workflow-origin scaffolding thread after operator requested workflow thread cleanup; no sessions were attached in the continuity scan."
+  ],
+  "created_at": "2026-05-31T01:40:26Z",
+  "resolved_at": "2026-06-02T21:27:35Z"
+}

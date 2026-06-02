@@ -1,0 +1,11 @@
+{
+  "id": "thread-4e0ff785",
+  "topic": "workflow arc: supervision-classifier (v1)",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Cleaned up workflow-origin scaffolding thread after operator requested workflow thread cleanup; no sessions were attached in the continuity scan."
+  ],
+  "created_at": "2026-06-01T07:34:14Z",
+  "resolved_at": "2026-06-02T21:27:17Z"
+}

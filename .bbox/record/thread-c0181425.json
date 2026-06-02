@@ -1,0 +1,11 @@
+{
+  "id": "thread-c0181425",
+  "topic": "workflow arc: arch-pathology-rust (v2)",
+  "status": "resolved",
+  "kind": "work_item",
+  "notes": [
+    "Cleaned up workflow-origin scaffolding thread after operator requested workflow thread cleanup; no sessions were attached in the continuity scan."
+  ],
+  "created_at": "2026-06-01T06:04:01Z",
+  "resolved_at": "2026-06-02T21:27:22Z"
+}
