@@ -56,6 +56,12 @@ pub struct HybridSearchParams {
 #[derive(Debug, Clone, Serialize)]
 pub(crate) struct HybridSearchResponse {
     pub(crate) text: String,
+    /// Response breadcrumbs: the next tools in the locate-information funnel,
+    /// carrying the actual top-seed refs. Mirrors inspect_entity's
+    /// `recommended_next_hops` — injected at the decision point so the agent is
+    /// pulled through discover → inspect → (paths) → bundle rather than
+    /// recalling the opening sequence from memory.
+    pub(crate) next_steps: Vec<String>,
     pub(crate) results: Vec<HybridResult>,
     pub(crate) vector_status: HybridVectorStatus,
     pub(crate) degraded: HybridDegraded,
@@ -279,13 +285,44 @@ pub(crate) fn hybrid_search_typed(
         result.rank = idx + 1;
     }
 
-    let text = render_text(query, &results, &vector_status, &degraded);
+    let next_steps = build_next_steps(&results);
+    let text = render_text(query, &results, &next_steps, &vector_status, &degraded);
     Ok(HybridSearchResponse {
         text,
+        next_steps,
         results,
         vector_status,
         degraded,
     })
+}
+
+/// Build response breadcrumbs naming the top-seed ref(s) and the next tools in
+/// the funnel. Carries the exact refs so the agent can paste them onward
+/// (Daystrom's "Type:Id for direct use in other tools" principle).
+fn build_next_steps(results: &[HybridResult]) -> Vec<String> {
+    if results.is_empty() {
+        return vec![
+            "No seeds. Broaden the query, drop the doc_type filter, or raise vector_weight toward 1.0 for paraphrase recall.".to_string(),
+        ];
+    }
+    let top = &results[0].entity_id;
+    let bundle_refs = results
+        .iter()
+        .take(3)
+        .map(|r| format!("\"{}\"", r.entity_id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    vec![
+        format!(
+            "Confirm the top seed: bbox_inspect_entity(entity_ref=\"{top}\") — properties + targeted edges in one call."
+        ),
+        format!(
+            "Multi-hop question? bbox_find_paths(from=\"{top}\", to_type=<target>), then pass the path_ids onward."
+        ),
+        format!(
+            "Package the answer: bbox_bundle_evidence(question=<q>, entity_refs=[{bundle_refs}])."
+        ),
+    ]
 }
 
 /// Aggregates per-chunk BM25 scores up to per-file scores and returns a
@@ -735,6 +772,7 @@ fn label_for_entity(
 fn render_text(
     query: &str,
     results: &[HybridResult],
+    next_steps: &[String],
     vector_status: &HybridVectorStatus,
     degraded: &HybridDegraded,
 ) -> String {
@@ -751,6 +789,12 @@ fn render_text(
             if let Some(excerpt) = &result.excerpt {
                 out.push_str(&format!("   > {}\n", excerpt.replace('\n', " ")));
             }
+        }
+    }
+    if !next_steps.is_empty() {
+        out.push_str("\nNext steps:\n");
+        for step in next_steps {
+            out.push_str(&format!("  → {step}\n"));
         }
     }
     out.push_str(&format!(
@@ -805,25 +849,74 @@ mod tests {
 
     #[test]
     fn response_shape_includes_vector_status() {
+        let results = [HybridResult {
+            rank: 1,
+            entity_id: "knowledge:a".into(),
+            score: 0.1,
+            base_score: 0.1,
+            label: "A".into(),
+            doc_type: Some("knowledge".into()),
+            chunk_kind: None,
+            role: None,
+            sources: BTreeMap::new(),
+            excerpt: None,
+        }];
+        let next_steps = build_next_steps(&results);
         let text = render_text(
             "fixture",
-            &[HybridResult {
-                rank: 1,
-                entity_id: "knowledge:a".into(),
-                score: 0.1,
-                base_score: 0.1,
-                label: "A".into(),
-                doc_type: Some("knowledge".into()),
-                chunk_kind: None,
-                role: None,
-                sources: BTreeMap::new(),
-                excerpt: None,
-            }],
+            &results,
+            &next_steps,
             &HybridVectorStatus::default(),
             &HybridDegraded::default(),
         );
         assert!(text.contains("Hybrid search: fixture"));
         assert!(text.contains("Vector status"));
+        // Breadcrumb names the top seed ref and points into the funnel.
+        assert!(text.contains("Next steps:"), "render should append breadcrumbs: {text}");
+        assert!(
+            text.contains("bbox_inspect_entity(entity_ref=\"knowledge:a\")"),
+            "breadcrumb should carry the top seed ref: {text}"
+        );
+    }
+
+    #[test]
+    fn next_steps_handle_empty_and_carry_refs() {
+        assert!(
+            build_next_steps(&[])[0].contains("No seeds"),
+            "empty results should yield a broaden-the-query hint"
+        );
+
+        let results = [
+            HybridResult {
+                rank: 1,
+                entity_id: "knowledge:top".into(),
+                score: 0.9,
+                base_score: 0.9,
+                label: "top".into(),
+                doc_type: Some("knowledge".into()),
+                chunk_kind: None,
+                role: None,
+                sources: BTreeMap::new(),
+                excerpt: None,
+            },
+            HybridResult {
+                rank: 2,
+                entity_id: "thread:abc".into(),
+                score: 0.5,
+                base_score: 0.5,
+                label: "t".into(),
+                doc_type: Some("thread".into()),
+                chunk_kind: None,
+                role: None,
+                sources: BTreeMap::new(),
+                excerpt: None,
+            },
+        ];
+        let steps = build_next_steps(&results);
+        assert!(steps.iter().any(|s| s.contains("bbox_inspect_entity(entity_ref=\"knowledge:top\")")));
+        assert!(steps.iter().any(|s| s.contains("bbox_find_paths(from=\"knowledge:top\"")));
+        // Bundle step lists the top refs for direct paste.
+        assert!(steps.iter().any(|s| s.contains("\"knowledge:top\", \"thread:abc\"")));
     }
 
     #[test]
