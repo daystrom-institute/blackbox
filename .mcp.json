@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "tmux": {
-      "command": "/home/invidious/repos/tmux-mcp/target/release/tmux-mcp-rs",
-      "args": ["--shell-type", "zsh"]
-    }
-  }
-}
