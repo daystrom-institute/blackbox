@@ -3,8 +3,8 @@ use rmcp::schemars;
 use serde::{Deserialize, Serialize};
 
 use crate::artifacts;
-use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use crate::gaps::{GapImpact, GapNote, GapResolution, GapStore};
+use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
 use crate::notes::{Note, NoteKind, NoteResolution, Notes};
 use crate::orchestration::{TaskStatus, TaskStore};
 use crate::threads::{Thread, ThreadStatus, Threads};
@@ -826,6 +826,7 @@ mod tests {
             superseded_by: None,
             resolution,
             project: project.map(ToOwned::to_owned),
+            write_dir: None,
             task_id: None,
             session_id: None,
             provider: None,

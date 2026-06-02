@@ -10,17 +10,24 @@ pub(crate) fn router() -> ToolRouter<BlackboxServer> {
 }
 
 impl BlackboxServer {
-    /// Resolve a raw project path/id to its canonical form. Registered projects
-    /// resolve through the registry (so the path matches `project_roots` and
-    /// routes the gap into the repo); unregistered paths fall back to
-    /// filesystem canonicalization, then the raw string.
-    fn resolve_gap_project(&self, raw: &str) -> String {
-        if let Ok(Some(record)) = self.state.projects.read().resolve(raw) {
-            return record.canonical_path;
+    /// Resolve a raw project path/id to its durable gap scope and optional
+    /// committed-file write target. Managed fleet worktrees key to the
+    /// registered base but write repo-owned files into the worktree so the
+    /// branch carries the gap. Other registered projects resolve through the
+    /// registry; unregistered paths fall back to filesystem canonicalization.
+    fn resolve_gap_project(&self, raw: &str) -> (String, Option<String>) {
+        if let Some((base, worktree)) =
+            crate::projects::fleet_worktree_scope_and_dir(raw, &self.state.projects.read().list())
+        {
+            return (base, Some(worktree));
         }
-        std::fs::canonicalize(raw)
+        if let Ok(Some(record)) = self.state.projects.read().resolve(raw) {
+            return (record.canonical_path, None);
+        }
+        let project = std::fs::canonicalize(raw)
             .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| raw.to_string())
+            .unwrap_or_else(|_| raw.to_string());
+        (project, None)
     }
 }
 
@@ -33,7 +40,9 @@ impl BlackboxServer {
     pub(crate) fn bbox_gap(&self, Parameters(mut p): Parameters<GapFileParams>) -> CallToolResult {
         Self::run("bbox_gap", || {
             if let Some(raw) = p.project.clone().filter(|s| !s.trim().is_empty()) {
-                p.project = Some(self.resolve_gap_project(&raw));
+                let (project, write_dir) = self.resolve_gap_project(&raw);
+                p.project = Some(project);
+                p.write_dir = write_dir;
             }
             let (id, created) = self.state.gaps.write().file(&p)?;
             if created {
@@ -51,7 +60,23 @@ impl BlackboxServer {
         description = "List / filter substrate gap notes by typed fields (gap_kind, impact, blocking_level, dedupe_key, resolution, project)."
     )]
     pub(crate) fn bbox_gaps(&self, Parameters(p): Parameters<GapListParams>) -> CallToolResult {
-        Self::run("bbox_gaps", || self.state.gaps.read().list_rendered(&p))
+        Self::run("bbox_gaps", || {
+            let normalized = p.project.as_deref().and_then(|proj| {
+                crate::projects::fleet_worktree_scope_and_dir(
+                    proj,
+                    &self.state.projects.read().list(),
+                )
+                .map(|(base, _worktree)| base)
+            });
+            match normalized {
+                Some(base) => {
+                    let mut p = p;
+                    p.project = Some(base);
+                    self.state.gaps.read().list_rendered(&p)
+                }
+                None => self.state.gaps.read().list_rendered(&p),
+            }
+        })
     }
 
     #[tool(
@@ -74,5 +99,138 @@ impl BlackboxServer {
         Parameters(p): Parameters<GapUpdateParams>,
     ) -> CallToolResult {
         Self::run("bbox_gap_update", || self.state.gaps.write().update(&p))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::state::SharedState;
+    use std::path::Path;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    fn run_git(cwd: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn gap_params(project: String) -> GapFileParams {
+        GapFileParams {
+            title: "worktree gap".into(),
+            gap_kind: "tooling".into(),
+            domain: "test-domain".into(),
+            wanted_capability: "write into the worktree".into(),
+            dedupe_key: "tooling/test-domain/worktree-gap".into(),
+            impact: None,
+            blocking_level: None,
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: None,
+            suggested_owner: None,
+            notes: None,
+            scope: Some("project".into()),
+            project: Some(project),
+            write_dir: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            allow_recurrence: None,
+        }
+    }
+
+    #[test]
+    fn bbox_gap_from_worktree_keys_base_writes_worktree_and_list_normalizes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("repo");
+        std::fs::create_dir_all(&base).unwrap();
+        run_git(&base, &["init", "-b", "main"]);
+        run_git(&base, &["config", "user.email", "t@example.com"]);
+        run_git(&base, &["config", "user.name", "T"]);
+        std::fs::write(base.join("README.md"), "base").unwrap();
+        run_git(&base, &["add", "."]);
+        run_git(&base, &["commit", "-m", "init"]);
+        let base_canon = base.canonicalize().unwrap();
+
+        let worktree = tmp.path().join("wt");
+        run_git(
+            &base,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/x",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let worktree_canon = worktree.canonicalize().unwrap();
+        let wt = worktree_canon.to_string_lossy().into_owned();
+
+        let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
+        server
+            .state
+            .projects
+            .write()
+            .register_path(&base_canon)
+            .unwrap();
+
+        let filed = server.bbox_gap(Parameters(gap_params(wt.clone())));
+        assert_ne!(filed.is_error, Some(true), "bbox_gap failed: {filed:?}");
+
+        let (id, project, write_dir) = {
+            let gaps = server.state.gaps.read();
+            let gap = gaps.all().first().expect("one gap").clone();
+            (gap.id, gap.project, gap.write_dir)
+        };
+        assert_eq!(
+            project.as_deref(),
+            Some(base_canon.to_string_lossy().as_ref()),
+            "logical scope must be the registered base"
+        );
+        assert_eq!(
+            write_dir.as_deref(),
+            Some(wt.as_str()),
+            "committed write target must be the worktree"
+        );
+        assert!(
+            worktree_canon
+                .join(".bbox")
+                .join("gaps")
+                .join(format!("{id}.json"))
+                .exists(),
+            "gap should be written into the worktree"
+        );
+        assert!(
+            !base_canon
+                .join(".bbox")
+                .join("gaps")
+                .join(format!("{id}.json"))
+                .exists(),
+            "gap must not be written into the base checkout"
+        );
+
+        let list = server.bbox_gaps(Parameters(GapListParams {
+            project: Some(wt),
+            include_addressed: Some(true),
+            ..Default::default()
+        }));
+        assert_ne!(list.is_error, Some(true), "bbox_gaps failed: {list:?}");
+        let body = format!("{:?}", list.content);
+        assert!(
+            body.contains("worktree gap"),
+            "worktree-scoped list should find the base-keyed gap: {body}"
+        );
     }
 }

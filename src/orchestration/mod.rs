@@ -1741,6 +1741,7 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                             }
                         }
                         if accepted {
+                            apply_cwd_updates_from_event(&mut inner, &evt);
                             inner.supervision.observe_event(&evt, &sink, now_ms());
                             apply_sink_updates(&mut inner, sink);
                         }
@@ -2156,6 +2157,96 @@ fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
     }
     if sink.num_turns.is_some() {
         inner.num_turns = sink.num_turns;
+    }
+}
+
+fn apply_cwd_updates_from_event(inner: &mut TaskInner, evt: &Value) {
+    if let Some(payload) = successful_tool_result_payload(&inner.events, evt, "enter_worktree") {
+        if let Some(cwd) = payload
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            inner.cwd = Some(cwd.to_string());
+        }
+    }
+    if let Some(payload) = successful_tool_result_payload(&inner.events, evt, "exit_worktree") {
+        if payload.get("removed_worktree").is_some()
+            && let Some(base_repo) = payload
+                .get("base_repo")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        {
+            inner.cwd = Some(base_repo.to_string());
+        }
+    }
+}
+
+fn successful_tool_result_payload(events: &[Value], evt: &Value, tool_name: &str) -> Option<Value> {
+    let mut tool_names = std::collections::HashMap::new();
+    for event in events {
+        let Some(blocks) = event
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for block in blocks {
+            if block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+                && let (Some(id), Some(name)) = (
+                    block.get("id").and_then(|id| id.as_str()),
+                    block.get("name").and_then(|name| name.as_str()),
+                )
+            {
+                tool_names.insert(id, name);
+            }
+        }
+    }
+
+    let blocks = evt
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_array())?;
+    blocks.iter().find_map(|block| {
+        if block.get("type").and_then(|t| t.as_str()) != Some("tool_result") {
+            return None;
+        }
+        if block
+            .get("is_error")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        let id = block.get("tool_use_id").and_then(|id| id.as_str())?;
+        if tool_names.get(id).copied() != Some(tool_name) {
+            return None;
+        }
+        let content = tool_result_content_text(block.get("content"));
+        let payload: Value = serde_json::from_str(&content).ok()?;
+        payload
+            .get("ok")
+            .and_then(|ok| ok.as_bool())
+            .unwrap_or(false)
+            .then_some(payload)
+    })
+}
+
+fn tool_result_content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|t| t.as_str())
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        Some(other) => other.to_string(),
+        None => String::new(),
     }
 }
 
@@ -3306,6 +3397,102 @@ mod tests {
         );
         assert_eq!(inner.cost_usd, Some(0.02));
         assert_eq!(inner.num_turns, Some(2));
+    }
+
+    #[test]
+    fn successful_enter_worktree_updates_task_cwd() {
+        let mut inner = TaskInner {
+            id: "t5".into(),
+            provider: Provider::Brodex,
+            session_id: "s1".into(),
+            events: vec![serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "tool_use", "id": "enter1", "name": "enter_worktree" }
+                ]}
+            })],
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: 1000,
+            completed_at: None,
+            exit_code: None,
+            cwd: Some("/repo/base".into()),
+            bro_label: None,
+            agent_label: None,
+            report: None,
+            recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
+            supervision: SupervisionState::default(),
+        };
+        let evt = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "enter1",
+                    "content": "{\"ok\":true,\"cwd\":\"/repo/.bro-fleet-worktrees/wt\",\"base_repo\":\"/repo/base\"}",
+                    "is_error": false
+                }
+            ]}
+        });
+        inner.events.push(evt.clone());
+
+        apply_cwd_updates_from_event(&mut inner, &evt);
+
+        assert_eq!(inner.cwd.as_deref(), Some("/repo/.bro-fleet-worktrees/wt"));
+    }
+
+    #[test]
+    fn successful_exit_worktree_with_removed_worktree_restores_base_cwd() {
+        let mut inner = TaskInner {
+            id: "t6".into(),
+            provider: Provider::Brodex,
+            session_id: "s1".into(),
+            events: vec![serde_json::json!({
+                "type": "assistant",
+                "message": { "content": [
+                    { "type": "tool_use", "id": "exit1", "name": "exit_worktree" }
+                ]}
+            })],
+            last_assistant_message: None,
+            usage: None,
+            cost_usd: None,
+            num_turns: None,
+            stderr: String::new(),
+            status: TaskStatus::Running,
+            started_at: 1000,
+            completed_at: None,
+            exit_code: None,
+            cwd: Some("/repo/.bro-fleet-worktrees/wt".into()),
+            bro_label: None,
+            agent_label: None,
+            report: None,
+            recoverable: false,
+            transcript_location: None,
+            transcript_cursor: None,
+            supervision: SupervisionState::default(),
+        };
+        let evt = serde_json::json!({
+            "type": "user",
+            "message": { "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "exit1",
+                    "content": "{\"ok\":true,\"disposition\":\"publish\",\"removed_worktree\":\"/repo/.bro-fleet-worktrees/wt\",\"base_repo\":\"/repo/base\"}",
+                    "is_error": false
+                }
+            ]}
+        });
+        inner.events.push(evt.clone());
+
+        apply_cwd_updates_from_event(&mut inner, &evt);
+
+        assert_eq!(inner.cwd.as_deref(), Some("/repo/base"));
     }
 }
 
