@@ -54,6 +54,12 @@ pub(super) struct WsChannel {
     /// Cached open connection, reused across `run` calls; `None` until the first
     /// turn or after a fault.
     conn: Option<WsStream>,
+    /// `x-codex-turn-state` captured from the handshake response (first-wins,
+    /// like codex's `OnceLock`); replayed on reconnect handshakes for sticky
+    /// routing, and surfaced for HTTP-fallback replay. A routing/cache-warmth
+    /// hint in our design (we full-replay after any reconnect, so it is not a
+    /// correctness mechanism), kept for codex parity.
+    turn_state: Option<String>,
 
     // --- incremental-input state (mirrors codex's last_request/last_response) ---
     last_full_input: Option<Vec<Value>>,
@@ -67,11 +73,17 @@ impl WsChannel {
         Self {
             url,
             conn: None,
+            turn_state: None,
             last_full_input: None,
             last_items_added: Vec::new(),
             last_response_id: None,
             last_nonfields: None,
         }
+    }
+
+    /// The captured `x-codex-turn-state`, for HTTP-fallback replay.
+    pub(super) fn turn_state(&self) -> Option<&str> {
+        self.turn_state.as_deref()
     }
 
     fn build_request(
@@ -90,18 +102,31 @@ impl WsChannel {
             }
         }
         headers.insert("openai-beta", HeaderValue::from_static(WS_BETA));
+        // Replay sticky routing on reconnect handshakes.
+        if let Some(ts) = &self.turn_state
+            && let Ok(v) = HeaderValue::from_str(ts)
+        {
+            headers.insert(HeaderName::from_static("x-codex-turn-state"), v);
+        }
         Ok(req)
     }
 
-    async fn connect(&self, state: &ResponsesState) -> Result<WsStream> {
+    /// Open a connection, returning the stream and any `x-codex-turn-state` the
+    /// server stamped on the handshake response.
+    async fn connect(&self, state: &ResponsesState) -> Result<(WsStream, Option<String>)> {
         ensure_crypto_provider();
         let req = self.build_request(state)?;
         tracing::info!(url = %self.url, "connecting Responses WebSocket");
-        let (ws, _resp) = tokio_tungstenite::connect_async(req)
+        let (ws, resp) = tokio_tungstenite::connect_async(req)
             .await
             .context("websocket connect")?;
-        tracing::debug!("Responses WebSocket connected");
-        Ok(ws)
+        let turn_state = resp
+            .headers()
+            .get("x-codex-turn-state")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        tracing::debug!(turn_state = ?turn_state, "Responses WebSocket connected");
+        Ok((ws, turn_state))
     }
 
     /// Drop the cached connection and invalidate the delta baseline (we no longer
@@ -177,7 +202,13 @@ impl WsChannel {
             // Ensure a connection.
             if self.conn.is_none() {
                 match self.connect(state).await {
-                    Ok(c) => self.conn = Some(c),
+                    Ok((c, ts)) => {
+                        self.conn = Some(c);
+                        // First-wins capture (codex's OnceLock semantics).
+                        if self.turn_state.is_none() && ts.is_some() {
+                            self.turn_state = ts;
+                        }
+                    }
                     Err(e) => {
                         if attempt < 2 {
                             continue;

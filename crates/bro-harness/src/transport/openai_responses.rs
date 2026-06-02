@@ -31,6 +31,10 @@ pub struct OpenAiResponsesTransport {
     /// The WebSocket channel, when the auth mode supports it (ChatGPT-OAuth).
     /// `None` for API-key auth, or after a session-permanent fallback to HTTP.
     ws: Option<WsChannel>,
+    /// `x-codex-turn-state` captured from the WS handshake, replayed on HTTP
+    /// requests after a WS→HTTP fallback so they stay sticky to the same backend
+    /// (routing/cache-warmth hint). `None` until a fallback occurs.
+    ws_turn_state: Option<String>,
 }
 
 impl OpenAiResponsesTransport {
@@ -50,6 +54,7 @@ impl OpenAiResponsesTransport {
             http,
             http_endpoint,
             ws,
+            ws_turn_state: None,
         })
     }
 
@@ -61,6 +66,10 @@ impl OpenAiResponsesTransport {
             .timeout(super::http::request_timeout());
         for (name, value) in self.state.identity_auth_headers() {
             rb = rb.header(name, value);
+        }
+        // After a WS→HTTP fallback, keep HTTP requests sticky to the WS backend.
+        if let Some(ts) = &self.ws_turn_state {
+            rb = rb.header("x-codex-turn-state", ts.clone());
         }
         rb
     }
@@ -328,9 +337,11 @@ impl Transport for OpenAiResponsesTransport {
                         error = %e,
                         "Responses WebSocket unavailable; falling back to HTTP-SSE for this session"
                     );
+                    // Keep HTTP requests sticky to the WS backend if we captured a
+                    // turn-state, then drop the channel. `state.input` is pristine
+                    // (WS only commits on success), so HTTP full-replays exactly.
+                    self.ws_turn_state = ws.turn_state().map(str::to_string);
                     self.ws = None;
-                    // `state.input` is pristine (WS only commits on success), so
-                    // the HTTP path full-replays exactly.
                 }
             }
         }

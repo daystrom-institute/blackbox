@@ -12,7 +12,7 @@ brief: "Scope and design for a new WebSocket Responses transport for bro-harness
 
 # Brodex WebSocket Responses transport (alongside HTTP-SSE)
 
-> **As-built (phases 1–4 done, live-verified).** Shipped: a shared
+> **As-built (phases 1–5 done, live-verified).** Shipped: a shared
 > `responses_common::ResponsesState` (one buffer, used by both paths); the WS
 > channel (`openai_responses_ws::WsChannel`) — handshake with the shared
 > identity/auth headers + `OpenAI-Beta: responses_websockets=2026-02-06`,
@@ -25,9 +25,27 @@ brief: "Scope and design for a new WebSocket Responses transport for bro-harness
 > propagate, they don't trigger fallback), and compaction always over HTTP.
 > Verified live: default dispatch auto-routes to WS (one connect across a
 > tool-using turn); a dead WS endpoint falls back to HTTP-SSE.
-> **Remaining: phase 5** — `generate=false` prewarm, `x-codex-turn-state` sticky
-> routing, and reconnect-on-idle. The decisions below reflect the original
-> proposal; the env-knob option was dropped in favor of auth-mode routing.
+>
+> **Phase 5 — scoped.** `x-codex-turn-state` sticky routing is implemented
+> (captured first-wins from the handshake, replayed on reconnect handshakes and
+> on HTTP-fallback requests). It is a routing/cache-warmth *hint*, not a
+> correctness mechanism in this design: we reset the delta baseline on any
+> reconnect (full-replay on a fresh socket), so `previous_response_id` is never
+> carried across a reconnect and never needs another backend's state. Observed
+> live: the ChatGPT backend did not even stamp a turn-state on our handshakes
+> (`turn_state=None`), so the capture/replay is currently a no-op kept for codex
+> parity + future-proofing.
+>
+> **Deliberately deferred (low value under our reuse model):**
+> `generate=false` prewarm — connection reuse already keeps the socket warm
+> across turns, so there is no per-turn reconnect for a prewarm to hide; it would
+> only help the very first turn after a pre-prompt idle window. Proactive
+> reconnect-on-idle — the stale-connection re-dial already recovers the ~60-min
+> server idle close on the next send. Both are revisitable if the fleet
+> persistent-session path shows a measurable first-token-latency win.
+>
+> The decisions below reflect the original proposal; the env-knob option was
+> dropped in favor of auth-mode routing.
 
 > **Relationship to the HTTP-SSE transport.** This is the "new brodex alongside
 > the fixed legacy path" split: `openai_responses.rs` (HTTP-SSE) stays the
