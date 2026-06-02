@@ -473,7 +473,7 @@ impl Session {
         match self
             .tx
             .compact(
-                self.compaction.keep_tail(),
+                self.compaction.params(),
                 crate::compaction::COMPACTION_INSTRUCTION,
                 &tool_specs,
                 &self.base_opts,
@@ -534,7 +534,7 @@ impl Session {
                 match self
                     .tx
                     .compact(
-                        self.compaction.keep_tail(),
+                        self.compaction.params(),
                         crate::compaction::COMPACTION_INSTRUCTION,
                         &tool_specs,
                         &self.base_opts,
@@ -594,7 +594,7 @@ impl Session {
                         match self
                             .tx
                             .compact(
-                                self.compaction.keep_tail(),
+                                self.compaction.params(),
                                 crate::compaction::COMPACTION_INSTRUCTION,
                                 &tool_specs,
                                 &self.base_opts,
@@ -1358,7 +1358,7 @@ mod tests {
         fn restore(&mut self, _snapshot: Value) {}
         async fn compact(
             &mut self,
-            _keep_tail: usize,
+            _params: transport::CompactionParams,
             _instruction: &str,
             _tools: &[transport::ToolSpec],
             _opts: &TurnOpts,

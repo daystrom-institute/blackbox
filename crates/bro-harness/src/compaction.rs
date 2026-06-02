@@ -38,6 +38,14 @@ use std::collections::BTreeMap;
 const DEFAULT_WINDOW: u64 = 200_000;
 const DEFAULT_RATIO: f64 = 0.75;
 const DEFAULT_KEEP_TAIL: usize = 6;
+/// Inline-summary output-token cap. Codex's inline summary is a full turn; the
+/// old hardcoded 2048 was far too small for a long thread. Generous default,
+/// env-overridable via `BRO_HARNESS_COMPACTION_SUMMARY_TOKENS`.
+const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 8192;
+/// Per-tool-result char cap when rendering the prefix transcript for the inline
+/// summarizer. Bounds the summarization prompt; env-overridable via
+/// `BRO_HARNESS_COMPACTION_TOOL_CAP`.
+const DEFAULT_TOOL_RENDER_CAP: usize = 2000;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 struct Entry {
@@ -51,6 +59,8 @@ struct Entry {
 pub struct CompactionPolicy {
     entries: BTreeMap<String, Entry>,
     keep_tail: usize,
+    summary_max_tokens: u32,
+    tool_render_cap: usize,
     enabled: bool,
 }
 
@@ -63,6 +73,14 @@ impl CompactionPolicy {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_KEEP_TAIL);
+        let summary_max_tokens = std::env::var("BRO_HARNESS_COMPACTION_SUMMARY_TOKENS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS);
+        let tool_render_cap = std::env::var("BRO_HARNESS_COMPACTION_TOOL_CAP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_TOOL_RENDER_CAP);
         let entries = std::env::var("BRO_HARNESS_COMPACTION_CONFIG")
             .ok()
             .and_then(|p| match std::fs::read_to_string(&p) {
@@ -85,6 +103,8 @@ impl CompactionPolicy {
         Self {
             entries,
             keep_tail,
+            summary_max_tokens,
+            tool_render_cap,
             enabled,
         }
     }
@@ -130,8 +150,13 @@ impl CompactionPolicy {
         Some((window as f64 * ratio) as u64)
     }
 
-    pub fn keep_tail(&self) -> usize {
-        self.keep_tail
+    /// Bundle the per-pass tuning knobs for `Transport::compact`.
+    pub fn params(&self) -> crate::transport::CompactionParams {
+        crate::transport::CompactionParams {
+            keep_tail: self.keep_tail,
+            summary_max_tokens: self.summary_max_tokens,
+            tool_render_cap: self.tool_render_cap,
+        }
     }
 }
 
@@ -184,6 +209,8 @@ mod tests {
         CompactionPolicy {
             entries: m,
             keep_tail: DEFAULT_KEEP_TAIL,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            tool_render_cap: DEFAULT_TOOL_RENDER_CAP,
             enabled: true,
         }
     }
@@ -228,6 +255,8 @@ mod tests {
         let p = CompactionPolicy {
             entries: default_entries(),
             keep_tail: DEFAULT_KEEP_TAIL,
+            summary_max_tokens: DEFAULT_SUMMARY_MAX_TOKENS,
+            tool_render_cap: DEFAULT_TOOL_RENDER_CAP,
             enabled: true,
         };
         assert_eq!(p.resolve("glm-4.6").0, 200_000);
@@ -235,5 +264,27 @@ mod tests {
         assert_eq!(p.resolve("claude-opus-4-8").0, 200_000);
         // ratio inherits from default everywhere
         assert_eq!(p.resolve("glm-4.6").1, DEFAULT_RATIO);
+    }
+
+    #[test]
+    fn params_carry_tuning_knobs() {
+        let p = CompactionPolicy {
+            entries: default_entries(),
+            keep_tail: 9,
+            summary_max_tokens: 12_345,
+            tool_render_cap: 4_096,
+            enabled: true,
+        };
+        let params = p.params();
+        assert_eq!(params.keep_tail, 9);
+        assert_eq!(params.summary_max_tokens, 12_345);
+        assert_eq!(params.tool_render_cap, 4_096);
+    }
+
+    #[test]
+    fn defaults_lift_the_summary_cap_above_the_old_2048() {
+        // Regression guard: the inline summary budget must not regress to the
+        // old hardcoded 2048 that squeezed long threads.
+        assert!(DEFAULT_SUMMARY_MAX_TOKENS > 2048);
     }
 }

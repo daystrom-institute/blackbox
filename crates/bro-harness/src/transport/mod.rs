@@ -184,6 +184,24 @@ pub struct TurnOpts {
     pub service_tier: Option<String>,
 }
 
+/// Tuning knobs for one compaction pass, sourced from `CompactionPolicy` and
+/// passed to `Transport::compact`. Only the **inline** (client-side) summarizer
+/// path — Anthropic / OpenAI-Chat, and the OpenAI-Responses API-key fallback —
+/// consults `summary_max_tokens` / `tool_render_cap`; the server-side
+/// `responses/compact` path ignores them (the backend owns retention + summary).
+#[derive(Debug, Clone, Copy)]
+pub struct CompactionParams {
+    /// Native messages preserved verbatim at the tail of the buffer.
+    pub keep_tail: usize,
+    /// Output-token cap for the inline summary call. Codex's inline summary is a
+    /// full turn (no tight cap); the old hardcoded 2048 squeezed a long thread
+    /// into ~1.5k words. Generous by default, env-overridable.
+    pub summary_max_tokens: u32,
+    /// Per-tool-result char cap when rendering the prefix transcript for the
+    /// summarizer. Bounds the summarization prompt so it can't itself overflow.
+    pub tool_render_cap: usize,
+}
+
 /// Sink for incremental, in-turn streaming events.
 ///
 /// The agent loop passes an implementor (backed by the stdout `Emitter`) into
@@ -263,7 +281,7 @@ pub trait Transport: Send {
     /// not implement compaction yet (the default).
     async fn compact(
         &mut self,
-        _keep_tail: usize,
+        _params: CompactionParams,
         _instruction: &str,
         _tools: &[ToolSpec],
         _opts: &TurnOpts,

@@ -246,6 +246,7 @@ impl OpenAiResponsesTransport {
         &self,
         transcript: &str,
         instruction: &str,
+        max_tokens: u32,
         opts: &TurnOpts,
     ) -> Result<String> {
         let body = json!({
@@ -255,6 +256,7 @@ impl OpenAiResponsesTransport {
                 "content": [{"type": "input_text", "text": format!("{transcript}\n\n---\n{instruction}")}],
             }],
             "instructions": "You summarize coding-agent conversations precisely and completely.",
+            "max_output_tokens": max_tokens,
             "stream": true,
             "store": false,
         });
@@ -452,18 +454,20 @@ impl Transport for OpenAiResponsesTransport {
 
     async fn compact(
         &mut self,
-        keep_tail: usize,
+        params: super::CompactionParams,
         instruction: &str,
         tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<Option<String>> {
         // Canonical OAI path: the ChatGPT backend supports server-side compaction
-        // (the unary `responses/compact` endpoint). Generic API-key vendors do
-        // not, so they fall through to the client-side summarizer below. This
-        // gate mirrors codex's `supports_remote_compaction()`.
+        // (the unary `responses/compact` endpoint), which owns retention + summary
+        // — so the inline `params` knobs don't apply there. Generic API-key
+        // vendors fall through to the client-side summarizer below. This gate
+        // mirrors codex's `supports_remote_compaction()`.
         if matches!(self.state.auth, Auth::ChatGpt { .. }) {
             return self.remote_compact(tools, opts).await;
         }
+        let keep_tail = params.keep_tail;
         let n = self.state.input.len();
         if n <= keep_tail + 1 {
             return Ok(None);
@@ -472,8 +476,13 @@ impl Transport for OpenAiResponsesTransport {
         let Some(split) = responses_common::responses_split(&self.state.input, limit) else {
             return Ok(None);
         };
-        let transcript = responses_common::render_responses_transcript(&self.state.input[..split]);
-        let summary = self.summarize_text(&transcript, instruction, opts).await?;
+        let transcript = responses_common::render_responses_transcript(
+            &self.state.input[..split],
+            params.tool_render_cap,
+        );
+        let summary = self
+            .summarize_text(&transcript, instruction, params.summary_max_tokens, opts)
+            .await?;
         let mut rebuilt: Vec<Value> = Vec::with_capacity(n - split + 1);
         rebuilt.push(json!({
             "type": "message",
@@ -494,7 +503,7 @@ impl Transport for OpenAiResponsesTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::{SystemPrompt, Transport};
+    use crate::transport::{CompactionParams, SystemPrompt, Transport};
     use serde_json::json;
 
     /// LIVE e2e (ignored, double-gated): drives the real `compact()` →
@@ -536,7 +545,12 @@ mod tests {
             web_search: false,
             service_tier: None,
         };
-        let summary = tx.compact(6, "compact", &[], &opts).await.expect("compact call");
+        let params = CompactionParams {
+            keep_tail: 6,
+            summary_max_tokens: 8192,
+            tool_render_cap: 2000,
+        };
+        let summary = tx.compact(params, "compact", &[], &opts).await.expect("compact call");
 
         let kinds: Vec<&str> = tx
             .state

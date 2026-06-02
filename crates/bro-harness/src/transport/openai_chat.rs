@@ -169,11 +169,12 @@ impl OpenAiChatTransport {
         &self,
         transcript: &str,
         instruction: &str,
+        max_tokens: u32,
         opts: &TurnOpts,
     ) -> Result<String> {
         let body = json!({
             "model": opts.model,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "messages": [
                 {"role": "system", "content": "You summarize coding-agent conversations precisely and completely."},
                 {"role": "user", "content": format!("{transcript}\n\n---\n{instruction}")},
@@ -530,11 +531,12 @@ impl Transport for OpenAiChatTransport {
 
     async fn compact(
         &mut self,
-        keep_tail: usize,
+        params: super::CompactionParams,
         instruction: &str,
         _tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<Option<String>> {
+        let keep_tail = params.keep_tail;
         let n = self.messages.len();
         if n <= keep_tail + 1 {
             return Ok(None);
@@ -543,8 +545,10 @@ impl Transport for OpenAiChatTransport {
         let Some(split) = chat_split(&self.messages, limit) else {
             return Ok(None);
         };
-        let transcript = render_chat_transcript(&self.messages[..split]);
-        let summary = self.summarize_text(&transcript, instruction, opts).await?;
+        let transcript = render_chat_transcript(&self.messages[..split], params.tool_render_cap);
+        let summary = self
+            .summarize_text(&transcript, instruction, params.summary_max_tokens, opts)
+            .await?;
         let mut rebuilt: Vec<Value> = Vec::with_capacity(n - split + 1);
         rebuilt.push(json!({
             "role": "user",
@@ -567,14 +571,14 @@ fn chat_split(messages: &[Value], limit: usize) -> Option<usize> {
 
 /// Render a slice of the chat buffer to a plain-text transcript for
 /// summarization. Tool results are truncated to keep the prompt bounded.
-fn render_chat_transcript(messages: &[Value]) -> String {
+fn render_chat_transcript(messages: &[Value], tool_cap: usize) -> String {
     let mut s = String::new();
     for m in messages {
         let role = m["role"].as_str().unwrap_or("?");
         s.push_str(&format!("\n## {role}\n"));
         if let Some(t) = m["content"].as_str() {
             if role == "tool" {
-                s.push_str(&super::truncate(t, 2000));
+                s.push_str(&super::truncate(t, tool_cap));
             } else {
                 s.push_str(t);
             }

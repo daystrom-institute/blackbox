@@ -472,7 +472,7 @@ pub(super) fn responses_split(input: &[Value], limit: usize) -> Option<usize> {
 
 /// Render a slice of the Responses input buffer to a plain-text transcript for
 /// summarization. Tool outputs are truncated to keep the prompt bounded.
-pub(super) fn render_responses_transcript(items: &[Value]) -> String {
+pub(super) fn render_responses_transcript(items: &[Value], tool_cap: usize) -> String {
     let mut s = String::new();
     for it in items {
         match it["type"].as_str().unwrap_or("") {
@@ -495,7 +495,7 @@ pub(super) fn render_responses_transcript(items: &[Value]) -> String {
             )),
             "function_call_output" => s.push_str(&format!(
                 "\n## tool\n[tool_result {}]\n",
-                super::truncate(it["output"].as_str().unwrap_or(""), 2000)
+                super::truncate(it["output"].as_str().unwrap_or(""), tool_cap)
             )),
             _ => {}
         }

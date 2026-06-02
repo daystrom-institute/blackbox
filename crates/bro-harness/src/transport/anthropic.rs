@@ -117,11 +117,12 @@ impl AnthropicTransport {
         &self,
         transcript: &str,
         instruction: &str,
+        max_tokens: u32,
         opts: &TurnOpts,
     ) -> Result<String> {
         let body = json!({
             "model": opts.model,
-            "max_tokens": 2048,
+            "max_tokens": max_tokens,
             "stream": false,
             "system": "You summarize coding-agent conversations precisely and completely.",
             "messages": [{
@@ -274,7 +275,7 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
 /// Render a slice of the native message buffer to a plain-text transcript for
 /// summarization. Tool I/O is rendered compactly and large tool results are
 /// truncated so the summarization prompt stays bounded.
-fn render_transcript(messages: &[Value]) -> String {
+fn render_transcript(messages: &[Value], tool_cap: usize) -> String {
     let mut s = String::new();
     for m in messages {
         let role = m["role"].as_str().unwrap_or("?");
@@ -292,7 +293,7 @@ fn render_transcript(messages: &[Value]) -> String {
                         )),
                         Some("tool_result") => s.push_str(&format!(
                             "[tool_result {}]",
-                            truncate(b["content"].as_str().unwrap_or(""), 2000)
+                            truncate(b["content"].as_str().unwrap_or(""), tool_cap)
                         )),
                         _ => {}
                     }
@@ -537,11 +538,12 @@ impl Transport for AnthropicTransport {
 
     async fn compact(
         &mut self,
-        keep_tail: usize,
+        params: super::CompactionParams,
         instruction: &str,
         _tools: &[super::ToolSpec],
         opts: &TurnOpts,
     ) -> Result<Option<String>> {
+        let keep_tail = params.keep_tail;
         let n = self.messages.len();
         if n <= keep_tail + 1 {
             return Ok(None);
@@ -563,8 +565,10 @@ impl Transport for AnthropicTransport {
             return Ok(None);
         };
 
-        let transcript = render_transcript(&self.messages[..split]);
-        let summary = self.summarize_text(&transcript, instruction, opts).await?;
+        let transcript = render_transcript(&self.messages[..split], params.tool_render_cap);
+        let summary = self
+            .summarize_text(&transcript, instruction, params.summary_max_tokens, opts)
+            .await?;
 
         let mut rebuilt: Vec<Value> = Vec::with_capacity(n - split + 1);
         rebuilt.push(json!({
