@@ -271,6 +271,55 @@ pub fn format_for_listing(memory: &SystemMemory) -> String {
     out
 }
 
+/// Max bytes of the one-line content preview shown in a signpost.
+const SIGNPOST_PREVIEW_BYTES: usize = 160;
+
+/// Render one memory as a compact signpost: id + title, tag line, a one-line
+/// content preview, and a retrieval breadcrumb pointing at the qualified-id
+/// query that returns the full runbook body.
+///
+/// This is the renderer for the *broad* `bbox_knowledge` surface path: a fuzzy
+/// multi-term query can match many runbooks, and dumping every full body
+/// overflows the token budget (system memory bodies reach ~40KB each). A
+/// signpost stays a few hundred bytes and tells the agent exactly how to pull
+/// the body it wants — `bbox_knowledge(query="sm-<id>")` short-circuits to the
+/// full body via the exact-id path.
+pub fn format_for_signpost(memory: &SystemMemory) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("[system] {} — {}\n", memory.id, memory.title));
+    if !memory.tags.is_empty() {
+        out.push_str(&format!("  tags: {}\n", memory.tags.join(", ")));
+    }
+    if let Some(preview) = signpost_preview(&memory.content) {
+        out.push_str(&format!("  {preview}\n"));
+    }
+    out.push_str(&format!(
+        "  → full runbook: bbox_knowledge(query=\"{}\")\n",
+        memory.id
+    ));
+    out
+}
+
+/// Derive a one-line content preview: the first prose line (skipping blank
+/// lines and markdown heading/list markers), truncated at a UTF-8 boundary.
+fn signpost_preview(content: &str) -> Option<String> {
+    let line = content.lines().map(str::trim).find(|line| {
+        !line.is_empty() && !line.chars().all(|c| matches!(c, '#' | '-' | '=' | '*' | '─' | ' '))
+    })?;
+    let line = line.trim_start_matches(['#', '-', '*', '>', ' ']).trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.len() <= SIGNPOST_PREVIEW_BYTES {
+        return Some(line.to_string());
+    }
+    let mut cut = SIGNPOST_PREVIEW_BYTES;
+    while cut > 0 && !line.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    Some(format!("{}…", &line[..cut]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +683,74 @@ mod tests {
         let out = format_for_listing(memory);
         assert!(out.starts_with("[system] sm-rule-packets"));
         assert!(out.contains("Rule-packets"));
+    }
+
+    #[test]
+    fn format_for_signpost_is_compact_with_retrieval_breadcrumb() {
+        let catalog = fixture_default_catalog();
+        let memory = catalog.get("sm-refactor").unwrap();
+        let out = format_for_signpost(memory);
+
+        // Header + breadcrumb present.
+        assert!(out.starts_with("[system] sm-refactor"));
+        assert!(
+            out.contains("→ full runbook: bbox_knowledge(query=\"sm-refactor\")"),
+            "signpost must point at the exact-id retrieval path: {out}"
+        );
+
+        // Compact: a signpost is a handful of lines, never the full body.
+        let full = format_for_listing(memory);
+        assert!(
+            out.len() < full.len(),
+            "signpost ({} bytes) should be smaller than full body ({} bytes)",
+            out.len(),
+            full.len()
+        );
+        assert!(
+            out.lines().count() <= 4,
+            "signpost should be at most header+tags+preview+breadcrumb: {out}"
+        );
+    }
+
+    #[test]
+    fn signposts_keep_broad_surfacing_bounded() {
+        // Mirrors the broad bbox_knowledge path: a fuzzy term matches many
+        // runbooks. Rendering every match as a signpost must stay far smaller
+        // than dumping every full body (the overflow the fix targets).
+        let catalog = fixture_default_catalog();
+        let matches = catalog.search(Some("refactor"));
+        assert!(matches.len() > 1, "expected several refactor runbooks");
+
+        let signposts: usize = matches.iter().map(|m| format_for_signpost(m).len()).sum();
+        let bodies: usize = matches.iter().map(|m| format_for_listing(m).len()).sum();
+
+        assert!(
+            signposts * 4 < bodies,
+            "signpost surfacing ({signposts} bytes) should be a small fraction of full bodies ({bodies} bytes)"
+        );
+        // Even the whole catalog as signposts (the empty-query worst case)
+        // stays cheap — vs ~250KB of full bodies and the ~81KB overflow seen
+        // on a real broad query.
+        let all: usize = catalog
+            .memories
+            .iter()
+            .map(|m| format_for_signpost(m).len())
+            .sum();
+        assert!(all < 16_000, "all signposts should fit a small budget: {all} bytes");
+    }
+
+    #[test]
+    fn signpost_preview_strips_markers_and_truncates() {
+        // A heading line's text makes a fine preview once its `#` markers are
+        // stripped.
+        let preview = signpost_preview("## Bro orchestration hygiene\n\nbody").expect("preview");
+        assert_eq!(preview, "Bro orchestration hygiene");
+
+        // A long first line is truncated at a byte budget with an ellipsis.
+        let long = "x".repeat(SIGNPOST_PREVIEW_BYTES + 50);
+        let truncated = signpost_preview(&format!("- {long}")).expect("preview");
+        assert!(truncated.ends_with('…'), "long preview should be truncated");
+        assert!(truncated.len() <= SIGNPOST_PREVIEW_BYTES + 4);
     }
 
     #[test]

@@ -232,6 +232,12 @@ impl BlackboxServer {
             // Also surface matching system memories. See
             // system-defaults/memories/ — these are file-loaded runbooks
             // read at startup, queryable but never rendered.
+            //
+            // The broad query path renders compact signposts, not full bodies:
+            // a fuzzy multi-term query matches many runbooks, and full bodies
+            // (~40KB each) overflow the token budget. The agent pulls a full
+            // body via the exact-id short-circuit (`bbox_knowledge(query="sm-…")`,
+            // handled above by exact_system_memory_response).
             let memories = system_memory::search(p.query.as_deref());
             if !memories.is_empty() {
                 if !combined.ends_with('\n') {
@@ -239,9 +245,12 @@ impl BlackboxServer {
                 }
                 combined.push_str("\n── System memories ──────────────────────────\n");
                 for m in memories {
-                    combined.push_str(&system_memory::format_for_listing(m));
+                    combined.push_str(&system_memory::format_for_signpost(m));
                     combined.push('\n');
                 }
+                combined.push_str(
+                    "  (signposts only — query an exact sm-* id for the full runbook body)\n",
+                );
             }
             Ok(combined)
         })

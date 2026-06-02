@@ -86,3 +86,9 @@ pub fn format_for_listing(memory: &SystemMemory) -> String {
 pub fn format_catalog_summary(query: Option<&str>) -> String {
     catalog().format_catalog_summary(query)
 }
+
+/// Render one memory as a compact signpost for the broad query surface: header
+/// + tags + one-line preview + a breadcrumb to pull the full body by exact id.
+pub fn format_for_signpost(memory: &SystemMemory) -> String {
+    catalog::format_for_signpost(memory)
+}
