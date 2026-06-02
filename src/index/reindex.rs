@@ -744,6 +744,7 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::Gemini => "gemini",
         Provider::Copilot => "copilot",
         Provider::Vibe => "vibe",
+        Provider::VibeBh => "vibebh",
         Provider::Glm => "opencode",
         Provider::Deepseek => "deepseek",
         Provider::Inception => "inception",

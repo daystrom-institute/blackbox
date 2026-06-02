@@ -59,6 +59,16 @@ pub enum Provider {
     Brodex,
     Copilot,
     Vibe,
+    /// Mistral (vibe) ridden through `bro-harness` on the OpenAI
+    /// **chat-completions** transport, parallel to the `vibe` CLI provider
+    /// (which stays unchanged). Distinct variant so the existing `vibe` →
+    /// vibe-CLI path is preserved; `vibebh` launches the harness with
+    /// `BRO_HARNESS_TRANSPORT=openai-chat` + `BRO_HARNESS_CHAT_REASONING=mistral`
+    /// against the Mistral API. The exemplar completions-transport harness
+    /// provider — the template for future OpenAI-compatible endpoints.
+    #[serde(alias = "vibe-bh")]
+    #[strum(serialize = "vibebh", serialize = "vibe-bh")]
+    VibeBh,
     Gemini,
     Workflow,
 }
@@ -115,6 +125,7 @@ impl Provider {
         Provider::Brodex,
         Provider::Copilot,
         Provider::Vibe,
+        Provider::VibeBh,
         Provider::Gemini,
     ];
 
@@ -140,6 +151,12 @@ impl Provider {
             Provider::Copilot => &[ToolUse, Resume],
             Provider::Gemini => &[Vision, ToolUse],
             Provider::Vibe => &[ToolUse, Resume],
+            // Mistral via bro-harness (chat-completions transport). Native tool
+            // use + resume (harness transcript persistence). Structured output
+            // is not yet implemented in the harness, so it is intentionally
+            // absent (fail-closed per the RX-V capability invariants), matching
+            // the other harness-backed providers.
+            Provider::VibeBh => &[ToolUse, Resume],
             Provider::Workflow => &[],
         };
         v.iter().copied().collect()
@@ -174,6 +191,7 @@ impl Provider {
             Provider::Brodex => "brodex",
             Provider::Copilot => "copilot",
             Provider::Vibe => "vibe",
+            Provider::VibeBh => "vibebh",
             Provider::Gemini => "gemini",
             Provider::Workflow => "workflow",
         }
@@ -190,6 +208,7 @@ impl Provider {
                 | Provider::Brodex
                 | Provider::Copilot
                 | Provider::Vibe
+                | Provider::VibeBh
                 | Provider::Gemini
         )
     }
@@ -204,6 +223,7 @@ impl Provider {
                 | Provider::Codex
                 | Provider::Brodex
                 | Provider::Copilot
+                | Provider::VibeBh
         )
     }
 

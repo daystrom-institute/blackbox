@@ -10,9 +10,19 @@
 //! Streaming: `stream:true` + `stream_options.include_usage`. The
 //! `chat.completion.chunk` deltas are folded incrementally and re-emitted to
 //! the [`TurnSink`](super::TurnSink) translated into the **Anthropic** event
-//! shape (`content_block_delta` text, `content_block_start`/`input_json_delta`
-//! for tool calls), so the harness speaks one convergent stream-json protocol
-//! regardless of the underlying provider.
+//! shape (`content_block_delta` text/thinking, `content_block_start` +
+//! `input_json_delta` for tool calls), so the harness speaks one convergent
+//! stream-json protocol regardless of the underlying provider.
+//!
+//! Reasoning: reasoning-capable chat endpoints (Mistral, verified live
+//! 2026-06-01) stream `delta.content` as a typed-chunk **array** —
+//! `{type:"thinking", thinking:[{type:"text",text}]}` and `{type:"text",text}`
+//! — once `reasoning_effort` is requested, and revert to a plain string after
+//! the thinking block closes. The fold handles both forms: thinking text is
+//! surfaced as the turn's display-only `thinking` (never replayed into the
+//! buffer, matching the Anthropic transport), and visible text is replayed as
+//! usual. The request-side `reasoning_effort` knob is provider-specific and
+//! gated by [`ReasoningProfile`].
 
 use super::{StopReason, Transport, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};
@@ -20,11 +30,63 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
+/// Request-side reasoning shaping for reasoning-capable chat endpoints.
+///
+/// Output-side parsing of array-form `content` (thinking chunks) is always on
+/// and provider-agnostic — it costs nothing when the field is absent. The
+/// *request* knob differs per provider, though: Mistral's `reasoning_effort`
+/// only accepts `{none, high}` (verified live — `medium`/`low` 400 with
+/// `invalid_request_invalid_args`), so a generic harness effort string is
+/// collapsed into that set. Endpoints with no reasoning knob stay [`Off`] and
+/// send no `reasoning_effort`. Selected via `BRO_HARNESS_CHAT_REASONING`.
+///
+/// [`Off`]: ReasoningProfile::Off
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum ReasoningProfile {
+    #[default]
+    Off,
+    Mistral,
+}
+
+impl ReasoningProfile {
+    fn from_env() -> Self {
+        match std::env::var("BRO_HARNESS_CHAT_REASONING")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "mistral" => ReasoningProfile::Mistral,
+            _ => ReasoningProfile::Off,
+        }
+    }
+
+    /// Map a generic harness effort into this endpoint's accepted
+    /// `reasoning_effort` value, or `None` to omit the param entirely.
+    ///
+    /// Follows the harness "no effort ⇒ no thinking" convention (mirrors the
+    /// Anthropic transport): an unset effort omits the knob, which is also
+    /// Mistral's no-reasoning default. Any effort that requests reasoning maps
+    /// to `high`; an explicit off/none/minimal maps to `none`.
+    fn reasoning_effort(self, effort: Option<&str>) -> Option<&'static str> {
+        match self {
+            ReasoningProfile::Off => None,
+            ReasoningProfile::Mistral => match effort.map(str::trim) {
+                None | Some("") => None,
+                Some(e) => match e.to_ascii_lowercase().as_str() {
+                    "off" | "none" | "minimal" => Some("none"),
+                    _ => Some("high"),
+                },
+            },
+        }
+    }
+}
+
 pub struct OpenAiChatTransport {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
     messages: Vec<Value>,
+    reasoning: ReasoningProfile,
 }
 
 impl OpenAiChatTransport {
@@ -42,6 +104,7 @@ impl OpenAiChatTransport {
             base_url,
             api_key,
             messages: Vec::new(),
+            reasoning: ReasoningProfile::from_env(),
         })
     }
 
@@ -89,6 +152,13 @@ impl OpenAiChatTransport {
         if !tool_defs.is_empty() {
             body["tools"] = json!(tool_defs);
             body["tool_choice"] = json!("auto");
+        }
+        // Request-side reasoning knob, mapped to the endpoint's accepted set.
+        // Output-side thinking parsing is unconditional (see run_turn), so a
+        // model that reasons by default still surfaces thinking even with the
+        // profile Off.
+        if let Some(effort) = self.reasoning.reasoning_effort(opts.effort.as_deref()) {
+            body["reasoning_effort"] = json!(effort);
         }
         body
     }
@@ -148,6 +218,52 @@ struct ChatToolAcc {
     args: String,
 }
 
+/// Accumulate a visible-text fragment into the turn buffer and forward it to the
+/// sink as an Anthropic `text_delta` at block index 1 (thinking holds index 0),
+/// opening the block on first use.
+fn emit_text_delta(
+    t: &str,
+    text_out: &mut String,
+    text_started: &mut bool,
+    sink: &dyn super::TurnSink,
+) {
+    if !*text_started {
+        sink.stream_event(json!({
+            "type": "content_block_start",
+            "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        }));
+        *text_started = true;
+    }
+    text_out.push_str(t);
+    sink.stream_event(json!({
+        "type": "content_block_delta",
+        "index": 1,
+        "delta": {"type": "text_delta", "text": t},
+    }));
+}
+
+/// Flatten a Mistral `thinking` chunk payload to plain text. The payload is an
+/// array of `{type:"text", text}` parts (occasionally a bare string); anything
+/// else is ignored.
+fn extract_thinking_text(thinking: &Value) -> String {
+    if let Some(s) = thinking.as_str() {
+        return s.to_string();
+    }
+    let Some(parts) = thinking.as_array() else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for p in parts {
+        if let Some(s) = p.as_str() {
+            out.push_str(s);
+        } else if p["type"].as_str() == Some("text") {
+            out.push_str(p["text"].as_str().unwrap_or(""));
+        }
+    }
+    out
+}
+
 #[async_trait]
 impl Transport for OpenAiChatTransport {
     fn name(&self) -> &'static str {
@@ -200,6 +316,8 @@ impl Transport for OpenAiChatTransport {
         let mut buf: Vec<u8> = Vec::new();
         let mut text_out = String::new();
         let mut text_started = false;
+        let mut reasoning_out = String::new();
+        let mut thinking_started = false;
         let mut tools_acc: Vec<ChatToolAcc> = Vec::new();
         let mut finish: Option<String> = None;
         let mut usage = Usage::default();
@@ -245,23 +363,54 @@ impl Transport for OpenAiChatTransport {
                 }
                 let delta = &choice["delta"];
 
-                if let Some(t) = delta["content"].as_str()
-                    && !t.is_empty()
-                {
-                    if !text_started {
-                        sink.stream_event(json!({
-                            "type": "content_block_start",
-                            "index": 0,
-                            "content_block": {"type": "text", "text": ""},
-                        }));
-                        text_started = true;
+                // `delta.content` is either a plain string (no reasoning) or,
+                // once reasoning is on, an array of typed chunks. A single
+                // delta can mix an (empty) thinking chunk with a text chunk at
+                // the thinking→text transition, so iterate every chunk.
+                // Block indices: thinking=0, text=1, tool_use=tc_index+2. No
+                // consumer keys off the literal index (the daemon parser groups
+                // by type, not index; the fleet renders from the final
+                // assistant block), so the gap when reasoning is off is inert —
+                // this layout just mirrors Claude's native block ordering.
+                match &delta["content"] {
+                    Value::String(t) if !t.is_empty() => {
+                        emit_text_delta(t, &mut text_out, &mut text_started, sink);
                     }
-                    text_out.push_str(t);
-                    sink.stream_event(json!({
-                        "type": "content_block_delta",
-                        "index": 0,
-                        "delta": {"type": "text_delta", "text": t},
-                    }));
+                    Value::Array(chunks) => {
+                        for chunk in chunks {
+                            match chunk["type"].as_str() {
+                                Some("thinking") => {
+                                    let tt = extract_thinking_text(&chunk["thinking"]);
+                                    if tt.is_empty() {
+                                        continue;
+                                    }
+                                    if !thinking_started {
+                                        sink.stream_event(json!({
+                                            "type": "content_block_start",
+                                            "index": 0,
+                                            "content_block": {"type": "thinking", "thinking": ""},
+                                        }));
+                                        thinking_started = true;
+                                    }
+                                    reasoning_out.push_str(&tt);
+                                    sink.stream_event(json!({
+                                        "type": "content_block_delta",
+                                        "index": 0,
+                                        "delta": {"type": "thinking_delta", "thinking": tt},
+                                    }));
+                                }
+                                Some("text") => {
+                                    if let Some(t) = chunk["text"].as_str()
+                                        && !t.is_empty()
+                                    {
+                                        emit_text_delta(t, &mut text_out, &mut text_started, sink);
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
                 }
 
                 if let Some(tcs) = delta["tool_calls"].as_array() {
@@ -280,10 +429,10 @@ impl Transport for OpenAiChatTransport {
                             && !name.is_empty()
                         {
                             acc.name = name.to_string();
-                            // Tool block lives after the text block (index 0).
+                            // Tool blocks live after thinking(0) + text(1).
                             sink.stream_event(json!({
                                 "type": "content_block_start",
-                                "index": idx + 1,
+                                "index": idx + 2,
                                 "content_block": {"type": "tool_use", "id": acc.id, "name": acc.name},
                             }));
                         }
@@ -293,7 +442,7 @@ impl Transport for OpenAiChatTransport {
                             acc.args.push_str(frag);
                             sink.stream_event(json!({
                                 "type": "content_block_delta",
-                                "index": idx + 1,
+                                "index": idx + 2,
                                 "delta": {"type": "input_json_delta", "partial_json": frag},
                             }));
                         }
@@ -345,8 +494,11 @@ impl Transport for OpenAiChatTransport {
 
         Ok(TurnOutput {
             text: text_out,
-            // Chat Completions exposes no separate reasoning channel here.
-            thinking: String::new(),
+            // Display-only: thinking is surfaced for the assistant turn block
+            // but never replayed into `self.messages` (the assistant message
+            // above carries text + tool_calls only), matching the Anthropic
+            // transport and keeping multi-turn requests reasoning-free.
+            thinking: reasoning_out,
             tool_calls,
             stop,
             usage,
@@ -451,6 +603,7 @@ mod tests {
             base_url: "http://x".into(),
             api_key: "k".into(),
             messages: vec![json!({"role": "user", "content": "hi"})],
+            reasoning: ReasoningProfile::Off,
         }
     }
     fn opts(system: SystemPrompt) -> TurnOpts {
@@ -516,5 +669,79 @@ mod tests {
         assert_eq!(chat_split(&msgs, 3), Some(1));
         // No assistant before limit 1 → nothing safe to compact.
         assert_eq!(chat_split(&msgs, 1), None);
+    }
+
+    #[test]
+    fn reasoning_profile_off_never_sends_effort() {
+        let p = ReasoningProfile::Off;
+        assert_eq!(p.reasoning_effort(None), None);
+        assert_eq!(p.reasoning_effort(Some("high")), None);
+        assert_eq!(p.reasoning_effort(Some("medium")), None);
+    }
+
+    #[test]
+    fn reasoning_profile_mistral_collapses_to_none_or_high() {
+        let p = ReasoningProfile::Mistral;
+        // Unset / blank ⇒ omit (Mistral's no-reasoning default; mirrors the
+        // "no effort ⇒ no thinking" convention).
+        assert_eq!(p.reasoning_effort(None), None);
+        assert_eq!(p.reasoning_effort(Some("")), None);
+        assert_eq!(p.reasoning_effort(Some("  ")), None);
+        // Explicit off ⇒ "none".
+        assert_eq!(p.reasoning_effort(Some("off")), Some("none"));
+        assert_eq!(p.reasoning_effort(Some("none")), Some("none"));
+        assert_eq!(p.reasoning_effort(Some("minimal")), Some("none"));
+        // Mistral rejects medium/low (verified live) → collapse to the only
+        // reasoning-on value it accepts.
+        assert_eq!(p.reasoning_effort(Some("low")), Some("high"));
+        assert_eq!(p.reasoning_effort(Some("medium")), Some("high"));
+        assert_eq!(p.reasoning_effort(Some("high")), Some("high"));
+        assert_eq!(p.reasoning_effort(Some("max")), Some("high"));
+        assert_eq!(p.reasoning_effort(Some("HIGH")), Some("high"));
+    }
+
+    #[test]
+    fn build_body_adds_reasoning_effort_only_under_profile() {
+        // Off profile: no reasoning_effort even when an effort is set.
+        let mut tx = transport();
+        tx.reasoning = ReasoningProfile::Off;
+        let mut o = opts(SystemPrompt::default());
+        o.effort = Some("high".into());
+        assert!(tx.build_body(&[], &o).get("reasoning_effort").is_none());
+
+        // Mistral profile: maps and sends.
+        tx.reasoning = ReasoningProfile::Mistral;
+        let body = tx.build_body(&[], &o);
+        assert_eq!(body["reasoning_effort"], "high");
+
+        // Mistral profile, no effort: omit.
+        let o_none = opts(SystemPrompt::default());
+        assert!(
+            tx.build_body(&[], &o_none)
+                .get("reasoning_effort")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn extract_thinking_text_handles_chunk_shapes() {
+        // The live shape: thinking is an array of {type:"text", text}.
+        assert_eq!(
+            extract_thinking_text(&json!([{"type": "text", "text": "Okay"}])),
+            "Okay"
+        );
+        assert_eq!(
+            extract_thinking_text(
+                &json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}])
+            ),
+            "ab"
+        );
+        // Empty array (the thinking→text transition chunk) yields nothing.
+        assert_eq!(extract_thinking_text(&json!([])), "");
+        // Bare-string fallback.
+        assert_eq!(extract_thinking_text(&json!("plain")), "plain");
+        // Non-text parts ignored.
+        assert_eq!(extract_thinking_text(&json!([{"type": "image"}])), "");
+        assert_eq!(extract_thinking_text(&Value::Null), "");
     }
 }

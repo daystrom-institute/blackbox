@@ -112,9 +112,11 @@ impl Provider {
     /// Parse a streaming JSON event and update the sink.
     pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
-                parse_claude_event(evt, sink)
-            }
+            Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Brodex
+            | Provider::VibeBh => parse_claude_event(evt, sink),
             Provider::Inception => parse_opencode_event(evt, sink),
             Provider::Codex => parse_codex_event(evt, sink),
             Provider::Copilot => parse_copilot_event(evt, sink),

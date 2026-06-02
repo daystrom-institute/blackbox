@@ -537,6 +537,59 @@ fn default_claude_compatible_env(
     Some(env)
 }
 
+/// Harness env for the vibe-bh provider — Mistral on the OpenAI
+/// **chat-completions** transport. The base URL is fixed to the Mistral API and
+/// the reasoning profile selects the Mistral effort/thinking shaping; the key is
+/// lifted from `MISTRAL_API_KEY` in the process env, falling back to the
+/// operator's `~/.vibe/.env` (where the vibe CLI stores it). The chat-transport
+/// analogue of `default_claude_compatible_env`, and the credential-wiring
+/// template for future OpenAI-compatible chat endpoints.
+fn default_vibe_harness_env(home_dir: &Path) -> HashMap<String, String> {
+    let mut env = HashMap::from([
+        (
+            "BRO_HARNESS_TRANSPORT".to_string(),
+            "openai-chat".to_string(),
+        ),
+        (
+            "BRO_HARNESS_CHAT_REASONING".to_string(),
+            "mistral".to_string(),
+        ),
+        (
+            "OPENAI_BASE_URL".to_string(),
+            "https://api.mistral.ai/v1".to_string(),
+        ),
+    ]);
+
+    if let Some(key) = std::env::var("MISTRAL_API_KEY")
+        .ok()
+        .filter(|k| !k.is_empty())
+        .or_else(|| read_vibe_env_key(home_dir, "MISTRAL_API_KEY"))
+    {
+        env.insert("OPENAI_API_KEY".to_string(), key);
+    }
+    env
+}
+
+/// Read a single `KEY=value` entry from `~/.vibe/.env` (the vibe CLI's dotenv).
+/// Tolerant of an `export ` prefix and surrounding quotes; returns None if the
+/// file or key is absent.
+fn read_vibe_env_key(home_dir: &Path, key: &str) -> Option<String> {
+    let body = std::fs::read_to_string(home_dir.join(".vibe").join(".env")).ok()?;
+    for raw in body.lines() {
+        let line = raw.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        if let Some(rest) = line.strip_prefix(key)
+            && let Some(val) = rest.trim_start().strip_prefix('=')
+        {
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if !val.is_empty() {
+                return Some(val.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn normalized_account_suffix(name: &str) -> Option<String> {
     let lowered = name.trim().to_ascii_lowercase();
     if lowered.is_empty() {
@@ -587,6 +640,9 @@ fn synthesized_account_env_for_home(
         | Provider::Inception
         | Provider::Gemini
         | Provider::Vibe
+        // vibe-bh authenticates via MISTRAL_API_KEY (env / ~/.vibe/.env), not a
+        // per-account config dir.
+        | Provider::VibeBh
         | Provider::Workflow => return None,
     };
 
@@ -630,6 +686,13 @@ fn resolve_provider_env_inner(
             "BRO_HARNESS_TRANSPORT".to_string(),
             "openai-responses".to_string(),
         )]),
+        // vibe-bh rides the harness on the OpenAI chat-completions transport
+        // against the Mistral API; base URL + reasoning profile are fixed and
+        // the key comes from MISTRAL_API_KEY (env / ~/.vibe/.env).
+        Provider::VibeBh => dirs::home_dir()
+            .as_deref()
+            .map(default_vibe_harness_env)
+            .unwrap_or_default(),
         Provider::Inception => {
             default_opencode_env(provider, store_dir, model, suppress_instructions)
         }
@@ -1638,6 +1701,48 @@ mod tests {
         );
         // No OPENAI_API_KEY → harness uses Codex ChatGPT OAuth from CODEX_HOME.
         assert!(!resolved.contains_key("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_vibebh_selects_chat_transport_and_mistral() {
+        let store = temp_store();
+        let home = temp_store();
+        let resolved = with_fake_home(home.path(), || {
+            // Isolate from any real MISTRAL_API_KEY in the process env so the
+            // ~/.vibe/.env fallback path is exercised deterministically.
+            let prior_key = std::env::var_os("MISTRAL_API_KEY");
+            unsafe {
+                std::env::remove_var("MISTRAL_API_KEY");
+            }
+            let vibe_dir = home.path().join(".vibe");
+            fs::create_dir_all(&vibe_dir).unwrap();
+            fs::write(vibe_dir.join(".env"), "MISTRAL_API_KEY=\"test-mistral-key\"\n").unwrap();
+
+            let resolved =
+                resolve_provider_env(Provider::VibeBh, None, None, store.path(), None).unwrap();
+
+            if let Some(value) = prior_key {
+                unsafe { std::env::set_var("MISTRAL_API_KEY", value) }
+            }
+            resolved
+        });
+        assert_eq!(
+            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
+            Some("openai-chat")
+        );
+        assert_eq!(
+            resolved.get("BRO_HARNESS_CHAT_REASONING").map(String::as_str),
+            Some("mistral")
+        );
+        assert_eq!(
+            resolved.get("OPENAI_BASE_URL").map(String::as_str),
+            Some("https://api.mistral.ai/v1")
+        );
+        // Key lifted from ~/.vibe/.env (quotes stripped).
+        assert_eq!(
+            resolved.get("OPENAI_API_KEY").map(String::as_str),
+            Some("test-mistral-key")
+        );
     }
 
     #[test]

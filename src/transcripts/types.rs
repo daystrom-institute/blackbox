@@ -413,6 +413,7 @@ impl NormalizedTranscriptEvent {
             Provider::Gemini => "gemini",
             Provider::Copilot => "copilot",
             Provider::Vibe => "vibe",
+            Provider::VibeBh => "vibebh",
             Provider::Glm => "opencode",
             Provider::Deepseek => "deepseek",
             Provider::Inception => "inception",

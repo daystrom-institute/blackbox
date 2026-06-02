@@ -453,7 +453,7 @@ impl Provider {
             // Harness providers persist sessions in their own store
             // (~/.bro-harness), not the claude projects dir; no cwd-aware
             // discovery, so resume needs an explicit project_dir.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
             Provider::Inception => None,
             Provider::Codex => resolve_codex_session_cwd(session_id),
             Provider::Gemini => resolve_gemini_session_cwd(session_id),

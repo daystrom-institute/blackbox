@@ -118,9 +118,9 @@ impl Provider {
                 args.extend([name.into(), url.into()]);
                 Some(args)
             }
-            // Harness providers (glm/deepseek/brodex) use transient inline
-            // --mcp-config injection, not vendor-CLI mcp add/remove/list.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
+            // Harness providers (glm/deepseek/brodex/vibebh) use transient
+            // inline --mcp-config injection, not vendor-CLI mcp add/remove/list.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
             Provider::Vibe | Provider::Workflow => None,
         }
     }
@@ -176,9 +176,9 @@ impl Provider {
                     name.into(),
                 ])
             }
-            // Harness providers (glm/deepseek/brodex) use transient inline
-            // --mcp-config injection, not vendor-CLI mcp add/remove/list.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
+            // Harness providers (glm/deepseek/brodex/vibebh) use transient
+            // inline --mcp-config injection, not vendor-CLI mcp add/remove/list.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
             Provider::Vibe | Provider::Workflow => None,
         }
     }
@@ -196,9 +196,9 @@ impl Provider {
             ]),
             Provider::Codex => Some(vec!["mcp".into(), "list".into()]),
             Provider::Gemini => Some(vec!["mcp".into(), "list".into()]),
-            // Harness providers (glm/deepseek/brodex) use transient inline
-            // --mcp-config injection, not vendor-CLI mcp add/remove/list.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => None,
+            // Harness providers (glm/deepseek/brodex/vibebh) use transient
+            // inline --mcp-config injection, not vendor-CLI mcp add/remove/list.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
             Provider::Vibe | Provider::Workflow => None,
         }
     }
@@ -239,7 +239,7 @@ impl Provider {
             // accept claude's --allowedTools. This is the client permission
             // plane (recursion guard + brofile + per-dispatch); surface is
             // separate and server-side via the MCP URL.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
                 let deny = expand_filter_patterns(&filters.disallow);
                 if !deny.is_empty() {
                     args.push("--deny-tools".into());
@@ -308,7 +308,11 @@ impl Provider {
             return Vec::new();
         }
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+            Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Brodex
+            | Provider::VibeBh => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
             Provider::Codex

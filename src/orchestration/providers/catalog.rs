@@ -25,6 +25,7 @@ pub(super) fn models_for(provider: Provider) -> &'static [ModelInfo] {
         Provider::Codex | Provider::Brodex => CODEX_MODELS,
         Provider::Copilot => COPILOT_MODELS,
         Provider::Vibe => VIBE_MODELS,
+        Provider::VibeBh => VIBEBH_MODELS,
         Provider::Gemini => GEMINI_MODELS,
         Provider::Workflow => &[],
     }
@@ -36,6 +37,7 @@ pub(super) fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
         Provider::Inception => OPENCODE_VARIANTS,
         Provider::Codex | Provider::Brodex => CODEX_EFFORTS,
         Provider::Copilot => COPILOT_EFFORTS,
+        Provider::VibeBh => VIBEBH_EFFORTS,
         _ => &[],
     }
 }
@@ -388,6 +390,55 @@ static COPILOT_EFFORTS: &[EffortInfo] = &[
 // env vars, or `vibe --setup`. Listing models here would imply they're
 // selectable through bro_exec/brofiles CLI flags when they aren't.
 static VIBE_MODELS: &[ModelInfo] = &[];
+
+// vibe-bh DOES take a model id (the harness `--model` flag is forwarded
+// verbatim as the chat-completions `model` field), unlike the vibe CLI. These
+// are real Mistral API model ids (verified live against /v1/models, 2026-06-01).
+static VIBEBH_MODELS: &[ModelInfo] = &[
+    ModelInfo {
+        id: "mistral-medium-3.5",
+        description: "Mistral Medium 3.5, reasoning-capable flagship via bro-harness",
+        default: true,
+    },
+    ModelInfo {
+        id: "mistral-vibe-cli-latest",
+        description: "Mistral vibe-CLI-tuned model via bro-harness",
+        default: false,
+    },
+    ModelInfo {
+        id: "magistral-medium-latest",
+        description: "Magistral Medium, dedicated reasoning model via bro-harness",
+        default: false,
+    },
+    ModelInfo {
+        id: "devstral-medium-latest",
+        description: "Devstral Medium, coding-tuned model via bro-harness",
+        default: false,
+    },
+    ModelInfo {
+        id: "devstral-small-latest",
+        description: "Devstral Small, fast low-cost coding model via bro-harness",
+        default: false,
+    },
+];
+
+// Mistral reasoning models accept reasoning_effort ∈ {none, high} only (verified
+// live — medium/low 400). The chat transport collapses any effort into that set,
+// but the catalog advertises just the two honest values. Default `high` to
+// showcase the reasoning path (mirrors vibe's own thinking="high" default);
+// pick `none` for a fast non-reasoning turn.
+static VIBEBH_EFFORTS: &[EffortInfo] = &[
+    EffortInfo {
+        id: "none",
+        description: "No reasoning — fastest, lowest cost",
+        default: false,
+    },
+    EffortInfo {
+        id: "high",
+        description: "Full reasoning (Mistral thinking)",
+        default: true,
+    },
+];
 
 static GEMINI_MODELS: &[ModelInfo] = &[
     ModelInfo {

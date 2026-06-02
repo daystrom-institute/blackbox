@@ -14,10 +14,10 @@ impl Provider {
     fn bin_with_env(&self) -> String {
         match self {
             Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
-            // GLM/DeepSeek/Brodex ride the custom harness instead of a vendor
-            // CLI; transport + credentials are selected via env (see
+            // GLM/DeepSeek/Brodex/VibeBh ride the custom harness instead of a
+            // vendor CLI; transport + credentials are selected via env (see
             // brofile::resolve_provider_env).
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
                 std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
             }
             Provider::Inception => {
@@ -39,7 +39,9 @@ impl Provider {
                 .unwrap_or_else(|| self.bin_with_env()),
             // Harness providers resolve via BRO_HARNESS_BIN (bin_with_env);
             // no dedicated config override today.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex => self.bin_with_env(),
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+                self.bin_with_env()
+            }
             Provider::Inception => cfg
                 .opencode_bin
                 .clone()
@@ -202,7 +204,7 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
 fn harness_default_model(provider: Provider) -> Option<String> {
     if !matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex
+        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
     ) {
         return None;
     }
@@ -231,7 +233,11 @@ impl Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+            Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Brodex
+            | Provider::VibeBh => {
                 let mut args = vec![
                     "-p".into(),
                     prompt.into(),
@@ -365,7 +371,11 @@ impl Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self {
-            Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex => {
+            Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Brodex
+            | Provider::VibeBh => {
                 let mut args = vec![
                     "--resume".into(),
                     session_id.into(),

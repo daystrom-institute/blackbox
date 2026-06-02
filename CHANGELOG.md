@@ -10,6 +10,21 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `vibebh` provider: Mistral (vibe) ridden through `bro-harness` on the OpenAI
+  chat-completions transport, parallel to the existing `vibe` CLI provider
+  (which is unchanged). Aliased `vibe-bh`; dispatchable via `bro_exec`,
+  workflows, `bro_resume`, and selectable in the Fleet TUI. Capabilities are
+  tool-use + resume (the `--model` flag is forwarded verbatim; default
+  `mistral-medium-3.5`). Credentials come from `MISTRAL_API_KEY` (process env or
+  `~/.vibe/.env`); base URL and reasoning profile are fixed. The exemplar
+  first-class completions-transport harness provider — the wiring template for
+  future OpenAI-compatible endpoints.
+- `bro-harness` OpenAI chat-completions reasoning support: the chat transport
+  now folds Mistral's array-form `content` (typed `thinking` chunks) into a
+  streamed thinking block and the turn's display thinking, and sends a mapped
+  `reasoning_effort` (Mistral accepts `{none, high}`) gated by
+  `BRO_HARNESS_CHAT_REASONING`. Reasoning-output parsing is provider-agnostic
+  and additive; the plain-string (non-reasoning) path is unchanged.
 - Terminal mode (`terminal_mode: "tmux"` brofile attribute): TUI-capable
   providers (Claude, vanilla Codex) run their real interactive TUI inside a tmux
   pane instead of as a headless child, and the turn's output is resolved from

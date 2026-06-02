@@ -233,7 +233,12 @@ fn fleet_state_from_snapshot(
 /// dispatchable everywhere else (bro_exec, orchestration). One-shot/under-
 /// supported providers (Codex, Gemini, Vibe, Inception, Copilot) are likewise
 /// hidden; they remain dispatchable elsewhere, just not pickable in the cockpit.
-const FLEET_PROVIDERS: &[Provider] = &[Provider::Glm, Provider::Deepseek, Provider::Brodex];
+const FLEET_PROVIDERS: &[Provider] = &[
+    Provider::Glm,
+    Provider::Deepseek,
+    Provider::Brodex,
+    Provider::VibeBh,
+];
 const DEFAULT_FLEET_PROVIDER: Provider = Provider::Brodex;
 
 // ── Zoom axis (§5.1) ──────────────────────────────────────────────────────
@@ -4948,6 +4953,7 @@ fn provider_tag(p: Provider) -> &'static str {
         Provider::Inception => "inc",
         Provider::Copilot => "cop",
         Provider::Vibe => "vib",
+        Provider::VibeBh => "vbh",
         Provider::Gemini => "gem",
         Provider::Workflow => "wf",
     }
@@ -4959,6 +4965,7 @@ fn provider_color(p: Provider) -> Color {
         Provider::Glm => Color::LightBlue,
         Provider::Deepseek => Color::LightCyan,
         Provider::Brodex => Color::LightGreen,
+        Provider::VibeBh => Color::LightRed,
         _ => Color::Gray,
     }
 }

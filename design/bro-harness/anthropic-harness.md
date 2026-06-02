@@ -299,7 +299,7 @@ loop {
     for block in resp.content_blocks {
         match block {
             Text(t)         => emit stream_event(content_block_delta text_delta)
-            Thinking(t)     => (optionally) emit; not surfaced to EventSink
+            Thinking(t)     => accumulate into TurnOutput.thinking (display-only block; see "Reasoning / thinking across transports")
             ToolUse(tu)     => pending.push(tu)        // client tool — we run it
             ServerToolUse(_) => {}                      // provider already ran it
             ToolResult(_)    => {}                      // server-side result, relay only
@@ -398,7 +398,7 @@ pub trait Transport: Send {
 
 Normalized types the loop works with: `ToolSpec {name, description, schema}`,
 `TurnOpts {model, max_tokens, system, effort, web_search}`,
-`TurnOutput {text, tool_calls: Vec<ToolCall>, stop: StopReason, usage}`,
+`TurnOutput {text, thinking, tool_calls: Vec<ToolCall>, stop: StopReason, usage}`,
 `ToolCall {id, name, args}`, `ToolResult {id, content, is_error}`,
 `StopReason {ToolCalls | Done | Length | Other}`.
 
@@ -443,6 +443,40 @@ Endpoint/client/skew are env-overridable (`CODEX_OAUTH_TOKEN_URL`,
 non-canonical `web_search_prime`/`tool_result` variant; DeepSeek returns
 canonical `web_search_tool_result` — the loose response parsing tolerates
 both.
+
+### Reasoning / thinking across transports
+
+Reasoning output is normalized into `TurnOutput.thinking` regardless of
+transport, then emitted by the loop as a **display-only** Anthropic-shaped
+`thinking` content block on the assistant turn (and as streamed
+`content_block_delta {thinking_delta}` events). It is **never** replayed into
+the transport's conversation buffer — there is no persisted signature to round-
+trip, and reasoning is request-scoped — so multi-turn requests stay reasoning-
+free. The daemon's `parse_claude_event` ignores `thinking_delta` (text only);
+the fleet TUI renders the final thinking block.
+
+Each transport differs only in the *request knob* and the *wire shape* of
+reasoning output:
+
+| | **anthropic** | **openai-chat** | **openai-responses** |
+|---|---|---|---|
+| Request knob | `thinking: {type:adaptive}` + `output_config.effort` (effort-gated) | `reasoning_effort` (profile-gated) | reasoning items (Responses-native) |
+| Output shape | `thinking` content block | array-form `delta.content` chunks `{type:thinking, thinking:[{type:text,text}]}` | reasoning output items |
+
+The **openai-chat** path is the subtle one (verified live against Mistral
+`mistral-medium-3.5`, 2026-06-01): once reasoning is on, `delta.content` switches
+from a plain string to a **typed-chunk array** mixing `thinking` and `text`
+chunks (a single delta can carry an empty thinking chunk plus the first text
+chunk at the transition), then reverts to a plain string after the thinking
+block closes. The fold handles string-or-array content per delta. The
+`reasoning_effort` request knob is provider-specific and gated by
+`BRO_HARNESS_CHAT_REASONING` (`ReasoningProfile`): Mistral accepts only
+`{none, high}` (`medium`/`low` 400 with `invalid_request_invalid_args`), so a
+generic harness effort is collapsed into that set; the `Off` profile sends no
+`reasoning_effort` and the array-content parsing stays inert on endpoints that
+never emit it. This is the transport seam the `vibebh` provider rides
+(`BRO_HARNESS_TRANSPORT=openai-chat` + `BRO_HARNESS_CHAT_REASONING=mistral`),
+and the template for future reasoning-capable OpenAI-compatible endpoints.
 
 ## Deferred tooling & tiering (our own Tool Search)
 

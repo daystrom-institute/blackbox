@@ -127,6 +127,7 @@ impl ClassifierConfig {
             Some("glm") => Provider::Glm,
             Some("deepseek") | Some("ds") => Provider::Deepseek,
             Some("brodex") | Some("bdx") => Provider::Brodex,
+            Some("vibebh") | Some("vibe-bh") => Provider::VibeBh,
             _ => Provider::Glm,
         }
     }
@@ -1271,12 +1272,16 @@ fn merge_env(
 
 /// Providers that speak the persistent bidirectional stream-json control
 /// protocol: Claude (CLI bidi mode) and the bro-harness providers GLM /
-/// DeepSeek / Brodex (§2). Others are one-shot only. Public so the cockpit can
-/// tell whether a non-live agent is resumable.
+/// DeepSeek / Brodex / VibeBh (§2). Others are one-shot only. Public so the
+/// cockpit can tell whether a non-live agent is resumable.
 pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex
+        Provider::Claude
+            | Provider::Glm
+            | Provider::Deepseek
+            | Provider::Brodex
+            | Provider::VibeBh
     )
 }
 
@@ -1295,7 +1300,7 @@ fn bidi_seeds_turn1_via_stdin(provider: Provider) -> bool {
 fn provider_uses_bro_harness(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex
+        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
     )
 }
 
@@ -1345,6 +1350,7 @@ mod tests {
             Provider::Glm,
             Provider::Deepseek,
             Provider::Brodex,
+            Provider::VibeBh,
         ] {
             let args = p.build_exec_args("hi", "sess", None, None);
             assert!(
@@ -1399,7 +1405,7 @@ mod tests {
         // stdin. bro-harness seeds turn-1 from `-p` → must NOT be stdin-seeded
         // (would double the first turn).
         assert!(bidi_seeds_turn1_via_stdin(Provider::Claude));
-        for p in [Provider::Glm, Provider::Deepseek, Provider::Brodex] {
+        for p in [Provider::Glm, Provider::Deepseek, Provider::Brodex, Provider::VibeBh] {
             assert!(
                 !bidi_seeds_turn1_via_stdin(p),
                 "{p} seeds turn-1 from -p; stdin-seeding would double it"
@@ -1414,6 +1420,7 @@ mod tests {
             Provider::Glm,
             Provider::Deepseek,
             Provider::Brodex,
+            Provider::VibeBh,
         ] {
             assert!(provider_supports_bidi(p), "{p} should be bidi-capable");
         }
