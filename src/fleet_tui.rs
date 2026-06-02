@@ -3139,23 +3139,14 @@ fn render_transcript(
     const ARG_MAX_LINES: usize = 15;
     const RESULT_MAX_LINES: usize = 25;
 
-    let hr = || {
-        Line::from(Span::styled(
-            "─".repeat(width.max(1)),
-            Style::default().fg(Color::DarkGray),
-        ))
-    };
-
     let mut lines: Vec<Line<'static>> = Vec::new();
     if !initial_prompt.is_empty() {
-        // Rule sits between the user turn and the assistant response.
         let status = if items.is_empty() {
             TurnRenderStatus::Waiting
         } else {
             TurnRenderStatus::Normal
         };
         lines.extend(render_steer_with_status(initial_prompt, width, status));
-        lines.push(hr());
         lines.push(Line::from(""));
     }
     if items.is_empty() && initial_prompt.is_empty() && queued_turns.is_empty() {
@@ -3169,15 +3160,12 @@ fn render_transcript(
         let before = lines.len();
         let mut compact_tool_call = false;
         match item {
-            // Each steer is followed by the turn rule (user → assistant
-            // boundary); the assistant response renders after it.
             TranscriptItem::UserSteer(t) => {
                 lines.extend(render_steer_with_status(
                     t,
                     width,
                     turn_render_status(items, idx),
                 ));
-                lines.push(hr());
             }
             TranscriptItem::AssistantText(t) => lines.extend(render_markdown_with_width(t, width)),
             TranscriptItem::Thinking(t) => {
@@ -3285,9 +3273,8 @@ fn render_transcript(
                     Style::default().fg(Color::DarkGray),
                 )));
             }
-            // The turn rule now leads each turn (after the user steer), so the
-            // end-of-turn result footer renders nothing — its stats live under
-            // the composer.
+            // The end-of-turn result footer renders nothing — its stats live
+            // under the composer.
             TranscriptItem::TurnFooter { .. } => {}
         }
         // Only space items that actually rendered (a suppressed quiet result
@@ -3305,7 +3292,6 @@ fn render_transcript(
             width,
             TurnRenderStatus::Queued,
         ));
-        lines.push(hr());
     }
     lines
 }
