@@ -14,12 +14,13 @@ brief: "A new top-level bro-client TUI: a human cockpit for dispatching and live
 > **As-built record.** The v1 cockpit and its entire harness-side substrate
 > (keystone §2, exec model §3, roster/nav/transcript §5) are built and runnable.
 > The residual work was excised to the backlog:
-> [`backlog-follow-ons.md`](./backlog-follow-ons.md) (§7 items 8/9/10/15/16:
-> `@project` cwd+MCP config, input-history persistence, allocator probe-core
-> extraction, capability badges + headroom v2, Alerting reuse + `/resume`-deleted)
-> and [`backlog-standalone-view.md`](./backlog-standalone-view.md) (§5.5). Net-new
-> UX polish surfaced by operator feedback (animated throbber, roster
-> cost→report-teaser, compact tool-call rendering) lives in
+> [`backlog-follow-ons.md`](./backlog-follow-ons.md) (§7 items 9/10/15/16:
+> input-history persistence, allocator probe-core extraction, capability badges
+> + headroom v2, Alerting reuse + `/resume`-deleted; §7.8 `@project`
+> cwd+MCP config is now built)
+> and [`backlog-standalone-view.md`](./backlog-standalone-view.md) (§5.5).
+> Operator-feedback UX polish (focused executor/classifier activity strip, roster
+> `report` teaser, compact tool-call rendering) has landed and is recorded in
 > [`backlog-ux-polish.md`](./backlog-ux-polish.md). §7 is retained below as the
 > as-built ledger.
 
@@ -34,10 +35,10 @@ brief: "A new top-level bro-client TUI: a human cockpit for dispatching and live
 > dispatch, live steering, interrupt, `/compact`, the verbose transcript, the
 > table roster with state buckets + timing columns, the navigation model +
 > slash-command autocomplete, session persistence/reload, resume-on-steer, and
-> Ctrl+X stop/delete. What remains are the **follow-ons**: the `@project` cwd /
-> MCP config (§7.8), input-history persistence (§7.9), the allocator probe-core
-> extraction for provider-headroom v2 (§7.10), Alerting-bucket supervision reuse,
-> and `/resume` of a *deleted* session. Per-item status (✅ done · ◑ partial ·
+> Ctrl+X stop/delete. What remains are the **follow-ons**: input-history
+> persistence (§7.9), the allocator probe-core extraction for provider-headroom
+> v2 (§7.10), Alerting-bucket supervision reuse, and `/resume` of a *deleted*
+> session. Per-item status (✅ done · ◑ partial ·
 > ○ follow-on) is marked in §7.
 >
 > **Grounding.** Every claim is cited `file:line`. Blackbox claims cite this
@@ -414,9 +415,9 @@ management; the standalone shell reuses the same component with no new model.
 ## 7. What needs to be added (net new)
 
 > Retained as the **as-built ledger**. The ✅ items are shipped. The residual
-> ◑/○ items (8 `@project` config, 9 input-history persist, 10 allocator
-> probe-core, 15 capability badges + headroom v2, 16 Alerting reuse +
-> `/resume`-deleted) are tracked as actionable work in
+> ◑/○ items (9 input-history persist, 10 allocator probe-core,
+> 15 capability badges + headroom v2, 16 Alerting reuse + `/resume`-deleted) are
+> tracked as actionable work in
 > [`backlog-follow-ons.md`](./backlog-follow-ons.md).
 
 Substrate:
@@ -465,7 +466,11 @@ Substrate:
 8. **TUI-local JSON config** (§5.2) — `@project` map (`keyword → absolute dir`) +
    typeahead, **and MCP server defs** injected via `--mcp-config`
    (`exec_args.rs:243`). Daemon-free; not the bbox project registry; no MCP mgmt
-   UI in v1. ○ **Follow-on** — not built; v1 uses the launch cwd / `--cwd`.
+   UI in v1. ✅ **Implemented** — `fleet.json.mcpServers` is injected via
+   `Provider::build_fleet_mcp_args`; `fleet.json.projects` drives
+   `@<keyword> <prompt>` roster dispatch, validates the target cwd, creates the
+   normal isolated fleet worktree from that project, and offers roster composer
+   completion/callouts.
 9. **Per-agent input-history store** (§5.3) — in-memory; optional persist to the
    cockpit's `store_dir`. ◑ **Partial** — in-memory recall implemented
    (single-agent ↑/↓, down-to-clear); on-disk persistence not yet.

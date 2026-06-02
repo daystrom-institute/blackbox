@@ -49,13 +49,21 @@ pub use super::tail::TailEvent;
 /// dispatched agent regardless of provider (`fleet-tui.md` §5.2). The
 /// normalization is `McpServerConfig` (the same Http/Sse/Stdio shape the rest of
 /// the codebase uses); the only per-provider work is translating it to CLI args
-/// at dispatch (`Provider::build_fleet_mcp_args`). Future surfaces (e.g. the
-/// `@project` cwd map) hang off this same file.
+/// at dispatch (`Provider::build_fleet_mcp_args`). The `projects` map is the
+/// fleet-local `@project` cwd selector (`keyword -> absolute dir`) used by the
+/// roster composer.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FleetConfig {
     #[serde(default, rename = "mcpServers")]
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+
+    /// Fleet-local project aliases used by the roster composer:
+    /// `@keyword <prompt>` dispatches a new isolated worktree from this cwd.
+    /// This is intentionally not the bbox project registry.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub projects: BTreeMap<String, String>,
 
     /// Extra harness tools to pin into the hot tool surface for every fleet
     /// agent. Fleet also contributes [`DEFAULT_FLEET_PIN_TOOLS`], so this field
@@ -1339,11 +1347,7 @@ fn merge_env(
 pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Claude
-            | Provider::Glm
-            | Provider::Deepseek
-            | Provider::Brodex
-            | Provider::VibeBh
+        Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
     )
 }
 
@@ -1453,6 +1457,27 @@ mod tests {
     }
 
     #[test]
+    fn fleet_config_parses_project_alias_map() {
+        let cfg: FleetConfig = serde_json::from_str(
+            r#"{
+                "projects": {
+                    "blackbox": "/Users/me/repos/transcript-search",
+                    "tools": "/Users/me/repos/transcript-search/crates/bro-tools"
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.projects.get("blackbox").map(String::as_str),
+            Some("/Users/me/repos/transcript-search")
+        );
+        assert_eq!(
+            cfg.projects.get("tools").map(String::as_str),
+            Some("/Users/me/repos/transcript-search/crates/bro-tools")
+        );
+    }
+
+    #[test]
     fn fleet_config_pin_tools_are_additive_to_grounding_defaults() {
         let cfg: FleetConfig = serde_json::from_str(r#"{ "pinTools": ["extra_tool"] }"#).unwrap();
         let pins = cfg.resolved_pin_tools();
@@ -1467,7 +1492,12 @@ mod tests {
         // stdin. bro-harness seeds turn-1 from `-p` → must NOT be stdin-seeded
         // (would double the first turn).
         assert!(bidi_seeds_turn1_via_stdin(Provider::Claude));
-        for p in [Provider::Glm, Provider::Deepseek, Provider::Brodex, Provider::VibeBh] {
+        for p in [
+            Provider::Glm,
+            Provider::Deepseek,
+            Provider::Brodex,
+            Provider::VibeBh,
+        ] {
             assert!(
                 !bidi_seeds_turn1_via_stdin(p),
                 "{p} seeds turn-1 from -p; stdin-seeding would double it"

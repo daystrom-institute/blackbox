@@ -20,7 +20,7 @@
 //! until the seam exists. The verbose inline transcript parser (§5.4, item 14)
 //! is also a follow-up; this skeleton renders the latest assistant message.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::future::Future;
 use std::io;
@@ -326,6 +326,8 @@ struct App {
     provider_flash_until: Option<Instant>,
     /// Selected completion in the slash-command menu (§5.1 slash carveout).
     slash_cursor: usize,
+    /// Selected completion in the roster `@project` menu.
+    project_cursor: usize,
     /// Buckets the user has collapsed.
     collapsed: HashSet<FleetState>,
     /// Fleet-local config state displayed and edited by `/config`.
@@ -422,6 +424,7 @@ impl App {
             next_effort: default_effort_for(default_provider).map(str::to_string),
             provider_flash_until: None,
             slash_cursor: 0,
+            project_cursor: 0,
             collapsed: HashSet::new(),
             config,
             config_cursor: 0,
@@ -549,7 +552,23 @@ fn launch_standalone_current_input(app: &mut App) {
 }
 
 fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
-    let worktree = match prepare_dispatch_worktree(&app.orch, app.launch_cwd.as_deref(), &prompt) {
+    let cfg = FleetConfig::load();
+    let project = match resolve_project_directive(&prompt, &cfg.projects) {
+        Ok(project) => project,
+        Err(e) => {
+            app.set_status(e, Duration::from_secs(6));
+            return;
+        }
+    };
+    let prompt = project.prompt;
+    let name = if project.alias.is_some() {
+        truncate(&prompt, NAME_LEN)
+    } else {
+        name
+    };
+    let launch_cwd = project.cwd.as_deref().or(app.launch_cwd.as_deref());
+
+    let worktree = match prepare_dispatch_worktree(&app.orch, launch_cwd, &prompt) {
         Ok(worktree) => worktree,
         Err(e) => {
             app.set_status(
@@ -618,9 +637,14 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
     app.orch.persist();
     app.set_status(
         format!(
-            "dispatched {} agent {} in {}",
+            "dispatched {} agent {}{} in {}",
             app.next_provider,
             &id[..8.min(id.len())],
+            project
+                .alias
+                .as_deref()
+                .map(|alias| format!(" @{alias}"))
+                .unwrap_or_default(),
             path_tail(&worktree.cwd)
         ),
         Duration::from_secs(3),
@@ -695,6 +719,52 @@ struct DispatchWorktree {
     project_cwd: String,
     grounding: String,
     env_overrides: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProjectDirective {
+    alias: Option<String>,
+    cwd: Option<String>,
+    prompt: String,
+}
+
+fn resolve_project_directive(
+    input: &str,
+    projects: &BTreeMap<String, String>,
+) -> Result<ProjectDirective, String> {
+    let trimmed = input.trim_start();
+    let Some(rest) = trimmed.strip_prefix('@') else {
+        return Ok(ProjectDirective {
+            alias: None,
+            cwd: None,
+            prompt: input.to_string(),
+        });
+    };
+    let key_len = rest.find(char::is_whitespace).ok_or_else(|| {
+        "usage: @project <prompt> (Tab completes configured projects)".to_string()
+    })?;
+    let key = &rest[..key_len];
+    if key.is_empty() {
+        return Err("usage: @project <prompt>".to_string());
+    }
+    let prompt = rest[key_len..].trim_start();
+    if prompt.is_empty() {
+        return Err(format!("usage: @{key} <prompt>"));
+    }
+    let raw = projects
+        .get(key)
+        .ok_or_else(|| format!("unknown @project `{key}`"))?;
+    let cwd = PathBuf::from(raw)
+        .canonicalize()
+        .map_err(|e| format!("@{key}: cannot resolve {raw}: {e}"))?;
+    if !cwd.is_dir() {
+        return Err(format!("@{key}: {} is not a directory", cwd.display()));
+    }
+    Ok(ProjectDirective {
+        alias: Some(key.to_string()),
+        cwd: Some(cwd.display().to_string()),
+        prompt: prompt.to_string(),
+    })
 }
 
 fn prepare_dispatch_worktree(
@@ -1143,6 +1213,51 @@ fn complete_slash(app: &mut App) {
     app.slash_cursor = 0;
 }
 
+// ── Roster @project autocomplete ────────────────────────────────────────────
+
+fn project_token(app: &App) -> Option<&str> {
+    if app.zone != Zone::Roster || app.rename_target.is_some() {
+        return None;
+    }
+    let input = app.input.as_str();
+    let rest = input.strip_prefix('@')?;
+    (!rest.contains(char::is_whitespace)).then_some(rest)
+}
+
+fn filtered_projects(app: &App) -> Vec<(&String, &String)> {
+    let Some(token) = project_token(app) else {
+        return Vec::new();
+    };
+    app.config
+        .projects
+        .iter()
+        .filter(|(key, _)| key.starts_with(token))
+        .collect()
+}
+
+fn project_active(app: &App) -> bool {
+    project_token(app).is_some() && !filtered_projects(app).is_empty()
+}
+
+fn project_move(app: &mut App, delta: isize) {
+    let n = filtered_projects(app).len();
+    if n == 0 {
+        return;
+    }
+    let cur = app.project_cursor.min(n - 1) as isize;
+    app.project_cursor = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+}
+
+fn complete_project(app: &mut App) {
+    let projects = filtered_projects(app);
+    if projects.is_empty() {
+        return;
+    }
+    let (key, _) = projects[app.project_cursor.min(projects.len() - 1)];
+    app.set_input(format!("@{key} "));
+    app.project_cursor = 0;
+}
+
 // ── Entry point ─────────────────────────────────────────────────────────────
 
 pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
@@ -1384,13 +1499,16 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         stop_or_delete_selected(app);
         return;
     }
-    // Slash carveout: while the slash menu is up, Tab completes the selection
-    // and ↑/↓ cycle completions (§5.1). Otherwise Tab cycles the current
+    // Completion carveouts: slash commands and roster @project aliases own Tab
+    // and ↑/↓ while their menus are up. Otherwise Tab cycles the current
     // sub-selector level (provider / model / effort).
     let slash = slash_active(app);
+    let project = project_active(app);
     if key.code == KeyCode::Tab {
         if slash {
             complete_slash(app);
+        } else if project {
+            complete_project(app);
         } else {
             match app.zone {
                 Zone::ModelSelector => {
@@ -1439,6 +1557,9 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         // Slash menu owns ↑/↓ while it's up.
         KeyCode::Up if slash => slash_move(app, -1),
         KeyCode::Down if slash => slash_move(app, 1),
+        // Roster @project menu owns ↑/↓ while it's up.
+        KeyCode::Up if project => project_move(app, -1),
+        KeyCode::Down if project => project_move(app, 1),
 
         // ── Text-editing cursor movement (when input is non-empty) ──
         // These sit above navigation so arrow keys edit text when present.
@@ -1497,6 +1618,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
                 app.input.remove(app.cursor_pos);
             }
             app.slash_cursor = 0;
+            app.project_cursor = 0;
             if app.input.is_empty() {
                 app.history_cursor = None;
             }
@@ -1508,6 +1630,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
             app.cursor_pos += c.len_utf8();
             app.history_cursor = None;
             app.slash_cursor = 0;
+            app.project_cursor = 0;
         }
 
         _ => {}
@@ -1876,10 +1999,7 @@ fn apply_config_change(app: &mut App) {
                     "saved {}{}",
                     path_tail(&path.display().to_string()),
                     if sync.started > 0 && sync.stopped > 0 {
-                        format!(
-                            "; restarted {} intern(s)",
-                            sync.started.max(sync.stopped)
-                        )
+                        format!("; restarted {} intern(s)", sync.started.max(sync.stopped))
                     } else if sync.started > 0 {
                         format!("; started {} intern(s)", sync.started)
                     } else if sync.stopped > 0 {
@@ -2470,6 +2590,8 @@ fn draw(f: &mut Frame, app: &mut App) {
         draw_composer(f, chunks[1], app, top_titles, bottom_title);
         if slash_active(app) {
             draw_slash_menu(f, chunks[1], app);
+        } else if project_active(app) {
+            draw_project_menu(f, chunks[1], app);
         }
     }
 
@@ -2524,6 +2646,52 @@ fn draw_slash_menu(f: &mut Frame, composer: Rect, app: &App) {
     f.render_stateful_widget(list, inner, &mut state);
 }
 
+/// Popup list of roster @project completions, anchored above the composer.
+fn draw_project_menu(f: &mut Frame, composer: Rect, app: &App) {
+    let projects = filtered_projects(app);
+    if projects.is_empty() {
+        return;
+    }
+    let h = (projects.len() as u16 + 2).min(8);
+    let w = 64.min(composer.width);
+    let y = composer.y.saturating_sub(h);
+    let area = Rect {
+        x: composer.x,
+        y,
+        width: w,
+        height: h,
+    };
+    let sel = app.project_cursor.min(projects.len() - 1);
+    let items: Vec<ListItem<'static>> = projects
+        .iter()
+        .map(|(key, path)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("@{}  ", key),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(truncate(path, 42), Style::default().fg(Color::DarkGray)),
+            ]))
+        })
+        .collect();
+    let mut state = ListState::default();
+    state.select(Some(sel));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::LightGreen))
+        .title(Span::styled(
+            " @projects — ↑/↓ · Tab completes ",
+            Style::default().fg(Color::LightGreen),
+        ));
+    f.render_widget(Clear, area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let list = List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    f.render_stateful_widget(list, inner, &mut state);
+}
+
 /// Centered popup overlay showing context-aware keyboard shortcuts.
 fn draw_help_overlay(f: &mut Frame, app: &App) {
     let shortcut_lines: Vec<Line<'static>> = match app.zone {
@@ -2531,6 +2699,7 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
             Line::from("  ↑/↓           navigate agents"),
             Line::from("  →             open agent (zoom in)"),
             Line::from("  ←             provider selector"),
+            Line::from("  @project Tab  dispatch from project alias"),
             Line::from("  Ctrl+R        rename agent"),
             Line::from("  Ctrl+X        stop / delete agent"),
             Line::from("  Ctrl+Q        quit"),
@@ -2767,6 +2936,27 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         Span::styled("-", dim),
         Span::styled(format!(" {waiting} waiting "), byline),
     ];
+    if !app.config.projects.is_empty() {
+        let aliases = app
+            .config
+            .projects
+            .keys()
+            .take(4)
+            .map(|key| format!("@{key}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let more = app.config.projects.len().saturating_sub(4);
+        let suffix = if more > 0 {
+            format!(" +{more}")
+        } else {
+            String::new()
+        };
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(
+            format!(" projects {aliases}{suffix} "),
+            Style::default().fg(Color::LightGreen),
+        ));
+    }
     if let Some(status) = &app.status {
         spans.push(Span::styled("──", dim));
         spans.push(Span::styled(format!(" {} ", truncate(status, 70)), byline));
@@ -3970,7 +4160,9 @@ fn promise_snapshot_block(
         if let Some(elapsed) = progress.get("elapsed_ms").and_then(|v| v.as_u64()) {
             parts.push(format!("elapsed={:.1}s", elapsed as f64 / 1000.0));
         }
-        if let Some(last) = progress.get("last_output_elapsed_ms").and_then(|v| v.as_u64())
+        if let Some(last) = progress
+            .get("last_output_elapsed_ms")
+            .and_then(|v| v.as_u64())
             && last > 0
         {
             parts.push(format!("last_out={:.1}s ago", last as f64 / 1000.0));
@@ -3983,11 +4175,7 @@ fn promise_snapshot_block(
             .get("stderr_bytes")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        parts.push(format!(
-            "stdout={} stderr={}",
-            fmt_bytes(so),
-            fmt_bytes(se)
-        ));
+        parts.push(format!("stdout={} stderr={}", fmt_bytes(so), fmt_bytes(se)));
         out.push(Line::from(Span::styled(
             format!("  {}", parts.join("  ")),
             Style::default().fg(Color::DarkGray),
@@ -5987,6 +6175,76 @@ mod tests {
     fn prompt_slug_is_stable_and_path_safe() {
         assert_eq!(prompt_slug("Fix TUI/harness gaps!"), "fix-tui-harness-gaps");
         assert_eq!(prompt_slug("!!!"), "task");
+    }
+
+    #[test]
+    fn project_directive_without_alias_uses_original_prompt() {
+        let projects = BTreeMap::new();
+        let resolved = resolve_project_directive("fix the roster", &projects).unwrap();
+        assert_eq!(
+            resolved,
+            ProjectDirective {
+                alias: None,
+                cwd: None,
+                prompt: "fix the roster".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn project_directive_resolves_alias_and_strips_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut projects = BTreeMap::new();
+        projects.insert("blackbox".to_string(), root.display().to_string());
+
+        let resolved = resolve_project_directive("@blackbox fix the roster", &projects).unwrap();
+        assert_eq!(resolved.alias.as_deref(), Some("blackbox"));
+        assert_eq!(resolved.cwd.as_deref(), Some(root.to_str().unwrap()));
+        assert_eq!(resolved.prompt, "fix the roster");
+    }
+
+    #[test]
+    fn project_directive_routes_each_alias_to_its_project_root() {
+        let soong = tempfile::tempdir().unwrap();
+        let transcript_search = tempfile::tempdir().unwrap();
+        let soong_root = soong.path().canonicalize().unwrap();
+        let transcript_root = transcript_search.path().canonicalize().unwrap();
+        let mut projects = BTreeMap::new();
+        projects.insert("soong".to_string(), soong_root.display().to_string());
+        projects.insert(
+            "transcript-search".to_string(),
+            transcript_root.display().to_string(),
+        );
+
+        let routed_soong = resolve_project_directive("@soong inspect build graph", &projects)
+            .expect("soong alias resolves");
+        let routed_transcript =
+            resolve_project_directive("@transcript-search inspect fleet tui", &projects)
+                .expect("transcript-search alias resolves");
+
+        assert_eq!(routed_soong.alias.as_deref(), Some("soong"));
+        assert_eq!(
+            routed_soong.cwd.as_deref(),
+            Some(soong_root.to_str().unwrap())
+        );
+        assert_eq!(routed_soong.prompt, "inspect build graph");
+        assert_eq!(
+            routed_transcript.alias.as_deref(),
+            Some("transcript-search")
+        );
+        assert_eq!(
+            routed_transcript.cwd.as_deref(),
+            Some(transcript_root.to_str().unwrap())
+        );
+        assert_eq!(routed_transcript.prompt, "inspect fleet tui");
+    }
+
+    #[test]
+    fn project_directive_rejects_unknown_alias() {
+        let projects = BTreeMap::new();
+        let err = resolve_project_directive("@missing fix", &projects).unwrap_err();
+        assert!(err.contains("unknown @project `missing`"));
     }
 
     #[test]

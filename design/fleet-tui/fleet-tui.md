@@ -30,6 +30,9 @@ This page is the **nav waypoint** — start here, then follow a link.
   single-agent transcript. §7 is the as-built ledger; residuals point to backlog.
 - [Window-0 diagnostics surfacing — Phase 1](fleet-window0-diagnostics-surfacing.md)
   — distinct rider rendering in the single-agent transcript.
+- [Builtin-tool rendering & roster UX polish](backlog-ux-polish.md) — focused
+  executor/classifier activity strip, roster `report` teaser replacing the cost
+  column, and compact single-line tool-call rendering.
 
 ## In flight / partial
 
@@ -39,13 +42,10 @@ This page is the **nav waypoint** — start here, then follow a link.
 
 ## Backlog (proposed — pick this up)
 
-- [Builtin-tool rendering & roster UX polish](backlog-ux-polish.md) — animated
-  activity throbber (executor + hidden classifier companion), roster
-  cost-column→`report`-teaser, compact single-line tool-call rendering
-  (← thread-068f07b4).
-- [v1 follow-ons](backlog-follow-ons.md) — `@project` cwd + MCP config,
-  input-history disk persistence, allocator probe-core extraction for headroom v2
-  + capability badges, Alerting bucket + `/resume` of a deleted session.
+- [v1 follow-ons](backlog-follow-ons.md) — input-history disk persistence,
+  allocator probe-core extraction for headroom v2 + capability badges, Alerting
+  bucket + `/resume` of a deleted session. (`@project` cwd aliases + MCP config
+  are now built.)
 - [Window-0 roster badge + Alerting derivation](backlog-window0-roster-alerting.md)
   — Phases 2–3: per-agent outstanding-errors badge + the acting-vs-ignoring
   `FleetState::Alerting` signal.

@@ -6,7 +6,7 @@ corpus: blackbox-design
 topic:
   - fleet-tui
   - surfaces
-brief: "The follow-on items from the shipped v1 cockpit (fleet-tui-cockpit §7 items 8/9/10/15/16): the @project cwd + MCP-config map, per-agent input-history disk persistence, the allocator probe-core extraction for provider-headroom v2 + capability badges, and the fleet-state residue (Alerting-bucket supervision reuse + /resume of a deleted session). None are correctness gaps — the v1 cockpit is runnable; these extend it."
+brief: "The remaining follow-on items from the shipped v1 cockpit (fleet-tui-cockpit §7 items 9/10/16): per-agent input-history disk persistence, the allocator probe-core extraction for provider-headroom v2 + capability badges, and the fleet-state residue (Alerting-bucket supervision reuse + /resume of a deleted session). §7.8 @project cwd aliases + fleet MCP config are now built. None are correctness gaps — the v1 cockpit is runnable; these extend it."
 ---
 
 # Fleet TUI — v1 follow-ons (backlog)
@@ -15,15 +15,38 @@ brief: "The follow-on items from the shipped v1 cockpit (fleet-tui-cockpit §7 i
 > §7 (the ◑ partial / ○ follow-on items). The §7 ledger in that doc remains the
 > as-built record; this is the actionable residue. Independently pickup-able.
 
-## §7.8 — `@project` cwd map + MCP config (○ not built)
+## §7.8 — `@project` cwd map + MCP config (✅ built)
 
 A TUI-local JSON config: an `@project` map (`keyword → absolute dir`) with
 typeahead, **and** MCP server defs injected via `--mcp-config`
 (`exec_args.rs:243`). Daemon-free; not the bbox project registry; no MCP
-management UI in v1. **Today:** v1 uses the launch cwd / `--cwd`.
-**Acceptance:** `@<keyword> <prompt>` resolves the new agent's cwd from the local
-map (resolved fresh per dispatch, no stickiness); MCP defs flow via
-`--mcp-config`.
+management UI in v1.
+
+**Current state:** built in `fleet.json` + roster composer dispatch.
+
+- `fleet.json.mcpServers` is parsed into normalized MCP server configs and
+  injected into supported fleet providers through `Provider::build_fleet_mcp_args`
+  as `--mcp-config`.
+- `fleet.json.projects` is a fleet-local alias map:
+
+  ```json
+  {
+    "projects": {
+      "blackbox": "/Users/invidious/repos/transcript-search"
+    }
+  }
+  ```
+
+- In the roster composer, `@<keyword> <prompt>` resolves the alias fresh at
+  dispatch time, strips the prefix from the agent prompt/name/history, validates
+  the target dir, and creates the normal isolated fleet worktree from that
+  project cwd.
+- The roster view shows a footer callout with configured aliases and an
+  `@projects` completion popup while typing `@...`; `Tab` completes the selected
+  alias.
+
+**Acceptance:** satisfied for direct `fleet.json` editing. There is still no MCP
+or project-alias management UI in v1; that remains intentionally out of scope.
 
 ## §7.9 — Per-agent input-history disk persistence (◑ partial)
 

@@ -5,6 +5,10 @@
       "url": "http://127.0.0.1:7264/mcp"
     }
   },
+  "projects": {
+    "soong": "/Users/invidious/repos/soong",
+    "transcript-search": "/Users/invidious/repos/transcript-search"
+  },
   "pinTools": [
     "bro_exec",
     "bro_resume",

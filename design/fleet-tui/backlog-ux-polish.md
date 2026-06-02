@@ -1,82 +1,85 @@
 ---
-title: "Fleet TUI — builtin-tool rendering & roster UX polish (backlog)"
+title: "Fleet TUI — builtin-tool rendering & roster UX polish"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
 topic:
   - fleet-tui
   - surfaces
-brief: "Operator-feedback UX polish for bro fleet, surfaced while driving the classifier-intern vehicle on feat/fleet-classifier-intern. Three independent items: (1) a live activity throbber for the executor AND its hidden classifier/intern companion; (2) drop the roster cost column in favor of a latest-report-tool teaser per agent; (3) compact builtin tool-call rendering to a single line tool(arg1, arg2) instead of a multi-line JSON args block."
+brief: "As-built record for operator-feedback UX polish in bro fleet: focused single-agent activity strip for executor + hidden classifier/intern companion, roster cost-column replacement with the latest report teaser, and compact builtin tool-call rendering as one-line tool(arg1, arg2) forms with graceful fallback."
 ---
 
-# Fleet TUI — builtin-tool rendering & roster UX polish (backlog)
+# Fleet TUI — builtin-tool rendering & roster UX polish
 
 > **Provenance.** Net-new from **thread-068f07b4** ("fleet-tui-ux-polish",
-> active). Code-grounded against `src/fleet_tui.rs` 2026-05-31 — all three items
-> are confirmed unbuilt. The cockpit as-built record is
-> [`fleet-tui-cockpit.md`](./fleet-tui-cockpit.md).
+> active). Originally recorded as backlog; re-grounded against
+> `src/fleet_tui.rs` on 2026-06-02 and promoted to an as-built record.
+> The cockpit as-built record is [`fleet-tui-cockpit.md`](./fleet-tui-cockpit.md).
 
-Three independent, pickup-able items. None block each other.
+## Status
+
+**Landed.** The three polish items are implemented in `src/fleet_tui.rs`.
+The activity implementation differs slightly from the original backlog wording:
+executor/classifier motion is surfaced in the focused single-agent activity
+strip rather than as a second animated cell on every roster row. The roster row
+still uses the state glyph; the selected agent's header/chrome carries the
+animated working/idle/waiting signal.
 
 ## 1. Activity throbber (executor + classifier companion)
 
-The TUI needs a live "working" indicator for **both** the executor **and** its
-classifier/intern companion, so the operator sees at a glance when each is in a
-turn vs idle/waiting. Long autonomous turns currently look indistinguishable from
-a hung/idle session.
+The TUI has a live working indicator for **both** the executor **and** its
+classifier/intern companion in the focused single-agent view.
 
-- **Today:** turn-in-flight is derivable (`turn_active` in `TaskSnapshot`;
-  `TaskStatus::Running if snap.turn_active => FleetState::Active` at
-  `fleet_tui.rs:139`) but surfaced only as a **static** glyph
-  (`FleetState::Active => ("✽", Color::Cyan)`, `fleet_tui.rs:95`) — no motion.
-- **Want:** an animated spinner/throbber on the roster row (and the single-agent
-  header) for any agent whose turn is active. The frame advances on a tick, so it
-  reads as motion, not a static character.
-- **Companion visibility (the harder half):** the hidden classifier/intern
-  companion has **no roster presence** today. Its activity must be visible too —
-  either a second throbber on the executor's row (a sub-indicator) or a dedicated
-  companion affordance. Requires surfacing the companion's turn-active state into
-  the snapshot the roster reads.
-- **Acceptance:** an agent mid-turn shows visible motion; an idle/waiting agent
-  does not; the companion's active turn is distinguishable from the executor's.
+- `App` tracks `activity_clocks` and `activity_frame`; the event loop advances
+  `activity_frame` on ticks.
+- `selected_activity_spans` renders the focused agent's activity segment and, if
+  present, the hidden classifier companion's segment.
+- `activity_segment` emits working/waiting/interrupted/finished/idle text, with
+  role-specific spinner frames from `activity_spinner`:
+  `Agent` uses `✽/✣/✢/✣`; `Classifier` uses `✻/✶/✷/✶`.
+- `activity_clock_records_last_completed_duration` covers the active→idle clock
+  transition.
+
+**Current behavior:** an active focused executor shows animated working motion;
+an active classifier companion is distinguishable by its separate magenta
+Classifier activity segment. Idle/waiting states render without motion. The
+roster row's leading state glyph remains static.
 
 ## 2. Roster: drop the cost column → `report`-tool teaser
 
-Cost is low-signal for live driving ("cost theatre"); the `report` teaser is what
-the operator actually wants to scan.
+Cost was low-signal for live driving ("cost theatre"); the roster now shows the
+agent's latest `report` message instead.
 
-- **Today:** the roster table carries a dedicated cost column —
-  `Length(8)` constraint (`fleet_tui.rs:1075`), `"cost"` header
-  (`fleet_tui.rs:1085`), `format!("${c:.4}")` cell (`fleet_tui.rs:1146`). The
-  latest `report` message is rendered in the single-agent transcript
-  (`fleet_tui.rs:1385`), **not** on the roster.
-- **Want:** replace the cost column with the latest builtin `report` message per
-  agent — a one-line status of what it's doing / needs. Reclaim the width for the
-  teaser. (Roster columns today: glyph · prov · name · model · cost · turns ·
-  started · last — `draw_roster`.)
-- **Acceptance:** each roster row shows its agent's most recent `report` one-liner
-  (truncated to fit) in place of the `$` figure; no cost column.
+- `AgentView` carries `report_message` from `TaskSnapshot`.
+- `draw_roster` defines columns as glyph · provider · agent · model · `report`
+  · started · last, with the `report` column as the flexible width.
+- Each row renders `v.report_message` truncated to fit, or `—` when absent.
+- There is no dedicated roster cost column; completed-task cost still appears in
+  completion transcript/status events where relevant.
+
+**Current behavior:** each roster row carries the latest one-line `report` teaser
+in place of the former `$` figure.
 
 ## 3. Compact single-line builtin tool-call rendering
 
-Compact tool calls in the verbose transcript to a single-line `tool(arg1, arg2)`
-form — positional args, no arg-name labels except where the value is non-obvious
-(then `key=value`).
+Tool calls in the verbose transcript render as compact one-line
+`tool(arg1, arg2)` forms when the arguments fit and can be summarized.
 
-- **Today:** the `ToolCall` arm prints `⏺ {name}` then a multi-line
-  pretty-printed JSON args block via `monospace_block(args, ARG_MAX_LINES, …)`
-  (`fleet_tui.rs:1340-1347`), which is noisy. (This matches the *current* §5.4
-  spec, which described a raw monospace block — so this item supersedes that
-  spec.)
-- **Want:** e.g. `⏺ smart_read(src/knowledge.rs)` / `⏺ shell_run("cargo test
-  --lib")` on one line. Positional args by default; `key=value` only where the
-  value would be ambiguous without its name. Fall back to the block form (or a
-  truncation rider) when args are too large for one line.
-- **Acceptance:** common tool calls render on one line with positional args;
-  oversized/ambiguous cases degrade gracefully rather than dumping the full JSON.
+- The `TranscriptItem::ToolCall` render arm first hides internal tools, then
+  tries `render_file_edit_call`, then `compact_tool_call_line`, and only falls
+  back to the monospace JSON block when compact rendering is unsuitable.
+- `compact_tool_call_line` parses JSON args, summarizes common builtin tools, and
+  refuses lines that exceed the current render width.
+- Builtin-specific compaction covers shell, file write, search/glob, web fetch,
+  git, clipboard, and fleet worktree helpers.
+- Tests cover positional single-arg rendering, shell command quoting, cwd display,
+  shell polling, file-write content summaries, content search, clipboard ranges,
+  large-arg fallback, width fallback, and no blank spacer between compact calls.
+
+**Current behavior:** common tool calls render on one line with compact positional
+or named arguments; oversized cases fall back cleanly.
 
 ## Relationship
 
-- As-built cockpit (incl. the current §5.4 rendering this supersedes):
-  [`fleet-tui-cockpit.md`](./fleet-tui-cockpit.md).
+- As-built cockpit: [`fleet-tui-cockpit.md`](./fleet-tui-cockpit.md).
 - Cluster hub: [`fleet-tui.md`](./fleet-tui.md).
