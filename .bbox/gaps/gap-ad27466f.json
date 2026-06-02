@@ -1,0 +1,21 @@
+{
+  "id": "gap-ad27466f",
+  "title": "No shell/CLI helper to call an MCP tool against the running daemon for smoke tests",
+  "gap_kind": "tooling",
+  "domain": "blackbox/mcp-surface",
+  "wanted_capability": "A one-shot way to invoke an MCP tool (initialize → tools/call) against the running blackboxd from the shell — e.g. `bro mcp call <tool> '<json-args>'` — so an agent that rebuilds and restarts the daemon can smoke-test the live MCP surface (confirm a tool is registered and round-trips) without hand-rolling the JSON-RPC handshake.",
+  "missing_primitive": "bro mcp call / bro mcp tools-list (shell MCP client for the local daemon)",
+  "fallback_used": "Hand-rolled curl: POST /mcp initialize, scraped the Mcp-Session-Id response header, then POSTed tools/list and tools/call with that header and parsed the SSE/JSON by hand to confirm bbox_gap was registered and filed a gap end-to-end.",
+  "evidence": [
+    "session: gap-notes first-class deploy smoke test",
+    "fallback: curl initialize + Mcp-Session-Id + tools/call against http://127.0.0.1:7264/mcp"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/blackbox-mcp-surface/mcp-smoke-call-helper",
+  "suggested_owner": "blackbox",
+  "notes": "bbox_mcp_surface(action=\"replay\") shows tools visible under a surface packet, but there's no plain \"call this tool / list registered tools\" client for verifying a daemon redeploy from the shell. Recurs for anyone who rebuilds blackboxd and wants to confirm the tool surface before trusting it.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T02:16:53Z",
+  "updated_at": "2026-06-02T02:16:53Z"
+}
