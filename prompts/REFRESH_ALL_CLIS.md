@@ -1,21 +1,21 @@
 ---
-title: "REFRESH_ALL_CLIS — orchestrate a full corpus refresh"
-kind: research-prompt
-corpus: blackbox-research
-track: harness
+title: "REFRESH_ALL_CLIS — orchestrate a full harness-corpus refresh"
+kind: operator-prompt
+corpus: blackbox-prompts
+audience: interactive
 topic:
+  - prompts
   - harness
-  - prompt
   - orchestration
-brief: "Operating prompt for a top-level orchestrator (a main-loop agent like Claude) to refresh every CLI subject in the harness research corpus by fanning out MINE_CLI.md over operator-specified latest versions. Bros are pointed AT the prompt doc (they read MINE_CLI.md) rather than carrying baked-in lenses, so the procedure stays tweakable in one place. Encodes the hard-won bro dispatch mechanics (no tool-filter, deferred tools, fan-in, prune, scoped commit)."
+brief: "Operator-pointed prompt for a top-level orchestrator (a main-loop agent like Claude) to refresh every CLI subject in the harness research corpus by fanning out the MINE_CLI lens over operator-specified latest versions. Bros are pointed AT prompts/agents/MINE_CLI.md (they read the lens) rather than carrying baked-in lenses, so the procedure stays tweakable in one place. Encodes the hard-won bro dispatch mechanics (no tool-filter, deferred tools, fan-in, prune, scoped commit)."
 ---
 
 # REFRESH_ALL_CLIS — orchestrate a full corpus refresh
 
 You are the **harness-research orchestrator** (a main-loop agent). You refresh
-the CLI subjects in `research/harness/` to the latest versions by fanning out
-`research/prompts/MINE_CLI.md` across bros. This is **forward** refresh (known
-axes); to expand the axis set, use `research/prompts/CLI_INVESTIGATOR.md`.
+the CLI subjects in `research/harness/` to the latest versions by fanning out the
+`prompts/agents/MINE_CLI.md` lens across bros. This is **forward** refresh (known
+axes); to expand the axis set, use `prompts/agents/CLI_INVESTIGATOR.md`.
 
 ## Step 1 — inputs / version detection
 
@@ -29,19 +29,20 @@ versions are omitted, detect installed ones:
 - `vibe` — `vibe --version`; source at `~/repos/mistral-vibe`.
 
 Confirm the latest version per subject and whether each is **source** or
-**binary** (sets the mining method in MINE_CLI).
+**binary** (sets the mining method in the lens).
 
 ## Step 2 — dispatch (the key pattern)
 
-For each subject, dispatch a bro that **reads `MINE_CLI.md` and executes it** —
-**do not** bake the procedure into a bro lens. The dispatch prompt is minimal:
+For each subject, dispatch a bro that **reads `prompts/agents/MINE_CLI.md` and
+executes it** — **do not** bake the procedure into a bro lens inline. The
+dispatch prompt is minimal:
 
-> Read `research/prompts/MINE_CLI.md` in full and follow it exactly for
+> Read `prompts/agents/MINE_CLI.md` in full and follow it exactly for
 > `SUBJECT=<x> VERSION=<y> SOURCE=<repo-path-or-binary> CONFIG=<dir>`. Honor its
 > output contract (write the cells, or emit them as fenced blocks if you lack a
 > write tool).
 
-Keeping the procedure in the doc (single source of truth) is the whole point:
+Keeping the procedure in the lens (single source of truth) is the whole point:
 tweak `MINE_CLI.md`, every future refresh inherits it.
 
 ## Step 3 — dispatch mechanics (hard-won; do not relearn these)
@@ -80,15 +81,17 @@ the new-version snapshot `supersedes:` the prior.
 ## Step 6 — validate
 
 Check frontmatter (`kind` ∈ {research-hub, research-axis, research-subject,
-research-finding, research-prompt}; `corpus: blackbox-research`), relative-link
-integrity, and a complete subject × axis matrix. Fix breaks — e.g. on a subject
-rename, repoint the convergence-table cell links in every axis doc.
+research-finding}; `corpus: blackbox-research`), relative-link integrity, and a
+complete subject × axis matrix. Fix breaks — e.g. on a subject rename, repoint
+the convergence-table cell links in every axis doc.
 
 ## Step 7 — cleanup & land
 
 - `bro_prune` the `task_id`s **you** created (terminal only).
-- Commit **scoped to your files by explicit path** (`research/`, plus any
-  snapshot/axis edits) — **never `git add -A`** in this multi-tenant repo.
+- Commit **scoped to your files by explicit pathspec** (`git commit -- research/ …`)
+  — **never `git add -A`** and never a bare `git commit` against the whole index
+  in this multi-tenant repo (a peer's staged changes will ride along). `git status`
+  in a separate step first.
 - Push `main` (fast-forward; if rejected, `git fetch` + rebase your commit +
   push).
 - No Claude `Co-Authored-By` trailer (house rule).
@@ -96,7 +99,7 @@ rename, repoint the convergence-table cell links in every axis doc.
 ## Step 8 — report
 
 Per-subject version deltas, axes that changed, residuals, and any **new-axis
-candidates** that surfaced — route those to `CLI_INVESTIGATOR.md`.
+candidates** that surfaced — route those to `prompts/agents/CLI_INVESTIGATOR.md`.
 
 ## Caveats
 

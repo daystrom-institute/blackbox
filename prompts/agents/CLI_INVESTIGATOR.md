@@ -1,22 +1,24 @@
 ---
 title: "CLI_INVESTIGATOR — backward discovery of missing axes"
-kind: research-prompt
-corpus: blackbox-research
-track: harness
+kind: agent-lens
+corpus: blackbox-prompts
+audience: dispatched-bro
 topic:
+  - prompts
+  - prompts-agents
   - harness
-  - prompt
   - discovery
-brief: "Operating prompt for a single-CLI deep dive that works BACKWARD — from source/binary to the taxonomy — to uncover agent-facing dimensions the current axis set MISSES or under-covers. The complement of MINE_CLI.md (which maps a CLI forward onto known axes). Produces a discovery report of generic candidate axes + extensions for the operator to fold into the charter, abstracted from the CLI as a lens and flagged for triangulation."
+brief: "Dispatched-bro lens for a single-CLI deep dive that works BACKWARD — from source/binary to the taxonomy — to uncover agent-facing dimensions the harness research corpus's axis set MISSES or under-covers. The complement of MINE_CLI.md (which maps a CLI forward onto known axes). Produces a discovery report of generic candidate axes + extensions for the operator to fold into the charter, abstracted from the CLI as a lens and flagged for triangulation."
 ---
 
 # CLI_INVESTIGATOR — backward discovery of missing axes
 
-You are a **harness-research investigator**. The opposite of `MINE_CLI.md`:
-instead of mapping a CLI onto the **known** axes, you hunt the CLI's source/binary
-for **agent-facing dimensions the current taxonomy MISSES**. The CLI is a
-**lens**, not a documentation target — every finding must be abstracted to a
-**generic** dimension that would apply to any harness.
+You are a **harness-research investigator**. The opposite of
+`prompts/agents/MINE_CLI.md`: instead of mapping a CLI onto the **known** axes,
+you hunt the CLI's source/binary for **agent-facing dimensions the current
+taxonomy MISSES**. The CLI is a **lens**, not a documentation target — every
+finding must be abstracted to a **generic** dimension that would apply to any
+harness.
 
 ## Step 0 — tool surface
 
@@ -79,7 +81,7 @@ must answer → Convergence table stub → Open invariants → a **"Surfaced by"
 provenance note naming this investigation), add them to charter **§3** (catalog +
 cluster) and **§3.1** (provenance: record this as a new discovery pass), and add
 a "Codex-lens-style extensions" section to any existing axis you refined. Then
-the new cells get filled by `MINE_CLI.md` runs.
+the new cells get filled by `prompts/agents/MINE_CLI.md` runs.
 
 ## Step 6 — guard against over-fit
 
@@ -89,7 +91,7 @@ harness is not yet an invariant.
 
 ## Don't
 
-- Force findings onto existing axes (that's `MINE_CLI.md`).
+- Force findings onto existing axes (that's `prompts/agents/MINE_CLI.md`).
 - Document CLI specifics for their own sake — produce *generic* dimensions.
 - Promote a one-CLI observation to an axis without triangulation.
 - Edit the target CLI's repo.

@@ -41,12 +41,14 @@ model-behavior (effort/thinking/steering response across model families).
 
 ## Operating procedures
 
-The repeatable procedures that run this program live in
-[`research/prompts/`](prompts/prompts.md): **MINE_CLI** (forward-mine one CLI
-against the axes), **REFRESH_ALL_CLIS** (orchestrate a fan-out refresh over all
-CLIs), and **CLI_INVESTIGATOR** (backward-discover missing axes). Agents and
-bros are pointed at these docs rather than carrying baked-in lenses, so the
-procedures stay tweakable in one place.
+The repeatable procedures that run this program live in the top-level
+[`prompts/`](../prompts/README.md) corpus: **REFRESH_ALL_CLIS** (operator-pointed
+orchestrator that fans the mining lens over all CLIs) plus the dispatched-agent
+lenses under [`prompts/agents/`](../prompts/agents/README.md) — **MINE_CLI**
+(forward-mine one CLI against the axes) and **CLI_INVESTIGATOR**
+(backward-discover missing axes). Agents and bros are pointed at these docs
+rather than carrying baked-in lenses, so the procedures stay tweakable in one
+place.
 
 ## Why a separate corpus
 

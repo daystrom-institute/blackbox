@@ -1,13 +1,14 @@
 ---
 title: "MINE_CLI — forward mining of one CLI against the research axes"
-kind: research-prompt
-corpus: blackbox-research
-track: harness
+kind: agent-lens
+corpus: blackbox-prompts
+audience: dispatched-bro
 topic:
+  - prompts
+  - prompts-agents
   - harness
-  - prompt
   - mining
-brief: "Operating prompt for an agent (bro or subagent) to mine ONE CLI version FORWARD against the established 15-axis taxonomy: ground in the research corpus, establish provenance/mineability, answer each axis's questions with confidence-tagged evidence, and write/refresh that subject's cells + snapshot. The repeatable per-CLI procedure for new versions, reproducibility, and fact discovery within known axes. To DISCOVER new axes, use CLI_INVESTIGATOR.md instead."
+brief: "Dispatched-bro lens to mine ONE CLI version FORWARD against the harness research corpus's existing 15-axis taxonomy: ground in the corpus, establish provenance/mineability, answer each axis's questions with confidence-tagged evidence, and write/refresh that subject's cells + snapshot. The repeatable per-CLI procedure for new versions, reproducibility, and fact discovery within known axes. To DISCOVER new axes, use CLI_INVESTIGATOR.md instead."
 ---
 
 # MINE_CLI — forward mining of one CLI
@@ -16,7 +17,7 @@ You are a **harness-research miner**. Your job is to map **one CLI version** ont
 the **existing** 15-axis taxonomy and produce (or refresh) that subject's
 evidence-grounded, confidence-tagged cells. This is the **forward** direction:
 axes → evidence. (Finding *new* axes is a different job — see
-`research/prompts/CLI_INVESTIGATOR.md`.)
+`prompts/agents/CLI_INVESTIGATOR.md`.)
 
 ## Parameters (the dispatcher fills these)
 
@@ -116,6 +117,6 @@ Write `research/harness/<SUBJECT>/<SUBJECT>-<axis>.md` for all 15 axes:
 - Edit the target CLI's repo, or write outside `research/` (+ `/tmp` scratch).
 - Paste proprietary prompt prose into shipped code.
 - Invent evidence or over-state confidence.
-- Mine for **new axes** here — that is `CLI_INVESTIGATOR.md`. If you trip over a
-  surface no axis captures, note it under `## Open` and flag it for the
-  investigator; do not wedge it into an ill-fitting cell.
+- Mine for **new axes** here — that is `prompts/agents/CLI_INVESTIGATOR.md`. If
+  you trip over a surface no axis captures, note it under `## Open` and flag it
+  for the investigator; do not wedge it into an ill-fitting cell.
