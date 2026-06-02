@@ -13,14 +13,20 @@ brief: "Ground-truth spec for how context compaction SHOULD work on the brodex (
 
 # Canonical compaction for brodex (OAI Responses), per codex reference
 
-> **Status: partial (phases 0, 1, 2 landed).** Landed: the context-window
-> overflow recovery (`77d0514`), the canonical **server-side `responses/compact`**
-> for the ChatGPT-OAuth path (live-validated on `gpt-5.5`, §5), and **phase 1
-> inline-summarizer fidelity** (lifted the 2048 cap → tunable knobs; helps
-> GLM/DeepSeek on the Anthropic inline path). Remaining: **phase 3** (proactive
-> pre-send trigger / model-downshift). Ground truth is `openai/codex` `main` as
-> vendored at `/home/invidious/repos/codex` (`codex-rs/…`). Citations are
-> `file:line` into that tree and into `crates/bro-harness/`.
+> **Status: the canonical set (phases 0–3) is landed.** Landed: the
+> context-window overflow recovery (`77d0514`); the canonical **server-side
+> `responses/compact`** for the ChatGPT-OAuth path (live-validated on `gpt-5.5`,
+> §5); **phase 1** inline-summarizer fidelity (lifted the 2048 cap → tunable
+> knobs); and **phase 3** the **proactive pre-send trigger** (projected =
+> last-observed + estimate of items appended since, so an appended item that
+> would overflow the next request compacts before it's sent — codex's
+> `get_total_token_usage` shape). Model-downshift is covered structurally by the
+> existing threshold-on-`set_model` + the reactive check. Only **phase 1b**
+> refinements remain (a true transcript *token* budget vs char cap; the
+> `BodyAfterPrefix` window scope — likely N/A since brodex compaction genuinely
+> shrinks the buffer). Ground truth is `openai/codex` `main` as vendored at
+> `/home/invidious/repos/codex` (`codex-rs/…`). Citations are `file:line` into
+> that tree and into `crates/bro-harness/`.
 
 ## 1. Why this doc exists
 
@@ -259,14 +265,16 @@ API-key / generic OpenAI-compatible vendor          → inline summarizer, done 
   (codex's 20k) in addition to the summary.
 - Replace `keep_tail = 6 messages` with a **token-budgeted** retained tail.
 
-**Triggering.**
-- Keep the reactive threshold + the landed overflow recovery as the safety net.
-- Add a proactive pre-send estimate so we compact *before* a step that would
-  overflow, not just after (closes the "one step late" gap). brodex has no local
-  token estimator today — this needs one (even a coarse chars/4 heuristic gated
-  by the cache-inclusive server figure once known).
-- Add model-downshift compaction on `set_model` when the carried history exceeds
-  the new window.
+**Triggering (landed, phase 3).**
+- Reactive threshold + the overflow recovery remain the safety net.
+- **Proactive pre-send estimate (done):** `pending_input_estimate` adds a coarse
+  (~chars/4) estimate of items appended since the last observed usage to
+  `last_prompt_tokens` for the threshold check, so a step that would overflow the
+  next request compacts before it's sent — closing the "one step late" gap.
+- **Model-downshift (covered structurally):** `set_model` re-derives the
+  threshold; the reactive check then compacts on the next turn when the carried
+  history exceeds the new (smaller) window. No dedicated path needed given
+  brodex's per-step trigger.
 
 **Policy home.** `summary_max_tokens`, `tool_render_budget`, and
 `retained_tail_tokens` should be model-keyed in `compaction.rs` alongside the
@@ -342,8 +350,20 @@ history that itself already exceeds the window (fit-trim parity).
   summarizer kept as the API-key fallback. Two double-gated live probes verify
   the endpoint and the real `compact()` path. The streaming `compaction_trigger`
   path remains a documented future option, not required.
-- **Phase 3 — proactive trigger + model-downshift + multi-compaction warning.**
-- **Phase 4 — optional parity: pre/post-compact hooks, analytics, rollout trace.**
+- **Phase 3 — LANDED.** Proactive trigger: `Session.pending_input_estimate`
+  accumulates a coarse (~chars/4) estimate of items appended since the last
+  observed usage (tool results via `est_tool_results`, mid-turn inputs + the new
+  user message via `est_tokens` in `push_user_text`), reset on each model call
+  and on compaction. The trigger checks `last_prompt_tokens + pending_input_estimate
+  > threshold`, mirroring codex's `get_total_token_usage` (last observed +
+  estimate of items after the last model turn). Model-downshift is covered
+  structurally: `set_model` re-derives the threshold and the reactive check
+  compacts on the next turn if the carried history exceeds the new window.
+- **Phase 1b (open, optional)** — true transcript *token* budget (vs flat char
+  cap) and token-budgeted verbatim-tail retention (vs `keep_tail` count); the
+  `BodyAfterPrefix` window scope (likely N/A — brodex compaction genuinely
+  shrinks the buffer, so re-compaction thrash isn't a real risk).
+- **Phase 4 (optional) — parity: pre/post-compact hooks, analytics, rollout trace.**
 
 ## 7. Reference index
 

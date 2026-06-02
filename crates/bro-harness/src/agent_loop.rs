@@ -292,6 +292,16 @@ struct Session {
     total_usage: Usage,
     turns: u64,
     last_prompt_tokens: u64,
+    /// Estimated tokens appended to the transport buffer since `last_prompt_tokens`
+    /// was last observed — tool results, mid-turn inputs, and the new user
+    /// message. Added to `last_prompt_tokens` for the proactive compaction
+    /// trigger, so an appended item that would push the *next* request over the
+    /// window triggers compaction before it is sent (rather than reacting one
+    /// step late, or relying on the overflow safety net). Mirrors codex's
+    /// `get_total_token_usage` = last observed total + estimate of items after
+    /// the last model turn (`context_manager/history.rs`). Reset to 0 on each
+    /// model call (the sent input is then measured) and on compaction.
+    pending_input_estimate: u64,
     /// Volatile system-tail nudge to surface on the upcoming model call.
     tail_nudge: Option<String>,
 }
@@ -442,6 +452,7 @@ impl Session {
             total_usage: Usage::default(),
             turns: 0,
             last_prompt_tokens: 0,
+            pending_input_estimate: 0,
             tail_nudge: None,
         })
     }
@@ -525,11 +536,18 @@ impl Session {
 
             let tool_specs = self.reg.wire_specs();
 
-            // Compact before composing when the previous prompt crossed the
-            // model's window threshold. Tools are forwarded so the server-side
-            // compaction path (brodex) can faithfully process tool-call history.
+            // Compact before composing when the projected next prompt crosses the
+            // model's window threshold. "Projected" = last observed input plus an
+            // estimate of items appended since (tool results, mid-turn inputs, the
+            // new user message), so an appended item that would overflow the next
+            // request triggers compaction *before* it's sent. Tools are forwarded
+            // so the server-side compaction path (brodex) can faithfully process
+            // tool-call history.
+            let projected_tokens = self
+                .last_prompt_tokens
+                .saturating_add(self.pending_input_estimate);
             if let Some(thresh) = self.compact_threshold
-                && self.last_prompt_tokens > thresh
+                && projected_tokens > thresh
             {
                 match self
                     .tx
@@ -542,12 +560,12 @@ impl Session {
                     .await
                 {
                     Ok(Some(summary)) => {
-                        tracing::info!(pre_tokens = self.last_prompt_tokens, "compacted");
-                        self.emitter.compact_boundary(
-                            "auto",
-                            self.last_prompt_tokens,
-                            summary.len(),
-                        );
+                        tracing::info!(pre_tokens = projected_tokens, "compacted");
+                        self.emitter.compact_boundary("auto", projected_tokens, summary.len());
+                        // The buffer was rewritten; its size will be re-measured
+                        // by the upcoming call, so the appended-tail estimate no
+                        // longer applies.
+                        self.pending_input_estimate = 0;
                     }
                     Ok(None) => {}
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
@@ -624,6 +642,9 @@ impl Session {
             self.turns += 1;
             self.total_usage.add(&out.usage);
             self.last_prompt_tokens = out.usage.total_input_tokens();
+            // The just-sent input is now reflected in last_prompt_tokens; clear
+            // the appended-tail estimate so it only counts items added afterward.
+            self.pending_input_estimate = 0;
             last_model_stop = Some(out.stop.clone());
             last_model_tool_call_count = out.tool_calls.len();
 
@@ -722,11 +743,17 @@ impl Session {
                     }
                 }
                 self.emitter.tool_results(&results);
+                self.pending_input_estimate = self
+                    .pending_input_estimate
+                    .saturating_add(est_tool_results(&results));
                 self.tx.push_tool_results(results);
                 break "interrupted_dispatch";
             }
 
             self.emitter.tool_results(&results);
+            self.pending_input_estimate = self
+                .pending_input_estimate
+                .saturating_add(est_tool_results(&results));
             self.tx.push_tool_results(results);
             self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
             self.hooks.tick();
@@ -761,6 +788,9 @@ impl Session {
 
     fn push_user_text(&mut self, prompt: &str) {
         self.tx.push_user_text(prompt);
+        self.pending_input_estimate = self
+            .pending_input_estimate
+            .saturating_add(est_tokens(prompt));
         for n in self.hooks.on_user_turn(prompt) {
             if n.delivery == Delivery::SystemTail {
                 self.tail_nudge = Some(n.message);
@@ -1075,6 +1105,21 @@ fn extract_user_text(v: &Value) -> Option<String> {
         return (!s.is_empty()).then_some(s);
     }
     None
+}
+
+/// Rough token estimate (~4 chars/token) for the proactive compaction trigger.
+/// Deliberately coarse: it only needs to flag an appended item large enough to
+/// push the next request over the window, and the threshold leaves headroom.
+fn est_tokens(s: &str) -> u64 {
+    (s.chars().count() / 4) as u64
+}
+
+/// Estimated tokens for a batch of tool results about to be appended.
+fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
+    results
+        .iter()
+        .map(|r| est_tokens(&r.content))
+        .fold(0u64, u64::saturating_add)
 }
 
 /// Compose the effective system prompt as a cache-stable prefix plus a volatile
@@ -1453,6 +1498,7 @@ mod tests {
             total_usage: Usage::default(),
             turns: 0,
             last_prompt_tokens: 0,
+            pending_input_estimate: 0,
             tail_nudge: None,
         };
         (session, shared)
@@ -1587,6 +1633,35 @@ mod tests {
             0,
             "/compact is a slash command, not a model turn"
         );
+    }
+
+    #[tokio::test]
+    async fn proactive_trigger_compacts_on_appended_estimate() {
+        // last_prompt_tokens stays 0 (the mock reports no usage), but the
+        // estimated tokens of the appended user message cross a tiny threshold —
+        // so the proactive trigger compacts *before* the would-be-over-window
+        // call, rather than only reacting after observing usage.
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
+        session.compact_threshold = Some(1);
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(Input::User("x".repeat(40))).unwrap(); // est_tokens = 10 > 1
+        drop(tx);
+        let ctrl = Emitter::new("ctrl".into());
+        session_loop(&mut session, rx, &ctrl, VecDeque::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            shared.compact_calls.load(Ordering::SeqCst),
+            1,
+            "appended-tail estimate should trigger compaction before the call"
+        );
+    }
+
+    #[test]
+    fn est_tokens_counts_chars_over_four() {
+        assert_eq!(est_tokens(""), 0);
+        assert_eq!(est_tokens("abcd"), 1);
+        assert_eq!(est_tokens(&"x".repeat(400)), 100);
     }
 
     #[tokio::test]
