@@ -236,16 +236,20 @@ ChatGPT-OAuth backend (supports_remote_compaction) → server-side compaction
 API-key / generic OpenAI-compatible vendor          → inline summarizer, done well
 ```
 
-**Server-side path (OAuth) — the canonical target.**
-- Reuse the existing `client_session`/stream seam: append
-  `{"type":"compaction_trigger"}` to `state.input`, run one stream, read back the
-  single encrypted `Compaction` item.
-- Rebuild history codex-style: retained user/developer/system messages truncated
-  to a 64k token budget + the `Compaction` item. Replay the encrypted item on the
-  next turn the same way reasoning `encrypted_content` is replayed under
-  `store:false`.
-- Pre-trim with the `trim…to_fit` rule so the compaction request fits.
-- Invalidate the WS delta baseline after rewrite (already done).
+**Server-side path (OAuth) — the canonical target (validated, §5).**
+- POST a `CompactionInput` (`{model, input: state.input, instructions, tools,
+  parallel_tool_calls}`) to `{http_endpoint}/compact`; parse the returned
+  `{output: [...]}` and set `state.input = output`. The server applies retention
+  (user/developer/system verbatim, 64k budget) and returns the replacement
+  history with a trailing `compaction_summary` (`encrypted_content`) item — no
+  client-side rendering, truncation, or summary cap.
+- Replay the encrypted `compaction_summary` on the next turn the same way
+  reasoning `encrypted_content` is replayed under `store:false` (verified: the
+  model answers from it).
+- Compaction stays over **HTTP** even when WS is the live turn path (matches
+  codex); invalidate the WS delta baseline after rewrite (already done).
+- Gate on `Auth::ChatGpt` (the capability proxy, mirroring codex's
+  `supports_remote_compaction`); API-key vendors fall through to the inline path.
 
 **Inline path (API-key) — the fallback, done well.**
 - Keep the summary a full call (no 2k cap), budget the *transcript* to fit the
@@ -267,24 +271,57 @@ API-key / generic OpenAI-compatible vendor          → inline summarizer, done 
 `retained_tail_tokens` should be model-keyed in `compaction.rs` alongside the
 existing thresholds (same exact→glob→default resolution), env-overridable.
 
-## 5. Open questions — require live probes
+## 5. Live-probe findings (RESOLVED, 2026-06-02)
 
-These gate the server-side path and are why it is not yet implemented (the repo
-norm for brodex is live-verified):
+Probed against the real ChatGPT backend (account `3212e60e…`, model `gpt-5.5`)
+via a double-gated `#[ignore]` test (`responses_common.rs::probe_responses_compaction`,
+run with `BRO_HARNESS_LIVE_PROBE=1`). bro-harness's existing identity/auth headers
+(no attestation) are accepted as-is — the probe reused `resolve_auth` /
+`http_endpoint` / `identity_auth_headers` verbatim.
 
-1. Does our ChatGPT-backend account accept `responses/compact` and/or the
-   `compaction_trigger` stream item? Which beta header, if any?
-2. Under `store:false`, is the returned `Compaction { encrypted_content }`
-   replayable on subsequent turns the way reasoning `encrypted_content` is?
-3. Server-side vs client-side retention: does the unary endpoint return the full
-   compacted history (server applies the 64k default) or just the summary? (v2
-   clearly returns one item and the client rebuilds — prefer v2.)
-4. Does `compaction_trigger` require `RemoteCompactionV2`-equivalent enablement,
-   or is it always-on for the backend?
-5. Behaviour parity across the WS and HTTP arms for the compaction stream.
+1. **Unary `responses/compact` — WORKS (200).** URL is `http_endpoint + "/compact"`
+   (= `https://chatgpt.com/backend-api/codex/responses/compact`). Request body is
+   the `CompactionInput` shape (`{model, input, instructions, tools, parallel_tool_calls}`,
+   non-streaming). Response is a single JSON object:
+   ```json
+   {"object":"response.compaction",
+    "output":[ {"type":"message","role":"user","content":[{"type":"input_text",...}]},
+               {"type":"message","role":"user",...},
+               {"type":"compaction_summary","encrypted_content":"gAAAAA…"} ]}
+   ```
+   So the **server does the retention + rebuild** and returns the full replacement
+   `input[]`: retained messages followed by one `compaction_summary` item. The
+   client just sets `state.input = output`.
+2. **Retention shape (answers old Q3).** With a `[user, assistant, user]` history,
+   the output kept **both user messages verbatim** and **dropped the assistant**
+   message — exactly codex's `is_retained_for_remote_compaction_v2`
+   (user/developer/system only). The 64k token budget is applied server-side; the
+   client does not need to truncate.
+3. **Summary item is `compaction_summary` with `encrypted_content`** — the wire
+   form of codex's `ResponseItem::Compaction` (`#[serde(alias="compaction_summary")]`).
+   Opaque blob, `store:false`-native.
+4. **Replay — WORKS (200), and the model uses it (answers old Q2).** Feeding the
+   unary output (including the encrypted `compaction_summary`) back as `input[]`
+   plus a fresh user turn returned 200 and the model answered correctly from the
+   compacted context ("Magic token: BANANA-7; 17*3 = 51"). The encrypted summary
+   replays under `store:false` exactly like reasoning `encrypted_content`.
+5. **Streaming `compaction_trigger` — WORKS (200).** Appending
+   `{"type":"compaction_trigger"}` to a normal `/responses` stream is accepted with
+   **no special beta/feature header** (answers old Q4). This is the alternative to
+   the unary endpoint and is WS-capable, but it is more complex (turn-metadata
+   header handling, stream collection of one item).
 
-Probes will be run against a scratch session (authorized) and captured here
-before code lands.
+**Conclusion: adopt the unary `responses/compact` endpoint** for brodex's
+ChatGPT-OAuth path. It is the simplest faithful mechanism — one POST, server-side
+retention + encrypted summary, replace `state.input` with the returned `output`.
+It is HTTP-only (matches codex's "compaction always over HTTP" and the existing
+WS-baseline invalidation), so WS/HTTP parity (old Q5) is a non-issue. The
+streaming-trigger path is kept on file as a future option but is not needed.
+
+Remaining to verify during implementation: behaviour on a **large** history with
+`function_call`/`function_call_output` items (does the server need the live
+`tools` to process them, and does it correctly drop tool-call pairs?) and on a
+history that itself already exceeds the window (fit-trim parity).
 
 ## 6. Phasing
 
@@ -294,9 +331,11 @@ before code lands.
   Token-budgeted retained tail; lift/parameterize the summary cap; transcript
   budgeting instead of flat 2000-char truncation; verbatim recent-user retention;
   model-keyed knobs in `compaction.rs`. Applies to all three transports.
-- **Phase 2 — server-side compaction for the OAuth path (live-probed).** Wire the
-  v2 `compaction_trigger` stream + encrypted `Compaction` replay + 64k retention
-  + fit-trim, gated by a `supports_remote_compaction`-style capability check.
+- **Phase 2 — server-side compaction for the OAuth path (contract validated, §5).**
+  Wire the unary `responses/compact` endpoint: POST `CompactionInput`, replace
+  `state.input` with the returned `output` (retained msgs + encrypted
+  `compaction_summary`), gated on `Auth::ChatGpt`. The streaming
+  `compaction_trigger` path is a documented future option, not required.
 - **Phase 3 — proactive trigger + model-downshift + multi-compaction warning.**
 - **Phase 4 — optional parity: pre/post-compact hooks, analytics, rollout trace.**
 
