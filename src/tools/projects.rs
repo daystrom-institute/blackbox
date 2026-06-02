@@ -103,6 +103,10 @@ fn init_project_path(project_dir: &Path, force: bool) -> anyhow::Result<ProjectI
         // Marks the project repo-owned for durable knowledge: project-scoped
         // bbox_learn/decide land here and travel with the checkout.
         bbox_dir.join("knowledge"),
+        // Marks the project repo-owned for substrate gap notes: project-scoped
+        // bbox_gap records land here (top-level) and travel with the checkout.
+        // (The spool drop folder lives under `gaps/inbox/`, created on demand.)
+        bbox_dir.join("gaps"),
     ];
     for dir in &dirs {
         let path = dir.as_path();

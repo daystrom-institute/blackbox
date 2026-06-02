@@ -36,6 +36,7 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
     "BLACKBOX_MCP_URL",
     "BLACKBOX_STATE_DIR",
     "BLACKBOX_KNOWLEDGE_PATH",
+    "BLACKBOX_GAPS_PATH",
     "BLACKBOX_THREADS_PATH",
     "BLACKBOX_NOTES_PATH",
     "BLACKBOX_GLOBAL_CLAUDE_MD",
@@ -605,8 +606,8 @@ Do NOT add new workspace tool names under the `bbox_*` namespace.";
 
 /// The workload-retrospective probe prompt, injected as a fake user turn
 /// when a bro's own session is resumed by `bro_prune(retro=true)` or
-/// `bro_retro`. It invites — but never compels — a `blackbox.gap_note.v1`
-/// followup about friction with the *blackbox substrate itself*.
+/// `bro_retro`. It invites — but never compels — a `bbox_gap` substrate-gap
+/// report about friction with the *blackbox substrate itself*.
 ///
 /// The wording is the policy: there is no rule engine deciding what's
 /// worth filing, so the prompt alone has to calibrate the bro's judgment
@@ -622,8 +623,8 @@ Do NOT add new workspace tool names under the `bbox_*` namespace.";
 /// guidance, orchestration) and explicitly waves off the target repo,
 /// language toolchain, and external services — those would be noise.
 ///
-/// Field names and the `gap_kind` enum are pinned to `notes.rs`
-/// gap-note validation; a malformed body would fail `bbox_note`.
+/// Field names and the `gap_kind` enum are pinned to `gaps.rs` (`GapKind`);
+/// an unknown gap_kind or malformed dedupe_key would fail `bbox_gap`.
 /// Deliberately NOT routed through `apply_ambient` — its recall /
 /// task-shape nudges miscue a reflection turn (see `workload_retro_prompt`).
 pub const WORKLOAD_RETRO_PROMPT: &str = "\
@@ -646,9 +647,8 @@ fought you was rustc, a flaky API, or a gap in the target repo's own docs — \
 that's real, but it's out of scope here, so skip it.\n\
 \n\
 If something concrete and in-scope stands out — something a future agent or the \
-operator would genuinely be glad blackbox knew — file one note per distinct gap \
-with bbox_note(kind=\"followup\"), body a blackbox.gap_note.v1 JSON object:\n\
-  • type: \"blackbox.gap_note.v1\"  (required)\n\
+operator would genuinely be glad blackbox knew — file one gap per distinct gap \
+with bbox_gap:\n\
   • title: one-line summary  (required)\n\
   • gap_kind: one of mcp_surface, tooling, workflow, agent, docs_runbook, \
 refactor_primitive, ontology, eval_coverage  (required) — mcp_surface for a \
@@ -657,10 +657,12 @@ or memory, workflow for dispatch/orchestration friction;\n\
   • domain: the blackbox subsystem it touches, e.g. orchestration, knowledge, \
 transcripts, refactor  (required)\n\
   • wanted_capability: what you wished existed, concretely  (required)\n\
+  • dedupe_key as \"<gap_kind>/<domain>/<slug>\" so duplicates from other runs \
+collapse, e.g. \"mcp_surface/transcripts/regex-search\"  (required)\n\
   • optional but helpful: missing_primitive; impact (low|medium|high|critical); \
-notes; dedupe_key as \"<gap_kind>/<domain>/<slug>\" so duplicates from other \
-runs collapse, e.g. \"mcp_surface/transcripts/regex-search\".\n\
-Keep each note specific enough to act on.\n\
+fallback_used; notes.\n\
+Run bbox_gaps first to dedupe — an open gap with the same dedupe_key collapses \
+automatically. Keep each gap specific enough to act on.\n\
 \n\
 If nothing in-scope stands out, that's a completely normal way for a run to \
 end — just say so in a line and file nothing. No quota, no expectation; a quiet \
@@ -2578,7 +2580,7 @@ mod tests {
     fn workload_retro_prompt_emits_scope_block() {
         let with_project = workload_retro_prompt("sess-123", Some("/repo/x"));
         assert!(with_project.starts_with("[scope] session:sess-123 · project:/repo/x\n\n"));
-        assert!(with_project.contains("blackbox.gap_note.v1"));
+        assert!(with_project.contains("bbox_gap"));
         // The body is the canonical prompt, unmodified.
         assert!(with_project.ends_with(WORKLOAD_RETRO_PROMPT));
 

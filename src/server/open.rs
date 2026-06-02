@@ -84,6 +84,25 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         }
     }
     sync_tool_docs(&mut kb);
+
+    // Gap store mirrors the kb repo-owned model. Load every registered repo's
+    // committed `.bbox/gaps/` into the query surface BEFORE any producer
+    // (bbox_packet_gap, gap-spool import) can save — a save with the repo's
+    // gaps not yet loaded would treat the in-memory set as authoritative and
+    // purge committed `.bbox/gaps/` files for a repo-owned project.
+    let gaps_path = cfg.paths.gaps_path.clone();
+    let mut gaps_store = crate::gaps::GapStore::open(&gaps_path)?;
+    tracing::info!("Gap store: {}", gaps_path.display());
+    {
+        let gap_roots: Vec<std::path::PathBuf> = projects_store
+            .list()
+            .into_iter()
+            .map(|r| std::path::PathBuf::from(r.canonical_path))
+            .collect();
+        if let Err(e) = gaps_store.set_project_roots(gap_roots) {
+            tracing::warn!("gaps project-root load at startup: {e:#}");
+        }
+    }
     load_system_memory_catalog(&cfg)?;
     configure_dispatch_mcp_env(&cfg);
     sweep_stale_gemini_policies();
@@ -153,6 +172,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     let shared = Arc::new(SharedState {
         idx: RwLock::new(idx),
         kb: RwLock::new(kb),
+        gaps: RwLock::new(gaps_store),
         roadmap: RwLock::new(roadmap_store),
         threads: RwLock::new(th),
         notes: RwLock::new(notes_store),

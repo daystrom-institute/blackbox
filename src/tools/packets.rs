@@ -132,7 +132,7 @@ impl BlackboxServer {
             }
         };
 
-        let warning = Packets::emit_companion_gap_note(&self.state.notes, &ev, &p);
+        let warning = Packets::emit_companion_gap_note(&self.state.gaps, &ev, &p);
 
         let mut response = serde_json::json!({
             "logged": true,

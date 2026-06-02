@@ -32,6 +32,7 @@ impl BlackboxServer {
             state,
             tool_router: crate::tools::projects::router()
                 + crate::tools::notes::router()
+                + crate::tools::gaps::router()
                 + crate::tools::threads::router()
                 + crate::tools::refactor::router()
                 + crate::tools::code_nav::router()

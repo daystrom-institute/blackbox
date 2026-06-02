@@ -11,6 +11,7 @@ pub mod code_nav;
 pub mod config;
 pub mod councils;
 pub mod dispatch;
+pub mod gaps;
 pub mod graph;
 pub mod knowledge;
 pub mod macros;

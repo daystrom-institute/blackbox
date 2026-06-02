@@ -217,9 +217,9 @@ fn log_gap_rejects_empty_description() {
 fn companion_gap_note_created() {
     let dir = TempDir::new().unwrap();
     let packets = Packets::open(dir.path()).unwrap();
-    let notes_path = dir.path().join("notes.json");
-    let notes = crate::notes::Notes::open(&notes_path).unwrap();
-    let notes_lock = parking_lot::RwLock::new(notes);
+    let gaps_path = dir.path().join("gaps.json");
+    let gaps = crate::gaps::GapStore::open(&gaps_path).unwrap();
+    let gaps_lock = parking_lot::RwLock::new(gaps);
 
     let ev = packets
         .log_gap(
@@ -239,24 +239,18 @@ fn companion_gap_note_created() {
         ast_feature_requested: Some("StringMatches".into()),
     };
 
-    let warning = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+    let warning = Packets::emit_companion_gap_note(&gaps_lock, &ev, &params);
     assert!(warning.is_none(), "should succeed without warning");
 
-    let notes = notes_lock.read();
-    assert_eq!(notes.all().len(), 1);
-    let note = &notes.all()[0];
-    assert_eq!(note.kind, crate::notes::NoteKind::Followup);
-
-    let parsed = crate::notes::GapNoteView::parse(note).unwrap();
-    assert_eq!(parsed.gap_kind.as_deref(), Some("packet_ast"));
-    assert_eq!(parsed.domain.as_deref(), Some("auth"));
+    let gaps = gaps_lock.read();
+    assert_eq!(gaps.all().len(), 1);
+    let gap = &gaps.all()[0];
+    assert_eq!(gap.gap_kind, crate::gaps::GapKind::PacketAst);
+    assert_eq!(gap.domain, "auth");
+    assert_eq!(gap.dedupe_key, "packet_ast/auth/StringMatches");
     assert_eq!(
-        parsed.dedupe_key.as_deref(),
-        Some("packet_ast/auth/StringMatches")
-    );
-    assert_eq!(
-        parsed.wanted_capability.as_deref(),
-        Some("wanted regex matching on log messages")
+        gap.wanted_capability,
+        "wanted regex matching on log messages"
     );
 }
 
@@ -264,9 +258,9 @@ fn companion_gap_note_created() {
 fn companion_gap_note_deduplicates() {
     let dir = TempDir::new().unwrap();
     let packets = Packets::open(dir.path()).unwrap();
-    let notes_path = dir.path().join("notes.json");
-    let notes = crate::notes::Notes::open(&notes_path).unwrap();
-    let notes_lock = parking_lot::RwLock::new(notes);
+    let gaps_path = dir.path().join("gaps.json");
+    let gaps = crate::gaps::GapStore::open(&gaps_path).unwrap();
+    let gaps_lock = parking_lot::RwLock::new(gaps);
 
     let params = GapParams {
         description: "wanted regex".into(),
@@ -285,8 +279,8 @@ fn companion_gap_note_deduplicates() {
             Some("StringMatches"),
         )
         .unwrap();
-    let _ = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
-    assert_eq!(notes_lock.read().all().len(), 1);
+    let _ = Packets::emit_companion_gap_note(&gaps_lock, &ev, &params);
+    assert_eq!(gaps_lock.read().all().len(), 1);
 
     let ev2 = packets
         .log_gap(
@@ -297,9 +291,9 @@ fn companion_gap_note_deduplicates() {
             Some("StringMatches"),
         )
         .unwrap();
-    let _ = Packets::emit_companion_gap_note(&notes_lock, &ev2, &params);
+    let _ = Packets::emit_companion_gap_note(&gaps_lock, &ev2, &params);
     assert_eq!(
-        notes_lock.read().all().len(),
+        gaps_lock.read().all().len(),
         1,
         "second call should not create a duplicate"
     );
@@ -309,9 +303,9 @@ fn companion_gap_note_deduplicates() {
 fn companion_gap_note_deduplicates_acknowledged() {
     let dir = TempDir::new().unwrap();
     let packets = Packets::open(dir.path()).unwrap();
-    let notes_path = dir.path().join("notes.json");
-    let notes = crate::notes::Notes::open(&notes_path).unwrap();
-    let notes_lock = parking_lot::RwLock::new(notes);
+    let gaps_path = dir.path().join("gaps.json");
+    let gaps = crate::gaps::GapStore::open(&gaps_path).unwrap();
+    let gaps_lock = parking_lot::RwLock::new(gaps);
 
     let params = GapParams {
         description: "no rate predicate".into(),
@@ -330,15 +324,16 @@ fn companion_gap_note_deduplicates_acknowledged() {
             Some("RateCmp"),
         )
         .unwrap();
-    let _ = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
-    let note_id = notes_lock.read().all()[0].id.clone();
+    let _ = Packets::emit_companion_gap_note(&gaps_lock, &ev, &params);
+    let gap_id = gaps_lock.read().all()[0].id.clone();
 
-    notes_lock
+    gaps_lock
         .write()
-        .resolve(&crate::notes::NoteResolveParams {
-            id: note_id,
+        .resolve(&crate::gaps::GapResolveParams {
+            id: gap_id,
             resolution: "acknowledged".into(),
             note: None,
+            superseded_by: None,
         })
         .unwrap();
 
@@ -351,9 +346,9 @@ fn companion_gap_note_deduplicates_acknowledged() {
             Some("RateCmp"),
         )
         .unwrap();
-    let _ = Packets::emit_companion_gap_note(&notes_lock, &ev2, &params);
+    let _ = Packets::emit_companion_gap_note(&gaps_lock, &ev2, &params);
     assert_eq!(
-        notes_lock.read().all().len(),
+        gaps_lock.read().all().len(),
         1,
         "acknowledged gap note should block new companion"
     );
@@ -363,9 +358,9 @@ fn companion_gap_note_deduplicates_acknowledged() {
 fn companion_gap_note_allows_after_addressed() {
     let dir = TempDir::new().unwrap();
     let packets = Packets::open(dir.path()).unwrap();
-    let notes_path = dir.path().join("notes.json");
-    let notes = crate::notes::Notes::open(&notes_path).unwrap();
-    let notes_lock = parking_lot::RwLock::new(notes);
+    let gaps_path = dir.path().join("gaps.json");
+    let gaps = crate::gaps::GapStore::open(&gaps_path).unwrap();
+    let gaps_lock = parking_lot::RwLock::new(gaps);
 
     let params = GapParams {
         description: "no temporal window".into(),
@@ -384,15 +379,16 @@ fn companion_gap_note_allows_after_addressed() {
             Some("Within{temporal}"),
         )
         .unwrap();
-    let _ = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
-    let note_id = notes_lock.read().all()[0].id.clone();
+    let _ = Packets::emit_companion_gap_note(&gaps_lock, &ev, &params);
+    let gap_id = gaps_lock.read().all()[0].id.clone();
 
-    notes_lock
+    gaps_lock
         .write()
-        .resolve(&crate::notes::NoteResolveParams {
-            id: note_id,
+        .resolve(&crate::gaps::GapResolveParams {
+            id: gap_id,
             resolution: "addressed".into(),
             note: Some("implemented RateCmp".into()),
+            superseded_by: None,
         })
         .unwrap();
 
@@ -405,9 +401,9 @@ fn companion_gap_note_allows_after_addressed() {
             Some("Within{temporal}"),
         )
         .unwrap();
-    let _ = Packets::emit_companion_gap_note(&notes_lock, &ev2, &params);
+    let _ = Packets::emit_companion_gap_note(&gaps_lock, &ev2, &params);
     assert_eq!(
-        notes_lock.read().all().len(),
+        gaps_lock.read().all().len(),
         2,
         "addressed gap note should allow new companion"
     );
@@ -417,10 +413,10 @@ fn companion_gap_note_allows_after_addressed() {
 fn packet_event_survives_note_failure() {
     let dir = TempDir::new().unwrap();
     let packets = Packets::open(dir.path()).unwrap();
-    let broken_path = dir.path().join("notes.json");
-    let notes = crate::notes::Notes::open(&broken_path).unwrap();
+    let broken_path = dir.path().join("gaps.json");
+    let gaps = crate::gaps::GapStore::open(&broken_path).unwrap();
     std::fs::create_dir(&broken_path).unwrap();
-    let notes_lock = parking_lot::RwLock::new(notes);
+    let gaps_lock = parking_lot::RwLock::new(gaps);
 
     let params = GapParams {
         description: "some gap".into(),
@@ -434,10 +430,10 @@ fn packet_event_survives_note_failure() {
         .log_gap("some gap", None, None, None, Some("Foo"))
         .unwrap();
 
-    let warning = Packets::emit_companion_gap_note(&notes_lock, &ev, &params);
+    let warning = Packets::emit_companion_gap_note(&gaps_lock, &ev, &params);
     assert!(
         warning.is_some(),
-        "note creation should fail on unwritable path"
+        "gap creation should fail on unwritable path"
     );
     assert!(warning.unwrap().contains("companion gap note failed"));
 

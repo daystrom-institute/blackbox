@@ -341,7 +341,7 @@ impl Packets {
                     .or(params.ast_feature_requested.as_deref())
                     .unwrap_or("unknown")),
             "gap_kind": "packet_ast",
-            "domain": ev.domain,
+            "domain": ev.domain.as_deref().unwrap_or("unknown"),
             "wanted_capability": params.description,
             "missing_primitive": params.ast_feature_requested,
             "fallback_used": params.fallback_used,
@@ -354,8 +354,11 @@ impl Packets {
         body.to_string()
     }
 
+    /// Emit the companion gap note for a packet-authoring gap into the
+    /// first-class gap store. Global-scoped (substrate gaps aren't repo-owned);
+    /// `GapStore::ingest` handles open-duplicate dedupe by `dedupe_key`.
     pub fn emit_companion_gap_note(
-        notes_lock: &parking_lot::RwLock<crate::notes::Notes>,
+        gaps_lock: &parking_lot::RwLock<crate::gaps::GapStore>,
         ev: &PacketEvent,
         params: &GapParams,
     ) -> Option<String> {
@@ -365,33 +368,21 @@ impl Packets {
             &params.description,
         );
 
-        {
-            let notes = notes_lock.read();
-            let already_reported = notes.all().iter().any(|n| {
-                !matches!(n.resolution, crate::notes::NoteResolution::Addressed)
-                    && crate::notes::GapNoteView::parse(n)
-                        .and_then(|v| v.dedupe_key)
-                        .as_deref()
-                        == Some(dedupe_key.as_str())
-            });
-            if already_reported {
-                return None;
-            }
-        }
-
         let body = Self::build_gap_note_body(ev, params, &dedupe_key);
-        let note_params = crate::notes::NoteParams {
-            kind: "followup".to_string(),
-            body,
-            task_id: None,
-            session_id: None,
-            project: None,
-            thread_id: None,
-            provider: None,
-            bro: None,
+        let value: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => return Some(format!("companion gap note build failed: {e:#}")),
+        };
+        let gap = match crate::gaps::GapNote::from_envelope(
+            &value,
+            String::new(),
+            crate::util::now_iso(),
+        ) {
+            Ok(g) => g,
+            Err(e) => return Some(format!("companion gap note build failed: {e:#}")),
         };
 
-        match notes_lock.write().create(&note_params) {
+        match gaps_lock.write().ingest(gap) {
             Ok(_) => None,
             Err(e) => Some(format!("companion gap note failed: {e:#}")),
         }

@@ -667,15 +667,17 @@ mod tests {
     }
 
     #[test]
-    fn gap_notes_memory_loaded_and_teaches_envelope() {
+    fn gap_notes_memory_loaded_and_teaches_bbox_gap() {
         let catalog = fixture_default_catalog();
         let memory = catalog
             .get("sm-gap-notes")
             .expect("sm-gap-notes must exist");
         assert!(memory.content.len() > 500);
+        // First-class surface: filing is via `bbox_gap`, dedupe via `bbox_gaps`.
+        assert!(memory.content.contains("bbox_gap("));
+        assert!(memory.content.contains("bbox_gaps"));
+        // The `blackbox.gap_note.v1` type tag survives for the file-drop spool path.
         assert!(memory.content.contains("blackbox.gap_note.v1"));
-        assert!(memory.content.contains("bbox_note(kind=\"followup\")"));
-        assert!(!memory.content.contains("bbox_gap("));
     }
 
     #[test]

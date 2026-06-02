@@ -30,10 +30,10 @@ impl BlackboxServer {
         Self::run("bbox_inbox", || {
             let import_report = if p.import_gap_spool.unwrap_or(false) {
                 let projects = self.state.projects.read();
-                let mut notes = self.state.notes.write();
+                let mut gaps = self.state.gaps.write();
                 let state_dir = self.state.config.read().paths.state_dir.clone();
                 Some(gap_spool::import_gap_spool(
-                    &mut notes, &projects, &state_dir,
+                    &mut gaps, &projects, &state_dir,
                 )?)
             } else {
                 None
@@ -42,11 +42,13 @@ impl BlackboxServer {
             let kb = self.state.kb.read();
             let threads = self.state.threads.read();
             let notes = self.state.notes.read();
+            let gaps = self.state.gaps.read();
             let task_store = self.state.task_store.read();
             let inbox = inbox::compute_inbox(
                 &kb,
                 &threads,
                 &notes,
+                &gaps,
                 &task_store,
                 &self.state.whiteboards,
                 &p,

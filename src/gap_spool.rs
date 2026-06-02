@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -6,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::notes::{GapNoteView, NoteParams, NoteResolution, Notes};
+use crate::gaps::{GapNote, GapStore};
 use crate::projects::ProjectRegistry;
 
 const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
@@ -34,7 +33,7 @@ impl GapSpoolImportReport {
             let project = item.project.as_deref().unwrap_or("-");
             out.push_str(&format!(
                 "  imported {} -> {} [{}]\n",
-                item.path, item.note_id, project
+                item.path, item.gap_id, project
             ));
         }
         for item in &self.skipped {
@@ -52,7 +51,7 @@ impl GapSpoolImportReport {
 pub struct ImportedGapFile {
     pub path: String,
     pub moved_to: String,
-    pub note_id: String,
+    pub gap_id: String,
     pub project: Option<String>,
 }
 
@@ -85,21 +84,21 @@ struct ImportState {
 struct ImportedFingerprint {
     path: String,
     sha256: String,
-    note_id: String,
+    gap_id: String,
     imported_at: String,
 }
 
 pub fn import_gap_spool(
-    notes: &mut Notes,
+    gaps: &mut GapStore,
     registry: &ProjectRegistry,
     state_dir: &Path,
 ) -> Result<GapSpoolImportReport> {
     let host_inbox = host_gap_inbox_dir();
-    import_gap_spool_from_dirs(notes, registry, state_dir, Some(host_inbox))
+    import_gap_spool_from_dirs(gaps, registry, state_dir, Some(host_inbox))
 }
 
 pub fn import_gap_spool_from_dirs(
-    notes: &mut Notes,
+    gaps: &mut GapStore,
     registry: &ProjectRegistry,
     state_dir: &Path,
     host_inbox: Option<PathBuf>,
@@ -127,7 +126,7 @@ pub fn import_gap_spool_from_dirs(
             if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            import_one(notes, &mut state, &mut report, &source, &path)?;
+            import_one(gaps, &mut state, &mut report, &source, &path)?;
         }
     }
 
@@ -136,7 +135,7 @@ pub fn import_gap_spool_from_dirs(
 }
 
 fn import_one(
-    notes: &mut Notes,
+    gaps: &mut GapStore,
     state: &mut ImportState,
     report: &mut GapSpoolImportReport,
     source: &SpoolSource,
@@ -191,69 +190,40 @@ fn import_one(
         return Ok(());
     }
 
-    let dedupe_key = object.get("dedupe_key").and_then(|v| v.as_str());
-    let wanted_capability = object.get("wanted_capability").and_then(|v| v.as_str());
-    if live_duplicate(notes, dedupe_key, wanted_capability) {
+    // Build the typed gap from the envelope; per-file rejection on a malformed
+    // or incomplete envelope (missing required field). Open-duplicate dedupe by
+    // `dedupe_key` + scope is handled inside `GapStore::ingest`.
+    let mut gap = match GapNote::from_envelope(&value, String::new(), crate::util::now_iso()) {
+        Ok(gap) => gap,
+        Err(err) => {
+            reject_file(report, source, path, format!("invalid gap envelope: {err}"))?;
+            return Ok(());
+        }
+    };
+    gap.project = source.project.clone();
+
+    let (gap_id, created) = gaps.ingest(gap)?;
+    let moved_to = move_file(path, &source.inbox_dir.join("imported"))?;
+    if created {
+        state.imported.push(ImportedFingerprint {
+            path: path.display().to_string(),
+            sha256: hash,
+            gap_id: gap_id.clone(),
+            imported_at: crate::util::now_iso(),
+        });
+        report.imported.push(ImportedGapFile {
+            path: path.display().to_string(),
+            moved_to: moved_to.display().to_string(),
+            gap_id,
+            project: source.project.clone(),
+        });
+    } else {
         report.skipped.push(SkippedGapFile {
             path: path.display().to_string(),
-            reason: "live gap note with same dedupe_key/wanted_capability".into(),
+            reason: "live gap with same dedupe_key already open".into(),
         });
-        move_file(path, &source.inbox_dir.join("imported"))?;
-        return Ok(());
     }
-
-    let before: HashSet<String> = notes.all().iter().map(|n| n.id.clone()).collect();
-    notes.create(&NoteParams {
-        kind: "followup".into(),
-        body: raw_text,
-        task_id: None,
-        session_id: None,
-        project: source.project.clone(),
-        thread_id: None,
-        provider: None,
-        bro: None,
-    })?;
-    let note_id = notes
-        .all()
-        .iter()
-        .find(|n| !before.contains(&n.id))
-        .map(|n| n.id.clone())
-        .unwrap_or_else(|| "note-unknown".into());
-
-    let moved_to = move_file(path, &source.inbox_dir.join("imported"))?;
-    state.imported.push(ImportedFingerprint {
-        path: path.display().to_string(),
-        sha256: hash,
-        note_id: note_id.clone(),
-        imported_at: crate::util::now_iso(),
-    });
-    report.imported.push(ImportedGapFile {
-        path: path.display().to_string(),
-        moved_to: moved_to.display().to_string(),
-        note_id,
-        project: source.project.clone(),
-    });
     Ok(())
-}
-
-fn live_duplicate(
-    notes: &Notes,
-    dedupe_key: Option<&str>,
-    wanted_capability: Option<&str>,
-) -> bool {
-    notes.all().iter().any(|note| {
-        if note.resolution == NoteResolution::Addressed {
-            return false;
-        }
-        let Some(view) = GapNoteView::parse(note) else {
-            return false;
-        };
-        match (dedupe_key, wanted_capability) {
-            (Some(key), _) if view.dedupe_key.as_deref() == Some(key) => true,
-            (None, Some(wanted)) if view.wanted_capability.as_deref() == Some(wanted) => true,
-            _ => false,
-        }
-    })
 }
 
 fn reject_file(
@@ -345,7 +315,6 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notes::NoteKind;
     use tempfile::tempdir;
 
     fn gap_body(title: &str, dedupe_slug: &str) -> String {
@@ -375,18 +344,17 @@ mod tests {
 
         let mut registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
         let record = registry.register_path(&project).unwrap();
-        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report =
-            import_gap_spool_from_dirs(&mut notes, &registry, &dir.path().join("state"), None)
+            import_gap_spool_from_dirs(&mut gaps, &registry, &dir.path().join("state"), None)
                 .unwrap();
 
         assert_eq!(report.imported.len(), 1);
         assert!(inbox.join("imported/gap.json").exists());
-        assert_eq!(notes.all().len(), 1);
-        assert_eq!(notes.all()[0].kind, NoteKind::Followup);
+        assert_eq!(gaps.all().len(), 1);
         assert_eq!(
-            notes.all()[0].project.as_deref(),
+            gaps.all()[0].project.as_deref(),
             Some(record.canonical_path.as_str())
         );
     }
@@ -402,10 +370,10 @@ mod tests {
         )
         .unwrap();
         let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
-        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report = import_gap_spool_from_dirs(
-            &mut notes,
+            &mut gaps,
             &registry,
             &dir.path().join("state"),
             Some(host.clone()),
@@ -414,20 +382,20 @@ mod tests {
 
         assert_eq!(report.imported.len(), 1);
         assert!(host.join("imported/gap.json").exists());
-        assert_eq!(notes.all()[0].project, None);
+        assert_eq!(gaps.all()[0].project, None);
     }
 
     #[test]
-    fn rejects_invalid_json_without_creating_note() {
+    fn rejects_invalid_json_without_creating_gap() {
         let dir = tempdir().unwrap();
         let host = dir.path().join("host/inbox");
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("bad.json"), "{not json").unwrap();
         let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
-        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let report = import_gap_spool_from_dirs(
-            &mut notes,
+            &mut gaps,
             &registry,
             &dir.path().join("state"),
             Some(host.clone()),
@@ -437,7 +405,7 @@ mod tests {
         assert_eq!(report.rejected.len(), 1);
         assert!(host.join("rejected/bad.json").exists());
         assert!(host.join("rejected/bad.json.error.txt").exists());
-        assert!(notes.all().is_empty());
+        assert!(gaps.all().is_empty());
     }
 
     #[test]
@@ -447,10 +415,10 @@ mod tests {
         fs::create_dir_all(&host).unwrap();
         fs::write(host.join("first.json"), gap_body("Need hook", "hook")).unwrap();
         let registry = ProjectRegistry::open(dir.path().join("projects.json")).unwrap();
-        let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let mut gaps = GapStore::open(&dir.path().join("gaps.json")).unwrap();
 
         let first = import_gap_spool_from_dirs(
-            &mut notes,
+            &mut gaps,
             &registry,
             &dir.path().join("state"),
             Some(host.clone()),
@@ -464,7 +432,7 @@ mod tests {
         )
         .unwrap();
         let second = import_gap_spool_from_dirs(
-            &mut notes,
+            &mut gaps,
             &registry,
             &dir.path().join("state"),
             Some(host.clone()),
@@ -472,7 +440,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(second.skipped.len(), 1);
-        assert_eq!(notes.all().len(), 1);
+        assert_eq!(gaps.all().len(), 1);
         assert!(host.join("imported/second.json").exists());
     }
 }

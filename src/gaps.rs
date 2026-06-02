@@ -1,0 +1,1386 @@
+//! First-class gap-note store.
+//!
+//! A "gap note" is a substrate-gap field report: a record that the blackbox
+//! substrate (a tool primitive, MCP surface, refactor atom, workflow shape,
+//! ontology edge, runbook) is missing a reusable capability. Gap notes used to
+//! ride inside the side-channel notes surface as a `blackbox.gap_note.v1` JSON
+//! envelope crammed into a `kind=followup` body. They are now first-class: a
+//! typed [`GapNote`] in a dedicated, repo-owned store that mirrors the
+//! `.bbox/knowledge/` persistence model (one file per record, project/central
+//! split, atomic-write + store-lock, watcher reload).
+//!
+//! Deliberately simpler than the knowledge store: NO recall telemetry sidecar,
+//! NO tantivy/search indexing, NO rendered provider memory. Gaps get durable
+//! persistence + live reload only.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use anyhow::{Context, Result};
+use rmcp::schemars;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub const GAP_NOTE_TYPE: &str = "blackbox.gap_note.v1";
+
+// ── Vocabularies ───────────────────────────────────────────────────
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GapKind {
+    /// Predicate the rule-packet AST cannot express.
+    PacketAst,
+    /// Missing CLI / shell / refactor helper.
+    Tooling,
+    /// Needed dispatchable agent that does not exist.
+    Agent,
+    /// Missing arc / wait / fork / cancel shape.
+    Workflow,
+    /// Language-specific refactor atom.
+    RefactorPrimitive,
+    /// Wrong allow/deny shape for a recurring role.
+    McpSurface,
+    /// Missing entity type or edge family.
+    Ontology,
+    /// Packet or test eval cannot reach a class of cases.
+    EvalCoverage,
+    /// Missing rendered guidance or runbook.
+    DocsRunbook,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Default,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GapImpact {
+    /// Nuisance, easy manual workaround.
+    Low,
+    /// Repeated friction or weak mechanization.
+    #[default]
+    Medium,
+    /// Blocks useful automation or causes recurring bad agent behavior.
+    High,
+    /// Causes unsafe edits, data-loss risk, or unusable workflows.
+    Critical,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum BlockingLevel {
+    None,
+    #[default]
+    WorkaroundAvailable,
+    BlocksTask,
+    BlocksClassOfWork,
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    strum::EnumString,
+    strum::AsRefStr,
+)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum GapResolution {
+    /// Reported, not triaged.
+    #[default]
+    Unresolved,
+    /// Seen, deduped, accepted for later handling.
+    Acknowledged,
+    /// Implemented, rejected, superseded, or intentionally closed.
+    Addressed,
+}
+
+// ── Record ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GapNote {
+    /// Canonical id `gap-<8hex>` (mirrors `note-<8hex>` / `thread-<8hex>`).
+    pub id: String,
+    pub title: String,
+    pub gap_kind: GapKind,
+    pub domain: String,
+    pub wanted_capability: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub missing_primitive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_used: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub impact: GapImpact,
+    #[serde(default)]
+    pub blocking_level: BlockingLevel,
+    /// Stable dedupe key `<gap_kind>/<domain>/<slug>`.
+    pub dedupe_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_owner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    /// This gap supersedes another (`gap-<8hex>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    /// This gap was superseded by another (`gap-<8hex>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default)]
+    pub resolution: GapResolution,
+    // ── Provenance (omitted on disk for repo-owned files — location encodes
+    //    scope, exactly like knowledge entries omit `project`). ──
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bro: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_note: Option<String>,
+}
+
+// ── Validation helpers ─────────────────────────────────────────────
+
+fn variants_list(variants: &[&str]) -> String {
+    variants.join(", ")
+}
+
+fn parse_gap_kind(value: &str) -> Result<GapKind> {
+    GapKind::from_str(value.trim()).map_err(|_| {
+        anyhow::anyhow!(
+            "gap_kind must be one of: {}",
+            variants_list(<GapKind as strum::VariantNames>::VARIANTS)
+        )
+    })
+}
+
+fn parse_impact(value: Option<&str>) -> Result<GapImpact> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(GapImpact::default()),
+        Some(v) => GapImpact::from_str(v).map_err(|_| {
+            anyhow::anyhow!(
+                "impact must be one of: {}",
+                variants_list(<GapImpact as strum::VariantNames>::VARIANTS)
+            )
+        }),
+    }
+}
+
+fn parse_blocking_level(value: Option<&str>) -> Result<BlockingLevel> {
+    match value.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(BlockingLevel::default()),
+        Some(v) => BlockingLevel::from_str(v).map_err(|_| {
+            anyhow::anyhow!(
+                "blocking_level must be one of: {}",
+                variants_list(<BlockingLevel as strum::VariantNames>::VARIANTS)
+            )
+        }),
+    }
+}
+
+/// `<gap_kind>/<domain>/<slug>` — at least three non-empty slash segments.
+fn validate_dedupe_key(key: &str) -> Result<()> {
+    let segments: Vec<&str> = key.split('/').collect();
+    if segments.len() < 3 || segments.iter().any(|s| s.trim().is_empty()) {
+        anyhow::bail!("dedupe_key must use `<gap_kind>/<domain>/<slug>` (3+ non-empty segments)");
+    }
+    Ok(())
+}
+
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut last_dash = false;
+    for ch in s.trim().to_lowercase().chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            last_dash = false;
+        } else if !last_dash && !out.is_empty() {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push_str("gap");
+    }
+    out
+}
+
+fn str_field(object: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+impl GapNote {
+    /// Build a [`GapNote`] from a `blackbox.gap_note.v1` JSON envelope. Used by
+    /// the spool importer and `bbox_packet_gap` (the programmatic producers).
+    /// `now`/`id` are supplied by the caller. A missing `dedupe_key` is derived
+    /// from `<gap_kind>/<domain>/<slug(title)>` rather than rejected, so older
+    /// host-dropped envelopes still ingest.
+    pub fn from_envelope(value: &Value, id: String, now: String) -> Result<Self> {
+        let object = value
+            .as_object()
+            .context("gap envelope must be a JSON object")?;
+        if object.get("type").and_then(Value::as_str) != Some(GAP_NOTE_TYPE) {
+            anyhow::bail!("gap envelope must have type={GAP_NOTE_TYPE}");
+        }
+        let title = str_field(object, "title").context("gap envelope missing `title`")?;
+        let gap_kind_raw = str_field(object, "gap_kind").context("gap envelope missing `gap_kind`")?;
+        let gap_kind = parse_gap_kind(&gap_kind_raw)?;
+        let domain = str_field(object, "domain").context("gap envelope missing `domain`")?;
+        let wanted_capability =
+            str_field(object, "wanted_capability").context("gap envelope missing `wanted_capability`")?;
+        let dedupe_key = match str_field(object, "dedupe_key") {
+            Some(key) => {
+                validate_dedupe_key(&key)?;
+                key
+            }
+            None => format!("{}/{}/{}", gap_kind.as_ref(), slugify(&domain), slugify(&title)),
+        };
+        let evidence = object
+            .get("evidence")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok(Self {
+            id,
+            title,
+            gap_kind,
+            domain,
+            wanted_capability,
+            missing_primitive: str_field(object, "missing_primitive"),
+            fallback_used: str_field(object, "fallback_used"),
+            evidence,
+            impact: parse_impact(object.get("impact").and_then(Value::as_str))?,
+            blocking_level: parse_blocking_level(object.get("blocking_level").and_then(Value::as_str))?,
+            dedupe_key,
+            suggested_owner: str_field(object, "suggested_owner"),
+            notes: str_field(object, "notes"),
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: now.clone(),
+            updated_at: now,
+            resolved_at: None,
+            resolution_note: None,
+        })
+    }
+
+    fn matches_id(&self, needle: &str) -> bool {
+        let needle = needle.trim();
+        self.id == needle || self.id.strip_prefix("gap-") == Some(needle)
+    }
+}
+
+// ── MCP parameter structs ──────────────────────────────────────────
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GapFileParams {
+    /// One-line summary of the missing capability.
+    pub title: String,
+    /// One of: packet_ast, tooling, agent, workflow, refactor_primitive,
+    /// mcp_surface, ontology, eval_coverage, docs_runbook.
+    pub gap_kind: String,
+    /// Subsystem / domain tag (free text), e.g. `review-policy`.
+    pub domain: String,
+    /// What capability you wanted that the substrate could not provide.
+    pub wanted_capability: String,
+    /// Stable dedupe key `<gap_kind>/<domain>/<slug>`. Boring and stable so a
+    /// recurrence reuses the same key.
+    pub dedupe_key: String,
+    /// One of: low, medium, high, critical (default: medium).
+    #[serde(default)]
+    pub impact: Option<String>,
+    /// One of: none, workaround_available, blocks_task, blocks_class_of_work.
+    #[serde(default)]
+    pub blocking_level: Option<String>,
+    /// The specific primitive/surface that was missing.
+    #[serde(default)]
+    pub missing_primitive: Option<String>,
+    /// What you did instead (the manual workaround).
+    #[serde(default)]
+    pub fallback_used: Option<String>,
+    /// Evidence refs (file:line, packet-event ids, thread ids, ...).
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+    /// Who should own the fix (default: blackbox).
+    #[serde(default)]
+    pub suggested_owner: Option<String>,
+    /// Free-text addendum.
+    #[serde(default)]
+    pub notes: Option<String>,
+    /// Storage scope: `project` (default → in-repo `.bbox/gaps/`) or `global`
+    /// (→ central host store, for cross-project substrate gaps).
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Project path (resolved by the tool layer). Owns the gap when
+    /// scope=project; ignored when scope=global.
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub bro: Option<String>,
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^(thread-)?[0-9a-f]{8}$"))]
+    pub thread_id: Option<String>,
+    /// File a fresh occurrence even when an open gap with the same dedupe_key
+    /// exists (recurrence tally). Default false → dedupes to the existing gap.
+    #[serde(default)]
+    pub allow_recurrence: Option<bool>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GapListParams {
+    /// Exact gap id `gap-<8hex>` (bare 8-hex suffix accepted).
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub gap_kind: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub impact: Option<String>,
+    #[serde(default)]
+    pub blocking_level: Option<String>,
+    #[serde(default)]
+    pub dedupe_key: Option<String>,
+    /// Filter by resolution: unresolved, acknowledged, addressed.
+    #[serde(default)]
+    pub resolution: Option<String>,
+    /// Filter by project substring.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Free-text substring over title/domain/wanted_capability.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// ISO 8601: only gaps created at or after this timestamp.
+    #[serde(default)]
+    pub since: Option<String>,
+    #[serde(default)]
+    pub limit: Option<u64>,
+    /// Include addressed gaps (default: false for lists, true for exact id).
+    #[serde(default)]
+    pub include_addressed: Option<bool>,
+    /// Emit machine-readable JSON records instead of the rendered text view.
+    #[serde(default)]
+    pub json: Option<bool>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GapResolveParams {
+    /// Gap id `gap-<8hex>` (bare 8-hex suffix accepted).
+    #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
+    pub id: String,
+    /// One of: unresolved, acknowledged, addressed.
+    pub resolution: String,
+    /// Optional resolution text (terminal reason).
+    #[serde(default)]
+    pub note: Option<String>,
+    /// Mark this gap superseded by another (`gap-<8hex>`); wires the structured
+    /// supersedes/superseded_by link on both records.
+    #[serde(default)]
+    #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
+    pub superseded_by: Option<String>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GapUpdateParams {
+    /// Gap id `gap-<8hex>` (bare 8-hex suffix accepted).
+    #[schemars(regex(pattern = r"^(gap-)?[0-9a-f]{8}$"))]
+    pub id: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub domain: Option<String>,
+    #[serde(default)]
+    pub wanted_capability: Option<String>,
+    #[serde(default)]
+    pub impact: Option<String>,
+    #[serde(default)]
+    pub blocking_level: Option<String>,
+    #[serde(default)]
+    pub missing_primitive: Option<String>,
+    #[serde(default)]
+    pub fallback_used: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<Vec<String>>,
+    #[serde(default)]
+    pub suggested_owner: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+// ── Persistence ────────────────────────────────────────────────────
+//
+// Mirrors the repo-owned `.bbox/knowledge/` model: project-scoped gaps live one
+// file per record under `<project>/.bbox/gaps/gap-<8hex>.json` and travel with
+// the checkout; global gaps stay in the central host store. The on-disk file
+// omits the `project` field — location encodes scope.
+//
+// Collision note: `gap_spool` owns `<project>/.bbox/gaps/inbox/` (drop folder,
+// with `imported/`/`rejected/` nested under it). The loader reads top-level
+// `*.json` only (non-recursive `read_dir` + extension filter naturally skips the
+// `inbox/` subdir), so durable gaps and the spool never alias.
+
+fn repo_gaps_dir(project_dir: &Path) -> PathBuf {
+    project_dir.join(".bbox").join("gaps")
+}
+
+/// A project is "repo-owned" for gaps once its `.bbox/gaps/` dir exists — via a
+/// clone that carries it, `bbox_project_init`, the spool dropping a file, or the
+/// first project-scoped `bbox_gap`.
+pub fn project_is_repo_owned(project_dir: &Path) -> bool {
+    repo_gaps_dir(project_dir).is_dir()
+}
+
+/// Load every project-scoped gap committed under `<project>/.bbox/gaps/`,
+/// stamping each with `project = project_dir` (absent on disk). Top-level
+/// `*.json` only; tolerant skip-and-continue per file.
+fn load_repo_gap_entries(project_dir: &Path) -> Result<Vec<GapNote>> {
+    let dir = repo_gaps_dir(project_dir);
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let project = project_dir.to_string_lossy().to_string();
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let read_dir = match fs::read_dir(&dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            tracing::warn!("gaps load: cannot read {}: {e}", dir.display());
+            return Ok(Vec::new());
+        }
+    };
+    for de in read_dir {
+        let path = match de {
+            Ok(de) => de.path(),
+            Err(e) => {
+                tracing::warn!("gaps load: unreadable dir entry in {}: {e}", dir.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        // Non-recursive: the `inbox/` subdir (spool-owned) has no `.json`
+        // extension and is skipped here.
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let raw = match fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(e) => {
+                tracing::warn!("gaps load: skipping unreadable {}: {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        let mut entry: GapNote = match serde_json::from_str(&raw) {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!("gaps load: skipping unparseable {}: {e}", path.display());
+                skipped += 1;
+                continue;
+            }
+        };
+        entry.project = Some(project.clone());
+        out.push(entry);
+    }
+    if skipped > 0 {
+        tracing::warn!(
+            "gaps load: {} loaded={} skipped={}",
+            dir.display(),
+            out.len(),
+            skipped
+        );
+    }
+    Ok(out)
+}
+
+/// Persist `entries` (all owned by `project_dir`) one file per gap under
+/// `<project>/.bbox/gaps/`, with the `project` field cleared. `purge` deletes
+/// committed files whose id is no longer present (generation semantics) — only
+/// safe when the in-memory set is authoritative for this project.
+fn persist_repo_gap_entries(project_dir: &Path, entries: &[&GapNote], purge: bool) -> Result<()> {
+    let dir = repo_gaps_dir(project_dir);
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    if purge {
+        let keep: BTreeSet<&str> = entries.iter().map(|e| e.id.as_str()).collect();
+        for de in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
+            let path = de?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if !keep.contains(stem) {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+    }
+
+    for entry in entries {
+        let mut on_disk = (*entry).clone();
+        on_disk.project = None;
+        let path = dir.join(format!("{}.json", entry.id));
+        let new_bytes = serde_json::to_vec_pretty(&on_disk)?;
+        if fs::read(&path).map(|cur| cur == new_bytes).unwrap_or(false) {
+            continue;
+        }
+        crate::json_store::atomic_write_json_locked(&path, &on_disk)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GapStoreData {
+    pub version: u32,
+    pub gaps: Vec<GapNote>,
+}
+
+impl GapStoreData {
+    fn new() -> Self {
+        Self {
+            version: 1,
+            gaps: Vec::new(),
+        }
+    }
+}
+
+pub struct GapStore {
+    store_path: PathBuf,
+    data: GapStoreData,
+    project_roots: Vec<PathBuf>,
+}
+
+impl GapStore {
+    pub fn open(store_path: &Path) -> Result<Self> {
+        let mut s = Self {
+            store_path: store_path.to_path_buf(),
+            data: GapStoreData::new(),
+            project_roots: Vec::new(),
+        };
+        s.reload()?;
+        Ok(s)
+    }
+
+    /// Register the repos whose committed `.bbox/gaps/` should load into the
+    /// query surface, then reload so their gaps are immediately visible.
+    pub fn set_project_roots(&mut self, roots: Vec<PathBuf>) -> Result<()> {
+        self.project_roots = roots;
+        self.reload()
+    }
+
+    pub fn reload(&mut self) -> Result<()> {
+        if self.store_path.exists() {
+            let raw = fs::read_to_string(&self.store_path)
+                .with_context(|| format!("reading {}", self.store_path.display()))?;
+            self.data = serde_json::from_str(&raw)
+                .with_context(|| format!("parsing {}", self.store_path.display()))?;
+        } else {
+            self.data = GapStoreData::new();
+        }
+        self.load_project_entries()?;
+        Ok(())
+    }
+
+    fn load_project_entries(&mut self) -> Result<()> {
+        let roots = self.project_roots.clone();
+        for root in &roots {
+            for entry in load_repo_gap_entries(root)? {
+                if let Some(existing) = self.data.gaps.iter_mut().find(|g| g.id == entry.id) {
+                    *existing = entry;
+                } else {
+                    self.data.gaps.push(entry);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn save(&self) -> Result<()> {
+        // Central store owns only global (project-less or not-yet-repo-owned)
+        // gaps; project-scoped gaps are written under their owning repo's
+        // `.bbox/gaps/`. A project whose repo isn't present falls back to
+        // central so the gap is never dropped.
+        let mut central = GapStoreData {
+            version: self.data.version,
+            gaps: Vec::new(),
+        };
+        let mut by_project: HashMap<PathBuf, Vec<&GapNote>> = HashMap::new();
+        for g in &self.data.gaps {
+            match g.project.as_deref() {
+                Some(dir) if !dir.is_empty() && project_is_repo_owned(Path::new(dir)) => {
+                    by_project.entry(PathBuf::from(dir)).or_default().push(g);
+                }
+                _ => central.gaps.push(g.clone()),
+            }
+        }
+        crate::json_store::atomic_write_json_locked(&self.store_path, &central)?;
+        let loaded: HashSet<&Path> = self.project_roots.iter().map(|p| p.as_path()).collect();
+        for (dir, entries) in &by_project {
+            let purge = loaded.contains(dir.as_path());
+            persist_repo_gap_entries(dir, entries, purge)?;
+        }
+        Ok(())
+    }
+
+    fn now_iso() -> String {
+        crate::util::now_iso()
+    }
+
+    fn gen_id() -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::time::SystemTime;
+        let mut h = DefaultHasher::new();
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .hash(&mut h);
+        std::process::id().hash(&mut h);
+        format!("gap-{:08x}", h.finish() as u32)
+    }
+
+    /// Immutable slice of all stored gaps — used by cross-store aggregators
+    /// (inbox) that can't go through the MCP layer.
+    pub fn all(&self) -> &[GapNote] {
+        &self.data.gaps
+    }
+
+    /// Open (non-addressed) gap with a matching `dedupe_key` in the same scope.
+    fn open_duplicate(&self, dedupe_key: &str, project: Option<&str>) -> Option<&GapNote> {
+        self.data.gaps.iter().find(|g| {
+            g.resolution != GapResolution::Addressed
+                && g.dedupe_key == dedupe_key
+                && g.project.as_deref() == project
+        })
+    }
+
+    // ── bbox_gap (file) ────────────────────────────────────────────
+
+    /// File a gap. The `project` field on `p` is the already-resolved owning
+    /// path (or None for global). Returns the gap id (existing id on a dedupe
+    /// hit). The boolean is true when a NEW gap was created.
+    pub fn file(&mut self, p: &GapFileParams) -> Result<(String, bool)> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.file_locked(p)
+        })
+    }
+
+    fn file_locked(&mut self, p: &GapFileParams) -> Result<(String, bool)> {
+        if p.title.trim().is_empty() {
+            anyhow::bail!("'title' is required and cannot be empty");
+        }
+        let gap_kind = parse_gap_kind(&p.gap_kind)?;
+        if p.domain.trim().is_empty() {
+            anyhow::bail!("'domain' is required and cannot be empty");
+        }
+        if p.wanted_capability.trim().is_empty() {
+            anyhow::bail!("'wanted_capability' is required and cannot be empty");
+        }
+        validate_dedupe_key(&p.dedupe_key)?;
+        let impact = parse_impact(p.impact.as_deref())?;
+        let blocking_level = parse_blocking_level(p.blocking_level.as_deref())?;
+
+        let scope = p.scope.as_deref().unwrap_or("project");
+        let project = match scope {
+            "global" => None,
+            "project" => p.project.clone().filter(|s| !s.trim().is_empty()),
+            other => anyhow::bail!("scope must be `project` or `global`, got `{other}`"),
+        };
+
+        let allow_recurrence = p.allow_recurrence.unwrap_or(false);
+        if !allow_recurrence {
+            if let Some(existing) = self.open_duplicate(&p.dedupe_key, project.as_deref()) {
+                return Ok((existing.id.clone(), false));
+            }
+        }
+
+        // Project-scoped gaps live in-repo: ensure `.bbox/gaps/` exists so the
+        // gap is routed to the repo (opt the project into repo-ownership), but
+        // only when the project path itself exists on disk.
+        if let Some(dir) = project.as_deref() {
+            let p = Path::new(dir);
+            if p.is_dir() {
+                fs::create_dir_all(repo_gaps_dir(p))
+                    .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
+            }
+        }
+
+        let now = Self::now_iso();
+        let gap = GapNote {
+            id: Self::gen_id(),
+            title: p.title.trim().to_string(),
+            gap_kind,
+            domain: p.domain.trim().to_string(),
+            wanted_capability: p.wanted_capability.trim().to_string(),
+            missing_primitive: p.missing_primitive.clone().filter(|s| !s.trim().is_empty()),
+            fallback_used: p.fallback_used.clone().filter(|s| !s.trim().is_empty()),
+            evidence: p.evidence.clone().unwrap_or_default(),
+            impact,
+            blocking_level,
+            dedupe_key: p.dedupe_key.trim().to_string(),
+            suggested_owner: p.suggested_owner.clone().filter(|s| !s.trim().is_empty()),
+            notes: p.notes.clone().filter(|s| !s.trim().is_empty()),
+            supersedes: None,
+            superseded_by: None,
+            resolution: GapResolution::Unresolved,
+            project,
+            task_id: p.task_id.clone(),
+            session_id: p.session_id.clone(),
+            provider: p.provider.clone(),
+            bro: p.bro.clone(),
+            thread_id: p.thread_id.clone(),
+            created_at: now.clone(),
+            updated_at: now,
+            resolved_at: None,
+            resolution_note: None,
+        };
+        let id = gap.id.clone();
+        self.data.gaps.push(gap);
+        self.save()?;
+        Ok((id, true))
+    }
+
+    /// Ingest a pre-built [`GapNote`] (spool / packet producers). Honors the
+    /// same open-duplicate dedupe by key+scope. Returns (id, created).
+    pub fn ingest(&mut self, mut gap: GapNote) -> Result<(String, bool)> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            if let Some(existing) = self.open_duplicate(&gap.dedupe_key, gap.project.as_deref()) {
+                return Ok((existing.id.clone(), false));
+            }
+            if let Some(dir) = gap.project.as_deref() {
+                let p = Path::new(dir);
+                if p.is_dir() {
+                    fs::create_dir_all(repo_gaps_dir(p))
+                        .with_context(|| format!("creating .bbox/gaps under {dir}"))?;
+                }
+            }
+            if gap.id.is_empty() {
+                gap.id = Self::gen_id();
+            }
+            let id = gap.id.clone();
+            self.data.gaps.push(gap);
+            self.save()?;
+            Ok((id, true))
+        })
+    }
+
+    // ── bbox_gap_resolve ───────────────────────────────────────────
+
+    pub fn resolve(&mut self, p: &GapResolveParams) -> Result<String> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.resolve_locked(p)
+        })
+    }
+
+    fn resolve_locked(&mut self, p: &GapResolveParams) -> Result<String> {
+        let resolution = GapResolution::from_str(p.resolution.trim()).map_err(|_| {
+            anyhow::anyhow!(
+                "Unknown resolution: {}. Use: unresolved, acknowledged, addressed",
+                p.resolution
+            )
+        })?;
+
+        // Canonical superseded_by id, if any.
+        let superseded_by = p.superseded_by.as_deref().map(|s| {
+            let s = s.trim();
+            if s.starts_with("gap-") {
+                s.to_string()
+            } else {
+                format!("gap-{s}")
+            }
+        });
+        // Validate the supersessor exists before mutating either side.
+        if let Some(by) = superseded_by.as_deref() {
+            if !self.data.gaps.iter().any(|g| g.matches_id(by)) {
+                anyhow::bail!("superseded_by gap not found: {by}");
+            }
+        }
+
+        let now = Self::now_iso();
+        let idx = self
+            .data
+            .gaps
+            .iter()
+            .position(|g| g.matches_id(&p.id))
+            .with_context(|| {
+                format!(
+                    "Gap not found: {} (expected `gap-<8hex>`, e.g. `gap-a1b2c3d4`)",
+                    p.id
+                )
+            })?;
+
+        let resolved_id = self.data.gaps[idx].id.clone();
+        {
+            let gap = &mut self.data.gaps[idx];
+            gap.resolution = resolution;
+            gap.updated_at = now.clone();
+            gap.resolved_at = if matches!(resolution, GapResolution::Unresolved) {
+                None
+            } else {
+                Some(now.clone())
+            };
+            if let Some(txt) = p.note.as_deref() {
+                gap.resolution_note = Some(txt.to_string());
+            }
+            if let Some(by) = &superseded_by {
+                gap.superseded_by = Some(by.clone());
+            }
+        }
+        // Wire the reverse link on the supersessor.
+        if let Some(by) = &superseded_by {
+            if let Some(other) = self.data.gaps.iter_mut().find(|g| g.matches_id(by)) {
+                other.supersedes = Some(resolved_id.clone());
+                other.updated_at = now;
+            }
+        }
+
+        self.save()?;
+        Ok(format!("Gap {resolved_id} → {}", resolution.as_ref()))
+    }
+
+    // ── bbox_gap_update ────────────────────────────────────────────
+
+    pub fn update(&mut self, p: &GapUpdateParams) -> Result<String> {
+        let path = self.store_path.clone();
+        crate::json_store::with_store_lock(&path, || {
+            self.reload()?;
+            self.update_locked(p)
+        })
+    }
+
+    fn update_locked(&mut self, p: &GapUpdateParams) -> Result<String> {
+        // Validate enum patches before locating the record.
+        let impact = p
+            .impact
+            .as_deref()
+            .map(|v| parse_impact(Some(v)))
+            .transpose()?;
+        let blocking_level = p
+            .blocking_level
+            .as_deref()
+            .map(|v| parse_blocking_level(Some(v)))
+            .transpose()?;
+
+        let gap = self
+            .data
+            .gaps
+            .iter_mut()
+            .find(|g| g.matches_id(&p.id))
+            .with_context(|| {
+                format!(
+                    "Gap not found: {} (expected `gap-<8hex>`, e.g. `gap-a1b2c3d4`)",
+                    p.id
+                )
+            })?;
+
+        if let Some(v) = p.title.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            gap.title = v.to_string();
+        }
+        if let Some(v) = p.domain.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            gap.domain = v.to_string();
+        }
+        if let Some(v) = p
+            .wanted_capability
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            gap.wanted_capability = v.to_string();
+        }
+        if let Some(v) = impact {
+            gap.impact = v;
+        }
+        if let Some(v) = blocking_level {
+            gap.blocking_level = v;
+        }
+        if let Some(v) = &p.missing_primitive {
+            gap.missing_primitive = Some(v.clone()).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = &p.fallback_used {
+            gap.fallback_used = Some(v.clone()).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = &p.evidence {
+            gap.evidence = v.clone();
+        }
+        if let Some(v) = &p.suggested_owner {
+            gap.suggested_owner = Some(v.clone()).filter(|s| !s.trim().is_empty());
+        }
+        if let Some(v) = &p.notes {
+            gap.notes = Some(v.clone()).filter(|s| !s.trim().is_empty());
+        }
+        gap.updated_at = Self::now_iso();
+        let id = gap.id.clone();
+        self.save()?;
+        Ok(format!("Gap {id} updated"))
+    }
+
+    // ── bbox_gaps (list / filter) ──────────────────────────────────
+
+    /// Filtered, newest-first view. Returns owned clones so callers can render
+    /// or serialize without holding the borrow.
+    pub fn query(&self, p: &GapListParams) -> Vec<GapNote> {
+        let gap_kind = p.gap_kind.as_deref().and_then(|v| GapKind::from_str(v.trim()).ok());
+        let impact = p.impact.as_deref().and_then(|v| GapImpact::from_str(v.trim()).ok());
+        let blocking = p
+            .blocking_level
+            .as_deref()
+            .and_then(|v| BlockingLevel::from_str(v.trim()).ok());
+        let resolution = p
+            .resolution
+            .as_deref()
+            .and_then(|v| GapResolution::from_str(v.trim()).ok());
+        let include_addressed = p.include_addressed.unwrap_or(p.id.is_some());
+        let id_needle = p
+            .id
+            .as_deref()
+            .map(|s| s.trim().strip_prefix("gap-").unwrap_or(s.trim()).to_ascii_lowercase());
+        let query_lower = p.query.as_deref().map(|s| s.to_lowercase());
+        let project_lower = p.project.as_deref().map(|s| s.to_lowercase());
+        let dedupe_lower = p.dedupe_key.as_deref().map(|s| s.to_lowercase());
+
+        let mut out: Vec<GapNote> = self
+            .data
+            .gaps
+            .iter()
+            .filter(|g| {
+                if let Some(needle) = &id_needle {
+                    if g.id.strip_prefix("gap-").unwrap_or(&g.id).to_ascii_lowercase() != *needle {
+                        return false;
+                    }
+                }
+                if let Some(k) = gap_kind {
+                    if g.gap_kind != k {
+                        return false;
+                    }
+                }
+                if let Some(i) = impact {
+                    if g.impact != i {
+                        return false;
+                    }
+                }
+                if let Some(b) = blocking {
+                    if g.blocking_level != b {
+                        return false;
+                    }
+                }
+                if let Some(r) = resolution {
+                    if g.resolution != r {
+                        return false;
+                    }
+                } else if !include_addressed && g.resolution == GapResolution::Addressed {
+                    return false;
+                }
+                if let Some(d) = &dedupe_lower {
+                    if !g.dedupe_key.to_lowercase().contains(d) {
+                        return false;
+                    }
+                }
+                if let Some(dom) = &p.domain {
+                    if !g.domain.eq_ignore_ascii_case(dom.trim()) {
+                        return false;
+                    }
+                }
+                if let Some(pl) = &project_lower {
+                    let proj = g.project.as_deref().unwrap_or("").to_lowercase();
+                    if !proj.contains(pl) {
+                        return false;
+                    }
+                }
+                if let Some(q) = &query_lower {
+                    let hay = format!(
+                        "{} {} {}",
+                        g.title.to_lowercase(),
+                        g.domain.to_lowercase(),
+                        g.wanted_capability.to_lowercase()
+                    );
+                    if !hay.contains(q) {
+                        return false;
+                    }
+                }
+                if let Some(since) = p.since.as_deref() {
+                    if g.created_at.as_str() < since {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        out.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        let limit = p.limit.unwrap_or(50).max(1) as usize;
+        out.truncate(limit);
+        out
+    }
+
+    pub fn list_rendered(&self, p: &GapListParams) -> Result<String> {
+        // Surface enum-filter typos loudly rather than silently matching nothing.
+        if let Some(v) = p.gap_kind.as_deref() {
+            parse_gap_kind(v)?;
+        }
+        if let Some(v) = p.impact.as_deref() {
+            parse_impact(Some(v))?;
+        }
+        if let Some(v) = p.blocking_level.as_deref() {
+            parse_blocking_level(Some(v))?;
+        }
+        if let Some(v) = p.resolution.as_deref() {
+            GapResolution::from_str(v.trim())
+                .map_err(|_| anyhow::anyhow!("Unknown resolution filter: {v}"))?;
+        }
+
+        let results = self.query(p);
+        if p.json.unwrap_or(false) {
+            return Ok(serde_json::to_string_pretty(&results)?);
+        }
+        if results.is_empty() {
+            return Ok("No gaps found.".to_string());
+        }
+        let mut out = format!("{} gap(s)\n\n", results.len());
+        for g in &results {
+            let scope = g.project.as_deref().map_or("global".to_string(), |p| {
+                p.rsplit('/').next().unwrap_or(p).to_string()
+            });
+            out.push_str(&format!(
+                "{id}  [{kind}/{impact}/{res}]  {ts}  scope={scope}  dedupe={dedupe}\n  {title}\n  want: {want}\n",
+                id = g.id,
+                kind = g.gap_kind.as_ref(),
+                impact = g.impact.as_ref(),
+                res = g.resolution.as_ref(),
+                ts = g.created_at,
+                dedupe = g.dedupe_key,
+                title = g.title,
+                want = g.wanted_capability,
+            ));
+            if let Some(by) = &g.superseded_by {
+                out.push_str(&format!("  superseded_by: {by}\n"));
+            }
+            if let Some(rn) = &g.resolution_note {
+                out.push_str(&format!("  ↳ {rn}\n"));
+            }
+            out.push('\n');
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn file_params(title: &str, dedupe: &str) -> GapFileParams {
+        GapFileParams {
+            title: title.into(),
+            gap_kind: "tooling".into(),
+            domain: "test-domain".into(),
+            wanted_capability: "do the thing".into(),
+            dedupe_key: dedupe.into(),
+            impact: Some("high".into()),
+            blocking_level: None,
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: None,
+            suggested_owner: None,
+            notes: None,
+            scope: Some("global".into()),
+            project: None,
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            allow_recurrence: None,
+        }
+    }
+
+    #[test]
+    fn file_and_query_roundtrip() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let (id, created) = store
+            .file(&file_params("Need a latch", "tooling/test-domain/latch"))
+            .unwrap();
+        assert!(created);
+        assert!(id.starts_with("gap-"));
+
+        let listed = store.query(&GapListParams::default());
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].impact, GapImpact::High);
+        assert_eq!(listed[0].gap_kind, GapKind::Tooling);
+    }
+
+    #[test]
+    fn dedupes_open_gap_by_key() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let (id1, c1) = store.file(&file_params("first", "tooling/test-domain/x")).unwrap();
+        assert!(c1);
+        let (id2, c2) = store.file(&file_params("second", "tooling/test-domain/x")).unwrap();
+        assert!(!c2, "same dedupe_key should not create a second open gap");
+        assert_eq!(id1, id2);
+        assert_eq!(store.all().len(), 1);
+    }
+
+    #[test]
+    fn recurrence_allowed_with_flag() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        store.file(&file_params("first", "tooling/test-domain/x")).unwrap();
+        let mut p = file_params("again", "tooling/test-domain/x");
+        p.allow_recurrence = Some(true);
+        let (_id, created) = store.file(&p).unwrap();
+        assert!(created);
+        assert_eq!(store.all().len(), 2);
+    }
+
+    #[test]
+    fn rejects_bad_dedupe_key() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let err = store
+            .file(&file_params("x", "too/short"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("dedupe_key"));
+    }
+
+    #[test]
+    fn rejects_unknown_gap_kind() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let mut p = file_params("x", "tooling/d/s");
+        p.gap_kind = "nonsense".into();
+        let err = store.file(&p).unwrap_err().to_string();
+        assert!(err.contains("gap_kind must be one of"));
+    }
+
+    #[test]
+    fn resolve_wires_supersession_both_ways() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let (old_id, _) = store.file(&file_params("old", "tooling/test-domain/a")).unwrap();
+        let (new_id, _) = store.file(&file_params("new", "tooling/test-domain/b")).unwrap();
+
+        store
+            .resolve(&GapResolveParams {
+                id: old_id.clone(),
+                resolution: "addressed".into(),
+                note: Some("rolled into successor".into()),
+                superseded_by: Some(new_id.clone()),
+            })
+            .unwrap();
+
+        let old = store.all().iter().find(|g| g.id == old_id).unwrap();
+        let new = store.all().iter().find(|g| g.id == new_id).unwrap();
+        assert_eq!(old.resolution, GapResolution::Addressed);
+        assert_eq!(old.superseded_by.as_deref(), Some(new_id.as_str()));
+        assert_eq!(new.supersedes.as_deref(), Some(old_id.as_str()));
+    }
+
+    #[test]
+    fn update_edits_in_place() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let (id, _) = store.file(&file_params("orig", "tooling/test-domain/a")).unwrap();
+        store
+            .update(&GapUpdateParams {
+                id: id.clone(),
+                title: Some("revised title".into()),
+                impact: Some("critical".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let g = store.all().iter().find(|g| g.id == id).unwrap();
+        assert_eq!(g.title, "revised title");
+        assert_eq!(g.impact, GapImpact::Critical);
+    }
+
+    #[test]
+    fn project_scoped_gap_lands_in_repo() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        store
+            .set_project_roots(vec![project.clone()])
+            .unwrap();
+
+        let mut p = file_params("repo gap", "tooling/test-domain/repo");
+        p.scope = Some("project".into());
+        p.project = Some(project.to_string_lossy().to_string());
+        let (id, created) = store.file(&p).unwrap();
+        assert!(created);
+
+        // Lands as a top-level file under <project>/.bbox/gaps/.
+        let on_disk = project.join(".bbox").join("gaps").join(format!("{id}.json"));
+        assert!(on_disk.exists(), "gap should be committed in-repo at {on_disk:?}");
+        // The on-disk file omits `project` (location encodes scope).
+        let raw = fs::read_to_string(&on_disk).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(v.get("project").is_none());
+        // Central store should NOT carry the repo-owned gap.
+        let central = fs::read_to_string(root.join("gaps.json")).unwrap();
+        let cv: GapStoreData = serde_json::from_str(&central).unwrap();
+        assert!(cv.gaps.is_empty(), "repo-owned gap must not stay central");
+    }
+
+    #[test]
+    fn ingest_from_envelope_derives_dedupe_when_absent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let env = serde_json::json!({
+            "type": GAP_NOTE_TYPE,
+            "title": "Need a Foo Hook",
+            "gap_kind": "workflow",
+            "domain": "ingest test",
+            "wanted_capability": "hook the foo"
+        });
+        let gap = GapNote::from_envelope(&env, GapStore::gen_id(), GapStore::now_iso()).unwrap();
+        assert_eq!(gap.dedupe_key, "workflow/ingest-test/need-a-foo-hook");
+        let (_id, created) = store.ingest(gap).unwrap();
+        assert!(created);
+    }
+
+    #[test]
+    fn workload_retro_prompt_names_only_valid_gap_kinds() {
+        // The retro probe (orchestration::WORKLOAD_RETRO_PROMPT) instructs bros
+        // to file gaps with a specific gap_kind. Those tokens must stay parseable
+        // as `GapKind` — a mismatch makes every retro `bbox_gap` call fail.
+        let prompt = crate::orchestration::WORKLOAD_RETRO_PROMPT;
+        for kind in [
+            "mcp_surface",
+            "tooling",
+            "workflow",
+            "agent",
+            "docs_runbook",
+            "refactor_primitive",
+            "ontology",
+            "eval_coverage",
+        ] {
+            assert!(
+                prompt.contains(kind),
+                "retro prompt no longer names gap_kind {kind:?}"
+            );
+            assert!(
+                GapKind::from_str(kind).is_ok(),
+                "retro prompt names gap_kind {kind:?} that GapKind cannot parse"
+            );
+        }
+    }
+
+    #[test]
+    fn loader_ignores_spool_inbox_subdir() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let project = root.join("project");
+        let gaps_dir = project.join(".bbox").join("gaps");
+        let inbox = gaps_dir.join("inbox");
+        fs::create_dir_all(&inbox).unwrap();
+        // A spool drop file under inbox/ must NOT be loaded as a durable gap.
+        fs::write(
+            inbox.join("dropped.json"),
+            serde_json::json!({"type": GAP_NOTE_TYPE, "title": "x"}).to_string(),
+        )
+        .unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        store.set_project_roots(vec![project.clone()]).unwrap();
+        assert!(store.all().is_empty(), "inbox/ files are spool-owned, not durable gaps");
+    }
+}

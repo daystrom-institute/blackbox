@@ -1598,7 +1598,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_retro",
-        description = "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files blackbox.gap_note.v1 followups only if something's worth surfacing. Does not delete the task."
+        description = "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task."
     )]
     pub(crate) fn bro_retro(&self, Parameters(p): Parameters<RetroParams>) -> CallToolResult {
         let (provider, session_id, cwd) = match self.state.task_store.read().get(&p.task_id) {

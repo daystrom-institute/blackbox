@@ -3,23 +3,23 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::notes::{NoteResolution, Notes};
+use crate::gaps::{GapResolution, GapStore};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapTrailerRef {
-    pub note_id: String,
+    pub gap_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GapTrailerStatus {
     Addressed,
-    Open(NoteResolution),
+    Open(GapResolution),
     Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapTrailerCheck {
-    pub note_id: String,
+    pub gap_id: String,
     pub status: GapTrailerStatus,
 }
 
@@ -32,9 +32,9 @@ pub fn scan_commit_trailers(message: &str) -> Vec<GapTrailerRef> {
                 return None;
             }
             let id = value.trim();
-            if is_canonical_note_id(id) {
+            if is_canonical_gap_id(id) {
                 Some(GapTrailerRef {
-                    note_id: id.to_ascii_lowercase(),
+                    gap_id: id.to_ascii_lowercase(),
                 })
             } else {
                 None
@@ -43,20 +43,20 @@ pub fn scan_commit_trailers(message: &str) -> Vec<GapTrailerRef> {
         .collect()
 }
 
-pub fn check_trailers(notes: &Notes, refs: &[GapTrailerRef]) -> Vec<GapTrailerCheck> {
+pub fn check_trailers(gaps: &GapStore, refs: &[GapTrailerRef]) -> Vec<GapTrailerCheck> {
     refs.iter()
         .map(|trailer| {
-            let status = notes
+            let status = gaps
                 .all()
                 .iter()
-                .find(|note| note.id == trailer.note_id)
-                .map(|note| match note.resolution {
-                    NoteResolution::Addressed => GapTrailerStatus::Addressed,
+                .find(|gap| gap.id == trailer.gap_id)
+                .map(|gap| match gap.resolution {
+                    GapResolution::Addressed => GapTrailerStatus::Addressed,
                     other => GapTrailerStatus::Open(other),
                 })
                 .unwrap_or(GapTrailerStatus::Missing);
             GapTrailerCheck {
-                note_id: trailer.note_id.clone(),
+                gap_id: trailer.gap_id.clone(),
                 status,
             }
         })
@@ -64,7 +64,7 @@ pub fn check_trailers(notes: &Notes, refs: &[GapTrailerRef]) -> Vec<GapTrailerCh
 }
 
 pub fn render_git_closeout_check(
-    notes: &Notes,
+    gaps: &GapStore,
     repo: &Path,
     range: Option<&str>,
 ) -> Result<String> {
@@ -72,7 +72,7 @@ pub fn render_git_closeout_check(
     if refs.is_empty() {
         return Ok(String::new());
     }
-    let checks = check_trailers(notes, &refs);
+    let checks = check_trailers(gaps, &refs);
     Ok(render_checks(&checks))
 }
 
@@ -85,17 +85,17 @@ pub fn render_checks(checks: &[GapTrailerCheck]) -> String {
     for check in checks {
         match check.status {
             GapTrailerStatus::Addressed => {
-                out.push_str(&format!("  {} — addressed\n", check.note_id));
+                out.push_str(&format!("  {} — addressed\n", check.gap_id));
             }
             GapTrailerStatus::Open(resolution) => {
                 out.push_str(&format!(
                     "  {} — still {}\n",
-                    check.note_id,
+                    check.gap_id,
                     resolution.as_ref()
                 ));
             }
             GapTrailerStatus::Missing => {
-                out.push_str(&format!("  {} — missing\n", check.note_id));
+                out.push_str(&format!("  {} — missing\n", check.gap_id));
             }
         }
     }
@@ -122,8 +122,8 @@ fn scan_git_trailers(repo: &Path, range: Option<&str>) -> Result<Vec<GapTrailerR
     Ok(scan_commit_trailers(&stdout))
 }
 
-fn is_canonical_note_id(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("note-") else {
+fn is_canonical_gap_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix("gap-") else {
         return false;
     };
     suffix.len() == 8 && suffix.chars().all(|c| c.is_ascii_hexdigit())
@@ -132,52 +132,50 @@ fn is_canonical_note_id(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::notes::{Note, NoteKind, NoteStore};
+    use crate::gaps::{GapFileParams, GapStore};
     use tempfile::tempdir;
 
-    fn notes_with(entries: Vec<(&str, NoteResolution)>) -> Notes {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("notes.json");
-        let notes = entries
-            .into_iter()
-            .map(|(id, resolution)| Note {
-                id: id.into(),
-                kind: NoteKind::Followup,
-                body: "{}".into(),
+    fn file_gap(store: &mut GapStore, slug: &str) -> String {
+        store
+            .file(&GapFileParams {
+                title: slug.into(),
+                gap_kind: "tooling".into(),
+                domain: "closeout-test".into(),
+                wanted_capability: "x".into(),
+                dedupe_key: format!("tooling/closeout-test/{slug}"),
+                impact: None,
+                blocking_level: None,
+                missing_primitive: None,
+                fallback_used: None,
+                evidence: None,
+                suggested_owner: None,
+                notes: None,
+                scope: Some("global".into()),
+                project: None,
                 task_id: None,
                 session_id: None,
-                project: None,
-                thread_id: None,
                 provider: None,
                 bro: None,
-                resolution,
-                created_at: "2026-05-12T00:00:00Z".into(),
-                updated_at: "2026-05-12T00:00:00Z".into(),
-                resolved_at: None,
-                resolution_note: None,
+                thread_id: None,
+                allow_recurrence: None,
             })
-            .collect();
-        std::fs::write(
-            &path,
-            serde_json::to_string(&NoteStore { version: 1, notes }).unwrap(),
-        )
-        .unwrap();
-        Notes::open(&path).unwrap()
+            .unwrap()
+            .0
     }
 
     #[test]
     fn scanner_recognizes_canonical_trailers() {
         let refs = scan_commit_trailers(
-            "implement thing\n\nAddresses-Gap-Note: note-a1b2c3d4\naddresses-gap-note: note-ffffffff\n",
+            "implement thing\n\nAddresses-Gap-Note: gap-a1b2c3d4\naddresses-gap-note: gap-ffffffff\n",
         );
         assert_eq!(
             refs,
             vec![
                 GapTrailerRef {
-                    note_id: "note-a1b2c3d4".into()
+                    gap_id: "gap-a1b2c3d4".into()
                 },
                 GapTrailerRef {
-                    note_id: "note-ffffffff".into()
+                    gap_id: "gap-ffffffff".into()
                 }
             ]
         );
@@ -190,22 +188,39 @@ mod tests {
     }
 
     #[test]
+    fn scanner_ignores_legacy_note_trailers() {
+        // Clean break: `note-<8hex>` trailers in old commits are historical and
+        // no longer resolve against the gap store.
+        let refs = scan_commit_trailers("Addresses-Gap-Note: note-a1b2c3d4");
+        assert!(refs.is_empty());
+    }
+
+    #[test]
     fn trailer_checks_report_missing_addressed_and_open() {
-        let notes = notes_with(vec![
-            ("note-a1b2c3d4", NoteResolution::Addressed),
-            ("note-11111111", NoteResolution::Unresolved),
-        ]);
+        // Seed a store with two real gaps: one addressed, one unresolved.
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let mut store = GapStore::open(&root.join("gaps.json")).unwrap();
+        let addressed_id = file_gap(&mut store, "addressed");
+        let open_id = file_gap(&mut store, "open");
+        store
+            .resolve(&crate::gaps::GapResolveParams {
+                id: addressed_id.clone(),
+                resolution: "addressed".into(),
+                note: None,
+                superseded_by: None,
+            })
+            .unwrap();
+
         let checks = check_trailers(
-            &notes,
+            &store,
             &[
                 GapTrailerRef {
-                    note_id: "note-a1b2c3d4".into(),
+                    gap_id: addressed_id,
                 },
+                GapTrailerRef { gap_id: open_id },
                 GapTrailerRef {
-                    note_id: "note-11111111".into(),
-                },
-                GapTrailerRef {
-                    note_id: "note-22222222".into(),
+                    gap_id: "gap-22222222".into(),
                 },
             ],
         );
@@ -213,7 +228,7 @@ mod tests {
         assert_eq!(checks[0].status, GapTrailerStatus::Addressed);
         assert_eq!(
             checks[1].status,
-            GapTrailerStatus::Open(NoteResolution::Unresolved)
+            GapTrailerStatus::Open(GapResolution::Unresolved)
         );
         assert_eq!(checks[2].status, GapTrailerStatus::Missing);
     }

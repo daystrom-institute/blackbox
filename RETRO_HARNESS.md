@@ -20,7 +20,7 @@ Run this as a non-compelling retrospective — it asks for reflection on the har
 
 > This is a retrospective on the harness you just ran inside — its built-in tools, its injected context, the intern (if one was active), and its turn machinery. Where did the harness get in your way? What built-in tool was missing, too narrow, or awkward to compose? Did an injected nudge or system message fire at the wrong moment or say the wrong thing? If an intern was advising you, did it help or was it noise? Did steering, interrupt, or compaction misbehave? Every `shell_run` here is a promise that wakes you on completion instead of making you poll — did that auto-wake model fit the work, or did you fight it? What did you reach for that the harness did not give you, and what did you do instead?
 >
-> File real harness or substrate gaps as gap notes using the `blackbox.gap_note.v1` JSON envelope via `bbox_note(kind="followup")`. Dedupe first with `bbox_notes(kind="followup", query="blackbox.gap_note.v1", include_addressed=false)`.
+> File real harness or substrate gaps with `bbox_gap` (typed params, not a note envelope), and dedupe first with `bbox_gaps` (filter by `dedupe_key` / `gap_kind` / `domain`).
 
 ## What counts as a gap
 
@@ -42,41 +42,37 @@ Do not file a gap note for ordinary product TODOs, one-off cleanup, or a user-st
 1. Walk the session and list every moment of "I wish the harness did X" or "why did the harness do Y."
 2. Group by reusable capability, not by individual annoyance.
 3. For each candidate, ask: would this bite another agent, in another session or project?
-4. Dedupe against open gap notes before filing.
+4. Dedupe against open gaps (`bbox_gaps`) before filing.
 5. File each real gap with a stable `dedupe_key`.
 6. Note any candidates you deliberately did not file, and why.
 
-## Gap-note template
+## Gap-filing call
 
-```json
-{
-  "type": "blackbox.gap_note.v1",
-  "title": "Short human-readable gap title",
-  "gap_kind": "tooling",
-  "domain": "harness/shell-tools",
-  "wanted_capability": "Describe the reusable harness/substrate capability the agent wanted.",
-  "missing_primitive": "Optional concrete tool, injection, or surface name.",
-  "fallback_used": "What the agent did manually instead.",
-  "impact": "medium",
-  "blocking_level": "workaround_available",
-  "evidence": [
-    "session retrospective",
-    "file:RETRO_HARNESS.md"
-  ],
-  "dedupe_key": "tooling/harness/capability-slug",
-  "suggested_owner": "blackbox",
-  "notes": "Any extra context useful for triage."
-}
+```text
+bbox_gap(
+  title="Short human-readable gap title",
+  gap_kind="tooling",
+  domain="harness/shell-tools",
+  wanted_capability="Describe the reusable harness/substrate capability the agent wanted.",
+  dedupe_key="tooling/harness/capability-slug",
+  impact="medium",
+  blocking_level="workaround_available",
+  missing_primitive="Optional concrete tool, injection, or surface name.",
+  fallback_used="What the agent did manually instead.",
+  evidence=["session retrospective", "file:RETRO_HARNESS.md"],
+)
 ```
 
-`gap_kind` names the *type of capability* that is missing, not the subsystem it lives in. Use one of the existing values — `tooling`, `agent`, `workflow`, `mcp_surface`, `docs_runbook`, `ontology`, `refactor_primitive`, `eval_coverage`, `packet_ast` — and do not coin new ones. There is deliberately **no `harness` kind**: the harness is a *domain*, not a capability type, so it goes in the `domain` field (`harness`, or a scoped `harness/<area>` such as `harness/shell-tools`, `harness/intern`, `harness/compaction`) while the kind stays the capability type. For a harness retro the common kinds are `tooling` (built-in tools), `agent` (the intern, or the harness's own loop behavior), `mcp_surface` (the admitted tool set), and `workflow` (steering / interrupt / compaction shape). Likewise, an aspirational "would be nice" item is not its own kind — file it under the matching capability kind with `blocking_level: "not_blocking"` and let `fallback_used` say what you did instead.
+Required: `title`, `gap_kind`, `domain`, `wanted_capability`, `dedupe_key`. See `sm-gap-notes` via `bbox_knowledge` for the full runbook.
+
+`gap_kind` names the *type of capability* that is missing, not the subsystem it lives in. Use one of the existing values — `tooling`, `agent`, `workflow`, `mcp_surface`, `docs_runbook`, `ontology`, `refactor_primitive`, `eval_coverage`, `packet_ast` — and do not coin new ones. There is deliberately **no `harness` kind**: the harness is a *domain*, not a capability type, so it goes in the `domain` field (`harness`, or a scoped `harness/<area>` such as `harness/shell-tools`, `harness/intern`, `harness/compaction`) while the kind stays the capability type. For a harness retro the common kinds are `tooling` (built-in tools), `agent` (the intern, or the harness's own loop behavior), `mcp_surface` (the admitted tool set), and `workflow` (steering / interrupt / compaction shape). Likewise, an aspirational "would be nice" item is not its own kind — file it under the matching capability kind with `blocking_level: "none"` and let `fallback_used` say what you did instead.
 
 ## Retrospective output shape
 
 When you run this harness, return a short summary:
 
-- Gap notes filed: note ids plus titles.
-- Existing notes reused or referenced: note ids plus dedupe keys.
+- Gaps filed: gap ids plus titles.
+- Existing gaps reused or referenced: gap ids plus dedupe keys.
 - Intern assessment, when one was active: helped / noise / mixed, in one sentence.
 - Wishlist candidates not filed: one line each, with the reason.
 - Follow-up risk: anything likely to keep hurting agents if left untriaged.

@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::artifacts;
 use crate::knowledge::{Approval, Knowledge, KnowledgeEntry, Status};
-use crate::notes::{GapImpact, GapNoteView, Note, NoteKind, NoteResolution, Notes};
+use crate::gaps::{GapImpact, GapNote, GapResolution, GapStore};
+use crate::notes::{Note, NoteKind, NoteResolution, Notes};
 use crate::orchestration::{TaskStatus, TaskStore};
 use crate::threads::{Thread, ThreadStatus, Threads};
 use crate::whiteboards::{Phase, WhiteboardRegistry};
@@ -45,6 +46,7 @@ pub fn compute_inbox(
     kb: &Knowledge,
     threads: &Threads,
     notes: &Notes,
+    gaps: &GapStore,
     task_store: &TaskStore,
     whiteboards: &WhiteboardRegistry,
     p: &InboxParams,
@@ -77,35 +79,26 @@ pub fn compute_inbox(
         out.push('\n');
     }
 
-    // 2. Gap notes — structured substrate gaps filed as followups
-    let gap_notes = gap_notes(notes, project_filter.as_deref(), limit);
-    if !gap_notes.is_empty() {
-        out.push_str(&format!("## Gap notes ({})\n", gap_notes.len()));
-        for gap in &gap_notes {
-            let gap_kind = gap.gap_kind.as_deref().unwrap_or("gap");
-            let project = project_leaf(gap.note.project.as_deref()).unwrap_or("-");
-            let detail = gap
-                .dedupe_key
-                .as_deref()
-                .or(gap.domain.as_deref())
-                .or(gap.blocking_level.as_deref())
-                .map(|d| format!(" ({d})"))
-                .unwrap_or_default();
+    // 2. Gap notes — first-class substrate gaps from the repo-owned gap store
+    let gaps_open = open_gaps(gaps, project_filter.as_deref(), limit);
+    if !gaps_open.is_empty() {
+        out.push_str(&format!("## Gap notes ({})\n", gaps_open.len()));
+        for gap in &gaps_open {
+            let project = project_leaf(gap.project.as_deref()).unwrap_or("-");
             out.push_str(&format!(
-                "  {} [{} {}] {} — {}{}\n",
-                gap.note.id,
-                gap.impact.as_str(),
-                gap_kind,
+                "  {} [{} {}] {} — {} ({})\n",
+                gap.id,
+                gap.impact.as_ref(),
+                gap.gap_kind.as_ref(),
                 project,
                 truncate(&gap.title, 120),
-                detail
+                gap.dedupe_key,
             ));
         }
         out.push('\n');
     }
 
-    let stale_gaps =
-        stale_high_impact_gap_notes(notes, project_filter.as_deref(), stale_days, limit);
+    let stale_gaps = stale_high_impact_gaps(gaps, project_filter.as_deref(), stale_days, limit);
     if !stale_gaps.is_empty() {
         out.push_str(&format!(
             "## Stale high-impact gap notes ≥{}d ({})\n",
@@ -113,13 +106,12 @@ pub fn compute_inbox(
             stale_gaps.len()
         ));
         for (gap, age) in &stale_gaps {
-            let gap_kind = gap.gap_kind.as_deref().unwrap_or("gap");
-            let project = project_leaf(gap.note.project.as_deref()).unwrap_or("-");
+            let project = project_leaf(gap.project.as_deref()).unwrap_or("-");
             out.push_str(&format!(
                 "  {} [{} {}] {} — {} (open {}d)\n",
-                gap.note.id,
-                gap.impact.as_str(),
-                gap_kind,
+                gap.id,
+                gap.impact.as_ref(),
+                gap.gap_kind.as_ref(),
                 project,
                 truncate(&gap.title, 120),
                 age
@@ -262,7 +254,7 @@ pub fn compute_inbox(
     }
 
     if p.aggregate_gaps.unwrap_or(false) {
-        let aggregate = render_gap_aggregates(notes, project_filter.as_deref());
+        let aggregate = render_gap_aggregates(gaps, project_filter.as_deref());
         if !aggregate.is_empty() {
             out.push_str(&aggregate);
         }
@@ -271,7 +263,7 @@ pub fn compute_inbox(
     if p.check_gap_closeouts.unwrap_or(false) {
         if let Some(project) = p.project.as_deref() {
             match crate::gap_closeout::render_git_closeout_check(
-                notes,
+                gaps,
                 std::path::Path::new(project),
                 p.gap_commit_range.as_deref(),
             ) {
@@ -345,7 +337,10 @@ fn followup_notes(notes: &Notes, project_filter: Option<&str>, limit: usize) -> 
         .filter(|n| n.kind == NoteKind::Followup)
         .filter(|n| n.resolution != NoteResolution::Addressed)
         .filter(|n| note_matches_project(n, project_filter))
-        .filter(|n| GapNoteView::parse(n).is_none())
+        // Historical gap-bodied followups (pre-`bbox_gap` era) stay hidden from
+        // the followups view — they're historical exhaust, surfaced (if at all)
+        // only through their new home in the gap store.
+        .filter(|n| !is_legacy_gap_body(&n.body))
         .map(|n| {
             (
                 n.created_at.clone(),
@@ -361,23 +356,33 @@ fn followup_notes(notes: &Notes, project_filter: Option<&str>, limit: usize) -> 
     rows.into_iter().take(limit).map(|(_, r)| r).collect()
 }
 
-fn gap_notes<'a>(
-    notes: &'a Notes,
+/// Cheap type-sniff for a legacy `blackbox.gap_note.v1` JSON body, used only to
+/// keep pre-migration gap rows out of the followups view. Not a full parse.
+fn is_legacy_gap_body(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body.trim())
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("type"))
+        .and_then(|t| t.as_str())
+        == Some(crate::gaps::GAP_NOTE_TYPE)
+}
+
+fn open_gaps<'a>(
+    gaps: &'a GapStore,
     project_filter: Option<&str>,
     limit: usize,
-) -> Vec<GapNoteView<'a>> {
-    let mut rows: Vec<GapNoteView<'a>> = notes
+) -> Vec<&'a GapNote> {
+    let mut rows: Vec<&GapNote> = gaps
         .all()
         .iter()
-        .filter(|n| n.resolution != NoteResolution::Addressed)
-        .filter(|n| note_matches_project(n, project_filter))
-        .filter_map(GapNoteView::parse)
+        .filter(|g| g.resolution != GapResolution::Addressed)
+        .filter(|g| gap_matches_project(g, project_filter))
         .collect();
     rows.sort_by(|a, b| {
-        resolution_rank(a.note.resolution)
-            .cmp(&resolution_rank(b.note.resolution))
+        gap_resolution_rank(a.resolution)
+            .cmp(&gap_resolution_rank(b.resolution))
             .then_with(|| b.impact.cmp(&a.impact))
-            .then_with(|| b.note.created_at.cmp(&a.note.created_at))
+            .then_with(|| b.created_at.cmp(&a.created_at))
     });
     rows.truncate(limit);
     rows
@@ -394,11 +399,22 @@ fn note_matches_project(note: &Note, project_filter: Option<&str>) -> bool {
     }
 }
 
-fn resolution_rank(resolution: NoteResolution) -> u8 {
+fn gap_matches_project(gap: &GapNote, project_filter: Option<&str>) -> bool {
+    match project_filter {
+        Some(pf) => gap
+            .project
+            .as_deref()
+            .map(|p| p.to_lowercase().contains(pf))
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+fn gap_resolution_rank(resolution: GapResolution) -> u8 {
     match resolution {
-        NoteResolution::Unresolved => 0,
-        NoteResolution::Acknowledged => 1,
-        NoteResolution::Addressed => 2,
+        GapResolution::Unresolved => 0,
+        GapResolution::Acknowledged => 1,
+        GapResolution::Addressed => 2,
     }
 }
 
@@ -406,25 +422,24 @@ fn is_high_impact(impact: GapImpact) -> bool {
     matches!(impact, GapImpact::Critical | GapImpact::High)
 }
 
-fn stale_high_impact_gap_notes<'a>(
-    notes: &'a Notes,
+fn stale_high_impact_gaps<'a>(
+    gaps: &'a GapStore,
     project_filter: Option<&str>,
     stale_days: u64,
     limit: usize,
-) -> Vec<(GapNoteView<'a>, u64)> {
+) -> Vec<(&'a GapNote, u64)> {
     let now_secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut rows: Vec<(GapNoteView<'a>, u64)> = notes
+    let mut rows: Vec<(&GapNote, u64)> = gaps
         .all()
         .iter()
-        .filter(|n| n.resolution != NoteResolution::Addressed)
-        .filter(|n| note_matches_project(n, project_filter))
-        .filter_map(GapNoteView::parse)
-        .filter(|gap| is_high_impact(gap.impact))
+        .filter(|g| g.resolution != GapResolution::Addressed)
+        .filter(|g| gap_matches_project(g, project_filter))
+        .filter(|g| is_high_impact(g.impact))
         .filter_map(|gap| {
-            let age = iso_age_days(&gap.note.created_at, now_secs);
+            let age = iso_age_days(&gap.created_at, now_secs);
             (age >= stale_days).then_some((gap, age))
         })
         .collect();
@@ -443,59 +458,54 @@ struct GapBucket {
 }
 
 impl GapBucket {
-    fn add(&mut self, note: &Note) {
-        match note.resolution {
-            NoteResolution::Unresolved => self.unresolved += 1,
-            NoteResolution::Acknowledged => self.acknowledged += 1,
-            NoteResolution::Addressed => self.addressed += 1,
+    fn add(&mut self, gap: &GapNote) {
+        match gap.resolution {
+            GapResolution::Unresolved => self.unresolved += 1,
+            GapResolution::Acknowledged => self.acknowledged += 1,
+            GapResolution::Addressed => self.addressed += 1,
         }
-        if note.resolution != NoteResolution::Addressed {
+        if gap.resolution != GapResolution::Addressed {
             if self
                 .oldest_open
                 .as_deref()
-                .map(|oldest| note.created_at.as_str() < oldest)
+                .map(|oldest| gap.created_at.as_str() < oldest)
                 .unwrap_or(true)
             {
-                self.oldest_open = Some(note.created_at.clone());
+                self.oldest_open = Some(gap.created_at.clone());
             }
             if self
                 .newest_open
                 .as_deref()
-                .map(|newest| note.created_at.as_str() > newest)
+                .map(|newest| gap.created_at.as_str() > newest)
                 .unwrap_or(true)
             {
-                self.newest_open = Some(note.created_at.clone());
+                self.newest_open = Some(gap.created_at.clone());
             }
         }
     }
 }
 
-fn render_gap_aggregates(notes: &Notes, project_filter: Option<&str>) -> String {
+fn render_gap_aggregates(gaps: &GapStore, project_filter: Option<&str>) -> String {
     use std::collections::BTreeMap;
 
     let mut by_kind: BTreeMap<String, GapBucket> = BTreeMap::new();
     let mut by_domain: BTreeMap<String, GapBucket> = BTreeMap::new();
     let mut by_dedupe: BTreeMap<String, GapBucket> = BTreeMap::new();
 
-    for note in notes
+    for gap in gaps
         .all()
         .iter()
-        .filter(|n| note_matches_project(n, project_filter))
+        .filter(|g| gap_matches_project(g, project_filter))
     {
-        let Some(gap) = GapNoteView::parse(note) else {
-            continue;
-        };
         by_kind
-            .entry(gap.gap_kind.clone().unwrap_or_else(|| "gap".into()))
+            .entry(gap.gap_kind.as_ref().to_string())
             .or_default()
-            .add(note);
-        by_domain
-            .entry(gap.domain.clone().unwrap_or_else(|| "-".into()))
+            .add(gap);
+        by_domain.entry(gap.domain.clone()).or_default().add(gap);
+        by_dedupe
+            .entry(gap.dedupe_key.clone())
             .or_default()
-            .add(note);
-        if let Some(key) = &gap.dedupe_key {
-            by_dedupe.entry(key.clone()).or_default().add(note);
-        }
+            .add(gap);
     }
 
     if by_kind.is_empty() && by_domain.is_empty() && by_dedupe.is_empty() {
@@ -786,22 +796,64 @@ mod tests {
         }
     }
 
-    fn gap_body(
+    #[allow(clippy::too_many_arguments)]
+    fn gap(
+        id: &str,
         title: &str,
-        impact: &str,
-        gap_kind: &str,
+        impact: GapImpact,
+        gap_kind: crate::gaps::GapKind,
         domain: &str,
         dedupe_key: &str,
-    ) -> String {
-        serde_json::json!({
-            "type": "blackbox.gap_note.v1",
-            "title": title,
-            "impact": impact,
-            "gap_kind": gap_kind,
-            "domain": domain,
-            "dedupe_key": dedupe_key
-        })
-        .to_string()
+        project: Option<&str>,
+        resolution: GapResolution,
+        created_at: &str,
+    ) -> GapNote {
+        GapNote {
+            id: id.into(),
+            title: title.into(),
+            gap_kind,
+            domain: domain.into(),
+            wanted_capability: "x".into(),
+            missing_primitive: None,
+            fallback_used: None,
+            evidence: Vec::new(),
+            impact,
+            blocking_level: crate::gaps::BlockingLevel::WorkaroundAvailable,
+            dedupe_key: dedupe_key.into(),
+            suggested_owner: None,
+            notes: None,
+            supersedes: None,
+            superseded_by: None,
+            resolution,
+            project: project.map(ToOwned::to_owned),
+            task_id: None,
+            session_id: None,
+            provider: None,
+            bro: None,
+            thread_id: None,
+            created_at: created_at.into(),
+            updated_at: created_at.into(),
+            resolved_at: None,
+            resolution_note: None,
+        }
+    }
+
+    fn empty_gaps(dir: &tempfile::TempDir) -> GapStore {
+        GapStore::open(&dir.path().join("gaps.json")).unwrap()
+    }
+
+    fn open_gaps_with(dir: &tempfile::TempDir, stored: Vec<GapNote>) -> GapStore {
+        let path = dir.path().join("gaps.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&crate::gaps::GapStoreData {
+                version: 1,
+                gaps: stored,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        GapStore::open(&path).unwrap()
     }
 
     fn open_notes_with(dir: &tempfile::TempDir, stored_notes: Vec<Note>) -> Notes {
@@ -824,6 +876,7 @@ mod tests {
         let kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
         let threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = empty_gaps(&dir);
         let task_store = TaskStore::new();
         let whiteboards = WhiteboardRegistry::new();
 
@@ -831,6 +884,7 @@ mod tests {
             &kb,
             &threads,
             &notes,
+            &gaps,
             &task_store,
             &whiteboards,
             &InboxParams {
@@ -854,6 +908,7 @@ mod tests {
         let mut kb = Knowledge::open(&dir.path().join("kb.json")).unwrap();
         let mut threads = Threads::open(&dir.path().join("th.json")).unwrap();
         let mut notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = empty_gaps(&dir);
         let task_store = TaskStore::new();
         let whiteboards = WhiteboardRegistry::new();
 
@@ -986,6 +1041,7 @@ mod tests {
             &kb,
             &threads,
             &notes,
+            &gaps,
             &task_store,
             &whiteboards,
             &InboxParams {
@@ -1015,41 +1071,40 @@ mod tests {
     }
 
     #[test]
-    fn inbox_surfaces_gap_notes_once_before_followups() {
+    fn inbox_surfaces_gap_notes_before_followups() {
         let dir = tempdir().unwrap();
         let (kb, threads, task_store, whiteboards) = empty_context(&dir);
         let notes = open_notes_with(
             &dir,
-            vec![
-                note(
-                    "note-00000001",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "Packet AST cannot express rate predicates",
-                        "high",
-                        "packet_ast",
-                        "review-policy",
-                        "packet_ast/review-policy/rate-window-predicate",
-                    ),
-                    Some("/repo/transcript-search"),
-                    NoteResolution::Unresolved,
-                    "2026-05-12T10:00:00Z",
-                ),
-                note(
-                    "note-00000002",
-                    NoteKind::Followup,
-                    "add tests for the cycle detector",
-                    Some("/repo/transcript-search"),
-                    NoteResolution::Unresolved,
-                    "2026-05-12T11:00:00Z",
-                ),
-            ],
+            vec![note(
+                "note-00000002",
+                NoteKind::Followup,
+                "add tests for the cycle detector",
+                Some("/repo/transcript-search"),
+                NoteResolution::Unresolved,
+                "2026-05-12T11:00:00Z",
+            )],
+        );
+        let gaps = open_gaps_with(
+            &dir,
+            vec![gap(
+                "gap-00000001",
+                "Packet AST cannot express rate predicates",
+                GapImpact::High,
+                crate::gaps::GapKind::PacketAst,
+                "review-policy",
+                "packet_ast/review-policy/rate-window-predicate",
+                Some("/repo/transcript-search"),
+                GapResolution::Unresolved,
+                "2026-05-12T10:00:00Z",
+            )],
         );
 
         let out = compute_inbox(
             &kb,
             &threads,
             &notes,
+            &gaps,
             &task_store,
             &whiteboards,
             &InboxParams {
@@ -1068,81 +1123,73 @@ mod tests {
         let gap_idx = out.find("## Gap notes").unwrap();
         let followup_idx = out.find("## Followups").unwrap();
         assert!(gap_idx < followup_idx);
-        assert!(out.contains("note-00000001 [high packet_ast] transcript-search"));
+        assert!(out.contains("gap-00000001 [high packet_ast] transcript-search"));
         assert!(out.contains("Packet AST cannot express rate predicates"));
         assert!(out.contains("note-00000002"));
-        assert!(!out.contains("note-00000001 —"));
     }
 
     #[test]
     fn inbox_gap_notes_honor_resolution_project_filter_and_ordering() {
+        use crate::gaps::GapKind;
         let dir = tempdir().unwrap();
         let (kb, threads, task_store, whiteboards) = empty_context(&dir);
-        let notes = open_notes_with(
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = open_gaps_with(
             &dir,
             vec![
-                note(
-                    "note-00000001",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "old low unresolved",
-                        "low",
-                        "gap",
-                        "workflow",
-                        "gap/old-low",
-                    ),
+                gap(
+                    "gap-00000001",
+                    "old low unresolved",
+                    GapImpact::Low,
+                    GapKind::Workflow,
+                    "workflow",
+                    "workflow/wf/old-low",
                     Some("/repo/x"),
-                    NoteResolution::Unresolved,
+                    GapResolution::Unresolved,
                     "2026-05-12T08:00:00Z",
                 ),
-                note(
-                    "note-00000002",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "new high unresolved",
-                        "high",
-                        "packet_ast",
-                        "packets",
-                        "gap/new-high",
-                    ),
+                gap(
+                    "gap-00000002",
+                    "new high unresolved",
+                    GapImpact::High,
+                    GapKind::PacketAst,
+                    "packets",
+                    "packet_ast/packets/new-high",
                     Some("/repo/x"),
-                    NoteResolution::Unresolved,
+                    GapResolution::Unresolved,
                     "2026-05-12T07:00:00Z",
                 ),
-                note(
-                    "note-00000003",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "critical acknowledged",
-                        "critical",
-                        "gap",
-                        "workflow",
-                        "gap/ack",
-                    ),
+                gap(
+                    "gap-00000003",
+                    "critical acknowledged",
+                    GapImpact::Critical,
+                    GapKind::Workflow,
+                    "workflow",
+                    "workflow/wf/ack",
                     Some("/repo/x"),
-                    NoteResolution::Acknowledged,
+                    GapResolution::Acknowledged,
                     "2026-05-12T12:00:00Z",
                 ),
-                note(
-                    "note-00000004",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "critical addressed",
-                        "critical",
-                        "gap",
-                        "workflow",
-                        "gap/addressed",
-                    ),
+                gap(
+                    "gap-00000004",
+                    "critical addressed",
+                    GapImpact::Critical,
+                    GapKind::Workflow,
+                    "workflow",
+                    "workflow/wf/addressed",
                     Some("/repo/x"),
-                    NoteResolution::Addressed,
+                    GapResolution::Addressed,
                     "2026-05-12T13:00:00Z",
                 ),
-                note(
-                    "note-00000005",
-                    NoteKind::Followup,
-                    &gap_body("other project", "critical", "gap", "workflow", "gap/other"),
+                gap(
+                    "gap-00000005",
+                    "other project",
+                    GapImpact::Critical,
+                    GapKind::Workflow,
+                    "workflow",
+                    "workflow/wf/other",
                     Some("/repo/y"),
-                    NoteResolution::Unresolved,
+                    GapResolution::Unresolved,
                     "2026-05-12T14:00:00Z",
                 ),
             ],
@@ -1152,6 +1199,7 @@ mod tests {
             &kb,
             &threads,
             &notes,
+            &gaps,
             &task_store,
             &whiteboards,
             &InboxParams {
@@ -1167,42 +1215,44 @@ mod tests {
         )
         .unwrap();
 
-        let high = out.find("note-00000002").unwrap();
-        let low = out.find("note-00000001").unwrap();
-        let ack = out.find("note-00000003").unwrap();
+        let high = out.find("gap-00000002").unwrap();
+        let low = out.find("gap-00000001").unwrap();
+        let ack = out.find("gap-00000003").unwrap();
         assert!(high < low);
-        assert!(low < ack, "acknowledged notes sort after unresolved notes");
-        assert!(!out.contains("note-00000004"));
-        assert!(!out.contains("note-00000005"));
+        assert!(low < ack, "acknowledged gaps sort after unresolved gaps");
+        assert!(!out.contains("gap-00000004"));
+        assert!(!out.contains("gap-00000005"));
     }
 
     #[test]
     fn inbox_reports_stale_high_impact_gap_notes() {
+        use crate::gaps::GapKind;
         let dir = tempdir().unwrap();
         let (kb, threads, task_store, whiteboards) = empty_context(&dir);
-        let notes = open_notes_with(
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = open_gaps_with(
             &dir,
             vec![
-                note(
-                    "note-00000001",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "old high",
-                        "high",
-                        "workflow",
-                        "orchestration",
-                        "gap/old-high",
-                    ),
+                gap(
+                    "gap-00000001",
+                    "old high",
+                    GapImpact::High,
+                    GapKind::Workflow,
+                    "orchestration",
+                    "workflow/orchestration/old-high",
                     Some("/repo/x"),
-                    NoteResolution::Unresolved,
+                    GapResolution::Unresolved,
                     "2020-01-01T00:00:00Z",
                 ),
-                note(
-                    "note-00000002",
-                    NoteKind::Followup,
-                    &gap_body("old low", "low", "workflow", "orchestration", "gap/old-low"),
+                gap(
+                    "gap-00000002",
+                    "old low",
+                    GapImpact::Low,
+                    GapKind::Workflow,
+                    "orchestration",
+                    "workflow/orchestration/old-low",
                     Some("/repo/x"),
-                    NoteResolution::Unresolved,
+                    GapResolution::Unresolved,
                     "2020-01-01T00:00:00Z",
                 ),
             ],
@@ -1212,6 +1262,7 @@ mod tests {
             &kb,
             &threads,
             &notes,
+            &gaps,
             &task_store,
             &whiteboards,
             &InboxParams {
@@ -1228,57 +1279,50 @@ mod tests {
         .unwrap();
 
         assert!(out.contains("## Stale high-impact gap notes"));
-        assert!(out.contains("note-00000001"));
-        assert!(!out.contains("note-00000002 [low workflow] x — old low (open"));
+        assert!(out.contains("gap-00000001"));
+        assert!(!out.contains("gap-00000002 [low workflow] x — old low (open"));
     }
 
     #[test]
     fn inbox_can_render_gap_aggregates() {
+        use crate::gaps::GapKind;
         let dir = tempdir().unwrap();
         let (kb, threads, task_store, whiteboards) = empty_context(&dir);
-        let notes = open_notes_with(
+        let notes = Notes::open(&dir.path().join("notes.json")).unwrap();
+        let gaps = open_gaps_with(
             &dir,
             vec![
-                note(
-                    "note-00000001",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "first",
-                        "high",
-                        "packet_ast",
-                        "review",
-                        "packet/review/rate",
-                    ),
+                gap(
+                    "gap-00000001",
+                    "first",
+                    GapImpact::High,
+                    GapKind::PacketAst,
+                    "review",
+                    "packet/review/rate",
                     Some("/repo/x"),
-                    NoteResolution::Unresolved,
+                    GapResolution::Unresolved,
                     "2026-01-01T00:00:00Z",
                 ),
-                note(
-                    "note-00000002",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "second",
-                        "medium",
-                        "packet_ast",
-                        "review",
-                        "packet/review/rate",
-                    ),
+                gap(
+                    "gap-00000002",
+                    "second",
+                    GapImpact::Medium,
+                    GapKind::PacketAst,
+                    "review",
+                    "packet/review/rate",
                     Some("/repo/x"),
-                    NoteResolution::Acknowledged,
+                    GapResolution::Acknowledged,
                     "2026-02-01T00:00:00Z",
                 ),
-                note(
-                    "note-00000003",
-                    NoteKind::Followup,
-                    &gap_body(
-                        "closed",
-                        "medium",
-                        "workflow",
-                        "dispatch",
-                        "workflow/dispatch",
-                    ),
+                gap(
+                    "gap-00000003",
+                    "closed",
+                    GapImpact::Medium,
+                    GapKind::Workflow,
+                    "dispatch",
+                    "workflow/dispatch",
                     Some("/repo/x"),
-                    NoteResolution::Addressed,
+                    GapResolution::Addressed,
                     "2026-03-01T00:00:00Z",
                 ),
             ],
@@ -1288,6 +1332,7 @@ mod tests {
             &kb,
             &threads,
             &notes,
+            &gaps,
             &task_store,
             &whiteboards,
             &InboxParams {

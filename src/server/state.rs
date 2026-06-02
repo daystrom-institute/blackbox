@@ -9,6 +9,7 @@ use serde_json::Value;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
+use crate::gaps::GapStore;
 use crate::index::TranscriptIndex;
 use crate::knowledge::Knowledge;
 use crate::notes::Notes;
@@ -31,6 +32,10 @@ use crate::{
 pub(crate) struct SharedState {
     pub(crate) idx: RwLock<TranscriptIndex>,
     pub(crate) kb: RwLock<Knowledge>,
+    /// First-class substrate gap-note store. Project-scoped gaps are repo-owned
+    /// (one file per gap under `<project>/.bbox/gaps/`); global gaps live in the
+    /// central host store. Mirrors the `kb` repo-owned model.
+    pub(crate) gaps: RwLock<GapStore>,
     pub(crate) roadmap: RwLock<Roadmap>,
     pub(crate) threads: RwLock<Threads>,
     pub(crate) notes: RwLock<Notes>,
@@ -302,10 +307,15 @@ impl SharedState {
                 .into_iter()
                 .map(|r| std::path::PathBuf::from(r.canonical_path))
                 .collect();
-        kb.set_project_roots(kb_project_roots).unwrap();
+        kb.set_project_roots(kb_project_roots.clone()).unwrap();
+        // Gap store mirrors the kb repo-owned model: load every registered
+        // project's committed `.bbox/gaps/` into the query surface at startup.
+        let mut gaps = GapStore::open(&store_dir.join("blackbox-gaps.json")).unwrap();
+        gaps.set_project_roots(kb_project_roots).unwrap();
         SharedState {
             idx: RwLock::new(idx),
             kb: RwLock::new(kb),
+            gaps: RwLock::new(gaps),
             roadmap: RwLock::new(Roadmap::open(&store_dir.join("roadmap.json")).unwrap()),
             threads: RwLock::new(Threads::open(&store_dir.join("threads.json")).unwrap()),
             notes: RwLock::new(Notes::open(&store_dir.join("notes.json")).unwrap()),

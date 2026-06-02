@@ -288,6 +288,7 @@ pub struct ProjectArtifactConfig {
 pub struct ResolvedPathConfig {
     pub state_dir: PathBuf,
     pub knowledge_path: PathBuf,
+    pub gaps_path: PathBuf,
     pub threads_path: PathBuf,
     pub roadmap_path: PathBuf,
     pub notes_path: PathBuf,
@@ -910,6 +911,12 @@ fn resolve_paths(
         .map(PathBuf::from)
         .unwrap_or_else(|| state_dir.join("blackbox-knowledge.json"));
 
+    let gaps_path = std::env::var("BLACKBOX_GAPS_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state_dir.join("blackbox-gaps.json"));
+
     let threads_path = std::env::var("BLACKBOX_THREADS_PATH")
         .ok()
         .filter(|s| !s.trim().is_empty())
@@ -1034,6 +1041,7 @@ fn resolve_paths(
     Ok(ResolvedPathConfig {
         state_dir,
         knowledge_path,
+        gaps_path,
         threads_path,
         roadmap_path,
         notes_path,

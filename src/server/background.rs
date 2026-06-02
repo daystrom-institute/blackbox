@@ -163,13 +163,15 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
         .collect();
     let catalog = Arc::new(shared.artifacts.read().clone());
 
-    // On a committed `.bbox/knowledge/` change (e.g. `git pull`, manual edit):
-    // reload the in-memory knowledge store so `bbox_knowledge`/`render` see it
-    // immediately, and flag the reindex thread to refresh search on its next
-    // tick. A `Weak` ref avoids a cycle — `SharedState` owns the watcher. The
-    // callback deliberately does NOT touch the search index directly: the
-    // reindex thread is the single tantivy writer, so this adds no writer
-    // contention and cannot deadlock against `idx`/`kb` readers.
+    // On a committed `.bbox/knowledge/` or top-level `.bbox/gaps/` change (e.g.
+    // `git pull`, manual edit): reload the in-memory store(s) so
+    // `bbox_knowledge`/`bbox_gaps`/`render`/`bbox_inbox` see it immediately, and
+    // flag the reindex thread to refresh search on its next tick. A `Weak` ref
+    // avoids a cycle — `SharedState` owns the watcher. The callback deliberately
+    // does NOT touch the search index directly: the reindex thread is the single
+    // tantivy writer, so this adds no writer contention and cannot deadlock
+    // against `idx`/`kb` readers. Gaps are not search-indexed, so reloading them
+    // is reload-only (no reindex contribution).
     let weak = Arc::downgrade(shared);
     let on_knowledge_change: watcher::KnowledgeChangeCallback = Arc::new(move || {
         let Some(state) = weak.upgrade() else {
@@ -181,16 +183,22 @@ fn start_bbox_watcher(shared: &Arc<SharedState>) {
                 tracing::warn!("watcher: kb reload after .bbox/knowledge change failed: {e:#}");
             }
         }
+        {
+            let mut gaps = state.gaps.write();
+            if let Err(e) = gaps.reload() {
+                tracing::warn!("watcher: gaps reload after .bbox/gaps change failed: {e:#}");
+            }
+        }
         state
             .reindex_dirty
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::debug!("watcher: .bbox/knowledge change → kb reloaded, reindex flagged");
+        tracing::debug!("watcher: .bbox repo-store change → kb+gaps reloaded, reindex flagged");
     });
 
     match watcher::BbxWatcher::start(project_roots, catalog, Some(on_knowledge_change)) {
         Ok(w) => {
             *shared.bbox_watcher.lock().unwrap() = Some(w);
-            tracing::info!(".bbox/ watcher started (artifacts + knowledge)");
+            tracing::info!(".bbox/ watcher started (artifacts + knowledge + gaps)");
         }
         Err(e) => tracing::warn!(".bbox/ watcher failed to start: {e:#}"),
     }

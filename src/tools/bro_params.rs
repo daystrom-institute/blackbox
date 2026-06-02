@@ -466,7 +466,7 @@ pub(crate) struct PruneParams {
     /// Opt-in workload retrospective: before dropping each terminal task,
     /// resume its own session with a (non-compelling) reflection prompt
     /// asking what blackbox-substrate tooling/guidance/workflow friction it
-    /// hit. The bro self-files `blackbox.gap_note.v1` followups only if it
+    /// hit. The bro self-files substrate gaps via `bbox_gap` only if it
     /// has something worth surfacing. Fire-and-forget; ignored on dry_run.
     /// Default false.
     #[serde(default)]

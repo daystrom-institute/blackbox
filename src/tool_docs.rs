@@ -28,6 +28,7 @@ pub enum ToolCategory {
     Knowledge,
     Threads,
     Notes,
+    Gaps,
     Inbox,
     Artifacts,
     Packets,
@@ -51,6 +52,7 @@ impl ToolCategory {
             Self::Knowledge => "Knowledge",
             Self::Threads => "Threads",
             Self::Notes => "Side-channel notes",
+            Self::Gaps => "Gap notes",
             Self::Inbox => "Attention / inbox",
             Self::Artifacts => "Artifact catalog",
             Self::Packets => "Rule-packets",
@@ -83,6 +85,9 @@ impl ToolCategory {
             }
             Self::Notes => {
                 "Structured side channel for *notable* observations surfaced during delegated work — orchestrators query `bbox_notes` / `bbox_inbox` at round boundaries. Seven kinds: `dispute`, `assumption`, `surprise`, `followup`, `blocked`, `learned`, `done`. Emit one only when you have something genuinely worth flagging; this is a signal channel, not a progress log, and silence is the right default when nothing is notable. A `done` note with a one-line acceptance summary is useful when a caller (atom, workflow, or an explicit completion contract) asks for a structured sign-off — it is not required on every dispatch."
+            }
+            Self::Gaps => {
+                "First-class substrate gap-note store. File a gap when the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — not in the current product codebase. Project-scoped gaps are repo-owned (committed under `<project>/.bbox/gaps/`, travel with the checkout); cross-project substrate gaps go to the central host store with `scope=\"global\"`. `bbox_gap` files (typed, validated, deduped by `dedupe_key`), `bbox_gaps` filters by typed fields, `bbox_gap_resolve` closes out (with structured supersession), `bbox_gap_update` edits in place. See `sm-gap-notes` via `bbox_knowledge` for the full envelope, vocabularies, and lifecycle."
             }
             Self::Inbox => {
                 "Attention aggregator: a single read that surfaces unresolved notes, stale threads, unverified knowledge, and failed tasks. Run at round boundaries, morning-brief style, and whenever you're unsure what needs attention next."
@@ -121,6 +126,7 @@ impl ToolCategory {
 
 fn deferred_system_memory(category: ToolCategory) -> Option<&'static str> {
     match category {
+        ToolCategory::Gaps => Some("sm-gap-notes"),
         ToolCategory::Packets => Some("sm-rule-packets"),
         ToolCategory::Refactor => Some("sm-refactor"),
         ToolCategory::Orchestration => Some("sm-bro-dispatch-patterns"),
@@ -662,7 +668,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
         name: "bbox_note",
         category: ToolCategory::Notes,
         summary: "Record a structured side-channel note while working.",
-        when_to_use: "Emit a note only when you have a *notable* signal worth surfacing to an orchestrator — a `dispute`, `surprise`, `blocked`, `learned` fact, or actionable `followup`. Silence is the correct default: this is a side channel, not a per-call progress log, so most dispatches should emit nothing. A `kind=done` sign-off is opt-in — emit it when a caller (atom, workflow, team broadcast, or an explicit completion contract) asks for one, not on every dispatch. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. For substrate gaps that other projects could plausibly hit too, use the `blackbox.gap_note.v1` JSON envelope inside `kind=\"followup\"`; do not invent a `bbox_gap` tool. See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "Emit a note only when you have a *notable* signal worth surfacing to an orchestrator — a `dispute`, `surprise`, `blocked`, `learned` fact, or actionable `followup`. Silence is the correct default: this is a side channel, not a per-call progress log, so most dispatches should emit nothing. A `kind=done` sign-off is opt-in — emit it when a caller (atom, workflow, team broadcast, or an explicit completion contract) asks for one, not on every dispatch. Use `learned` for agent-discovered facts, not user-stated rules. See `sm-side-channel-notes` via `bbox_knowledge` for the full note taxonomy. Substrate gaps that other projects could plausibly hit too are NOT side-channel notes — file them with `bbox_gap` (see `sm-gap-notes` via `bbox_knowledge`), not here.",
         example: Some(
             r#"bbox_note(kind="dispute", body="brief assumes schema is additive — migration 0042 makes it subtractive")"#,
         ),
@@ -683,12 +689,47 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
             r#"bbox_note_resolve(id="note-a1b2c3d4", resolution="addressed", note="fixed in commit abc123")"#,
         ),
     },
+    // ── Gap notes ────────────────────────────────────────────────────
+    ToolDoc {
+        name: "bbox_gap",
+        category: ToolCategory::Gaps,
+        summary: "File a first-class substrate gap note into the repo-owned gap store.",
+        when_to_use: "When the blocker is in the blackbox substrate or shared agent workflow — a missing tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, or runbook that agents in other projects could plausibly hit too — NOT an ordinary TODO in the current product codebase and NOT a user-stated rule (those go to bbox_learn / bbox_decide). Dedupe first with `bbox_gaps` and reuse the same `dedupe_key` (`<gap_kind>/<domain>/<slug>`); an open gap with that key dedupes by default (pass `allow_recurrence=true` to tally a recurrence). Project-scoped by default (committed in-repo under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. While authoring a rule-packet, use `bbox_packet_gap` instead (it emits the companion gap for you). See `sm-gap-notes` via `bbox_knowledge`.",
+        example: Some(
+            r#"bbox_gap(title="Packet AST cannot express rate predicates", gap_kind="packet_ast", domain="review-policy", wanted_capability="Classify entities by count/rate within a time window.", dedupe_key="packet_ast/review-policy/rate-window-predicate", impact="medium")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_gaps",
+        category: ToolCategory::Gaps,
+        summary: "List / filter substrate gap notes by typed fields (gap_kind, impact, blocking_level, dedupe_key, resolution, project).",
+        when_to_use: "The mandatory dedupe step before `bbox_gap`: search open gaps by `dedupe_key`, `gap_kind`, `domain`, `impact`, or free-text `query` before filing. Also the triage surface — pass `json=true` for machine-readable records to group/extract, or `include_addressed=true` to see closed gaps. Addressed gaps are hidden by default for lists, shown by default for an exact `id`.",
+        example: Some(r#"bbox_gaps(gap_kind="mcp_surface", include_addressed=false)"#),
+    },
+    ToolDoc {
+        name: "bbox_gap_resolve",
+        category: ToolCategory::Gaps,
+        summary: "Resolve a gap note (acknowledged/addressed); optionally wire a structured supersession link.",
+        when_to_use: "Close-out move when a gap is implemented, rejected, superseded, or intentionally closed. `addressed` hides it from default views; `acknowledged` keeps it visible as deferred. Pass `superseded_by=gap-<id>` to retire a stale gap in favor of a better-shaped successor — it sets the structured supersedes/superseded_by link on both records. The commit that fills a gap should also carry an `Addresses-Gap-Note: gap-<id>` trailer.",
+        example: Some(
+            r#"bbox_gap_resolve(id="gap-a1b2c3d4", resolution="addressed", note="implemented in commit abc123")"#,
+        ),
+    },
+    ToolDoc {
+        name: "bbox_gap_update",
+        category: ToolCategory::Gaps,
+        summary: "Edit an existing gap note's fields in place.",
+        when_to_use: "Amend a gap with additional context/evidence discovered after filing — refine the title, wanted_capability, impact, blocking_level, missing_primitive, fallback_used, evidence, or notes — without creating a disjoint successor or re-filing.",
+        example: Some(
+            r#"bbox_gap_update(id="gap-a1b2c3d4", impact="high", evidence=["src/foo.rs:120", "thread-7f01324e"])"#,
+        ),
+    },
     // ── Inbox ────────────────────────────────────────────────────────
     ToolDoc {
         name: "bbox_inbox",
         category: ToolCategory::Inbox,
         summary: "Aggregate attention layer across every store.",
-        when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view. Gap reports filed as `blackbox.gap_note.v1` followups surface here too; pass `import_gap_spool=true`, `aggregate_gaps=true`, or `check_gap_closeouts=true` for the gap workflow helpers. See `sm-gap-notes` via `bbox_knowledge`.",
+        when_to_use: "Round boundaries, morning brief, any 'what needs my attention' moment. Surfaces unresolved disputes/blocked/surprises, deferred followups, stale threads, unverified knowledge, failed bro tasks. Single call, prioritized view. Open gaps from the `bbox_gap` store surface here too; pass `import_gap_spool=true`, `aggregate_gaps=true`, or `check_gap_closeouts=true` for the gap workflow helpers. See `sm-gap-notes` via `bbox_knowledge`.",
         example: Some(r#"bbox_inbox(project="/repo/x", stale_days=3)"#),
     },
     // ── Artifact catalog ─────────────────────────────────────────────
@@ -976,8 +1017,8 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bro_retro",
         category: ToolCategory::Orchestration,
-        summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files blackbox.gap_note.v1 followups only if something's worth surfacing. Does not delete the task.",
-        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_/work_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file blackbox.gap_note.v1 followups (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
+        summary: "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task.",
+        when_to_use: "You want a finished bro to reflect on friction with the blackbox substrate itself — missing/awkward bbox_/bro_/work_ tools, stale guidance or memories, clumsy workflow/dispatch steps — and self-file substrate gaps via bbox_gap (surfaced in bbox_inbox) only if something's worth surfacing. Scoped to surfaces blackbox can change, not the target repo or its toolchain. Does not delete the task; bro_prune(retro=true) is the bulk path at cleanup time.",
         example: Some(r#"bro_retro(task_id="…")"#),
     },
     ToolDoc {

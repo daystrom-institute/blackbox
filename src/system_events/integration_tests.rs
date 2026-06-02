@@ -36,6 +36,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     )
     .unwrap();
     let kb = Knowledge::open(&tmp.path().join("knowledge.json")).unwrap();
+    let gaps = crate::gaps::GapStore::open(&tmp.path().join("gaps.json")).unwrap();
     let threads = Threads::open(&tmp.path().join("threads.json")).unwrap();
     let roadmap_store = Roadmap::open(&tmp.path().join("roadmap.json")).unwrap();
     let notes = Notes::open(&tmp.path().join("notes.json")).unwrap();
@@ -47,6 +48,7 @@ fn test_server(tmp: &tempfile::TempDir) -> BlackboxServer {
     let state = Arc::new(SharedState {
         idx: RwLock::new(index),
         kb: RwLock::new(kb),
+        gaps: RwLock::new(gaps),
         roadmap: RwLock::new(roadmap_store),
         threads: RwLock::new(threads),
         notes: RwLock::new(notes),

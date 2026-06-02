@@ -51,17 +51,17 @@ impl BbxWatcher {
                     }
                 };
                 let roots = watched_roots_cb.lock().unwrap().clone();
-                let mut knowledge_dirty = false;
+                let mut repo_store_dirty = false;
                 for event in events {
-                    if !knowledge_dirty && event_touches_knowledge(&event.event, &roots) {
-                        knowledge_dirty = true;
+                    if !repo_store_dirty && event_touches_repo_store(&event.event, &roots) {
+                        repo_store_dirty = true;
                     }
                     handle_event(&event.event, &roots, &catalog_cb);
                 }
                 // Fire once for the whole batch — a `git pull` lands many files
                 // under one debounce window, and the reload/reindex it triggers
                 // is a full refresh, not per-file.
-                if knowledge_dirty {
+                if repo_store_dirty {
                     if let Some(cb) = &on_knowledge_change {
                         cb();
                     }
@@ -217,11 +217,15 @@ fn handle_remove(path: &Path, project_id: &str, bbox_root: &Path, catalog: &Arti
     }
 }
 
-/// True when an event is a create/modify/remove of a committed
-/// `<bbox_root>/knowledge/*.json` file. Modify is included on purpose: artifact
-/// routing ignores in-place modifies, but knowledge entries are edited in place
-/// (manual edits, some editor/git write patterns). Access events are ignored.
-fn event_touches_knowledge(event: &notify::Event, roots: &[(String, PathBuf)]) -> bool {
+/// True when an event is a create/modify/remove of a committed repo-owned store
+/// file: `<bbox_root>/knowledge/*.json` (any depth) OR a top-level
+/// `<bbox_root>/gaps/*.json`. Both stores are repo-owned and live-reloaded.
+/// Gaps match top-level only — the `gaps/inbox/` subtree is spool-owned (drop
+/// folder) and its churn must not trigger a durable-store reload. Modify is
+/// included on purpose: artifact routing ignores in-place modifies, but
+/// knowledge/gap entries are edited in place (manual edits, some editor/git
+/// write patterns). Access events are ignored.
+fn event_touches_repo_store(event: &notify::Event, roots: &[(String, PathBuf)]) -> bool {
     if !matches!(
         event.kind,
         notify::EventKind::Create(_) | notify::EventKind::Modify(_) | notify::EventKind::Remove(_)
@@ -229,10 +233,13 @@ fn event_touches_knowledge(event: &notify::Event, roots: &[(String, PathBuf)]) -
         return false;
     }
     event.paths.iter().any(|path| {
-        path.extension().and_then(|e| e.to_str()) == Some("json")
-            && roots
-                .iter()
-                .any(|(_, root)| path.starts_with(root.join("knowledge")))
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            return false;
+        }
+        roots.iter().any(|(_, root)| {
+            path.starts_with(root.join("knowledge"))
+                || path.parent() == Some(root.join("gaps").as_path())
+        })
     })
 }
 
@@ -406,14 +413,14 @@ mod tests {
             notify::EventKind::Remove(notify::event::RemoveKind::File),
         ] {
             assert!(
-                event_touches_knowledge(&mk(kind, &kb_entry), &roots),
+                event_touches_repo_store(&mk(kind, &kb_entry), &roots),
                 "knowledge {kind:?} should be detected"
             );
         }
 
         // Access events are not changes.
         assert!(
-            !event_touches_knowledge(
+            !event_touches_repo_store(
                 &mk(
                     notify::EventKind::Access(notify::event::AccessKind::Read),
                     &kb_entry
@@ -433,8 +440,8 @@ mod tests {
                 p,
             )
         };
-        assert!(!event_touches_knowledge(&create(&non_json), &roots));
-        assert!(!event_touches_knowledge(&create(&artifact), &roots));
+        assert!(!event_touches_repo_store(&create(&non_json), &roots));
+        assert!(!event_touches_repo_store(&create(&artifact), &roots));
 
         // A path outside any watched root is ignored.
         let foreign = dir
@@ -442,6 +449,19 @@ mod tests {
             .canonicalize()
             .unwrap()
             .join("other/.bbox/knowledge/x.json");
-        assert!(!event_touches_knowledge(&create(&foreign), &roots));
+        assert!(!event_touches_repo_store(&create(&foreign), &roots));
+
+        // Top-level `.bbox/gaps/*.json` is a repo-owned gap store change.
+        let gap_entry = bbox_root.join("gaps").join("gap-abc12345.json");
+        assert!(
+            event_touches_repo_store(&create(&gap_entry), &roots),
+            "top-level gaps json should be detected"
+        );
+        // The spool's `gaps/inbox/` subtree is NOT a durable-store change.
+        let spool_drop = bbox_root.join("gaps").join("inbox").join("dropped.json");
+        assert!(
+            !event_touches_repo_store(&create(&spool_drop), &roots),
+            "gaps/inbox/ churn must not trigger a gap-store reload"
+        );
     }
 }

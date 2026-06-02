@@ -6,6 +6,7 @@ corpus: blackbox-design
 topic:
   - corpus
   - knowledge
+superseded_by: "first-class repo-owned gap store (src/gaps.rs, bbox_gap* tools, committed .bbox/gaps/); see sm-gap-notes"
 ---
 
 # Note-backed gap log implementation plan

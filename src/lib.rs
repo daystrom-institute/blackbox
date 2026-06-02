@@ -39,6 +39,7 @@ pub mod entity_ref;
 mod eval_check;
 mod gap_closeout;
 mod gap_spool;
+mod gaps;
 mod git;
 mod inbox;
 mod index;

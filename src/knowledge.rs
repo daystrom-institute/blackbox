@@ -2425,7 +2425,7 @@ fn render_entries(entries: &[&KnowledgeEntry], provider: &str, out: &mut String)
 fn render_global_common_core_rules(out: &mut String) {
     out.push_str("## Critical Instructions\n\n");
     out.push_str("**Report Blackbox substrate gaps with gap notes.**\n\n");
-    out.push_str("When blackbox itself is missing a reusable capability — tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, rendered instruction, or runbook — file a gap note, not an ad hoc TODO. First dedupe with `bbox_notes(kind=\"followup\", query=\"blackbox.gap_note.v1\", include_addressed=false)`, then call `bbox_note(kind=\"followup\")` with a `blackbox.gap_note.v1` JSON body. If the current client has deferred those tools, load `bbox_notes`, `bbox_note`, and `bbox_note_resolve` with `tool_search` before deduping. Use `bbox_packet_gap` only for packet AST expressiveness gaps while authoring packets. Pull `sm-gap-notes` via `bbox_knowledge` for the full envelope and lifecycle.\n\n");
+    out.push_str("When blackbox itself is missing a reusable capability — tool primitive, MCP surface, refactor atom, workflow shape, ontology edge, rendered instruction, or runbook — file a gap note with `bbox_gap`, not an ad hoc TODO. First dedupe with `bbox_gaps` (filter by `dedupe_key` / `gap_kind` / `domain`) and reuse the same `dedupe_key`; an open gap with that key dedupes by default. Project-scoped gaps are repo-owned (committed under `.bbox/gaps/`); pass `scope=\"global\"` for cross-project substrate gaps. Close out via `bbox_gap_resolve` (with optional structured supersession). If the current client has deferred those tools, load `bbox_gap`, `bbox_gaps`, and `bbox_gap_resolve` with `tool_search` first. Use `bbox_packet_gap` only for packet AST expressiveness gaps while authoring packets. Pull `sm-gap-notes` via `bbox_knowledge` for the full envelope and lifecycle.\n\n");
 }
 
 fn render_entries_grouped(entries: &[&KnowledgeEntry], provider: &str, out: &mut String) {
@@ -4144,9 +4144,9 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
 
         assert!(common.starts_with("## Critical Instructions"));
         assert!(common.contains("Report Blackbox substrate gaps with gap notes"));
-        assert!(common.contains("blackbox.gap_note.v1"));
-        assert!(common.contains("bbox_note(kind=\"followup\")"));
-        assert!(common.contains("bbox_notes(kind=\"followup\""));
+        assert!(common.contains("file a gap note with `bbox_gap`"));
+        assert!(common.contains("bbox_gaps"));
+        assert!(common.contains("bbox_gap_resolve"));
         assert!(common.contains("bbox_packet_gap"));
         assert!(common.contains("sm-gap-notes"));
     }

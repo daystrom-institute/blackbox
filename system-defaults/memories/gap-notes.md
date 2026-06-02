@@ -1,14 +1,14 @@
 +++
-title = "Gap notes — report substrate gaps via bbox_note"
-tags = ["gap", "gap-note", "gap-notes", "blackbox.gap_note.v1", "substrate", "substrate-gap", "missing-primitive", "missing-capability", "field-report", "bbox_note", "followup", "note-backed-gap-log", "packet_ast", "tooling", "agent-gap", "workflow-gap", "refactor_primitive", "mcp_surface", "ontology", "eval_coverage", "docs_runbook", "dedupe_key", "impact", "blocking_level", "addresses-gap-note", "close-out", "runbook"]
+title = "Gap notes — report substrate gaps via bbox_gap"
+tags = ["gap", "gap-note", "gap-notes", "bbox_gap", "bbox_gaps", "bbox_gap_resolve", "bbox_gap_update", "blackbox.gap_note.v1", "substrate", "substrate-gap", "missing-primitive", "missing-capability", "field-report", "repo-owned", "packet_ast", "tooling", "agent-gap", "workflow-gap", "refactor_primitive", "mcp_surface", "ontology", "eval_coverage", "docs_runbook", "dedupe_key", "impact", "blocking_level", "addresses-gap-note", "close-out", "runbook"]
 order = 18
 template = false
 +++
-# Gap notes — report substrate gaps via `bbox_note`
+# Gap notes — report substrate gaps via `bbox_gap`
 
 When the blocker is in the blackbox substrate or shared agent workflow — not in the current product codebase — file a gap note.
 
-There is no `bbox_gap` tool. Do not invent one. The shape below rides inside the existing `bbox_note(kind="followup")` surface so every agent on the host can report a gap without a new MCP catalog entry.
+Gap notes are first-class: a dedicated, typed, repo-owned store with its own `bbox_gap*` tool family. They are NOT side-channel notes — do not file them through `bbox_note`.
 
 ## When to file
 
@@ -31,38 +31,34 @@ Not a gap note:
 - user-stated standing rules (those go to `bbox_learn` / `bbox_decide`)
 - active-arc instructions (those go to `bbox_pin` or a work-item thread)
 
-The test: would agents in unrelated projects plausibly hit the same missing blackbox capability? If yes, gap note. If no, normal `followup` note.
+The test: would agents in unrelated projects plausibly hit the same missing blackbox capability? If yes, gap note. If no, a normal `bbox_note(kind="followup")`.
 
 ## How to file
 
-1. Call `bbox_note(kind="followup")`.
-2. Put a `blackbox.gap_note.v1` JSON object in `body`.
-3. Set `project`, `task_id`, `session_id`, `provider`, `bro`, and `thread_id` whenever the ambient `[scope]` block has them. These preserve cross-project provenance.
+Call `bbox_gap` with typed parameters (no JSON envelope):
 
-## Envelope
-
-```json
-{
-  "type": "blackbox.gap_note.v1",
-  "title": "Packet AST cannot express rate predicates",
-  "gap_kind": "packet_ast",
-  "domain": "review-policy",
-  "wanted_capability": "Classify entities by count/rate within a time window.",
-  "missing_primitive": "RateCmp / WithinWindow",
-  "fallback_used": "Prose rubric plus manual review.",
-  "impact": "medium",
-  "blocking_level": "workaround_available",
-  "evidence": [
-    "packet-event:gap:2026-05-12T19:21:45Z",
-    "thread-7f01324e"
-  ],
-  "dedupe_key": "packet_ast/review-policy/rate-window-predicate",
-  "suggested_owner": "blackbox",
-  "notes": "Observed while compiling a reusable review packet."
-}
+```text
+bbox_gap(
+  title="Packet AST cannot express rate predicates",
+  gap_kind="packet_ast",
+  domain="review-policy",
+  wanted_capability="Classify entities by count/rate within a time window.",
+  dedupe_key="packet_ast/review-policy/rate-window-predicate",
+  impact="medium",
+  blocking_level="workaround_available",
+  missing_primitive="RateCmp / WithinWindow",
+  fallback_used="Prose rubric plus manual review.",
+  evidence=["packet-event:gap:...", "thread-7f01324e"],
+)
 ```
 
-`type` is the routing tag — exact string, no synonyms.
+Required: `title`, `gap_kind`, `domain`, `wanted_capability`, `dedupe_key`.
+Optional: `impact` (default `medium`), `blocking_level`, `missing_primitive`, `fallback_used`, `evidence`, `suggested_owner`, `notes`.
+
+Pass `project` (the working dir) and `scope`:
+
+- `scope="project"` (default) → the gap is **repo-owned**: one file per gap under `<project>/.bbox/gaps/gap-<8hex>.json`, committed and travelling with the checkout.
+- `scope="global"` → cross-project substrate gaps that aren't about the current repo land in the central host store.
 
 ## Advisory vocabularies
 
@@ -110,50 +106,57 @@ refactor_primitive/java/extract-enum
 
 ## Before filing — dedupe
 
-Search recent open gap notes first:
+Search open gaps first with `bbox_gaps`, filtering by the typed fields:
 
 ```text
-bbox_notes(kind="followup", query="blackbox.gap_note.v1", include_addressed=false)
+bbox_gaps(dedupe_key="packet_ast/review-policy/rate-window-predicate")
+bbox_gaps(gap_kind="mcp_surface", domain="transcripts")
 ```
 
-If a match is open, do not file a new note. Either add a normal `followup` referencing the existing id, or file a new occurrence with the same `dedupe_key` so the operator can tally recurrences. Addressed notes are NOT a dedupe hit — a recurrence after close-out is itself signal.
+An open gap with the same `dedupe_key` **dedupes automatically**: `bbox_gap` returns the existing id instead of creating a duplicate. To deliberately tally a recurrence after close-out, pass `allow_recurrence=true`. Addressed gaps are not a dedupe hit — a recurrence after close-out is itself signal. Pass `json=true` to `bbox_gaps` for machine-readable records.
+
+## Editing and supersession
+
+- Amend a gap in place with `bbox_gap_update` (refine title, wanted_capability, impact, evidence, notes, …) — no need to re-file.
+- Retire a stale gap in favor of a better-shaped successor with `bbox_gap_resolve(id=…, resolution="addressed", superseded_by="gap-<id>")`. This writes the structured `supersedes` / `superseded_by` link on both records.
 
 ## Packet AST gaps
 
-If you are actively authoring a packet and the AST is the missing surface, use `bbox_packet_gap` directly. It records the packet event AND emits the companion gap note for you; do not double-file.
+If you are actively authoring a packet and the AST is the missing surface, use `bbox_packet_gap` directly. It records the packet event AND emits the companion gap into the gap store for you; do not double-file.
 
-For non-packet substrate gaps, the gap-note path above is the only path.
+## File-drop spool (non-MCP agents)
+
+An agent without the `bbox_gap` tool can drop a `blackbox.gap_note.v1` JSON file into `<project>/.bbox/gaps/inbox/` (or the host spool `~/.local/share/blackbox/gaps/inbox/`). `bbox_inbox(import_gap_spool=true)` ingests each into the typed gap store and moves the file to `inbox/imported/`. The envelope mirrors the `bbox_gap` fields with a `"type": "blackbox.gap_note.v1"` routing tag.
 
 ## Lifecycle
 
-The existing note resolution states are the lifecycle:
+The resolution states are the lifecycle:
 
 - `unresolved` — reported, not triaged
 - `acknowledged` — seen, deduped, accepted for later handling
 - `addressed` — implemented, rejected, superseded, or intentionally closed
 
-Resolution text should carry the terminal reason:
+Resolve with `bbox_gap_resolve(id="gap-…", resolution="addressed", note="…")`; the resolution text should carry the terminal reason:
 
 ```text
 implemented in commit abc123; added packet predicate WithinWindow
-duplicate of note-a1b2c3d4
 rejected: application-specific TODO, not blackbox substrate
 superseded by roadmap item BB-RX-14
 ```
 
-When a gap escalates into real implementation work, open or link a `bbox_thread(kind="work_item")` or roadmap item. The note stays as the original field report; the thread becomes the execution object.
+When a gap escalates into real implementation work, open or link a `bbox_thread(kind="work_item")` or roadmap item. The gap stays as the original field report; the thread becomes the execution object.
 
 ## Close-out
 
 The commit that fills a gap should:
 
 - update the supporting code / tests / docs
-- resolve the note via `bbox_note_resolve(id="note-…", resolution="addressed")`
-- mention the note id in the resolution text
+- resolve the gap via `bbox_gap_resolve(id="gap-…", resolution="addressed")`
+- mention the gap id in the resolution text
 - optionally include a trailer in the commit body:
 
 ```text
-Addresses-Gap-Note: note-a1b2c3d4
+Addresses-Gap-Note: gap-a1b2c3d4
 ```
 
-Do not delete the note record. Addressed notes are hidden from default views but remain available for provenance and recurrence analysis.
+Do not delete the gap record. Addressed gaps are hidden from default views but remain available for provenance and recurrence analysis.
