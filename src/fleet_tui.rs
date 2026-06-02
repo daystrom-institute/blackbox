@@ -30,10 +30,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEvent, MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -1362,7 +1359,11 @@ fn run_tui(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<
 fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Do not enable terminal mouse capture: in the single-agent view the
+    // transcript and composer are plain text surfaces that operators need to
+    // select/copy with the native terminal mouse selection. Keyboard scrolling
+    // (PgUp/PgDn, Home/End, Ctrl+↑/↓ while editing) remains available.
+    execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -1395,7 +1396,6 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
                             break;
                         }
                     }
-                    Event::Mouse(mouse) => handle_mouse(app, mouse),
                     _ => {}
                 }
             }
@@ -1419,33 +1419,8 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
     })();
 
     disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     result
-}
-
-fn handle_mouse(app: &mut App, mouse: MouseEvent) {
-    if app.zone != Zone::SingleAgent {
-        return;
-    }
-    let Some((top, bottom)) = app.transcript_y_range else {
-        return;
-    };
-    if mouse.row < top || mouse.row >= bottom {
-        return;
-    }
-    match mouse.kind {
-        MouseEventKind::ScrollUp => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_add(3);
-        }
-        MouseEventKind::ScrollDown => {
-            app.scroll_from_bottom = app.scroll_from_bottom.saturating_sub(3);
-        }
-        _ => {}
-    }
 }
 
 fn page_scroll_step(app: &App) -> usize {
@@ -2709,6 +2684,8 @@ fn draw_help_overlay(f: &mut Frame, app: &App) {
             Line::from("  Esc           interrupt running turn"),
             Line::from("  Ctrl+X        stop / delete agent"),
             Line::from("  ↑/↓           recall input history"),
+            Line::from("  PgUp/PgDn     scroll transcript"),
+            Line::from("  mouse drag    select/copy transcript or composer text"),
             Line::from("  Ctrl+Q        quit"),
         ],
         Zone::Config => vec![
