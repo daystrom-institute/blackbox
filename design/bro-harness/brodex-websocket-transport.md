@@ -1,7 +1,7 @@
 ---
 title: "Brodex WebSocket Responses transport (alongside HTTP-SSE)"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
@@ -11,6 +11,23 @@ brief: "Scope and design for a new WebSocket Responses transport for bro-harness
 ---
 
 # Brodex WebSocket Responses transport (alongside HTTP-SSE)
+
+> **As-built (phases 1–4 done, live-verified).** Shipped: a shared
+> `responses_common::ResponsesState` (one buffer, used by both paths); the WS
+> channel (`openai_responses_ws::WsChannel`) — handshake with the shared
+> identity/auth headers + `OpenAI-Beta: responses_websockets=2026-02-06`,
+> `response.create` framing, connection **reuse** across turns/steps, codex-
+> faithful **incremental input** (`previous_response_id` + delta, full-replay
+> otherwise), and a stale-connection re-dial; and the unified routing transport
+> (`openai_responses::OpenAiResponsesTransport`) — **auto-routing by auth mode**
+> (ChatGPT-OAuth → WS, API-key → HTTP-SSE; **no env knob**) with **automatic
+> session-permanent WS→HTTP fallback** on a WS transport failure (API errors
+> propagate, they don't trigger fallback), and compaction always over HTTP.
+> Verified live: default dispatch auto-routes to WS (one connect across a
+> tool-using turn); a dead WS endpoint falls back to HTTP-SSE.
+> **Remaining: phase 5** — `generate=false` prewarm, `x-codex-turn-state` sticky
+> routing, and reconnect-on-idle. The decisions below reflect the original
+> proposal; the env-knob option was dropped in favor of auth-mode routing.
 
 > **Relationship to the HTTP-SSE transport.** This is the "new brodex alongside
 > the fixed legacy path" split: `openai_responses.rs` (HTTP-SSE) stays the

@@ -280,15 +280,10 @@ pub async fn build_transport(kind: TransportKind) -> Result<Box<dyn Transport>> 
         TransportKind::Anthropic => Box::new(anthropic::AnthropicTransport::from_env()?),
         TransportKind::OpenAiChat => Box::new(openai_chat::OpenAiChatTransport::from_env()?),
         TransportKind::OpenAiResponses => {
-            // TRANSITIONAL (WS phase 2): probe the WebSocket transport behind an
-            // env flag without flipping default brodex traffic before the HTTP
-            // fallback exists. Replaced in phase 4 by automatic auth-mode routing
-            // (ChatGPT-OAuth → WS, API-key → HTTP) with WS→HTTP fallback.
-            if std::env::var("BRO_HARNESS_RESPONSES_WS").is_ok() {
-                Box::new(openai_responses_ws::OpenAiResponsesWsTransport::from_env().await?)
-            } else {
-                Box::new(openai_responses::OpenAiResponsesTransport::from_env().await?)
-            }
+            // The Responses transport routes internally by auth mode:
+            // ChatGPT-OAuth → WebSocket (codex's responses_websockets) with
+            // automatic HTTP-SSE fallback; API-key → HTTP-SSE. No env knob.
+            Box::new(openai_responses::OpenAiResponsesTransport::from_env().await?)
         }
     };
     Ok(tx)

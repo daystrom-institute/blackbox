@@ -8,7 +8,7 @@
 //! request type — reqwest builder vs WS handshake), and the small pure mappers.
 //! Each transport owns only its connection lifecycle and framing.
 
-use super::{StopReason, ToolCall, ToolSpec, TurnOpts, TurnOutput, Usage};
+use super::{StopReason, ToolCall, ToolResult, ToolSpec, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
@@ -21,6 +21,73 @@ pub(super) enum Auth {
         access_token: String,
         account_id: String,
     },
+}
+
+/// The conversation + identity state shared by the HTTP-SSE and WebSocket
+/// Responses transports. Owning this in one place lets the routing transport
+/// keep a single buffer across a WS→HTTP fallback (no two-buffer divergence).
+pub(super) struct ResponsesState {
+    pub auth: Auth,
+    /// Stable per-session id (codex `session-id` header + `prompt_cache_key`).
+    pub session_id: String,
+    /// Per-turn id (codex `thread-id` header); rotated on each new user turn.
+    pub thread_id: String,
+    /// Flat Responses `input[]` buffer.
+    pub input: Vec<Value>,
+}
+
+impl ResponsesState {
+    pub(super) fn new(auth: Auth) -> Self {
+        Self {
+            auth,
+            session_id: String::new(),
+            thread_id: new_id(),
+            input: Vec::new(),
+        }
+    }
+
+    pub(super) fn push_user_text(&mut self, text: &str) {
+        // A new user turn begins: rotate the per-turn `thread-id` (codex mints a
+        // fresh ThreadId per turn while `session-id` stays stable).
+        self.thread_id = new_id();
+        self.input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": text}],
+        }));
+    }
+
+    pub(super) fn push_tool_results(&mut self, results: Vec<ToolResult>) {
+        for r in results {
+            self.input.push(json!({
+                "type": "function_call_output",
+                "call_id": r.id,
+                "output": r.content,
+            }));
+        }
+    }
+
+    pub(super) fn snapshot(&self) -> Value {
+        json!(self.input)
+    }
+
+    pub(super) fn restore(&mut self, snapshot: Value) {
+        if let Some(arr) = snapshot.as_array() {
+            self.input = arr.clone();
+        }
+    }
+
+    pub(super) fn build_body(&self, tools: &[ToolSpec], opts: &TurnOpts) -> Value {
+        build_body(&self.input, &self.session_id, tools, opts)
+    }
+
+    pub(super) fn parse_sse(&mut self, sse: &str) -> Result<TurnOutput> {
+        parse_sse(&mut self.input, sse)
+    }
+
+    pub(super) fn identity_auth_headers(&self) -> Vec<(&'static str, String)> {
+        identity_auth_headers(&self.session_id, &self.thread_id, &self.auth)
+    }
 }
 
 /// Resolve auth from env: an explicit `OPENAI_API_KEY` selects the standard
@@ -508,6 +575,129 @@ pub(super) fn classify_http_error(status: reqwest::StatusCode, body: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::SystemPrompt;
+
+    fn state() -> ResponsesState {
+        let mut s = ResponsesState::new(Auth::ApiKey("k".into()));
+        s.session_id = "sess-1".into();
+        s.input = vec![json!({
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+        })];
+        s
+    }
+    fn opts(system: SystemPrompt) -> TurnOpts {
+        TurnOpts {
+            model: "gpt-5-codex".into(),
+            max_tokens: 16,
+            system,
+            effort: None,
+            web_search: false,
+            service_tier: None,
+        }
+    }
+
+    #[test]
+    fn stable_is_instructions_volatile_is_trailing_developer_item() {
+        let body = state().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: Some("MANIFEST".into()),
+            }),
+        );
+        assert_eq!(body["instructions"], "BASE");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[1]["content"][0]["text"], "MANIFEST");
+        // Volatile never persisted into the buffer.
+        assert_eq!(state().input.len(), 1);
+    }
+
+    #[test]
+    fn empty_stable_falls_back_to_nonempty_instructions() {
+        let body = state().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: None,
+                volatile: Some("V".into()),
+            }),
+        );
+        assert!(!body["instructions"].as_str().unwrap().is_empty());
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["role"], "developer");
+    }
+
+    #[test]
+    fn modern_body_carries_cache_key_service_tier_and_reasoning() {
+        let mut o = opts(SystemPrompt {
+            stable: Some("BASE".into()),
+            volatile: None,
+        });
+        o.effort = Some("medium".into());
+        o.service_tier = Some("priority".into());
+        let body = state().build_body(&[], &o);
+        assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["prompt_cache_key"], "sess-1");
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["reasoning"]["effort"], "medium");
+        assert_eq!(body["include"][0], "reasoning.encrypted_content");
+    }
+
+    #[test]
+    fn default_service_tier_is_dropped() {
+        let mut o = opts(SystemPrompt {
+            stable: Some("BASE".into()),
+            volatile: None,
+        });
+        o.service_tier = Some("default".into());
+        let body = state().build_body(&[], &o);
+        assert!(body.get("service_tier").is_none());
+    }
+
+    #[test]
+    fn reasoning_omitted_for_non_reasoning_model() {
+        let mut o = opts(SystemPrompt {
+            stable: Some("BASE".into()),
+            volatile: None,
+        });
+        o.model = "gpt-4o".into();
+        o.effort = Some("high".into());
+        let body = state().build_body(&[], &o);
+        assert!(body.get("reasoning").is_none());
+        assert!(body.get("include").is_none());
+    }
+
+    #[test]
+    fn reasoning_item_replayed_only_with_encrypted_content() {
+        let mut s = state();
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"encrypted_content\":\"ENC\",\"summary\":[]}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"bare\"}]}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+        );
+        s.parse_sse(sse).unwrap();
+        let reasoning: Vec<_> = s.input.iter().filter(|i| i["type"] == "reasoning").collect();
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0]["encrypted_content"], "ENC");
+    }
+
+    #[test]
+    fn parse_sse_surfaces_reasoning_as_thinking() {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"pondering\"}]}}\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"answer\"}]}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+        );
+        let out = state().parse_sse(sse).unwrap();
+        assert_eq!(out.text, "answer");
+        assert_eq!(out.thinking, "pondering");
+    }
 
     #[test]
     fn responses_split_avoids_orphan_tool_output() {

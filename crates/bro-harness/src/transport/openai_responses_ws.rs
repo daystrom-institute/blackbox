@@ -1,32 +1,29 @@
-//! OpenAI Responses transport over **WebSocket** — codex's modern
-//! `responses_websockets=2026-02-06` path. Shares the entire request/parse/auth
-//! core with the HTTP-SSE transport ([`super::responses_common`]); only the
-//! framing and connection lifecycle differ. The HTTP-SSE transport
-//! ([`super::openai_responses`]) is the fallback when WS is unavailable
-//! (wired in a later phase) — see
-//! `design/bro-harness/brodex-websocket-transport.md`.
+//! WebSocket channel for the Responses transport — codex's
+//! `responses_websockets=2026-02-06` path. This is **not** a standalone
+//! `Transport`; it is a helper driven by the routing transport in
+//! [`super::openai_responses`], which owns the shared [`ResponsesState`] and
+//! falls back to HTTP-SSE on a WS transport failure. Shares the entire
+//! request/parse/auth core with the HTTP path
+//! ([`super::responses_common`]); only framing and the connection differ.
+//! See `design/bro-harness/brodex-websocket-transport.md`.
 //!
-//! Wire framing (codex `codex-api/src/endpoint/responses_websocket.rs`):
-//!   - up: one text frame per request — the same body the HTTP path builds, with
-//!     a `"type":"response.create"` tag (the `ResponsesWsRequest::ResponseCreate`
-//!     internally-tagged enum), optionally carrying `previous_response_id` +
-//!     a delta `input`.
-//!   - down: one text frame per event, each carrying the *same* JSON event the
-//!     HTTP path receives after `data:`. We re-wrap each frame as an SSE `data:`
-//!     line and hand the accumulated stream to the shared `parse_sse`.
+//! Framing: up = one text frame per request — the shared body with a
+//! `"type":"response.create"` tag, optionally carrying `previous_response_id` +
+//! a delta `input`. Down = one JSON event per text frame (same shapes as the
+//! HTTP SSE `data:` payloads); we re-wrap each as a `data:` line and hand the
+//! accumulated stream to the shared `parse_sse`.
 //!
-//! Phase 3 scope: connection **reuse** (the socket is cached on the struct and
-//! reused across `run_turn` calls — within a turn's tool loop and across turns)
-//! and **incremental input** (`previous_response_id` + delta items when the new
-//! input strictly extends what the server already has; full replay otherwise,
-//! mirroring codex's `get_incremental_items`). A stale cached connection is
-//! transparently re-dialed once (full replay). No prewarm, sticky routing, or
-//! WS→HTTP fallback yet (later phases).
+//! Reuse + incremental input: the socket is cached and reused across `run`
+//! calls; when the new input strictly extends the server's known state (prior
+//! request input + the items it returned) and non-input fields are unchanged we
+//! send only the delta (mirroring codex's `get_incremental_items`), else full
+//! replay. A stale cached connection is re-dialed once. `run` classifies its
+//! result so the caller knows whether to propagate (API error) or fall back to
+//! HTTP (transport failure).
 
-use super::responses_common::{self, Auth};
-use super::{Transport, TurnOpts, TurnOutput};
+use super::responses_common::ResponsesState;
+use super::{TurnOpts, TurnOutput};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use std::sync::Once;
@@ -37,65 +34,57 @@ use tokio_tungstenite::tungstenite::http::{HeaderName, HeaderValue};
 /// The WebSocket Responses beta opt-in (codex `RESPONSES_WEBSOCKETS_V2_BETA_HEADER_VALUE`).
 const WS_BETA: &str = "responses_websockets=2026-02-06";
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
-pub struct OpenAiResponsesWsTransport {
-    ws_url: String,
-    auth: Auth,
-    session_id: String,
-    thread_id: String,
-    input: Vec<Value>,
+/// Outcome of a WS turn, telling the routing transport what to do next.
+pub(super) enum WsOutcome {
+    /// Completed normally.
+    Done(TurnOutput),
+    /// A real API/protocol error (e.g. `response.failed`); propagate — HTTP would
+    /// re-fail, so do NOT fall back.
+    Api(anyhow::Error),
+    /// A transport-level failure (connect/send/read/idle/premature close);
+    /// the caller should fall back to HTTP-SSE for the rest of the session.
+    Transport(anyhow::Error),
+}
 
-    /// Cached open connection, reused across `run_turn` calls. `None` until the
-    /// first turn or after a fault.
+pub(super) struct WsChannel {
+    url: String,
+    /// Cached open connection, reused across `run` calls; `None` until the first
+    /// turn or after a fault.
     conn: Option<WsStream>,
 
     // --- incremental-input state (mirrors codex's last_request/last_response) ---
-    /// The full `input` array of the prior request (delta baseline, part 1).
     last_full_input: Option<Vec<Value>>,
-    /// The output items the server added in the prior response (delta baseline,
-    /// part 2 — so we never resend the model's own output).
     last_items_added: Vec<Value>,
-    /// The prior response id, for `previous_response_id`.
     last_response_id: Option<String>,
-    /// The prior request's non-`input` fields; a delta is only valid when these
-    /// are unchanged (model/tools/instructions/reasoning/service_tier/…).
     last_nonfields: Option<Value>,
 }
 
-impl OpenAiResponsesWsTransport {
-    pub async fn from_env() -> Result<Self> {
-        let http = reqwest::Client::new();
-        let auth = responses_common::resolve_auth(&http).await?;
-        let ws_url = responses_common::ws_endpoint(&auth);
-        Ok(Self {
-            ws_url,
-            auth,
-            session_id: String::new(),
-            thread_id: responses_common::new_id(),
-            input: Vec::new(),
+impl WsChannel {
+    pub(super) fn new(url: String) -> Self {
+        Self {
+            url,
             conn: None,
             last_full_input: None,
             last_items_added: Vec::new(),
             last_response_id: None,
             last_nonfields: None,
-        })
+        }
     }
 
-    /// Build the `wss://` upgrade request with the shared identity/auth headers
-    /// plus the websockets beta opt-in.
-    fn build_request(&self) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    fn build_request(
+        &self,
+        state: &ResponsesState,
+    ) -> Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
         let mut req = self
-            .ws_url
+            .url
             .as_str()
             .into_client_request()
             .context("build websocket request")?;
         let headers = req.headers_mut();
-        for (name, value) in
-            responses_common::identity_auth_headers(&self.session_id, &self.thread_id, &self.auth)
-        {
+        for (name, value) in state.identity_auth_headers() {
             if let Ok(v) = HeaderValue::from_str(&value) {
                 headers.insert(HeaderName::from_static(name), v);
             }
@@ -104,11 +93,10 @@ impl OpenAiResponsesWsTransport {
         Ok(req)
     }
 
-    /// Open a fresh connection (no caching).
-    async fn connect(&self) -> Result<WsStream> {
+    async fn connect(&self, state: &ResponsesState) -> Result<WsStream> {
         ensure_crypto_provider();
-        let req = self.build_request()?;
-        tracing::info!(url = %self.ws_url, "connecting Responses WebSocket");
+        let req = self.build_request(state)?;
+        tracing::info!(url = %self.url, "connecting Responses WebSocket");
         let (ws, _resp) = tokio_tungstenite::connect_async(req)
             .await
             .context("websocket connect")?;
@@ -116,10 +104,9 @@ impl OpenAiResponsesWsTransport {
         Ok(ws)
     }
 
-    /// Drop the cached connection and invalidate the delta baseline. After a
-    /// fault we no longer know the server's retained state, so the next request
-    /// must full-replay on a fresh connection.
-    fn reset_connection(&mut self) {
+    /// Drop the cached connection and invalidate the delta baseline (we no longer
+    /// know the server's retained state).
+    fn reset(&mut self) {
         self.conn = None;
         self.last_response_id = None;
         self.last_full_input = None;
@@ -127,9 +114,14 @@ impl OpenAiResponsesWsTransport {
         self.last_nonfields = None;
     }
 
-    /// Compute the incremental `input` delta vs. what the server already has
-    /// (prior request input + the items it returned), or `None` to full-replay.
-    /// Faithful to codex's `get_incremental_items`.
+    /// Caller is abandoning WS (fallback) or the turn was interrupted; forget all
+    /// cached state.
+    pub(super) fn invalidate(&mut self) {
+        self.reset();
+    }
+
+    /// Incremental `input` delta vs. the server's known state, or `None` to
+    /// full-replay. Faithful to codex's `get_incremental_items`.
     fn compute_delta(&self, current_input: &[Value], current_nonfields: &Value) -> Option<Vec<Value>> {
         self.last_response_id.as_ref()?;
         let last_input = self.last_full_input.as_ref()?;
@@ -145,65 +137,23 @@ impl OpenAiResponsesWsTransport {
             None
         }
     }
-}
 
-/// The request body's non-`input` fields, for the delta validity check.
-fn nonfields_of(body: &Value) -> Value {
-    let mut v = body.clone();
-    if let Some(obj) = v.as_object_mut() {
-        obj.remove("input");
-    }
-    v
-}
-
-#[async_trait]
-impl Transport for OpenAiResponsesWsTransport {
-    fn name(&self) -> &'static str {
-        "openai-responses-ws"
-    }
-
-    fn set_session_id(&mut self, id: String) {
-        self.session_id = id;
-    }
-
-    fn push_user_text(&mut self, text: &str) {
-        self.thread_id = responses_common::new_id();
-        self.input.push(json!({
-            "type": "message",
-            "role": "user",
-            "content": [{"type": "input_text", "text": text}],
-        }));
-    }
-
-    fn push_tool_results(&mut self, results: Vec<super::ToolResult>) {
-        for r in results {
-            self.input.push(json!({
-                "type": "function_call_output",
-                "call_id": r.id,
-                "output": r.content,
-            }));
-        }
-    }
-
-    async fn run_turn(
+    /// Run one turn over the WebSocket. See [`WsOutcome`] for how the result
+    /// should be handled by the routing transport.
+    pub(super) async fn run(
         &mut self,
+        state: &mut ResponsesState,
         tools: &[super::ToolSpec],
         opts: &TurnOpts,
         sink: &dyn super::TurnSink,
-    ) -> Result<TurnOutput> {
-        let full_body = responses_common::build_body(&self.input, &self.session_id, tools, opts);
+    ) -> WsOutcome {
+        let full_body = state.build_body(tools, opts);
         let full_input: Vec<Value> = full_body["input"].as_array().cloned().unwrap_or_default();
         let cur_nonfields = nonfields_of(&full_body);
-        // Items appended by parse_sse this turn = self.input[pre_len..]; used as
-        // the delta baseline for the *next* turn.
-        let pre_len = self.input.len();
+        let pre_len = state.input.len();
         let idle = super::http::stream_idle_timeout();
 
-        // At most two attempts: a stale cached connection fails the send, and we
-        // re-dial once (full replay on the fresh socket).
         for attempt in 1..=2u32 {
-            // A reused connection lets us send a delta; a fresh one means the
-            // server has no state, so full-replay.
             let reuse = self.conn.is_some();
             let (send_input, prev_id) = if reuse {
                 match self.compute_delta(&full_input, &cur_nonfields) {
@@ -219,17 +169,20 @@ impl Transport for OpenAiResponsesWsTransport {
                 frame["previous_response_id"] = json!(pid);
             }
             frame["type"] = json!("response.create");
-            let frame_text = serde_json::to_string(&frame).context("serialize ws request frame")?;
+            let frame_text = match serde_json::to_string(&frame) {
+                Ok(t) => t,
+                Err(e) => return WsOutcome::Api(anyhow::Error::new(e).context("serialize ws frame")),
+            };
 
             // Ensure a connection.
             if self.conn.is_none() {
-                match self.connect().await {
+                match self.connect(state).await {
                     Ok(c) => self.conn = Some(c),
                     Err(e) => {
                         if attempt < 2 {
                             continue;
                         }
-                        return Err(e);
+                        return WsOutcome::Transport(e);
                     }
                 }
             }
@@ -242,13 +195,14 @@ impl Transport for OpenAiResponsesWsTransport {
                 .send(Message::Text(frame_text))
                 .await
             {
-                // Most likely a stale cached connection; re-dial and full-replay.
-                self.reset_connection();
+                self.reset();
                 if attempt < 2 {
                     tracing::warn!(error = %e, "ws send failed (stale connection?); re-dialing");
                     continue;
                 }
-                return Err(anyhow::Error::new(e).context("websocket send response.create"));
+                return WsOutcome::Transport(
+                    anyhow::Error::new(e).context("websocket send response.create"),
+                );
             }
 
             // Consume one event per text frame.
@@ -320,8 +274,7 @@ impl Transport for OpenAiResponsesWsTransport {
                                 }
                             }
                             "response.completed" | "response.incomplete" => {
-                                response_id =
-                                    ev["response"]["id"].as_str().map(str::to_string);
+                                response_id = ev["response"]["id"].as_str().map(str::to_string);
                                 terminal_seen = true;
                                 break 'consume;
                             }
@@ -333,7 +286,6 @@ impl Transport for OpenAiResponsesWsTransport {
                         }
                     }
                     Message::Ping(payload) => {
-                        // Keep the connection alive; tungstenite does not auto-pong.
                         let ponged = ws.send(Message::Pong(payload)).await;
                         if ponged.is_err() {
                             fault = Some(anyhow::anyhow!("websocket closed while ponging"));
@@ -350,52 +302,47 @@ impl Transport for OpenAiResponsesWsTransport {
             }
 
             if fault.is_none() && !terminal_seen {
-                fault = Some(anyhow::anyhow!(
-                    "websocket stream closed before a terminal event"
-                ));
+                fault = Some(anyhow::anyhow!("websocket stream closed before a terminal event"));
             }
 
             if let Some(err) = fault {
-                self.reset_connection();
+                self.reset();
                 if !emitted_text && attempt < 2 {
                     tracing::warn!(error = %err, "ws stream fault before output; re-dialing");
                     continue;
                 }
-                return Err(err.context(if emitted_text {
-                    "websocket stream fault after partial output; not retried (would duplicate)"
+                return WsOutcome::Transport(err.context(if emitted_text {
+                    "websocket stream fault after partial output"
                 } else {
-                    "websocket stream retries exhausted"
+                    "websocket stream unusable"
                 }));
             }
 
-            // Terminal event seen → authoritative parse (also classifies a fatal
-            // response.failed). Keep the connection open for reuse.
-            let out = responses_common::parse_sse(&mut self.input, &accum)?;
-
-            // Record the delta baseline for the next request.
-            self.last_full_input = Some(full_input);
-            self.last_items_added = self.input[pre_len..].to_vec();
-            self.last_response_id = response_id;
-            self.last_nonfields = Some(cur_nonfields);
-            return Ok(out);
+            // Terminal event seen → authoritative parse. A `response.failed` is an
+            // API error (do not fall back); the buffer is left pristine (parse_sse
+            // bails before appending), and the connection stays healthy for reuse.
+            match state.parse_sse(&accum) {
+                Ok(out) => {
+                    self.last_full_input = Some(full_input);
+                    self.last_items_added = state.input[pre_len..].to_vec();
+                    self.last_response_id = response_id;
+                    self.last_nonfields = Some(cur_nonfields);
+                    return WsOutcome::Done(out);
+                }
+                Err(e) => return WsOutcome::Api(e),
+            }
         }
-        Err(anyhow::anyhow!("websocket run_turn retry loop exhausted"))
+        WsOutcome::Transport(anyhow::anyhow!("websocket run retry loop exhausted"))
     }
+}
 
-    fn note_interrupted(&mut self) {
-        // The cached connection holds in-flight server state for the aborted
-        // request; drop it so the next turn starts clean (full replay).
-        self.reset_connection();
+/// The request body's non-`input` fields, for the delta validity check.
+fn nonfields_of(body: &Value) -> Value {
+    let mut v = body.clone();
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("input");
     }
-
-    fn snapshot(&self) -> Value {
-        json!(self.input)
-    }
-    fn restore(&mut self, snapshot: Value) {
-        if let Some(arr) = snapshot.as_array() {
-            self.input = arr.clone();
-        }
-    }
+    v
 }
 
 /// rustls 0.23 needs a process-default crypto provider before a `ClientConfig`
@@ -412,19 +359,8 @@ fn ensure_crypto_provider() {
 mod tests {
     use super::*;
 
-    fn tx() -> OpenAiResponsesWsTransport {
-        OpenAiResponsesWsTransport {
-            ws_url: "wss://x/responses".into(),
-            auth: Auth::ApiKey("k".into()),
-            session_id: "sess-1".into(),
-            thread_id: "thread-1".into(),
-            input: Vec::new(),
-            conn: None,
-            last_full_input: None,
-            last_items_added: Vec::new(),
-            last_response_id: None,
-            last_nonfields: None,
-        }
+    fn channel() -> WsChannel {
+        WsChannel::new("wss://x/responses".into())
     }
 
     fn item(tag: &str) -> Value {
@@ -433,38 +369,36 @@ mod tests {
 
     #[test]
     fn no_delta_without_a_prior_response() {
-        let t = tx();
-        assert!(t.compute_delta(&[item("a")], &json!({"model": "m"})).is_none());
+        let c = channel();
+        assert!(c.compute_delta(&[item("a")], &json!({"model": "m"})).is_none());
     }
 
     #[test]
     fn delta_is_the_strict_suffix_after_baseline() {
-        let mut t = tx();
-        // Prior request sent input [a]; server added [b]; → baseline [a, b].
-        t.last_full_input = Some(vec![item("a")]);
-        t.last_items_added = vec![item("b")];
-        t.last_response_id = Some("resp_1".into());
-        t.last_nonfields = Some(json!({"model": "m"}));
-        // Current input extends the baseline by [c].
+        let mut c = channel();
+        c.last_full_input = Some(vec![item("a")]);
+        c.last_items_added = vec![item("b")];
+        c.last_response_id = Some("resp_1".into());
+        c.last_nonfields = Some(json!({"model": "m"}));
         let current = vec![item("a"), item("b"), item("c")];
-        let delta = t.compute_delta(&current, &json!({"model": "m"})).unwrap();
+        let delta = c.compute_delta(&current, &json!({"model": "m"})).unwrap();
         assert_eq!(delta, vec![item("c")]);
     }
 
     #[test]
     fn full_replay_when_nonfields_change_or_prefix_breaks() {
-        let mut t = tx();
-        t.last_full_input = Some(vec![item("a")]);
-        t.last_items_added = vec![item("b")];
-        t.last_response_id = Some("resp_1".into());
-        t.last_nonfields = Some(json!({"model": "m"}));
+        let mut c = channel();
+        c.last_full_input = Some(vec![item("a")]);
+        c.last_items_added = vec![item("b")];
+        c.last_response_id = Some("resp_1".into());
+        c.last_nonfields = Some(json!({"model": "m"}));
         let current = vec![item("a"), item("b"), item("c")];
-        // Non-input fields changed (e.g. tool set / model) → full replay.
-        assert!(t.compute_delta(&current, &json!({"model": "m2"})).is_none());
-        // Prefix broken (a trailing volatile item sat between baseline and the
-        // new tail) → full replay, no item stacking.
+        // Non-input fields changed (model/tools/…) → full replay.
+        assert!(c.compute_delta(&current, &json!({"model": "m2"})).is_none());
+        // Prefix broken (a trailing volatile item between baseline and the new
+        // tail) → full replay, no item stacking.
         let broken = vec![item("a"), item("VOL"), item("b"), item("c")];
-        assert!(t.compute_delta(&broken, &json!({"model": "m"})).is_none());
+        assert!(c.compute_delta(&broken, &json!({"model": "m"})).is_none());
     }
 
     #[test]
@@ -474,5 +408,31 @@ mod tests {
         assert!(nf.get("input").is_none());
         assert_eq!(nf["model"], "m");
         assert_eq!(nf["store"], false);
+    }
+
+    struct NoSink;
+    impl crate::transport::TurnSink for NoSink {
+        fn stream_event(&self, _event: Value) {}
+    }
+
+    #[tokio::test]
+    async fn unreachable_ws_yields_transport_fault_for_fallback() {
+        // A refused connection (nothing on 127.0.0.1:1) must classify as a
+        // Transport failure so the routing transport falls back to HTTP — not as
+        // an Api error (which would propagate).
+        use crate::transport::responses_common::{Auth, ResponsesState};
+        let mut ch = WsChannel::new("ws://127.0.0.1:1/responses".into());
+        let mut state = ResponsesState::new(Auth::ApiKey("k".into()));
+        state.push_user_text("hi");
+        let opts = TurnOpts {
+            model: "gpt-5-codex".into(),
+            max_tokens: 16,
+            system: crate::transport::SystemPrompt::default(),
+            effort: None,
+            web_search: false,
+            service_tier: None,
+        };
+        let outcome = ch.run(&mut state, &[], &opts, &NoSink).await;
+        assert!(matches!(outcome, WsOutcome::Transport(_)));
     }
 }
