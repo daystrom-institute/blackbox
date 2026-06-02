@@ -1,0 +1,21 @@
+{
+  "id": "gap-ed72c6c0",
+  "title": "Design corpus frontmatter schema is implicit — authored by example, not stated",
+  "gap_kind": "docs_runbook",
+  "domain": "design-corpus/frontmatter",
+  "wanted_capability": "A stated frontmatter contract for the design/ corpus (and its siblings research/, specs/) — the required fields (title, kind, lifecycle, corpus, topic), the topic=[corpus, <subdir>] convention, and the lifecycle vocabulary (proposed/partial/archived) — written into the corpus map, so an agent authoring a new design doc applies the schema directly instead of reverse-engineering it from sibling docs and list-design-docs.sh.",
+  "missing_primitive": "stated frontmatter schema section in design/design-corpus.md (and the research/specs corpus maps)",
+  "fallback_used": "Inferred the schema by reading sibling docs (sed -n '1,20p'), design-corpus.md, and design/list-design-docs.sh, then mirrored an active (proposed/partial) doc's frontmatter.",
+  "evidence": [
+    "interactive retrospective",
+    "file:prompts/RETRO_INTERACTIVE.md",
+    "design/design-corpus.md",
+    "design/list-design-docs.sh"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/design-corpus/frontmatter-schema",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T20:42:23Z",
+  "updated_at": "2026-06-02T20:42:23Z"
+}
