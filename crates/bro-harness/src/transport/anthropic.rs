@@ -173,14 +173,20 @@ impl AnthropicTransport {
 /// One in-progress content block accumulated from SSE deltas.
 #[derive(Default)]
 struct SseBlock {
-    /// `"text"`, `"thinking"`, `"tool_use"`, or other.
+    /// `"text"`, `"thinking"`, `"tool_use"`, `"server_tool_use"`, or a
+    /// server-produced result block (`"tool_result"` / `"web_search_tool_result"`).
     kind: String,
     /// Accumulated `text_delta.text` or `thinking_delta.thinking`.
     text: String,
     tool_id: String,
     tool_name: String,
-    /// Accumulated `input_json_delta.partial_json`.
+    /// Accumulated `input_json_delta.partial_json` (tool_use + server_tool_use).
     tool_json: String,
+    /// Raw `content_block` captured verbatim at `content_block_start` for
+    /// server-produced result blocks, whose content arrives inline there (no
+    /// deltas) — kept so the server-tool turn replays faithfully and a paused
+    /// turn can be resumed.
+    raw: Option<Value>,
 }
 
 fn map_stop(reason: &str) -> StopReason {
@@ -237,9 +243,17 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
             let cb = &ev["content_block"];
             let b = &mut blocks[idx];
             b.kind = cb["type"].as_str().unwrap_or("").to_string();
-            if b.kind == "tool_use" {
-                b.tool_id = cb["id"].as_str().unwrap_or("").to_string();
-                b.tool_name = cb["name"].as_str().unwrap_or("").to_string();
+            match b.kind.as_str() {
+                // Both stream their input via `input_json_delta`.
+                "tool_use" | "server_tool_use" => {
+                    b.tool_id = cb["id"].as_str().unwrap_or("").to_string();
+                    b.tool_name = cb["name"].as_str().unwrap_or("").to_string();
+                }
+                "text" | "thinking" => {}
+                // Server-produced result block (e.g. `tool_result` /
+                // `web_search_tool_result`): its content is inline in
+                // `content_block_start`, so capture it verbatim for replay.
+                _ => b.raw = Some(cb.clone()),
             }
         }
         Some("content_block_delta") => {
@@ -278,6 +292,69 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
 /// Render a slice of the native message buffer to a plain-text transcript for
 /// summarization. Tool I/O is rendered compactly and large tool results are
 /// truncated so the summarization prompt stays bounded.
+/// Max `pause_turn` resumes for a single server-tool turn before we stop and
+/// return what we have. A safety bound against a pathological pause loop; a real
+/// server tool (e.g. web_search with a small `max_uses`) pauses zero or one times.
+const MAX_PAUSE_RESUMES: u32 = 8;
+
+fn parse_tool_input(tool_json: &str) -> Value {
+    serde_json::from_str(if tool_json.is_empty() { "{}" } else { tool_json })
+        .unwrap_or_else(|_| json!({}))
+}
+
+/// Reconstruct one assistant segment from the SSE accumulators: the `content`
+/// blocks to store for replay, plus the normalized text/thinking/tool-call
+/// outputs. Server-side tool blocks (`server_tool_use` and the
+/// `tool_result`/`web_search_tool_result` they produce) are preserved verbatim
+/// into `content` so the turn replays faithfully and a paused turn can be
+/// resumed — but they are NOT surfaced as client `tool_calls` (the server
+/// already executed them). Thinking is returned for display only and never
+/// enters `content` (Anthropic needs a persisted signature to replay it).
+fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<super::ToolCall>) {
+    let mut content: Vec<Value> = Vec::new();
+    let mut text_out = String::new();
+    let mut thinking_out = String::new();
+    let mut tool_calls: Vec<super::ToolCall> = Vec::new();
+    for b in blocks {
+        match b.kind.as_str() {
+            "text" if !b.text.is_empty() => {
+                content.push(json!({"type": "text", "text": b.text}));
+                text_out.push_str(&b.text);
+            }
+            "thinking" if !b.text.is_empty() => {
+                thinking_out.push_str(&b.text);
+            }
+            "tool_use" => {
+                let args = parse_tool_input(&b.tool_json);
+                content.push(json!({
+                    "type": "tool_use", "id": b.tool_id, "name": b.tool_name, "input": args.clone(),
+                }));
+                tool_calls.push(super::ToolCall {
+                    id: b.tool_id.clone(),
+                    name: b.tool_name.clone(),
+                    args,
+                });
+            }
+            "server_tool_use" => {
+                // Server-executed: preserve for replay, do not dispatch.
+                content.push(json!({
+                    "type": "server_tool_use",
+                    "id": b.tool_id,
+                    "name": b.tool_name,
+                    "input": parse_tool_input(&b.tool_json),
+                }));
+            }
+            _ => {
+                // Server-produced result block captured verbatim.
+                if let Some(raw) = &b.raw {
+                    content.push(raw.clone());
+                }
+            }
+        }
+    }
+    (content, text_out, thinking_out, tool_calls)
+}
+
 fn render_transcript(messages: &[Value], tool_cap: usize) -> String {
     let mut s = String::new();
     for m in messages {
@@ -352,17 +429,33 @@ impl Transport for AnthropicTransport {
         opts: &TurnOpts,
         sink: &dyn TurnSink,
     ) -> Result<TurnOutput> {
-        let body = self.build_body(tools, opts);
-
         // `?beta=true` + the `anthropic-beta` header gate adaptive-thinking
         // effort and the 1M window on these endpoints (mirrors Claude Code).
         let url = format!("{}/v1/messages?beta=true", self.base_url);
         let betas = anthropic_betas();
         let max_inband = super::http::max_retries();
         let idle = super::http::stream_idle_timeout();
+
+        // A server-tool turn can be split across `pause_turn` boundaries: the
+        // server pauses a long server-side tool turn (e.g. web_search hitting its
+        // iteration limit) and we resume by re-sending the conversation with the
+        // partial assistant appended — the server continues where it left off.
+        // Every segment is merged into ONE assistant message so the buffer stays
+        // alternation-valid for the next turn; bounded so a pause loop can't run
+        // away. `inband_attempt` resets per segment; `resumes` counts pauses.
+        let mut acc_text = String::new();
+        let mut acc_thinking = String::new();
+        let mut acc_tool_calls: Vec<super::ToolCall> = Vec::new();
+        let mut acc_usage = Usage::default();
+        let mut assistant_idx: Option<usize> = None;
         let mut inband_attempt = 0u32;
+        let mut resumes = 0u32;
         loop {
             inband_attempt += 1;
+            // Rebuilt each iteration: on a resume the buffer now ends with the
+            // partial assistant turn, so the request continues it (on an in-band
+            // retry the buffer is unchanged, so the body is identical).
+            let body = self.build_body(tools, opts);
             let resp = super::http::send_with_retry("anthropic/messages", || {
                 let mut rb = self
                     .http
@@ -488,65 +581,61 @@ impl Transport for AnthropicTransport {
                 anyhow::bail!("anthropic stream error ({msg})");
             }
 
-            // Reconstruct the assistant turn from the accumulated blocks.
-            let mut content: Vec<Value> = Vec::new();
-            let mut text_out = String::new();
-            let mut thinking_out = String::new();
-            let mut tool_calls: Vec<super::ToolCall> = Vec::new();
-            for b in &blocks {
-                match b.kind.as_str() {
-                    "text" if !b.text.is_empty() => {
-                        content.push(json!({"type": "text", "text": b.text}));
-                        text_out.push_str(&b.text);
+            // Reconstruct this segment and merge it into the single assistant
+            // message that represents the (possibly multi-segment) turn.
+            let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks);
+            acc_text.push_str(&text);
+            acc_thinking.push_str(&thinking);
+            acc_tool_calls.extend(tool_calls);
+            // Output tokens accrue per segment; input/cache reflect the final
+            // (largest) prompt, so the last segment's figures win.
+            acc_usage.output_tokens += usage.output_tokens;
+            acc_usage.input_tokens = usage.input_tokens;
+            acc_usage.cached_input_tokens = usage.cached_input_tokens;
+            acc_usage.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+            match assistant_idx {
+                // First segment: store the assistant turn (even if empty, so the
+                // conversation alternates when only tool calls were produced).
+                None => {
+                    self.messages
+                        .push(json!({"role": "assistant", "content": content}));
+                    assistant_idx = Some(self.messages.len() - 1);
+                }
+                // Resume continuation: append onto the same assistant message so
+                // the buffer keeps exactly one assistant turn for this request.
+                Some(i) => {
+                    if let Some(arr) = self.messages[i]["content"].as_array_mut() {
+                        arr.extend(content);
                     }
-                    // Capture thinking for display (returned in TurnOutput), but
-                    // do NOT push it into `content` — the replay buffer stays
-                    // thinking-free (Anthropic needs a matching signature to
-                    // replay a thinking block, which we don't persist).
-                    "thinking" if !b.text.is_empty() => {
-                        thinking_out.push_str(&b.text);
-                    }
-                    "tool_use" => {
-                        let args: Value = serde_json::from_str(if b.tool_json.is_empty() {
-                            "{}"
-                        } else {
-                            &b.tool_json
-                        })
-                        .unwrap_or_else(|_| json!({}));
-                        content.push(json!({
-                            "type": "tool_use",
-                            "id": b.tool_id,
-                            "name": b.tool_name,
-                            "input": args.clone(),
-                        }));
-                        tool_calls.push(super::ToolCall {
-                            id: b.tool_id.clone(),
-                            name: b.tool_name.clone(),
-                            args,
-                        });
-                    }
-                    _ => {}
                 }
             }
 
-            // Record the assistant turn for the next request. Always store the
-            // assistant message (even if empty) so the conversation alternates
-            // correctly when only tool calls were produced.
-            self.messages
-                .push(json!({"role": "assistant", "content": content}));
-
-            // Safety: if tool calls were produced, ensure the loop continues even
-            // if the stop_reason event was missed.
-            if !tool_calls.is_empty() {
-                stop = StopReason::ToolCalls;
+            // `pause_turn`: resume the server-tool turn. The next iteration's
+            // rebuilt body now carries the partial assistant, so the server
+            // continues where it left off. Reset the in-band budget per segment;
+            // bound the resume count against a runaway pause loop.
+            if matches!(&stop, StopReason::Other(s) if s == "pause_turn")
+                && resumes < MAX_PAUSE_RESUMES
+            {
+                resumes += 1;
+                inband_attempt = 0;
+                tracing::info!(resume = resumes, "pause_turn; resuming server-tool turn");
+                continue;
             }
 
+            // If client tool calls were produced, ensure the agent loop continues
+            // even if the stop_reason event was missed.
+            let stop = if acc_tool_calls.is_empty() {
+                stop
+            } else {
+                StopReason::ToolCalls
+            };
             return Ok(TurnOutput {
-                text: text_out,
-                thinking: thinking_out,
-                tool_calls,
+                text: acc_text,
+                thinking: acc_thinking,
+                tool_calls: acc_tool_calls,
                 stop,
-                usage,
+                usage: acc_usage,
             });
         }
     }
@@ -894,5 +983,74 @@ mod tests {
             &mut stop,
         );
         assert_eq!(stop, StopReason::Done);
+    }
+
+    #[test]
+    fn fold_sse_captures_server_tool_use_and_result_blocks() {
+        // Exact shape captured live from a GLM web_search turn: the
+        // `server_tool_use` input streams via `input_json_delta`; the
+        // `tool_result` content arrives inline in `content_block_start`.
+        let mut blocks: Vec<SseBlock> = Vec::new();
+        let mut usage = Usage::default();
+        let mut stop = StopReason::Done;
+        let evs = [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"server_tool_use","id":"call_1","name":"web_search","input":{}}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"search_query\":\"rust\"}"}}),
+            json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_result","tool_use_id":"call_1","content":"[[{\"title\":\"x\"}]]"}}),
+        ];
+        for ev in &evs {
+            fold_sse(ev, &mut blocks, &mut usage, &mut stop);
+        }
+        assert_eq!(blocks[0].kind, "server_tool_use");
+        assert_eq!(blocks[0].tool_id, "call_1");
+        assert_eq!(blocks[0].tool_name, "web_search");
+        assert_eq!(blocks[0].tool_json, "{\"search_query\":\"rust\"}");
+        // The result block is captured verbatim (content inline, no deltas).
+        assert_eq!(blocks[1].kind, "tool_result");
+        let raw = blocks[1].raw.as_ref().expect("raw result block");
+        assert_eq!(raw["tool_use_id"], "call_1");
+        assert_eq!(raw["content"], "[[{\"title\":\"x\"}]]");
+    }
+
+    #[test]
+    fn reconstruct_segment_preserves_server_blocks_without_dispatching() {
+        let blocks = vec![
+            SseBlock {
+                kind: "text".into(),
+                text: "Searching.".into(),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "server_tool_use".into(),
+                tool_id: "call_1".into(),
+                tool_name: "web_search".into(),
+                tool_json: "{\"search_query\":\"x\"}".into(),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "tool_result".into(),
+                raw: Some(json!({"type":"tool_result","tool_use_id":"call_1","content":"[r]"})),
+                ..Default::default()
+            },
+            SseBlock {
+                kind: "tool_use".into(),
+                tool_id: "t2".into(),
+                tool_name: "read_file".into(),
+                tool_json: "{\"path\":\"a\"}".into(),
+                ..Default::default()
+            },
+        ];
+        let (content, text, _thinking, tool_calls) = reconstruct_segment(&blocks);
+        // Server blocks are preserved verbatim into the replay content...
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[1]["type"], "server_tool_use");
+        assert_eq!(content[1]["input"]["search_query"], "x");
+        assert_eq!(content[2]["type"], "tool_result");
+        assert_eq!(content[2]["content"], "[r]");
+        assert_eq!(content[3]["type"], "tool_use");
+        assert_eq!(text, "Searching.");
+        // ...but only the CLIENT tool_use is surfaced for dispatch.
+        assert_eq!(tool_calls.len(), 1);
+        assert_eq!(tool_calls[0].name, "read_file");
     }
 }
