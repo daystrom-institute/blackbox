@@ -31,6 +31,7 @@ edges, storage, and corpus-facing assistants.
 
 ## Retrieval And Storage
 
+- [Locate-Information Coherence Path](agentic-corpus/locate-information-coherence.md)
 - [Code Navigation](code-navigation/code-navigation.md)
 - [Storage And Performance](storage/storage-and-performance.md)
 
