@@ -1,0 +1,19 @@
+{
+  "id": "38ce0e71",
+  "title": "prompts/ corpus: operator-pointed prompts + dispatched-agent lenses",
+  "content": "`prompts/` is the home for checked-in prose prompts an agent is pointed at: operator-pointed prompts at the root, dispatched-agent lenses under `prompts/agents/` (so brofiles stay thin pointers). Distinct from `system-defaults/` (installable JSON artifacts) and `.claude` skills (harness-native commands). Index: `prompts/README.md`.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-02T18:32:32Z",
+  "updated_at": "2026-06-02T18:32:32Z",
+  "recall_count": 0
+}

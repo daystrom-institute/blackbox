@@ -29,7 +29,7 @@ an agent is told to read.
 
 | Prompt | When to point an agent at it |
 |--------|------------------------------|
-| [daily-boot-sequence.md](daily-boot-sequence.md) | Run the operator's daily TODO list: ingest, action one item at a time (ground → reflect → decide → action → report), then debrief + self-update. Carries the ambient host/tool context. |
+| [daily-boot-sequence.md](daily-boot-sequence.md) | Daily conductor: clean → survey residuals/net-news → process gaps → refine & process the TODO list → closeout. Sequences the other daily prompts; owns the TODO-refinement loop + closeout. |
 | [daily-cleaning.md](daily-cleaning.md) | Start-of-day environment reset: sync main, prune landed manual worktrees, full cargo clean, cold rebuild + reinstall prod daemon/bro/bro-harness, restart prod service (gated). |
 | [gap-processing.md](gap-processing.md) | Launch the gap-processing orchestrator bro (Layer 1 → 2 → 3 sieve): cluster active gaps, fan out validators, present grouped/sorted action lists, resolve operator-gated one at a time. |
 | [CLOSEOUT.md](CLOSEOUT.md) | Fold a worktree back into `main`: commit, ff-only merge, push, clean up. |

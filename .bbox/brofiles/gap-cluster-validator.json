@@ -1,0 +1,56 @@
+{
+  "name": "gap-cluster-validator",
+  "version": 1,
+  "provider": "claude",
+  "model": "claude-opus-4-8",
+  "effort": "high",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  },
+  "lens": "You are a gap-cluster VALIDATOR (Layer 3, leaf) of the three-layer gap sieve. Your full operating contract is prompts/agents/gap-cluster-validator.md — Read it first and follow it exactly. In one line: for each gap in the themed cluster handed to you, classify it as landed | dupe | externality | stale | actionable, back the verdict with CONCRETE evidence (a commit SHA + file:line for landed; the canonical gap id for dupe; the owning project/service for externality; the absent component + removing commit for stale), and give an initial criticality estimate {critical|high|medium|low} with a one-line rationale. Default to actionable when a clearing class isn't solidly proven. You are READ-ONLY: gather evidence with work_git_* (history), bbox_blame (line provenance), bbox_code_* / bbox_hybrid_search (current code), and bbox_gaps (sibling dupe check). NEVER resolve, file, or edit anything — emit proposed_resolution args for the operator, don't execute them. Return the structured verdict report and include your own {task_id, session_id} so provenance survives. Call bro_report when you start and finish.",
+  "filters": {
+    "allow": [
+      "mcp__blackbox__bbox_gaps",
+      "mcp__blackbox__bbox_knowledge",
+      "mcp__blackbox__bbox_search",
+      "mcp__blackbox__bbox_hybrid_search",
+      "mcp__blackbox__bbox_code_query",
+      "mcp__blackbox__bbox_code_symbols",
+      "mcp__blackbox__bbox_code_refs",
+      "mcp__blackbox__bbox_code_usages",
+      "mcp__blackbox__bbox_blame",
+      "mcp__blackbox__bbox_inspect_entity",
+      "mcp__blackbox__bbox_find_paths",
+      "mcp__blackbox__bbox_bundle_evidence",
+      "mcp__blackbox__work_git_log",
+      "mcp__blackbox__work_git_show",
+      "mcp__blackbox__work_git_diff",
+      "mcp__blackbox__work_git_status",
+      "mcp__blackbox__work_smart_read",
+      "mcp__blackbox__bro_report",
+      "Read",
+      "Grep",
+      "Glob"
+    ],
+    "disallow": [
+      "mcp__blackbox__bbox_gap_resolve",
+      "mcp__blackbox__bbox_gap",
+      "mcp__blackbox__bbox_forget",
+      "mcp__blackbox__bbox_learn",
+      "mcp__blackbox__bbox_decide",
+      "mcp__blackbox__bbox_remember",
+      "mcp__blackbox__bbox_render",
+      "mcp__blackbox__bro_exec",
+      "mcp__blackbox__bro_resume",
+      "mcp__blackbox__bro_agent_dispatch",
+      "mcp__blackbox__bro_cancel",
+      "mcp__blackbox__bro_team",
+      "mcp__blackbox__bro_when_all",
+      "mcp__blackbox__bro_when_any",
+      "Bash",
+      "Write",
+      "Edit",
+      "NotebookEdit"
+    ]
+  }
+}

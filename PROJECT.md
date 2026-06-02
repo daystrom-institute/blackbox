@@ -214,6 +214,9 @@ or system memories and link/pointer from here.
 - `docs/index.md` - human documentation map.
 - `examples/runnable-examples.md`, `system-defaults/system-defaults.md` - maps for
   tutorial examples and installable default artifacts.
+- `prompts/README.md` - map of checked-in prose prompts (operator-pointed
+  interactive prompts and dispatched-agent lenses). Distinct from
+  `system-defaults/` artifacts and `.claude` skills.
 - `docs/getting-started.md`, `docs/operating-blackbox.md`,
   `docs/operations.md` - operational setup and day-2 runbooks.
 - `docs/internals.md`, `docs/index-embedding-internals.md`,
@@ -234,6 +237,11 @@ or system memories and link/pointer from here.
   provider APIs, protocols) that feeds `design/`. Sibling of `design/`, distinct
   `corpus: blackbox-research`. First track + charter:
   `research/harness/harness-tracks.md`.
+- `specs/specs-corpus.md` - map for the specs corpus: the CANON — normative,
+  source-grounded contracts for what each subsystem should be/do. Third sibling
+  of `design/` (intent) and `research/` (description), distinct
+  `corpus: blackbox-spec`; backfilled by inverting code + design + research.
+  First domain + charter: `specs/bro-harness/bro-harness-spec.md`.
 - `design/list-design-docs.sh` - list design docs whose frontmatter lifecycle
   is `proposed` or `partial`.
 - `design/corpus/` - topic home for agentic corpus, knowledge/memory, notes,

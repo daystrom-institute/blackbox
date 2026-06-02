@@ -1,0 +1,19 @@
+{
+  "id": "1f4af0e8",
+  "title": "specs/ canon corpus (blackbox-spec), third sibling of design/research",
+  "content": "`specs/` is the canon corpus (`corpus: blackbox-spec`): normative, source-grounded contracts for what each subsystem should be/do — the third sibling of `design/` (intent) and `research/` (description). Status lifecycle `draft → specified → ratified`; per-clause source-tier grading (`standard`/`vendor`/`research`/`derived`), no RFC-2119 keywords; backfilled by inverting code + design + research; the conformance section wires clauses to code/intent/evidence anchors. Charter: `specs/specs-corpus.md`.",
+  "variants": {},
+  "category": "convention",
+  "scope": "project",
+  "providers": [],
+  "priority": "standard",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": true,
+  "source": "user",
+  "created_at": "2026-06-02T18:32:35Z",
+  "updated_at": "2026-06-02T18:32:35Z",
+  "recall_count": 0
+}

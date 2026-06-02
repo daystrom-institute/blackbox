@@ -1,0 +1,20 @@
+{
+  "id": "gap-a5e152fb",
+  "title": "No first-class way to dispatch a registered orchestrator agent (by brofile) with recursion enabled",
+  "gap_kind": "mcp_surface",
+  "domain": "orchestration/agent-dispatch",
+  "wanted_capability": "A single dispatch call that launches a registered agent/brofile AND enables allow_recursion, so a recursion-needing orchestrator bro (e.g. the gap-processing orchestrator that fans out to per-cluster validator sub-bros) can be launched by brofile name. Today bro_agent_dispatch resolves the brofile/filters but hardcodes allow_recursion=false (src/tools/agents.rs:906), while bro_exec carries allow_recursion but targets a named live bro or provider+inline-lens — brofile-template-by-name resolution via bro_exec is unverified. So launching a recursion-enabled orchestrator from a thin brofile has no clean path.",
+  "missing_primitive": "allow_recursion param on bro_agent_dispatch, or documented/verified brofile-name targeting on bro_exec",
+  "fallback_used": "Documented launch via bro_exec with allow_recursion=true and flagged brofile-by-name targeting as a FIRST-RUN VERIFY item in prompts/gap-processing.md",
+  "evidence": [
+    "file:src/tools/agents.rs:906",
+    "file:src/tools/bro_params.rs:10",
+    "file:prompts/gap-processing.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/agent-dispatch/recursive-orchestrator-dispatch",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T18:33:21Z",
+  "updated_at": "2026-06-02T18:33:21Z"
+}

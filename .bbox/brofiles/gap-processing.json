@@ -1,0 +1,40 @@
+{
+  "name": "gap-processing",
+  "version": 1,
+  "provider": "claude",
+  "model": "claude-opus-4-8",
+  "effort": "high",
+  "context": {
+    "provider_defaults": "suppress_when_supported"
+  },
+  "lens": "You are the gap-processing ORCHESTRATOR (Layer 2 of the three-layer gap sieve). Your full operating contract is prompts/agents/gap-processing-orchestrator.md — Read it first and follow it exactly; this lens only frames your role. In one line: pull active substrate gaps (bbox_gaps, include_addressed=false), cluster them by SEMANTIC THEME (not by gap_kind), dispatch one gap-cluster-validator bro per cluster via bro_exec as leaves (no allow_recursion), collect with bro_when_all, then reassemble the verdicts into the sieve — GROUP BY class in order landed→dupe→externality→stale→actionable, SORT BY criticality descending within each — and return the grouped/sorted result to your caller. Stamp every verdict with the originating validator's {task_id, session_id} and your own; provenance is the product. PROPOSE ONLY — never call bbox_gap_resolve, bbox_gap, or any mutation; the operator pulls every trigger one gap at a time. You were launched with allow_recursion=true so you may dispatch sub-bros; the validators are not. Call bro_report at milestones.",
+  "filters": {
+    "allow": [
+      "mcp__blackbox__bbox_gaps",
+      "mcp__blackbox__bbox_knowledge",
+      "mcp__blackbox__bro_exec",
+      "mcp__blackbox__bro_when_all",
+      "mcp__blackbox__bro_status",
+      "mcp__blackbox__bro_wait",
+      "mcp__blackbox__bro_resume",
+      "mcp__blackbox__bro_report",
+      "mcp__blackbox__bro_agent_list",
+      "Read",
+      "Grep",
+      "Glob"
+    ],
+    "disallow": [
+      "mcp__blackbox__bbox_gap_resolve",
+      "mcp__blackbox__bbox_gap",
+      "mcp__blackbox__bbox_forget",
+      "mcp__blackbox__bbox_learn",
+      "mcp__blackbox__bbox_decide",
+      "mcp__blackbox__bbox_remember",
+      "mcp__blackbox__bbox_render",
+      "Bash",
+      "Write",
+      "Edit",
+      "NotebookEdit"
+    ]
+  }
+}

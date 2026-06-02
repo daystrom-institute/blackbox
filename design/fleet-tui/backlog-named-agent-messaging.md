@@ -31,6 +31,19 @@ brief: "Proposed Fleet TUI extension: assign every roster-spawned top-level agen
 > provider-agnostic; fleet injects env/pinned tools for Brodex-family children
 > through `FleetOrchestrator::pin_tools_env`.
 
+> **Code-grounding re-verified 2026-06-02 (dispatch prep).** All primary anchors
+> still hold: `FLEET_PROVIDERS`, `DEFAULT_FLEET_PIN_TOOLS`, `pin_tools_env`,
+> `dispatch_fleet_prompt`, `send_user_turn`, `FleetOrchestrator`, `run_tui_inner`.
+> Phase 1 is unstarted (`Agent` has `name` but no `handle`; no `FleetIdentityStore`,
+> no `roster-identities.json`) and Phases 2–3 are unstarted (`fleet_send_message`
+> appears only in a doc-comment, not as code). **One drift reconciled:**
+> `FLEET_PROVIDERS` now includes **VibeBh** (Mistral via bro-harness) — the fleet
+> roster is `[Glm, Deepseek, Brodex, VibeBh]`, four providers, not the three this
+> doc originally assumed. Sections below have been updated to include VibeBh in
+> the sender-tool pinning. Lifecycle stays `proposed` (nothing implemented), but
+> the design is dispatch-ready; see `bbox_thread` handle in the dispatch note at
+> the end of §11.
+
 ## 1. Goal
 
 Give fleet agents stable, human-addressable handles and a first-class peer
@@ -220,9 +233,10 @@ Tool behavior:
 4. Write a new JSON file into `mailbox/outbox` atomically (`tmp` + rename).
 5. Return a compact receipt to the sender; do not block on target delivery.
 
-Add `fleet_send_message` to `DEFAULT_FLEET_PIN_TOOLS` so Brodex/GLM/DeepSeek
-fleet agents see it in their hot tool surface. These are the only providers the
-cockpit surfaces (see `FLEET_PROVIDERS` in `src/fleet_tui.rs`).
+Add `fleet_send_message` to `DEFAULT_FLEET_PIN_TOOLS` so every fleet provider —
+GLM, DeepSeek, Brodex, **and VibeBh** — sees it in its hot tool surface. These
+are the providers the cockpit surfaces (see `FLEET_PROVIDERS` in
+`src/fleet_tui.rs`, currently `[Glm, Deepseek, Brodex, VibeBh]`).
 
 > **Decision (operator, 2026-06-01): Claude is out of fleet entirely.** Claude
 > Code does **not** execute `bro-tools` builtins directly, so a Claude row could
@@ -233,7 +247,8 @@ cockpit surfaces (see `FLEET_PROVIDERS` in `src/fleet_tui.rs`).
 > (`ClassifierConfig::provider_resolved`, which now defaults to GLM). Claude
 > remains a first-class provider everywhere else (`bro_exec`, orchestration); it
 > is simply not a fleet-cockpit participant. This design therefore assumes a
-> Brodex/GLM/DeepSeek roster only — no recipient-only Claude path.
+> GLM/DeepSeek/Brodex/VibeBh roster (the current `FLEET_PROVIDERS`) — all
+> bro-harness/`bro-tools`-capable senders, no recipient-only Claude path.
 
 A read-only `fleet_roster` tool is optional but useful:
 
@@ -385,3 +400,11 @@ Single-agent view additions:
 - Unknown/stale targets fail visibly and do not silently drop messages.
 - The implementation does not call a running `blackboxd` or introduce any daemon
   runtime dependency into `bro fleet` / `bro-harness`.
+
+## 12. Dispatch note
+
+Dispatch-prepared 2026-06-02. The implementation work item is tracked in
+`bbox_thread` **`thread-3f9a84f6`** (`named-agent-messaging-impl`, kind
+`work_item`, handoff_doc → this file), which carries the re-verified anchor list,
+the VibeBh drift to honor, and the §9 phase→task breakdown. Resume that thread to
+launch implementation.

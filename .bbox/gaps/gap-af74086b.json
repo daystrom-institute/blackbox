@@ -1,0 +1,19 @@
+{
+  "id": "gap-af74086b",
+  "title": "bbox_knowledge broad smart-mode queries overflow the token budget and spill to a file",
+  "gap_kind": "mcp_surface",
+  "domain": "knowledge/bbox_knowledge",
+  "wanted_capability": "Output bounding (or a compact/titles-only default) for bbox_knowledge so a broad smart-mode query does not exceed the token budget. A multi-term smart query returned ~81k chars / 1400+ lines twice this session, forcing a spill-to-file and a re-query. A `limit` row-count exists but smart-mode recall-broadening still emits unbounded total bytes; a byte cap or titles-first compact mode (opt into bodies) would keep interactive dedupe checks cheap.",
+  "missing_primitive": "byte-cap / titles-only compact mode on bbox_knowledge smart queries",
+  "fallback_used": "Re-queried with mode=substring + a tight phrase + small limit, then grepped the spilled tool-result file",
+  "evidence": [
+    "bbox_knowledge query='rtk grep ripgrep rg fd shell command rewrite quirk' -> 81632 chars",
+    "bbox_knowledge query='rtk rewrite' -> 81580 chars"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/bbox-knowledge/broad-query-output-bounding",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T18:33:30Z",
+  "updated_at": "2026-06-02T18:33:30Z"
+}

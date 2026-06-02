@@ -46,9 +46,17 @@ When spinning up a git worktree of this Cargo workspace ad hoc (outside orchestr
 
 bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share code via workspace crates (e.g. bro-tools), but bro-harness must never have a runtime dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it is going the wrong way. Shared capabilities the harness needs must be extracted into a workspace crate both processes link, not implemented by having the harness call a daemon service. The bro-harness Promise layer follows the same invariant: Promise producers are harness-local, and `bro_exec`/`bro_resume`/daemon orchestration are not Promise producers inside the harness.
 
+**prompts/ corpus: operator-pointed prompts + dispatched-agent lenses**
+
+`prompts/` is the home for checked-in prose prompts an agent is pointed at: operator-pointed prompts at the root, dispatched-agent lenses under `prompts/agents/` (so brofiles stay thin pointers). Distinct from `system-defaults/` (installable JSON artifacts) and `.claude` skills (harness-native commands). Index: `prompts/README.md`.
+
 **research/ corpus + harness research charter**
 
 The `research/` corpus (sibling of `design/`, mapped by `research/research-corpus.md`) is a point-in-time, evidence-graded study of the external problem space — reference harnesses, provider APIs, protocols — that feeds the `design/` corpus. It is a distinct corpus: `corpus: blackbox-research`, its own kinds (`research-hub`/`research-axis`/`research-subject`/`research-finding`), a research `status` lifecycle (`stub → researching → enriched → verified`) with inline per-claim confidence tiers, and version-snapshot supersession (a new `<harness>-<version>.md` snapshot supersedes the prior and re-mines only changed axes). The first track, `research/harness/`, studies agentic coding CLIs across a matrix of subject × axis. Before doing harness research or adding any research doc, read the charter `research/harness/harness-tracks.md` — it defines the axes, the matrix ontology, the frontmatter schema, the mining shape, and the researcher pickup contract. Adopt mined idioms into `design/`; never paste proprietary prompt prose into shipped code.
+
+**specs/ canon corpus (blackbox-spec), third sibling of design/research**
+
+`specs/` is the canon corpus (`corpus: blackbox-spec`): normative, source-grounded contracts for what each subsystem should be/do — the third sibling of `design/` (intent) and `research/` (description). Status lifecycle `draft → specified → ratified`; per-clause source-tier grading (`standard`/`vendor`/`research`/`derived`), no RFC-2119 keywords; backfilled by inverting code + design + research; the conformance section wires clauses to code/intent/evidence anchors. Charter: `specs/specs-corpus.md`.
 
 ### Forgejo Coordination Identity
 
