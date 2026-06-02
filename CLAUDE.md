@@ -41,7 +41,7 @@ When spinning up a git worktree of this Cargo workspace ad hoc (outside orchestr
 
 **bro-harness shares code with daemon, never runtime**
 
-bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share **code** via workspace crates (e.g. bro-tools), but bro-harness must never have a **runtime** dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it's going the wrong way. Corollary: shared capabilities the harness needs (e.g. LSP session management) are shared by extracting code into a workspace crate both link, not by the harness calling a daemon service.
+bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share code via workspace crates (e.g. bro-tools), but bro-harness must never have a runtime dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it is going the wrong way. Shared capabilities the harness needs must be extracted into a workspace crate both processes link, not implemented by having the harness call a daemon service. The bro-harness Promise layer follows the same invariant: Promise producers are harness-local, and `bro_exec`/`bro_resume`/daemon orchestration are not Promise producers inside the harness.
 
 ### Forgejo Coordination Identity
 
@@ -84,6 +84,10 @@ System memories must state current system invariants and operational runbooks, n
 
 
 ## Workflow
+
+**Fleet TUI validation uses tmux MCP and live probes**
+
+When changing Fleet TUI behavior, validate user-facing behavior with tmux MCP tools against a real TUI session, not only unit tests. Prefer an isolated tmux socket/session for smoke tests, capture panes to verify rendering and interaction, and clean up any validation sessions you create. For Fleet TUI work, limited LLM spend is authorized when needed to probe real dispatch, routing, or provider behavior; keep probes narrow, avoid repeated broad runs, and report exactly what was exercised. If tmux MCP tools are unavailable, discover or configure them before falling back to raw tmux CLI.
 
 **List Before Create**
 
