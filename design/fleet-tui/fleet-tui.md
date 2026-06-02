@@ -42,6 +42,10 @@ This page is the **nav waypoint** — start here, then follow a link.
 
 ## Backlog (proposed — pick this up)
 
+- [Multi-instance coherent view](backlog-multi-instance-coherence.md) — desired
+  UX and local coordinator architecture so multiple `bro fleet` TUIs on the same
+  machine attach to one shared fleet instead of each owning process-local live
+  state.
 - [v1 follow-ons](backlog-follow-ons.md) — input-history disk persistence,
   allocator probe-core extraction for headroom v2 + capability badges, Alerting
   bucket + `/resume` of a deleted session. (`@project` cwd aliases + MCP config

@@ -1,0 +1,19 @@
+{
+  "id": "gap-3b647912",
+  "title": "Promise completion wake should suppress stale follow-up after explicit wait",
+  "gap_kind": "workflow",
+  "domain": "harness/promise",
+  "wanted_capability": "When an agent explicitly waits for a shell promise and receives its terminal result, the harness should either suppress the later auto-injected HARNESS_EVENT for that promise or mark it as already consumed with no misleading next-step instruction. The auto-wake should not tell the agent to call promise_status after the terminal result is already in context.",
+  "missing_primitive": "promise auto-wake consumption tracking",
+  "fallback_used": "Ignored the redundant HARNESS_EVENT after promise_wait had already returned the completed shell result.",
+  "evidence": [
+    "RETRO_HARNESS.md:15",
+    "session: shell_run promise pr-1 followed by promise_wait terminal result, then HARNESS_EVENT still instructed promise_status"
+  ],
+  "impact": "low",
+  "blocking_level": "none",
+  "dedupe_key": "workflow/harness/promise-stale-completion-wake-after-wait",
+  "resolution": "unresolved",
+  "created_at": "2026-06-02T05:31:15Z",
+  "updated_at": "2026-06-02T05:31:15Z"
+}
