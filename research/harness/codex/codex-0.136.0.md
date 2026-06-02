@@ -8,7 +8,7 @@ version: "0.136.0"
 platform: linux-x86_64
 captured: "2026-06-02"
 supersedes: null
-status: researching
+status: enriched
 topic:
   - harness
   - codex
@@ -31,12 +31,12 @@ brief: "STUB snapshot for Codex 0.136.0: the temporal anchor and per-axis checkl
 
 ## Update (2026-06-02 · mining pass)
 
-The **5 governance-axis cells** (privilege-approvals, planning-goals,
-memory-persistence, modes-personas, session-lifecycle) are now **enriched**
-(`confidence: high`) from the codex-lens discovery mine — the pass that surfaced
-those axes. The **10 base-axis cells** (transport…skills) **remain stubs**,
-pending a full mining pass like the one vibe/agy received. Per-cell frontmatter is
-authoritative; the table below is not re-statused.
+All 15 axis cells for codex are now **enriched** (`confidence: high`). The 5
+governance-axis cells came from the codex-lens discovery mine (the pass that
+surfaced those axes); the 10 base-axis cells (transport…skills) were filled by a
+full source mining pass over `codex-rs` (DeepSeek + GLM bros, 2026-06-02). Codex
+is now the deepest-mined subject — fitting, since it's the discovery lens.
+Per-cell frontmatter is authoritative; the table below is not re-statused.
 
 ## Axis checklist
 

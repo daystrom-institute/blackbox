@@ -39,6 +39,15 @@ Candidate future tracks (not yet seeded): provider-apis (raw wire contracts
 across vendors), protocols (MCP, ACP, stream-json envelope evolution),
 model-behavior (effort/thinking/steering response across model families).
 
+## Operating procedures
+
+The repeatable procedures that run this program live in
+[`research/prompts/`](prompts/prompts.md): **MINE_CLI** (forward-mine one CLI
+against the axes), **REFRESH_ALL_CLIS** (orchestrate a fan-out refresh over all
+CLIs), and **CLI_INVESTIGATOR** (backward-discover missing axes). Agents and
+bros are pointed at these docs rather than carrying baked-in lenses, so the
+procedures stay tweakable in one place.
+
 ## Why a separate corpus
 
 `corpus: blackbox-research` keeps these docs out of `design/`'s lifecycle
