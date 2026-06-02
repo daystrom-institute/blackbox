@@ -13,7 +13,7 @@ topic:
   - harness
   - claude
   - subagents
-brief: "How Claude Code 2.1.160 exposes subagents via the Agent tool: a typed registry (claude, Explore, general-purpose, Plan, statusline-setup, claude-code-guide) with scoped tools, worktree isolation opt-in, background execution, per-call model override, final-text-as-return-value contract, and SendMessage continuation. Parallelism via multiple Agent calls in one block, with a concurrency cap. Backfilled from direct observation of the running harness."
+brief: "Claude Code 2.1.160 exposes subagents via the Agent tool and separately manages background sessions through claude agents. The Agent tool has typed agents, scoped tools, worktree isolation, background execution, model override, final-text-as-result, and SendMessage continuation; the CLI agent view adds JSON listing, dispatch defaults, worktree/tmux support, cwd filtering, and preserved permission/model/effort/plugin/MCP settings."
 ---
 
 # Claude · Subagents
@@ -57,6 +57,14 @@ directly).
   them in a single message with multiple tool uses so they run concurrently."*
 - **Continuation.** A new `Agent` call starts fresh; `SendMessage` to an agent's
   id/name continues it *"with its context intact."*
+
+## Background Agent CLI (2026-06-02 local pass)
+
+claude agents is now a substantial orchestration surface, not only a viewer. Current help exposes --json for machine-readable live sessions, --cwd filtering, --add-dir, --settings, --mcp-config, --strict-mcp-config, --plugin-dir, --permission-mode, --allow-dangerously-skip-permissions, --dangerously-skip-permissions, --model, --effort, and --agent as dispatch defaults.
+
+Changelog entries add lifecycle and isolation details: background sessions can be resumed, detached sessions preserve fallback model and permission settings, background subagents report running state on resume, worktree isolation guards are enforced for subagents/background sessions, and Claude-managed worktrees live under .claude/worktrees/ with cleanup/retention behavior. Background agents and bash commands can run asynchronously and send messages to wake the main agent.
+
+The Agent tool and claude agents should be treated as related but distinct: Agent is an in-session delegation tool; claude agents is a process/session manager for background Claude sessions.
 
 ## Open
 

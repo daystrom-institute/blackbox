@@ -13,7 +13,7 @@ topic:
   - harness
   - claude
   - mcp
-brief: "How Claude Code 2.1.160 integrates MCP servers, with emphasis on the deferred-tiering anti-bloat pattern: MCP tools are surfaced by name only in a <system-reminder> manifest, their JSON schemas withheld until fetched via the ToolSearch tool (select-by-name or keyword/ranked queries), then become callable in-session. FQDN namespacing (mcp__server__tool). Backfilled from direct observation of the running harness, which runs on exactly this mechanism."
+brief: "How Claude Code 2.1.160 integrates MCP servers: deferred ToolSearch tiering with mcp__server__tool namespacing, plus CLI management for stdio/HTTP/SSE servers, project .mcp.json approval gating, strict MCP config, reset-project-choices, server health checks, and plugin/agent propagation controls."
 ---
 
 # Claude · MCP Tooling
@@ -57,6 +57,19 @@ applied to tools — the single most important pattern for "steer without bloat.
 - **Auth caveat (medium).** Interactively-authenticated MCP servers (e.g.
   claude.ai connectors) may be absent in headless/cron runs — surfaced as a
   documented caveat.
+
+## CLI Management Deltas (2026-06-02 local pass)
+
+Current claude mcp help adds operational shape around the deferred model-facing mechanism:
+
+- claude mcp add supports HTTP servers with headers and stdio servers with env vars/subprocess args.
+- claude mcp add-json accepts stdio or SSE JSON config.
+- claude mcp get/list show unapproved project .mcp.json servers as Pending approval and do not connect to them; approved servers are health-checked.
+- claude mcp reset-project-choices clears approved/rejected project-scoped server choices.
+- --strict-mcp-config restricts a session to --mcp-config servers; claude agents accepts the same strict MCP config for dispatched background sessions.
+- Changelog entries confirm subagent/frontmatter MCP inheritance edge cases, managed MCP allow/deny policies, plugin MCP component display, and wildcard mcp__server__* permission patterns.
+
+This adds a second lesson beside ToolSearch: Claude gates project-provided MCP config before connection, not only before tool use. Deferred schemas reduce token cost; approval state controls whether a project MCP server is even launched/health-checked.
 
 ## Open
 

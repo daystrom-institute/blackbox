@@ -34,6 +34,8 @@ Anthropic Messages is **stateless**, so compaction is client-side:
 2. **Summarize** the prefix `[..split]` into one synthetic message.
 3. **Rebuild** as `[summary, ...tail]` and continue.
 
+Session recap is a separate feature from this compaction path. `/recap` and the automatic return-from-away recap run a one-turn no-tools `away_summary` generation; the automatic path appends a short `system` status message, while manual `/recap` displays local slash-command output. Neither path picks a split point, replaces history, or rebuilds the message buffer. Treat recap as context/status injection, not context-window compression.
+
 ## Two summarizer prompts (high)
 
 Selected by situation, sharing one section skeleton; framing and final two

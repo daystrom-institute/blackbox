@@ -13,7 +13,7 @@ topic:
   - harness
   - claude
   - transport
-brief: "Claude Code 2.1.160 speaks the Anthropic Messages API (stateless; full history resent each turn) and opts into six betas: context-management, effort, extended-cache-ttl, fine-grained-tool-streaming, interleaved-thinking, token-efficient-tools — plus a 1M context window (claude-opus-4-8[1m]) and a user-facing fast mode. Beta inventory mined in the bro-harness api-robustness work; per-flag header values and the streaming envelope detail remain open."
+brief: "Claude Code 2.1.160 speaks the Anthropic Messages API (stateless; full history resent each turn) and opts into six betas. Current CLI help adds transport/session knobs: --betas for API-key users, --fallback-model for print mode fallback, --include-partial-messages and --include-hook-events for stream-json, --json-schema structured output, --prompt-suggestions, hidden --sdk-url remote WebSocket streaming, and --bare minimal mode."
 ---
 
 # Claude · Transport & Feature Flags
@@ -55,12 +55,22 @@ input via `input_json_delta` like a normal `tool_use`; inline `tool_result` /
 `web_search_tool_result` blocks carry content in `content_block_start` (no
 deltas) — confirmed by live capture in the api-robustness mine.
 
+## CLI transport knobs (2026-06-02 local pass)
+
+Current help exposes several machine-facing modes that were not captured in the original leaf:
+
+- --betas adds beta headers for API-key users.
+- --fallback-model switches to specified fallback model(s) for the rest of a print-mode session when the primary is overloaded or not found, while retrying the primary at the start of each user turn.
+- --output-format=stream-json plus --include-partial-messages exposes partial chunks; --include-hook-events adds hook lifecycle events to the stream.
+- --input-format=stream-json supports realtime streaming input; --replay-user-messages echoes stdin user messages back to stdout for acknowledgement.
+- --json-schema adds structured output validation.
+- --prompt-suggestions emits predicted next-prompt messages in print/SDK mode.
+- --bare sets CLAUDE_CODE_SIMPLE=1 and skips hooks, LSP, plugin sync, attribution, auto-memory, background prefetches, keychain reads, and CLAUDE.md auto-discovery. It is explicitly not a no-context mode: context can still be provided through system prompt flags, --add-dir, --mcp-config, --settings, --agents, and --plugin-dir.
+- A hidden --sdk-url flag in binary strings indicates remote WebSocket endpoint support for SDK I/O streaming with print + stream-json.
+
 ## Open
 
-<!-- TODO(mine): the exact header name/value for each beta and how /fast and the
-effort control map onto headers; anthropic-beta header composition; base URL /
-auth-mode (OAuth vs API key) paths; whether any server-side transform is gated on
-OAuth (as on the Codex/Responses side). -->
+<!-- TODO(mine): the exact header name/value for each beta and how /fast and the effort control map onto headers; anthropic-beta header composition; base URL / auth-mode paths; hidden --sdk-url protocol; whether fallback-model is API-key-only or OAuth-compatible in every path. -->
 
 ## Feeds
 

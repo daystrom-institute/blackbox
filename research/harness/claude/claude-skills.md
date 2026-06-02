@@ -13,7 +13,7 @@ topic:
   - harness
   - claude
   - skills
-brief: "How Claude Code 2.1.160 exposes skills: a name + one-line-description manifest injected into context (always present, body deferred), invoked via the Skill tool or a user-typed /name, with plugin namespacing (plugin:skill) and argument passing. Progressive disclosure keeps large skill bodies out of context until invocation — the same anti-bloat lever as MCP deferred tiering. Backfilled from direct observation of the running harness."
+brief: "Claude Code 2.1.160 exposes skills through deferred one-line manifests plus Skill tool or /name invocation. Current CLI adds --disable-slash-commands as all-skills disable, --plugin-dir/--plugin-url for session-only plugins, plugin init/list/details/validate surfaces, SessionStart reloadSkills support, and hooks/agents/MCP/plugins as skill-adjacent extension bundles."
 ---
 
 # Claude · Skills
@@ -49,6 +49,19 @@ skill name."*
 This is the skills analogue of [MCP deferred tiering](claude-mcp.md): procedural
 knowledge is named-but-not-loaded, expanded to full instructions only on
 invocation. The context cost of having N skills available is N one-liners.
+
+## Plugin And Reload Deltas (2026-06-02 local pass)
+
+Current CLI help and changelog deepen the skill/plugin surface:
+
+- --disable-slash-commands is described as disabling all skills.
+- --plugin-dir and --plugin-url load plugins for the current session only; claude agents has matching --plugin-dir dispatch support.
+- claude plugin init scaffolds a plugin under ~/.claude/skills/<name>/ and auto-loads it next session as <name>@skills-dir.
+- claude plugin details reports a plugin component inventory and projected token cost; Discover/Browse screens show commands, agents, skills, hooks, and MCP/LSP servers before install.
+- SessionStart hooks can return reloadSkills: true so skills installed by the hook are available in the same session.
+- Changelog entries confirm hooks support in skill/slash-command frontmatter, forked sub-agent skill execution via context: fork, an agent field in skill frontmatter, and skill frontmatter for auto-loading skills in subagents.
+
+This reinforces the earlier anti-bloat finding: Claude treats skills as part of a broader plugin component graph, but the model still gets a cheap manifest until a skill is invoked or explicitly loaded.
 
 ## Open
 
