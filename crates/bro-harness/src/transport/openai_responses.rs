@@ -159,85 +159,152 @@ impl Transport for OpenAiResponsesTransport {
         sink: &dyn super::TurnSink,
     ) -> Result<TurnOutput> {
         let body = self.build_body(tools, opts);
-
-        let resp = self
-            .send_with_auth_recovery("openai-responses", &body)
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let sse = resp.text().await.unwrap_or_default();
-            anyhow::bail!(classify_http_error(status, &sse));
-        }
-
-        // Stream the SSE: forward text/reasoning deltas to the sink live (in
-        // Anthropic shape) while accumulating the full body, then hand it to the
-        // proven `parse_sse` for the authoritative item/usage reconstruction.
-        let mut stream = resp.bytes_stream();
         let idle = super::http::stream_idle_timeout();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut accum = String::new();
-        let mut text_started = false;
-        loop {
-            // Bound the gap between events: a connection that stays open but
-            // stops producing is a hung turn, not progress.
-            let next = tokio::time::timeout(idle, stream.next())
-                .await
-                .context("responses SSE idle timeout (no event within idle window)")?;
-            let Some(chunk) = next else { break };
-            let chunk = chunk.context("read responses SSE chunk")?;
-            buf.extend_from_slice(&chunk);
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let raw: Vec<u8> = buf.drain(..=pos).collect();
-                let line_cow = String::from_utf8_lossy(&raw);
-                // Keep the full SSE text (with newline) for parse_sse.
-                accum.push_str(&line_cow);
-                let line = line_cow.trim();
-                let Some(data) = line.strip_prefix("data:") else {
-                    continue;
+        let max = super::http::max_retries();
+        let mut attempt = 0u32;
+
+        // Mid-stream resume — codex *restarts* a faulted stream rather than
+        // resuming a partial response (`run_sampling_request` rebuilds the prompt
+        // from history each attempt; there is no resume token). We do the same:
+        // a transient stream fault re-sends the whole request. `self.input` is
+        // only mutated by `parse_sse` on success, so a dropped attempt leaves the
+        // buffer pristine and a re-send is exact. To avoid duplicating output
+        // already on the wire we only retry while no visible *text* delta has been
+        // emitted yet (re-streamed reasoning is display-only — at worst cosmetic);
+        // once text has reached the sink a fault fails the turn.
+        'attempt: loop {
+            attempt += 1;
+            // Connection-level retry + 401 recovery happen inside; a non-success
+            // status returned here is already past those, so a 4xx is fatal.
+            let resp = self
+                .send_with_auth_recovery("openai-responses", &body)
+                .await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let sse = resp.text().await.unwrap_or_default();
+                anyhow::bail!(classify_http_error(status, &sse));
+            }
+
+            // Stream the SSE: forward text/reasoning deltas to the sink live (in
+            // Anthropic shape) while accumulating the full body, then hand it to
+            // the proven `parse_sse` for the authoritative reconstruction.
+            let mut stream = resp.bytes_stream();
+            let mut buf: Vec<u8> = Vec::new();
+            let mut accum = String::new();
+            let mut text_started = false;
+            let mut emitted_text = false;
+            let mut terminal_seen = false;
+            let mut fault: Option<anyhow::Error> = None;
+
+            'consume: loop {
+                // Bound the gap between events: a connection that stays open but
+                // stops producing is a hung turn, not progress.
+                let next = match tokio::time::timeout(idle, stream.next()).await {
+                    Ok(next) => next,
+                    Err(_) => {
+                        fault = Some(anyhow::anyhow!(
+                            "responses SSE idle timeout (no event within idle window)"
+                        ));
+                        break 'consume;
+                    }
                 };
-                let data = data.trim();
-                if data.is_empty() || data == "[DONE]" {
-                    continue;
-                }
-                let Ok(ev) = serde_json::from_str::<Value>(data) else {
-                    continue;
+                let Some(chunk) = next else { break 'consume };
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        fault = Some(anyhow::Error::new(e).context("read responses SSE chunk"));
+                        break 'consume;
+                    }
                 };
-                match ev["type"].as_str().unwrap_or("") {
-                    "response.output_text.delta" => {
-                        if let Some(t) = ev["delta"].as_str()
-                            && !t.is_empty()
-                        {
-                            if !text_started {
+                buf.extend_from_slice(&chunk);
+                while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                    let raw: Vec<u8> = buf.drain(..=pos).collect();
+                    let line_cow = String::from_utf8_lossy(&raw);
+                    // Keep the full SSE text (with newline) for parse_sse.
+                    accum.push_str(&line_cow);
+                    let line = line_cow.trim();
+                    let Some(data) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let data = data.trim();
+                    if data.is_empty() || data == "[DONE]" {
+                        continue;
+                    }
+                    let Ok(ev) = serde_json::from_str::<Value>(data) else {
+                        continue;
+                    };
+                    match ev["type"].as_str().unwrap_or("") {
+                        "response.output_text.delta" => {
+                            if let Some(t) = ev["delta"].as_str()
+                                && !t.is_empty()
+                            {
+                                if !text_started {
+                                    sink.stream_event(json!({
+                                        "type": "content_block_start",
+                                        "index": 0,
+                                        "content_block": {"type": "text", "text": ""},
+                                    }));
+                                    text_started = true;
+                                }
                                 sink.stream_event(json!({
-                                    "type": "content_block_start",
+                                    "type": "content_block_delta",
                                     "index": 0,
-                                    "content_block": {"type": "text", "text": ""},
+                                    "delta": {"type": "text_delta", "text": t},
                                 }));
-                                text_started = true;
+                                emitted_text = true;
                             }
-                            sink.stream_event(json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": t},
-                            }));
                         }
-                    }
-                    "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                        if let Some(t) = ev["delta"].as_str()
-                            && !t.is_empty()
-                        {
-                            sink.stream_event(json!({
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "thinking_delta", "thinking": t},
-                            }));
+                        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                            if let Some(t) = ev["delta"].as_str()
+                                && !t.is_empty()
+                            {
+                                sink.stream_event(json!({
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "thinking_delta", "thinking": t},
+                                }));
+                            }
                         }
+                        "response.completed" | "response.incomplete" | "response.failed" | "error" => {
+                            terminal_seen = true;
+                        }
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
+
+            // A stream that ended without any terminal event was truncated; treat
+            // it like a transport fault (codex: "stream closed before
+            // response.completed").
+            if fault.is_none() && !terminal_seen {
+                fault = Some(anyhow::anyhow!(
+                    "responses stream closed before a terminal event (response.completed/incomplete/failed)"
+                ));
+            }
+
+            if let Some(err) = fault {
+                if !emitted_text && attempt <= max {
+                    let wait = super::http::backoff(attempt);
+                    tracing::warn!(
+                        attempt,
+                        error = %err,
+                        wait_ms = wait.as_millis() as u64,
+                        "responses stream fault before output; re-sending request"
+                    );
+                    tokio::time::sleep(wait).await;
+                    continue 'attempt;
+                }
+                return Err(err.context(if emitted_text {
+                    "responses stream fault after partial output; not retried (would duplicate)"
+                } else {
+                    "responses stream retries exhausted"
+                }));
+            }
+
+            // Terminal event seen → authoritative parse (also classifies a fatal
+            // `response.failed` code).
+            return self.parse_sse(&accum);
         }
-        self.parse_sse(&accum)
     }
 
     fn snapshot(&self) -> Value {
