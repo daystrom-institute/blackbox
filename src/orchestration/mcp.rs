@@ -577,15 +577,10 @@ fn glob_match_inner(p: &[char], pi: usize, t: &[char], ti: usize) -> bool {
 const CLI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Provider set used by every fan-out call site (action_add /
-/// action_remove / action_sync). Vibe is excluded because it has no
-/// MCP CRUD CLI; the per-provider closure can short-circuit by
-/// returning None when arg-builders return None.
-const FANOUT_PROVIDERS: [Provider; 4] = [
-    Provider::Claude,
-    Provider::Copilot,
-    Provider::Codex,
-    Provider::Gemini,
-];
+/// action_remove / action_sync). All surviving live providers use
+/// bro-harness transient per-dispatch MCP injection, so no vendor CLI gets
+/// persistent MCP CRUD.
+const FANOUT_PROVIDERS: [Provider; 0] = [];
 
 /// Run a per-provider closure against FANOUT_PROVIDERS in parallel
 /// using a scoped thread pool. Closures return Option<String> — None

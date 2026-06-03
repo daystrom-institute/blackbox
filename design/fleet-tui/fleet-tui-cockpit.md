@@ -63,7 +63,6 @@ Brodex dispatch through `bro-harness` (`providers.rs` `Provider` enum +
 What those agents spawn underneath them (nested bros, sub-dispatches) is a
 separate, orthogonal concern handled elsewhere — `bro_dashboard`
 (`src/tools/roster.rs:32`), `bro tail` (`cli.rs:86`), and the (designed,
-not-built) tmux portal (`tmux-portal-workflows.md`). The cockpit may hand off to
 those, but does not own them. Not the council board (`cli.rs:90`,
 `council_tui.rs`). Not a workflow DSL.
 
@@ -408,7 +407,6 @@ management; the standalone shell reuses the same component with no new model.
 ## 6. Relationship to other surfaces
 
 - **Nested bros** (what entrypoint agents spawn): orthogonal — `bro_dashboard`
-  (`src/tools/roster.rs:32`), `bro tail` (`cli.rs:86`), tmux portal (designed).
   The cockpit may offer "drill into this agent's children" as a hand-off.
 - **`bro council`** (`cli.rs:90`, `council_tui.rs`): orthogonal chat board.
 

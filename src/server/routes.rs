@@ -264,11 +264,9 @@ pub(crate) async fn orchestrate_handler(
                 .into_response();
         }
     };
-    // Stateful capability/terminal-mode validation must gate this path too.
-    // The MCP `bro_orchestrate_run` path already validates before dry-run, but
-    // the plain HTTP dry-run used to return right after `compile`, letting an
-    // ineligible actor (e.g. terminal_mode=tmux on a harness-backed provider)
-    // pass dry-run and only fail at dispatch. Validate before both branches.
+    // Stateful capability validation must gate this path too. The MCP
+    // `bro_orchestrate_run` path already validates before dry-run; keep the
+    // plain HTTP dry-run on the same validation path.
     if let Err(e) = validate_workflow_capabilities(&compiled, &state) {
         return (
             axum::http::StatusCode::BAD_REQUEST,
@@ -2209,7 +2207,6 @@ pub(crate) async fn admin_brofile_upsert(
         coerce_workspace: None,
         runtime: None,
         context: None,
-        terminal_mode: orchestration::brofile::TerminalMode::Native,
     };
     if let Err(e) = orchestration::brofile::save_brofile(&bf, "global", &state.store_dir, None) {
         return (

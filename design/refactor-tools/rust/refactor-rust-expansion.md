@@ -579,7 +579,6 @@ The shape it produces:
 - `ProviderDriver` modules (behavior) — argv construction, MCP CRUD,
   filter translation, event parsing, session discovery. Codex pointed
   at `providers.rs:279, 600, 806, 1094` for the behavior families.
-- Driver-family sharing — `OpenCode | Glm | Deepseek | Inception` share
   a driver with different model specs.
 
 - **Inputs**: `source`, `enum_name` (the enum whose variants drive the
@@ -881,7 +880,6 @@ with an undeclared-`touches` mutating command is unsupported.
    plan kind currently accepts `driver_share_groups` as explicit input.
    An auto-detection pass (find enum variants whose match arms produce
    structurally-identical code modulo identifiers) is harder than it
-   sounds because the OpenCode-family case has subtle per-variant
    differences. Leave to operator for v1.
 5. **Brofile prerequisites.** Refactor atoms need a narrow
    `rust-refactor-persona` brofile because the agent filter overlay can

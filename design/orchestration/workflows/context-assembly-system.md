@@ -502,11 +502,7 @@ Modes:
 as `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `BLACKBOX.md`, `PROJECT.md`, and
 their `@` includes. It is intentionally separate from template rendering.
 
-For OpenCode/Inception, `harness_markdown` uniformly governs the generated
-opencode `instructions` array — including the current `BLACKBOX.md` entry and
-any future `AGENTS.md`-style entries. `build_opencode_config` filters the
 candidate list through the policy before writing the config; there is no
-secondary mechanism for opencode-specific exemptions.
 
 Fields:
 
@@ -540,19 +536,16 @@ the provider reports unsupported suppression rather than pretending to be clean.
 | Copilot | `gh copilot -- -p <prompt>` and `--resume=<session>` | Provider behavior is inherited from Copilot CLI; no suppression control currently wired | Report suppression unsupported until a concrete CLI/config mechanism is verified. |
 | Gemini | `gemini -p <prompt>` and `gemini --resume <session> -p <prompt>` | Gemini CLI default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Gemini controls are verified. MCP tool exclusions are separate tool policy, not markdown suppression. |
 | Vibe | `vibe -p <prompt>` and `vibe --resume <session> -p <prompt>` | Vibe config/default context behavior is not controlled by blackbox today | Report suppression unsupported until exact Vibe controls are verified. |
-| Inception/OpenCode | `opencode run <prompt>` / `opencode run --session <session> <prompt>` | blackbox writes a generated `OPENCODE_CONFIG` file and, when `BLACKBOX.md` exists, lists it in the opencode `instructions` array so opencode merges it into the system prompt | Move the `instructions` write behind `provider_defaults`; dry-run shows whether `BLACKBOX.md` is included, suppressed, or replaced in the `instructions` array. |
 
 `suppress_when_supported` is therefore best-effort and warning-heavy. It must
 not pretend unsupported providers are clean. `strict_suppress` fails closed on
 any provider without a verified mechanism.
 
 The v1 deliverable for Phase 2 is the schema plus the report-and-warn
-behavior. Claude-compatible transports and OpenCode/Inception ship as
 enforcing providers: Claude-compatible launches override the provider system
 prompt with `--system-prompt ""` while preserving MCP injection; Codex
 overrides base instructions, disables injected instruction blocks, suppresses
 project docs, and omits global AGENTS files via an overlayed `CODEX_HOME`;
-OpenCode omits generated `instructions` entries. Other providers accept the
 policy field, but strict modes fail until a verified suppression mechanism
 exists. Wiring additional providers as enforcing is a follow-up patch per
 provider, not a phase gate.
@@ -841,8 +834,6 @@ entry; resolution does not depend on filesystem layout alone.
 - Add provider-default suppression modes.
 - Add harness markdown file-level policy parsing and dry-run reporting.
 - Start by verifying and wiring the installed Codex CLI controls.
-- Move the OpenCode generated-config `instructions` array (currently always
-  including `BLACKBOX.md` when it exists, via `build_opencode_config`) behind
   provider-default policy so suppression and replacement are explicit.
 - Report unsupported suppression in dry-run and dispatch warnings.
 

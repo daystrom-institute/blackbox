@@ -49,7 +49,6 @@ Knowledge/notes/threads buckets have source counts but zero indexed vectors in p
 - **Auto-compact edge sidecars** *(low)*
 
 ### Debt
-- **Opencode provider instruction loading** *(medium)*
 - **Wire cancel_arc routing verdict** *(medium)*
 - **Refactor / code-tools documentation page** *(medium)* · 1t
 

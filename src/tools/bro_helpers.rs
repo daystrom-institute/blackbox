@@ -195,19 +195,8 @@ pub(crate) fn split_csv(s: &Option<String>) -> Vec<String> {
 
 pub(crate) fn infer_provider_from_path(path: &Path) -> Option<Provider> {
     let s = path.to_string_lossy();
-    if s.contains("/.codex/sessions/") {
-        Some(Provider::Codex)
-    } else if s.contains("/.gemini/tmp/") {
-        Some(Provider::Gemini)
-    } else if s.contains("/.copilot/session-state/") {
-        Some(Provider::Copilot)
-    } else if s.contains("/.vibe/logs/session/") {
-        Some(Provider::Vibe)
-    } else if s.contains("/projects/") {
-        Some(Provider::Claude)
-    } else {
-        None
-    }
+    let _ = s;
+    None
 }
 
 pub(crate) fn build_member_entry(

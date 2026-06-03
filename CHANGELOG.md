@@ -25,7 +25,6 @@ out explicitly under `Changed` or `Removed`.
   `reasoning_effort` (Mistral accepts `{none, high}`) gated by
   `BRO_HARNESS_CHAT_REASONING`. Reasoning-output parsing is provider-agnostic
   and additive; the plain-string (non-reasoning) path is unchanged.
-- Terminal mode (`terminal_mode: "tmux"` brofile attribute): TUI-capable
   providers (Claude, vanilla Codex) run their real interactive TUI inside a tmux
   pane instead of as a headless child, and the turn's output is resolved from
   the provider transcript read plane — never from pane scraping. It is a brofile
@@ -37,7 +36,6 @@ out explicitly under `Changed` or `Removed`.
   context instead of cold-starting. `bro_arc_cancel` (workflow) and `bro_cancel`
   (`bro_exec`) interrupt an in-flight turn and reap its pane. Requires `tmux` on
   `PATH`; headless dispatch is unchanged and remains the default. See
-  `design/orchestration/workflows/tmux-terminal-mode-slice.md`.
 - `bro agent` standalone single-agent cockpit: a one-agent shell that reuses the
   Fleet TUI transcript/composer component without roster chrome, with provider /
   model / effort / cwd launch flags plus standalone `/clear` and `/resume`.
@@ -209,7 +207,6 @@ out explicitly under `Changed` or `Removed`.
   dropped its cache-read counter entirely, and copilot hardcoded input to 0.
   `Usage` now carries `cached_input_tokens` and `cache_creation_input_tokens`,
   `input_tokens` is normalized to **fresh** (cache-exclusive) input across every
-  provider (claude, codex, copilot, gemini, opencode, and the glm/deepseek/
   brodex harness path), and rollups surface the cache breakdown plus the
   cache-inclusive grand total. Token-burn supervision now keys off fresh input
   so a long cached session no longer trips false alerts. `bro-harness` emits the

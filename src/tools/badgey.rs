@@ -525,7 +525,7 @@ mod tests {
         let _ = orchestration::brofile::save_brofile(
             &orchestration::brofile::Brofile {
                 name: "badgey-persona".to_string(),
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 account: None,
                 lens: Some("Badgey test lens".to_string()),
                 model: None,
@@ -537,7 +537,6 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
-                terminal_mode: orchestration::brofile::TerminalMode::Native,
             },
             "global",
             &tmp.path().join("bro"),
@@ -723,7 +722,7 @@ mod tests {
                 project_id: tmp.path().to_string_lossy().into_owned(),
                 initial_brief: None,
             },
-            Provider::Codex,
+            Provider::Brodex,
             "codex-session-3".to_string(),
             "thread-00000001".to_string(),
         );
@@ -804,7 +803,7 @@ mod tests {
                 project_id: tmp.path().to_string_lossy().into_owned(),
                 initial_brief: None,
             },
-            Provider::Codex,
+            Provider::Brodex,
             "codex-session-4".to_string(),
             "thread-00000001".to_string(),
         );
@@ -863,7 +862,7 @@ mod tests {
                 project_id: tmp.path().to_string_lossy().into_owned(),
                 initial_brief: None,
             },
-            Provider::Codex,
+            Provider::Brodex,
             "codex-session-5".to_string(),
             "thread-00000001".to_string(),
         );
@@ -988,7 +987,7 @@ mod tests {
                     brofile_version: "badgey-persona".to_string(),
                     scope: scope.clone(),
                     charter: "replay".to_string(),
-                    provider: Provider::Codex,
+                    provider: Provider::Brodex,
                     provider_session_id: "codex-session-6".to_string(),
                 })
                 .unwrap(),
@@ -1052,7 +1051,7 @@ mod tests {
                     brofile_version: "badgey-persona".to_string(),
                     scope: scope.clone(),
                     charter: "pending replay".to_string(),
-                    provider: Provider::Codex,
+                    provider: Provider::Brodex,
                     provider_session_id: "pending".to_string(),
                 })
                 .unwrap(),
@@ -1086,7 +1085,7 @@ mod tests {
                 project_id: tmp.path().to_string_lossy().into_owned(),
                 initial_brief: None,
             },
-            Provider::Codex,
+            Provider::Brodex,
             "codex-session-7".to_string(),
             "thread-00000001".to_string(),
         );
@@ -1185,7 +1184,7 @@ mod tests {
                 project_id: tmp.path().to_string_lossy().into_owned(),
                 initial_brief: None,
             },
-            Provider::Codex,
+            Provider::Brodex,
             "codex-session-8".to_string(),
             "thread-00000001".to_string(),
         );

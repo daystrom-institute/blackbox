@@ -198,8 +198,8 @@ pub fn blackbox_artifacts_dir(home: &Path) -> PathBuf {
 /// Provider-neutral global memory file. Lives under `~/.blackbox/`
 /// (parallel to `~/.codex/`, `~/.gemini/`) — *not* `~/.claude-shared/`,
 /// which is claude-specific multi-account state. Each provider's global
-/// memory file `@imports` (or, for opencode, lists in its `instructions`
-/// config) this path so they share one canonical body of guidance.
+/// memory files import this path so providers share one canonical body of
+/// guidance.
 pub fn blackbox_global_common_md_path(home: &Path) -> PathBuf {
     env_path("BLACKBOX_GLOBAL_COMMON_MD")
         .unwrap_or_else(|| home.join(".blackbox").join("BLACKBOX.md"))

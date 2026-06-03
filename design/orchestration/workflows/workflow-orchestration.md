@@ -18,8 +18,6 @@ handoff to human-visible tmux state.
 
 - [Brofile Context Templates](context-assembly-system.md)
 - [Turing Completeness](turing-completeness.md)
-- [Tmux Portal Workflows](tmux-portal-workflows.md)
-- [Tmux Portal Workflows - Implementation Plan](tmux-portal-workflows-impl.md)
 
 ## Crosscuts
 

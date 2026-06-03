@@ -112,16 +112,9 @@ impl Provider {
     /// Parse a streaming JSON event and update the sink.
     pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
-            Provider::Claude
-            | Provider::Glm
-            | Provider::Deepseek
-            | Provider::Brodex
-            | Provider::VibeBh => parse_claude_event(evt, sink),
-            Provider::Inception => parse_opencode_event(evt, sink),
-            Provider::Codex => parse_codex_event(evt, sink),
-            Provider::Copilot => parse_copilot_event(evt, sink),
-            Provider::Vibe => parse_vibe_event(evt, sink),
-            Provider::Gemini => parse_gemini_event(evt, sink),
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+                parse_claude_event(evt, sink)
+            }
             Provider::Workflow => {}
         }
     }
@@ -136,10 +129,8 @@ impl Provider {
     }
 
     pub fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
-        match self {
-            Provider::Inception => Some(vec!["export".into(), session_id.into()]),
-            _ => None,
-        }
+        let _ = session_id;
+        None
     }
 }
 
@@ -243,76 +234,6 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
         sink.cost_usd = evt["total_cost_usd"].as_f64();
         sink.num_turns = evt["num_turns"].as_u64();
     }
-}
-
-fn parse_opencode_event(evt: &Value, sink: &mut EventSink) {
-    if let Some(session_id) = evt["sessionID"].as_str() {
-        sink.session_id = Some(session_id.to_string());
-    }
-    if evt["type"].as_str() == Some("step_start") {
-        sink.last_assistant_message = None;
-    } else if evt["type"].as_str() == Some("text")
-        && let Some(text) = evt["part"]["text"].as_str()
-        && !text.is_empty()
-    {
-        sink.last_assistant_message = Some(text.to_string());
-    }
-}
-
-pub fn parse_opencode_export(raw: &str, sink: &mut EventSink) {
-    let Some(json_start) = raw.find('{') else {
-        return;
-    };
-    let Ok(export) = serde_json::from_str::<Value>(&raw[json_start..]) else {
-        return;
-    };
-
-    if sink.session_id.is_none() {
-        sink.session_id = export["info"]["id"].as_str().map(str::to_string);
-    }
-
-    let Some(messages) = export["messages"].as_array() else {
-        return;
-    };
-
-    let assistant_messages: Vec<&Value> = messages
-        .iter()
-        .filter(|msg| msg["info"]["role"].as_str() == Some("assistant"))
-        .collect();
-
-    sink.num_turns = Some(assistant_messages.len() as u64);
-
-    let Some(last_assistant) = assistant_messages.last() else {
-        return;
-    };
-
-    let text_parts: Vec<&str> = last_assistant["parts"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|part| part["type"].as_str() == Some("text"))
-        .filter_map(|part| part["text"].as_str())
-        .collect();
-    if !text_parts.is_empty() {
-        sink.last_assistant_message = Some(text_parts.join("\n"));
-    }
-
-    let tokens = &last_assistant["info"]["tokens"];
-    let input_tokens = tokens["input"].as_u64();
-    let output_tokens = tokens["output"].as_u64();
-    if let (Some(input_tokens), Some(output_tokens)) = (input_tokens, output_tokens) {
-        // OpenCode reports cache reads/writes under `tokens.cache.{read,write}`
-        // and keeps `tokens.input` fresh (cache-exclusive), so it already
-        // matches our convention.
-        sink.usage = Some(Usage {
-            input_tokens,
-            output_tokens,
-            cached_input_tokens: tokens["cache"]["read"].as_u64().unwrap_or(0),
-            cache_creation_input_tokens: tokens["cache"]["write"].as_u64().unwrap_or(0),
-        });
-    }
-
-    sink.cost_usd = last_assistant["info"]["cost"].as_f64();
 }
 
 fn parse_codex_event(evt: &Value, sink: &mut EventSink) {
@@ -460,12 +381,12 @@ mod disruption_tests {
     fn detects_structured_api_error_status() {
         let rl = json!({"type": "assistant", "apiErrorStatus": 429, "isApiErrorMessage": true});
         assert_eq!(
-            Provider::Claude.detect_disruption(&rl),
+            Provider::Glm.detect_disruption(&rl),
             Some(Disruption::RateLimited)
         );
         let ov = json!({"apiErrorStatus": 529});
         assert_eq!(
-            Provider::Claude.detect_disruption(&ov),
+            Provider::Glm.detect_disruption(&ov),
             Some(Disruption::Overloaded)
         );
         // harness providers share the Claude envelope.
@@ -479,12 +400,12 @@ mod disruption_tests {
     fn detects_explicit_error_text_only_on_error_fields() {
         let err = json!({"type": "result", "is_error": true, "result": "Error: rate_limit_error — too many requests"});
         assert_eq!(
-            Provider::Codex.detect_disruption(&err),
+            Provider::Brodex.detect_disruption(&err),
             Some(Disruption::RateLimited)
         );
         let ov = json!({"error": {"message": "the model is overloaded, please retry"}});
         assert_eq!(
-            Provider::Claude.detect_disruption(&ov),
+            Provider::Glm.detect_disruption(&ov),
             Some(Disruption::Overloaded)
         );
     }
@@ -493,12 +414,12 @@ mod disruption_tests {
     fn does_not_fire_on_normal_content_or_unrelated_status() {
         // The word "quota" in normal assistant text must NOT trip a disruption.
         let normal = json!({"type": "assistant", "message": {"content": [{"type": "text", "text": "Your quota for the project looks fine."}]}});
-        assert_eq!(Provider::Claude.detect_disruption(&normal), None);
+        assert_eq!(Provider::Glm.detect_disruption(&normal), None);
         // A non-rate-limit error status is ignored.
         let other = json!({"apiErrorStatus": 400});
-        assert_eq!(Provider::Claude.detect_disruption(&other), None);
+        assert_eq!(Provider::Glm.detect_disruption(&other), None);
         // A successful result with no error text.
         let ok = json!({"type": "result", "is_error": false, "result": "done"});
-        assert_eq!(Provider::Claude.detect_disruption(&ok), None);
+        assert_eq!(Provider::Glm.detect_disruption(&ok), None);
     }
 }

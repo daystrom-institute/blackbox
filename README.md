@@ -529,7 +529,6 @@ Maintained in `src/orchestration/providers.rs`:
 - **Claude** - Opus 4.7 (default, 1M context built-in), Opus 4.6, Sonnet 4.6, Haiku 4.5. Effort tiers `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`; `xhigh` is Opus-4.7-only, `max` unsupported on Haiku). Runs with `--include-partial-messages` so progress notifiers see true delta streaming.
 - **GLM** - Z.AI Coding Plan API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `glm-5.1`, helper model `glm-4.5-air`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-zai` by default). Legacy `zai-coding-plan/...` model slugs are normalized at dispatch.
 - **DeepSeek** - DeepSeek API models via Claude Code's Anthropic-compatible custom-model path. Defaults to `deepseek-v4-pro`, helper model `deepseek-v4-flash`, and Claude effort tiers `low`/`medium`/`high`/`xhigh`/`max`. Provider credentials/configuration are owned by the selected Claude config dir (`~/.claude-ds` by default). Legacy `deepseek/...` model slugs are normalized at dispatch.
-- **Inception** - Inception Mercury via OpenCode transport. Exposes only `inception/mercury-2` as the default/tool-capable model, with OpenCode variants `minimal`/`low`/`medium`/`high`/`max`. Provider credentials/configuration are owned by OpenCode.
 - **Codex** - gpt-5.4 family. Efforts `minimal`/`low`/`medium`/`high`/`xhigh`.
 - **Copilot** - Anthropic + OpenAI models. Efforts `low`/`medium`/`high`/`xhigh`.
 - **Vibe**, **Gemini** - model lists only.
@@ -555,7 +554,6 @@ Auto-detection works out of the box for most setups. Override via environment va
 | `BBOX_PORT` / `BRO_PORT` | `7264` | HTTP port for MCP + `/tail` + `/roster` endpoints |
 | `BLACKBOX_GLOBAL_CLAUDE_MD` / `BLACKBOX_GLOBAL_CODEX_MD` / `BLACKBOX_GLOBAL_GEMINI_MD` | provider defaults | Override global render targets; useful for dev instances that must not touch prod memory files |
 | `BLACKBOX_BACKUP_DIR` | `~/.local/state/blackbox/backups` | Managed-region backup root for `bbox_render(scope=global)` |
-| `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` / `VIBE_BIN` | from `$PATH` | Override provider binary paths |
 | `BLACKBOX_RUST_ANALYZER_BIN` (also `BRO_LSP_RUST_ANALYZER_BIN` / `BRO_RUST_ANALYZER_BIN`) | `rust-analyzer` from `$PATH` | rust-analyzer binary for window-0 harness diagnostics - see *Window-0 diagnostics* below |
 | `RUST_LOG` | `blackbox=info` | Tracing filter |
 

@@ -341,16 +341,12 @@ observations with runtime observations from spawned drone tasks.
 | `usage-endpoint` | Codex | Read `auth.json` tokens and call `https://chatgpt.com/backend-api/wham/usage` with bearer token and optional `ChatGPT-Account-Id`; parse `rate_limit.primary_window.used_percent`, `primary_window.reset_at`, `secondary_window.used_percent`, `allowed`, `limit_reached`, and `plan_type`. | `five_hour_utilization`, `seven_day_utilization`, `status`, `resets_at`, `plan` |
 | `credential-freshness` | Gemini | Read `oauth_creds.json` from the Gemini home directory selected by account env, confirm `access_token`, and compare `expiry_date` milliseconds to now. Daystrom notes no public quota API. Drone-acquired Gemini sessions must store cwd in the drone registry (Section 8), because cwd/session lookup is provider-specific and should not be rediscovered on resume. | `credential_status`, `expires_at`; quota utilization is unknown |
 | `zai-usage-endpoint` | GLM/Z.AI Coding Plan via Claude Code custom model config | Read `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir (`~/.claude-zai/settings.json` for the default account) and call `https://api.z.ai/api/monitor/usage/quota/limit` with `Authorization: <key>`, `Accept-Language: en-US,en`, and `Content-Type: application/json`. Parse `data.limits[]`: `type=TOKENS_LIMIT, number=5, unit=3` is the five-hour window; `type=TOKENS_LIMIT, number=1, unit=6` is the weekly/seven-day window. Use `percentage` as utilization and `nextResetTime` milliseconds as reset. If the quota endpoint fails, fall back to `glm-active-probe` behavior for launchability and error-code classification. | `five_hour_utilization`, `seven_day_utilization`, `resets_at`, `plan_level`, `provider_cooldown_until` |
-| `glm-active-probe` | GLM/Z.AI via Claude Code · Inception via OpenCode | Fallback probe for GLM/Z.AI when the usage endpoint cannot be called, and primary probe for Inception. Run a minimal provider invocation against the configured model with the selected account env. A success proves the account is currently accepted for work but does not reveal a utilization percentage. Parse provider error codes into `quota_status`, `resets_at`, and cooldown fields (see error-code → state mapping table below). | `credential_status`, `quota_status`, `resets_at`, `provider_cooldown_until`; quota utilization is unknown on success |
 | `deepseek-balance` | DeepSeek via Claude Code custom model config | Call `https://api.deepseek.com/user/balance` with `ANTHROPIC_AUTH_TOKEN` from the selected Claude config dir (`~/.claude-ds/settings.json` for the default account) as `Authorization: Bearer <key>`. `is_available=false` marks the account unavailable; `is_available=true` with positive `balance_infos[0].total_balance` proves pay-as-you-go availability but does not map to 5h/7d utilization. If no direct token is extractable, fall back to a minimal Claude Code invocation and treat success as `active_acceptance`, not `payg_balance`. | `credential_status`, `quota_status`, `balance_available`, `balance_total`, `balance_currency`; quota utilization is unknown |
-| `file-presence` | OpenCode fallback only | Check provider account auth file presence when no active provider probe is configured or extractable. This is a launchability preflight, not a quota signal. | `credential_status`; quota utilization is unknown |
 | `none` | Vibe or unsupported providers | No active probe. Select only by task in-flight count and failure cooldown. | `status=unknown`; quota utilization is unknown |
 
 Claude Code custom-model config stores the default GLM and DeepSeek credentials
 under `~/.claude-zai/settings.json` and `~/.claude-ds/settings.json`
 respectively. Each config supplies `ANTHROPIC_BASE_URL`,
-`ANTHROPIC_AUTH_TOKEN`, and default model env vars. Existing OpenCode auth
-(`~/.local/share/opencode/auth.json` keys `zai-coding-plan` and `deepseek`) can
 remain a probe-token fallback, but dispatch should prefer the Claude config dirs
 for consistent JSONL/session behavior.
 
@@ -480,8 +476,6 @@ Represent that explicitly:
 - `quota_confidence`:
   `quota_probe | runtime_rate_limit | payg_balance | active_acceptance | credential_only | none`
 
-This prevents unknown-quota OpenCode accounts from outranking quota-aware Claude
-or Codex accounts just because the OpenCode auth file exists.
 
 ### Synthetic capacity
 
@@ -507,7 +501,6 @@ Each mechanism maps to quota_capacity via a fixed, mechanical derivation table
 | `rate-limit-headers` · `usage-endpoint` (probe failed, runtime data exists) | `runtime_rate_limit` | `1.0 - max(5h, 7d, runtime_observed)` |
 | `zai-usage-endpoint` (probe success) | `quota_probe` | `1.0 - max(5h, 7d)` |
 | `deepseek-balance` (`is_available=true`, balance known) | `payg_balance` | `min(1.0, balance / ceiling) * payg_available_multiplier` |
-| `deepseek-balance` (direct token unavailable, minimal OpenCode call succeeds) | `active_acceptance` | `active_probe_success` bucket |
 | `glm-active-probe` (success) | `active_acceptance` | `active_probe_success` bucket |
 | `zai-usage-endpoint` · `glm-active-probe` · `deepseek-balance` (probe failed) | — | lane excluded by cooldown, not scored |
 | `credential-freshness` (present, not expired) | `credential_only` | `credential_only` bucket |
@@ -548,7 +541,6 @@ Where:
   endpoint is **not** enough evidence for the PAYG bucket; mark
   `quota_status=probe_failed` and cool the lane. Only a valid balance response
   with `is_available=true` may produce `quota_confidence=payg_balance`. If the
-  direct balance token is unavailable but a minimal OpenCode DeepSeek call
   succeeds, use `quota_confidence=active_acceptance` and the
   `active_probe_success` bucket instead.
 - `concurrency_capacity` is `1.0 - in_flight / max_concurrent_per_account`,
@@ -842,7 +834,6 @@ Tests:
 - runtime `RateLimit` updates account utilization/exhaustion after a task
 - runtime `UsageUpdate` and `Completed.Metrics` update session accounting
 - Gemini expired credential marks account non-selectable
-- OpenCode file-presence probe maps missing auth to non-selectable
 
 ## 11. Open questions
 
@@ -868,5 +859,4 @@ Tests:
   `accounts: ["default"]` automatically with `~/.claude-zai` and
   `~/.claude-ds`. Additional GLM/DeepSeek accounts should use explicit account
   env overrides for `CLAUDE_CONFIG_DIR` until a stable suffix convention is
-  chosen. Inception remains OpenCode-backed and still needs explicit account env
   overrides for non-default accounts.

@@ -12,7 +12,6 @@ topic:
 
 Status: implemented and archived after `c3022b5`
 Date: 2026-05-12
-Related: [Provider Transcript Read Plane Impl](provider-transcript-read-plane-impl.md), [Tmux Portal Workflows](../../orchestration/workflows/tmux-portal-workflows.md), [Workflow Engine](../../../docs/workflows.md)
 
 Implementation note: this archived design records the pre-implementation
 intent. The landed code in `src/transcripts/types.rs` uses a flat
@@ -24,15 +23,12 @@ shape in this document. New implementation work should treat
 
 ## 1. Thesis
 
-Blackbox needs a provider-neutral transcript read plane before tmux portal
 mode becomes a durable workflow feature.
 
 Today each provider is handled in a different partial path:
 
 - Claude and Codex are indexed into Tantivy from JSONL files.
 - Gemini has session-file discovery and a rich parser, but is not indexed.
-- OpenCode is parsed from `opencode run --format json` plus post-run
-  `opencode export`, but its SQLite session store is not read directly.
 - Vibe and Copilot have some provider-specific handling, but not a unified
   adapter contract.
 
@@ -51,7 +47,6 @@ shapes:
 - normalize messages, tool calls, tool results, reasoning, errors, and
   metadata
 - expose stable cursors for workflow gates and status summaries
-- feed Tantivy indexing, `bro tail`, workflow state, and tmux portal status
   from the same normalized stream
 - preserve raw references so any normalized event can be cited back to the
   provider store
@@ -70,7 +65,6 @@ Non-goals:
 | Claude Code | `~/.claude*/projects/**/*.jsonl`, plus `history.jsonl` | Indexed by background reindexer; parsed by `parse_transcript_line`; rich parser used by `bro tail`. | Mostly needs adapter wrapping and cursor contract. |
 | Codex | `~/.codex/sessions/**/rollout-*.jsonl`, plus `history.jsonl` | Indexed by background reindexer; parsed by `parse_codex_line`. | Mostly needs adapter wrapping and cursor contract. |
 | Gemini | `~/.gemini/tmp/<project>/chats/session-<iso>-<first8>.json` | Session discovery, resume-cwd safety, and rich parsing through `parse_gemini_file_rich`; not indexed. | Needs full-file polling adapter and index integration. |
-| OpenCode | CLI stream from `opencode run --format json`; post-run `opencode export <session>`; local store is SQLite under `~/.local/share/opencode/`. | Orchestration extracts `sessionID`, text events, last assistant text, turn count, and cost. | Needs SQLite adapter or robust export adapter; direct indexing is absent. |
 | Copilot | `~/.copilot/session-state/<session>/events.jsonl` helper lookup exists. | Streaming parser exists for orchestration/tail paths. | Needs explicit adapter and indexing decision. |
 | Vibe | `~/.vibe/logs/session/` discovery paths exist. | Bulk/non-streaming orchestration path. | Needs adapter or explicit out-of-scope decision. |
 
@@ -134,7 +128,6 @@ enum TranscriptLocation {
 ```
 
 `ProviderCommand` is allowed only for read-only export commands such as
-`opencode export <session_id>`. It is a snapshot source, not a streaming
 transport. `read_since` may re-run the command, parse the full output, and
 diff by provider message ids. Commands must have no side effects, inherit the
 same provider environment used for dispatch, and use a bounded timeout.
@@ -285,11 +278,7 @@ existing schema can index that identity without new fields, no schema bump is
 required. If provider-message lookup needs additional stored fields, bump the
 schema version and force a full reindex.
 
-### 6.4 OpenCode
 
-OpenCode is the highest-risk adapter because the durable store is SQLite,
-not JSONL. Locally observed storage under `~/.local/share/opencode/` includes
-`opencode.db` with at least:
 
 - `session`
 - `message`
@@ -303,15 +292,12 @@ There are two possible v1 paths:
 1. **SQLite adapter:** read `message` and `part` by `session_id` ordered by
    `time_created,id`; optionally use `event`/`event_sequence` if they prove
    append-only and semantically cleaner.
-2. **Export adapter:** invoke `opencode export <session_id>` and diff message
    IDs from the returned JSON.
 
 The SQLite adapter is better for live workflows if the schema is stable
 enough. The export adapter is simpler but already has observed stale-read
 risk after a run completes, so it should not be the only live-read path if
-tmux mode depends on it.
 
-OpenCode adapter rules:
 
 - use read-only SQLite connections
 - support WAL mode without blocking the writer
@@ -322,12 +308,8 @@ OpenCode adapter rules:
 
 If schema drift is detected, include the observed table list and the failing
 query profile in the adapter error. Workflow consumers use the generic
-degradation rule in section 7.3 rather than inventing OpenCode-specific
 fallback behavior.
 
-The OpenCode prototype should decide between `message`/`part` and
-`event`/`event_sequence` before any workflow gate depends on OpenCode live
-reads. Until then, OpenCode can still be used in tmux mode for human steering
 with transcript-derived automation disabled or degraded.
 
 ### 6.5 Copilot
@@ -341,7 +323,6 @@ structure.
 
 Vibe should either get a minimal adapter over its session logs or be marked
 as "dispatch-only, no durable read plane" until its storage shape is stable.
-Tmux mode can still steer Vibe-like providers, but workflow automation
 should know that no canonical read stream is available.
 
 ## 7. Read Plane Users
@@ -352,7 +333,6 @@ The background reindexer should stop knowing provider filesystem layouts
 directly. Instead it should ask registered adapters for discoverable
 locations and normalized events.
 
-This keeps Claude/Codex behavior intact while allowing Gemini/OpenCode to
 join the corpus without special one-off reindex paths.
 
 ### 7.2 `bro tail`
@@ -379,7 +359,6 @@ Workflow nodes should be able to wait on normalized transcript conditions:
 }
 ```
 
-This is the layer that tmux mode should depend on for automated status.
 
 Adapter failures are workflow-visible. A workflow gate that depends on the
 read plane should treat adapter errors as transient until proven otherwise:
@@ -395,9 +374,7 @@ read plane should treat adapter errors as transient until proven otherwise:
 This keeps terminal capture out of the canonical state path while still
 giving the operator useful context.
 
-### 7.4 Tmux Portal
 
-Tmux portal mode should carry both handles:
 
 ```rust
 struct TranscriptPortalHandle {
@@ -428,18 +405,14 @@ read-source type.
    exercise.
 4. Add Gemini adapter and index `~/.gemini/tmp`.
 5. Add durable live-read cursor storage under blackbox state.
-6. Prototype OpenCode SQLite adapter against local `opencode.db`.
-7. Compare OpenCode SQLite output against `opencode export` and current
    streaming JSON events.
 8. Add Copilot adapter if its JSONL schema is stable enough.
 9. Add workflow degradation behavior for read-plane adapter failures.
 10. Update workflow engine to track provider read handles on actor tasks.
-11. Make tmux portal mode consume read handles for status, summaries, and
    attention gates.
 
 ## 9. Open Questions
 
-1. Is OpenCode `event_sequence` stable enough to be the primary cursor, or
    should v1 poll `message`/`part` directly?
 2. Should Gemini full-file polling be part of the background reindexer, live
    tailer, or both?

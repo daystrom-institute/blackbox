@@ -36,8 +36,6 @@ the [Design Corpus](../design-corpus.md) Topic Hubs:
 - [Workflow Orchestration](workflows/workflow-orchestration.md)
 - [Brofile Context Templates](workflows/context-assembly-system.md)
 - [Turing Completeness](workflows/turing-completeness.md)
-- [Tmux Portal Workflows](workflows/tmux-portal-workflows.md)
-- [Tmux Portal Workflows - Implementation Plan](workflows/tmux-portal-workflows-impl.md)
 
 ## Supervised Execution
 

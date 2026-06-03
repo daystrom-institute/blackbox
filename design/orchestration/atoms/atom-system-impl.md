@@ -28,7 +28,6 @@ Related:
 - [Agent System](../agents/agent-system.md) - predecessor implementation shape.
 - [Workflow Engine](../../../docs/workflows.md) - current workflow actor/subworkflow model.
 - [Supervision Impl](../supervision/supervision-impl.md) - advisor/oracle policy substrate.
-- [Tmux Portal Impl](../workflows/tmux-portal-workflows-impl.md) - run focus and portal
   state.
 - [Phase Decomposer](../phase-decomposer/phase-decomposer.md) and
   [Phase Decomposer Impl](../phase-decomposer/phase-decomposer-impl.md) - workflow-level

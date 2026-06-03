@@ -2477,7 +2477,7 @@ mod tests {
         let BroCommand::Agent(args) = cli.command else {
             panic!("expected Agent command");
         };
-        assert_eq!(args.provider, Provider::Claude);
+        assert_eq!(args.provider, Provider::Glm);
         assert_eq!(args.model.as_deref(), Some("sonnet"));
         assert_eq!(args.effort.as_deref(), Some("high"));
         assert_eq!(args.cwd.as_deref(), Some("/tmp/project"));

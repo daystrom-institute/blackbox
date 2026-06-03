@@ -5495,28 +5495,21 @@ fn draw_composer(
 
 fn provider_tag(p: Provider) -> &'static str {
     match p {
-        Provider::Claude => "cl",
         Provider::Glm => "glm",
         Provider::Deepseek => "ds",
         Provider::Brodex => "bdx",
-        Provider::Codex => "cdx",
-        Provider::Inception => "inc",
-        Provider::Copilot => "cop",
-        Provider::Vibe => "vib",
         Provider::VibeBh => "vbh",
-        Provider::Gemini => "gem",
         Provider::Workflow => "wf",
     }
 }
 
 fn provider_color(p: Provider) -> Color {
     match p {
-        Provider::Claude => Color::LightMagenta,
         Provider::Glm => Color::LightBlue,
         Provider::Deepseek => Color::LightCyan,
         Provider::Brodex => Color::LightGreen,
         Provider::VibeBh => Color::LightRed,
-        _ => Color::Gray,
+        Provider::Workflow => Color::Gray,
     }
 }
 
@@ -5809,7 +5802,7 @@ mod tests {
             Provider::Brodex
         );
         assert_eq!(default_effort_for(Provider::Brodex), Some("high"));
-        assert_eq!(default_effort_for(Provider::Claude), Some("high"));
+        assert_eq!(default_effort_for(Provider::Glm), Some("high"));
     }
 
     #[test]

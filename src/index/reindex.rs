@@ -738,16 +738,10 @@ pub(crate) fn backfill_tool_edges_for_project(
 
 fn provider_label(provider: Provider) -> &'static str {
     match provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
         Provider::Brodex => "brodex",
-        Provider::Gemini => "gemini",
-        Provider::Copilot => "copilot",
-        Provider::Vibe => "vibe",
         Provider::VibeBh => "vibebh",
-        Provider::Glm => "opencode",
+        Provider::Glm => "glm",
         Provider::Deepseek => "deepseek",
-        Provider::Inception => "inception",
         Provider::Workflow => "workflow",
     }
 }
@@ -771,16 +765,11 @@ pub(super) fn human_bytes(bytes: u64) -> String {
 mod tests {
     use super::*;
     use crate::entity_ref;
-    use crate::parser::{self, MessageRole, ParsedEvent};
-    use crate::transcripts::adapters::{
-        ClaudeTranscriptAdapter, CodexTranscriptAdapter, TranscriptReadAdapter,
-    };
+    use crate::parser::{MessageRole, ParsedEvent};
     use crate::transcripts::types::{
         NormalizedTranscriptEvent, RawTranscriptRef, TranscriptStorage,
     };
-    use serde_json::json;
     use tantivy::TantivyDocument;
-    use tempfile::tempdir;
 
     #[test]
     fn transcript_docs_include_doc_type_and_parser_version() {
@@ -797,14 +786,14 @@ mod tests {
             tool_call: None,
         };
         let raw = RawTranscriptRef::jsonl(
-            Provider::Codex,
+            Provider::Brodex,
             TranscriptStorage::JsonlFile,
             "/tmp/session.jsonl",
             0,
             0,
             0,
         );
-        let normalized = NormalizedTranscriptEvent::from_parsed_event(Provider::Codex, parsed, raw);
+        let normalized = NormalizedTranscriptEvent::from_parsed_event(Provider::Brodex, parsed, raw);
         let doc = normalized_to_doc(
             &normalized,
             "codex",
@@ -820,118 +809,6 @@ mod tests {
             first_text(&doc, fields.parser_version),
             entity_ref::PARSER_VERSION
         );
-    }
-
-    /// Phase 2 parity guard: the adapter-routed pipeline must produce the same
-    /// doc-shape fields the legacy `parse_transcript_line → build_transcript_doc`
-    /// path produced (content, role, session_id, account, file_path, byte_offset).
-    /// `entity_id` is intentionally additive in the adapter path (Phase 0.4 → 4).
-    #[test]
-    fn claude_adapter_indexing_matches_legacy_doc_fields() {
-        let (_schema, fields) = crate::index::build_schema();
-        let dir = tempdir().unwrap();
-        let projects_dir = dir.path().join("projects").join("-repo");
-        fs::create_dir_all(&projects_dir).unwrap();
-        let path = projects_dir.join("sess-parity.jsonl");
-        let line = json!({
-            "type": "user",
-            "sessionId": "sess-parity",
-            "timestamp": "2026-05-12T00:00:00Z",
-            "message": {"content": "parity matters"}
-        })
-        .to_string();
-        fs::write(&path, format!("{line}\n")).unwrap();
-
-        let adapter =
-            ClaudeTranscriptAdapter::new(vec![("claude".to_string(), dir.path().to_path_buf())]);
-        let location = adapter.locate("sess-parity").unwrap().unwrap();
-        let snapshot = adapter.load_snapshot(&location).unwrap();
-        assert_eq!(snapshot.events.len(), 1);
-        let normalized = &snapshot.events[0];
-
-        let parsed = parser::parse_transcript_line(&line);
-        assert_eq!(parsed.len(), 1);
-        let legacy = &parsed[0];
-
-        let adapter_doc = normalized_to_doc(
-            normalized,
-            location.account.as_deref().unwrap_or("claude"),
-            &path.to_string_lossy(),
-            location.is_subagent,
-            location.project.as_deref().unwrap_or(""),
-            fields,
-        )
-        .expect("normalized event is indexable");
-
-        assert_eq!(first_text(&adapter_doc, fields.doc_type), "transcript");
-        assert_eq!(first_text(&adapter_doc, fields.content), legacy.content);
-        assert_eq!(first_text(&adapter_doc, fields.role), legacy.role.as_ref());
-        assert_eq!(
-            first_text(&adapter_doc, fields.session_id),
-            legacy.session_id
-        );
-        assert_eq!(first_text(&adapter_doc, fields.account), "claude");
-        assert_eq!(
-            first_text(&adapter_doc, fields.file_path),
-            path.to_string_lossy()
-        );
-    }
-
-    #[test]
-    fn codex_adapter_indexing_fills_cwd_and_account_label() {
-        let (_schema, fields) = crate::index::build_schema();
-        let dir = tempdir().unwrap();
-        let sessions_dir = dir
-            .path()
-            .join("sessions")
-            .join("2026")
-            .join("05")
-            .join("12");
-        fs::create_dir_all(&sessions_dir).unwrap();
-        let path = sessions_dir
-            .join("rollout-2026-05-12T01-02-03-019d8319-6ffe-78b0-904b-4bfdb2a9cdb5.jsonl");
-        let meta = json!({
-            "timestamp": "2026-05-12T01:02:03Z",
-            "type": "session_meta",
-            "payload": {"cwd": "/repo", "base_instructions": "be useful"}
-        })
-        .to_string();
-        let message = json!({
-            "timestamp": "2026-05-12T01:03:00Z",
-            "type": "response_item",
-            "payload": {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "output_text", "text": "ok"}]
-            }
-        })
-        .to_string();
-        fs::write(&path, format!("{meta}\n{message}\n")).unwrap();
-
-        let adapter = CodexTranscriptAdapter::new(dir.path().to_path_buf());
-        let location = adapter
-            .locate("019d8319-6ffe-78b0-904b-4bfdb2a9cdb5")
-            .unwrap()
-            .unwrap();
-        let snapshot = adapter.load_snapshot(&location).unwrap();
-        let message_event = snapshot
-            .events
-            .iter()
-            .find(|e| !e.content.is_empty())
-            .expect("message event present");
-
-        let doc = normalized_to_doc(
-            message_event,
-            location.account.as_deref().unwrap_or("codex"),
-            &path.to_string_lossy(),
-            location.is_subagent,
-            location.project.as_deref().unwrap_or(""),
-            fields,
-        )
-        .unwrap();
-
-        assert_eq!(first_text(&doc, fields.account), "codex");
-        assert_eq!(first_text(&doc, fields.project), "/repo");
     }
 
     fn first_text(doc: &TantivyDocument, field: Field) -> String {

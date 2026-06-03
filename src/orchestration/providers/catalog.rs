@@ -18,27 +18,20 @@ pub struct EffortInfo {
 
 pub(super) fn models_for(provider: Provider) -> &'static [ModelInfo] {
     match provider {
-        Provider::Claude => CLAUDE_MODELS,
         Provider::Glm => GLM_MODELS,
         Provider::Deepseek => DEEPSEEK_MODELS,
-        Provider::Inception => INCEPTION_MODELS,
-        Provider::Codex | Provider::Brodex => CODEX_MODELS,
-        Provider::Copilot => COPILOT_MODELS,
-        Provider::Vibe => VIBE_MODELS,
+        Provider::Brodex => CODEX_MODELS,
         Provider::VibeBh => VIBEBH_MODELS,
-        Provider::Gemini => GEMINI_MODELS,
         Provider::Workflow => &[],
     }
 }
 
 pub(super) fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
-        Provider::Claude | Provider::Glm | Provider::Deepseek => CLAUDE_EFFORTS,
-        Provider::Inception => OPENCODE_VARIANTS,
-        Provider::Codex | Provider::Brodex => CODEX_EFFORTS,
-        Provider::Copilot => COPILOT_EFFORTS,
+        Provider::Glm | Provider::Deepseek => CLAUDE_EFFORTS,
+        Provider::Brodex => CODEX_EFFORTS,
         Provider::VibeBh => VIBEBH_EFFORTS,
-        _ => &[],
+        Provider::Workflow => &[],
     }
 }
 
@@ -66,67 +59,6 @@ static CLAUDE_EFFORTS: &[EffortInfo] = &[
     EffortInfo {
         id: "max",
         description: "Maximum reasoning depth",
-        default: false,
-    },
-];
-
-static OPENCODE_VARIANTS: &[EffortInfo] = &[
-    EffortInfo {
-        id: "minimal",
-        description: "Fastest variant",
-        default: false,
-    },
-    EffortInfo {
-        id: "low",
-        description: "Light reasoning",
-        default: false,
-    },
-    EffortInfo {
-        id: "medium",
-        description: "Balanced speed and depth",
-        default: true,
-    },
-    EffortInfo {
-        id: "high",
-        description: "Deeper reasoning",
-        default: false,
-    },
-    EffortInfo {
-        id: "max",
-        description: "Maximum reasoning depth",
-        default: false,
-    },
-];
-
-static CLAUDE_MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        id: "claude-opus-4-8",
-        description: "Frontier model, 1M context built-in",
-        default: true,
-    },
-    ModelInfo {
-        id: "claude-opus-4-7",
-        description: "Previous frontier, 1M context built-in",
-        default: false,
-    },
-    ModelInfo {
-        id: "claude-opus-4-6[1m]",
-        description: "Previous frontier, 1M context window",
-        default: false,
-    },
-    ModelInfo {
-        id: "claude-opus-4-6",
-        description: "Previous frontier, 200K context",
-        default: false,
-    },
-    ModelInfo {
-        id: "claude-sonnet-4-6",
-        description: "Fast + capable, balanced cost",
-        default: false,
-    },
-    ModelInfo {
-        id: "claude-haiku-4-5-20251001",
-        description: "Fastest, lowest cost",
         default: false,
     },
 ];
@@ -222,12 +154,6 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
     },
 ];
 
-static INCEPTION_MODELS: &[ModelInfo] = &[ModelInfo {
-    id: "inception/mercury-2",
-    description: "Inception Mercury 2 tool-capable model via OpenCode",
-    default: true,
-}];
-
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {
         id: "gpt-5.5",
@@ -308,88 +234,6 @@ static CODEX_EFFORTS: &[EffortInfo] = &[
         default: false,
     },
 ];
-
-static COPILOT_MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        id: "claude-opus-4-8",
-        description: "Anthropic Opus 4.8",
-        default: true,
-    },
-    ModelInfo {
-        id: "claude-opus-4-7",
-        description: "Anthropic Opus 4.7",
-        default: false,
-    },
-    ModelInfo {
-        id: "claude-opus-4-6",
-        description: "Anthropic Opus 4.6",
-        default: false,
-    },
-    ModelInfo {
-        id: "claude-sonnet-4-6",
-        description: "Anthropic Sonnet 4.6",
-        default: false,
-    },
-    ModelInfo {
-        id: "gpt-5.5",
-        description: "OpenAI general purpose (codex tier mirror)",
-        default: false,
-    },
-    ModelInfo {
-        id: "gpt-5.3-codex",
-        description: "OpenAI Codex-optimized",
-        default: false,
-    },
-    ModelInfo {
-        id: "gpt-5.3-codex-mini",
-        description: "OpenAI Codex lightweight (economy tier mirror)",
-        default: false,
-    },
-    ModelInfo {
-        id: "gpt-5.2-codex",
-        description: "OpenAI Codex",
-        default: false,
-    },
-    ModelInfo {
-        id: "gpt-5.1-codex-max",
-        description: "OpenAI deep reasoning",
-        default: false,
-    },
-    ModelInfo {
-        id: "gpt-5.2",
-        description: "OpenAI general purpose",
-        default: false,
-    },
-];
-
-static COPILOT_EFFORTS: &[EffortInfo] = &[
-    EffortInfo {
-        id: "low",
-        description: "Fast responses with lighter reasoning",
-        default: false,
-    },
-    EffortInfo {
-        id: "medium",
-        description: "Balanced speed and depth",
-        default: true,
-    },
-    EffortInfo {
-        id: "high",
-        description: "Greater depth for complex problems",
-        default: false,
-    },
-    EffortInfo {
-        id: "xhigh",
-        description: "Maximum reasoning depth",
-        default: false,
-    },
-];
-
-// Vibe CLI does not have a --model flag; model selection is via
-// `--agent NAME` (~/.vibe/agents/*.toml), `VIBE_AGENT` / `VIBE_ACTIVE_MODEL`
-// env vars, or `vibe --setup`. Listing models here would imply they're
-// selectable through bro_exec/brofiles CLI flags when they aren't.
-static VIBE_MODELS: &[ModelInfo] = &[];
 
 // vibe-bh DOES take a model id (the harness `--model` flag is forwarded
 // verbatim as the chat-completions `model` field), unlike the vibe CLI. These

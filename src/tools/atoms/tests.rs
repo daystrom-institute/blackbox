@@ -25,7 +25,7 @@ fn make_task(
 ) -> Arc<orchestration::Task> {
     let task = orchestration::spawn_in_process_task(
         task_id.to_string(),
-        crate::orchestration::providers::Provider::Codex,
+        crate::orchestration::providers::Provider::Brodex,
         "session-primary".to_string(),
         None,
         server.state.store_dir.clone(),

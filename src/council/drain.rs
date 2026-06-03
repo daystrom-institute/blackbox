@@ -32,7 +32,6 @@ use crate::orchestration::{
     brofile::{enforce_provider_defaults, resolve_brofile, resolve_provider_env},
     mcp::{
         McpFilters, McpStore, global_store_path, project_store_path, resolve_effective,
-        write_gemini_policy_file,
     },
     providers::{ExecOpts, Provider},
     team::{Team, TeamMember, load_all_teams},
@@ -517,7 +516,6 @@ fn build_dispatch(
     let task_id = uuid::Uuid::new_v4().to_string();
     let session_id = match &existing_session {
         Some(s) => s.clone(),
-        None if matches!(bf.provider, Provider::Claude) => uuid::Uuid::new_v4().to_string(),
         None => "pending".to_string(),
     };
 
@@ -680,15 +678,8 @@ fn build_filter_args(
         eff.filters.merge_from(extra);
     }
 
-    let mut args = provider.build_filter_args(&eff.filters);
-    let mut policy_file = None;
-    if provider == Provider::Gemini {
-        if let Ok(Some(path)) = write_gemini_policy_file(task_id, &eff.filters) {
-            args.push("--policy".into());
-            args.push(path.to_string_lossy().into_owned());
-            policy_file = Some(path);
-        }
-    }
+    let args = provider.build_filter_args(&eff.filters);
+    let policy_file = None;
     DispatchFilters { args, policy_file }
 }
 

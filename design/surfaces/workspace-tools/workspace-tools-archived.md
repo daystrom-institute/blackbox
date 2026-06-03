@@ -51,7 +51,6 @@ Provider built-ins (`Read`, `Write`, `Edit`, `MultiEdit`, `Bash`,
 3. **No coercion.** There's no surface-level mechanism to say "for symbol
    edits, prefer `bbox_refactor_apply`." Agents pick whichever tool
    their training prior reaches for. RTK only nudges Claude via host
-   hooks; codex / gemini / vibe / opencode get nothing.
 
 Daystrom solved this for `.NET` agents with **per-agent SdkMcpServer
 workspace tools**: `file_read`, `smart_read`, `file_edit`, `file_write`,
@@ -142,7 +141,6 @@ Optional `enrich=false` returns plain content for cheap reads. Default
 the shell with the agent's working directory; records the call as a
 `tool_call_event`; applies rtk-style minification on output before
 returning. The minification is the same pipeline the host hook uses
-today, but inside the MCP boundary so codex / gemini / vibe / opencode
 benefit too. Important edge cases: long-running commands stream chunks
 back via the same MCP response cap (80KB) — extend with a
 `run_in_background=true` mode that returns a handle and a follow-up
@@ -312,7 +310,6 @@ This collapses two of phase-decomposer's open questions
 
 `bbox_bash` runs the same minification pipeline rtk uses on the host
 shell hook today, but inside the MCP boundary. Cross-provider parity:
-codex / gemini / vibe / opencode get token shrinkage without
 provider-specific host hooks. The Claude RTK hook stays in place for
 non-dispatched (interactive-session) Bash calls.
 

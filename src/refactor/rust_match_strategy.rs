@@ -614,15 +614,15 @@ mod tests {
             "router missing match: {replacement}"
         );
         assert!(
-            replacement.contains("Provider::Claude"),
+            replacement.contains("Provider::Glm"),
             "router missing Claude"
         );
         assert!(
-            replacement.contains("Provider::Codex"),
+            replacement.contains("Provider::Brodex"),
             "router missing Codex"
         );
         assert!(
-            replacement.contains("Provider::Copilot"),
+            replacement.contains("Provider::VibeBh"),
             "router missing Copilot"
         );
 

@@ -63,7 +63,6 @@ badgey is one citizen, not the model citizen.
 
 Three concrete payoffs:
 
-1. **Cross-provider parity.** Codex, Gemini, OpenCode have no native
    agent-selection layer. With agents as MCP-discoverable artifacts,
    every provider gets the same surface: search by query → dispatch →
    resume. Claude users can choose: native Task tool for ephemeral
@@ -191,7 +190,6 @@ Storage:
 ### 2.1 Layering
 
 ```
-caller LLM (Claude / Codex / Gemini / OpenCode)
    │
    ▼  (MCP transport)
 bbox daemon
@@ -994,7 +992,6 @@ Codex, and vice versa.
 
 **v1 commits to single-provider agents.** A given agent
 (`agent:foo@v1`) binds to one provider via its `brofile_ref`. Any
-caller (Claude, Codex, Gemini, OpenCode) can *invoke*
 `bro_agent_dispatch(agent="foo")`; the dispatch spawns under the
 brofile's declared provider regardless of caller provider. The
 caller's MCP transport is provider-agnostic; the spawned bro is not.

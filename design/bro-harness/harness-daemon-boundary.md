@@ -8,7 +8,6 @@ topic:
   - orchestration
   - surfaces
   - fleet-tui
-brief: "Restates the bro-harness/daemon boundary for the post-CLI, API-native era. The 'no daemon runtime dependency' rule was a temporary scaffold; with codex/vibe/claude/opencode CLI holes dropped and all providers API-native through bro-harness, the harness becomes a linkable crate the daemon runs in-process. The load-bearing half of the invariant survives as a compiler-enforced acyclic DAG. Capabilities and wire messages cross through a shared contract bottom — a small family of crates (bro-core / bro-protocol / bro-capabilities) cleaved by consumer, not by domain taxonomy — so the thin fleet client links only the protocol it needs and gRPC is unnecessary (the Rust types are the contract, serde is the wire). Consolidation collapses the fleet coordinator into the singleton daemon (TUI = thin view, agents = bros), turns corpus/atom lookups into in-memory trait calls, makes the MCP surface an in-process filter evaluation reusing the shipped surface evaluator, and runs V8 in-process (isolate-contained) with shell ops as supervised child processes so 'one process' isn't 'one fault domain' (OS sandboxing deferred — a trusted-agent box gets accident-containment from supervision, not security from a sandbox). Supersedes the per-store fleet coordinator placement; refines narf-draft2 §6; extends mcp-surfaces."
 ---
 
 # The harness–daemon boundary: in-process consolidation
@@ -23,7 +22,6 @@ brief: "Restates the bro-harness/daemon boundary for the post-CLI, API-native er
 
 > The "no daemon runtime dependency" rule was a temporary scaffold to find
 > bro-harness's shape. Now that all surviving providers are **API-native through
-> bro-harness** (the codex/vibe/claude/opencode CLI holes are legacy), the
 > harness becomes a **linkable crate the daemon runs in-process**. The
 > load-bearing half of the invariant survives, upgraded from a convention to a
 > **compiler-enforced acyclic DAG**. Capabilities and cross-process messages
@@ -53,7 +51,6 @@ The sign was always meant to come down at the next step.
 Two facts make now the time:
 
 - **The CLI holes are legacy.** Codex and Vibe are subsumed into bro-harness;
-  `claude -p` moves to API pricing (no CLI cost advantage to preserve); OpenCode
   is redundant once the OpenAI and Anthropic transports exist natively. The
   surviving dispatch targets are **our code on an HTTP transport**, not foreign
   binaries.
@@ -220,7 +217,6 @@ The migration is wholesale — every CLI-shaped provider is dropped:
   are frozen as legacy.
 - **claude `-p`** — moves to API pricing (June 15), erasing the CLI cost
   advantage; dispatch goes through the native Anthropic transport.
-- **OpenCode/Inception** — redundant once the OpenAI and Anthropic transports
   exist natively; cut.
 - **Gemini** — dead: the CLI was deprecated in favour of the new Antigravity CLI,
   which doesn't work properly. Dropped.
@@ -229,7 +225,6 @@ The migration is wholesale — every CLI-shaped provider is dropped:
   carrying.
 
 So `Provider::build_exec_args`/`build_filter_args` for all of these, the
-OpenCode/Inception transport, and the `claude -p` subprocess path are deleted.
 All dispatch is API-native via the harness transports (Anthropic, OpenAI
 Responses, OpenAI chat). If a CLI-shaped adapter is genuinely needed later,
 re-add it as a subprocess leaf behind the same `Session` API.
@@ -470,7 +465,6 @@ bindings — only the projection to the model branches.
 The consolidation is plausibly **net-negative code**.
 
 **Delete:** codex/vibe/copilot/gemini CLI arg-builders + dispatch branches;
-OpenCode/Inception transport; the `claude -p` subprocess path; stream-json
 *parsing* on the daemon side for in-process sessions; the MCP-client-for-corpus
 robustness wrapping; `Provider::build_filter_args` translation for harness
 agents; the fleet in-process `FleetOrchestrator` duplication; the entire

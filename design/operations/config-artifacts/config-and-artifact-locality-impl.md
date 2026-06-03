@@ -193,7 +193,6 @@ Prerequisites:
        pub codex_bin: Option<String>,
        pub gemini_bin: Option<String>,
        pub copilot_bin: Option<String>,
-       pub opencode_bin: Option<String>,
        pub vibe_bin: Option<String>,
        pub vibe_session_dir: Option<PathBuf>,
        pub extra_path: Vec<PathBuf>,

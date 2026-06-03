@@ -167,7 +167,6 @@ and uses MCP tools.
 | `claude` | yes | yes | Strongest cold-start grounding |
 | `codex` | yes | yes | Good quality, usually higher latency |
 | `gemini` | yes | expected | Renders to `GEMINI.md` |
-| `glm` / `deepseek` via opencode | no | usually falls back to grep/read | Import-following gap reduces grounding |
 
 ## System memories
 

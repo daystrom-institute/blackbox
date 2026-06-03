@@ -169,20 +169,8 @@ pub(crate) fn resolve_dispatch_filters(
         eff.filters.merge_from(extra);
     }
 
-    let mut args = provider.build_filter_args(&eff.filters);
-    let mut policy_file = None;
-
-    if provider == Provider::Gemini {
-        match orchestration::mcp::write_gemini_policy_file(task_id, &eff.filters) {
-            Ok(Some(path)) => {
-                args.push("--policy".into());
-                args.push(path.to_string_lossy().into_owned());
-                policy_file = Some(path);
-            }
-            Ok(None) => { /* no filters → no file */ }
-            Err(e) => tracing::warn!("gemini policy file write failed: {e:#}"),
-        }
-    }
+    let args = provider.build_filter_args(&eff.filters);
+    let policy_file = None;
 
     Ok(DispatchFilters {
         args,

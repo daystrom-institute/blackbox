@@ -291,11 +291,7 @@ impl BlackboxServer {
         );
 
         let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = if matches!(request.provider, Provider::Claude) {
-            uuid::Uuid::new_v4().to_string()
-        } else {
-            "pending".to_string()
-        };
+        let session_id = "pending".to_string();
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
@@ -418,7 +414,7 @@ impl BlackboxServer {
             }
         } else if exec_params_have_runtime(&p) {
             (
-                Provider::Codex,
+                Provider::Brodex,
                 None,
                 None,
                 None,
@@ -432,33 +428,6 @@ impl BlackboxServer {
                 "Provide either bro, provider, or runtime allocation parameters",
             );
         };
-        // Terminal-mode brofiles run the provider TUI in tmux instead of the
-        // headless allocator path. Branch before allocation; the turn runs as a
-        // background task and the caller polls the returned task.
-        if let Some(bro) = p.bro.as_deref()
-            && self.brofile_is_terminal(bro, p.project_dir.as_deref())
-        {
-            let task = match self.dispatch_terminal_bro_task(
-                provider,
-                exec_opts.as_ref().and_then(|o| o.model.clone()),
-                exec_opts.as_ref().and_then(|o| o.effort.clone()),
-                cwd.clone(),
-                p.prompt.clone(),
-                None,
-                Some(bro.to_string()),
-            ) {
-                Ok(t) => t,
-                Err(e) => return Self::err_text(&e),
-            };
-            let inner = task.inner.lock();
-            return Self::ok_json(&json!({
-                "taskId": inner.id,
-                "sessionId": inner.session_id,
-                "status": "running",
-                "terminalMode": "tmux",
-            }));
-        }
-
         let brofile_runtime = p
             .bro
             .as_deref()
@@ -566,38 +535,8 @@ impl BlackboxServer {
         // through to the caller's cwd and let them surface the failure.
         let cwd = match provider.resolve_session_cwd(&session_id) {
             Some(p) => Some(p.to_string_lossy().into_owned()),
-            None if provider == Provider::Gemini && cwd.is_none() => {
-                return Self::err_text(&format!(
-                    "Gemini session {session_id} not found in ~/.gemini/tmp/*/chats. Refusing to resume because Gemini silently forks a new session when the UUID isn't in the cwd's project folder (aliasing the resumed session). Verify the session ID or re-dispatch.",
-                ));
-            }
             None => cwd,
         };
-
-        // A session first dispatched in terminal (tmux) mode is remembered, so
-        // resuming it continues in tmux transparently — the resume surface keys
-        // on session_id+provider, not a brofile.
-        if orchestration::tmux_dispatch::is_terminal_session(&self.state.store_dir, &session_id) {
-            let task = match self.dispatch_terminal_bro_task(
-                provider,
-                exec_opts.as_ref().and_then(|o| o.model.clone()),
-                exec_opts.as_ref().and_then(|o| o.effort.clone()),
-                cwd.clone(),
-                p.prompt.clone(),
-                Some(session_id.clone()),
-                p.bro.clone(),
-            ) {
-                Ok(t) => t,
-                Err(e) => return Self::err_text(&e),
-            };
-            let inner = task.inner.lock();
-            return Self::ok_json(&json!({
-                "taskId": inner.id,
-                "sessionId": session_id,
-                "status": "running",
-                "terminalMode": "tmux",
-            }));
-        }
 
         let allow_recursion = p.allow_recursion.unwrap_or(false);
         let task_id = uuid::Uuid::new_v4().to_string();
@@ -1284,13 +1223,6 @@ impl BlackboxServer {
                     // through and error loudly themselves.
                     let member_cwd = match effective_provider.resolve_session_cwd(sid) {
                         Some(p) => Some(p.to_string_lossy().into_owned()),
-                        None if effective_provider == Provider::Gemini => {
-                            launched.push(json!({
-                                "bro": member.name,
-                                "error": format!("Gemini session {sid} not found in ~/.gemini/tmp/*/chats — refusing to resume (silent-fork aliasing)"),
-                            }));
-                            continue;
-                        }
                         None => cwd.clone(),
                     };
                     let task_id = uuid::Uuid::new_v4().to_string();
@@ -1348,11 +1280,7 @@ impl BlackboxServer {
                 }
             } else {
                 let task_id = uuid::Uuid::new_v4().to_string();
-                let session_id = if matches!(brofile.provider, Provider::Claude) {
-                    uuid::Uuid::new_v4().to_string()
-                } else {
-                    "pending".into()
-                };
+                let session_id = "pending".to_string();
                 let exec_prompt = build_exec_prompt(&task_id, &session_id);
                 let mut args = brofile.provider.build_exec_args(
                     &exec_prompt,
@@ -1691,10 +1619,8 @@ impl BlackboxServer {
                 let _ = self.state.cancel_arc(&inner.session_id);
             }
         }
-        // Terminal-mode (tmux) bro turns register their cancel token under the
-        // task id. Trip it so the in-flight turn is interrupted and its pane
-        // reaped; cancel_task below then records the cancelled status. No-op for
-        // non-terminal tasks (no token registered under their id).
+        // Workflow tasks register cancel tokens under their task id. Trip it so
+        // in-flight work is interrupted before cancel_task records the status.
         let _ = self.state.cancel_arc(&p.task_id);
         match orch::cancel_task(&task, &self.state.task_store, &self.state.store_dir) {
             Ok(()) => {
@@ -2118,7 +2044,7 @@ mod tests {
             ("keep-running", orch::TaskStatus::Running),
         ] {
             store
-                .insert(id.into(), orch::test_task(id, status, Provider::Claude))
+                .insert(id.into(), orch::test_task(id, status, Provider::Glm))
                 .unwrap();
         }
     }
@@ -2212,7 +2138,7 @@ mod tests {
         let _ = orchestration::brofile::save_brofile(
             &orchestration::brofile::Brofile {
                 name: name.to_string(),
-                provider: Provider::Gemini,
+                provider: Provider::Deepseek,
                 account: None,
                 lens: None,
                 model: None,
@@ -2221,7 +2147,6 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
-                terminal_mode: orchestration::brofile::TerminalMode::Native,
             },
             "global",
             &tmp.path().join("bro"),
@@ -2268,7 +2193,7 @@ mod tests {
         assert!(exec_params_have_runtime(&params));
         let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
         let pin = request.pin.unwrap();
-        assert_eq!(pin.provider, Some(Provider::Codex));
+        assert_eq!(pin.provider, Some(Provider::Brodex));
         assert_eq!(pin.account.as_deref(), Some("codex-alt"));
         assert_eq!(pin.model.as_deref(), Some("gpt-5.3-codex-spark"));
         assert_eq!(pin.effort.as_deref(), Some("low"));
@@ -2340,11 +2265,11 @@ mod tests {
         );
         assert_eq!(
             request.pool.unwrap().providers,
-            vec![orchestration::providers::Provider::Codex]
+            vec![orchestration::providers::Provider::Brodex]
         );
         assert_eq!(
             request.pin.as_ref().and_then(|pin| pin.provider),
-            Some(orchestration::providers::Provider::Codex)
+            Some(orchestration::providers::Provider::Brodex)
         );
         assert_eq!(
             request.pin.as_ref().and_then(|pin| pin.account.as_deref()),
@@ -2352,7 +2277,7 @@ mod tests {
         );
         assert_eq!(
             request.prefer.and_then(|prefer| prefer.provider),
-            Some(Provider::Codex)
+            Some(Provider::Brodex)
         );
         assert!(!request.durable);
         assert!(
@@ -2425,7 +2350,7 @@ mod tests {
             server
                 .resolve_resume_target(Some("blue::reviewer"), None, None, None)
                 .unwrap();
-        assert_eq!(provider, Provider::Gemini);
+        assert_eq!(provider, Provider::Deepseek);
         assert_eq!(session_id, "sid-blue");
         assert_eq!(cwd.as_deref(), Some("/tmp/blue"));
     }

@@ -154,7 +154,6 @@ rather than relying on response-optimized task result JSON.
 - old task-record serde defaults
 - response-optimized green snapshots
 - full snapshots on alerts/thresholds
-- OpenCode-style tool extraction
 - structural compaction marker detection
 
 Future supervision docs should reference this layer as implemented telemetry,

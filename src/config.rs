@@ -73,7 +73,6 @@ pub struct ProviderOverrides {
     pub codex_bin: Option<Option<String>>,
     pub gemini_bin: Option<Option<String>>,
     pub copilot_bin: Option<Option<String>>,
-    pub opencode_bin: Option<Option<String>>,
     pub vibe_bin: Option<Option<String>>,
     pub vibe_session_dir: Option<Option<PathBuf>>,
     pub extra_path: Option<Vec<PathBuf>>,
@@ -193,7 +192,6 @@ struct RawProviderConfig {
     pub codex_bin: Option<String>,
     pub gemini_bin: Option<String>,
     pub copilot_bin: Option<String>,
-    pub opencode_bin: Option<String>,
     pub vibe_bin: Option<String>,
     pub vibe_session_dir: Option<PathBuf>,
     #[serde(default)]
@@ -341,7 +339,6 @@ pub struct ProviderConfig {
     pub codex_bin: Option<String>,
     pub gemini_bin: Option<String>,
     pub copilot_bin: Option<String>,
-    pub opencode_bin: Option<String>,
     pub vibe_bin: Option<String>,
     pub vibe_session_dir: Option<PathBuf>,
     pub extra_path: Vec<PathBuf>,
@@ -418,7 +415,6 @@ impl Config {
                 codex_bin: None,
                 gemini_bin: None,
                 copilot_bin: None,
-                opencode_bin: None,
                 vibe_bin: None,
                 vibe_session_dir: None,
                 extra_path: Vec::new(),
@@ -605,7 +601,6 @@ fn apply_explicit_env(raw: RawConfig) -> RawConfig {
     set_provider_bin!("CODEX_BIN", codex_bin);
     set_provider_bin!("GEMINI_BIN", gemini_bin);
     set_provider_bin!("COPILOT_BIN", copilot_bin);
-    set_provider_bin!("OPENCODE_BIN", opencode_bin);
     set_provider_bin!("VIBE_BIN", vibe_bin);
 
     // VIBE_SESSION_DIR
@@ -700,7 +695,6 @@ pub fn load_with(options: LoadOptions) -> Result<Config> {
             codex_bin: raw.providers.codex_bin,
             gemini_bin: raw.providers.gemini_bin,
             copilot_bin: raw.providers.copilot_bin,
-            opencode_bin: raw.providers.opencode_bin,
             vibe_bin: raw.providers.vibe_bin,
             vibe_session_dir: raw.providers.vibe_session_dir,
             extra_path: raw.providers.extra_path,
@@ -797,9 +791,6 @@ fn apply_flag_overrides(mut raw: RawConfig, overrides: ConfigOverrides) -> RawCo
     }
     if let Some(copilot_bin) = overrides.providers.copilot_bin {
         raw.providers.copilot_bin = copilot_bin;
-    }
-    if let Some(opencode_bin) = overrides.providers.opencode_bin {
-        raw.providers.opencode_bin = opencode_bin;
     }
     if let Some(vibe_bin) = overrides.providers.vibe_bin {
         raw.providers.vibe_bin = vibe_bin;

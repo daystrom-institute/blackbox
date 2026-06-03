@@ -73,11 +73,9 @@ In transcript-search, `work_*` MCP tools are reserved for restricted agents oper
 
 **Do not expose mercury-edit-2**
 
-For the Inception provider catalog in blackbox, expose `inception/mercury-2` as the tool-capable model and do not make `inception/mercury-edit-2` available. Manual OpenCode smoke showed `mercury-2` can execute MCP tools, while `mercury-edit-2` rejects OpenAI-style tool schemas.
 
 **Semantic Claude-compatible GLM and DeepSeek providers**
 
-Bro provider names should remain semantic: use `glm` for the Z.AI Coding Plan API and `deepseek` for the DeepSeek API. Both are Claude Code CLI-backed Anthropic-compatible transports, with credentials/configuration owned by the selected Claude config directory (`~/.claude-zai` and `~/.claude-ds` by default). OpenCode remains available for Inception and future nonstandard provider transports.
 
 
 ### Render Hygiene

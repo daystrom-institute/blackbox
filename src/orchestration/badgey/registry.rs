@@ -221,7 +221,7 @@ mod tests {
                 project_id: "proj".to_string(),
                 initial_brief: Some("brief".to_string()),
             },
-            Provider::Codex,
+            Provider::Brodex,
             "provider-session".to_string(),
             "thread-1".to_string(),
         );
@@ -254,7 +254,7 @@ mod tests {
                     project_id: "proj".to_string(),
                     initial_brief: None,
                 },
-                Provider::Codex,
+                Provider::Brodex,
                 "session-1".to_string(),
                 "thread-1".to_string(),
             ))

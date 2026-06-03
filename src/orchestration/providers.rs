@@ -9,17 +9,10 @@ mod session;
 mod tests;
 
 pub use catalog::{EffortInfo, ModelInfo};
-pub use events::{Disruption, EventSink, Usage, parse_opencode_export};
-#[cfg(test)]
-use exec_args::{
-    CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE, CODEX_DISABLE_PROJECT_DOCS_OVERRIDE,
-    CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE, CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE,
-};
+pub use events::{Disruption, EventSink, Usage};
 pub use exec_args::{ExecOpts, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin};
 #[cfg(test)]
 use mcp_args::{MatchState, copilot_format_mcp_tool, format_toml_string_array};
-pub use mcp_args::{transient_blackbox_name, transient_blackbox_url};
-pub use session::{discover_gemini_session, discover_vibe_session};
 #[cfg(test)]
 use session::{
     discover_gemini_session_in, resolve_claude_session_cwd_in, resolve_codex_session_cwd_in,
@@ -46,30 +39,20 @@ use session::{
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
-    Claude,
-    #[serde(alias = "opencode")]
-    #[strum(serialize = "glm", serialize = "opencode")]
+    #[strum(serialize = "glm")]
     Glm,
     Deepseek,
-    Inception,
-    Codex,
     /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
-    /// transport) instead of the `codex` CLI. Distinct provider so the
-    /// existing `codex` → codex-CLI path is preserved unchanged.
+    /// transport).
     Brodex,
-    Copilot,
-    Vibe,
     /// Mistral (vibe) ridden through `bro-harness` on the OpenAI
-    /// **chat-completions** transport, parallel to the `vibe` CLI provider
-    /// (which stays unchanged). Distinct variant so the existing `vibe` →
-    /// vibe-CLI path is preserved; `vibebh` launches the harness with
+    /// **chat-completions** transport. `vibebh` launches the harness with
     /// `BRO_HARNESS_TRANSPORT=openai-chat` + `BRO_HARNESS_CHAT_REASONING=mistral`
     /// against the Mistral API. The exemplar completions-transport harness
     /// provider — the template for future OpenAI-compatible endpoints.
     #[serde(alias = "vibe-bh")]
     #[strum(serialize = "vibebh", serialize = "vibe-bh")]
     VibeBh,
-    Gemini,
     Workflow,
 }
 
@@ -117,17 +100,15 @@ pub enum Capability {
 
 impl Provider {
     pub const ALL: &[Provider] = &[
-        Provider::Claude,
         Provider::Glm,
         Provider::Deepseek,
-        Provider::Inception,
-        Provider::Codex,
         Provider::Brodex,
-        Provider::Copilot,
-        Provider::Vibe,
         Provider::VibeBh,
-        Provider::Gemini,
     ];
+
+    pub fn is_dispatchable(&self) -> bool {
+        !matches!(self, Provider::Workflow)
+    }
 
     /// Capabilities this provider offers regardless of model. Per-model
     /// overrides are NOT modeled today (matches daystrom's per-provider
@@ -138,8 +119,6 @@ impl Provider {
     pub fn capabilities(&self) -> std::collections::HashSet<Capability> {
         use Capability::*;
         let v: &[Capability] = match self {
-            Provider::Claude => &[StructuredOutput, Vision, LongContext, ToolUse, Resume],
-            Provider::Codex => &[StructuredOutput, ToolUse, Resume],
             // Codex/ChatGPT backend via bro-harness (Responses transport).
             // Tool use + resume (transcript persistence). Structured output is
             // not yet implemented in the harness, so it is intentionally
@@ -147,10 +126,6 @@ impl Provider {
             Provider::Brodex => &[ToolUse, Resume],
             Provider::Glm => &[ToolUse, Resume],
             Provider::Deepseek => &[ToolUse, Resume],
-            Provider::Inception => &[ToolUse, Resume],
-            Provider::Copilot => &[ToolUse, Resume],
-            Provider::Gemini => &[Vision, ToolUse],
-            Provider::Vibe => &[ToolUse, Resume],
             // Mistral via bro-harness (chat-completions transport). Native tool
             // use + resume (harness transcript persistence). Structured output
             // is not yet implemented in the harness, so it is intentionally
@@ -162,37 +137,12 @@ impl Provider {
         v.iter().copied().collect()
     }
 
-    /// True iff this provider dispatches through an interactive TUI process
-    /// that can be steered with typed input and persists a transcript store.
-    ///
-    /// Terminal mode (`ActorSpec.terminal_mode = Tmux`) is only valid for
-    /// TUI-capable providers: the daemon launches the provider's real TUI in a
-    /// tmux pane and completes the workflow node from the transcript read
-    /// plane. This is a dispatch-surface fact, deliberately separate from
-    /// `capabilities()` (which describes model capabilities).
-    ///
-    /// Harness-backed providers (Brodex/GLM/DeepSeek via bro-harness) emit the
-    /// Claude stream-json envelope with no interactive surface to type into, so
-    /// they are excluded — structurally, not by policy. Codex (the `codex` CLI)
-    /// and Brodex (bro-harness, Responses transport) are distinct variants for
-    /// exactly this reason. OpenCode/Copilot/Vibe/Gemini are not promoted until
-    /// each has a manual TUI smoke record (see the slice design doc).
-    pub fn tui_capable(&self) -> bool {
-        matches!(self, Provider::Claude | Provider::Codex)
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
-            Provider::Claude => "claude",
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
-            Provider::Inception => "inception",
-            Provider::Codex => "codex",
             Provider::Brodex => "brodex",
-            Provider::Copilot => "copilot",
-            Provider::Vibe => "vibe",
             Provider::VibeBh => "vibebh",
-            Provider::Gemini => "gemini",
             Provider::Workflow => "workflow",
         }
     }
@@ -200,30 +150,17 @@ impl Provider {
     pub fn supports_resume(&self) -> bool {
         matches!(
             self,
-            Provider::Claude
-                | Provider::Glm
+            Provider::Glm
                 | Provider::Deepseek
-                | Provider::Inception
-                | Provider::Codex
                 | Provider::Brodex
-                | Provider::Copilot
-                | Provider::Vibe
                 | Provider::VibeBh
-                | Provider::Gemini
         )
     }
 
     pub fn is_streaming_json(&self) -> bool {
         matches!(
             self,
-            Provider::Claude
-                | Provider::Glm
-                | Provider::Deepseek
-                | Provider::Inception
-                | Provider::Codex
-                | Provider::Brodex
-                | Provider::Copilot
-                | Provider::VibeBh
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
         )
     }
 

@@ -12,8 +12,6 @@ pub mod resume_lease;
 pub mod supervision;
 pub mod tail;
 pub mod team;
-pub mod tmux;
-pub mod tmux_dispatch;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -1309,10 +1307,7 @@ pub fn spawn_task_interactive(
 }
 
 fn move_large_prompt_arg_to_stdin(provider: Provider, args: &mut Vec<String>) -> Option<String> {
-    if !matches!(
-        provider,
-        Provider::Claude | Provider::Glm | Provider::Deepseek
-    ) {
+    if !matches!(provider, Provider::Glm | Provider::Deepseek) {
         return None;
     }
     let mut idx = 0usize;
@@ -1564,102 +1559,6 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         });
     }
 
-    if provider == Provider::Gemini && session_id == "pending" {
-        if let Some(cwd_clone) = cwd.clone() {
-            let task_ref_watch = task.clone();
-            let task_store_watch = task_store.clone();
-            let tail_tx_watch = tail_tx.clone();
-            let store_dir_watch = store_dir.clone();
-            let task_id_watch = id.clone();
-            let started_at = task.inner.lock().started_at;
-            tokio::spawn(async move {
-                loop {
-                    {
-                        let inner = task_ref_watch.inner.lock();
-                        if inner.status != TaskStatus::Running || inner.session_id != "pending" {
-                            break;
-                        }
-                    }
-
-                    if let Some(sid) = providers::discover_gemini_session(
-                        started_at,
-                        &cwd_clone,
-                        Some(&task_id_watch),
-                    ) {
-                        let discovered = {
-                            let mut inner = task_ref_watch.inner.lock();
-                            if inner.session_id == "pending" {
-                                inner.session_id = sid.clone();
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if discovered {
-                            team::propagate_session_id(&task_id_watch, &sid, &store_dir_watch);
-                            task_store_watch.read().persist(&store_dir_watch);
-                            // Empty activity: session-id discovery notification,
-                            // not meaningful task progress — skip system event.
-                            let _ = tail_tx_watch.send(tail::TailEvent::TaskProgress {
-                                task_id: task_id_watch.clone(),
-                                activity: String::new(),
-                            });
-                        }
-                        break;
-                    }
-
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                }
-            });
-        }
-    }
-
-    if provider == Provider::Vibe && session_id == "pending" {
-        let task_ref_watch = task.clone();
-        let task_store_watch = task_store.clone();
-        let tail_tx_watch = tail_tx.clone();
-        let store_dir_watch = store_dir.clone();
-        let task_id_watch = id.clone();
-        let cwd_clone = cwd.clone().unwrap_or_default();
-        let started_at = task.inner.lock().started_at;
-        tokio::spawn(async move {
-            loop {
-                {
-                    let inner = task_ref_watch.inner.lock();
-                    if inner.status != TaskStatus::Running || inner.session_id != "pending" {
-                        break;
-                    }
-                }
-
-                if let Some(sid) = providers::discover_vibe_session(started_at, &cwd_clone) {
-                    let discovered = {
-                        let mut inner = task_ref_watch.inner.lock();
-                        if inner.session_id == "pending" {
-                            inner.session_id = sid.clone();
-                            true
-                        } else {
-                            false
-                        }
-                    };
-                    if discovered {
-                        populate_transcript_handle(&task_ref_watch);
-                        team::propagate_session_id(&task_id_watch, &sid, &store_dir_watch);
-                        task_store_watch.read().persist(&store_dir_watch);
-                        // Empty activity: session-id discovery notification,
-                        // not meaningful task progress — skip system event.
-                        let _ = tail_tx_watch.send(tail::TailEvent::TaskProgress {
-                            task_id: task_id_watch.clone(),
-                            activity: String::new(),
-                        });
-                    }
-                    break;
-                }
-
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            }
-        });
-    }
-
     // Spawn stdout reader — signals completion via oneshot so the process
     // waiter can ensure all output is consumed before marking the task done.
     let stdout = child.stdout.take().unwrap();
@@ -1668,8 +1567,6 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     let is_streaming = provider.is_streaming_json();
     let tail_tx_clone = tail_tx.clone();
     let task_id_clone = id.clone();
-    let env_overrides_export = env_overrides.clone();
-    let cwd_export = cwd.clone();
     let system_events_progress = system_events.clone();
     let disruption_store_dir = store_dir.clone();
     let disruption_task_id = id.clone();
@@ -1868,44 +1765,6 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
         let _ = stderr_done_rx.await;
         let code = status.ok().and_then(|s| s.code());
 
-        // Post-hoc vibe session discovery. Run unconditionally when
-        // session_id is still "pending"; discover_vibe_session falls
-        // back to the most-recent session within the start_ms window
-        // when project_dir is empty, so bro_exec without project_dir
-        // still gets a real session id.
-        if provider == Provider::Vibe {
-            let inner = task_ref_wait.inner.lock();
-            if inner.session_id == "pending" {
-                let start = inner.started_at;
-                let cwd_clone = inner.cwd.clone().unwrap_or_default();
-                drop(inner); // release lock before blocking call
-                if let Some(sid) = providers::discover_vibe_session(start, &cwd_clone) {
-                    task_ref_wait.inner.lock().session_id = sid;
-                }
-            }
-        }
-
-        if provider == Provider::Inception {
-            let session_id = {
-                let inner = task_ref_wait.inner.lock();
-                (inner.session_id != "pending").then(|| inner.session_id.clone())
-            };
-            if let Some(session_id) = session_id {
-                if let Some(sink) = export_opencode_session(
-                    provider,
-                    &session_id,
-                    cwd_export.as_deref(),
-                    env_overrides_export.as_ref(),
-                )
-                .await
-                {
-                    let mut inner = task_ref_wait.inner.lock();
-                    inner.supervision.observe_bulk_sink(&sink, now_ms());
-                    apply_sink_updates(&mut inner, sink);
-                }
-            }
-        }
-
         let (terminal_status, elapsed, cost, error_snippet, source_session, task_kind) = {
             let mut inner = task_ref_wait.inner.lock();
             inner.exit_code = code;
@@ -2011,53 +1870,6 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
     }
 }
 
-async fn export_opencode_session(
-    provider: Provider,
-    session_id: &str,
-    cwd: Option<&str>,
-    env_overrides: Option<&std::collections::HashMap<String, String>>,
-) -> Option<EventSink> {
-    let args = provider.build_export_args(session_id)?;
-
-    let path_env = providers::dispatch_path_env();
-
-    let raw_bin = provider.bin();
-    let bin = providers::resolve_bin(&raw_bin).unwrap_or(raw_bin);
-    let mut cmd = Command::new(&bin);
-    cmd.args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .env("PATH", &path_env)
-        .env("NO_COLOR", "1")
-        .env("TERM", "dumb")
-        .env("FORCE_COLOR", "0");
-    if let Some(cwd) = cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(overrides) = env_overrides {
-        for (k, v) in overrides {
-            cmd.env(k, v);
-        }
-    }
-
-    let output = cmd.output().await.ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let mut sink = EventSink {
-        last_assistant_message: None,
-        usage: None,
-        cost_usd: None,
-        num_turns: None,
-        session_id: Some(session_id.to_string()),
-    };
-    let raw = String::from_utf8_lossy(&output.stdout);
-    providers::parse_opencode_export(&raw, &mut sink);
-    Some(sink)
-}
-
 /// Wait for a task to complete. Returns immediately if already terminal.
 /// Uses `enable()` on the Notify future before checking status to avoid
 /// lost-wakeup races (TOCTOU between status check and await).
@@ -2139,13 +1951,7 @@ pub fn now_ms() -> u64 {
 
 fn apply_sink_updates(inner: &mut TaskInner, sink: EventSink) {
     // Merge — never CLEAR fields that were already captured during the
-    // streaming run by overwriting with None from a partial export.
-    // Observed failure: opencode's post-run `export` occasionally
-    // returns a messages array that hasn't yet flushed the new
-    // assistant turn (a session-DB write race), so sink ends up with
-    // last_assistant_message=None / num_turns=None. Without this guard
-    // we'd nuke valid streaming-captured text and the council drain
-    // would treat it as an empty reply.
+    // streaming run by overwriting with None from a partial update.
     if sink.last_assistant_message.is_some() {
         inner.last_assistant_message = sink.last_assistant_message;
     }
@@ -2269,110 +2075,6 @@ pub fn format_elapsed(started_at: u64, completed_at: Option<u64>) -> String {
     } else {
         format!("{}m {}s", s / 60, s % 60)
     }
-}
-
-/// Build a synthetic terminal-state task (no child process) for dispatch paths
-/// that complete out-of-band — e.g. tmux terminal-mode actor turns, where tmux
-/// owns the process and the turn is resolved from the transcript read plane.
-/// The task is already terminal, so `wait_for_task*` returns immediately.
-#[allow(clippy::too_many_arguments)]
-pub fn synthetic_terminal_task(
-    id: String,
-    provider: Provider,
-    session_id: String,
-    status: TaskStatus,
-    result: Option<String>,
-    stderr: String,
-    cwd: Option<String>,
-    transcript_location: Option<crate::transcripts::types::TranscriptLocation>,
-) -> Arc<Task> {
-    let now = now_ms();
-    Arc::new(Task {
-        inner: Mutex::new(TaskInner {
-            id,
-            provider,
-            session_id,
-            events: vec![],
-            last_assistant_message: result,
-            usage: None,
-            cost_usd: None,
-            num_turns: None,
-            stderr,
-            status,
-            started_at: now,
-            completed_at: Some(now),
-            exit_code: None,
-            cwd,
-            bro_label: None,
-            agent_label: None,
-            report: None,
-            recoverable: false,
-            transcript_location,
-            transcript_cursor: None,
-            supervision: SupervisionState::default(),
-        }),
-        notify: Arc::new(Notify::new()),
-        child_id: Mutex::new(None),
-    })
-}
-
-/// Build a `Running` terminal-mode task (no child process). Used by `bro_exec`/
-/// `bro_resume` terminal dispatch, which returns immediately while a background
-/// task drives the tmux turn and finalizes this record on completion.
-pub fn running_terminal_task(
-    id: String,
-    provider: Provider,
-    cwd: Option<String>,
-    bro_label: Option<String>,
-) -> Arc<Task> {
-    Arc::new(Task {
-        inner: Mutex::new(TaskInner {
-            id,
-            provider,
-            session_id: "pending".to_string(),
-            events: vec![],
-            last_assistant_message: None,
-            usage: None,
-            cost_usd: None,
-            num_turns: None,
-            stderr: String::new(),
-            status: TaskStatus::Running,
-            started_at: now_ms(),
-            completed_at: None,
-            exit_code: None,
-            cwd,
-            bro_label,
-            agent_label: None,
-            report: None,
-            recoverable: false,
-            transcript_location: None,
-            transcript_cursor: None,
-            supervision: SupervisionState::default(),
-        }),
-        notify: Arc::new(Notify::new()),
-        child_id: Mutex::new(None),
-    })
-}
-
-/// Finalize a running terminal task in place from a completed turn outcome.
-pub fn finalize_terminal_task(
-    task: &Arc<Task>,
-    session_id: String,
-    result: Option<String>,
-    status: TaskStatus,
-    stderr: String,
-    transcript_location: Option<crate::transcripts::types::TranscriptLocation>,
-) {
-    {
-        let mut inner = task.inner.lock();
-        inner.session_id = session_id;
-        inner.last_assistant_message = result;
-        inner.status = status;
-        inner.completed_at = Some(now_ms());
-        inner.stderr = stderr;
-        inner.transcript_location = transcript_location;
-    }
-    task.notify.notify_waiters();
 }
 
 pub fn task_result_json(task: &Task) -> Value {
@@ -2712,7 +2414,7 @@ mod tests {
             "stream-json".into(),
         ];
 
-        let stdin = move_large_prompt_arg_to_stdin(Provider::Claude, &mut args);
+        let stdin = move_large_prompt_arg_to_stdin(Provider::Glm, &mut args);
 
         assert_eq!(stdin.as_deref(), Some(prompt.as_str()));
         assert_eq!(
@@ -2730,12 +2432,12 @@ mod tests {
     #[test]
     fn small_or_non_claude_prompt_stays_in_argv() {
         let mut small_args = vec!["-p".into(), "hello".into()];
-        assert!(move_large_prompt_arg_to_stdin(Provider::Claude, &mut small_args).is_none());
+        assert!(move_large_prompt_arg_to_stdin(Provider::Glm, &mut small_args).is_none());
         assert_eq!(small_args, vec!["-p", "hello"]);
 
         let prompt = "x".repeat(PROMPT_STDIN_ARG_BYTES_THRESHOLD);
         let mut codex_args = vec!["exec".into(), "--json".into(), prompt];
-        assert!(move_large_prompt_arg_to_stdin(Provider::Codex, &mut codex_args).is_none());
+        assert!(move_large_prompt_arg_to_stdin(Provider::Brodex, &mut codex_args).is_none());
         assert_eq!(codex_args.len(), 3);
     }
 
@@ -2751,7 +2453,7 @@ mod tests {
             "stream-json".into(),
         ];
 
-        let stdin = move_large_prompt_arg_to_stdin(Provider::Claude, &mut args);
+        let stdin = move_large_prompt_arg_to_stdin(Provider::Glm, &mut args);
 
         assert_eq!(stdin.as_deref(), Some(prompt.as_str()));
         assert_eq!(
@@ -2766,7 +2468,7 @@ mod tests {
         let first = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-known".to_string(),
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 session_id: "session-a".to_string(),
                 events: vec![],
                 last_assistant_message: None,
@@ -2793,7 +2495,7 @@ mod tests {
         let second = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-known".to_string(),
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 session_id: "session-b".to_string(),
                 events: vec![],
                 last_assistant_message: None,
@@ -2836,7 +2538,7 @@ mod tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "task-reserved".to_string(),
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 session_id: "session-a".to_string(),
                 events: vec![],
                 last_assistant_message: None,
@@ -2883,7 +2585,7 @@ mod tests {
         let task = spawn_with_pre_minted_id(
             "task-known-id".to_string(),
             SpawnTaskParams {
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 args: Vec::new(),
                 session_id: "observed-session".to_string(),
                 cwd: None,
@@ -2931,7 +2633,7 @@ mod tests {
             project_dir: Some("/repo/x".into()),
             bro_name: Some("executor".into()),
             allow_recursion: false,
-            provider: Some(providers::Provider::Claude),
+            provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
         let out = apply_ambient("do stuff", &ctx);
@@ -2949,11 +2651,11 @@ mod tests {
         // Every provider relies on mechanical filtering now. Vibe has
         // no MCP to recurse through at all.
         for p in [
-            providers::Provider::Claude,
-            providers::Provider::Copilot,
-            providers::Provider::Codex,
-            providers::Provider::Gemini,
-            providers::Provider::Vibe,
+            providers::Provider::Glm,
+            providers::Provider::VibeBh,
+            providers::Provider::Brodex,
+            providers::Provider::Deepseek,
+            providers::Provider::VibeBh,
         ] {
             let ctx = AmbientContext {
                 allow_recursion: false,
@@ -2992,7 +2694,7 @@ mod tests {
         let ctx = AmbientContext {
             session_id: Some("sess-orch".into()),
             allow_recursion: true,
-            provider: Some(providers::Provider::Claude),
+            provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
         let out = apply_ambient("coordinate stuff", &ctx);
@@ -3171,7 +2873,7 @@ mod tests {
             coerce_workspace: true,
             allow_recursion: true,
             completion_contract: Some("emit done".into()),
-            provider: Some(providers::Provider::Claude),
+            provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
         let out = apply_ambient("work", &ctx);
@@ -3199,7 +2901,7 @@ mod tests {
         let ctx = AmbientContext {
             session_id: Some("sess-xyz".into()),
             allow_recursion: false,
-            provider: Some(providers::Provider::Claude),
+            provider: Some(providers::Provider::Glm),
             ..Default::default()
         };
         let wrapped = apply_brofile_lens(&apply_ambient("work", &ctx), Some("You are a reviewer"));
@@ -3215,7 +2917,7 @@ mod tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t1".into(),
-                provider: Provider::Claude,
+                provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
                 last_assistant_message: Some("Done!".into()),
@@ -3257,7 +2959,7 @@ mod tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t2".into(),
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 session_id: "s2".into(),
                 events: vec![],
                 last_assistant_message: None,
@@ -3296,7 +2998,7 @@ mod tests {
     fn fork_rejection_marks_failed_without_overwriting_result_state() {
         let mut inner = TaskInner {
             id: "t3".into(),
-            provider: Provider::Gemini,
+            provider: Provider::Deepseek,
             session_id: "requested-session".into(),
             events: vec![],
             last_assistant_message: Some("trusted prior result".into()),
@@ -3348,7 +3050,7 @@ mod tests {
     fn apply_sink_updates_replaces_task_observed_state() {
         let mut inner = TaskInner {
             id: "t4".into(),
-            provider: Provider::Gemini,
+            provider: Provider::Deepseek,
             session_id: "s1".into(),
             events: vec![],
             last_assistant_message: None,
@@ -3507,7 +3209,7 @@ mod async_tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t1".into(),
-                provider: Provider::Claude,
+                provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
                 last_assistant_message: None,
@@ -3541,7 +3243,7 @@ mod async_tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t2".into(),
-                provider: Provider::Claude,
+                provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
                 last_assistant_message: None,
@@ -3588,7 +3290,7 @@ mod async_tests {
         let task = Arc::new(Task {
             inner: Mutex::new(TaskInner {
                 id: "t3".into(),
-                provider: Provider::Claude,
+                provider: Provider::Glm,
                 session_id: "s1".into(),
                 events: vec![],
                 last_assistant_message: None,

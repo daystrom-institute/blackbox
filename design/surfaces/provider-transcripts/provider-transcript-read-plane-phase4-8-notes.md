@@ -174,7 +174,6 @@ Based on actual provider storage shapes:
 | Claude | `ByteOffset(u64)` | Append-only JSONL, byte offset sufficient |
 | Codex | `ByteOffset(u64)` | Same as Claude |
 | Gemini | `MessageIdSet(Vec<String>)` | Full-file re-parse; track seen message IDs |
-| OpenCode | `SqliteRow { table, timestamp_ms, id }` | Ordered query position |
 | Copilot | `ByteOffset(u64)` | Append-only JSONL |
 | Vibe | `ByteOffset(u64)` | Append-only JSONL |
 
@@ -189,7 +188,6 @@ For file-backed providers: `sha256(canonical_path)`. This is stable across
 daemon restarts and detects file replacement (e.g., session rotated to a new
 path after compaction).
 
-For SQLite-backed (OpenCode): `sha256(db_path + session_id)`. Detects DB file
 replacement.
 
 For provider-command-backed: `sha256(argv.join("\0") + session_id)`.
@@ -206,20 +204,12 @@ wait loop must:
 
 ---
 
-## Phase 6: OpenCode Adapter
 
 ### Surfaces that exist
 
 | Surface | Location | Notes |
 |---------|----------|-------|
-| `parse_opencode_event` | `providers.rs:1251` | Streaming JSON event parser (dispatch-time) |
-| `parse_opencode_export` | `providers.rs:1280` | Post-run bulk export parser |
-| `build_exec_args` (OpenCode) | `providers.rs:321-338` | `["run", "--format", "json", ...]` |
-| `build_resume_args` (OpenCode) | `providers.rs:453-469` | `["run", "--format", "json", "--session", id, ...]` |
 | `build_export_args` | `providers.rs:1119` | `["export", session_id]` |
-| `export_opencode_session` | `mod.rs:1323` | Async export runner |
-| `build_opencode_config` | `brofile.rs:240` | Generates JSON config with model, tools, instructions, MCP |
-| `OPENCODE_BIN` env | `config.rs:514` | Binary path override |
 
 ### Blocker: no rusqlite dependency
 
@@ -227,16 +217,13 @@ wait loop must:
 dependency decision. Recommendations:
 
 - `rusqlite` with `bundled` feature disabled (use system SQLite)
-- Feature-gate behind a `read-plane-opencode` feature flag if the team wants to
   defer the dependency
 - The adapter module (`src/transcripts/adapters.rs` from Phase 0) owns the import
   so it doesn't leak into parser/index code
 
 Estimated dependency weight: `rusqlite` adds ~2MB to the binary (non-bundled).
 
-### Blocker: OpenCode SQLite schema unknown
 
-The codebase references "opencode's session DB" in comments (providers.rs:1259,
 mod.rs:1464) but never opens or queries it. The design doc proposes:
 
 ```sql
@@ -246,17 +233,12 @@ SELECT name FROM sqlite_master WHERE type = 'table'
 This probe must run first. DB candidate paths:
 
 ```text
-~/.local/share/opencode/opencode.db
-~/.local/share/opencode/opencode-local.db
 ```
 
 The adapter should try both and prefer the one containing the target session_id.
 
-### Blocker: no OpenCode session discovery
 
 Unlike Gemini (`discover_gemini_session`) and Vibe (`discover_vibe_session`), there
-is NO `discover_opencode_session` function. Session IDs are captured only from
-streaming events during dispatch (`parse_opencode_event` reads `sessionID` from
 JSON events).
 
 For the read-plane adapter, session discovery means:
@@ -267,33 +249,23 @@ For the read-plane adapter, session discovery means:
 
 This is a NEW function that must be written. It can live in the adapter module.
 
-### Blocker: no OpenCode in find_session_file
 
 `find_session_file` (helpers.rs) handles Claude, Codex, Gemini, Copilot, Vibe
-but NOT OpenCode. Adding OpenCode requires either:
 
 - A SQLite query (not a file path lookup), or
-- Marking OpenCode as "no file path" and returning `None`
 
 The `BroRosterEntry.jsonl_path` field is `Option<String>` so `None` is valid.
-But workflow tools that need transcript access for OpenCode sessions must go
 through the adapter directly, not through `find_session_file`.
 
-### Blocker: no OpenCode indexing
 
 Same as Gemini — no scan, no bulk index function. Requires:
 
-1. `ReindexConfig` gains an `opencode_db: Option<PathBuf>`
-2. New `index_opencode_standalone` function
-3. SQLite query + `entity_id = "opencode:<session_id>:<message_id>:<part_idx>"`
 4. Cursor: `SqliteRow { table: "message", timestamp_ms, id }`
 
 ### Export adapter fallback
 
 The design doc mentions `TranscriptLocation::ProviderCommand` as a fallback.
-Current `parse_opencode_export` (providers.rs:1280) already does this:
 
-1. Run `opencode export <session_id>`
 2. Parse JSON output
 3. Extract session metadata + last assistant message
 
@@ -303,8 +275,6 @@ secondary adapter behind the SQLite primary.
 ### DB write race
 
 Comments at providers.rs:1255-1267 describe the race: streaming capture is
-preferred because "opencode's post-run export occasionally returns empty or
-stale data — the assistant message not yet flushed to opencode's session DB".
 The SQLite adapter must handle this gracefully:
 
 - Retry with backoff if a message query returns fewer parts than expected
@@ -457,7 +427,6 @@ Current `TaskInner` (mod.rs:64-102) has no such fields. Adding them requires:
 | Claude | Immediately (provided) | Dispatch start |
 | Codex | Immediately | Dispatch start |
 | Gemini | Late (background poll, mod.rs:1032) | After discovery |
-| OpenCode | From streaming events | After first event |
 | Copilot | Immediately | Dispatch start |
 | Vibe | Late (post-exit, mod.rs:1229) | After process exit |
 
@@ -535,7 +504,6 @@ Phase 0 (types + trait + projection)
   │                 ├── Phase 4 (Gemini)     ← needs entity_id in build_transcript_doc
   │                 ├── Phase 7 (Copilot/Vibe) ← Copilot is trivially parallel with Phase 4
   │                 └── Phase 5 (cursor store) ← independent of 3/4, needed by 6/8
-  │                       ├── Phase 6 (OpenCode) ← needs rusqlite + schema probe
   │                       └── Phase 8 (workflow) ← needs 4+5+6 for full coverage
 ```
 
@@ -548,7 +516,6 @@ Minimum phases for a working `provider_event` wait on Claude:
 3. Phase 5 (cursor store)
 4. Phase 8 (workflow integration)
 
-Gemini gates add Phase 4. OpenCode gates add Phase 6.
 Copilot/Vibe gates add Phase 7.
 
 ### Recommended implementation order for parallel work
@@ -558,7 +525,6 @@ After Phase 3 lands:
 1. **Phase 5 (cursor store)** — no provider dependencies, pure infrastructure
 2. **Phase 7 Copilot** (parallel with 5) — simplest adapter, validates the trait
 3. **Phase 4 (Gemini)** — needs entity_id extension, but parser/discovery exist
-4. **Phase 6 (OpenCode)** — largest new surface, blocked on rusqlite + schema probe
 5. **Phase 7 Vibe** (parallel with 6) — straightforward if heuristic error inference is acceptable
 6. **Phase 8 (workflow)** — last, integrates everything
 
@@ -568,7 +534,6 @@ After Phase 3 lands:
 
 ### Immediate (before Phase 0 starts)
 
-1. **OpenCode SQLite schema probe** — run `sqlite3 ~/.local/share/opencode/opencode.db ".tables"` and `.schema session`, `.schema message`, `.schema part` to confirm the query profile the adapter will use. This determines whether Phase 6's v1 query profile is viable or needs redesign.
 
 2. **Confirm entity_id field behavior** — verify that leaving `entity_id` empty on existing transcript docs doesn't break search/filter behavior. The field is `STRING | STORED` — empty string vs absent may differ in tantivy.
 
@@ -585,8 +550,6 @@ After Phase 3 lands:
 
 8. Add `rusqlite` to `Cargo.toml` (feature-gate optional)
 9. Write schema probe that validates required tables
-10. Implement `discover_opencode_session` (query session table by cwd)
-11. Write `index_opencode_standalone` using SQLite query + entity_id
 
 ### Phase 8 prerequisites (after Phases 4-5)
 

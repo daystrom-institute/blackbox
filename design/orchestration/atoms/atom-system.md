@@ -32,8 +32,6 @@ Related:
 - [Supervision](../supervision/supervision.md) and
   [Supervision Impl](../supervision/supervision-impl.md) - oracle / advisor / evaluation roles
   over running work.
-- [Tmux Portal Workflows](../workflows/tmux-portal-workflows.md) and
-  [Tmux Portal Impl](../workflows/tmux-portal-workflows-impl.md) - human projection and
   focus for live runs.
 - [Phase Decomposer](../phase-decomposer/phase-decomposer.md) and
   [Phase Decomposer Impl](../phase-decomposer/phase-decomposer-impl.md) - workflow-level
@@ -114,7 +112,6 @@ A bro has:
 - transcript cursor/location
 - supervision state
 
-`bro_exec`, `bro_resume`, `bro_cancel`, `bro_wait`, and the tmux portal remain
 runtime control tools. "Bro" is the imperative runtime noun: spawn one, resume
 one, cancel one, focus one.
 

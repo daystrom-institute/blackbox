@@ -185,72 +185,7 @@ fn header_fraction(headers: &HeaderMap, name: &str) -> Option<f64> {
         .map(|v| v.clamp(0.0, 1.0))
 }
 
-/// Parse Anthropic unified rate-limit headers. These utilizations are already
-/// fractions (e.g. `0.02`), unlike GLM/Codex percentages.
-fn parse_claude_ratelimit(
-    account: Option<String>,
-    headers: &HeaderMap,
-    now: u64,
-) -> Option<ProbeRecord> {
-    let five_hour = header_fraction(headers, "anthropic-ratelimit-unified-5h-utilization");
-    let seven_day = header_fraction(headers, "anthropic-ratelimit-unified-7d-utilization");
-    if five_hour.is_none() && seven_day.is_none() {
-        return None;
-    }
-    let status = headers
-        .get("anthropic-ratelimit-unified-status")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-    let exhausted =
-        status == "rejected" || five_hour.unwrap_or(0.0) >= 1.0 || seven_day.unwrap_or(0.0) >= 1.0;
-    let mut rec = base_record(Provider::Claude, account, now);
-    rec.five_hour_utilization = five_hour;
-    rec.seven_day_utilization = seven_day;
-    rec.quota_status = if exhausted {
-        QuotaStatus::Exhausted
-    } else {
-        QuotaStatus::Known
-    };
-    rec.raw_summary = Some(format!("claude unified rate-limit, status={status}"));
-    Some(rec)
-}
-
-async fn probe_claude(
-    client: &reqwest::Client,
-    home: &Path,
-    now: u64,
-) -> Option<(String, ProbeRecord)> {
-    let token = read_claude_oauth_token(home)?;
-    let result = async {
-        let resp = client
-            .post(CLAUDE_MESSAGES_URL)
-            .header("authorization", format!("Bearer {token}"))
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", "oauth-2025-04-20")
-            .header("content-type", "application/json")
-            .timeout(PROBE_TIMEOUT)
-            .json(&serde_json::json!({
-                "model": "claude-haiku-4-5-20251001",
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "ping"}]
-            }))
-            .send()
-            .await
-            .context("claude request failed")?;
-        parse_claude_ratelimit(None, resp.headers(), now)
-            .context("claude response had no unified rate-limit headers")
-    }
-    .await;
-    match result {
-        Ok(rec) => Some((lane_key(Provider::Claude, None), rec)),
-        Err(e) => {
-            tracing::warn!(error = %e, "claude probe failed");
-            None
-        }
-    }
-}
-
-// ── Codex: usage-endpoint (shared with Brodex) ──────────────────────────────
+// ── Brodex: ChatGPT usage-endpoint ──────────────────────────────────────────
 
 /// `(access_token, account_id)` from the codex CLI's `~/.codex/auth.json`.
 fn read_codex_auth(home: &Path) -> Option<(String, Option<String>)> {
@@ -320,12 +255,7 @@ async fn probe_codex(
             return Vec::new();
         }
     };
-    // Codex and Brodex both draw from the same ChatGPT plan quota, so one usage
-    // probe describes both lanes.
     let mut out = Vec::new();
-    if let Some(rec) = parse_codex_usage(Provider::Codex, &body, now) {
-        out.push((lane_key(Provider::Codex, None), rec));
-    }
     if let Some(rec) = parse_codex_usage(Provider::Brodex, &body, now) {
         out.push((lane_key(Provider::Brodex, None), rec));
     }
@@ -402,9 +332,6 @@ pub async fn refresh_account_probes(store_dir: &Path, home: &Path, now: u64) -> 
     let client = reqwest::Client::new();
     let mut probed: Vec<(String, ProbeRecord)> = Vec::new();
     probed.extend(probe_glm(&client, home, now).await);
-    if let Some(p) = probe_claude(&client, home, now).await {
-        probed.push(p);
-    }
     probed.extend(probe_codex(&client, home, now).await);
     if let Some(p) = probe_deepseek(&client, home, now).await {
         probed.push(p);
@@ -490,46 +417,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_claude_headers_reads_fractions_directly() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "0.02".parse().unwrap(),
-        );
-        h.insert(
-            "anthropic-ratelimit-unified-7d-utilization",
-            "0.17".parse().unwrap(),
-        );
-        h.insert(
-            "anthropic-ratelimit-unified-status",
-            "allowed".parse().unwrap(),
-        );
-        let rec = parse_claude_ratelimit(None, &h, 5).unwrap();
-        assert_eq!(rec.provider, Provider::Claude);
-        // Already fractions — NOT divided by 100.
-        assert_eq!(rec.five_hour_utilization, Some(0.02));
-        assert_eq!(rec.seven_day_utilization, Some(0.17));
-        assert!(matches!(rec.quota_status, QuotaStatus::Known));
-    }
-
-    #[test]
-    fn parse_claude_headers_rejected_status_is_exhausted() {
-        let mut h = HeaderMap::new();
-        h.insert(
-            "anthropic-ratelimit-unified-5h-utilization",
-            "0.5".parse().unwrap(),
-        );
-        h.insert(
-            "anthropic-ratelimit-unified-status",
-            "rejected".parse().unwrap(),
-        );
-        let rec = parse_claude_ratelimit(None, &h, 0).unwrap();
-        assert!(matches!(rec.quota_status, QuotaStatus::Exhausted));
-        // No utilization headers at all → no probe.
-        assert!(parse_claude_ratelimit(None, &HeaderMap::new(), 0).is_none());
-    }
-
-    #[test]
     fn parse_codex_usage_maps_windows_and_keys_both_lanes() {
         let body = serde_json::json!({
             "plan_type": "pro",
@@ -539,7 +426,7 @@ mod tests {
                 "secondary_window": {"used_percent": 17}
             }
         });
-        let codex = parse_codex_usage(Provider::Codex, &body, 9).unwrap();
+        let codex = parse_codex_usage(Provider::Brodex, &body, 9).unwrap();
         assert_eq!(codex.five_hour_utilization, Some(0.0));
         assert_eq!(codex.seven_day_utilization, Some(0.17));
         assert!(matches!(codex.quota_status, QuotaStatus::Known));
@@ -556,7 +443,7 @@ mod tests {
             "primary_window": {"used_percent": 100},
             "secondary_window": {"used_percent": 40}
         }});
-        let rec = parse_codex_usage(Provider::Codex, &body, 0).unwrap();
+        let rec = parse_codex_usage(Provider::Brodex, &body, 0).unwrap();
         assert!(matches!(rec.quota_status, QuotaStatus::Exhausted));
     }
 
@@ -597,15 +484,15 @@ mod tests {
         let store_dir = dir.path();
         // Seed a healthy probe for the lane (real utilization from a probe).
         let mut store = probe_store_load(store_dir);
-        let mut seed = base_record(Provider::Claude, None, 100);
+        let mut seed = base_record(Provider::Glm, None, 100);
         seed.five_hour_utilization = Some(0.4);
-        store.records.insert(lane_key(Provider::Claude, None), seed);
+        store.records.insert(lane_key(Provider::Glm, None), seed);
         probe_store_save(store_dir, &store);
 
         // A 429 lands on a real dispatch.
         record_disruption_cooldown(
             store_dir,
-            Provider::Claude,
+            Provider::Glm,
             None,
             Disruption::RateLimited,
             1000,
@@ -613,7 +500,7 @@ mod tests {
 
         let rec = probe_store_load(store_dir)
             .records
-            .remove(&lane_key(Provider::Claude, None))
+            .remove(&lane_key(Provider::Glm, None))
             .unwrap();
         // Cooldown set 300s out; the lane is now exhausted; utilization kept.
         assert_eq!(rec.cooldown_until, Some(1000 + 300_000));

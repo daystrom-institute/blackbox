@@ -13,49 +13,23 @@ impl Provider {
 
     fn bin_with_env(&self) -> String {
         match self {
-            Provider::Claude => std::env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".into()),
             // GLM/DeepSeek/Brodex/VibeBh ride the custom harness instead of a
             // vendor CLI; transport + credentials are selected via env (see
             // brofile::resolve_provider_env).
             Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
                 std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
             }
-            Provider::Inception => {
-                std::env::var("OPENCODE_BIN").unwrap_or_else(|_| "opencode".into())
-            }
-            Provider::Codex => std::env::var("CODEX_BIN").unwrap_or_else(|_| "codex".into()),
-            Provider::Copilot => std::env::var("COPILOT_BIN").unwrap_or_else(|_| "gh".into()),
-            Provider::Vibe => std::env::var("VIBE_BIN").unwrap_or_else(|_| "vibe".into()),
-            Provider::Gemini => std::env::var("GEMINI_BIN").unwrap_or_else(|_| "gemini".into()),
             Provider::Workflow => "workflow".into(),
         }
     }
 
-    pub fn bin_with_config(&self, cfg: &ProviderConfig) -> String {
+    pub fn bin_with_config(&self, _cfg: &ProviderConfig) -> String {
         match self {
-            Provider::Claude => cfg
-                .claude_bin
-                .clone()
-                .unwrap_or_else(|| self.bin_with_env()),
             // Harness providers resolve via BRO_HARNESS_BIN (bin_with_env);
             // no dedicated config override today.
             Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
                 self.bin_with_env()
             }
-            Provider::Inception => cfg
-                .opencode_bin
-                .clone()
-                .unwrap_or_else(|| self.bin_with_env()),
-            Provider::Codex => cfg.codex_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Copilot => cfg
-                .copilot_bin
-                .clone()
-                .unwrap_or_else(|| self.bin_with_env()),
-            Provider::Vibe => cfg.vibe_bin.clone().unwrap_or_else(|| self.bin_with_env()),
-            Provider::Gemini => cfg
-                .gemini_bin
-                .clone()
-                .unwrap_or_else(|| self.bin_with_env()),
             Provider::Workflow => "workflow".into(),
         }
     }
@@ -130,37 +104,6 @@ pub struct ExecOpts {
 }
 
 const EMPTY_SYSTEM_PROMPT_OVERRIDE: &str = "";
-pub(super) const CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE: &str = concat!(
-    "instructions=\"",
-    "You are operating autonomously in non-interactive mode. ",
-    "Do not use AskUserQuestion tools; halt if you encounter an unresolvable ambiguity.",
-    "\""
-);
-const CODEX_EMPTY_DEVELOPER_INSTRUCTIONS_OVERRIDE: &str = "developer_instructions=\"\"";
-pub(super) const CODEX_DISABLE_PROJECT_DOCS_OVERRIDE: &str = "project_doc_max_bytes=0";
-pub(super) const CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE: &str =
-    "include_permissions_instructions=false";
-const CODEX_DISABLE_APPS_INSTRUCTIONS_OVERRIDE: &str = "include_apps_instructions=false";
-const CODEX_DISABLE_COLLABORATION_INSTRUCTIONS_OVERRIDE: &str =
-    "include_collaboration_mode_instructions=false";
-const CODEX_DISABLE_ENVIRONMENT_CONTEXT_OVERRIDE: &str = "include_environment_context=false";
-pub(super) const CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE: &str =
-    "skills.include_instructions=false";
-
-fn append_codex_suppression_config(args: &mut Vec<String>) {
-    for override_value in [
-        CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE,
-        CODEX_EMPTY_DEVELOPER_INSTRUCTIONS_OVERRIDE,
-        CODEX_DISABLE_PROJECT_DOCS_OVERRIDE,
-        CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE,
-        CODEX_DISABLE_APPS_INSTRUCTIONS_OVERRIDE,
-        CODEX_DISABLE_COLLABORATION_INSTRUCTIONS_OVERRIDE,
-        CODEX_DISABLE_ENVIRONMENT_CONTEXT_OVERRIDE,
-        CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE,
-    ] {
-        args.extend(["-c".into(), override_value.into()]);
-    }
-}
 
 impl ExecOpts {
     pub fn with_provider_defaults(mut self, context: Option<&BrofileContext>) -> Self {
@@ -220,7 +163,7 @@ impl Provider {
         &self,
         prompt: &str,
         session_id: &str,
-        cwd: Option<&str>,
+        _cwd: Option<&str>,
         opts: Option<&ExecOpts>,
     ) -> Vec<String> {
         let model = opts
@@ -233,8 +176,7 @@ impl Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self {
-            Provider::Claude
-            | Provider::Glm
+            Provider::Glm
             | Provider::Deepseek
             | Provider::Brodex
             | Provider::VibeBh => {
@@ -270,87 +212,6 @@ impl Provider {
                 }
                 args
             }
-            Provider::Inception => {
-                let mut args = vec![
-                    "run".into(),
-                    "--format".into(),
-                    "json".into(),
-                    "--dangerously-skip-permissions".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["--variant".into(), e.into()]);
-                }
-                if let Some(c) = cwd {
-                    args.extend(["--dir".into(), c.into()]);
-                }
-                args.push(prompt.into());
-                args
-            }
-            Provider::Codex => {
-                let mut args = vec![
-                    "exec".into(),
-                    "--dangerously-bypass-approvals-and-sandbox".into(),
-                    "--json".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["-c".into(), format!("model_reasoning_effort=\"{e}\"")]);
-                }
-                if suppress_provider_defaults {
-                    append_codex_suppression_config(&mut args);
-                }
-                if let Some(c) = cwd {
-                    args.extend(["-C".into(), c.into()]);
-                }
-                args.push(prompt.into());
-                args
-            }
-            Provider::Copilot => {
-                let mut args = vec![
-                    "copilot".into(),
-                    "--".into(),
-                    "-p".into(),
-                    prompt.into(),
-                    "--yolo".into(),
-                    "--autopilot".into(),
-                    "--output-format".into(),
-                    "json".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["--effort".into(), e.into()]);
-                }
-                if let Some(c) = cwd {
-                    args.extend(["--add-dir".into(), c.into()]);
-                }
-                args
-            }
-            Provider::Vibe => {
-                // Vibe CLI has no `--model` flag; model selection is out-of-band.
-                let _ = model;
-                vec!["-p".into(), prompt.into(), "--output".into(), "json".into()]
-            }
-            Provider::Gemini => {
-                let mut args = vec![
-                    "-p".into(),
-                    prompt.into(),
-                    "--yolo".into(),
-                    "--skip-trust".into(),
-                    "-o".into(),
-                    "json".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                args
-            }
             Provider::Workflow => Vec::new(),
         }
     }
@@ -371,8 +232,7 @@ impl Provider {
             .is_some_and(ProviderDefaultsMode::suppresses);
 
         match self {
-            Provider::Claude
-            | Provider::Glm
+            Provider::Glm
             | Provider::Deepseek
             | Provider::Brodex
             | Provider::VibeBh => {
@@ -402,92 +262,6 @@ impl Provider {
                 if let Some(url) = transient_blackbox_url() {
                     let name = transient_blackbox_name();
                     args.extend(["--mcp-config".into(), claude_mcp_config_json(&name, &url)]);
-                }
-                args
-            }
-            Provider::Inception => {
-                let mut args = vec![
-                    "run".into(),
-                    "--format".into(),
-                    "json".into(),
-                    "--session".into(),
-                    session_id.into(),
-                    "--dangerously-skip-permissions".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["--variant".into(), e.into()]);
-                }
-                args.push(prompt.into());
-                args
-            }
-            Provider::Codex => {
-                let mut args = vec![
-                    "exec".into(),
-                    "resume".into(),
-                    "--dangerously-bypass-approvals-and-sandbox".into(),
-                    "--json".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["-c".into(), format!("model_reasoning_effort=\"{e}\"")]);
-                }
-                if suppress_provider_defaults {
-                    append_codex_suppression_config(&mut args);
-                }
-                args.push(session_id.into());
-                args.push(prompt.into());
-                args
-            }
-            Provider::Copilot => {
-                let mut args = vec![
-                    "copilot".into(),
-                    "--".into(),
-                    format!("--resume={session_id}"),
-                    "-p".into(),
-                    prompt.into(),
-                    "--yolo".into(),
-                    "--autopilot".into(),
-                    "--output-format".into(),
-                    "json".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
-                }
-                if let Some(e) = effort {
-                    args.extend(["--effort".into(), e.into()]);
-                }
-                args
-            }
-            Provider::Vibe => {
-                // Vibe CLI has no `--model` flag; see build_exec_args.
-                let _ = model;
-                vec![
-                    "--resume".into(),
-                    session_id.into(),
-                    "-p".into(),
-                    prompt.into(),
-                    "--output".into(),
-                    "json".into(),
-                ]
-            }
-            Provider::Gemini => {
-                let mut args = vec![
-                    "--resume".into(),
-                    session_id.into(),
-                    "-p".into(),
-                    prompt.into(),
-                    "--yolo".into(),
-                    "--skip-trust".into(),
-                    "-o".into(),
-                    "json".into(),
-                ];
-                if let Some(m) = model.as_deref() {
-                    args.extend(["--model".into(), m.into()]);
                 }
                 args
             }

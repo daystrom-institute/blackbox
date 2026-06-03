@@ -407,16 +407,10 @@ impl NormalizedTranscriptEvent {
         let byte_offset = self.raw.byte_offset?;
         let event_idx = self.raw.event_idx?;
         let provider = match self.provider {
-            Provider::Claude => "claude",
-            Provider::Codex => "codex",
             Provider::Brodex => "brodex",
-            Provider::Gemini => "gemini",
-            Provider::Copilot => "copilot",
-            Provider::Vibe => "vibe",
             Provider::VibeBh => "vibebh",
-            Provider::Glm => "opencode",
+            Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
-            Provider::Inception => "inception",
             Provider::Workflow => "workflow",
         };
         Some(format!(
@@ -457,7 +451,7 @@ mod tests {
     #[test]
     fn transcript_read_error_display_and_debug_do_not_leak_large_payloads() {
         let err = TranscriptReadError::InvalidJsonLine {
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             path: PathBuf::from("/tmp/session.jsonl"),
             byte_offset: 42,
             line_len: 40_000,

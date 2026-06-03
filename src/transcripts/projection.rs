@@ -238,10 +238,10 @@ mod tests {
             }),
         };
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
-            Provider::Claude,
+            Provider::Glm,
             parsed.clone(),
             RawTranscriptRef::jsonl(
-                Provider::Claude,
+                Provider::Glm,
                 super::super::types::TranscriptStorage::JsonlFile,
                 "/tmp/session.jsonl",
                 7,
@@ -296,10 +296,10 @@ mod tests {
             }),
         };
         let normalized = NormalizedTranscriptEvent::from_parsed_event(
-            Provider::Claude,
+            Provider::Glm,
             parsed,
             RawTranscriptRef::jsonl(
-                Provider::Claude,
+                Provider::Glm,
                 super::super::types::TranscriptStorage::JsonlFile,
                 "/tmp/session.jsonl",
                 7,

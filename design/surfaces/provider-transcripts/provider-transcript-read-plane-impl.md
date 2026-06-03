@@ -13,7 +13,6 @@ topic:
 Date: 2026-05-12
 Status: implemented and archived after `c3022b5`
 Companion to: `design/surfaces/provider-transcripts/provider-transcript-read-plane.md` (design);
-supports `design/orchestration/workflows/tmux-portal-workflows.md`.
 
 The implementation should land the read-plane abstraction without breaking
 the current Claude/Codex corpus behavior. The build order is deliberately
@@ -27,7 +26,6 @@ Phase 0 -> Phase 1 -> Phase 2 -> Phase 3
 ```
 
 Phases 0-3 are the core compatibility path. Phase 4 adds Gemini indexing,
-Phase 5 adds durable live-read cursors, Phase 6 adds OpenCode live reads,
 Phase 7 fills Copilot/Vibe where worth it, and Phase 8 exposes
 workflow-facing reads.
 
@@ -108,7 +106,6 @@ is wired.
   Tantivy schema in this phase.
 - The new document builder must be able to set `entity_id`. The current
   `build_transcript_doc` path does not populate `entity_id`; that is fine for
-  byte-offset JSONL identity, but it is not sufficient for Gemini/OpenCode
   documents that rely on stable provider ids.
 
 **Deliverable:** Types compile, but no behavior is routed through them yet.
@@ -450,7 +447,6 @@ Claude/Codex/Gemini.
 
 ---
 
-## Phase 6: OpenCode Adapter
 
 **Prerequisites:** Phase 0 and Phase 5. Phase 3 recommended.
 
@@ -475,8 +471,6 @@ Require at least `session`, `message`, and `part` for the v1
 settings. Do not take write locks. Default DB candidates:
 
 ```text
-~/.local/share/opencode/opencode.db
-~/.local/share/opencode/opencode-local.db
 ```
 
 Prefer the DB containing the requested `session_id`.
@@ -493,18 +487,13 @@ Use `TranscriptCursor::SqliteRow { table: "message", timestamp_ms,
 id }` for v1.
 
 6.5 **Export adapter fallback.** Implement `TranscriptLocation::ProviderCommand`
-for `opencode export <session_id>` only after the SQLite path exists. Use it
 as an explicit fallback, not as the default live workflow source.
 
 6.6 **Compare with current dispatch output.** Current orchestration reads:
 
-- streaming `opencode run --format json`
-- post-run `opencode export <session_id>`
 
 Add a debug/test utility that compares the SQLite adapter's last assistant
-message against `parse_opencode_export` for recent sessions.
 
-**Deliverable:** OpenCode sessions can be read from SQLite with stable cursors,
 or return explicit schema-drift errors.
 
 **Tests:**
@@ -557,7 +546,6 @@ capable or explicitly unsupported for durable workflow gates.
 
 ## Phase 8: Workflow and API Integration
 
-**Prerequisites:** Phases 0-5. OpenCode-specific workflow gates require Phase
 6. Copilot/Vibe gates require Phase 7.
 
 **What gets built:**
@@ -625,14 +613,11 @@ Claude/Codex/Gemini and degrade predictably when the read adapter fails.
 1. **No behavior change for Claude/Codex until Phase 2 tests prove parity.**
    The adapter path must emit the same indexed docs as the current parser
    path for existing fixtures.
-2. **No tmux portal implementation depends on read-plane internals.** Tmux
    receives `TranscriptLocation`/`TranscriptCursor` handles and normalized
    events only.
-3. **No schema bump unless required.** Use `entity_id` for Gemini/OpenCode
    identity first. Bump `INDEX_SCHEMA_VERSION` only if a new queryable/stored
    field is needed.
 4. **Provider-specific weirdness stays inside adapters.** Workflow gates,
-   `bro tail`, and tmux portal code must not know whether the provider is
    JSONL, full JSON, SQLite, or export-command backed.
 5. **Terminal capture is never a read-plane fallback.** It can become
    diagnostic evidence on failure, not canonical gate input.
@@ -645,8 +630,6 @@ Claude/Codex/Gemini and degrade predictably when the read adapter fails.
    `blackboxd` and `bro` share adapter code directly?
 2. Should Gemini context tools get a provider-specific context reader in Phase
    4, or is search-only Gemini indexing enough until workflow gates need it?
-3. Which OpenCode DB should win when multiple DBs contain the same session id?
-4. Does OpenCode `event_sequence` provide a better cursor than
    `message.time_created,id`?
 5. After Phase 7, should `bro tail` render normalized events directly, or
    keep using `TranscriptEvent` as its rich display model?

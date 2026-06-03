@@ -198,7 +198,6 @@ The axis set is itself a versioned, evolving artifact — not a fixed truth.
 > `mistral-vibe`. Both sources were cloned to `~/repos/`. New-axis cells (the
 > five † axes) are seeded per subject as each is mined, not pre-generated.
 
-Candidate subjects (not yet seeded): OpenCode (Inception transport, 1.14.25 on
 this host), Copilot CLI, Cursor agent.
 
 ## 5. Frontmatter schema

@@ -30,177 +30,26 @@ impl Provider {
 
     pub fn build_mcp_add_http_args_full(
         &self,
-        name: &str,
-        url: &str,
-        exclude_tools: &[String],
-        headers: &BTreeMap<String, String>,
-        scope: &str,
+        _name: &str,
+        _url: &str,
+        _exclude_tools: &[String],
+        _headers: &BTreeMap<String, String>,
+        _scope: &str,
     ) -> Option<Vec<String>> {
-        match self {
-            Provider::Claude => {
-                let scope_flag = match scope {
-                    "user" | "project" | "local" => scope,
-                    _ => return None,
-                };
-                let mut args = vec![
-                    "mcp".into(),
-                    "add".into(),
-                    "-s".into(),
-                    scope_flag.into(),
-                    "--transport".into(),
-                    "http".into(),
-                ];
-                for (k, v) in headers {
-                    args.push("-H".into());
-                    args.push(format!("{k}: {v}"));
-                }
-                args.extend([name.into(), url.into()]);
-                Some(args)
-            }
-            Provider::Inception => None,
-            Provider::Copilot => {
-                if scope != "user" {
-                    return None;
-                }
-                if !headers.is_empty() {
-                    tracing::debug!(target: "blackbox::mcp",
-                        "copilot mcp add: dropping {} header(s) (no documented header flag)",
-                        headers.len());
-                }
-                Some(vec![
-                    "copilot".into(),
-                    "--".into(),
-                    "mcp".into(),
-                    "add".into(),
-                    "--transport".into(),
-                    "http".into(),
-                    name.into(),
-                    url.into(),
-                ])
-            }
-            Provider::Codex => {
-                if scope != "user" {
-                    return None;
-                }
-                if !headers.is_empty() {
-                    tracing::debug!(target: "blackbox::mcp",
-                        "codex mcp add: dropping {} header(s) (only --bearer-token-env-var supported)",
-                        headers.len());
-                }
-                Some(vec![
-                    "mcp".into(),
-                    "add".into(),
-                    name.into(),
-                    "--url".into(),
-                    url.into(),
-                ])
-            }
-            Provider::Gemini => {
-                let scope_flag = match scope {
-                    "user" | "project" => scope,
-                    _ => return None,
-                };
-                let mut args = vec![
-                    "mcp".into(),
-                    "add".into(),
-                    "-t".into(),
-                    "http".into(),
-                    "-s".into(),
-                    scope_flag.into(),
-                ];
-                if !exclude_tools.is_empty() {
-                    args.extend(["--exclude-tools".into(), exclude_tools.join(",")]);
-                }
-                for (k, v) in headers {
-                    args.push("-H".into());
-                    args.push(format!("{k}: {v}"));
-                }
-                args.extend([name.into(), url.into()]);
-                Some(args)
-            }
-            // Harness providers (glm/deepseek/brodex/vibebh) use transient
-            // inline --mcp-config injection, not vendor-CLI mcp add/remove/list.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
-            Provider::Vibe | Provider::Workflow => None,
-        }
+        None
     }
 
-    pub fn build_mcp_remove_args(&self, name: &str) -> Option<Vec<String>> {
-        self.build_mcp_remove_args_scoped(name, "user")
+    pub fn build_mcp_remove_args(&self, _name: &str) -> Option<Vec<String>> {
+        None
     }
 
-    pub fn build_mcp_remove_args_scoped(&self, name: &str, scope: &str) -> Option<Vec<String>> {
-        match self {
-            Provider::Claude => {
-                let scope_flag = match scope {
-                    "user" | "project" | "local" => scope,
-                    _ => return None,
-                };
-                Some(vec![
-                    "mcp".into(),
-                    "remove".into(),
-                    "-s".into(),
-                    scope_flag.into(),
-                    name.into(),
-                ])
-            }
-            Provider::Inception => None,
-            Provider::Copilot => {
-                if scope != "user" {
-                    return None;
-                }
-                Some(vec![
-                    "copilot".into(),
-                    "--".into(),
-                    "mcp".into(),
-                    "remove".into(),
-                    name.into(),
-                ])
-            }
-            Provider::Codex => {
-                if scope != "user" {
-                    return None;
-                }
-                Some(vec!["mcp".into(), "remove".into(), name.into()])
-            }
-            Provider::Gemini => {
-                let scope_flag = match scope {
-                    "user" | "project" => scope,
-                    _ => return None,
-                };
-                Some(vec![
-                    "mcp".into(),
-                    "remove".into(),
-                    "-s".into(),
-                    scope_flag.into(),
-                    name.into(),
-                ])
-            }
-            // Harness providers (glm/deepseek/brodex/vibebh) use transient
-            // inline --mcp-config injection, not vendor-CLI mcp add/remove/list.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
-            Provider::Vibe | Provider::Workflow => None,
-        }
+    pub fn build_mcp_remove_args_scoped(&self, _name: &str, _scope: &str) -> Option<Vec<String>> {
+        None
     }
 
     #[allow(dead_code)]
     pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
-        match self {
-            Provider::Claude => Some(vec!["mcp".into(), "list".into()]),
-            Provider::Inception => None,
-            Provider::Copilot => Some(vec![
-                "copilot".into(),
-                "--".into(),
-                "mcp".into(),
-                "list".into(),
-            ]),
-            Provider::Codex => Some(vec!["mcp".into(), "list".into()]),
-            Provider::Gemini => Some(vec!["mcp".into(), "list".into()]),
-            // Harness providers (glm/deepseek/brodex/vibebh) use transient
-            // inline --mcp-config injection, not vendor-CLI mcp add/remove/list.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => None,
-            Provider::Vibe | Provider::Workflow => None,
-        }
+        None
     }
 
     #[allow(dead_code)]
@@ -221,18 +70,6 @@ impl Provider {
         }
         let mut args = Vec::new();
         match self {
-            Provider::Claude => {
-                let expanded = expand_filter_patterns(&filters.disallow);
-                if !expanded.is_empty() {
-                    args.push("--disallowedTools".into());
-                    args.push(expanded.join(" "));
-                }
-                let expanded_allow = expand_filter_patterns(&filters.allow);
-                if !expanded_allow.is_empty() {
-                    args.push("--allowedTools".into());
-                    args.push(expanded_allow.join(" "));
-                }
-            }
             // Harness providers take a comma-separated, fully-qualified
             // allow/deny list (`mcp__<server>__<tool>`) that the harness
             // enforces in-registry — its own flag names, since it doesn't
@@ -251,32 +88,6 @@ impl Provider {
                     args.push(allow.join(","));
                 }
             }
-            Provider::Inception => {}
-            Provider::Copilot => {
-                for p in expand_filter_patterns(&filters.disallow) {
-                    args.push(format!(
-                        "--deny-tool={}",
-                        copilot_format_mcp_tool(&p).unwrap_or(p)
-                    ));
-                }
-                for p in expand_filter_patterns(&filters.allow) {
-                    args.push(format!(
-                        "--allow-tool={}",
-                        copilot_format_mcp_tool(&p).unwrap_or(p)
-                    ));
-                }
-            }
-            Provider::Codex => {
-                emit_codex_filter_overrides(&mut args, &filters.disallow, "disabled_tools");
-                emit_codex_filter_overrides(&mut args, &filters.allow, "enabled_tools");
-            }
-            Provider::Gemini => {}
-            Provider::Vibe => {
-                for p in expand_filter_patterns(&filters.allow) {
-                    args.push("--enabled-tools".into());
-                    args.push(p);
-                }
-            }
             Provider::Workflow => {}
         }
         args
@@ -286,11 +97,10 @@ impl Provider {
     pub fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,
-            Provider::Claude
-                | Provider::Copilot
-                | Provider::Codex
-                | Provider::Gemini
-                | Provider::Vibe
+            Provider::Glm
+                | Provider::Deepseek
+                | Provider::Brodex
+                | Provider::VibeBh
         )
     }
 
@@ -308,19 +118,13 @@ impl Provider {
             return Vec::new();
         }
         match self {
-            Provider::Claude
-            | Provider::Glm
+            Provider::Glm
             | Provider::Deepseek
             | Provider::Brodex
             | Provider::VibeBh => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
-            Provider::Codex
-            | Provider::Gemini
-            | Provider::Copilot
-            | Provider::Inception
-            | Provider::Vibe
-            | Provider::Workflow => Vec::new(),
+            Provider::Workflow => Vec::new(),
         }
     }
 }
@@ -382,6 +186,7 @@ fn to_json_object(m: &BTreeMap<String, String>) -> Value {
     )
 }
 
+#[cfg(test)]
 fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key: &str) {
     if patterns.is_empty() {
         return;
@@ -399,6 +204,7 @@ fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key:
     }
 }
 
+#[cfg(test)]
 fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<String>)> {
     let universe: Vec<&str> = crate::tool_docs::all_tool_names();
     let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -438,6 +244,7 @@ fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<Strin
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn copilot_format_mcp_tool(full: &str) -> Option<String> {
     let rest = full.strip_prefix("mcp__")?;
     let (server, tool) = rest.split_once("__")?;
@@ -472,16 +279,13 @@ pub(super) fn format_toml_string_array(items: &[String]) -> String {
     format_toml_string_array_impl(items)
 }
 
-#[cfg(not(test))]
-fn format_toml_string_array(items: &[String]) -> String {
-    format_toml_string_array_impl(items)
-}
-
+#[cfg(test)]
 fn format_toml_string_array_impl(items: &[String]) -> String {
     let quoted: Vec<String> = items.iter().map(|s| toml_basic_string(s)).collect();
     format!("[{}]", quoted.join(","))
 }
 
+#[cfg(test)]
 fn toml_basic_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');

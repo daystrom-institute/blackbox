@@ -143,7 +143,6 @@ The prior draft listed four env vars in a single table. The actual surface is ~3
 | Bro home / store | `BRO_HOME`, `BRO_STORE` | **Collapse to `BRO_HOME` only**; warn on `BRO_STORE` use |
 | Task TTL | `BRO_TASK_TTL_MS` | TOML `[daemon].task_ttl_ms` |
 | Provider extra PATH | `BRO_EXTRA_PATH` | env-only |
-| Provider binaries | `CLAUDE_BIN` / `CODEX_BIN` / `GEMINI_BIN` / `COPILOT_BIN` / `OPENCODE_BIN` / `VIBE_BIN` | TOML `[providers]` (key omitted = `$PATH` lookup) |
 | Vibe session dir | `VIBE_SESSION_DIR` | TOML `[providers]` |
 | LSP binaries | `BLACKBOX_JDTLS_BIN`, `BLACKBOX_RUST_ANALYZER_BIN`, `RUST_ANALYZER_BIN` | TOML `[lsp]`; **deprecate unprefixed `RUST_ANALYZER_BIN`** |
 | Provider global memory paths | `BLACKBOX_GLOBAL_CLAUDE_MD` / `CODEX_MD` / `GEMINI_MD` / `COMMON_MD` | env-only (override hatch); see migration A above for default change |
@@ -192,7 +191,6 @@ git_notes_namespace           = "bbox-provenance"
 # codex_bin    = "/usr/local/bin/codex"
 # gemini_bin   = "..."
 # copilot_bin  = "..."
-# opencode_bin = "..."
 # vibe_bin     = "..."
 # vibe_session_dir = "~/.vibe"
 

@@ -13,23 +13,6 @@ pub(crate) fn validate_workflow_capabilities(
     state: &Arc<SharedState>,
 ) -> Result<(), String> {
     for (actor_name, actor) in &compiled.spec.actors {
-        // Terminal-mode (tmux) eligibility is a brofile attribute, independent
-        // of `requires`. If an executor actor's brofile dispatches in tmux mode,
-        // its provider must be TUI-capable — fail closed, since terminal mode
-        // requires an interactive TUI.
-        if let Some(brofile_name) = actor.brofile.as_deref()
-            && let Some(bf) =
-                orchestration::brofile::resolve_brofile(brofile_name, &state.store_dir, None)
-            && bf.is_terminal()
-            && !bf.provider.tui_capable()
-        {
-            return Err(format!(
-                "actor '{actor_name}' uses terminal_mode=tmux brofile '{brofile_name}', but \
-                 provider '{}' is not TUI-capable; terminal mode requires an interactive TUI \
-                 (Claude/Codex), so harness-backed providers (brodex/glm/deepseek) are not eligible",
-                bf.provider
-            ));
-        }
         if actor.requires.is_empty() {
             continue;
         }
@@ -342,8 +325,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
         let compiled = runtime_actor_workflow(vec![
-            orchestration::providers::Provider::Gemini,
-            orchestration::providers::Provider::Codex,
+            orchestration::providers::Provider::Deepseek,
+            orchestration::providers::Provider::Brodex,
         ]);
 
         validate_workflow_capabilities(&compiled, &state).unwrap();
@@ -353,7 +336,7 @@ mod tests {
     fn runtime_actor_capability_validation_fails_when_no_candidate_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
-        let compiled = runtime_actor_workflow(vec![orchestration::providers::Provider::Gemini]);
+        let compiled = runtime_actor_workflow(vec![orchestration::providers::Provider::Deepseek]);
 
         let err = validate_workflow_capabilities(&compiled, &state).unwrap_err();
         assert!(

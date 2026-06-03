@@ -55,14 +55,10 @@ pub fn find_session_file(
         &registry_config,
     );
     for provider in [
-        crate::orchestration::providers::Provider::Claude,
-        crate::orchestration::providers::Provider::Codex,
-        crate::orchestration::providers::Provider::Gemini,
-        crate::orchestration::providers::Provider::Copilot,
-        crate::orchestration::providers::Provider::Vibe,
         crate::orchestration::providers::Provider::Glm,
         crate::orchestration::providers::Provider::Deepseek,
-        crate::orchestration::providers::Provider::Inception,
+        crate::orchestration::providers::Provider::Brodex,
+        crate::orchestration::providers::Provider::VibeBh,
     ] {
         if let Ok(Some(location)) = registry.locate(provider, session_id)
             && matches!(
@@ -116,67 +112,6 @@ pub fn find_session_file(
                     .unwrap_or_default();
                 if name.contains(session_id) {
                     return Some(p.to_path_buf());
-                }
-            }
-        }
-    }
-
-    // Gemini layout: ~/.gemini/tmp/<project>/chats/session-<ts>-<first8>.json
-    // Filename carries only the first 8 chars of the session UUID.
-    if let Some(home) = dirs::home_dir() {
-        let gemini_tmp = home.join(".gemini").join("tmp");
-        if gemini_tmp.exists() && session_id.len() >= 8 {
-            let prefix = &session_id[..8];
-            let needle = format!("-{prefix}.json");
-            for entry in WalkDir::new(&gemini_tmp)
-                .follow_links(true)
-                .max_depth(4)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                let p = entry.path();
-                if p.extension().map(|e| e != "json").unwrap_or(true) {
-                    continue;
-                }
-                let name = p
-                    .file_name()
-                    .map(|n| n.to_string_lossy())
-                    .unwrap_or_default();
-                if name.starts_with("session-") && name.ends_with(&needle) {
-                    return Some(p.to_path_buf());
-                }
-            }
-        }
-    }
-
-    // Copilot layout: ~/.copilot/session-state/<full-session-id>/events.jsonl
-    // Directory name IS the full session UUID.
-    if let Some(home) = dirs::home_dir() {
-        let candidate = home
-            .join(".copilot")
-            .join("session-state")
-            .join(session_id)
-            .join("events.jsonl");
-        if candidate.exists() {
-            return Some(candidate);
-        }
-    }
-
-    // Vibe layout: ~/.vibe/logs/session/session_<date>_<time>_<first8>/messages.jsonl
-    if let Some(home) = dirs::home_dir() {
-        let vibe_root = home.join(".vibe").join("logs").join("session");
-        if vibe_root.exists() && session_id.len() >= 8 {
-            let prefix = &session_id[..8];
-            let needle = format!("_{prefix}");
-            if let Ok(entries) = std::fs::read_dir(&vibe_root) {
-                for entry in entries.filter_map(|e| e.ok()) {
-                    let name = entry.file_name().to_string_lossy().into_owned();
-                    if name.starts_with("session_") && name.ends_with(&needle) {
-                        let msg_file = entry.path().join("messages.jsonl");
-                        if msg_file.exists() {
-                            return Some(msg_file);
-                        }
-                    }
                 }
             }
         }

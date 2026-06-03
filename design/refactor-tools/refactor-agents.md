@@ -66,7 +66,6 @@ This design specifies the **atomic refactor agent** as a class of
   and outputs (consumable by chained agents or by an orchestrator,
   though validation is advisory in v1).
 - Each atom is `cross-provider` — any caller (Claude, Codex, Gemini,
-  OpenCode) can dispatch it; the brofile decides which provider
   executes.
 - Each atom is `discoverable` via `bro_agent_search` so callers find it
   by intent rather than name.

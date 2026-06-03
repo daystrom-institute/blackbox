@@ -392,72 +392,45 @@ pub fn built_in_config() -> AllocatorConfig {
     tier(
         "economy",
         vec![
-            (Claude, Some("claude-haiku-4-5-20251001"), Some("low"), None),
-            (Codex, Some("gpt-5.3-codex-spark"), Some("low"), None),
-            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
             (Brodex, Some("gpt-5.3-codex-spark"), Some("low"), None),
-            // Copilot mirrors the codex GPT lane (spark -> mini).
-            (Copilot, Some("gpt-5.3-codex-mini"), Some("low"), None),
             (Glm, Some("glm-4.5-air"), Some("low"), None),
             (Deepseek, Some("deepseek-v4-flash"), Some("low"), None),
-            (Gemini, Some("gemini-3.1-flash-lite-preview"), None, None),
-            (Vibe, None, None, None),
+            (VibeBh, Some("devstral-small-latest"), Some("none"), None),
         ],
     );
     tier(
         "standard",
         vec![
-            (Claude, Some("claude-sonnet-4-6"), Some("high"), None),
-            (Codex, Some("gpt-5.5"), Some("medium"), None),
-            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
             (Brodex, Some("gpt-5.5"), Some("medium"), None),
-            // Copilot mirrors the codex GPT lane.
-            (Copilot, Some("gpt-5.5"), Some("medium"), None),
             (Glm, Some("glm-5-turbo"), Some("medium"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("medium"), None),
-            (Gemini, Some("gemini-3-flash-preview"), None, None),
-            (Vibe, None, None, None),
+            (VibeBh, Some("mistral-medium-3.5"), Some("high"), None),
         ],
     );
     tier(
         "premium",
         vec![
-            (Claude, Some("claude-opus-4-8"), Some("high"), None),
-            (Codex, Some("gpt-5.5"), Some("high"), None),
-            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
             (Brodex, Some("gpt-5.5"), Some("high"), None),
-            // Copilot mirrors the codex GPT lane.
-            (Copilot, Some("gpt-5.5"), Some("high"), None),
             (Glm, Some("glm-5.1"), Some("high"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("high"), None),
-            (Gemini, Some("gemini-3.1-pro-preview"), None, None),
+            (VibeBh, Some("magistral-medium-latest"), Some("high"), None),
         ],
     );
     tier(
         "deepthink",
         vec![
-            (Claude, Some("claude-opus-4-8"), Some("xhigh"), None),
-            (Codex, Some("gpt-5.5"), Some("xhigh"), None),
-            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
             (Brodex, Some("gpt-5.5"), Some("xhigh"), None),
-            // Copilot mirrors the codex GPT lane.
-            (Copilot, Some("gpt-5.5"), Some("xhigh"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("max"), None),
+            (VibeBh, Some("magistral-medium-latest"), Some("high"), None),
         ],
     );
     tier(
         "super-el-cheapo-drones",
         vec![
-            (Codex, Some("gpt-5.3-codex-spark"), Some("low"), Some(1.0)),
-            // Brodex (Codex/ChatGPT via bro-harness) mirrors the codex lane.
             (Brodex, Some("gpt-5.3-codex-spark"), Some("low"), Some(1.0)),
-            // Copilot mirrors the codex GPT lane (spark -> mini).
-            (Copilot, Some("gpt-5.3-codex-mini"), Some("low"), Some(1.0)),
             (Glm, Some("glm-4.5-air"), Some("low"), Some(0.8)),
             (Deepseek, Some("deepseek-v4-flash"), Some("low"), Some(0.8)),
-            // Vibe is model-less (host-bound via VIBE_ACTIVE_MODEL/agent);
-            // it joins as a cheap local-drone lane with no model slug.
-            (Vibe, None, None, Some(0.8)),
+            (VibeBh, Some("devstral-small-latest"), Some("none"), Some(0.8)),
         ],
     );
 
@@ -465,12 +438,12 @@ pub fn built_in_config() -> AllocatorConfig {
     pools.insert(
         "coding".into(),
         PoolConfig {
-            providers: vec![Codex, Claude, Glm, Deepseek],
+            providers: vec![Brodex, Glm, Deepseek, VibeBh],
             provider_weights: provider_weights(&[
+                (Brodex, 1.0),
                 (Glm, 1.0),
-                (Claude, 0.82),
-                (Codex, 0.68),
                 (Deepseek, 0.55),
+                (VibeBh, 0.45),
             ]),
             max_concurrent_per_account: Some(1),
         },
@@ -478,15 +451,12 @@ pub fn built_in_config() -> AllocatorConfig {
     pools.insert(
         "any".into(),
         PoolConfig {
-            providers: vec![Glm, Claude, Codex, Deepseek, Gemini, Inception, Vibe],
+            providers: vec![Glm, Brodex, Deepseek, VibeBh],
             provider_weights: provider_weights(&[
                 (Glm, 1.0),
-                (Claude, 0.82),
-                (Codex, 0.68),
+                (Brodex, 0.68),
                 (Deepseek, 0.55),
-                (Gemini, 0.45),
-                (Inception, 0.35),
-                (Vibe, 0.25),
+                (VibeBh, 0.45),
             ]),
             max_concurrent_per_account: Some(1),
         },
@@ -1256,7 +1226,7 @@ fn fallback_lane(request: &RuntimeRequest) -> RuntimeLane {
                 .as_ref()
                 .and_then(|pool| pool.providers.first().copied())
         })
-        .unwrap_or(Provider::Codex);
+        .unwrap_or(Provider::Brodex);
     untiered_lane(provider, None, request.pin.as_ref())
 }
 
@@ -1647,7 +1617,6 @@ mod tests {
             "CODEX_BIN",
             "GEMINI_BIN",
             "VIBE_BIN",
-            "OPENCODE_BIN",
             "COPILOT_BIN",
             "BRO_HARNESS_BIN",
         ];
@@ -1700,7 +1669,7 @@ mod tests {
                 tier: Some("standard".into()),
                 pool: Some(PoolRef {
                     name: Some("coding".into()),
-                    providers: vec![Provider::Codex],
+                    providers: vec![Provider::Brodex],
                 }),
                 durable: true,
                 ..Default::default()
@@ -1719,7 +1688,7 @@ mod tests {
                 "{:?}",
                 allocation.trace.error
             );
-            assert_eq!(allocation.lane.provider, Provider::Codex);
+            assert_eq!(allocation.lane.provider, Provider::Brodex);
             assert_eq!(allocation.lane.model.as_deref(), Some("gpt-5.5"));
             assert_eq!(allocation.lane.effort.as_deref(), Some("medium"));
         });
@@ -1740,7 +1709,7 @@ mod tests {
             // The dispatch seam seeds a pin from the brofile's static provider.
             let request = pin_static_provider_if_inert(
                 inert,
-                Provider::Codex,
+                Provider::Brodex,
                 Some("gpt-5.5".into()),
                 Some("medium".into()),
             )
@@ -1762,7 +1731,7 @@ mod tests {
             );
             // Honors the declared provider instead of free-selecting across
             // Provider::ALL — the pre-fix bug landed on claude-opus-4-8.
-            assert_eq!(allocation.lane.provider, Provider::Codex);
+            assert_eq!(allocation.lane.provider, Provider::Brodex);
             assert_eq!(allocation.lane.model.as_deref(), Some("gpt-5.5"));
             assert_eq!(allocation.lane.effort.as_deref(), Some("medium"));
         });
@@ -1776,7 +1745,7 @@ mod tests {
                 tier: Some("standard".into()),
                 pool: Some(PoolRef {
                     name: None,
-                    providers: vec![Provider::Gemini],
+                    providers: vec![Provider::Deepseek],
                 }),
                 capabilities: vec![Capability::StructuredOutput],
                 ..Default::default()
@@ -1810,7 +1779,7 @@ mod tests {
             let request = RuntimeRequest {
                 tier: Some("standard".into()),
                 pin: Some(RuntimePin {
-                    provider: Some(Provider::Codex),
+                    provider: Some(Provider::Brodex),
                     model: Some("gpt-5.3-codex-spark".into()),
                     authority: PinAuthority::Operator,
                     ..Default::default()
@@ -1831,7 +1800,7 @@ mod tests {
                 "{:?}",
                 allocation.trace.error
             );
-            assert_eq!(allocation.lane.provider, Provider::Codex);
+            assert_eq!(allocation.lane.provider, Provider::Brodex);
             assert_eq!(
                 allocation.lane.model.as_deref(),
                 Some("gpt-5.3-codex-spark")
@@ -1846,7 +1815,7 @@ mod tests {
             let request = RuntimeRequest {
                 tier: Some("standard".into()),
                 pin: Some(RuntimePin {
-                    provider: Some(Provider::Codex),
+                    provider: Some(Provider::Brodex),
                     model: Some("not-a-real-codex-model".into()),
                     authority: PinAuthority::Operator,
                     ..Default::default()
@@ -1890,7 +1859,7 @@ mod tests {
             let cfg = built_in_config();
             let request = RuntimeRequest {
                 pin: Some(RuntimePin {
-                    provider: Some(Provider::Vibe),
+                    provider: Some(Provider::VibeBh),
                     model: Some("ignored-model".into()),
                     authority: PinAuthority::Operator,
                     ..Default::default()
@@ -1935,7 +1904,7 @@ mod tests {
             let request = RuntimeRequest {
                 tier: Some("standard".into()),
                 pin: Some(RuntimePin {
-                    provider: Some(Provider::Gemini),
+                    provider: Some(Provider::Deepseek),
                     effort: Some("high".into()),
                     authority: PinAuthority::Operator,
                     ..Default::default()
@@ -1981,10 +1950,10 @@ mod tests {
                 tier: Some("standard".into()),
                 pool: Some(PoolRef {
                     name: Some("coding".into()),
-                    providers: vec![Provider::Glm, Provider::Claude],
+                    providers: vec![Provider::Glm, Provider::Glm],
                 }),
                 prefer: Some(RuntimePreference {
-                    provider: Some(Provider::Claude),
+                    provider: Some(Provider::Glm),
                 }),
                 ..Default::default()
             };
@@ -2002,7 +1971,7 @@ mod tests {
                 "{:?}",
                 allocation.trace.error
             );
-            assert_eq!(allocation.lane.provider, Provider::Claude);
+            assert_eq!(allocation.lane.provider, Provider::Glm);
             assert!(
                 allocation.trace.candidates.iter().any(|candidate| candidate
                     .score_components
@@ -2022,7 +1991,7 @@ mod tests {
                 tier: Some("standard".into()),
                 pool: Some(PoolRef {
                     name: Some("coding".into()),
-                    providers: vec![Provider::Glm, Provider::Claude],
+                    providers: vec![Provider::Glm, Provider::Glm],
                 }),
                 ..Default::default()
             };
@@ -2045,9 +2014,9 @@ mod tests {
                     },
                 ),
                 (
-                    lane_key(Provider::Claude, None),
+                    lane_key(Provider::Glm, None),
                     ProbeRecord {
-                        provider: Provider::Claude,
+                        provider: Provider::Glm,
                         account: None,
                         credential_status: CredentialStatus::Present,
                         quota_status: QuotaStatus::Known,
@@ -2076,7 +2045,7 @@ mod tests {
                 "{:?}",
                 allocation.trace.error
             );
-            assert_eq!(allocation.lane.provider, Provider::Claude);
+            assert_eq!(allocation.lane.provider, Provider::Glm);
             assert!(allocation.trace.candidates.iter().any(|candidate| {
                 candidate
                     .score_components
@@ -2094,7 +2063,7 @@ mod tests {
                 tier: Some("standard".into()),
                 pool: Some(PoolRef {
                     name: Some("coding".into()),
-                    providers: vec![Provider::Glm, Provider::Codex],
+                    providers: vec![Provider::Glm, Provider::Brodex],
                 }),
                 selection_policy: Some(serde_json::json!({
                     "kind": "score",
@@ -2119,7 +2088,7 @@ mod tests {
                 "{:?}",
                 allocation.trace.error
             );
-            assert_eq!(allocation.lane.provider, Provider::Codex);
+            assert_eq!(allocation.lane.provider, Provider::Brodex);
             assert!(
                 allocation
                     .trace
@@ -2165,16 +2134,16 @@ mod tests {
             cfg.pools.insert(
                 "loose".into(),
                 PoolConfig {
-                    providers: vec![Provider::Codex],
-                    provider_weights: BTreeMap::from([(Provider::Codex, 1.0)]),
+                    providers: vec![Provider::Brodex],
+                    provider_weights: BTreeMap::from([(Provider::Brodex, 1.0)]),
                     max_concurrent_per_account: None,
                 },
             );
             cfg.pools.insert(
                 "strict".into(),
                 PoolConfig {
-                    providers: vec![Provider::Codex],
-                    provider_weights: BTreeMap::from([(Provider::Codex, 1.0)]),
+                    providers: vec![Provider::Brodex],
+                    provider_weights: BTreeMap::from([(Provider::Brodex, 1.0)]),
                     max_concurrent_per_account: Some(1),
                 },
             );
@@ -2191,7 +2160,7 @@ mod tests {
                 &cfg,
                 &BroConfig::default(),
                 &AllocationContext {
-                    in_flight: BTreeMap::from([(lane_key(Provider::Codex, None), 1)]),
+                    in_flight: BTreeMap::from([(lane_key(Provider::Brodex, None), 1)]),
                     ..Default::default()
                 },
             );
@@ -2242,7 +2211,7 @@ mod tests {
         let lease = RuntimeLease {
             task_id: "task-1".into(),
             session_id: "session-1".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: Some("codex-alt".into()),
             model: Some("gpt-5.3-codex-spark".into()),
             effort: Some("low".into()),
@@ -2265,7 +2234,7 @@ mod tests {
 
         let loaded = lookup_lease_for_task(tmp.path(), "task-1").unwrap();
         assert!(!loaded.durable);
-        assert_eq!(loaded.provider, Provider::Codex);
+        assert_eq!(loaded.provider, Provider::Brodex);
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.3-codex-spark"));
     }
 
@@ -2275,7 +2244,7 @@ mod tests {
         let older = RuntimeLease {
             task_id: "task-1".into(),
             session_id: "session-1".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: Some("codex-old".into()),
             model: Some("gpt-5.4".into()),
             effort: Some("low".into()),
@@ -2292,7 +2261,7 @@ mod tests {
         let newer = RuntimeLease {
             task_id: "task-2".into(),
             session_id: "session-1".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: Some("codex-new".into()),
             model: Some("gpt-5.3-codex-spark".into()),
             effort: Some("medium".into()),
@@ -2307,7 +2276,7 @@ mod tests {
             brofile_context: None,
         };
         let wrong_provider = RuntimeLease {
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: Some("claude".into()),
             ..newer.clone()
         };
@@ -2323,7 +2292,7 @@ mod tests {
         );
 
         let loaded =
-            lookup_lease_for_session(tmp.path(), &TaskStore::new(), Provider::Codex, "session-1")
+            lookup_lease_for_session(tmp.path(), &TaskStore::new(), Provider::Brodex, "session-1")
                 .unwrap();
         assert_eq!(loaded.task_id, "task-2");
         assert_eq!(loaded.account.as_deref(), Some("codex-new"));
@@ -2336,7 +2305,7 @@ mod tests {
         let lease = RuntimeLease {
             task_id: "task-runtime".into(),
             session_id: "session-allocator-swapped".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: Some("claude-alt".into()),
             model: Some("claude-sonnet-4-6".into()),
             effort: Some("medium".into()),
@@ -2365,7 +2334,7 @@ mod tests {
             lookup_lease_for_session(
                 tmp.path(),
                 &TaskStore::new(),
-                Provider::Codex,
+                Provider::Brodex,
                 "session-allocator-swapped",
             )
             .is_none(),
@@ -2377,7 +2346,7 @@ mod tests {
             "session-allocator-swapped",
         )
         .unwrap();
-        assert_eq!(loaded.provider, Provider::Claude);
+        assert_eq!(loaded.provider, Provider::Glm);
         assert_eq!(
             loaded.brofile_context.and_then(|ctx| ctx.provider_defaults),
             Some(crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress)
@@ -2389,7 +2358,7 @@ mod tests {
         let previous = RuntimeLease {
             task_id: "task-1".into(),
             session_id: "session-1".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: Some("codex-alt".into()),
             model: Some("gpt-5.3-codex-spark".into()),
             effort: Some("low".into()),
@@ -2411,7 +2380,7 @@ mod tests {
             Some("/repo/subdir".into()),
         );
         assert_eq!(resumed.task_id, "task-2");
-        assert_eq!(resumed.provider, Provider::Codex);
+        assert_eq!(resumed.provider, Provider::Brodex);
         assert_eq!(resumed.account.as_deref(), Some("codex-alt"));
         assert_eq!(resumed.model.as_deref(), Some("gpt-5.3-codex-spark"));
         assert_eq!(resumed.effort.as_deref(), Some("low"));
@@ -2449,13 +2418,13 @@ mod tests {
         assert!(!inert.expresses_selection_intent());
         let pinned = pin_static_provider_if_inert(
             Some(inert),
-            Provider::Codex,
+            Provider::Brodex,
             Some("gpt-5.5".to_string()),
             Some("medium".to_string()),
         )
         .unwrap();
         let pin = pinned.pin.expect("pin seeded");
-        assert_eq!(pin.provider, Some(Provider::Codex));
+        assert_eq!(pin.provider, Some(Provider::Brodex));
         assert_eq!(pin.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(pin.effort.as_deref(), Some("medium"));
         assert_eq!(pin.authority, PinAuthority::Artifact);
@@ -2477,7 +2446,7 @@ mod tests {
         };
         assert!(tiered.expresses_selection_intent());
         let result =
-            pin_static_provider_if_inert(Some(tiered), Provider::Codex, None, None).unwrap();
+            pin_static_provider_if_inert(Some(tiered), Provider::Brodex, None, None).unwrap();
         assert!(result.pin.is_none(), "tiered request must not be pinned");
 
         // The durable flag alone is NOT selection intent — a durable
@@ -2489,11 +2458,11 @@ mod tests {
         };
         assert!(!durable_only.expresses_selection_intent());
         let seeded =
-            pin_static_provider_if_inert(Some(durable_only), Provider::Claude, None, None).unwrap();
-        assert_eq!(seeded.pin.and_then(|p| p.provider), Some(Provider::Claude));
+            pin_static_provider_if_inert(Some(durable_only), Provider::Glm, None, None).unwrap();
+        assert_eq!(seeded.pin.and_then(|p| p.provider), Some(Provider::Glm));
 
         // No request at all stays None (never reaches the allocator).
-        assert!(pin_static_provider_if_inert(None, Provider::Codex, None, None).is_none());
+        assert!(pin_static_provider_if_inert(None, Provider::Brodex, None, None).is_none());
     }
 
     #[test]
@@ -2537,7 +2506,7 @@ mod tests {
     #[test]
     fn exclude_providers_for_diversity_is_soft_and_inert_safe() {
         // No-op cases: None request, empty exclude.
-        assert!(exclude_providers_for_diversity(None, &[Provider::Codex]).is_none());
+        assert!(exclude_providers_for_diversity(None, &[Provider::Brodex]).is_none());
         let untouched =
             exclude_providers_for_diversity(Some(RuntimeRequest::default()), &[]).unwrap();
         assert!(

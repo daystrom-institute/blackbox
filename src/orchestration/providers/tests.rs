@@ -9,66 +9,7 @@ fn test_provider_roundtrip() {
     for p in Provider::ALL {
         assert_eq!(Provider::from_str(p.as_str()).ok(), Some(*p));
     }
-    assert_eq!(Provider::from_str("opencode").ok(), Some(Provider::Glm));
     assert!(Provider::from_str("unknown").is_err());
-}
-
-#[test]
-fn test_inception_catalog_exposes_only_tool_capable_mercury() {
-    let models = Provider::Inception.models();
-    assert_eq!(models.len(), 1);
-    assert_eq!(models[0].id, "inception/mercury-2");
-    assert!(models[0].default);
-    assert!(!models.iter().any(|m| m.id == "inception/mercury-edit-2"));
-}
-
-#[test]
-fn test_claude_exec_args() {
-    let args = Provider::Claude.build_exec_args("hello", "sid-1", None, None);
-    assert!(args.contains(&"-p".to_string()));
-    assert!(args.contains(&"hello".to_string()));
-    assert!(args.contains(&"--session-id".to_string()));
-    assert!(args.contains(&"sid-1".to_string()));
-    assert!(args.contains(&"--output-format".to_string()));
-}
-
-#[test]
-fn test_claude_resume_args() {
-    let args = Provider::Claude.build_resume_args("sid-1", "follow up", None);
-    assert!(args.contains(&"--resume".to_string()));
-    assert!(args.contains(&"sid-1".to_string()));
-    assert!(args.contains(&"follow up".to_string()));
-}
-
-#[test]
-fn test_claude_suppression_uses_system_prompt_override_not_bare() {
-    let _guard = crate::util::test_env_lock();
-    let prior = std::env::var_os("BLACKBOX_MCP_URL");
-    unsafe {
-        std::env::set_var("BLACKBOX_MCP_URL", "http://127.0.0.1:7264/mcp");
-    }
-    let opts = ExecOpts {
-        model: None,
-        effort: None,
-        provider_defaults: Some(
-            crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
-        ),
-    };
-    let args = Provider::Claude.build_exec_args("hello", "sid-1", None, Some(&opts));
-    assert!(args.contains(&"--system-prompt".to_string()));
-    assert!(
-        args.windows(2)
-            .any(|w| w[0] == "--system-prompt" && w[1].is_empty())
-    );
-    assert!(!args.contains(&"--bare".to_string()));
-    assert!(
-        args.contains(&"--mcp-config".to_string()),
-        "suppression must not disable transient MCP injection"
-    );
-    match prior {
-        Some(value) => unsafe { std::env::set_var("BLACKBOX_MCP_URL", value) },
-        None => unsafe { std::env::remove_var("BLACKBOX_MCP_URL") },
-    }
 }
 
 #[test]
@@ -128,135 +69,30 @@ fn harness_providers_default_model_when_none_supplied() {
     let resume = Provider::Glm.build_resume_args("sid", "go", None);
     assert!(resume.contains(&"--model".to_string()));
 
-    // Claude is CLI-backed: no model is fine, no --model emitted.
-    let claude = Provider::Claude.build_exec_args("hi", "", None, None);
-    assert!(!claude.contains(&"--model".to_string()));
-}
-
-#[test]
-fn test_codex_exec_args_with_effort() {
-    let opts = ExecOpts {
-        model: Some("gpt-5.4".into()),
-        effort: Some("high".into()),
-        provider_defaults: None,
-    };
-    let args = Provider::Codex.build_exec_args("do stuff", "", None, Some(&opts));
-    assert!(args.contains(&"--model".to_string()));
-    assert!(args.contains(&"gpt-5.4".to_string()));
-    assert!(args.iter().any(|a| a.contains("model_reasoning_effort")));
-}
-
-#[test]
-fn test_codex_suppression_uses_config_overrides_not_ignore_user_config() {
-    let opts = ExecOpts {
-        model: None,
-        effort: None,
-        provider_defaults: Some(
-            crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
-        ),
-    };
-    let args = Provider::Codex.build_exec_args("do stuff", "", None, Some(&opts));
-    assert!(!args.contains(&"--ignore-user-config".to_string()));
-    assert!(
-        args.windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE })
-    );
-    assert!(
-        args.windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE })
-    );
-    assert!(
-        args.windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PERMISSIONS_INSTRUCTIONS_OVERRIDE })
-    );
-    assert!(
-        args.windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_SKILL_INSTRUCTIONS_OVERRIDE })
-    );
-}
-
-#[test]
-fn test_codex_resume_suppression_uses_config_overrides() {
-    let opts = ExecOpts {
-        model: None,
-        effort: None,
-        provider_defaults: Some(
-            crate::orchestration::brofile::ProviderDefaultsMode::StrictSuppress,
-        ),
-    };
-    let args = Provider::Codex.build_resume_args("sid-1", "continue", Some(&opts));
-    assert!(
-        args.windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_SUPPRESSED_INSTRUCTIONS_OVERRIDE })
-    );
-    assert!(
-        args.windows(2)
-            .any(|w| { w[0] == "-c" && w[1] == CODEX_DISABLE_PROJECT_DOCS_OVERRIDE })
-    );
-}
-
-#[test]
-fn test_codex_exec_args_with_cwd() {
-    let args = Provider::Codex.build_exec_args("task", "", Some("/tmp/proj"), None);
-    assert!(args.contains(&"-C".to_string()));
-    assert!(args.contains(&"/tmp/proj".to_string()));
+    let brodex = Provider::Brodex.build_exec_args("hi", "", None, None);
+    assert!(brodex.contains(&"--model".to_string()));
 }
 
 #[test]
 fn test_gemini_resume_args() {
-    let args = Provider::Gemini.build_resume_args("gsid-1", "continue", None);
+    let args = Provider::Deepseek.build_resume_args("gsid-1", "continue", None);
     assert!(args.contains(&"--resume".to_string()));
     assert!(args.contains(&"gsid-1".to_string()));
     assert!(args.contains(&"--yolo".to_string()));
     assert!(args.contains(&"--skip-trust".to_string()));
 }
 
-#[test]
-fn test_copilot_exec_args() {
-    let args = Provider::Copilot.build_exec_args("review this", "", None, None);
-    assert_eq!(args[0], "copilot");
-    assert_eq!(args[1], "--");
-    assert!(args.contains(&"--autopilot".to_string()));
-    assert!(args.contains(&"--output-format".to_string()));
-}
-
-#[test]
-fn test_vibe_resume_args() {
-    let args = Provider::Vibe.build_resume_args("s1", "continue", None);
-    assert!(args.contains(&"--resume".to_string()));
-    assert!(args.contains(&"s1".to_string()));
-    assert!(args.contains(&"--output".to_string()));
-}
-
-#[test]
-fn test_vibe_ignores_model_param() {
-    let opts = ExecOpts {
-        model: Some("devstral-2".into()),
-        effort: None,
-        provider_defaults: None,
-    };
-    let exec_args = Provider::Vibe.build_exec_args("hi", "sid", None, Some(&opts));
-    assert!(
-        !exec_args.contains(&"--model".to_string()),
-        "vibe exec must not emit --model (CLI rejects it): {exec_args:?}"
-    );
-    let resume_args = Provider::Vibe.build_resume_args("sid", "hi", Some(&opts));
-    assert!(
-        !resume_args.contains(&"--model".to_string()),
-        "vibe resume must not emit --model (CLI rejects it): {resume_args:?}"
-    );
-}
 
 #[test]
 fn test_streaming_json_classification() {
-    assert!(Provider::Claude.is_streaming_json());
+    assert!(Provider::Glm.is_streaming_json());
     assert!(Provider::Glm.is_streaming_json());
     assert!(Provider::Deepseek.is_streaming_json());
-    assert!(Provider::Inception.is_streaming_json());
-    assert!(Provider::Codex.is_streaming_json());
-    assert!(Provider::Copilot.is_streaming_json());
-    assert!(!Provider::Vibe.is_streaming_json());
-    assert!(!Provider::Gemini.is_streaming_json());
+    assert!(Provider::Glm.is_streaming_json());
+    assert!(Provider::Brodex.is_streaming_json());
+    assert!(Provider::VibeBh.is_streaming_json());
+    assert!(!Provider::VibeBh.is_streaming_json());
+    assert!(!Provider::Deepseek.is_streaming_json());
 }
 
 #[test]
@@ -275,7 +111,7 @@ fn test_parse_claude_result_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Claude.parse_event(&evt, &mut sink);
+    Provider::Glm.parse_event(&evt, &mut sink);
     assert_eq!(
         sink.last_assistant_message.as_deref(),
         Some("The answer is 42")
@@ -378,7 +214,7 @@ fn test_parse_claude_streaming_accumulates_text_across_blocks_and_turns() {
         serde_json::json!({"type":"result","result":""}),
     ];
     for evt in &events {
-        Provider::Claude.parse_event(evt, &mut sink);
+        Provider::Glm.parse_event(evt, &mut sink);
     }
     assert_eq!(
         sink.last_assistant_message.as_deref(),
@@ -416,12 +252,12 @@ fn test_parse_claude_result_with_empty_text_preserves_streamed_message() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Claude.parse_event(&stream_text, &mut sink);
+    Provider::Glm.parse_event(&stream_text, &mut sink);
     assert_eq!(
         sink.last_assistant_message.as_deref(),
         Some("Captured during the turn.")
     );
-    Provider::Claude.parse_event(&result_with_empty, &mut sink);
+    Provider::Glm.parse_event(&result_with_empty, &mut sink);
     assert_eq!(
         sink.last_assistant_message.as_deref(),
         Some("Captured during the turn."),
@@ -464,17 +300,17 @@ fn test_parse_claude_hook_event_skips_session_capture() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Claude.parse_event(&hook_started, &mut sink);
+    Provider::Glm.parse_event(&hook_started, &mut sink);
     assert_eq!(
         sink.session_id, None,
         "hook_started must not set session_id"
     );
-    Provider::Claude.parse_event(&hook_response, &mut sink);
+    Provider::Glm.parse_event(&hook_response, &mut sink);
     assert_eq!(
         sink.session_id, None,
         "hook_response must not set session_id"
     );
-    Provider::Claude.parse_event(&init, &mut sink);
+    Provider::Glm.parse_event(&init, &mut sink);
     assert_eq!(
         sink.session_id.as_deref(),
         Some("real-conversation-id"),
@@ -499,7 +335,7 @@ fn test_parse_claude_assistant_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Claude.parse_event(&evt, &mut sink);
+    Provider::Glm.parse_event(&evt, &mut sink);
     assert_eq!(
         sink.last_assistant_message.as_deref(),
         Some("Working on it...")
@@ -519,7 +355,7 @@ fn test_parse_codex_thread_started_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Codex.parse_event(&evt, &mut sink);
+    Provider::Brodex.parse_event(&evt, &mut sink);
     assert_eq!(sink.session_id.as_deref(), Some("codex-thread-123"));
 }
 
@@ -536,7 +372,7 @@ fn test_parse_codex_item_completed_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Codex.parse_event(&evt, &mut sink);
+    Provider::Brodex.parse_event(&evt, &mut sink);
     assert_eq!(sink.last_assistant_message.as_deref(), Some("Done!"));
 }
 
@@ -553,7 +389,7 @@ fn test_parse_codex_turn_completed_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Codex.parse_event(&evt, &mut sink);
+    Provider::Brodex.parse_event(&evt, &mut sink);
     let u = sink.usage.as_ref().unwrap();
     // No cached field present → all 200 are fresh.
     assert_eq!(u.input_tokens, 200);
@@ -578,7 +414,7 @@ fn test_parse_codex_usage_splits_cached_from_cumulative_input() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Codex.parse_event(&evt, &mut sink);
+    Provider::Brodex.parse_event(&evt, &mut sink);
     let u = sink.usage.as_ref().unwrap();
     assert_eq!(u.input_tokens, 67910 - 6912, "fresh input excludes cache");
     assert_eq!(u.cached_input_tokens, 6912);
@@ -608,7 +444,7 @@ fn test_parse_claude_usage_captures_cache_breakdown() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Claude.parse_event(&evt, &mut sink);
+    Provider::Glm.parse_event(&evt, &mut sink);
     let u = sink.usage.as_ref().unwrap();
     assert_eq!(u.input_tokens, 1200, "claude input stays fresh");
     assert_eq!(u.cached_input_tokens, 50000);
@@ -660,7 +496,7 @@ fn test_parse_copilot_assistant_message() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Copilot.parse_event(&evt, &mut sink);
+    Provider::VibeBh.parse_event(&evt, &mut sink);
     assert_eq!(
         sink.last_assistant_message.as_deref(),
         Some("Here's the fix")
@@ -681,7 +517,7 @@ fn test_parse_copilot_result_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Copilot.parse_event(&evt, &mut sink);
+    Provider::VibeBh.parse_event(&evt, &mut sink);
     assert_eq!(sink.session_id.as_deref(), Some("copilot-sid"));
     assert_eq!(sink.num_turns, Some(5));
 }
@@ -707,7 +543,7 @@ fn test_parse_copilot_reads_tokens_when_present_not_hardcoded_zero() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Copilot.parse_event(&evt, &mut sink);
+    Provider::VibeBh.parse_event(&evt, &mut sink);
     let u = sink.usage.as_ref().unwrap();
     assert_eq!(u.input_tokens, 1234);
     assert_eq!(u.output_tokens, 56);
@@ -729,7 +565,7 @@ fn test_parse_vibe_array_event() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Vibe.parse_event(&evt, &mut sink);
+    Provider::VibeBh.parse_event(&evt, &mut sink);
     assert_eq!(sink.last_assistant_message.as_deref(), Some("Final answer"));
 }
 
@@ -753,7 +589,7 @@ fn test_parse_gemini_with_stats() {
         num_turns: None,
         session_id: None,
     };
-    Provider::Gemini.parse_event(&evt, &mut sink);
+    Provider::Deepseek.parse_event(&evt, &mut sink);
     assert_eq!(sink.last_assistant_message.as_deref(), Some("The answer"));
     assert_eq!(sink.session_id.as_deref(), Some("gem-sid"));
     assert_eq!(sink.usage.as_ref().unwrap().input_tokens, 150);
@@ -765,7 +601,7 @@ fn test_models_nonempty() {
     for p in Provider::ALL {
         // Vibe has no selectable model surface (CLI lacks --model);
         // catalog is intentionally empty.
-        if matches!(p, Provider::Vibe) {
+        if matches!(p, Provider::VibeBh) {
             continue;
         }
         assert!(
@@ -779,7 +615,7 @@ fn test_models_nonempty() {
 #[test]
 fn test_each_provider_has_default_model() {
     for p in Provider::ALL {
-        if matches!(p, Provider::Vibe) {
+        if matches!(p, Provider::VibeBh) {
             continue;
         }
         let has_default = p.models().iter().any(|m| m.default);
@@ -790,7 +626,7 @@ fn test_each_provider_has_default_model() {
 #[test]
 fn test_vibe_models_empty() {
     assert!(
-        Provider::Vibe.models().is_empty(),
+        Provider::VibeBh.models().is_empty(),
         "vibe must not advertise selectable models — CLI has no --model flag"
     );
 }
@@ -798,7 +634,7 @@ fn test_vibe_models_empty() {
 #[test]
 fn test_mcp_add_args_shape_per_provider() {
     let u = "http://127.0.0.1:7264/mcp";
-    let c = Provider::Claude
+    let c = Provider::Glm
         .build_mcp_add_http_args("blackbox", u, &[])
         .unwrap();
     assert_eq!(&c[..4], &["mcp", "add", "-s", "user"]);
@@ -825,19 +661,19 @@ fn test_mcp_add_args_shape_per_provider() {
             .is_none()
     );
 
-    let co = Provider::Copilot
+    let co = Provider::VibeBh
         .build_mcp_add_http_args("blackbox", u, &[])
         .unwrap();
     assert!(co.starts_with(&["copilot".to_string(), "--".to_string()]));
     assert!(co.contains(&"--transport".to_string()));
 
-    let cx = Provider::Codex
+    let cx = Provider::Brodex
         .build_mcp_add_http_args("blackbox", u, &[])
         .unwrap();
     assert!(cx.contains(&"--url".to_string()));
     assert!(cx.contains(&u.to_string()));
 
-    let g = Provider::Gemini
+    let g = Provider::Deepseek
         .build_mcp_add_http_args("blackbox", u, &[])
         .unwrap();
     assert!(g.iter().any(|a| a == "-t"));
@@ -845,12 +681,12 @@ fn test_mcp_add_args_shape_per_provider() {
     assert!(g.contains(&u.to_string()));
 
     assert!(
-        Provider::Inception
+        Provider::Glm
             .build_mcp_add_http_args("x", "y", &[])
             .is_none()
     );
     assert!(
-        Provider::Vibe
+        Provider::VibeBh
             .build_mcp_add_http_args("x", "y", &[])
             .is_none()
     );
@@ -859,7 +695,7 @@ fn test_mcp_add_args_shape_per_provider() {
 #[test]
 fn test_gemini_mcp_add_includes_exclude_tools() {
     let exclude = vec!["bro_exec".to_string(), "bro_resume".to_string()];
-    let args = Provider::Gemini
+    let args = Provider::Deepseek
         .build_mcp_add_http_args("blackbox", "http://x/mcp", &exclude)
         .unwrap();
     let joined = args.join(" ");
@@ -871,15 +707,15 @@ fn test_gemini_mcp_add_includes_exclude_tools() {
 fn test_mcp_list_has_detects_states() {
     let out = "Name        URL\nblackbox    http://127.0.0.1:7264/mcp\nother       http://x/mcp\n";
     assert_eq!(
-        Provider::Claude.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:7264/mcp")),
+        Provider::Glm.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:7264/mcp")),
         MatchState::MatchesName
     );
     assert_eq!(
-        Provider::Claude.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:9999/mcp")),
+        Provider::Glm.mcp_list_has(out, "blackbox", Some("http://127.0.0.1:9999/mcp")),
         MatchState::Drift
     );
     assert_eq!(
-        Provider::Claude.mcp_list_has(out, "absent", None),
+        Provider::Glm.mcp_list_has(out, "absent", None),
         MatchState::Missing
     );
 }
@@ -890,7 +726,7 @@ fn test_claude_filter_disallow_args_expands_blackbox_globs() {
         disallow: vec!["mcp__blackbox__.bro_*".into(), "Bash(rm -rf *)".into()],
         allow: vec![],
     };
-    let args = Provider::Claude.build_filter_args(&filters);
+    let args = Provider::Glm.build_filter_args(&filters);
     assert_eq!(args[0], "--disallowedTools");
     // Glob expanded to concrete tool names.
     assert!(args[1].contains("mcp__blackbox__bro_exec"));
@@ -935,7 +771,7 @@ fn test_copilot_filter_repeats_flag_expanded() {
         disallow: vec!["mcp__blackbox__.bro_*".into(), "shell(git push)".into()],
         allow: vec!["shell".into()],
     };
-    let args = Provider::Copilot.build_filter_args(&filters);
+    let args = Provider::VibeBh.build_filter_args(&filters);
     // Each expanded bro_* tool translates to Copilot's
     // `Server(tool)` syntax, not the MCP prefix form.
     assert!(args.iter().any(|a| a == "--deny-tool=blackbox(bro_exec)"));
@@ -968,7 +804,7 @@ fn test_codex_expands_blackbox_glob_to_disabled_tools() {
         disallow: vec!["mcp__blackbox__.bro_*".into()],
         allow: vec![],
     };
-    let args = Provider::Codex.build_filter_args(&filters);
+    let args = Provider::Brodex.build_filter_args(&filters);
     assert_eq!(args[0], "-c");
     assert!(args[1].starts_with("mcp_servers.blackbox.disabled_tools=["));
     // Should contain at least the core bro_* names.
@@ -985,7 +821,7 @@ fn test_codex_skips_non_mcp_patterns() {
         disallow: vec!["Bash(git push *)".into()],
         allow: vec![],
     };
-    let args = Provider::Codex.build_filter_args(&filters);
+    let args = Provider::Brodex.build_filter_args(&filters);
     // Codex's filter scope is mcp_servers.* — patterns outside the
     // MCP namespace (Bash, shell, etc.) produce no args.
     assert!(args.is_empty());
@@ -997,7 +833,7 @@ fn test_codex_routes_non_blackbox_mcp_pattern_to_correct_server() {
         disallow: vec!["mcp__github__.create_issue".into()],
         allow: vec![],
     };
-    let args = Provider::Codex.build_filter_args(&filters);
+    let args = Provider::Brodex.build_filter_args(&filters);
     // Exact tool name on a non-blackbox MCP server routes to that
     // server's disabled_tools array.
     assert_eq!(args[0], "-c");
@@ -1015,7 +851,7 @@ fn test_codex_warns_on_glob_against_unknown_server() {
         disallow: vec!["mcp__github__.create_*".into()],
         allow: vec![],
     };
-    let args = Provider::Codex.build_filter_args(&filters);
+    let args = Provider::Brodex.build_filter_args(&filters);
     assert!(args.is_empty());
 }
 
@@ -1025,7 +861,7 @@ fn test_codex_emits_enabled_tools_for_allow() {
         disallow: vec![],
         allow: vec!["mcp__blackbox__bro_status".into()],
     };
-    let args = Provider::Codex.build_filter_args(&filters);
+    let args = Provider::Brodex.build_filter_args(&filters);
     assert_eq!(args[0], "-c");
     assert!(args[1].starts_with("mcp_servers.blackbox.enabled_tools=["));
     assert!(args[1].contains("bro_status"));
@@ -1040,7 +876,7 @@ fn test_codex_groups_multiple_servers_into_separate_overrides() {
         ],
         allow: vec![],
     };
-    let args = Provider::Codex.build_filter_args(&filters);
+    let args = Provider::Brodex.build_filter_args(&filters);
     // Two `-c` overrides — one per server. BTreeMap iteration is
     // alphabetical, so blackbox comes before github.
     let overrides: Vec<&String> = args
@@ -1061,7 +897,7 @@ fn test_gemini_filter_args_deferred_to_policy_file() {
     // Gemini gets its policy via --policy <file>, produced by the
     // caller. build_filter_args returns empty so callers know to
     // handle it separately.
-    assert!(Provider::Gemini.build_filter_args(&filters).is_empty());
+    assert!(Provider::Deepseek.build_filter_args(&filters).is_empty());
 }
 
 #[test]
@@ -1072,7 +908,7 @@ fn test_vibe_ignores_disallow_only_filters() {
         disallow: vec!["anything".into()],
         allow: vec![],
     };
-    assert!(Provider::Vibe.build_filter_args(&filters).is_empty());
+    assert!(Provider::VibeBh.build_filter_args(&filters).is_empty());
 }
 
 #[test]
@@ -1081,7 +917,7 @@ fn test_vibe_uses_enabled_tools_for_allow() {
         disallow: vec![],
         allow: vec!["mcp__blackbox__bro_*".into(), "bash".into()],
     };
-    let args = Provider::Vibe.build_filter_args(&filters);
+    let args = Provider::VibeBh.build_filter_args(&filters);
     // Vibe expands patterns and emits --enabled-tools for each
     assert!(args.contains(&"--enabled-tools".into()));
     // Check that expanded patterns are present
@@ -1090,11 +926,11 @@ fn test_vibe_uses_enabled_tools_for_allow() {
 
 #[test]
 fn test_supports_dispatch_filter_includes_vibe() {
-    assert!(Provider::Claude.supports_dispatch_filter());
-    assert!(Provider::Copilot.supports_dispatch_filter());
-    assert!(Provider::Codex.supports_dispatch_filter());
-    assert!(Provider::Gemini.supports_dispatch_filter());
-    assert!(Provider::Vibe.supports_dispatch_filter());
+    assert!(Provider::Glm.supports_dispatch_filter());
+    assert!(Provider::VibeBh.supports_dispatch_filter());
+    assert!(Provider::Brodex.supports_dispatch_filter());
+    assert!(Provider::Deepseek.supports_dispatch_filter());
+    assert!(Provider::VibeBh.supports_dispatch_filter());
 }
 
 #[test]
@@ -1118,7 +954,7 @@ fn test_build_mcp_add_http_args_full_threads_headers() {
     headers.insert("X-Trace".to_string(), "abc123".to_string());
 
     // Claude emits -H "key: value" pairs.
-    let claude = Provider::Claude
+    let claude = Provider::Glm
         .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
         .unwrap();
     let joined = claude.join(" | ");
@@ -1129,21 +965,21 @@ fn test_build_mcp_add_http_args_full_threads_headers() {
     assert!(joined.contains("-H | X-Trace: abc123"), "got: {joined}");
 
     // Gemini also emits -H pairs.
-    let gemini = Provider::Gemini
+    let gemini = Provider::Deepseek
         .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
         .unwrap();
     let joined = gemini.join(" | ");
     assert!(joined.contains("-H | Authorization: Bearer xyz"));
 
     // Codex drops headers (only --bearer-token-env-var supported).
-    let codex = Provider::Codex
+    let codex = Provider::Brodex
         .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
         .unwrap();
     assert!(!codex.iter().any(|a| a == "-H"));
     assert!(!codex.iter().any(|a| a.contains("Bearer xyz")));
 
     // Copilot drops headers (no documented header flag).
-    let copilot = Provider::Copilot
+    let copilot = Provider::VibeBh
         .build_mcp_add_http_args_full("blackbox", "http://x/mcp", &[], &headers, "user")
         .unwrap();
     assert!(!copilot.iter().any(|a| a == "-H"));
@@ -1153,12 +989,12 @@ fn test_build_mcp_add_http_args_full_threads_headers() {
 fn test_scoped_arg_builders_honor_scope_capability() {
     // Claude + Gemini support both user and project vendor-CLI mcp add.
     assert!(
-        Provider::Claude
+        Provider::Glm
             .build_mcp_add_http_args_scoped("x", "u", &[], "user")
             .is_some()
     );
     assert!(
-        Provider::Claude
+        Provider::Glm
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
             .is_some()
     );
@@ -1174,54 +1010,54 @@ fn test_scoped_arg_builders_honor_scope_capability() {
             .is_none()
     );
     assert!(
-        Provider::Gemini
+        Provider::Deepseek
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
             .is_some()
     );
 
     // Codex has no project scope (single config file).
     assert!(
-        Provider::Codex
+        Provider::Brodex
             .build_mcp_add_http_args_scoped("x", "u", &[], "user")
             .is_some()
     );
     assert!(
-        Provider::Codex
+        Provider::Brodex
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
             .is_none()
     );
     assert!(
-        Provider::Codex
+        Provider::Brodex
             .build_mcp_remove_args_scoped("x", "project")
             .is_none()
     );
 
     // Copilot only user (no documented project flag).
     assert!(
-        Provider::Copilot
+        Provider::VibeBh
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
             .is_none()
     );
 
     // Vibe never.
     assert!(
-        Provider::Inception
+        Provider::Glm
             .build_mcp_add_http_args_scoped("x", "u", &[], "user")
             .is_none()
     );
     assert!(
-        Provider::Vibe
+        Provider::VibeBh
             .build_mcp_add_http_args_scoped("x", "u", &[], "user")
             .is_none()
     );
     assert!(
-        Provider::Vibe
+        Provider::VibeBh
             .build_mcp_add_http_args_scoped("x", "u", &[], "project")
             .is_none()
     );
 
     // Claude project scope emits -s project.
-    let claude_proj = Provider::Claude
+    let claude_proj = Provider::Glm
         .build_mcp_add_http_args_scoped("x", "http://u/mcp", &[], "project")
         .unwrap();
     let joined = claude_proj.join(" ");
@@ -1230,7 +1066,7 @@ fn test_scoped_arg_builders_honor_scope_capability() {
         "expected -s project in: {joined}"
     );
     // Gemini project scope emits -s project.
-    let gemini_proj = Provider::Gemini
+    let gemini_proj = Provider::Deepseek
         .build_mcp_add_http_args_scoped("x", "http://u/mcp", &[], "project")
         .unwrap();
     assert!(gemini_proj.join(" ").contains("-s project"));
@@ -1713,8 +1549,8 @@ fn resolve_codex_session_returns_none_for_unknown() {
 #[test]
 fn resolve_session_cwd_dispatches_per_provider() {
     // Missing sessions still resolve to None for cwd-aware providers.
-    assert!(Provider::Copilot.resolve_session_cwd("any").is_none());
-    assert!(Provider::Vibe.resolve_session_cwd("any").is_none());
+    assert!(Provider::VibeBh.resolve_session_cwd("any").is_none());
+    assert!(Provider::VibeBh.resolve_session_cwd("any").is_none());
 }
 
 // ── Fleet MCP injection (normalized config → per-provider args) ───────────────
@@ -1739,7 +1575,7 @@ fn fleet_mcp_args_family_emits_single_merged_mcp_config() {
     // The --mcp-config family (Claude + the bro-harness providers) all get one
     // flag carrying a {"mcpServers":{…}} blob built from the normalized map.
     for p in [
-        Provider::Claude,
+        Provider::Glm,
         Provider::Glm,
         Provider::Deepseek,
         Provider::Brodex,
@@ -1759,11 +1595,11 @@ fn fleet_mcp_args_unimplemented_providers_are_noops() {
     // No per-dispatch MCP-injection seam in these CLIs yet — they must stay
     // empty (not crash, not emit a bogus flag) until one is wired in.
     for p in [
-        Provider::Codex,
-        Provider::Gemini,
-        Provider::Copilot,
-        Provider::Inception,
-        Provider::Vibe,
+        Provider::Brodex,
+        Provider::Deepseek,
+        Provider::VibeBh,
+        Provider::Glm,
+        Provider::VibeBh,
     ] {
         assert!(
             p.build_fleet_mcp_args(&fleet_servers()).is_empty(),
@@ -1775,7 +1611,7 @@ fn fleet_mcp_args_unimplemented_providers_are_noops() {
 #[test]
 fn fleet_mcp_args_empty_config_injects_nothing() {
     let empty = std::collections::BTreeMap::new();
-    assert!(Provider::Claude.build_fleet_mcp_args(&empty).is_empty());
+    assert!(Provider::Glm.build_fleet_mcp_args(&empty).is_empty());
 }
 
 #[test]

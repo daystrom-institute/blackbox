@@ -643,7 +643,6 @@ Landed:
     session-cwd resolution helpers previously embedded in
     `orchestration/providers.rs`.
 27. `src/orchestration/providers/events.rs` owns provider event parsing,
-    `EventSink`, `Usage`, and OpenCode export parsing previously embedded in
     `orchestration/providers.rs`.
 28. `src/orchestration/providers/mcp_args.rs` owns provider MCP registration,
     removal/listing, dispatch-filter argument construction, transient blackbox

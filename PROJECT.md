@@ -123,7 +123,6 @@ Important state/config env vars:
 - Index/transcripts: `TRANSCRIPT_SEARCH_ROOTS`,
   `TRANSCRIPT_SEARCH_CODEX_ROOT`, `TRANSCRIPT_SEARCH_INDEX_PATH`,
   `BLACKBOX_REINDEX_INTERVAL_SECS`, `BLACKBOX_EDGE_INDEX_BOOT_REBUILD`
-- Providers: `CLAUDE_BIN`, `OPENCODE_BIN`, `CODEX_BIN`, `COPILOT_BIN`,
   `VIBE_BIN`, `GEMINI_BIN`, `BRO_EXTRA_PATH`, `VIBE_SESSION_DIR`
 - LSP/refactor: `BLACKBOX_LSP_IDLE_SECS`, `BLACKBOX_JDTLS_TIMEOUT_SECS`,
   `BLACKBOX_JDTLS_INIT_TIMEOUT_SECS`, `BLACKBOX_JDTLS_BIN`,
@@ -151,7 +150,6 @@ routing facts:
   `design/bro-harness/anthropic-harness.md`.
 - Codex dispatches through the codex CLI — a path distinct from Brodex
   (`codex` → codex CLI; `brodex` → bro-harness/Responses), preserved unchanged.
-- Inception dispatches through OpenCode transport.
 - Copilot, Vibe, and Gemini each have provider-specific arg builders.
 - Provider binary overrides belong in config/env, not hard-coded call sites.
 

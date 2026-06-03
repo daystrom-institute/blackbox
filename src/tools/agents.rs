@@ -1526,7 +1526,7 @@ mod tests {
         use orchestration::providers::Provider;
         let bf = Brofile {
             name: "auditor".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: None,
             lens: None,
             model: None,
@@ -1541,7 +1541,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: crate::orchestration::brofile::TerminalMode::Native,
         };
         let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
         let manifest = serde_json::json!({

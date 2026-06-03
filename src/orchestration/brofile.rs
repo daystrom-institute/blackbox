@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 use super::allocator::RuntimeRequest;
 use super::mcp::McpFilters;
@@ -14,36 +13,6 @@ use super::providers::{Capability, Provider};
 // ---------------------------------------------------------------------------
 // Brofile
 // ---------------------------------------------------------------------------
-
-/// How dispatches using a brofile are hosted.
-///
-/// `Native` (default) is the existing headless dispatch: the provider CLI runs
-/// as a child process whose stdout stream-json is the dispatch channel.
-///
-/// `Tmux` runs the provider's interactive TUI inside a tmux pane and resolves
-/// the turn from the transcript read plane. Only valid for
-/// `Provider::tui_capable()` providers (Claude/Codex). It is a brofile attribute
-/// so every dispatch path — workflow executor actors, `bro_exec`, `bro_resume`
-/// — picks it up from the resolved brofile without per-call flags. See
-/// `design/orchestration/workflows/tmux-terminal-mode-slice.md`.
-#[derive(
-    Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, schemars::JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum TerminalMode {
-    #[default]
-    Native,
-    Tmux,
-}
-
-impl TerminalMode {
-    pub fn is_native(&self) -> bool {
-        matches!(self, TerminalMode::Native)
-    }
-    pub fn is_tmux(&self) -> bool {
-        matches!(self, TerminalMode::Tmux)
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Brofile {
@@ -81,17 +50,6 @@ pub struct Brofile {
     /// context-producer fields are not part of v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<BrofileContext>,
-    /// How dispatches using this brofile are hosted (headless vs tmux TUI).
-    /// Picked up by every dispatch path; only valid for TUI-capable providers.
-    #[serde(default, skip_serializing_if = "TerminalMode::is_native")]
-    pub terminal_mode: TerminalMode,
-}
-
-impl Brofile {
-    /// True iff dispatches using this brofile run the provider TUI in tmux.
-    pub fn is_terminal(&self) -> bool {
-        self.terminal_mode.is_tmux()
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -133,22 +91,12 @@ impl ProviderDefaultsMode {
 }
 
 /// Whether `provider` can honor a non-`Default` `ProviderDefaultsMode`
-/// in v1. Claude-compatible transports use `--system-prompt ""` so the
-/// provider default system prompt / CLAUDE.md-derived prompt material is
-/// replaced while transient MCP config is still injected. Codex overrides
-/// base instructions, suppresses injected instruction blocks, caps project
-/// docs at zero, and runs through a CODEX_HOME overlay that omits global
-/// AGENTS files while preserving config/auth/MCP entries. OpenCode-backed
-/// providers suppress generated `instructions` config entries. Other
-/// providers are recorded but unsupported until per-provider wiring lands.
+/// in v1. Only surviving harness providers advertise this; removed CLI-backed
+/// providers fail closed before environment or arg construction.
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Claude
-            | Provider::Glm
-            | Provider::Deepseek
-            | Provider::Codex
-            | Provider::Inception
+        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
     )
 }
 
@@ -355,23 +303,6 @@ pub fn effective_account(
         .or_else(|| provider_default_account(provider, store_dir))
 }
 
-fn write_json_file(path: &Path, value: &Value) {
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    if let Ok(data) = serde_json::to_string_pretty(value) {
-        let _ = fs::write(path, data);
-    }
-}
-
-fn default_opencode_config_path(store_dir: &Path, provider: Provider) -> PathBuf {
-    store_dir.join("generated").join(format!(
-        "{}-opencode-{}.json",
-        provider.as_str(),
-        uuid::Uuid::new_v4().simple()
-    ))
-}
-
 fn skipped_codex_home_entry(name: &std::ffi::OsStr) -> bool {
     name == "AGENTS.md" || name == "AGENTS.override.md"
 }
@@ -416,92 +347,6 @@ fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io:
     }
 
     Ok(overlay)
-}
-
-struct OpencodeProfile {
-    default_model: &'static str,
-    small_model: &'static str,
-}
-
-fn opencode_profile(provider: Provider) -> Option<OpencodeProfile> {
-    match provider {
-        Provider::Inception => Some(OpencodeProfile {
-            default_model: "inception/mercury-2",
-            small_model: "inception/mercury-2",
-        }),
-        _ => None,
-    }
-}
-
-fn build_opencode_config(
-    provider: Provider,
-    model: Option<&str>,
-    suppress_instructions: bool,
-) -> Value {
-    let profile = opencode_profile(provider).expect("provider must be OpenCode-backed");
-    let model = model
-        .map(str::trim)
-        .filter(|m| !m.is_empty())
-        .unwrap_or(profile.default_model);
-    let mut config = serde_json::json!({
-        "$schema": "https://opencode.ai/config.json",
-        "model": model,
-        "small_model": profile.small_model,
-        "tools": {
-            "blackbox_bro_*": false
-        }
-    });
-
-    // OpenCode does NOT follow Claude Code's `@import` syntax in
-    // AGENTS.md/CLAUDE.md — those references stay as plain text. Wire
-    // BLACKBOX.md (the provider-neutral global memory file) explicitly
-    // via the `instructions` config field, which opencode reads, fetches,
-    // and merges into the system prompt at the `Instructions from: <path>`
-    // header. Existing files are added to the `instructions` array; missing
-    // files are silently skipped by opencode (`fs.glob` returns `[]`).
-    // When the caller's brofile asks for harness-defaults suppression,
-    // omit the array entirely so opencode loads no blackbox-controlled
-    // instructions.
-    if !suppress_instructions {
-        if let Some(home) = dirs::home_dir() {
-            let blackbox_md = crate::util::blackbox_global_common_md_path(&home);
-            if blackbox_md.exists() {
-                config["instructions"] =
-                    serde_json::json!([blackbox_md.to_string_lossy().into_owned()]);
-            }
-        }
-    }
-
-    if let Some(url) = super::providers::transient_blackbox_url() {
-        config["mcp"] = serde_json::json!({
-            super::providers::transient_blackbox_name(): {
-                "type": "remote",
-                "url": url,
-                "enabled": true
-            }
-        });
-    }
-
-    config
-}
-
-fn default_opencode_env(
-    provider: Provider,
-    store_dir: &Path,
-    model: Option<&str>,
-    suppress_instructions: bool,
-) -> HashMap<String, String> {
-    let mut env = HashMap::new();
-    let config_path = default_opencode_config_path(store_dir, provider);
-    write_json_file(
-        &config_path,
-        &build_opencode_config(provider, model, suppress_instructions),
-    );
-    env.insert(
-        "OPENCODE_CONFIG".into(),
-        config_path.to_string_lossy().into_owned(),
-    );
-    env
 }
 
 /// Harness env for the Anthropic-transport providers (GLM, DeepSeek). These
@@ -630,20 +475,10 @@ fn synthesized_account_env_for_home(
     let suffix = normalized_account_suffix(account_name)?;
 
     let (env_key, rel_path) = match provider {
-        Provider::Claude => ("CLAUDE_CONFIG_DIR", format!(".claude{suffix}")),
-        // Codex and Brodex both ride the Codex/ChatGPT config dir.
-        Provider::Codex | Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
-        // `gh` respects GH_CONFIG_DIR; keep the same account suffix pattern.
-        Provider::Copilot => ("GH_CONFIG_DIR", format!(".config/gh{suffix}")),
-        Provider::Glm
-        | Provider::Deepseek
-        | Provider::Inception
-        | Provider::Gemini
-        | Provider::Vibe
-        // vibe-bh authenticates via MISTRAL_API_KEY (env / ~/.vibe/.env), not a
-        // per-account config dir.
-        | Provider::VibeBh
-        | Provider::Workflow => return None,
+        Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
+        // GLM/DeepSeek inherit credentials from fixed Claude-compatible config
+        // dirs; vibe-bh authenticates via MISTRAL_API_KEY, not accounts.
+        Provider::Glm | Provider::Deepseek | Provider::VibeBh | Provider::Workflow => return None,
     };
 
     Some(HashMap::from([(
@@ -665,10 +500,13 @@ pub fn resolve_provider_env(
 fn resolve_provider_env_inner(
     provider: Provider,
     account_name: Option<&str>,
-    model: Option<&str>,
+    _model: Option<&str>,
     store_dir: &Path,
     brofile_context: Option<&BrofileContext>,
 ) -> Option<HashMap<String, String>> {
+    if !provider.is_dispatchable() {
+        return None;
+    }
     let account_name = effective_account(provider, account_name, store_dir);
     let suppress_instructions = brofile_context
         .and_then(|c| c.provider_defaults)
@@ -693,17 +531,11 @@ fn resolve_provider_env_inner(
             .as_deref()
             .map(default_vibe_harness_env)
             .unwrap_or_default(),
-        Provider::Inception => {
-            default_opencode_env(provider, store_dir, model, suppress_instructions)
-        }
-        _ => HashMap::new(),
+        Provider::Workflow => HashMap::new(),
     };
 
     if let Some(account_name) = account_name.as_deref() {
-        if !matches!(
-            provider,
-            Provider::Glm | Provider::Deepseek | Provider::Inception
-        ) {
+        if !matches!(provider, Provider::Glm | Provider::Deepseek | Provider::VibeBh) {
             if let Some(account_env) = dirs::home_dir()
                 .as_deref()
                 .and_then(|home| synthesized_account_env_for_home(provider, account_name, home))
@@ -719,7 +551,7 @@ fn resolve_provider_env_inner(
         }
     }
 
-    if provider == Provider::Codex && suppress_instructions {
+    if provider == Provider::Brodex && suppress_instructions {
         let base_home = env
             .get("CODEX_HOME")
             .map(PathBuf::from)
@@ -778,7 +610,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "reviewer".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: None,
             lens: Some("You are a code reviewer".into()),
             model: None,
@@ -787,14 +619,13 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
         assert!(loaded.is_some());
         let loaded = loaded.unwrap();
         assert_eq!(loaded.name, "reviewer");
-        assert_eq!(loaded.provider, Provider::Claude);
+        assert_eq!(loaded.provider, Provider::Glm);
         assert_eq!(loaded.lens.as_deref(), Some("You are a code reviewer"));
     }
 
@@ -808,7 +639,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "post-install-verification".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: None,
             lens: Some("test".into()),
             model: Some("gpt-5.5".into()),
@@ -817,7 +648,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -837,7 +667,7 @@ mod tests {
 
         let global_bf = Brofile {
             name: "worker".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: None,
             lens: Some("global lens".into()),
             model: None,
@@ -846,13 +676,12 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
         let project_bf = Brofile {
             name: "worker".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: None,
             lens: Some("project lens".into()),
             model: None,
@@ -861,7 +690,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(
             &project_bf,
@@ -877,7 +705,7 @@ mod tests {
             Some(project.path().to_str().unwrap()),
         );
         assert!(resolved.is_some());
-        assert_eq!(resolved.unwrap().provider, Provider::Codex);
+        assert_eq!(resolved.unwrap().provider, Provider::Brodex);
     }
 
     #[test]
@@ -886,7 +714,7 @@ mod tests {
         for name in &["alpha", "beta", "gamma"] {
             let bf = Brofile {
                 name: name.to_string(),
-                provider: Provider::Claude,
+                provider: Provider::Glm,
                 account: None,
                 lens: None,
                 model: None,
@@ -895,7 +723,6 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
-                terminal_mode: TerminalMode::Native,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -910,7 +737,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "to_delete".into(),
-            provider: Provider::Gemini,
+            provider: Provider::Deepseek,
             account: None,
             lens: None,
             model: None,
@@ -919,7 +746,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -957,7 +783,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "auditor".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: None,
             lens: None,
             model: None,
@@ -969,7 +795,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -985,7 +810,7 @@ mod tests {
             include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
         let bf: Brofile = serde_json::from_str(src).expect("rust-refactor-persona parses");
         assert_eq!(bf.name, "rust-refactor-persona");
-        assert_eq!(bf.provider, Provider::Claude);
+        assert_eq!(bf.provider, Provider::Glm);
         assert_eq!(
             bf.context.as_ref().and_then(|c| c.provider_defaults),
             Some(ProviderDefaultsMode::SuppressWhenSupported)
@@ -1055,7 +880,7 @@ mod tests {
             include_str!("../../system-defaults/brofiles/refactor/java-refactor-persona.json");
         let bf: Brofile = serde_json::from_str(src).expect("java-refactor-persona parses");
         assert_eq!(bf.name, "java-refactor-persona");
-        assert_eq!(bf.provider, Provider::Codex);
+        assert_eq!(bf.provider, Provider::Brodex);
         assert_eq!(bf.model.as_deref(), Some("gpt-5.5"));
         assert_eq!(bf.effort.as_deref(), Some("medium"));
         assert_eq!(
@@ -1122,56 +947,12 @@ mod tests {
     }
 
     #[test]
-    fn terminal_mode_defaults_native_and_parses_tmux() {
-        // Absent -> Native (back-compat for every existing brofile).
-        let bf: Brofile = serde_json::from_str(
-            r#"{"name":"x","provider":"codex"}"#,
-        )
-        .unwrap();
-        assert_eq!(bf.terminal_mode, TerminalMode::Native);
-        assert!(!bf.is_terminal());
-
-        // Explicit tmux.
-        let bf: Brofile = serde_json::from_str(
-            r#"{"name":"x","provider":"codex","terminal_mode":"tmux"}"#,
-        )
-        .unwrap();
-        assert_eq!(bf.terminal_mode, TerminalMode::Tmux);
-        assert!(bf.is_terminal());
-
-        // Native is skipped on serialize (keeps existing brofile JSON stable).
-        let json = serde_json::to_string(&Brofile {
-            name: "x".into(),
-            provider: Provider::Codex,
-            account: None,
-            lens: None,
-            model: None,
-            effort: None,
-            filters: None,
-            coerce_workspace: None,
-            runtime: None,
-            context: None,
-            terminal_mode: TerminalMode::Native,
-        })
-        .unwrap();
-        assert!(!json.contains("terminal_mode"), "{json}");
-
-        // Unknown value rejected.
-        assert!(
-            serde_json::from_str::<Brofile>(
-                r#"{"name":"x","provider":"codex","terminal_mode":"screen"}"#
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
     fn phase_decomposer_edit_implementer_parses() {
         let src =
             include_str!("../../system-defaults/brofiles/phase-decompose/edit-implementer.json");
         let bf: Brofile = serde_json::from_str(src).expect("phase-decomposer edit brofile parses");
         assert_eq!(bf.name, "phase-decomposer-edit-implementer");
-        assert_eq!(bf.provider, Provider::Codex);
+        assert_eq!(bf.provider, Provider::Brodex);
         // Retiered to runtime allocation (commit 6ae3437): model/effort are no
         // longer hardcoded; the brofile selects a "premium" runtime tier.
         assert_eq!(bf.model, None);
@@ -1268,7 +1049,7 @@ mod tests {
             include_str!("../../system-defaults/brofiles/phase-decompose/corpus-pathfinder.json");
         let bf: Brofile = serde_json::from_str(src).expect("corpus-pathfinder brofile parses");
         assert_eq!(bf.name, "corpus-pathfinder");
-        assert_eq!(bf.provider, Provider::Codex);
+        assert_eq!(bf.provider, Provider::Brodex);
         assert_eq!(
             bf.context.as_ref().and_then(|c| c.provider_defaults),
             Some(ProviderDefaultsMode::SuppressWhenSupported)
@@ -1286,7 +1067,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "fast".into(),
-            provider: Provider::Codex,
+            provider: Provider::Brodex,
             account: None,
             lens: None,
             model: Some("gpt-5.4-mini".into()),
@@ -1295,7 +1076,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
@@ -1308,7 +1088,7 @@ mod tests {
         let dir = temp_store();
         let bf = Brofile {
             name: "ws-worker".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: None,
             lens: None,
             model: None,
@@ -1317,7 +1097,6 @@ mod tests {
             coerce_workspace: Some(true),
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
@@ -1325,7 +1104,7 @@ mod tests {
 
         let bf_off = Brofile {
             name: "ws-off".into(),
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             account: None,
             lens: None,
             model: None,
@@ -1334,7 +1113,6 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
-            terminal_mode: TerminalMode::Native,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
         let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();
@@ -1356,7 +1134,7 @@ mod tests {
     #[test]
     fn test_synthesized_account_env_for_claude_aliases() {
         let env = synthesized_account_env_for_home(
-            Provider::Claude,
+            Provider::Glm,
             "yolo2",
             Path::new("/tmp/fake-home"),
         )
@@ -1370,7 +1148,7 @@ mod tests {
     #[test]
     fn test_synthesized_account_env_for_codex_account_name() {
         let env = synthesized_account_env_for_home(
-            Provider::Codex,
+            Provider::Brodex,
             "account3",
             Path::new("/tmp/fake-home"),
         )
@@ -1395,7 +1173,7 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved =
-            resolve_provider_env(Provider::Claude, Some("account2"), None, store.path(), None)
+            resolve_provider_env(Provider::Glm, Some("account2"), None, store.path(), None)
                 .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(
@@ -1410,14 +1188,14 @@ mod tests {
         let store = temp_store();
         let mut config = load_config(store.path());
         config.provider_defaults.insert(
-            Provider::Claude,
+            Provider::Glm,
             ProviderDefault {
                 account: "account2".into(),
             },
         );
         save_config(&config, store.path());
 
-        let effective = effective_account(Provider::Claude, None, store.path());
+        let effective = effective_account(Provider::Glm, None, store.path());
         assert_eq!(effective.as_deref(), Some("account2"));
     }
 
@@ -1433,7 +1211,7 @@ mod tests {
             },
         );
         config.provider_defaults.insert(
-            Provider::Claude,
+            Provider::Glm,
             ProviderDefault {
                 account: "account2".into(),
             },
@@ -1441,7 +1219,7 @@ mod tests {
         save_config(&config, store.path());
 
         let resolved =
-            resolve_provider_env(Provider::Claude, None, None, store.path(), None).unwrap();
+            resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
         assert!(
             resolved
@@ -1458,7 +1236,6 @@ mod tests {
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap()
         });
-        assert!(!resolved.contains_key("OPENCODE_CONFIG"));
         // GLM now rides bro-harness on the Anthropic transport, not the
         // claude CLI; it selects the transport rather than CLAUDE_CONFIG_DIR.
         assert_eq!(
@@ -1506,113 +1283,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_opencode_config_includes_blackbox_md_in_instructions() {
-        let home = temp_store();
-        let blackbox_dir = home.path().join(".blackbox");
-        fs::create_dir_all(&blackbox_dir).unwrap();
-        let blackbox_md = blackbox_dir.join("BLACKBOX.md");
-        fs::write(&blackbox_md, "# global guidance").unwrap();
-
-        let config = with_fake_home(home.path(), || {
-            build_opencode_config(Provider::Inception, None, false)
-        });
-        let instructions = config
-            .get("instructions")
-            .and_then(Value::as_array)
-            .expect("instructions should be present when BLACKBOX.md exists");
-        assert_eq!(instructions.len(), 1);
-        assert_eq!(
-            instructions[0].as_str(),
-            Some(blackbox_md.to_string_lossy().as_ref())
-        );
-    }
-
-    #[test]
-    fn test_build_opencode_config_omits_instructions_when_blackbox_md_missing() {
-        let home = temp_store();
-        let config = with_fake_home(home.path(), || {
-            build_opencode_config(Provider::Inception, None, false)
-        });
-        assert!(
-            config.get("instructions").is_none(),
-            "instructions field should be absent when BLACKBOX.md does not exist"
-        );
-    }
-
-    #[test]
-    fn test_build_opencode_config_suppresses_instructions_when_requested() {
-        let home = temp_store();
-        let blackbox_dir = home.path().join(".blackbox");
-        fs::create_dir_all(&blackbox_dir).unwrap();
-        fs::write(blackbox_dir.join("BLACKBOX.md"), "# global guidance").unwrap();
-
-        let config = with_fake_home(home.path(), || {
-            build_opencode_config(Provider::Inception, None, true)
-        });
-        assert!(
-            config.get("instructions").is_none(),
-            "suppress_instructions=true must omit the instructions array even when BLACKBOX.md exists"
-        );
-    }
-
-    #[test]
-    fn test_resolve_provider_env_inception_uses_distinct_config_paths() {
-        let store = temp_store();
-        let home = temp_store();
-        let blackbox_dir = home.path().join(".blackbox");
-        fs::create_dir_all(&blackbox_dir).unwrap();
-        fs::write(blackbox_dir.join("BLACKBOX.md"), "# global guidance").unwrap();
-
-        let (first, second) = with_fake_home(home.path(), || {
-            let first = resolve_provider_env(
-                Provider::Inception,
-                None,
-                Some("inception/mercury-2"),
-                store.path(),
-                None,
-            )
-            .unwrap();
-            let ctx = BrofileContext {
-                provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
-            };
-            let second = resolve_provider_env(
-                Provider::Inception,
-                None,
-                Some("inception/mercury-2"),
-                store.path(),
-                Some(&ctx),
-            )
-            .unwrap();
-            (first, second)
-        });
-
-        let first_path = first.get("OPENCODE_CONFIG").unwrap();
-        let second_path = second.get("OPENCODE_CONFIG").unwrap();
-        assert_ne!(
-            first_path, second_path,
-            "different launches must not race through a provider-wide generated opencode config"
-        );
-        assert!(
-            serde_json::from_str::<Value>(&fs::read_to_string(first_path).unwrap())
-                .unwrap()
-                .get("instructions")
-                .is_some()
-        );
-        assert!(
-            serde_json::from_str::<Value>(&fs::read_to_string(second_path).unwrap())
-                .unwrap()
-                .get("instructions")
-                .is_none(),
-            "strict suppression launch config must omit opencode instructions"
-        );
-    }
-
-    #[test]
     fn test_enforce_provider_defaults_strict_unsupported_fails() {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        let err = enforce_provider_defaults(Provider::Copilot, Some(&ctx)).expect_err(
+        let err = enforce_provider_defaults(Provider::VibeBh, Some(&ctx)).expect_err(
             "strict_suppress on Copilot should fail closed until verified controls exist",
         );
         assert!(err.contains("error.provider_defaults_unsupported"));
@@ -1624,11 +1299,11 @@ mod tests {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        enforce_provider_defaults(Provider::Inception, Some(&ctx))
+        enforce_provider_defaults(Provider::Glm, Some(&ctx))
             .expect("strict_suppress on Inception is honored");
-        enforce_provider_defaults(Provider::Claude, Some(&ctx))
+        enforce_provider_defaults(Provider::Glm, Some(&ctx))
             .expect("strict_suppress on Claude is honored via --system-prompt override");
-        enforce_provider_defaults(Provider::Codex, Some(&ctx))
+        enforce_provider_defaults(Provider::Brodex, Some(&ctx))
             .expect("strict_suppress on Codex is honored via config overrides");
     }
 
@@ -1651,7 +1326,7 @@ mod tests {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
         let env = with_fake_home(home.path(), || {
-            resolve_provider_env(Provider::Codex, None, None, store.path(), Some(&ctx)).unwrap()
+            resolve_provider_env(Provider::Brodex, None, None, store.path(), Some(&ctx)).unwrap()
         });
         let overlay = PathBuf::from(env.get("CODEX_HOME").unwrap());
 
@@ -1667,7 +1342,7 @@ mod tests {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::SuppressWhenSupported),
         };
-        enforce_provider_defaults(Provider::Claude, Some(&ctx))
+        enforce_provider_defaults(Provider::Glm, Some(&ctx))
             .expect("suppress_when_supported is best-effort and never fails closed");
     }
 
@@ -1679,7 +1354,6 @@ mod tests {
         let resolved = with_fake_home(home.path(), || {
             resolve_provider_env(Provider::Deepseek, None, None, store.path(), None).unwrap()
         });
-        assert!(!resolved.contains_key("OPENCODE_CONFIG"));
         // DeepSeek now rides bro-harness on the Anthropic transport.
         assert_eq!(
             resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
@@ -1745,18 +1419,4 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_resolve_provider_env_defaults_inception_opencode_config() {
-        let store = temp_store();
-
-        let resolved =
-            resolve_provider_env(Provider::Inception, None, None, store.path(), None).unwrap();
-        let config_path = resolved.get("OPENCODE_CONFIG").unwrap();
-        assert!(config_path.contains("inception-opencode-"));
-        assert!(config_path.ends_with(".json"));
-        let config = fs::read_to_string(config_path).unwrap();
-        assert!(config.contains("\"model\": \"inception/mercury-2\""));
-        assert!(config.contains("\"small_model\": \"inception/mercury-2\""));
-        assert!(!config.contains("mercury-edit-2"));
-    }
 }

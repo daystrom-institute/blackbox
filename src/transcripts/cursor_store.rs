@@ -149,7 +149,7 @@ mod tests {
 
     fn location(path: PathBuf) -> TranscriptLocation {
         TranscriptLocation {
-            provider: Provider::Claude,
+            provider: Provider::Glm,
             storage: TranscriptStorage::JsonlFile,
             path,
             account: Some("claude".into()),

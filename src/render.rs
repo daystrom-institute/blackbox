@@ -47,8 +47,7 @@ pub fn global_target_path(provider: &str) -> Option<Result<PathBuf>> {
 }
 
 /// Shared global-memory destination for provider-neutral content. Provider
-/// global files stay small and include this by reference (`@import` for
-/// claude/codex/gemini, `instructions: [path]` config field for opencode).
+/// global files stay small and include this by reference.
 ///
 /// Lives under `~/.blackbox/` — provider-neutral by design. Historical
 /// location was `~/.claude-shared/BLACKBOX.md`; that path now serves as a

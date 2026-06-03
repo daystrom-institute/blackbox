@@ -107,7 +107,6 @@ rolling utilization percentages suitable for direct quota capacity:
   default) as bearer auth. This returns pay-as-you-go balance availability, not
   rolling-window utilization.
 - Inception currently has no quota endpoint in this design; it uses the
-  OpenCode-backed active-probe donor path described in
   `design/orchestration/supervision/acquire-drone.md` §6.
 
 Allocation policy must keep these signals distinct: Z.AI can be quota-probe

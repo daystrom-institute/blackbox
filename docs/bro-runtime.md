@@ -124,7 +124,6 @@ bro_providers()
 ```
 
 Provider binaries can be overridden with env vars such as `CLAUDE_BIN`,
-`CODEX_BIN`, `COPILOT_BIN`, `GEMINI_BIN`, `OPENCODE_BIN`, and `VIBE_BIN`.
 
 ## MCP Servers And Filters
 

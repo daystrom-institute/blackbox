@@ -92,7 +92,7 @@ mod tests {
         let r1 = reg.clone();
         let o1 = order.clone();
         let h1 = tokio::spawn(async move {
-            let _g = r1.acquire(Provider::Claude, "sid").await;
+            let _g = r1.acquire(Provider::Glm, "sid").await;
             o1.lock().push(1);
             tokio::time::sleep(Duration::from_millis(50)).await;
             o1.lock().push(2);
@@ -104,7 +104,7 @@ mod tests {
         let r2 = reg.clone();
         let o2 = order.clone();
         let h2 = tokio::spawn(async move {
-            let _g = r2.acquire(Provider::Claude, "sid").await;
+            let _g = r2.acquire(Provider::Glm, "sid").await;
             o2.lock().push(3);
         });
 
@@ -119,12 +119,12 @@ mod tests {
 
         let r1 = reg.clone();
         let h1 = tokio::spawn(async move {
-            let _g = r1.acquire(Provider::Claude, "sid-a").await;
+            let _g = r1.acquire(Provider::Glm, "sid-a").await;
             tokio::time::sleep(Duration::from_millis(40)).await;
         });
         let r2 = reg.clone();
         let h2 = tokio::spawn(async move {
-            let _g = r2.acquire(Provider::Claude, "sid-b").await;
+            let _g = r2.acquire(Provider::Glm, "sid-b").await;
             tokio::time::sleep(Duration::from_millis(40)).await;
         });
 
@@ -144,10 +144,10 @@ mod tests {
     fn try_acquire_returns_none_when_same_key_busy() {
         let reg = ResumeLeaseRegistry::new();
         let first = reg
-            .try_acquire(Provider::Claude, "sid")
+            .try_acquire(Provider::Glm, "sid")
             .expect("first lease should acquire");
-        assert!(reg.try_acquire(Provider::Claude, "sid").is_none());
+        assert!(reg.try_acquire(Provider::Glm, "sid").is_none());
         drop(first);
-        assert!(reg.try_acquire(Provider::Claude, "sid").is_some());
+        assert!(reg.try_acquire(Provider::Glm, "sid").is_some());
     }
 }

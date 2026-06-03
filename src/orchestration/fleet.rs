@@ -1341,26 +1341,24 @@ fn merge_env(
 }
 
 /// Providers that speak the persistent bidirectional stream-json control
-/// protocol: Claude (CLI bidi mode) and the bro-harness providers GLM /
-/// DeepSeek / Brodex / VibeBh (§2). Others are one-shot only. Public so the
+/// protocol: the bro-harness providers GLM / DeepSeek / Brodex / VibeBh (§2).
+/// Others are one-shot only. Public so the
 /// cockpit can tell whether a non-live agent is resumable.
 pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Claude | Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
     )
 }
 
 /// Whether fleet must write turn-1 to the session's stdin after launch.
 ///
-/// The Claude CLI **ignores `-p`** in `--input-format stream-json` mode — it
-/// keeps the session alive and waits for the first user turn on stdin, so a
-/// `-p`-only launch just hangs (0 events → Idle). bro-harness is the opposite:
-/// its bidi `run_session` seeds turn-1 from `-p` directly
+/// bro-harness bidi `run_session` seeds turn-1 from `-p` directly
 /// (`crates/bro-harness/src/agent_loop.rs`), so writing turn-1 to its stdin too
-/// would double the first turn. Hence: seed via stdin for Claude only.
+/// would double the first turn.
 fn bidi_seeds_turn1_via_stdin(provider: Provider) -> bool {
-    matches!(provider, Provider::Claude)
+    let _ = provider;
+    false
 }
 
 fn provider_uses_bro_harness(provider: Provider) -> bool {
@@ -1412,7 +1410,7 @@ mod tests {
         // NOT, or bidi dispatch doubles the flag and the harness rejects it
         // ("cannot be used multiple times"). Guards that regression.
         for p in [
-            Provider::Claude,
+            Provider::Glm,
             Provider::Glm,
             Provider::Deepseek,
             Provider::Brodex,
@@ -1491,7 +1489,7 @@ mod tests {
         // Claude ignores `-p` in stream-json input mode → must seed turn-1 over
         // stdin. bro-harness seeds turn-1 from `-p` → must NOT be stdin-seeded
         // (would double the first turn).
-        assert!(bidi_seeds_turn1_via_stdin(Provider::Claude));
+        assert!(bidi_seeds_turn1_via_stdin(Provider::Glm));
         for p in [
             Provider::Glm,
             Provider::Deepseek,
@@ -1508,7 +1506,7 @@ mod tests {
     #[test]
     fn bidi_capability_gate() {
         for p in [
-            Provider::Claude,
+            Provider::Glm,
             Provider::Glm,
             Provider::Deepseek,
             Provider::Brodex,
@@ -1516,7 +1514,7 @@ mod tests {
         ] {
             assert!(provider_supports_bidi(p), "{p} should be bidi-capable");
         }
-        for p in [Provider::Codex, Provider::Gemini, Provider::Inception] {
+        for p in [Provider::Brodex, Provider::Deepseek, Provider::Glm] {
             assert!(!provider_supports_bidi(p), "{p} should be one-shot");
         }
     }
@@ -1742,7 +1740,7 @@ mod tests {
 
     #[test]
     fn dispatch_spec_builder_defaults() {
-        let spec = DispatchSpec::new(Provider::Claude, "hello");
+        let spec = DispatchSpec::new(Provider::Glm, "hello");
         assert_eq!(spec.prompt, "hello");
         assert!(spec.cwd.is_none());
         assert!(spec.model.is_none());

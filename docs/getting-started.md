@@ -81,7 +81,6 @@ restricted surface such as `readonly`.
 url = "http://127.0.0.1:7264/mcp?surface=ops"
 ```
 
-**OpenCode** - add to `~/.config/opencode/opencode.json`:
 
 ```json
 {
@@ -130,5 +129,4 @@ store, not the rendered markdown.
 | `TRANSCRIPT_SEARCH_CODEX_ROOT` | Override Codex data dir | `~/.codex` |
 | `TRANSCRIPT_SEARCH_INDEX_PATH` | Override tantivy index location | XDG state dir |
 | `BLACKBOX_REINDEX_INTERVAL_SECS` | Background reindex interval | `120` |
-| `CLAUDE_BIN` / `OPENCODE_BIN` / `CODEX_BIN` / `COPILOT_BIN` / `GEMINI_BIN` | Override provider binary paths | auto-resolved |
 | `RUST_LOG` | Tracing filter | `transcript_search=info` |

@@ -41,51 +41,19 @@ impl<'a> WorkflowRunner<'a> {
                 "visit": self.visit_counts.get(node_id).copied().unwrap_or(0),
             }),
         );
-        let task = if self
+        let task = self
             .server
-            .brofile_is_terminal(brofile, self.project_dir.as_deref())
-        {
-            // Terminal mode: run the provider TUI in a tmux pane and resolve the
-            // turn from the transcript. Returns an already-completed synthetic
-            // task. For a durable actor, `existing_session` resumes the same
-            // provider session across visits (claude --resume / codex resume),
-            // so a durable terminal-mode node keeps context instead of
-            // cold-starting.
-            self.server
-                .workflow_dispatch_executor_tmux(
-                    brofile,
-                    prompt,
-                    self.project_dir.as_deref(),
-                    &self.ctx.meta.arc_id,
-                    actor_name,
-                    existing_session.as_deref(),
-                    &self.cancel_token,
-                )
-                .await
-                .map_err(|e| {
-                    // Emit the canonical "arc cancelled" sentinel so the runner
-                    // classifies a cancelled turn as `cancelled`, not `failed`
-                    // (engine.rs maps only the exact sentinel to cancelled).
-                    if self.cancel_token.is_cancelled() {
-                        anyhow!("arc cancelled")
-                    } else {
-                        anyhow!("tmux dispatch for node '{node_id}': {e}")
-                    }
-                })?
-        } else {
-            self.server
-                .workflow_dispatch_executor(
-                    brofile,
-                    prompt,
-                    self.project_dir.as_deref(),
-                    existing_session.as_deref(),
-                    existing_task_id.as_deref(),
-                    self.runtime_for_actor(actor),
-                    &[],
-                )
-                .await
-                .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?
-        };
+            .workflow_dispatch_executor(
+                brofile,
+                prompt,
+                self.project_dir.as_deref(),
+                existing_session.as_deref(),
+                existing_task_id.as_deref(),
+                self.runtime_for_actor(actor),
+                &[],
+            )
+            .await
+            .map_err(|e| anyhow!("dispatch for node '{node_id}': {e}"))?;
 
         let task_id = {
             let inner = task.inner.lock();

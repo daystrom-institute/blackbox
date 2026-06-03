@@ -117,14 +117,14 @@ mod tests {
                 brofile_version: "1".to_string(),
                 scope,
                 charter: "help".to_string(),
-                provider: Provider::Codex,
+                provider: Provider::Brodex,
                 provider_session_id: "session-1".to_string(),
             },
             ThreadEvent::Turn {
                 turn_id: 1,
                 mode: "answer".to_string(),
                 caller: CallerRef {
-                    provider: Provider::Claude,
+                    provider: Provider::Glm,
                     session_id: "caller-session".to_string(),
                 },
                 question: "why".to_string(),

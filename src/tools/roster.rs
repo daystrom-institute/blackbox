@@ -273,7 +273,6 @@ impl BlackboxServer {
                     coerce_workspace: p.coerce_workspace,
                     runtime: None,
                     context: p.context.clone(),
-                    terminal_mode: p.terminal_mode.unwrap_or_default(),
                 };
                 if let Err(e) =
                     brofile::save_brofile(&bf, scope, store_dir, p.project_dir.as_deref())
@@ -895,11 +894,7 @@ Next step: <one concrete steering suggestion>\n",
                 task
             }
             None => {
-                let session_id = if matches!(provider, Provider::Claude) {
-                    uuid::Uuid::new_v4().to_string()
-                } else {
-                    "pending".into()
-                };
+                let session_id = "pending".to_string();
                 let ambient_ctx = orch::AmbientContext {
                     task_id: Some(task_id.clone()),
                     session_id: Some(session_id.clone()),

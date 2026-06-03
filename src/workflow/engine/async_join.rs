@@ -25,19 +25,6 @@ impl<'a> WorkflowRunner<'a> {
                 let brofile = actor.brofile.as_deref().ok_or_else(|| {
                     anyhow!("async target '{target_id}' executor missing brofile")
                 })?;
-                // Terminal mode runs the turn synchronously, which is
-                // incompatible with fork/fire-and-forget concurrency. Fail
-                // closed rather than silently downgrade to a headless dispatch.
-                if self
-                    .server
-                    .brofile_is_terminal(brofile, self.project_dir.as_deref())
-                {
-                    bail!(
-                        "actor '{actor_name}' uses a terminal_mode=tmux brofile ('{brofile}'), \
-                         which is not supported in fork/fire-and-forget nodes (target \
-                         '{target_id}'); use it on a synchronous executor node"
-                    );
-                }
                 let existing = if actor.durable {
                     self.actor_sessions.get(&actor_name).cloned()
                 } else {
