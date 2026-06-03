@@ -5,7 +5,7 @@ track: harness
 status: researching
 confidence: mixed
 generated_by: claude
-last_reviewed: 2026-06-02
+last_reviewed: 2026-06-03
 topics:
   - narf
   - metatools
@@ -13,6 +13,7 @@ topics:
   - bro-harness
   - authoring-layer
   - bounded-recursion
+  - surface-split
 ---
 
 # NARF Draft 2 — the native authoring layer as the primary harness interface
@@ -229,6 +230,13 @@ mirroring `exec`/`wait`, `code-mode/src/lib.rs:45`), and *all* capability —
 atoms, code discovery, refactor, refs, promises, tx — lives as **bindings inside
 the sandbox**, not as direct tools.
 
+> **Refined in §9:** that collapse is not total. *Interpretive* discovery
+> (search/describe) stays on a thin **direct** orientation surface — a fuzzy
+> result must reach the model's context to be judged, and you cannot learn to
+> drive the box from inside it. Only *exact* capability access
+> (dereference-by-ref) lives in the sandbox. The line is exact-vs-interpretive,
+> not in-box-vs-out; see §9.
+
 > **Decision (2026-06-02): NARF is a config-selected mode, not NARF-only.** The
 > radical `code_mode_only` surface is the primary interface *for
 > composition-capable models doing multi-step work* — but the harness preserves a
@@ -338,6 +346,34 @@ These carry forward from the shipped systems and are not up for trade:
 - The JS runtime exposes **explicit globals only**, no ambient fs/network/console
   (`runtime/globals.rs:13`).
 
+### 7.1 Stale-hash is mechanical; dirty-worktree is not an authority flag
+
+The shared-worktree bullet hides a recategorization worth stating. A
+worktree-level `dirty` boolean + an `acknowledge` flag is the wrong gate: in this
+repo multiple agents share working state, so *dirty is the normal steady state* —
+the flag is always passed, degrading to a rubber stamp (alarm-fatigue applied to a
+permission gate), and the "dirty → pass the flag" lesson is one compaction makes
+the agent re-learn each cycle without ever buying safety.
+
+The real hazard is not "the worktree is dirty" but "the *specific bytes this plan
+touches* moved underneath me" — **per-target stale-hash** (the axis-2 DX-2
+mechanism), which the refactor runner already carries. It fixes all three failure
+modes at once: other files dirty is irrelevant (silent on the normal case); a
+second round is planned against the state the first round produced (no
+self-collision); and it is mechanical, so the agent is not responsible for
+remembering it (compaction-proof). When it fires it is not a flag to stamp — it is
+"the bytes you planned against are gone; re-ground and re-plan," bypassable only by
+doing the right thing.
+
+The category error: stale-hash is a *mechanical* fact the system checks itself;
+operator-authority (`RX-V1`) is a *semantic* decision the agent cannot self-grant.
+The dirty flag wore RX-V1's clothes without being it — the agent legitimately has
+authority to edit a dirty worktree (that *is* the normal mode), so the "opt-out" is
+always granted, so it is noise. The governing test, which generalizes past this one
+gate: **does the signal fire on the delta or on the steady state?** A
+steady-state-firing gate is simultaneously a correctness failure (rubber stamp) and
+a context-bloat failure — kill it; keep the delta-firing check (stale-hash).
+
 ## 8. Open forks (decisions deferred to the next pass)
 
 Stated, not resolved — these are the choices that change *which runtime* gets
@@ -365,12 +401,163 @@ built.
   per-item bounds + LRU, and whether the budget is enforced by the runtime or
   declared by the program.
 
+## 9. The two surfaces: orientation (direct) vs work (in-box)
+
+§5 framed the model-facing surface as collapsing to `narf_exec`/`narf_wait`. That
+is too pure. The canonical interface is **two surfaces with opposite context
+semantics**, and the line between them is the load-bearing interface decision NARF
+makes.
+
+- **Orientation surface — direct, OOTB, model-facing, in-context.** A thin,
+  curated set of normal tool calls the agent issues in its turn loop to learn what
+  capabilities exist and how to drive the box: discover, search, describe, schema.
+  These already exist as direct bbox tools (`atom_search` / `atom_describe` /
+  `atom_list`, `bbox_describe_schema`, `bbox_hybrid_search` — the agentic opening
+  sequence). Their results *belong in context*: the model must hold the menu, in
+  its own reasoning, to author a correct cell.
+- **Work surface — code-mode-only, in-box, out-of-context.** The composition
+  runtime: typed programs over capability bindings, values held as refs, effects
+  applied in a `Tx`. This is where §5's "primary interface" lives — but it is *not*
+  the only surface, and it deliberately *excludes* discovery.
+
+The shape is **code-mode-only-for-work + a direct OOTB orientation set** — the
+obvious in-between Codex's `code_mode_only` (exec/wait only) skips by purism. You
+cannot learn to use the box from inside the box (cold-start: you would need to
+already know the registry exists, its shape, and how to author a cell). The
+orientation tools are the on-ramp. The keep-values-out-of-context discipline
+applies to *work products*, not to *orientation* — discovery is the one thing that
+should enter context, because it informs authoring.
+
+### 9.1 The boundary is interpretation (CQRS, redrawn)
+
+CQRS is the gateway intuition (reads vs writes); the load-bearing axis is one notch
+over: **exact vs interpretive.** Commands are exact by construction; reads split
+into exact-by-key (`atom_get(handle)`, `file.read(path)`, a hash) and interpretive
+(search, ranked retrieval, fuzzy match). The decision rule:
+
+> **Can downstream code trust this value without a model having looked at it?**
+> Yes → in-box. No → direct.
+
+Interpretive results must land in the model's context, where the agent judges them
+before anything depends on them; exact results are safe to consume in code.
+
+This guards a **third error class** the rest of the system is blind to.
+`const node = (await search("SharedState"))[0]; refactor.plan({source: node})`
+passes axis-1 typecheck (well-typed node), passes axis-2 diagnostics (the wrong
+refactor still compiles), passes stale-hash (no bytes moved) — and silently
+refactors the wrong entity. Mechanical guards catch mechanical faults; a
+misresolution from a fuzzy query is *semantic*, catchable only by a model reading
+the response. The surface split *is* that guard. (Axis-1/axis-2 are the LSP-of-the-
+script vs LSP-of-the-effect distinction; this is a third, orthogonal axis.)
+
+### 9.2 Enforcement: facade, dereference-never-select
+
+The split is enforced **mechanically, in the type signature**, not by convention
+(a "remember to inspect fuzzy results" rule dies at compaction):
+
+- **No `search` / `list` / `all` bindings in the box.** Eliminating search is
+  necessary but not sufficient — `list().filter(a => a.name.includes("Shared"))[0]`
+  is search in a `.filter()` costume; enumerate-then-pick is the same footgun. The
+  rule is **the box dereferences, never selects.**
+- **In-box capability access is dereference-by-exact-ref only.**
+  `atom("atom:foo@v1")` is a constructor over an exact `AtomRef`
+  (`../../src/orchestration/atoms/types.rs:899`), exact-equal under the hood,
+  fail-closed on miss. There is no overload taking a query string, so axis-1
+  typecheck makes the footgun *unrepresentable*, not merely discouraged. A miss
+  routes a `suggested_fix` to the *model* (re-author with the exact ref), never to
+  code that auto-picks it.
+- **One engine, two faces.** The same catalog/graph that powers the interpretive
+  *direct* tools (`atom_search`, `hybrid_search`) backs the in-box `atom(ref)`
+  facade; the facade strips interpretive capability from a store that has it. The
+  box's surface stays exact even though storage is a search index.
+
+**The model is the only bridge that collapses non-exact → exact.** Interpretive
+query → direct tool → context → model judges → model emits an exact ref → ref
+crosses into the box. The box only ever receives tokens a model already
+adjudicated — which also closes the laundering edge at the source: with no fuzzy
+source in the box, there is nothing to launder (invoke results are exact per the
+output schema; the only fuzzy values live in context). `@latest` is exact-now but
+not reproducible — `prepare` pins it to the concrete `@vN` in the frozen artifact,
+the same move as digest-pinning (see `narf-capability-library.md` §6–§7).
+
+### 9.3 What Codex got right and wrong
+
+Codex's instinct was correct: let the agent discover capabilities by
+*predicate/semantic search* rather than coarse exact-name or deferred-name loading.
+The error was the **boundary** — it exposes the catalog as an in-box filterable
+value (`ALL_TOOLS.filter(t => t.name.includes("thread"))[0]`), which is precisely
+the footgun. NARF keeps the rich discovery and moves it to the *direct orientation
+surface*, leaving the box exact-only. §2's "ALL_TOOLS should evolve into a richer
+registry" resolves here: the richer registry is the orientation surface, not an
+in-box array.
+
+## 10. v1 scope and deferred levers
+
+The correctness apparatus above is real but heavy, and context is the budget
+correctness runs on — verbose machinery spends it and accelerates the compaction
+that erases the lessons it carries. So v1 is deliberately optimistic, with the
+heavy mechanisms named as **levers**, each with a pressure-signal tripwire.
+
+**The principle that keeps this safe: optimistic v1 assumes the world is *stable*,
+not that it is *complete*.** Optimism drops the *movement* guards (staleness,
+drop-stale, dirty→stale-hash) — it trusts the orchestrator deconflicted you. It does
+**not** drop the *absence* floors (capability-not-bound, LSP-unavailable): those are
+cheap soundness checks, not concurrency machinery, and faking-present an absent
+analyzer is a different, worse sin. Optimism touches movement, never absence.
+
+### v1 core (thin — mostly composition of what exists)
+
+- The two metatools (`narf_exec`/`narf_wait`) + V8 sandbox, explicit globals.
+- Capabilities as **direct bindings** with generated `.d.ts`; discovery via the
+  **direct orientation tools** (§9), not an in-box scout.
+- Refs + local promises (already in `bro-tools`).
+- **Axis-1 validation only** at prepare: parse + typecheck against the pinned
+  `.d.ts` + alias/digest resolution + policy (RX-V1 pass-through, surface allowlist,
+  refuse-write-outside-`Tx`). Sound and complete at prepare time because the
+  authored surface does not move.
+- Prepare→run (freeze the artifact) for mutating multi-step scripts; direct exec for
+  reads/single edits. Status may be a plain boolean — optimism earns it back.
+- Apply through the existing refactor runner → rollback-on-failure is **free**.
+- window=0 **instant-tier** rider (shipped; wire it into the apply path).
+- A run trace/journal for replay + review.
+
+### Levers (with tripwires)
+
+| Lever | Pull when |
+| --- | --- |
+| Version-correlation + drop-stale (DX-2) | stale-chase incidents, or async diagnostic delivery |
+| Stale-hash apply gate (dirty→hash, §7.1) | shared-worktree clobbering actually happens |
+| Scope-honest status envelope (vs boolean) | prepare starts making axis-2 claims it cannot keep |
+| Scout retrieval engine (vector/BM25/decay/NARF-lib) | the bound-declaration set outgrows what the agent can survey in context |
+| Tx-vs-saga cross-atom composition (§8) | scripts compose *dispatched* atoms whose effects must commit/roll back as a unit |
+| Durable promises | scripts must survive harness resume boundaries |
+| check/truth diagnostic tiers | inherit the trigger from `bro-harness-diagnostics.md` |
+
+### Three floors not to YAGNI past
+
+1. **Absence floors stay** — RX-V1 (never infer operator flags) and RX-V3 (LSP
+   fail-closed on absence) are cheap soundness, not staleness.
+2. **Don't collapse prepare→run into "just run the source."** The freeze defends
+   against compaction corrupting *what executes* — an agent-memory problem optimism
+   says nothing about. Keep it for mutating scripts.
+3. **Keep the free rollback.** Don't *build* saga; don't *strip* the refactor
+   runner's existing rollback.
+
+The discovery cut, stated precisely: the grounding **sequence** (once-per-session
+discipline, §9 orientation surface) and the route-card **contract** are v1, over a
+small capability universe; only the retrieval **engine** that pre-narrows a *large*
+catalog is the lever. Scout's required precision scales with corpus size because the
+agent reads the survivors — a small corpus tolerates a dumb ranker, so the contract
+ships and the ranking sophistication scales in.
+
 ## Crosslinks / breadcrumbs
 
 - v1 braindump (breadcrumb map + exploratory script sketches):
   [narf.md](narf.md).
 - The axis this answers: [metatools.md](metatools.md) — see the leaf-grain
-  dimension and the dissolved fine/coarse open invariant.
+  dimension and the dissolved fine/coarse open invariant; §9's surface split also
+  resolves where predicate discovery lives (direct, not in-box).
+- Capability-library negotiation/grounding (corrected by §9): [../../design/bro-harness/narf-capability-library.md](../../design/bro-harness/narf-capability-library.md) §3.
 - Track charter: [harness-tracks.md](harness-tracks.md).
 - Atoms canon in code: `../../src/orchestration/atoms/types.rs`,
   `../../src/orchestration/atoms/invocation.rs`,

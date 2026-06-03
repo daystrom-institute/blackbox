@@ -102,6 +102,22 @@ by writing refs, traces, session metadata, or library telemetry.
 
 ## 3. Capability negotiation, not plain search
 
+> **Correction (2026-06-03) — scout is not an in-box service.** The
+> `narf.capabilities.scout(...)` and route-card shapes below are the right
+> *contract* (intent → signposted routes with `fit` / `requires` / `effects` /
+> `next` / `stop_if`) and the right *discipline* (the grounding sequence, §3.1) —
+> but they are **not** an in-box sandbox binding. Discovery is *interpretive*, so
+> it lives on the **direct orientation surface**: normal model-facing tool calls
+> (`atom_search` / `atom_describe` / `bbox_hybrid_search`) whose responses the
+> model reads in context and adjudicates. The in-box surface exposes only *exact*
+> dereference-by-ref (`atom("atom:foo@v1")`), never search or
+> enumerate-and-filter — the box dereferences, never selects. See
+> [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md)
+> §9 (orientation/work surface split; the exact-vs-interpretive / CQRS boundary;
+> facade enforcement). Read the route-card fields below as the shape of what those
+> *direct* tools return / what the model reads — not as a `narf.capabilities.*`
+> binding callable from authored JS.
+
 The opening move is a statement of intent, not a package lookup:
 
 ```ts
@@ -169,6 +185,13 @@ a condition holds. Hybrid retrieval and decay affect ranking; the agentic
 surface affects convergence.
 
 ### 3.1 Grounding sequence as tool surface
+
+> **See** [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md)
+> §9 (the orientation/work surface split) and §10 (v1 scope): the grounding
+> *sequence* below is v1 discipline and "step 2 / scout" is performed on the
+> **direct orientation surface** (model-facing `atom_search`/`atom_describe`/
+> `bbox_hybrid_search`), not an in-box runtime call; only the retrieval *engine*
+> that pre-narrows a large catalog is a deferred lever.
 
 The scout surface should encode the opening discipline directly. Future agents
 should not have to remember a prose runbook or re-derive the phase order after
@@ -300,6 +323,12 @@ helpers are not globally discoverable by default.
 
 ## 5. NARF-lib lifecycle and decay
 
+> **Deferred lever.** Cross-session NARF-lib + decay/telemetry is not v1 — it is
+> not-yet-applicable rather than merely heavy: there is nothing to decay until
+> cross-session usage accumulates. It arrives with cross-session persistence; see
+> [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md)
+> §10 (levers). v1 keeps only session-local helpers (§4).
+
 Published library functions are cross-session, searchable, and decay-managed.
 They are lighter than atoms but still structured:
 
@@ -355,6 +384,13 @@ semantic fit, policy fit, effect fit, or route completeness.
 
 Compaction boundaries make hidden state dangerous. For mutating scripts, NARF
 authoring should be two-step:
+
+> **See** [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md)
+> §10 floor #2 (the freeze defends against compaction corrupting *what executes* —
+> an agent-memory problem, not a world-movement one, so it survives the optimistic
+> v1 cut) and §9.2 (the model is the only bridge collapsing non-exact → exact; the
+> resolved artifact carries exact refs only, and `@latest` is pinned to a concrete
+> `@vN` here at prepare).
 
 ```text
 prepare(source)
@@ -467,6 +503,43 @@ The output should be compact but actionable:
 }
 ```
 
+### 8.1 Two axes of validation — what `prepare` may guarantee
+
+The list above mixes two kinds of check with opposite freshness properties, and
+they must be treated differently or the green light lies.
+
+- **Axis 1 — the authored surface (settled at prepare, a real guarantee).**
+  Subject is the NARF script itself: parse, typecheck against the pinned capability
+  `.d.ts`, alias/digest resolution, effect-annotation match, policy (RX-V1
+  pass-through, surface allowlist, write-outside-`Tx`). These have **no TOCTOU** —
+  the script is frozen and the declarations are digest-pinned, so nothing moves
+  between prepare and run. This is where `prepare` earns a green light it can stand
+  behind. (Note the gradient the §8 list under-specifies: "illegal JS/TS syntax" is
+  parse-level; the load-bearing check is *typecheck against the capability schemas*
+  — declaration-as-enforced-gate, not declaration-as-prompt-hint.)
+- **Axis 2 — executing effects (recorded assumptions, re-verified at apply).**
+  Subject is the target tree: LSP availability, file hashes, dirty/stale state,
+  capability-bound-at-run. These are time-sensitive; `prepare` can record the
+  world-version it assumes but **cannot guarantee** it. The guarantee arrives only
+  at the version-correlated apply (window=0 / DX-2), never from a prepare-time
+  precondition.
+
+Consequence for `status`: it must be **scope-honest** — a green `ready` is a
+*scoped* claim ("ready under {worktree-hash, LSP-as-of-prepare}, axis-2 re-checked
+at apply"), never "all good." Don't lie in the one-liner; push the scope detail into
+the artifact. And **inherit the diagnostics invariants rather than re-derive a
+weaker freshness story**: DX-1 (synchronous, rides the action), DX-2
+(version-correlate, drop-stale — "silence-or-truth, never stale-lie"), DX-3
+(precision over recall), DX-4 (scope-honest payload) from
+[`bro-harness-diagnostics.md`](./bro-harness-diagnostics.md). Axis 1's window=0
+analogue is a synchronous typecheck rider on the authoring result; axis 2's is the
+window=0 instant-tier rider on the apply.
+
+Per [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md)
+§10, v1 runs axis-1 to completion and treats axis-2 as advisory pre-flight (the
+optimistic stance), with the version-correlated apply as the lever that upgrades
+axis-2 from assumption to guarantee.
+
 ## 9. Promotion to atom
 
 NARF-lib helpers are code modules; atoms are capability contracts. Promotion is
@@ -513,8 +586,10 @@ implemented later without changing the authoring surface.
 
 A narrow spike should prove the lifecycle without building the whole catalog:
 
-1. Add `narf.capabilities.scout` over a small fixed universe: one atom, one
-   session helper, one tool-sequence recipe.
+1. Surface discovery through the **direct orientation tools** (§3 correction) over
+   a small fixed universe — one atom, one session helper, one tool-sequence
+   recipe — returning route-card-shaped responses the model reads. Not an in-box
+   `narf.capabilities.scout` binding.
 2. Add `narf.session.define` / `narf.session.import` for session-local helpers.
 3. Add `narf.prepare` that renders a full script with inline annotations and
    syntax/import diagnostics.
@@ -533,7 +608,9 @@ without relying on post-compaction memory of hidden imports or tool layering.
   this doc owns authoring-library behavior; the boundary doc owns topology and
   durability placement.
 - **Extends** [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md):
-  it fills the gap between ephemeral `Script` and promoted `Atom`.
+  it fills the gap between ephemeral `Script` and promoted `Atom`. Corrected/scoped
+  by draft2 §9 (orientation/work surface split, exact-vs-interpretive boundary),
+  §10 (v1 scope and deferred levers), and §7.1 (stale-hash vs dirty-worktree).
 - **Builds on** [`bro-harness-tool-chaining.md`](./bro-harness-tool-chaining.md):
   refs, promises, and hidden value flow are the substrate that make helpers
   compact and replayable.
