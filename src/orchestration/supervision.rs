@@ -1179,7 +1179,7 @@ mod tests {
     }
 
     #[test]
-    fn observe_event_extracts_opencode_tool_shape() {
+    fn observe_event_extracts_nested_tool_shape() {
         let mut state = SupervisionState::default();
         let event = serde_json::json!({
             "part": {

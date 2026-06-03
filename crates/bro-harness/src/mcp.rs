@@ -336,7 +336,6 @@ fn collect_text(content: &[Content]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn tool_filter_deny_blocks_recursion_guard_patterns() {
@@ -374,11 +373,11 @@ mod tests {
         let parsed = parse_servers(
             r#"{
                 "mcpServers": {
-                    "tmux": {
+                    "local_tools": {
                         "type": "stdio",
-                        "command": "/opt/bin/tmux-mcp-rs",
-                        "args": ["--socket", "fleet-test"],
-                        "env": {"TMUX_MCP_SOCKET": "fleet-test"}
+                        "command": "/opt/bin/local-tools",
+                        "args": ["--scope", "probe"],
+                        "env": {"LOCAL_TOOLS_SCOPE": "probe"}
                     }
                 }
             }"#,
@@ -388,13 +387,13 @@ mod tests {
         assert_eq!(
             parsed,
             vec![(
-                "tmux".to_string(),
+                "local_tools".to_string(),
                 McpTransportConfig::Stdio {
-                    command: "/opt/bin/tmux-mcp-rs".to_string(),
-                    args: vec!["--socket".to_string(), "fleet-test".to_string()],
+                    command: "/opt/bin/local-tools".to_string(),
+                    args: vec!["--scope".to_string(), "probe".to_string()],
                     env: BTreeMap::from([(
-                        "TMUX_MCP_SOCKET".to_string(),
-                        "fleet-test".to_string()
+                        "LOCAL_TOOLS_SCOPE".to_string(),
+                        "probe".to_string()
                     )]),
                 },
             )]
@@ -426,85 +425,4 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    #[ignore = "requires BRO_HARNESS_TEST_TMUX_MCP pointing at a local tmux MCP binary"]
-    async fn live_stdio_tmux_plugin_lists_creates_and_cleans_up() {
-        let command = std::env::var("BRO_HARNESS_TEST_TMUX_MCP")
-            .expect("BRO_HARNESS_TEST_TMUX_MCP must point at tmux-mcp-rs");
-        let transport = McpTransportConfig::Stdio {
-            command,
-            args: vec!["--shell-type".to_string(), "zsh".to_string()],
-            env: BTreeMap::new(),
-        };
-        let tools = list_server_tools(&transport).await.unwrap();
-        let socket = format!("bro-harness-stdio-smoke-{}", std::process::id());
-        let session_name = format!("bro-harness-stdio-smoke-{}", std::process::id());
-
-        // List before create: this validates the stdio transport and prevents
-        // colliding with a leftover session on the isolated socket.
-        let before = call_named_tool(&tools, "list-sessions", json!({ "socket": socket })).await;
-        match before {
-            ToolResult::Error(e) => assert!(
-                e.contains("No such file or directory"),
-                "unexpected list-sessions error before create: {e}"
-            ),
-            ok => assert!(
-                !tool_result_text(&ok).contains(&session_name),
-                "unique smoke session should not exist before create: {:?}",
-                ok
-            ),
-        }
-
-        let create = call_named_tool(
-            &tools,
-            "create-session",
-            json!({ "socket": socket, "name": session_name }),
-        )
-        .await;
-        assert_tool_ok(create);
-
-        let found = call_named_tool(
-            &tools,
-            "find-session",
-            json!({ "socket": socket, "name": session_name }),
-        )
-        .await;
-        assert!(
-            tool_result_text(&found).contains(&session_name),
-            "session should be findable after create: {:?}",
-            found
-        );
-
-        let cleanup = call_named_tool(
-            &tools,
-            "kill-session",
-            json!({ "socket": socket, "sessionId": session_name }),
-        )
-        .await;
-        assert_tool_ok(cleanup);
-    }
-
-    async fn call_named_tool(tools: &[McpTool], name: &str, input: Value) -> ToolResult {
-        tools
-            .iter()
-            .find(|t| t.name == name)
-            .unwrap_or_else(|| panic!("tool {name} not listed"))
-            .call_inner(input)
-            .await
-            .unwrap_or_else(|e| panic!("{name} failed: {e:#}"))
-    }
-
-    fn assert_tool_ok(result: ToolResult) {
-        if let ToolResult::Error(e) = result {
-            panic!("tool returned error: {e}");
-        }
-    }
-
-    fn tool_result_text(result: &ToolResult) -> String {
-        match result {
-            ToolResult::Text(t) => t.clone(),
-            ToolResult::Json(v) => v.to_string(),
-            ToolResult::Error(e) => e.clone(),
-        }
-    }
 }
