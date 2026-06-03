@@ -599,6 +599,12 @@ impl Session {
             store.id.clone(),
             callback.clone(),
         ))));
+        // In-process capability bindings (harness-daemon-boundary.md §6): when the
+        // daemon has installed corpus/atom/refactor impls, expose them as direct
+        // trait-dispatch tools. Empty (no-op) for the standalone binary, so those
+        // surfaces fail closed by absence. Registered as builtins so the surface
+        // ToolFilter still gates them.
+        builtins.extend(crate::capabilities::capability_tools());
         let tool_filter =
             mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
         let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;

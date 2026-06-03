@@ -6,6 +6,7 @@
 
 pub mod agent_loop;
 pub mod bound;
+pub mod capabilities;
 pub mod cli;
 pub mod compaction;
 pub mod diagnostics;
