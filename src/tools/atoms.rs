@@ -609,7 +609,18 @@ impl BlackboxServer {
         let wrapped_prompt = orchestration::apply_ambient(&p.prompt, &ambient_ctx);
 
         let mut args = provider.build_resume_args(&session_id, &wrapped_prompt, exec_opts.as_ref());
-        let brofile_filters = bf.filters.clone();
+        // §6: fold the brofile's surface-packet verdict into the dispatch filter
+        // plane (disallow-wins), so this in-process session is surface-governed
+        // by the same evaluate_tool_surface authority the wire head applies.
+        let surface_filters = crate::server::surface::dispatch_surface_filters(
+            &self.state.packets.read(),
+            bf.surface.as_deref(),
+            resume_cwd.as_deref(),
+        );
+        let brofile_filters = crate::server::progress::combine_dispatch_filters(
+            bf.filters.as_ref(),
+            surface_filters.as_ref(),
+        );
         let dispatch_filters = match crate::server::progress::resolve_dispatch_filters(
             provider,
             resume_cwd.as_deref(),

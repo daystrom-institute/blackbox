@@ -175,6 +175,38 @@ pub fn evaluate_tool_surface(
     }
 }
 
+/// Resolve a surface's filter contribution for a *dispatch* identity, making the
+/// dispatch/in-process path a third consumer of `evaluate_tool_surface` —
+/// alongside the rmcp wire head (`list_tools`/`call_tool`) — so wire callers and
+/// in-process agents share one packet authority (harness-daemon-boundary.md §6).
+///
+/// Returns `None` when no surface is named or the verdict imposes no
+/// restriction (passthrough / empty allow+disallow), so callers can merge
+/// unconditionally. A `Deny` verdict maps to a deny-all filter (`disallow: *`),
+/// preserving the evaluator's fail-closed intent in the client-side filter plane
+/// that governs in-process sessions (which never hit the wire head).
+pub fn dispatch_surface_filters(
+    packets: &Packets,
+    surface: Option<&str>,
+    project: Option<&str>,
+) -> Option<McpFilters> {
+    let surface = surface?;
+    let entity = build_surface_entity(surface, project);
+    let decision = evaluate_tool_surface(packets, entity, project);
+    if decision.is_deny() {
+        return Some(McpFilters {
+            allow: Vec::new(),
+            disallow: vec!["*".to_string()],
+        });
+    }
+    let filters = decision.filters;
+    if filters.allow.is_empty() && filters.disallow.is_empty() {
+        None
+    } else {
+        Some(filters)
+    }
+}
+
 // ── Name normalization ─────────────────────────────────────────────
 
 fn strip_mcp_prefix(name: &str) -> String {
@@ -315,6 +347,53 @@ mod tests {
             "consequent": serde_json::to_string(&consequent).unwrap(),
             "classification": "deny",
         })
+    }
+
+    #[test]
+    fn dispatch_surface_filters_none_when_no_surface_named() {
+        let (_dir, packets) = tmp_packets();
+        assert!(dispatch_surface_filters(&packets, None, None).is_none());
+    }
+
+    #[test]
+    fn dispatch_surface_filters_none_when_no_packet_installed() {
+        // Surface named but no packet → passthrough → no filter contribution.
+        let (_dir, packets) = tmp_packets();
+        assert!(dispatch_surface_filters(&packets, Some("readonly"), None).is_none());
+    }
+
+    #[test]
+    fn dispatch_surface_filters_returns_tool_surface_allow_disallow() {
+        let (_dir, packets) = tmp_packets();
+        compile_surface_packet(
+            &packets,
+            vec![
+                surface_rule(
+                    "readonly",
+                    "readonly",
+                    &["mcp__blackbox__bbox_*"],
+                    &["mcp__blackbox__bro_exec"],
+                    "tool_surface",
+                ),
+                catchall_deny_rule(),
+            ],
+            "global",
+            None,
+        );
+        let filters = dispatch_surface_filters(&packets, Some("readonly"), None)
+            .expect("a tool_surface verdict contributes filters");
+        assert!(filters.allow.iter().any(|p| p.contains("bbox_")));
+        assert!(filters.disallow.iter().any(|p| p.contains("bro_exec")));
+    }
+
+    #[test]
+    fn dispatch_surface_filters_deny_verdict_denies_all() {
+        let (_dir, packets) = tmp_packets();
+        compile_surface_packet(&packets, vec![catchall_deny_rule()], "global", None);
+        let filters = dispatch_surface_filters(&packets, Some("anything"), None)
+            .expect("a deny verdict must fail closed");
+        assert_eq!(filters.disallow, vec!["*".to_string()]);
+        assert!(filters.allow.is_empty());
     }
 
     #[test]

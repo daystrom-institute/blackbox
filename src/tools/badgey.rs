@@ -534,6 +534,7 @@ mod tests {
                     allow: Vec::new(),
                     disallow: vec!["mcp__blackbox__bro_*".to_string()],
                 }),
+                surface: None,
                 coerce_workspace: None,
                 runtime: None,
                 context: None,

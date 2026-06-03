@@ -1538,6 +1538,7 @@ mod tests {
                 ],
                 disallow: vec!["mcp__blackbox__bro_exec".into()],
             }),
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,

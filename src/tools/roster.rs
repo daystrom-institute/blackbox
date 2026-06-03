@@ -270,6 +270,7 @@ impl BlackboxServer {
                     model: p.model.clone(),
                     effort: p.effort.clone(),
                     filters,
+                    surface: p.surface.clone(),
                     coerce_workspace: p.coerce_workspace,
                     runtime: None,
                     context: p.context.clone(),

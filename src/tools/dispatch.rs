@@ -2201,6 +2201,7 @@ mod tests {
                 model: None,
                 effort: None,
                 filters: None,
+                surface: None,
                 coerce_workspace: None,
                 runtime: None,
                 context: None,

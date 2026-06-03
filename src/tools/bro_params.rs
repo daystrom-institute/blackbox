@@ -604,6 +604,11 @@ pub(crate) struct BrofileParams {
     pub(crate) allow_tools: Option<Vec<String>>,
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
+    /// Optional tool-surface selector embedded in the brofile. When set, the
+    /// daemon evaluates the installed surface packet for this surface and folds
+    /// the verdict into the dispatch filter plane (harness-daemon-boundary.md §6).
+    #[serde(default)]
+    pub(crate) surface: Option<String>,
     /// When true, inject the workspace-tools appendix into every dispatch
     /// using this brofile. Default off (absent / false).
     #[serde(default)]

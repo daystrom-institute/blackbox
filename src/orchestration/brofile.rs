@@ -32,6 +32,15 @@ pub struct Brofile {
     /// inherits without touching global/project config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filters: Option<McpFilters>,
+    /// Optional tool-surface selector. When set, the daemon evaluates the
+    /// installed surface packet for this surface (the same `evaluate_tool_surface`
+    /// authority the rmcp wire head uses for `?surface=<id>` callers) and folds
+    /// the verdict into the dispatch filter plane, so an in-process session is
+    /// surface-governed exactly like a wire caller. Unset → no surface fold
+    /// (recursion-guard + `filters` still apply). See
+    /// design/bro-harness/harness-daemon-boundary.md §6.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
     /// When true, inject the workspace-tools appendix into every dispatch
     /// using this brofile. The appendix teaches the agent to prefer
     /// workspace-scoped tools (work_smart_read, work_bash, work_git_*)
@@ -616,6 +625,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -645,6 +655,7 @@ mod tests {
             model: Some("gpt-5.5".into()),
             effort: Some("medium".into()),
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -673,6 +684,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -687,6 +699,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -720,6 +733,7 @@ mod tests {
                 model: None,
                 effort: None,
                 filters: None,
+                surface: None,
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
@@ -743,6 +757,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -792,6 +807,7 @@ mod tests {
                 allow: vec![],
                 disallow: vec!["mcp__blackbox__bro_*".into(), "Bash(*)".into()],
             }),
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -1073,6 +1089,7 @@ mod tests {
             model: Some("gpt-5.4-mini".into()),
             effort: Some("low".into()),
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,
@@ -1094,6 +1111,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            surface: None,
             coerce_workspace: Some(true),
             runtime: None,
             context: None,
@@ -1110,6 +1128,7 @@ mod tests {
             model: None,
             effort: None,
             filters: None,
+            surface: None,
             coerce_workspace: None,
             runtime: None,
             context: None,

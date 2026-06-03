@@ -159,12 +159,16 @@ pub(crate) fn resolve_dispatch_filters(
     // set; allow patterns add to the allow set. Recursion guard still wins
     // because allow doesn't override disallow at provider level.
     //
-    // NOTE: tool *surface* selection is intentionally NOT handled here. A
-    // surface is a server-side scope selected via the MCP URL `?surface=`
-    // query param; the daemon picks it and the MCP endpoint enforces which
-    // tools are even listed. This function is purely the client-side
-    // allow/deny (recursion guard + brofile + per-dispatch) plane — the two
-    // are orthogonal and must not be interleaved.
+    // Surface-packet governance for in-process sessions (harness-daemon-boundary.md
+    // §6): originally surface selection was MCP-endpoint-only (the rmcp wire head
+    // filters list_tools/call_tool by `?surface=`). But in-process harness
+    // sessions call tools directly and never hit that head, so they would escape
+    // surface governance entirely. The fix is to let callers fold a surface
+    // verdict into this client-side plane via `extra`: a brofile names a surface,
+    // the caller evaluates it with `surface::dispatch_surface_filters` (the same
+    // evaluate_tool_surface authority the wire head uses), and merges the result
+    // here. Surface, recursion guard, and brofile/per-dispatch filters all
+    // compose with disallow-wins.
     if let Some(extra) = extra {
         eff.filters.merge_from(extra);
     }
