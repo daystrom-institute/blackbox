@@ -7,14 +7,29 @@
 use crate::transport::{ToolResult, Usage};
 use serde_json::{Value, json};
 use std::io::Write;
+use std::sync::Arc;
 
+pub type EventCallback = Arc<dyn Fn(Value) + Send + Sync + 'static>;
+
+#[derive(Clone)]
 pub struct Emitter {
     session_id: String,
+    callback: Option<EventCallback>,
 }
 
 impl Emitter {
     pub fn new(session_id: String) -> Self {
-        Self { session_id }
+        Self {
+            session_id,
+            callback: None,
+        }
+    }
+
+    pub fn with_callback(session_id: String, callback: EventCallback) -> Self {
+        Self {
+            session_id,
+            callback: Some(callback),
+        }
     }
 
     pub fn session_id(&self) -> &str {
@@ -22,6 +37,10 @@ impl Emitter {
     }
 
     fn write_line(&self, v: serde_json::Value) {
+        if let Some(callback) = &self.callback {
+            callback(v);
+            return;
+        }
         let mut out = std::io::stdout().lock();
         // A failed write to stdout (closed pipe) is unrecoverable for the
         // protocol; ignore and let the process wind down.
@@ -211,5 +230,33 @@ impl Emitter {
 impl crate::transport::TurnSink for Emitter {
     fn stream_event(&self, event: Value) {
         Emitter::stream_event(self, event);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn callback_emitter_captures_protocol_events_in_process() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-1".into(), sink);
+
+        emitter.system_init();
+        emitter.result("done", &Usage::default(), 1, None);
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "system");
+        assert_eq!(events[0]["session_id"], "session-1");
+        assert_eq!(events[1]["type"], "result");
+        assert_eq!(events[1]["result"], "done");
     }
 }

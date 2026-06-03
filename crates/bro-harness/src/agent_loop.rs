@@ -16,7 +16,7 @@
 //! are identical across providers.
 
 use crate::cli::Cli;
-use crate::emit::Emitter;
+use crate::emit::{Emitter, EventCallback};
 use crate::hooks::{Delivery, HookEngine, NudgeLedger};
 use crate::lsp_baselines::LspBaselines;
 use crate::mcp;
@@ -93,13 +93,21 @@ const INTERRUPTED_TOOL_RESULT: &str = "[Request interrupted by user]";
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
+    run_with_emitter(cli, None).await
+}
+
+pub async fn run_with_event_callback(cli: Cli, callback: EventCallback) -> Result<()> {
+    run_with_emitter(cli, Some(callback)).await
+}
+
+async fn run_with_emitter(cli: Cli, callback: Option<EventCallback>) -> Result<()> {
     if cli.input_format.as_deref() == Some("stream-json") {
-        return run_session(cli).await;
+        return run_session(cli, callback).await;
     }
 
     // One-shot: a single prompt, one user turn, then persist and exit.
     let prompt = resolve_prompt(&cli)?;
-    let mut session = Session::build(&cli).await?;
+    let mut session = Session::build(&cli, callback).await?;
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -110,20 +118,27 @@ pub async fn run(cli: Cli) -> Result<()> {
     Ok(())
 }
 
+fn make_emitter(session_id: String, callback: Option<EventCallback>) -> Emitter {
+    match callback {
+        Some(callback) => Emitter::with_callback(session_id, callback),
+        None => Emitter::new(session_id),
+    }
+}
+
 /// Bidirectional persistent session driven over stdin NDJSON.
-async fn run_session(cli: Cli) -> Result<()> {
+async fn run_session(cli: Cli, callback: Option<EventCallback>) -> Result<()> {
     let replay = cli.replay_user_messages;
-    let mut session = Session::build(&cli).await?;
+    let mut session = Session::build(&cli, callback.clone()).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
 
     // The stdin reader runs as its own task so control messages (interrupt)
     // arrive while a turn is in flight. It owns a clone of the emitter purely to
     // honour `--replay-user-messages`.
-    let input_rx = spawn_stdin_reader(replay, Emitter::new(sid.clone()));
+    let input_rx = spawn_stdin_reader(replay, make_emitter(sid.clone(), callback.clone()));
     // A separate emitter for control responses emitted *during* a turn, when the
     // session's own emitter is borrowed by the running turn.
-    let ctrl_emitter = Emitter::new(sid);
+    let ctrl_emitter = make_emitter(sid, callback);
 
     // Steers that arrived mid-turn wait here for the next turn boundary.
     let mut pending: VecDeque<String> = VecDeque::new();
@@ -307,7 +322,7 @@ struct Session {
 }
 
 impl Session {
-    async fn build(cli: &Cli) -> Result<Self> {
+    async fn build(cli: &Cli, callback: Option<EventCallback>) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
             && fmt != "stream-json"
         {
@@ -399,8 +414,9 @@ impl Session {
         // registered always but only pinned in fleet (bidirectional) mode.
         let fleet = cli.input_format.as_deref() == Some("stream-json");
         let mut builtins = builtin_tools_for_mode(fleet);
-        builtins.push(Arc::new(crate::report::ReportTool::new(Emitter::new(
+        builtins.push(Arc::new(crate::report::ReportTool::new(make_emitter(
             store.id.clone(),
+            callback.clone(),
         ))));
         let tool_filter =
             mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
@@ -423,7 +439,7 @@ impl Session {
                 .or_else(|| std::env::var("BRO_HARNESS_SERVICE_TIER").ok()),
         };
 
-        let emitter = Emitter::new(store.id.clone());
+        let emitter = make_emitter(store.id.clone(), callback);
         let compaction = crate::compaction::CompactionPolicy::from_env();
         let compact_threshold = compaction.threshold(&base_opts.model);
         let tool_result_cap = crate::bound::cap_bytes();
