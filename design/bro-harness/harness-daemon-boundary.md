@@ -722,16 +722,37 @@ roster render.
     calling daemon-logic methods on `Provider` is what 1b/1c remove; until then
     `blackbox` is the only crate that needs the dispatch traits, which is correct
     (none are called by `bro-cli`).
-  - NOT done: **1b** make the fleet client daemon-only (drop `FleetOrchestrator`'s
-    in-process dispatch branch, keep only the HTTP `DaemonFleetClient`); **1c**
-    relocate the view/wire DTOs (`TaskStatus`/`AgentHandle`/`DispatchSpec`/
-    `ResumeSpec`/`TranscriptItem`/`Todo*`/`ClassifierConfig`/`FleetConfig`) into
-    `bro-protocol` and the parser transcript types into a shared crate; **1d**
-    point `bro-cli` at the contract bottom + a thin client crate and DROP the
-    `blackbox = { path = ... }` dependency. (The remaining `bro-cli → blackbox`
-    surface is `blackbox::fleet::*` (engine + DTOs + `intern_rider`/
-    `provider_supports_bidi`), `blackbox::parser::*`, and `blackbox::config::load`.)
-    Still a durable-bro + reviewer effort, not a single sprint.
+  - **Step 1b — DONE: the fleet client is daemon-only.** `FleetOrchestrator`'s
+    in-process dispatch branch is removed: `daemon` is now a required
+    `DaemonFleetClient` (no `Option`), and `dispatch`/`resume`/`stop` only POST
+    `/control/{exec,resume,cancel}`. `bro fleet` with no `--daemon-url` defaults
+    to the local daemon (`default_daemon_url()` → `BBOX_PORT`/7264). This drops
+    fleet.rs's coupling to `brofile::resolve_provider_env`, `cancel_task`,
+    `spawn_task`/`spawn_task_interactive`, and `ProviderExec`/`ProviderMcp`
+    (`build_exec_args`/`build_fleet_mcp_args`); `ProviderEvents::parse_event` and
+    `SupervisionState` stay (the daemon status poller uses both). `AgentHandle`
+    lost its in-process `stdin` field — control is daemon-only (steer/interrupt
+    over `/control/*`); `set_model` now uniformly unsupported (awaits §8). The
+    in-process helpers + their tests were deleted (−~460 lines net in fleet.rs).
+    Validated: blackbox lib + lib-tests + bro-cli compile 0/0, 0 new clippy,
+    fleet (21) + provider (27) tests pass, both bins link, and a live
+    isolated-daemon smoke (port 7299) confirmed `bro fleet` **with no
+    `--daemon-url`** resolves the default daemon URL and dispatches end-to-end
+    (TUI → `/control/exec` → brodex agent → ✓ Finished). Two items are now
+    orphaned-but-kept (`#[allow(dead_code)]`, removal deferred to a later step):
+    `mod.rs::spawn_task_interactive` (+ `SpawnedTask.stdin`) and the fleet
+    pin-tools / `ProviderMcp::build_fleet_mcp_args` translation — both candidates
+    to wire into daemon-side `/control/exec` (forwarding fleet.json MCP/pin tools)
+    or delete when the daemon dispatch is consolidated.
+  - NOT done: **1c** relocate the view/wire DTOs (`TaskStatus`/`AgentHandle`/
+    `DispatchSpec`/`ResumeSpec`/`TranscriptItem`/`Todo*`/`ClassifierConfig`/
+    `FleetConfig`) into `bro-protocol` and the parser transcript types into a
+    shared crate; **1d** point `bro-cli` at the contract bottom + a thin client
+    crate and DROP the `blackbox = { path = ... }` dependency. (The remaining
+    `bro-cli → blackbox` surface is `blackbox::fleet::*` (the now daemon-only
+    `FleetOrchestrator` + DTOs + `intern_rider`/`provider_supports_bidi`),
+    `blackbox::parser::*`, and `blackbox::config::load`.) Still a durable-bro +
+    reviewer effort, not a single sprint.
 - **§5 in-process V8 + supervised shell (execution isolation).** Not started;
   no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
   per-child env hook but not timeout/cap supervision.

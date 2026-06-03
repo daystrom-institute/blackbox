@@ -23,16 +23,13 @@ use std::sync::Arc;
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::io::AsyncWriteExt;
-use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
+use tokio::sync::{Notify, broadcast};
 
 use super::mcp::McpServerConfig;
-use super::providers::{EventSink, ExecOpts};
+use super::providers::EventSink;
 use super::providers::dispatch_prelude::*;
 use super::supervision::SupervisionState;
-use super::{
-    Task, TaskInner, TaskStore, format_elapsed, now_ms, spawn_task, spawn_task_interactive,
-};
+use super::{Task, TaskInner, TaskStore, format_elapsed, now_ms};
 
 // Re-export the consumer-facing types so the `bro fleet` cockpit depends only
 // on `blackbox::fleet::*` and never reaches into the crate-private
@@ -197,6 +194,10 @@ pub const CLASSIFIER_NAME_PREFIX: &str = "\u{27c2}intern:";
 /// Fleet-mode hot tools. Setting `BRO_HARNESS_PIN_TOOLS` replaces the harness
 /// defaults, so fleet supplies both the existing clipboard/slice affordances
 /// and its mandatory grounding tools when launching Brodex/GLM/DeepSeek agents.
+// Parsed/resolved but not yet forwarded to the daemon: with the fleet client
+// daemon-only (§7), per-session env/tool injection is the daemon's job. Kept so
+// fleet.json `pinTools` still round-trips and can be wired into `/control/exec`.
+#[allow(dead_code)]
 const DEFAULT_FLEET_PIN_TOOLS: &[&str] = &[
     "bbox_slice_*",
     "clip_yank",
@@ -289,6 +290,7 @@ impl FleetConfig {
 }
 
 impl FleetConfig {
+    #[allow(dead_code)] // see DEFAULT_FLEET_PIN_TOOLS: daemon-side forwarding TODO (§7)
     fn resolved_pin_tools(&self) -> Vec<String> {
         let mut out = Vec::new();
         for tool in DEFAULT_FLEET_PIN_TOOLS
@@ -373,17 +375,18 @@ impl ResumeSpec {
     }
 }
 
-/// Opaque handle to a dispatched entrypoint agent. Wraps the live task; the
-/// cockpit holds these (it owns exactly what it spawned) and reads state
+/// Opaque handle to a dispatched entrypoint agent. Wraps the live task mirror
+/// (fed by the daemon status poller); the cockpit holds these and reads state
 /// through [`AgentHandle::snapshot`] without touching crate-private internals.
 ///
-/// For bidi-capable providers the handle also holds the child's writable stdin
-/// (behind an async mutex so `&self` steer calls serialize), the channel for
-/// driving the persistent session per fleet-tui.md §1.
+/// Control flows through the daemon over HTTP (`/control/*`): `daemon` is
+/// `Some` while the session is live and steerable, and `None` for a
+/// reloaded/historical/failed agent that must be resumed before it can be
+/// driven again. The fleet client is daemon-only — there is no in-process child
+/// or local stdin pipe (harness-daemon-boundary.md §7).
 #[derive(Clone)]
 pub struct AgentHandle {
     task: Arc<Task>,
-    stdin: Option<Arc<AsyncMutex<tokio::process::ChildStdin>>>,
     daemon: Option<DaemonAgentHandle>,
 }
 
@@ -392,64 +395,45 @@ impl AgentHandle {
         self.task.id()
     }
 
-    /// True when this agent runs a persistent bidirectional session and can be
-    /// steered (user-turns / control_requests). False for one-shot providers
-    /// (Codex et al., §2.1) — steering those is unsupported.
+    /// True when this agent has a live daemon session that can be steered
+    /// (user-turns / interrupt over `/control/*`). False for a reloaded or
+    /// terminal agent — resume it first to get a fresh live handle.
     pub fn can_steer(&self) -> bool {
-        self.stdin.is_some() || self.daemon.is_some()
+        self.daemon.is_some()
     }
 
-    /// A clone of this handle with the live stdin dropped — used after the
-    /// session is stopped, so the cockpit treats it as non-live (a later steer
-    /// resumes it rather than writing to a dead pipe).
+    /// A clone of this handle marking it non-live (a later steer resumes it
+    /// rather than driving a dead session). In daemon-only mode there is no
+    /// local pipe to drop, so this is a plain clone kept for cockpit API
+    /// compatibility.
     pub fn without_stdin(&self) -> AgentHandle {
-        AgentHandle {
-            task: self.task.clone(),
-            stdin: None,
-            daemon: self.daemon.clone(),
-        }
+        self.clone()
     }
 
-    /// Write one NDJSON control-plane line to the session's stdin.
-    async fn write_line(&self, line: String) -> anyhow::Result<()> {
-        let Some(stdin) = &self.stdin else {
-            anyhow::bail!("agent is not an interactive session — cannot steer");
-        };
-        let mut guard = stdin.lock().await;
-        guard.write_all(line.as_bytes()).await?;
-        guard.write_all(b"\n").await?;
-        guard.flush().await?;
-        Ok(())
-    }
-
-    /// Send a user-turn message (a steer / reply) into the live session (§1.1).
-    /// Queues at the agent's next turn boundary if a turn is in flight.
+    /// Send a user-turn message (a steer / reply) into the live session (§1.1):
+    /// `/control/steer`, which queues at the agent's next turn boundary if a
+    /// turn is in flight.
     pub async fn send_user_turn(&self, text: &str) -> anyhow::Result<()> {
-        if let Some(daemon) = &self.daemon {
-            daemon.steer(text).await?;
-            return Ok(());
-        }
-        self.write_line(user_turn_ndjson(text)).await
+        let Some(daemon) = &self.daemon else {
+            anyhow::bail!("agent has no live daemon session — resume it before steering");
+        };
+        daemon.steer(text).await
     }
 
-    /// `control_request{interrupt}` — cancel the running turn (§1.1, `Esc`).
+    /// `control_request{interrupt}` — cancel the running turn (§1.1, `Esc`) via
+    /// `/control/interrupt`.
     pub async fn interrupt(&self) -> anyhow::Result<()> {
-        if let Some(daemon) = &self.daemon {
-            daemon.interrupt(None).await?;
-            return Ok(());
-        }
-        self.write_line(control_ndjson("interrupt", serde_json::Map::new()))
-            .await
+        let Some(daemon) = &self.daemon else {
+            anyhow::bail!("agent has no live daemon session — nothing to interrupt");
+        };
+        daemon.interrupt(None).await
     }
 
-    /// `control_request{set_model}` — switch the model for subsequent turns.
-    pub async fn set_model(&self, model: &str) -> anyhow::Result<()> {
-        if self.daemon.is_some() {
-            anyhow::bail!("daemon-backed fleet sessions do not support live set_model yet");
-        }
-        let mut extra = serde_json::Map::new();
-        extra.insert("model".into(), Value::String(model.to_string()));
-        self.write_line(control_ndjson("set_model", extra)).await
+    /// `control_request{set_model}` — switch the model for subsequent turns. The
+    /// daemon control plane does not yet expose live set_model (§8), so this is
+    /// currently unsupported for daemon-backed fleet sessions.
+    pub async fn set_model(&self, _model: &str) -> anyhow::Result<()> {
+        anyhow::bail!("daemon-backed fleet sessions do not support live set_model yet")
     }
 
     /// `/compact` — an in-stream slash command delivered as a user turn; the
@@ -1069,7 +1053,6 @@ impl DaemonFleetClient {
                     TaskStatus::Failed,
                     error.to_string(),
                 ),
-                stdin: None,
                 daemon: None,
             };
         }
@@ -1099,7 +1082,6 @@ impl DaemonFleetClient {
         spawn_daemon_status_poller(self.clone(), task.clone(), tail_tx, task_id);
         AgentHandle {
             task,
-            stdin: None,
             daemon: Some(daemon),
         }
     }
@@ -1370,35 +1352,32 @@ pub struct FleetOrchestrator {
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
     store_dir: PathBuf,
-    daemon: Option<DaemonFleetClient>,
-    /// Normalized MCP servers from `fleet.json`, injected into every dispatched
-    /// agent via `Provider::build_fleet_mcp_args`. Empty when no config exists.
-    mcp_servers: BTreeMap<String, McpServerConfig>,
+    /// The daemon singleton this cockpit drives. The fleet client is
+    /// daemon-only — every dispatch/resume/stop is an HTTP call to `/control/*`
+    /// (harness-daemon-boundary.md §7). MCP injection and per-session env are
+    /// the daemon's concern, not the client's.
+    daemon: DaemonFleetClient,
     /// Experimental classifier-companion config from `fleet.json`; `None` when
     /// the feature is off.
     classifier: RwLock<Option<ClassifierConfig>>,
-    /// Resolved fleet-level hot tools injected into Brodex-family harness
-    /// children through `BRO_HARNESS_PIN_TOOLS`.
-    pin_tools: Vec<String>,
 }
 
 impl FleetOrchestrator {
-    /// Construct over an explicit `store_dir`. Tests and embedders use this;
-    /// the cockpit normally goes through [`FleetOrchestrator::from_config`].
+    /// Construct over an explicit `store_dir`, pointed at the default local
+    /// daemon. Tests and embedders use this; the cockpit normally goes through
+    /// [`FleetOrchestrator::from_config`].
     pub fn new(store_dir: PathBuf) -> Self {
-        Self::with_store(store_dir, TaskStore::new())
+        Self::with_store(store_dir, TaskStore::new(), DaemonFleetClient::new(default_daemon_url()))
     }
 
-    fn with_store(store_dir: PathBuf, store: TaskStore) -> Self {
+    fn with_store(store_dir: PathBuf, store: TaskStore, daemon: DaemonFleetClient) -> Self {
         let (tail_tx, _rx) = broadcast::channel(1024);
         Self {
             task_store: Arc::new(RwLock::new(store)),
             tail_tx,
             store_dir,
-            daemon: None,
-            mcp_servers: BTreeMap::new(),
+            daemon,
             classifier: RwLock::new(None),
-            pin_tools: Vec::new(),
         }
     }
 
@@ -1408,21 +1387,18 @@ impl FleetOrchestrator {
     /// `Running` tasks come back as recoverable (Interrupted, §5). This is why
     /// historical sessions survive a cockpit reload.
     pub fn from_config() -> anyhow::Result<Self> {
-        Self::from_config_store("fleet", std::env::var("BLACKBOX_FLEET_DAEMON_URL").ok())
+        Self::from_config_store("fleet", None)
     }
 
     pub fn from_config_with_daemon_url(daemon_url: Option<String>) -> anyhow::Result<Self> {
-        Self::from_config_store(
-            "fleet",
-            daemon_url.or_else(|| std::env::var("BLACKBOX_FLEET_DAEMON_URL").ok()),
-        )
+        Self::from_config_store("fleet", daemon_url)
     }
 
     /// Build from the resolved blackbox config for the standalone `bro agent`
     /// shell. It uses a separate task-store subdirectory so one-off single-agent
     /// sessions do not appear in the fleet roster.
     pub fn from_agent_config() -> anyhow::Result<Self> {
-        Self::from_config_store("agent", std::env::var("BLACKBOX_FLEET_DAEMON_URL").ok())
+        Self::from_config_store("agent", None)
     }
 
     fn from_config_store(store_name: &str, daemon_url: Option<String>) -> anyhow::Result<Self> {
@@ -1431,13 +1407,15 @@ impl FleetOrchestrator {
         // No age-based eviction: the cockpit's model is manual cleanup (§5), so
         // historical sessions persist until explicitly deleted, not by TTL.
         let store = TaskStore::load(&store_dir, u64::MAX);
-        let mut orch = Self::with_store(store_dir, store);
-        // TUI-local MCP servers injected into every dispatched agent (§5.2),
-        // plus the optional classifier-companion config — loaded once.
+        // The fleet client is daemon-only: resolve an explicit --daemon-url,
+        // then BLACKBOX_FLEET_DAEMON_URL, then the default local daemon. Dispatch
+        // always rides `/control/*` against this singleton (§7).
+        let url = daemon_url
+            .or_else(|| std::env::var("BLACKBOX_FLEET_DAEMON_URL").ok())
+            .unwrap_or_else(default_daemon_url);
+        let orch = Self::with_store(store_dir, store, DaemonFleetClient::new(url));
+        // The optional classifier-companion config — loaded once.
         let cfg = FleetConfig::load();
-        orch.pin_tools = cfg.resolved_pin_tools();
-        orch.mcp_servers = cfg.mcp_servers;
-        orch.daemon = daemon_url.map(DaemonFleetClient::new);
         *orch.classifier.write() = cfg.classifier.filter(ClassifierConfig::enabled_resolved);
         Ok(orch)
     }
@@ -1499,7 +1477,6 @@ impl FleetOrchestrator {
             .into_iter()
             .map(|task| AgentHandle {
                 task,
-                stdin: None,
                 daemon: None,
             })
             .collect()
@@ -1515,95 +1492,21 @@ impl FleetOrchestrator {
     /// stdin kept open for steering; other providers fall back to one-shot
     /// dispatch (no steering, §2.1). Returns an [`AgentHandle`] — the cockpit
     /// holds it to read state and drive the session.
-    pub fn dispatch(&self, spec: DispatchSpec) -> AgentHandle {
-        if let Some(daemon) = &self.daemon {
-            let handle = daemon.dispatch(spec, self.tail_tx.clone());
-            let _ = self
-                .task_store
-                .write()
-                .insert(handle.id(), handle.task.clone());
-            return handle;
+    pub fn dispatch(&self, mut spec: DispatchSpec) -> AgentHandle {
+        // Fleet agents are entrypoint agents, not bros; the cockpit reuses
+        // `name` as the durable roster display name (an explicit name, else the
+        // prompt head) so the row survives a reload (§2.2, §5). Everything else
+        // — provider args, transport env, MCP injection — is the daemon's job;
+        // the client just POSTs `/control/exec` (§7).
+        if spec.name.is_none() {
+            spec.name = Some(prompt_head(&spec.prompt));
         }
-
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = uuid::Uuid::new_v4().to_string();
-
-        let opts = ExecOpts {
-            model: spec.model.clone(),
-            effort: spec.effort.clone(),
-            provider_defaults: None,
-        };
-        let mut args = spec.provider.build_exec_args(
-            &spec.prompt,
-            &session_id,
-            spec.cwd.as_deref(),
-            Some(&opts),
-        );
-        // One fleet-wide MCP set, translated to this provider's CLI flags.
-        args.extend(spec.provider.build_fleet_mcp_args(&self.mcp_servers));
-
-        // The initial `-p <prompt>` from build_exec_args becomes the first user
-        // turn; bidi providers add the input-format flags in launch_interactive
-        // and ride subsequent turns/controls on the open stdin.
-        let bidi = provider_supports_bidi(spec.provider);
-
-        // Resolve transport env (ANTHROPIC_BASE_URL + credentials for the
-        // harness providers; selects Anthropic vs Responses transport). Without
-        // this the bro-harness child fails at Session::build. Mirrors the daemon
-        // dispatch path; user-supplied overrides win on conflict.
-        let resolved_env = super::brofile::resolve_provider_env(
-            spec.provider,
-            None,
-            spec.model.as_deref(),
-            &self.store_dir,
-            None,
-        );
-        let env_overrides = merge_env(
-            merge_env(resolved_env, self.pin_tools_env(spec.provider)),
-            spec.env_overrides,
-        );
-
-        // Fleet agents are entrypoint agents, not bros, so `bro_label` carries no
-        // team/brofile meaning here — the cockpit reuses it as the durable
-        // display name (the initial prompt's head, or an explicit name) so the
-        // row survives a reload (§2.2, §5).
-        let label = spec
-            .name
-            .clone()
-            .or_else(|| Some(prompt_head(&spec.prompt)));
-        if bidi {
-            let seed = bidi_seeds_turn1_via_stdin(spec.provider).then(|| spec.prompt.clone());
-            self.launch_interactive(
-                task_id,
-                spec.provider,
-                args,
-                session_id,
-                spec.cwd,
-                label,
-                env_overrides,
-                seed,
-            )
-        } else {
-            let task = spawn_task(
-                task_id,
-                spec.provider,
-                args,
-                session_id,
-                spec.cwd,
-                env_overrides,
-                self.store_dir.clone(),
-                self.task_store.clone(),
-                self.tail_tx.clone(),
-                label,
-                None,
-                None,
-            );
-            AgentHandle {
-                task,
-                stdin: None,
-                daemon: None,
-            }
-        }
+        let handle = self.daemon.dispatch(spec, self.tail_tx.clone());
+        let _ = self
+            .task_store
+            .write()
+            .insert(handle.id(), handle.task.clone());
+        handle
     }
 
     /// Resume a prior session (§5). Builds `--resume <id> -p <prompt>` and
@@ -1611,49 +1514,14 @@ impl FleetOrchestrator {
     /// `session_id`; the prompt is the first turn of the resumed conversation.
     /// Bidi-capable providers only.
     pub fn resume(&self, spec: ResumeSpec) -> AgentHandle {
-        if let Some(daemon) = &self.daemon {
-            let handle = daemon.resume(spec, self.tail_tx.clone());
-            let _ = self
-                .task_store
-                .write()
-                .insert(handle.id(), handle.task.clone());
-            return handle;
-        }
-
-        let prior_events = self.events_for_session(&spec.session_id);
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let opts = ExecOpts {
-            model: spec.model.clone(),
-            effort: spec.effort.clone(),
-            provider_defaults: None,
-        };
-        let mut args = spec
-            .provider
-            .build_resume_args(&spec.session_id, &spec.prompt, Some(&opts));
-        args.extend(spec.provider.build_fleet_mcp_args(&self.mcp_servers));
-        let resolved_env = super::brofile::resolve_provider_env(
-            spec.provider,
-            None,
-            spec.model.as_deref(),
-            &self.store_dir,
-            None,
-        );
-        let env_overrides = merge_env(
-            merge_env(resolved_env, self.pin_tools_env(spec.provider)),
-            spec.env_overrides,
-        );
-        let seed = bidi_seeds_turn1_via_stdin(spec.provider).then(|| spec.prompt.clone());
-        let handle = self.launch_interactive(
-            task_id,
-            spec.provider,
-            args,
-            spec.session_id.clone(),
-            spec.cwd,
-            spec.name,
-            env_overrides,
-            seed,
-        );
-        seed_resumed_transcript(&handle, prior_events, &spec.session_id, &spec.prompt);
+        // Daemon-only: the daemon owns the session store and its transcript; the
+        // poller repopulates the mirror task's recent events from
+        // `/control/status` after the resume lands.
+        let handle = self.daemon.resume(spec, self.tail_tx.clone());
+        let _ = self
+            .task_store
+            .write()
+            .insert(handle.id(), handle.task.clone());
         handle
     }
 
@@ -1668,122 +1536,24 @@ impl FleetOrchestrator {
     /// Stop a running session (Ctrl+X): SIGTERM the child and mark it Cancelled
     /// (→ Interrupted). The provider session survives on disk for resume.
     pub fn stop(&self, handle: &AgentHandle) -> Result<(), String> {
-        if let Some(daemon) = &handle.daemon {
-            let result = block_on_fleet_http(
-                daemon
-                    .client
-                    .post_json("/control/cancel", json!({ "task_id": daemon.task_id })),
-            )
-            .map_err(|err| err.to_string());
-            if result.is_ok() {
-                let mut inner = handle.task.inner.lock();
-                inner.status = TaskStatus::Cancelled;
-                inner.completed_at = Some(now_ms());
-                handle.task.notify.notify_waiters();
-            }
-            return result.map(|_| ());
-        }
-        super::cancel_task(&handle.task, &self.task_store, &self.store_dir)
-    }
-
-    /// Spawn a persistent bidirectional session from already-built provider args
-    /// (shared by dispatch + resume): append the input-format flags, keep stdin
-    /// writable, wrap into an [`AgentHandle`].
-    fn launch_interactive(
-        &self,
-        task_id: String,
-        provider: Provider,
-        mut args: Vec<String>,
-        session_id: String,
-        cwd: Option<String>,
-        name: Option<String>,
-        env_overrides: Option<HashMap<String, String>>,
-        seed_prompt: Option<String>,
-    ) -> AgentHandle {
-        args.push("--input-format".into());
-        args.push("stream-json".into());
-        args.push("--replay-user-messages".into());
-        let spawned = spawn_task_interactive(
-            task_id,
-            provider,
-            args,
-            session_id,
-            cwd,
-            env_overrides,
-            self.store_dir.clone(),
-            self.task_store.clone(),
-            self.tail_tx.clone(),
-            name,
-            None,
-            None,
-        );
-        let handle = AgentHandle {
-            task: spawned.task,
-            stdin: spawned.stdin.map(|s| Arc::new(AsyncMutex::new(s))),
-            daemon: None,
+        let Some(daemon) = &handle.daemon else {
+            return Err("agent has no live daemon session — nothing to cancel".to_string());
         };
-        // Seed turn-1 over stdin for providers that ignore `-p` in stream-json
-        // input mode (Claude). Fire-and-forget on the same runtime that spawned
-        // the child's stdout reader; the write queues in the pipe until the CLI
-        // reads it. Without this the Claude session launches and hangs (no turn).
-        if let Some(seed) = seed_prompt {
-            if handle.stdin.is_some() {
-                let h = handle.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = h.send_user_turn(&seed).await {
-                        tracing::warn!("fleet: failed to seed first turn over stdin: {e:#}");
-                    }
-                });
-            }
+        let result = block_on_fleet_http(
+            daemon
+                .client
+                .post_json("/control/cancel", json!({ "task_id": daemon.task_id })),
+        )
+        .map_err(|err| err.to_string());
+        if result.is_ok() {
+            let mut inner = handle.task.inner.lock();
+            inner.status = TaskStatus::Cancelled;
+            inner.completed_at = Some(now_ms());
+            handle.task.notify.notify_waiters();
         }
-        handle
+        result.map(|_| ())
     }
 
-    fn pin_tools_env(&self, provider: Provider) -> Option<HashMap<String, String>> {
-        if self.pin_tools.is_empty() || !provider_uses_bro_harness(provider) {
-            return None;
-        }
-        Some(HashMap::from([(
-            "BRO_HARNESS_PIN_TOOLS".to_string(),
-            self.pin_tools.join(","),
-        )]))
-    }
-
-    fn events_for_session(&self, session_id: &str) -> Vec<Value> {
-        self.task_store
-            .read()
-            .all_tasks()
-            .into_iter()
-            .filter_map(|task| {
-                let inner = task.inner.lock();
-                (inner.session_id == session_id).then(|| inner.events.clone())
-            })
-            .max_by_key(Vec::len)
-            .unwrap_or_default()
-    }
-}
-
-fn seed_resumed_transcript(
-    handle: &AgentHandle,
-    mut prior_events: Vec<Value>,
-    session_id: &str,
-    prompt: &str,
-) {
-    prior_events.push(serde_json::json!({
-        "type": "user",
-        "session_id": session_id,
-        "message": {
-            "role": "user",
-            "content": prompt,
-        },
-    }));
-    let mut inner = handle.task.inner.lock();
-    if inner.events.is_empty() {
-        inner.events = prior_events;
-    } else {
-        prior_events.extend(inner.events.drain(..));
-        inner.events = prior_events;
-    }
 }
 
 /// First line of the prompt, capped — the durable display name for a session.
@@ -1792,20 +1562,16 @@ fn prompt_head(prompt: &str) -> String {
     line.chars().take(60).collect()
 }
 
-/// Merge resolved transport env (base) with caller-supplied overrides (win on
-/// conflict). Returns `None` only when both are empty.
-fn merge_env(
-    base: Option<HashMap<String, String>>,
-    overrides: Option<HashMap<String, String>>,
-) -> Option<HashMap<String, String>> {
-    match (base, overrides) {
-        (None, None) => None,
-        (Some(m), None) | (None, Some(m)) => Some(m),
-        (Some(mut b), Some(o)) => {
-            b.extend(o);
-            Some(b)
-        }
-    }
+/// The default daemon base URL the cockpit drives when no `--daemon-url` /
+/// `BLACKBOX_FLEET_DAEMON_URL` is given: the local daemon on `BBOX_PORT`
+/// (default 7264). The fleet client is daemon-only, so `bro fleet` with no flags
+/// targets the local singleton (harness-daemon-boundary.md §7).
+fn default_daemon_url() -> String {
+    let port = std::env::var("BBOX_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(7264);
+    format!("http://127.0.0.1:{port}")
 }
 
 /// Providers that speak the persistent bidirectional stream-json control
@@ -1819,47 +1585,6 @@ pub fn provider_supports_bidi(provider: Provider) -> bool {
     )
 }
 
-/// Whether fleet must write turn-1 to the session's stdin after launch.
-///
-/// bro-harness bidi `run_session` seeds turn-1 from `-p` directly
-/// (`crates/bro-harness/src/agent_loop.rs`), so writing turn-1 to its stdin too
-/// would double the first turn.
-fn bidi_seeds_turn1_via_stdin(provider: Provider) -> bool {
-    let _ = provider;
-    false
-}
-
-fn provider_uses_bro_harness(provider: Provider) -> bool {
-    matches!(
-        provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
-    )
-}
-
-/// One NDJSON user-turn message for the harness/Claude input stream
-/// (`{"type":"user","message":{"role":"user","content":"…"}}`).
-fn user_turn_ndjson(text: &str) -> String {
-    serde_json::json!({
-        "type": "user",
-        "message": { "role": "user", "content": text },
-    })
-    .to_string()
-}
-
-/// One NDJSON `control_request` line with a fresh `request_id`. `extra` carries
-/// subtype-specific fields (e.g. `model` for `set_model`).
-fn control_ndjson(subtype: &str, extra: serde_json::Map<String, Value>) -> String {
-    let mut obj = serde_json::Map::new();
-    obj.insert("type".into(), Value::String("control_request".into()));
-    obj.insert(
-        "request_id".into(),
-        Value::String(uuid::Uuid::new_v4().to_string()),
-    );
-    obj.insert("subtype".into(), Value::String(subtype.into()));
-    obj.extend(extra);
-    Value::Object(obj).to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1870,26 +1595,6 @@ mod tests {
         assert!(orch.tasks().is_empty());
         // subscribe must yield a live receiver without a prior dispatch.
         let _rx = orch.subscribe();
-    }
-
-    #[test]
-    fn build_exec_args_omits_input_format() {
-        // launch_interactive owns adding `--input-format`; build_exec_args must
-        // NOT, or bidi dispatch doubles the flag and the harness rejects it
-        // ("cannot be used multiple times"). Guards that regression.
-        for p in [
-            Provider::Glm,
-            Provider::Glm,
-            Provider::Deepseek,
-            Provider::Brodex,
-            Provider::VibeBh,
-        ] {
-            let args = p.build_exec_args("hi", "sess", None, None);
-            assert!(
-                !args.iter().any(|a| a == "--input-format"),
-                "{p} build_exec_args must not add --input-format"
-            );
-        }
     }
 
     #[test]
@@ -1953,23 +1658,6 @@ mod tests {
     }
 
     #[test]
-    fn harness_providers_seed_turn1_from_prompt_arg() {
-        // bro-harness seeds turn-1 from the prompt arg; stdin-seeding would
-        // double the first user turn.
-        for p in [
-            Provider::Glm,
-            Provider::Deepseek,
-            Provider::Brodex,
-            Provider::VibeBh,
-        ] {
-            assert!(
-                !bidi_seeds_turn1_via_stdin(p),
-                "{p} seeds turn-1 from -p; stdin-seeding would double it"
-            );
-        }
-    }
-
-    #[test]
     fn bidi_capability_gate() {
         for p in [
             Provider::Glm,
@@ -1980,58 +1668,6 @@ mod tests {
             assert!(provider_supports_bidi(p), "{p} should be bidi-capable");
         }
         assert!(!provider_supports_bidi(Provider::Workflow));
-    }
-
-    #[test]
-    fn user_turn_ndjson_shape() {
-        let line = user_turn_ndjson("hi there");
-        let v: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(v["type"], "user");
-        assert_eq!(v["message"]["role"], "user");
-        assert_eq!(v["message"]["content"], "hi there");
-        assert!(!line.contains('\n'), "NDJSON line must be single-line");
-    }
-
-    #[test]
-    fn resumed_transcript_keeps_prior_events_before_resume_turn() {
-        let task = crate::orchestration::test_task("new", TaskStatus::Running, Provider::Glm);
-        let handle = AgentHandle {
-            task: task.clone(),
-            stdin: None,
-            daemon: None,
-        };
-        seed_resumed_transcript(
-            &handle,
-            vec![serde_json::json!({
-                "type": "assistant",
-                "message": {"content": [{"type": "text", "text": "old answer"}]},
-            })],
-            "sid-1",
-            "next turn",
-        );
-
-        let events = task.inner.lock().events.clone();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0]["type"], "assistant");
-        assert_eq!(events[1]["type"], "user");
-        assert_eq!(events[1]["session_id"], "sid-1");
-        assert_eq!(events[1]["message"]["content"], "next turn");
-    }
-
-    #[test]
-    fn control_ndjson_shape() {
-        let interrupt = control_ndjson("interrupt", serde_json::Map::new());
-        let v: Value = serde_json::from_str(&interrupt).unwrap();
-        assert_eq!(v["type"], "control_request");
-        assert_eq!(v["subtype"], "interrupt");
-        assert!(v["request_id"].as_str().is_some_and(|s| !s.is_empty()));
-
-        let mut extra = serde_json::Map::new();
-        extra.insert("model".into(), Value::String("opus".into()));
-        let set_model = control_ndjson("set_model", extra);
-        let v: Value = serde_json::from_str(&set_model).unwrap();
-        assert_eq!(v["subtype"], "set_model");
-        assert_eq!(v["model"], "opus");
     }
 
     #[test]

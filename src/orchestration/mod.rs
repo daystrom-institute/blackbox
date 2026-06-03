@@ -973,6 +973,9 @@ pub struct SpawnTaskParams {
 /// in one-shot mode (closed after the prompt) and on spawn failure.
 pub struct SpawnedTask {
     pub task: Arc<Task>,
+    // Read only by the (removed) fleet in-process interactive launch; kept with
+    // `spawn_task_interactive` until the daemon-side dispatch is consolidated.
+    #[allow(dead_code)]
     pub stdin: Option<tokio::process::ChildStdin>,
 }
 
@@ -1545,6 +1548,11 @@ async fn run_harness_in_process(
 /// Args should already include `--input-format stream-json` (and typically
 /// `--replay-user-messages`); the initial `-p <prompt>` becomes the first user
 /// turn, subsequent turns/controls are written to the returned stdin.
+///
+/// Orphaned by the §7 fleet-daemon-only cut (its only caller was the fleet
+/// in-process launch). Kept until the daemon-side dispatch is consolidated;
+/// remove together with the rest of the in-process spawn machinery.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_task_interactive(
     task_id: String,
