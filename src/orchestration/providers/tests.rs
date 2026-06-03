@@ -3,6 +3,7 @@ use std::str::FromStr;
 use crate::orchestration::mcp::{McpFilters, McpServerConfig, SecretString};
 
 use super::*;
+use super::dispatch_prelude::*;
 
 fn empty_sink() -> EventSink {
     EventSink {

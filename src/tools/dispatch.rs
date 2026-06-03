@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 use crate::orchestration;
 use crate::orchestration as orch;
 use crate::orchestration::providers::{ExecOpts, Provider};
+use crate::orchestration::providers::dispatch_prelude::*;
 use crate::orchestration::tail::TailEvent;
 use crate::server::BlackboxServer;
 use crate::server::progress::{

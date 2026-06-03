@@ -27,6 +27,7 @@ use tokio::sync::Notify;
 use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
 use providers::{EventSink, Provider, Usage};
+use providers::dispatch_prelude::*;
 use supervision::SupervisionState;
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[

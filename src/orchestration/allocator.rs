@@ -11,6 +11,7 @@ use serde_json::Value;
 use super::TaskStore;
 use super::brofile::BroConfig;
 use super::providers::{self, Capability, ExecOpts, Provider};
+use super::providers::dispatch_prelude::*;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PoolRef {

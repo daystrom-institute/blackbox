@@ -79,12 +79,27 @@ fn disruption_from_error_text(s: &str) -> Option<Disruption> {
     }
 }
 
-impl Provider {
+/// Streaming-event parsing for a provider (daemon-side: updates an
+/// [`EventSink`] from the provider's wire envelope). Part of the provider
+/// dispatch surface — see [`super::dispatch_prelude`].
+pub trait ProviderEvents {
+    /// Detect a rate-limit / overload disruption from a single streaming event.
+    fn detect_disruption(&self, evt: &Value) -> Option<Disruption>;
+    /// Parse a streaming JSON event and update the sink.
+    fn parse_event(&self, evt: &Value, sink: &mut EventSink);
+    /// For non-streaming providers, parse the full stdout after process exit.
+    fn parse_bulk_output(&self, raw: &str, sink: &mut EventSink);
+    /// Build provider-native transcript export args, if any.
+    #[allow(dead_code)]
+    fn build_export_args(&self, session_id: &str) -> Option<Vec<String>>;
+}
+
+impl ProviderEvents for Provider {
     /// Detect a rate-limit / overload disruption from a single streaming event.
     /// Structured `apiErrorStatus` (429/529) first — surfaced by the Claude CLI
     /// and the bro-harness Anthropic envelope (GLM/DeepSeek/Brodex) — then the
     /// provider's explicit error text on error records only.
-    pub fn detect_disruption(&self, evt: &Value) -> Option<Disruption> {
+    fn detect_disruption(&self, evt: &Value) -> Option<Disruption> {
         let status = evt["apiErrorStatus"]
             .as_u64()
             .or_else(|| evt["message"]["apiErrorStatus"].as_u64());
@@ -110,7 +125,7 @@ impl Provider {
     }
 
     /// Parse a streaming JSON event and update the sink.
-    pub fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
+    fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
             Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
                 parse_claude_event(evt, sink)
@@ -120,7 +135,7 @@ impl Provider {
     }
 
     /// For non-streaming providers, parse the full stdout after process exit.
-    pub fn parse_bulk_output(&self, raw: &str, sink: &mut EventSink) {
+    fn parse_bulk_output(&self, raw: &str, sink: &mut EventSink) {
         if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
             self.parse_event(&parsed, sink);
         } else {
@@ -128,7 +143,7 @@ impl Provider {
         }
     }
 
-    pub fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
+    fn build_export_args(&self, session_id: &str) -> Option<Vec<String>> {
         let _ = session_id;
         None
     }

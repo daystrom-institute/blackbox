@@ -701,16 +701,37 @@ roster render.
 
 ### Remaining
 
-- **§7 thin-client crate (stage 2).** Done so far: `bro` is split into its own
-  crate (`bro-cli`), establishing the client/daemon boundary; the status DTOs are
-  wired. NOT done: cutting `bro-cli`'s dependency on `blackbox` so it links only
-  `bro-protocol` + `bro-core`. The long pole is relocating `Provider` to the
-  contract bottom — it has `impl Provider` blocks across ~6 files
-  (`providers.rs`, `events.rs`, `session.rs`, `exec_args.rs`, `mcp_args.rs`) that
-  would all convert from inherent to trait impls, plus ~12 heavy-method call-site
-  files, plus the `FleetOrchestrator` engine (≈50 call sites), the view DTOs,
-  `config::load`, and `parser` all needing relocation. This is a multi-stage,
-  ~50-file refactor — a durable-bro + reviewer effort, not a single sprint.
+- **§7 thin-client crate (stage 2).** A multi-stage, ~50-file refactor; the
+  sub-steps land as independent compiling commits.
+  - **Step 1a — DONE: `Provider` relocated to the contract bottom.** The enum +
+    `Capability` + the model/effort catalog (`ModelInfo`/`EffortInfo` + tables)
+    and the *pure* methods (`ALL`/`is_dispatchable`/`capabilities`/`as_str`/
+    `supports_resume`/`is_streaming_json`/`models`/`efforts`/`Display`) now live
+    in `bro-core` (`crates/bro-core/src/provider.rs`); `bro-core` gained a
+    `strum` dep for `EnumString`/`FromStr`. The *daemon-logic* methods convert
+    from inherent `impl Provider` to four traits impl'd in `blackbox` —
+    `ProviderExec` (bin/build_exec_args/build_resume_args), `ProviderEvents`
+    (parse_event/detect_disruption/…), `ProviderMcp` (build_filter_args/
+    build_fleet_mcp_args/build_mcp_*), `ProviderSession` (resolve_session_cwd) —
+    reached through one `providers::dispatch_prelude` glob added at ~13 call
+    sites. `orchestration::providers` does `pub use bro_core::{Capability,
+    Provider}` so the ~45 type-users didn't churn. Validated: `bro-core` checks
+    standalone, blackbox lib + bro-cli compile 0/0, 27 provider tests pass, both
+    bins link, and a live isolated-daemon fleet-TUI smoke (port 7299) renders the
+    provider/model/effort selector from the relocated type. The fleet client
+    calling daemon-logic methods on `Provider` is what 1b/1c remove; until then
+    `blackbox` is the only crate that needs the dispatch traits, which is correct
+    (none are called by `bro-cli`).
+  - NOT done: **1b** make the fleet client daemon-only (drop `FleetOrchestrator`'s
+    in-process dispatch branch, keep only the HTTP `DaemonFleetClient`); **1c**
+    relocate the view/wire DTOs (`TaskStatus`/`AgentHandle`/`DispatchSpec`/
+    `ResumeSpec`/`TranscriptItem`/`Todo*`/`ClassifierConfig`/`FleetConfig`) into
+    `bro-protocol` and the parser transcript types into a shared crate; **1d**
+    point `bro-cli` at the contract bottom + a thin client crate and DROP the
+    `blackbox = { path = ... }` dependency. (The remaining `bro-cli → blackbox`
+    surface is `blackbox::fleet::*` (engine + DTOs + `intern_rider`/
+    `provider_supports_bidi`), `blackbox::parser::*`, and `blackbox::config::load`.)
+    Still a durable-bro + reviewer effort, not a single sprint.
 - **§5 in-process V8 + supervised shell (execution isolation).** Not started;
   no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
   per-child env hook but not timeout/cap supervision.

@@ -6,32 +6,15 @@ use std::path::PathBuf;
 use super::Provider;
 use super::mcp_args::{claude_mcp_config_json, transient_blackbox_name, transient_blackbox_url};
 
-impl Provider {
-    pub fn bin(&self) -> String {
-        self.bin_with_env()
-    }
-
-    fn bin_with_env(&self) -> String {
-        match self {
-            // GLM/DeepSeek/Brodex/VibeBh ride the custom harness instead of a
-            // vendor CLI; transport + credentials are selected via env (see
-            // brofile::resolve_provider_env).
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
-                std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
-            }
-            Provider::Workflow => "workflow".into(),
+/// Resolve the harness/provider binary name from env. GLM/DeepSeek/Brodex/VibeBh
+/// ride the custom harness instead of a vendor CLI; transport + credentials are
+/// selected via env (see brofile::resolve_provider_env).
+fn bin_with_env(provider: Provider) -> String {
+    match provider {
+        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+            std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
         }
-    }
-
-    pub fn bin_with_config(&self, _cfg: &ProviderConfig) -> String {
-        match self {
-            // Harness providers resolve via BRO_HARNESS_BIN (bin_with_env);
-            // no dedicated config override today.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
-                self.bin_with_env()
-            }
-            Provider::Workflow => "workflow".into(),
-        }
+        Provider::Workflow => "workflow".into(),
     }
 }
 
@@ -158,8 +141,48 @@ fn harness_default_model(provider: Provider) -> Option<String> {
         .map(|m| m.id.to_string())
 }
 
-impl Provider {
-    pub fn build_exec_args(
+/// Argument construction for spawning/resuming a provider (daemon-side: reaches
+/// brofile/config/MCP-injection types). Part of the provider dispatch surface —
+/// see [`super::dispatch_prelude`].
+pub trait ProviderExec {
+    /// The binary the daemon spawns for this provider.
+    fn bin(&self) -> String;
+    /// Like [`bin`](Self::bin) but allowing a per-provider config override.
+    fn bin_with_config(&self, cfg: &ProviderConfig) -> String;
+    /// Build the args for a fresh dispatch.
+    fn build_exec_args(
+        &self,
+        prompt: &str,
+        session_id: &str,
+        cwd: Option<&str>,
+        opts: Option<&ExecOpts>,
+    ) -> Vec<String>;
+    /// Build the args for resuming an existing session.
+    fn build_resume_args(
+        &self,
+        session_id: &str,
+        prompt: &str,
+        opts: Option<&ExecOpts>,
+    ) -> Vec<String>;
+}
+
+impl ProviderExec for Provider {
+    fn bin(&self) -> String {
+        bin_with_env(*self)
+    }
+
+    fn bin_with_config(&self, _cfg: &ProviderConfig) -> String {
+        match self {
+            // Harness providers resolve via BRO_HARNESS_BIN (bin_with_env);
+            // no dedicated config override today.
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+                bin_with_env(*self)
+            }
+            Provider::Workflow => "workflow".into(),
+        }
+    }
+
+    fn build_exec_args(
         &self,
         prompt: &str,
         session_id: &str,
@@ -216,7 +239,7 @@ impl Provider {
         }
     }
 
-    pub fn build_resume_args(
+    fn build_resume_args(
         &self,
         session_id: &str,
         prompt: &str,

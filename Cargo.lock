@@ -458,6 +458,7 @@ name = "bro-core"
 version = "0.0.1"
 dependencies = [
  "serde",
+ "strum 0.26.3",
 ]
 
 [[package]]

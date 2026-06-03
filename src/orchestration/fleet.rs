@@ -28,6 +28,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast};
 
 use super::mcp::McpServerConfig;
 use super::providers::{EventSink, ExecOpts};
+use super::providers::dispatch_prelude::*;
 use super::supervision::SupervisionState;
 use super::{
     Task, TaskInner, TaskStore, format_elapsed, now_ms, spawn_task, spawn_task_interactive,

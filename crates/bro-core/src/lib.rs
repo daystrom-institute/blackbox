@@ -7,6 +7,9 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+mod provider;
+pub use provider::{Capability, EffortInfo, ModelInfo, Provider};
+
 macro_rules! id_type {
     ($name:ident) => {
         #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

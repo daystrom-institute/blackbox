@@ -7,6 +7,7 @@ use crate::orchestration;
 use crate::orchestration as orch;
 use crate::orchestration::TaskStore;
 use crate::orchestration::providers::Provider;
+use crate::orchestration::providers::dispatch_prelude::*;
 
 // ---------------------------------------------------------------------------
 // Progress notifications — MCP progressToken plumbing for blocking waits

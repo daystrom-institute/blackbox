@@ -6,9 +6,53 @@ use crate::orchestration::mcp::{self, McpFilters};
 
 use super::Provider;
 
-impl Provider {
+/// MCP/filter argument translation for a provider (daemon-side: reaches the MCP
+/// config + tool-docs universe). Part of the provider dispatch surface — see
+/// [`super::dispatch_prelude`].
+pub trait ProviderMcp {
     #[allow(dead_code)]
-    pub fn build_mcp_add_http_args(
+    fn build_mcp_add_http_args(
+        &self,
+        name: &str,
+        url: &str,
+        exclude_tools: &[String],
+    ) -> Option<Vec<String>>;
+    #[allow(dead_code)]
+    fn build_mcp_add_http_args_scoped(
+        &self,
+        name: &str,
+        url: &str,
+        exclude_tools: &[String],
+        scope: &str,
+    ) -> Option<Vec<String>>;
+    fn build_mcp_add_http_args_full(
+        &self,
+        name: &str,
+        url: &str,
+        exclude_tools: &[String],
+        headers: &BTreeMap<String, String>,
+        scope: &str,
+    ) -> Option<Vec<String>>;
+    fn build_mcp_remove_args(&self, name: &str) -> Option<Vec<String>>;
+    fn build_mcp_remove_args_scoped(&self, name: &str, scope: &str) -> Option<Vec<String>>;
+    #[allow(dead_code)]
+    fn build_mcp_list_args(&self) -> Option<Vec<String>>;
+    #[allow(dead_code)]
+    fn mcp_list_has(&self, stdout: &str, name: &str, expected_url: Option<&str>) -> MatchState;
+    fn build_filter_args(&self, filters: &McpFilters) -> Vec<String>;
+    #[allow(dead_code)]
+    fn supports_dispatch_filter(&self) -> bool;
+    /// Translate a normalized fleet MCP server map into provider-native dispatch
+    /// args.
+    fn build_fleet_mcp_args(
+        &self,
+        servers: &BTreeMap<String, mcp::McpServerConfig>,
+    ) -> Vec<String>;
+}
+
+impl ProviderMcp for Provider {
+    #[allow(dead_code)]
+    fn build_mcp_add_http_args(
         &self,
         name: &str,
         url: &str,
@@ -18,7 +62,7 @@ impl Provider {
     }
 
     #[allow(dead_code)]
-    pub fn build_mcp_add_http_args_scoped(
+    fn build_mcp_add_http_args_scoped(
         &self,
         name: &str,
         url: &str,
@@ -28,7 +72,7 @@ impl Provider {
         self.build_mcp_add_http_args_full(name, url, exclude_tools, &BTreeMap::new(), scope)
     }
 
-    pub fn build_mcp_add_http_args_full(
+    fn build_mcp_add_http_args_full(
         &self,
         _name: &str,
         _url: &str,
@@ -39,21 +83,21 @@ impl Provider {
         None
     }
 
-    pub fn build_mcp_remove_args(&self, _name: &str) -> Option<Vec<String>> {
+    fn build_mcp_remove_args(&self, _name: &str) -> Option<Vec<String>> {
         None
     }
 
-    pub fn build_mcp_remove_args_scoped(&self, _name: &str, _scope: &str) -> Option<Vec<String>> {
-        None
-    }
-
-    #[allow(dead_code)]
-    pub fn build_mcp_list_args(&self) -> Option<Vec<String>> {
+    fn build_mcp_remove_args_scoped(&self, _name: &str, _scope: &str) -> Option<Vec<String>> {
         None
     }
 
     #[allow(dead_code)]
-    pub fn mcp_list_has(&self, stdout: &str, name: &str, expected_url: Option<&str>) -> MatchState {
+    fn build_mcp_list_args(&self) -> Option<Vec<String>> {
+        None
+    }
+
+    #[allow(dead_code)]
+    fn mcp_list_has(&self, stdout: &str, name: &str, expected_url: Option<&str>) -> MatchState {
         let has_name = stdout.lines().any(|l| l.contains(name));
         if !has_name {
             return MatchState::Missing;
@@ -64,7 +108,7 @@ impl Provider {
         }
     }
 
-    pub fn build_filter_args(&self, filters: &McpFilters) -> Vec<String> {
+    fn build_filter_args(&self, filters: &McpFilters) -> Vec<String> {
         if filters.is_empty() {
             return Vec::new();
         }
@@ -94,7 +138,7 @@ impl Provider {
     }
 
     #[allow(dead_code)]
-    pub fn supports_dispatch_filter(&self) -> bool {
+    fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,
             Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
@@ -107,7 +151,7 @@ impl Provider {
     /// the bro-harness providers) is implemented; everything else returns empty
     /// (no per-dispatch MCP-injection seam in its CLI yet). When a future
     /// provider grows one, it slots in here against the same input map.
-    pub fn build_fleet_mcp_args(
+    fn build_fleet_mcp_args(
         &self,
         servers: &BTreeMap<String, mcp::McpServerConfig>,
     ) -> Vec<String> {

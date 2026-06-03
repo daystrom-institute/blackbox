@@ -32,6 +32,7 @@ use rmcp::schemars;
 
 use super::brofile;
 use super::providers::Provider;
+use super::providers::dispatch_prelude::*;
 
 // ── Types ──────────────────────────────────────────────────────────
 

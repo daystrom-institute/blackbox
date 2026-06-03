@@ -5,6 +5,7 @@ mod supervision;
 #[cfg(test)]
 mod tests;
 use crate::orchestration;
+use crate::orchestration::providers::dispatch_prelude::*;
 use crate::server::BlackboxServer;
 use crate::tools::bro_params::{
     AtomDelegateParams, AtomDescribeParams, AtomGetParams, AtomInvokeParams, AtomListParams,
