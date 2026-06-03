@@ -2472,9 +2472,44 @@ fn populate_transcript_handle(task: &Task) {
     }
 }
 
+/// Project a task's core state into the shared `bro_protocol` wire DTO — the
+/// status-plane half of the contract bottom (harness-daemon-boundary.md §7).
+/// This is the typed snapshot the fleet client consumes from `/control/status`;
+/// it is what gives `bro_protocol::TaskSnapshot`/`TaskStatus` a real producer.
+/// (A free fn, not `From`, because the orphan rule forbids
+/// `impl From<&TaskInner> for bro_protocol::TaskSnapshot` — both are foreign.)
+pub fn protocol_task_snapshot(inner: &TaskInner) -> bro_protocol::TaskSnapshot {
+    use bro_protocol::TaskStatus as Wire;
+    let status = match inner.status {
+        TaskStatus::Running => Wire::Running,
+        TaskStatus::Completed => Wire::Completed,
+        TaskStatus::Failed => Wire::Failed,
+        TaskStatus::Cancelled => Wire::Cancelled,
+    };
+    let error = if matches!(inner.status, TaskStatus::Failed) && !inner.stderr.trim().is_empty() {
+        Some(bro_core::BroError::new(
+            "task_failed",
+            inner.stderr.trim().to_string(),
+        ))
+    } else {
+        None
+    };
+    bro_protocol::TaskSnapshot {
+        task_id: bro_core::TaskId::new(inner.id.clone()),
+        session_id: (!inner.session_id.is_empty())
+            .then(|| bro_core::SessionId::new(inner.session_id.clone())),
+        status,
+        last_message: inner.last_assistant_message.clone(),
+        error,
+    }
+}
+
 pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let mut obj = task_result_json(task);
     let inner = task.inner.lock();
+    // Typed wire snapshot (additive field; existing ad-hoc fields stay for the
+    // IRC bridge and other readers). The fleet poller deserializes this.
+    obj["snapshot"] = serde_json::to_value(protocol_task_snapshot(&inner)).unwrap_or(Value::Null);
     let event_count = observed_event_count(&inner);
     obj["eventCount"] = Value::from(event_count);
     if tail > 0 && !inner.events.is_empty() {
@@ -2605,6 +2640,41 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("no live in-process harness control channel"));
+    }
+
+    #[test]
+    fn protocol_task_snapshot_maps_status_and_error() {
+        // Completed task → wire Completed, last_message carried, no error.
+        let t = test_task("t1", TaskStatus::Completed, Provider::Glm);
+        t.inner.lock().last_assistant_message = Some("OK".to_string());
+        let snap = protocol_task_snapshot(&t.inner.lock());
+        assert_eq!(snap.task_id.as_str(), "t1");
+        assert_eq!(snap.session_id.as_ref().map(|s| s.as_str()), Some("sess-t1"));
+        assert_eq!(snap.status, bro_protocol::TaskStatus::Completed);
+        assert_eq!(snap.last_message.as_deref(), Some("OK"));
+        assert!(snap.error.is_none());
+
+        // Failed task with stderr → error populated with a typed code.
+        let f = test_task("t2", TaskStatus::Failed, Provider::Glm);
+        f.inner.lock().stderr = "boom".to_string();
+        let snap2 = protocol_task_snapshot(&f.inner.lock());
+        assert_eq!(snap2.status, bro_protocol::TaskStatus::Failed);
+        assert_eq!(
+            snap2.error.as_ref().map(|e| e.code.as_str()),
+            Some("task_failed")
+        );
+
+        // Cancelled maps through; running maps to wire Running.
+        assert_eq!(
+            protocol_task_snapshot(&test_task("t3", TaskStatus::Cancelled, Provider::Glm).inner.lock())
+                .status,
+            bro_protocol::TaskStatus::Cancelled
+        );
+        assert_eq!(
+            protocol_task_snapshot(&test_task("t4", TaskStatus::Running, Provider::Glm).inner.lock())
+                .status,
+            bro_protocol::TaskStatus::Running
+        );
     }
 
     #[test]

@@ -1266,16 +1266,38 @@ fn spawn_daemon_status_poller(
 
 fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) -> bool {
     let mut inner = task.inner.lock();
-    if let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) {
-        inner.session_id = session_id.to_string();
-    }
-    if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
-        inner.status = match status {
-            "completed" => TaskStatus::Completed,
-            "failed" => TaskStatus::Failed,
-            "cancelled" => TaskStatus::Cancelled,
-            _ => TaskStatus::Running,
+    // Prefer the typed wire snapshot (bro_protocol::TaskSnapshot) for the core
+    // status plane; fall back to the legacy ad-hoc fields when an older daemon
+    // omits it. This is the fleet's consumer of the contract-bottom status DTO
+    // (harness-daemon-boundary.md §7).
+    let typed: Option<bro_protocol::TaskSnapshot> = value
+        .get("snapshot")
+        .and_then(|s| serde_json::from_value(s.clone()).ok());
+    if let Some(snap) = &typed {
+        if let Some(sid) = &snap.session_id {
+            inner.session_id = sid.as_str().to_string();
+        }
+        inner.status = match snap.status {
+            bro_protocol::TaskStatus::Completed => TaskStatus::Completed,
+            bro_protocol::TaskStatus::Failed => TaskStatus::Failed,
+            bro_protocol::TaskStatus::Cancelled => TaskStatus::Cancelled,
+            // Pending/Running both map to the daemon's Running.
+            bro_protocol::TaskStatus::Pending | bro_protocol::TaskStatus::Running => {
+                TaskStatus::Running
+            }
         };
+    } else {
+        if let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) {
+            inner.session_id = session_id.to_string();
+        }
+        if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
+            inner.status = match status {
+                "completed" => TaskStatus::Completed,
+                "failed" => TaskStatus::Failed,
+                "cancelled" => TaskStatus::Cancelled,
+                _ => TaskStatus::Running,
+            };
+        }
     }
     if let Some(events) = value.get("recentEvents").and_then(|v| v.as_array()) {
         inner.events = events.clone();
