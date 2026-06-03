@@ -1257,8 +1257,8 @@ fn complete_project(app: &mut App) {
 
 // ── Entry point ─────────────────────────────────────────────────────────────
 
-pub async fn run(cwd: Option<String>) -> anyhow::Result<()> {
-    let orch = Arc::new(FleetOrchestrator::from_config()?);
+pub async fn run(cwd: Option<String>, daemon_url: Option<String>) -> anyhow::Result<()> {
+    let orch = Arc::new(FleetOrchestrator::from_config_with_daemon_url(daemon_url)?);
     let mut app = App::new(orch.clone(), cwd, tokio::runtime::Handle::current());
 
     // Repopulate from prior fleet sessions persisted on disk (crashed/orphaned
@@ -1564,7 +1564,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Home if app.zone == Zone::SingleAgent => app.scroll_from_bottom = usize::MAX / 2,
         KeyCode::End if app.zone == Zone::SingleAgent => app.scroll_from_bottom = 0,
 
-        KeyCode::Enter if shift || ctrl => {
+        KeyCode::Enter if shift => {
             app.input.push('\n');
             app.cursor_pos = app.input.len();
         }

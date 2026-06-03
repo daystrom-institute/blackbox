@@ -103,6 +103,10 @@ struct FleetArgs {
     /// cockpit's launch cwd.
     #[arg(long, value_name = "DIR")]
     cwd: Option<String>,
+    /// Daemon base URL for daemon-backed fleet dispatch/control. Also accepted
+    /// via BLACKBOX_FLEET_DAEMON_URL.
+    #[arg(long, value_name = "URL")]
+    daemon_url: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1485,7 +1489,7 @@ fn main() -> anyhow::Result<()> {
         }
         BroCommand::Fleet(args) => {
             default_fleet_harness_tee();
-            let result = rt.block_on(fleet_tui::run(args.cwd));
+            let result = rt.block_on(fleet_tui::run(args.cwd, args.daemon_url));
             drop(rt);
             return result;
         }
