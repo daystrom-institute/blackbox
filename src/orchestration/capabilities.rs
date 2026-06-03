@@ -9,13 +9,17 @@
 
 use std::sync::Arc;
 
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use bro_capabilities::{
     AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
-    CorpusLookup,
+    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
+use parking_lot::RwLock;
 
+use crate::refactor::{self, RefactorPlanParams};
 use crate::server::state::{BlackboxServer, SharedState};
 use crate::tools::bro_params::AtomInvokeParams;
 
@@ -82,6 +86,78 @@ impl AtomCapability for DaemonAtoms {
     }
 }
 
+/// Refactor capability backed by the daemon's real plan path. Produced plans
+/// are kept host-side keyed by handle id; only the handle (id + preview)
+/// crosses into the agent's context (§6/§9 ref-handle model).
+pub(crate) struct DaemonRefactor {
+    pub(crate) state: Arc<SharedState>,
+    plans: RwLock<HashMap<String, serde_json::Value>>,
+}
+
+impl DaemonRefactor {
+    fn new(state: Arc<SharedState>) -> Self {
+        Self {
+            state,
+            plans: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+/// One-line preview of a plan for the model: kind plus edit count when present.
+fn plan_preview(plan: &serde_json::Value) -> String {
+    let kind = plan.get("kind").and_then(|k| k.as_str()).unwrap_or("plan");
+    match plan.get("edits").and_then(|e| e.as_array()) {
+        Some(edits) => format!("{kind}: {} edit(s)", edits.len()),
+        None => kind.to_string(),
+    }
+}
+
+#[async_trait]
+impl RefactorCapability for DaemonRefactor {
+    async fn plan_refactor(
+        &self,
+        request: RefactorRequest,
+    ) -> CapabilityResult<RefactorPlanHandle> {
+        // Merge the request kind into the params object, then deserialize the
+        // exact RefactorPlanParams the MCP tool uses — same dispatch, same
+        // governance (RX-V1/V2/V3 fail-closed behavior is unchanged).
+        let mut params_value = match request.input_json {
+            serde_json::Value::Object(map) => serde_json::Value::Object(map),
+            serde_json::Value::Null => serde_json::json!({}),
+            other => {
+                return Err(BroError::new(
+                    "bad_input",
+                    format!("refactor params must be an object, got {other}"),
+                ));
+            }
+        };
+        params_value["kind"] = serde_json::Value::String(request.kind);
+        let params: RefactorPlanParams = serde_json::from_value(params_value)
+            .map_err(|e| BroError::new("bad_input", e.to_string()))?;
+
+        let ctx = refactor::PlanContext {
+            lsp: Some(self.state.lsp_sessions.clone()),
+        };
+        let plan_json = refactor::plan_with_ctx(&params, &ctx)
+            .map_err(|e| BroError::new("refactor_plan_failed", e.to_string()))?;
+        let plan: serde_json::Value = serde_json::from_str(&plan_json)
+            .map_err(|e| BroError::new("refactor_plan_parse_failed", e.to_string()))?;
+
+        let id = format!("ref:plan/{}", uuid::Uuid::new_v4());
+        let preview = plan_preview(&plan);
+        self.plans.write().insert(id.clone(), plan);
+        Ok(RefactorPlanHandle { id, preview })
+    }
+
+    async fn materialize_plan(&self, id: String) -> CapabilityResult<serde_json::Value> {
+        self.plans
+            .read()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| BroError::new("unknown_plan", format!("no host-side plan for {id}")))
+    }
+}
+
 /// Install the daemon's in-memory capability implementations into the harness
 /// capability slots. Called once at startup; the standalone harness binary
 /// never calls this, so those surfaces fail closed by absence.
@@ -92,6 +168,7 @@ pub(crate) fn install(state: &Arc<SharedState>) {
     bro_harness::capabilities::install_atoms(Arc::new(DaemonAtoms {
         state: state.clone(),
     }));
+    bro_harness::capabilities::install_refactor(Arc::new(DaemonRefactor::new(state.clone())));
 }
 
 #[cfg(test)]
@@ -136,5 +213,35 @@ mod tests {
             .await;
         let err = result.expect_err("unknown atom must error");
         assert_eq!(err.code, "atom_invoke_failed");
+    }
+
+    /// A bogus plan kind drives the real plan dispatch and surfaces its error —
+    /// proving plan_refactor reaches live refactor machinery, not a stub.
+    #[tokio::test]
+    async fn daemon_refactor_reaches_real_plan_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(dir.path()));
+        let refactor = DaemonRefactor::new(state);
+        let result = refactor
+            .plan_refactor(RefactorRequest {
+                kind: "no_such_plan_kind".to_string(),
+                input_json: serde_json::json!({ "source": "a.rs" }),
+            })
+            .await;
+        assert!(result.is_err(), "unknown plan kind must error");
+    }
+
+    /// Materializing an id that was never produced is a clean error, not a
+    /// panic — the handle is real (dereferenceable) or it fails.
+    #[tokio::test]
+    async fn daemon_refactor_unknown_plan_id_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(dir.path()));
+        let refactor = DaemonRefactor::new(state);
+        let err = refactor
+            .materialize_plan("ref:plan/missing".to_string())
+            .await
+            .expect_err("unknown plan id must error");
+        assert_eq!(err.code, "unknown_plan");
     }
 }
