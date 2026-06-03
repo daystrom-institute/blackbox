@@ -8,7 +8,7 @@ topic:
   - orchestration
   - surfaces
   - fleet-tui
-brief: "Restates the bro-harness/daemon boundary for the post-CLI, API-native era. The 'no daemon runtime dependency' rule was a temporary scaffold; with codex/vibe/claude/opencode CLI holes dropped and all providers API-native through bro-harness, the harness becomes a linkable crate the daemon runs in-process. The load-bearing half of the invariant survives as a compiler-enforced acyclic DAG. Capabilities and wire messages cross through a shared contract bottom — a small family of crates (bro-core / bro-protocol / bro-capabilities) cleaved by consumer, not by domain taxonomy — so the thin fleet client links only the protocol it needs and gRPC is unnecessary (the Rust types are the contract, serde is the wire). Consolidation collapses the fleet coordinator into the singleton daemon (TUI = thin view, agents = bros), turns corpus/atom lookups into in-memory trait calls, makes the MCP surface an in-process filter evaluation reusing the shipped surface evaluator, and keeps a V8/shell isolation gradient so 'one process' isn't 'one fault domain.' Supersedes the per-store fleet coordinator placement; refines narf-draft2 §6; extends mcp-surfaces."
+brief: "Restates the bro-harness/daemon boundary for the post-CLI, API-native era. The 'no daemon runtime dependency' rule was a temporary scaffold; with codex/vibe/claude/opencode CLI holes dropped and all providers API-native through bro-harness, the harness becomes a linkable crate the daemon runs in-process. The load-bearing half of the invariant survives as a compiler-enforced acyclic DAG. Capabilities and wire messages cross through a shared contract bottom — a small family of crates (bro-core / bro-protocol / bro-capabilities) cleaved by consumer, not by domain taxonomy — so the thin fleet client links only the protocol it needs and gRPC is unnecessary (the Rust types are the contract, serde is the wire). Consolidation collapses the fleet coordinator into the singleton daemon (TUI = thin view, agents = bros), turns corpus/atom lookups into in-memory trait calls, makes the MCP surface an in-process filter evaluation reusing the shipped surface evaluator, and runs V8 in-process (isolate-contained) with shell ops as supervised child processes so 'one process' isn't 'one fault domain' (OS sandboxing deferred — a trusted-agent box gets accident-containment from supervision, not security from a sandbox). Supersedes the per-store fleet coordinator placement; refines narf-draft2 §6; extends mcp-surfaces."
 ---
 
 # The harness–daemon boundary: in-process consolidation
@@ -34,8 +34,11 @@ brief: "Restates the bro-harness/daemon boundary for the post-CLI, API-native er
 > collapses three things into the singleton daemon: the fleet coordinator (TUI
 > becomes a thin view, agents become bros), corpus/atom lookups (in-memory trait
 > calls instead of MCP round-trips), and the MCP surface (an in-process filter
-> evaluation reusing the shipped surface evaluator). A V8/shell isolation
-> gradient keeps "one process" from becoming "one fault domain."
+> evaluation reusing the shipped surface evaluator). In-process V8
+> (isolate-contained) plus supervised shell child processes keep "one process"
+> from becoming "one fault domain" — OS sandboxing is deferred, because a
+> trusted-agent box gets accident-containment from supervision, not security from
+> a sandbox.
 
 ## 1. Why the invariant existed, and why it comes down now
 
@@ -186,9 +189,13 @@ keyed to the isolation/control tradeoff:
 - **In-process** (function call, typed events, method-call control plane) — the
   daemon (for the API-native providers), the `bro` CLI standalone, fleet's
   interactive sessions.
-- **Subprocess** (spawn the thin binary, stream-json envelope, control over
-  stdin) — retained for **isolated leaves** (§5) and as the legacy/foreign-CLI
-  adapter shape if one is ever re-added.
+- **Subprocess** (spawn the thin harness binary, stream-json envelope, control
+  over stdin) — retained only as the **legacy/foreign-CLI adapter shape** if one is
+  ever re-added. CLI-shaped providers are dead-dead, so this is **not** a live
+  provider-driving escape hatch: any future external adapter must justify itself
+  behind the session/capability API. (Shell *tool* ops are separately child
+  processes the in-process harness spawns and supervises — §5 — not the harness
+  running as a subprocess.)
 
 This **inverts** the position taken before the API-native premise was on the
 table. That earlier "keep spawning subprocesses for fan-out" rested on three
@@ -202,7 +209,8 @@ legs; the premise kicks out two:
    exists because env is global) is irrelevant to API-native sessions.
 2. **Foreign-CLI uniformity — gone.** "stream-json stays as the uniform
    subprocess contract" only mattered while foreign CLIs existed. None survive.
-3. **Crash isolation — the survivor**, handled by the gradient in §5.
+3. **Crash isolation — the survivor**, handled in §5 (in-process V8 + supervised
+   shell), much lighter than a worker-process gradient.
 
 ## 4. API-native, no CLI holes
 
@@ -226,35 +234,74 @@ All dispatch is API-native via the harness transports (Anthropic, OpenAI
 Responses, OpenAI chat). If a CLI-shaped adapter is genuinely needed later,
 re-add it as a subprocess leaf behind the same `Session` API.
 
-## 5. In-process execution + the isolation gradient
+## 5. Execution isolation: in-process V8, supervised shell
 
-The daemon runs API-native sessions in-process. The surviving cost is **crash
-and restart blast radius** — the daemon now holds the corpus *and* every live
-session *and* the RPC surface. Design for it, don't hand-wave it:
+The daemon runs API-native sessions in-process. The crash/restart blast-radius
+concern is real — the daemon holds the corpus *and* every live session *and* the
+RPC surface — but the right isolation is much lighter than a worker-process
+gradient, and a **trusted-agent** threat model (the agents are the operator's own,
+on the operator's machine) deflates most of it.
 
 - **Tokio gives task-level isolation for ordinary panics.** A logic panic in one
   session's turn is caught at the task boundary; the daemon and siblings survive
   — **if** the build is `panic = "unwind"` (not `abort`) and shared corpus/atom
-  state uses **non-poisoning locks** (`parking_lot`), so a task panicking under a
-  write lock doesn't poison it for everyone.
-- **Task isolation does *not* contain OOM or FFI/V8 crashes.** Hence the
-  gradient: cheap, safe work (HTTP-transport turn loops, in-memory atom/ref
-  state) runs in-process; **dangerous execution leaves run isolated** — NARF's
-  V8 cells especially (V8 + arbitrary JS + thread-per-isolate is the exact
-  OOM/FFI surface to keep out of the daemon core), and untrusted/heavy shell tool
-  ops. The daemon runs sessions in-process and *dispatches* V8/shell execution to
-  **separate worker processes** — the process boundary is the v1 isolation
-  (crash containment). OS-level sandbox *hardening* of those workers
-  (namespaces/Seatbelt/landlock) is a separate, forward-looking design —
-  [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md) — **not v1**.
+  state uses **non-poisoning locks** (`parking_lot`). These two are prerequisites,
+  not nice-to-haves.
+- **V8 runs in-process.** The isolate, not a process, is the containment unit —
+  the codex code-mode / Deno embedding model. A per-isolate heap bound +
+  `add_near_heap_limit_callback` → `terminate_execution` contains script OOM;
+  `terminate_execution` from another thread kills runaway loops; deleted globals
+  (`console`/`Atomics`/`SharedArrayBuffer`/`WebAssembly`) deny ambient host access.
+  This keeps NARF cells' capability calls **in-memory** (§6 applies to composition
+  cells, not just flat-tool sessions). The price of in-process is config you must
+  get right — see **Future concerns**.
+- **Shell ops are already child processes.** `exec` spawns a separate process
+  inherently; there is no "isolate shell in a worker" abstraction to build. What's
+  worth doing is cheap and reliability-motivated, *not* security: a **timeout** to
+  kill hangs, and a **ulimit/cgroup cap** on the spawned child so a runaway makes
+  the OOM-killer target *it*, not the daemon. Ref I/O stays the existing clipboard
+  ABI (`shell_run stdin_from`/`stdout_to`).
+- **Cell-bounded `Tx` → rollback on abort.** `Tx` lifetime is the cell (narf-draft2
+  §4); if a cell is terminated (heap-limit `terminate_execution`, a caught panic, a
+  timeout), its uncommitted `Tx` rolls back. In-process, this is a drop-guard, not
+  a cross-process protocol — the worker-leaf bridge an earlier draft sketched here
+  is unnecessary once V8 is in-process.
+- **OS sandboxing is not in the v1 picture.** Wrapping shell children in
+  namespaces/Seatbelt confines *scope* (worktree, network, PIDs) but does **not**
+  deny capability — a trusted agent with file-write + execute can do anything
+  within its scope regardless of bash-vs-python. On a single-user box that is
+  accident-containment, not security, so it stays a proposed escape hatch
+  ([`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md)) — see **Future
+  concerns**.
 - **Restart** drops live sessions. Mitigations in hand: session persistence +
-  resume, the dev/prod daemon split, graceful drain on shutdown. The starting
-  topology is **decided** (§12.1: monolith + isolated leaves); the corpus/
-  execution split is kept as a trait-enabled escape hatch, not initial work.
+  resume, the dev/prod daemon split, graceful drain on shutdown. The corpus/
+  execution split (§12.1) stays a trait-enabled escape hatch.
+
+### Future concerns
+
+- **In-process V8 must be configured correctly or it can take the daemon.** With
+  no near-heap-limit callback wired, V8's OOM path `abort()`s the *process*; a Rust
+  panic that unwinds across a V8 callback into C++ frames (no `catch_unwind`) is
+  UB. In-process V8 trades a process boundary for **config discipline** — get it
+  wrong and a cell *can* crash the daemon. This is the residual the trusted-agent
+  model accepts.
+- **A low-probability V8 embedding/internal fault has no process boundary to catch
+  it** — it would take the daemon (corpus + all sessions). Accepted as
+  low-prob-with-a-mature-crate; revisit if it ever bites.
+- **Allowlists (execpolicy / RX-V2) are speed bumps, not walls.** `cargo check`
+  runs `build.rs` = arbitrary code; indirection defeats any name-based "what may
+  run." Treat them as accident/predictability guards, not containment.
+- **Scope-bounding cannot stop within-scope destruction.** An agent allowed to
+  write its worktree can destroy *its own* worktree (bash or python — same thing);
+  only blast radius to *peers/host* is containable, and only by the sandbox.
+- **Two triggers flip the OS sandbox from optional to load-bearing:** (1) running
+  genuinely **untrusted / third-party** agents, (2) **unattended autonomous** runs
+  where no human is watching the blast radius. Until one is real,
+  [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md) stays on the shelf.
 
 Consolidate where it pays (atoms, corpus, control plane); isolate where it
-actually protects you (V8, shell). "One process" must not become "one fault
-domain for the entire system."
+actually protects you — which, for a trusted single-user agent, is mostly just
+supervising shell children (timeout + cap), not building a sandbox.
 
 ## 6. Tool bindings: in-process, skip the wire
 
@@ -381,6 +428,16 @@ that needs this extension.)
 
 ## 9. NARF placement under consolidation
 
+> **Consolidation changes the capability *seam*, not the authoring *model*.**
+> Daemon-backed code-graph/refactor/atom capabilities arrive as injected in-memory
+> `bro-capabilities` traits instead of MCP tools — but the agent still sees the
+> same high-level authoring concepts inside the sandbox. This doc owns
+> **topology**; [narf-draft2](../../research/harness/narf-draft2.md) owns the
+> **authoring substrate** (`Ref`/`Promise`/`Plan`/`Tx`/`Atom`/`Script`, the JS/TS
+> bindings, bounded egress, the mode split); [narf.md](../../research/harness/narf.md)
+> is the exploratory **breadcrumb** record. Treat this section as the *placement
+> constraint*, not the full NARF design.
+
 NARF (see [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md))
 splits at the durable/ephemeral line, like everything else:
 
@@ -388,9 +445,15 @@ splits at the durable/ephemeral line, like everything else:
   promises/operation handles, the atom-invocation tree, traces. Coordination
   state the daemon already owns for bros; atom/corpus lookups from a cell are
   **in-memory `bro-capabilities` trait calls** (§2), not MCP.
-- **Isolated leaf (ephemeral, per cell):** the V8 runtime executing one
-  composition cell, materializing refs by handle and applying plans to the local
-  worktree — kept out of the daemon core per the gradient (§5).
+- **Ephemeral (per cell):** the V8 runtime executes one composition cell
+  **in-process** (isolate-contained, §5), materializing refs by handle and applying
+  plans to the local worktree; cell state dies with the isolate, and an aborted
+  cell rolls back its `Tx`.
+
+The concrete ref taxonomy (`ref:slice/*`, `ref:plan/*`, `ref:diag/*`,
+`ref:atom/*`, `ref:trace/*`) stays in the NARF design; this doc constrains only
+**durability**: refs needed for resume/coordination are daemon-side; refs that
+live and die within one cell execution may stay worker-local.
 
 This **refines narf-draft2 §6**: when the harness runs in-daemon, the
 corpus-capability seam is the in-memory **trait**, not an MCP client; the MCP path
@@ -450,9 +513,9 @@ RX-V2 atom command allowlist, RX-V3 LSP fail-closed) carry forward unchanged.
 
 The direction above is argued; these forks are not settled:
 
-- **One process or two — DECIDED: monolith + isolated leaves.** `blackbox` owns
-  execution in-process; V8 cells and shell ops run as separate worker processes
-  for crash containment (§5). The corpus/execution split (a per-host execution
+- **One process or two — DECIDED: monolith, in-process V8, supervised shell.**
+  `blackbox` owns execution in-process; V8 runs in-process (isolate-contained) and
+  shell ops run as supervised child processes (§5). The corpus/execution split (a per-host execution
   singleton sibling of the corpus daemon) is **not** initial work — the
   `bro-capabilities` trait makes it a swap-the-injected-impl change, so it stays a
   pre-enabled escape hatch. **Triggers** to pull it: corpus-side crashes observed
@@ -466,7 +529,9 @@ The direction above is argued; these forks are not settled:
   SSE `/tail` + HTTP. gRPC is **decided against** (§2). This is a thin, reversible
   pick.
 - **NARF tx vs saga** for nested atoms — the edit-rollback composition question
-  from narf-draft2 §8 (transaction unwind vs compensate-forward).
+  from narf-draft2 §8 (transaction unwind vs compensate-forward). Constraint: the
+  `bro-capabilities` seam must **not bake in one accidentally** — keep the trait
+  signatures neutral so either semantics stays buildable.
 - **Standalone harness scope.** Does the standalone binary stay a maintained
   product (degraded, absent capability impls) or a test/edge artifact only?
 - **Contract granularity beyond three.** Whether any of `bro-protocol`/
@@ -487,9 +552,85 @@ The direction above is argued; these forks are not settled:
   in-daemon).
 - **Extends** [`../surfaces/mcp/mcp-surfaces.md`](../surfaces/mcp/mcp-surfaces.md)
   with the in-process binding as a third consumer of `evaluate_tool_surface`.
-- **Spins out** [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md) — the
-  OS-level sandbox hardening of the V8/shell worker leaves (proposed, forward-
-  looking; the §5 process boundary is the v1 isolation).
+- **Spins out** [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md) —
+  OS-level *scope* sandboxing of shell child processes; a threat-model-change
+  escape hatch (untrusted / unattended agents), **not** v1. V8 runs in-process; the
+  v1 shell isolation is supervision (timeout/cap), not a sandbox.
 - **Hub:** [`bro-harness.md`](./bro-harness.md); control-plane detail in
   [`../fleet-tui/fleet-tui-cockpit.md`](../fleet-tui/fleet-tui-cockpit.md) and
   [`bro-harness-api-robustness.md`](./bro-harness-api-robustness.md).
+
+## 14. Feedback from NARF reread
+
+After rereading the NARF v1 braindump and draft 2 against this boundary note,
+the documents look broadly aligned. The most important clarification is
+ownership:
+
+- **This doc owns topology.** It decides the post-CLI harness/daemon shape:
+  contract-bottom crates, in-process daemon sessions, in-memory
+  `bro-capabilities` calls, singleton fleet ownership, and V8/shell worker
+  isolation.
+- **narf-draft2 owns the authoring substrate.** It keeps the vocabulary and model
+  projection details: `Ref<T>`, `Promise<T>`, `Plan<E>`, `Tx`,
+  `Atom<I,O>`, `Script`; generated JS/TS bindings; explicit sandbox globals;
+  bounded egress; and the config-selected split between NARF composition mode and
+  conventional flat-tool mode.
+- **narf.md owns the breadcrumb map.** It preserves the session examples and the
+  discovery path through Codex code-mode, bro-harness clipboard/promises,
+  bbox_refactor, bbox_slice, and atoms. This boundary doc should not duplicate
+  that material, but it should keep pointing through draft 2 so the breadcrumbs
+  are not lost.
+
+The NARF nuance is therefore not dropped, but it is easy to understate in a
+boundary document. The key phrase to preserve is: **consolidation changes the
+capability seam, not the authoring model**. In consolidated mode, daemon-backed
+code graph/refactor/atom capabilities arrive as injected in-memory traits rather
+than MCP tools; the agent still sees the same high-level authoring concepts
+inside the sandbox.
+
+Given the settled premise that CLI-shaped providers are dead-dead, future edits
+should avoid treating provider subprocesses as a live escape hatch. Subprocesses
+remain important only as **execution leaves**: V8 cells, shell operations, and
+other crash/OOM/FFI-risk work that should not live in the daemon core. If a
+future adapter is ever external, it should justify itself as an isolated leaf
+behind the session/capability API, not as a return to stdin/stdout provider
+driving.
+
+The remaining design pressure points after the reread:
+
+- **Worker leaf contract.** Section 5 says V8/shell run in separate worker
+  processes; draft 2 says `Tx` lifetime is cell-bounded and refs are host-side
+  handles. The bridge needs an explicit contract: how a worker materializes refs,
+  reports produced refs, returns bounded egress, aborts/rolls back uncommitted
+  transactions on crash, and records trace/journal entries for replay.
+- **Tx vs saga stays the real NARF fork.** The topology is decided enough to
+  proceed, but nested atom edit effects still need a semantic choice:
+  shared-worktree transaction unwind vs compensate-forward saga. The
+  `bro-capabilities` seam should not bake in one accidentally.
+- **Flat tools and NARF mode must share policy.** The config-selected model
+  projection in narf-draft2 is correct: lower-tier models keep flat tools,
+  composition-capable models get `narf_exec`. Both projections must be filtered
+  by the same surface evaluator and call-time visibility checks described in
+  section 6.
+- **Ref taxonomy belongs in NARF, but storage placement belongs here.** The
+  concrete namespaces (`ref:slice/*`, `ref:plan/*`, `ref:diag/*`,
+  `ref:atom/*`, `ref:trace/*`) should stay in the NARF design. This boundary
+  doc should only constrain their durability: daemon-side for resume/coordination,
+  worker-local only for ephemeral cell execution.
+- **Crosslink hygiene.** The current chain is acceptable: boundary -> draft2 ->
+  v1. If this doc gains more NARF detail later, add a direct note that v1 is the
+  exploratory breadcrumb record and draft2 is the canon authoring-layer pass, so
+  future readers do not treat section 9 as the full NARF design.
+
+**Resolution (folded into the body).** The seam-not-model phrasing + the
+ownership/crosslink note are now §9's headline; the V8/shell isolation is
+simplified in §5 (V8 in-process, shell supervised — the worker-leaf abstraction
+dropped on review); the "subprocess ≠ provider-driving" tightening is in §3;
+the tx-vs-saga seam-neutrality constraint is in §12; the ref durability constraint
+is in §9. The flat-tools/NARF-mode shared-policy point was already in §6/§9.
+
+Net feedback: the boundary move is the right next step. It removes the accidental
+MCP/provider-CLI transport tax while preserving the NARF core: typed refs instead
+of pasted blobs, promises instead of polling chatter, plans/transactions instead
+of hopeful edits, atoms as polymorphic supervised leaves, and a sandboxed program
+as the agent's serious-work interface.
