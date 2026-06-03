@@ -9,6 +9,7 @@ members = [
     "crates/bro-tools",
     "crates/bro-harness",
     "crates/bro-lsp",
+    "crates/bro-cli",
 ]
 
 [package]
@@ -20,9 +21,7 @@ edition = "2024"
 name = "blackboxd"
 path = "src/main.rs"
 
-[[bin]]
-name = "bro"
-path = "src/cli.rs"
+# `bro` now lives in its own crate (crates/bro-cli) — §7 thin-client extraction.
 
 [[bin]]
 name = "bro-irc"

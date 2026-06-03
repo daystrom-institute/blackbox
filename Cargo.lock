@@ -335,6 +335,7 @@ dependencies = [
  "bro-core",
  "bro-harness",
  "bro-protocol",
+ "bro-tools",
  "chrono",
  "clap",
  "cron",
@@ -378,6 +379,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "toml_edit 0.22.27",
+ "tower",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -426,6 +428,29 @@ dependencies = [
  "bro-core",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bro-cli"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "blackbox",
+ "clap",
+ "crossterm",
+ "dirs",
+ "futures",
+ "futures-util",
+ "ratatui",
+ "ratatui-core",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tui-markdown",
+ "unicode-width 0.2.0",
+ "uuid",
 ]
 
 [[package]]

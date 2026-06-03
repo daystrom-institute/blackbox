@@ -57,7 +57,7 @@ mod orchestration;
 /// `orchestration` stays crate-private; the fleet cockpit links only this.
 pub use orchestration::fleet;
 mod packets;
-mod parser;
+pub mod parser;
 mod path_cache;
 mod pins;
 mod pollers;
