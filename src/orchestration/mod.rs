@@ -14,14 +14,14 @@ pub mod tail;
 pub mod team;
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
@@ -48,6 +48,11 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
 ];
 
 const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
+
+fn harness_context_lock() -> &'static AsyncMutex<()> {
+    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| AsyncMutex::new(()))
+}
 
 // ---------------------------------------------------------------------------
 // Task
@@ -1208,6 +1213,26 @@ pub fn spawn_task(
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
 ) -> Arc<Task> {
+    if matches!(
+        provider,
+        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+    ) {
+        return spawn_harness_in_process_task(
+            task_id,
+            provider,
+            args,
+            session_id,
+            cwd,
+            env_overrides,
+            store_dir,
+            task_store,
+            tail_tx,
+            bro_label,
+            agent_label,
+            system_events,
+        );
+    }
+
     if let Err(err) = task_store.write().reserve_id(&task_id) {
         if let Some(existing) = task_store.read().get(&task_id) {
             return existing;
@@ -1239,6 +1264,225 @@ pub fn spawn_task(
     };
 
     spawn_task_reserved(task_id, params).task
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_harness_in_process_task(
+    task_id: String,
+    provider: Provider,
+    args: Vec<String>,
+    session_id: String,
+    cwd: Option<String>,
+    env_overrides: Option<HashMap<String, String>>,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    bro_label: Option<String>,
+    agent_label: Option<String>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) -> Arc<Task> {
+    let task = spawn_in_process_task(
+        task_id.clone(),
+        provider,
+        session_id,
+        cwd.clone(),
+        store_dir.clone(),
+        task_store.clone(),
+        tail_tx.clone(),
+        bro_label,
+        agent_label,
+        system_events.clone(),
+    );
+    if task.inner.lock().status != TaskStatus::Running {
+        return task;
+    }
+
+    let task_for_run = task.clone();
+    let task_for_events = task.clone();
+    let task_store_for_run = task_store.clone();
+    let store_dir_for_run = store_dir.clone();
+    let tail_for_events = tail_tx.clone();
+    let tail_for_finish = tail_tx.clone();
+    let system_events_for_events = system_events.clone();
+    let system_events_for_finish = system_events.clone();
+    let event_provider = provider;
+    let event_task_id = task_id.clone();
+    let callback = Arc::new(move |evt: Value| {
+        ingest_harness_event(
+            &task_for_events,
+            event_provider,
+            evt,
+            &tail_for_events,
+            &event_task_id,
+            system_events_for_events.clone(),
+        );
+    });
+
+    tokio::spawn(async move {
+        let result = run_harness_in_process(args, cwd, env_overrides, callback).await;
+        let (mut status, stderr) = match result {
+            Ok(()) => (TaskStatus::Completed, None),
+            Err(err) => (TaskStatus::Failed, Some(format!("{err:#}\n"))),
+        };
+        {
+            let inner = task_for_run.inner.lock();
+            if matches!(inner.status, TaskStatus::Failed | TaskStatus::Cancelled) {
+                status = inner.status;
+            }
+        }
+        finish_in_process_task(
+            &task_for_run,
+            status,
+            None,
+            stderr,
+            task_store_for_run.as_ref(),
+            &store_dir_for_run,
+            &tail_for_finish,
+            system_events_for_finish,
+        );
+    });
+
+    task
+}
+
+fn ingest_harness_event(
+    task: &Task,
+    provider: Provider,
+    evt: Value,
+    tail_tx: &tokio::sync::broadcast::Sender<tail::TailEvent>,
+    task_id: &str,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) {
+    let snippet_to_emit = {
+        let mut inner = task.inner.lock();
+        inner.events.push(evt.clone());
+        let mut sink = EventSink {
+            last_assistant_message: inner.last_assistant_message.clone(),
+            usage: inner.usage.clone(),
+            cost_usd: inner.cost_usd,
+            num_turns: inner.num_turns,
+            session_id: if inner.session_id != "pending" {
+                Some(inner.session_id.clone())
+            } else {
+                None
+            },
+        };
+        provider.parse_event(&evt, &mut sink);
+        let emitted_session_id = sink.session_id.clone();
+        let mut accepted = true;
+        if let Some(sid) = emitted_session_id {
+            if inner.session_id == "pending" {
+                inner.session_id = sid;
+            } else if inner.session_id != sid {
+                reject_forked_session(&mut inner, &sid);
+                accepted = false;
+            }
+        }
+        if accepted {
+            apply_cwd_updates_from_event(&mut inner, &evt);
+            inner.supervision.observe_event(&evt, &sink, now_ms());
+            apply_sink_updates(&mut inner, sink);
+        }
+        accepted
+            .then(|| {
+                inner.last_assistant_message.as_ref().map(|msg| {
+                    const TAIL_CHARS: usize = 160;
+                    let count = msg.chars().count();
+                    if count > TAIL_CHARS {
+                        let skip = count - TAIL_CHARS;
+                        let tail: String = msg.chars().skip(skip).collect();
+                        format!("…{tail}")
+                    } else {
+                        msg.clone()
+                    }
+                })
+            })
+            .flatten()
+    };
+
+    if let Some(snippet) = snippet_to_emit {
+        let _ = tail_tx.send(tail::TailEvent::TaskProgress {
+            task_id: task_id.to_string(),
+            activity: snippet.clone(),
+        });
+        if let Some(ref hub) = system_events {
+            emit_task_progress_event(hub, task_id.to_string(), snippet);
+        }
+    }
+}
+
+async fn run_harness_in_process(
+    args: Vec<String>,
+    cwd: Option<String>,
+    env_overrides: Option<HashMap<String, String>>,
+    callback: bro_harness::emit::EventCallback,
+) -> anyhow::Result<()> {
+    use clap::Parser;
+
+    let _guard = harness_context_lock().lock().await;
+    let previous_cwd = std::env::current_dir().ok();
+    if let Some(cwd) = cwd.as_deref() {
+        std::env::set_current_dir(cwd)?;
+    }
+
+    let mut keys: Vec<String> = BLACKBOX_SERVICE_ENV_VARS
+        .iter()
+        .map(|key| key.to_string())
+        .collect();
+    keys.extend([
+        "PATH".to_string(),
+        "NO_COLOR".to_string(),
+        "TERM".to_string(),
+        "FORCE_COLOR".to_string(),
+    ]);
+    if let Some(overrides) = &env_overrides {
+        keys.extend(overrides.keys().cloned());
+    }
+    keys.sort();
+    keys.dedup();
+    let saved: Vec<(String, Option<std::ffi::OsString>)> = keys
+        .iter()
+        .map(|key| (key.clone(), std::env::var_os(key)))
+        .collect();
+
+    let path_env = providers::dispatch_path_env();
+    // SAFETY: all in-process harness runs take harness_context_lock, serializing
+    // process-wide cwd/env mutation until transports accept explicit config.
+    unsafe {
+        std::env::set_var("PATH", path_env);
+        std::env::set_var("NO_COLOR", "1");
+        std::env::set_var("TERM", "dumb");
+        std::env::set_var("FORCE_COLOR", "0");
+        for key in BLACKBOX_SERVICE_ENV_VARS {
+            std::env::remove_var(key);
+        }
+        if let Some(overrides) = &env_overrides {
+            for (key, value) in overrides {
+                std::env::set_var(key, value);
+            }
+        }
+    }
+
+    let cli = bro_harness::cli::Cli::try_parse_from(
+        std::iter::once("bro-harness".to_string()).chain(args),
+    )?;
+    let result = bro_harness::agent_loop::run_with_event_callback(cli, callback).await;
+
+    // SAFETY: still under harness_context_lock; restore the process context this
+    // run borrowed for the env-driven transport implementation.
+    unsafe {
+        for (key, value) in saved {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+    if let Some(previous_cwd) = previous_cwd {
+        let _ = std::env::set_current_dir(previous_cwd);
+    }
+
+    result
 }
 
 /// Spawn a task in **persistent bidirectional mode** (fleet-tui.md item 6): the
