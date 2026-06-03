@@ -12,11 +12,14 @@ topic:
 
 # The harness–daemon boundary: in-process consolidation
 
-> **Status.** This is the synthesis of a design jam, not a ratified plan. The
-> *direction* (API-native consolidation, harness-as-crate, a shared contract
-> bottom, singleton execution) is argued as the target; the **Open decisions**
-> section marks the forks that are genuinely undecided. Verify against code
-> before treating any of it as current behavior.
+> **Status.** This was the synthesis of a design jam; it is now **partially
+> implemented** on `beta/blackbox-v2`. The *direction* (API-native
+> consolidation, harness-as-crate, a shared contract bottom, singleton
+> execution) is the target; most of it is built and tested, with one large
+> piece (the §7 thin-client crate decoupling) deliberately staged. See
+> **§15 Implementation status** for what is live vs. remaining, tied to
+> commits. The **Open decisions** section marks forks that were genuinely
+> undecided. Verify against code before treating any of it as current behavior.
 
 ## 0. Thesis
 
@@ -632,3 +635,89 @@ MCP/provider-CLI transport tax while preserving the NARF core: typed refs instea
 of pasted blobs, promises instead of polling chatter, plans/transactions instead
 of hopeful edits, atoms as polymorphic supervised leaves, and a sandboxed program
 as the agent's serious-work interface.
+
+## 15. Implementation status (beta/blackbox-v2)
+
+This section is the running ledger of what the design has actually become in
+code on `beta/blackbox-v2`. It supersedes the aspirational tense elsewhere in
+the doc for the items listed; the rest remains target-state. Verify against code
+before relying on any line here.
+
+### Live and tested
+
+- **Contract bottom (§2).** `bro-core` / `bro-protocol` / `bro-capabilities`
+  exist as the dependency-inverted bottom; the compile DAG is acyclic and
+  `bro-harness` cannot depend on `blackbox`. Earlier the three crates were inert
+  (no impls, no callers); they are now load-bearing.
+- **Capabilities (§2/§6/§9).** `CorpusCapability`, `AtomCapability`, and
+  `RefactorCapability` are each wired end-to-end: the daemon implements them over
+  its in-memory stores and installs them into the harness at startup; the harness
+  exposes them as in-process `Tool`s (direct trait dispatch, no MCP round-trip).
+  Standalone harness leaves the slots empty → fail-closed by absence.
+  `RefactorCapability` follows the §9 ref-handle model (plan stays host-side,
+  only a handle + preview cross). Commits: "Wire {Corpus,Atom,Refactor}Capability
+  through the contract bottom".
+- **Control plane / `bro-protocol` (§8/§11).** `bro_protocol::SessionCommand` is
+  the live control-plane contract: `apply_session_command` translates it to the
+  harness's internal `SessionInput`, and steer/interrupt route through it. Every
+  variant maps to a genuinely-handled path (UserTurn/Interrupt/SetModel/Compact).
+- **Status plane (§7, partial).** `bro_protocol::TaskSnapshot`/`TaskStatus` now
+  have a real producer (daemon `task_status_json` emits a typed `snapshot` field
+  via `protocol_task_snapshot`) and consumer (the fleet poller deserializes it).
+  Additive, so other `/control/status` readers are unaffected.
+- **§5 prerequisite.** `panic = "unwind"` is pinned in `profile.release` with a
+  comment; the non-poisoning-lock half was already satisfied by `parking_lot`.
+  (In-process V8 and supervised-shell isolation themselves are NOT built — no V8
+  yet; that part of §5 remains target-state.)
+- **§6 surface governance.** The dispatch path is now a third consumer of
+  `evaluate_tool_surface`: brofiles carry a `surface` selector, and
+  `surface::dispatch_surface_filters` folds the verdict into the dispatch filter
+  plane (disallow-wins) for atom + exec + resume + broadcast dispatch. This
+  reverses the former "surface is MCP-endpoint-only" orthogonality for the
+  in-process case (the old note in `progress.rs` is updated). No surface packet
+  installed → passthrough → no-op.
+- **§3 identity env.** Per-session identity (auth token, base URL, account home,
+  transport kind, model) flows via a tokio task-local (`transport::with_session_env`
+  / `session_var`), NOT process-global env. Transports resolve identity through
+  `session_var` (task-local → env fallback for the standalone binary). Fixes a
+  real credential-leak-into-bash-children bug. Live-validated against the real GLM
+  endpoint (gated test `live_glm_turn_resolves_creds_from_task_local`).
+- **§3 concurrency.** `harness_context_lock` (held across the whole session,
+  serializing in-process sessions to one at a time) is **dissolved**: cwd via a
+  `--cwd` flag → `ToolCx.root`, PATH augmented once at startup, display vars set
+  per shell child, and daemon service env scrubbed from children via
+  `bro_tools::shell::with_spawn_scrub`. Concurrent in-process sessions no longer
+  collide.
+- **/irc → /control (governance cleanup).** The generic `bro_*` control plane was
+  re-homed from the IRC-named routes to a neutral `/control/*` namespace that the
+  fleet client and the bro-irc sidecar both consume; `/irc/*` is retained as a
+  back-compat alias. (Not a numbered section here, but it removed the "fleet rides
+  the IRC interface" smell and is the transport the fleet TUI uses.)
+
+The whole stack was exercised live through the real fleet TUI (tmux): a dispatch
+flows TUI → `/control/exec` → in-process harness (task-local identity, `--cwd`,
+spawn-scrub, no lock) → a real brodex/GLM agent → typed `TaskSnapshot` → fleet
+roster render.
+
+### Remaining
+
+- **§7 thin-client crate (stage 2).** Done so far: `bro` is split into its own
+  crate (`bro-cli`), establishing the client/daemon boundary; the status DTOs are
+  wired. NOT done: cutting `bro-cli`'s dependency on `blackbox` so it links only
+  `bro-protocol` + `bro-core`. The long pole is relocating `Provider` to the
+  contract bottom — it has `impl Provider` blocks across ~6 files
+  (`providers.rs`, `events.rs`, `session.rs`, `exec_args.rs`, `mcp_args.rs`) that
+  would all convert from inherent to trait impls, plus ~12 heavy-method call-site
+  files, plus the `FleetOrchestrator` engine (≈50 call sites), the view DTOs,
+  `config::load`, and `parser` all needing relocation. This is a multi-stage,
+  ~50-file refactor — a durable-bro + reviewer effort, not a single sprint.
+- **§5 in-process V8 + supervised shell (execution isolation).** Not started;
+  no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
+  per-child env hook but not timeout/cap supervision.
+- **NARF substrate (§9).** Authoring layer (`Ref`/`Promise`/`Plan`/`Tx`/`Atom`/
+  `Script`, JS/TS bindings) is unbuilt; the capability seam it would ride is in
+  place. (A peer `Design NARF capability library` commit on this branch is design,
+  not implementation.)
+- **§4 deletion ledger.** The CLI-hole providers / tmux / opencode scrub landed
+  earlier on the branch; verify no live CLI-shaped dispatch path remains before
+  treating §4 as fully closed.
