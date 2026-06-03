@@ -105,7 +105,6 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
     }
     load_system_memory_catalog(&cfg)?;
     configure_dispatch_mcp_env(&cfg);
-    sweep_stale_gemini_policies();
 
     let th = Threads::open(&th_path)?;
     tracing::info!("Thread store: {}", th_path.display());
@@ -270,14 +269,6 @@ fn load_system_memory_catalog(cfg: &config::Config) -> anyhow::Result<()> {
         cfg.paths.defaults_memories_dir.display()
     );
     Ok(())
-}
-
-fn sweep_stale_gemini_policies() {
-    match orchestration::mcp::sweep_stale_gemini_policies(24) {
-        Ok(n) if n > 0 => tracing::info!("swept {n} stale gemini policy file(s)"),
-        Ok(_) => {}
-        Err(e) => tracing::debug!("gemini policy sweep: {e:#}"),
-    }
 }
 
 fn backfill_artifact_hashes(artifacts_store: &artifacts::ArtifactCatalog) {

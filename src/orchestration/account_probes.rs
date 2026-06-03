@@ -18,7 +18,6 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::header::HeaderMap;
 use serde_json::Value;
 
 use crate::orchestration::allocator::{
@@ -33,7 +32,6 @@ const COOLDOWN_OVERLOADED_SECS: u64 = 60;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 const ZAI_QUOTA_URL: &str = "https://api.z.ai/api/monitor/usage/quota/limit";
-const CLAUDE_MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const DEEPSEEK_BALANCE_URL: &str = "https://api.deepseek.com/user/balance";
 
@@ -160,29 +158,6 @@ async fn probe_glm(client: &reqwest::Client, home: &Path, now: u64) -> Vec<(Stri
         }
     }
     out
-}
-
-// ── Claude: rate-limit-headers ──────────────────────────────────────────────
-
-/// Claude Code OAuth access token from `~/.claude/.credentials.json`.
-fn read_claude_oauth_token(home: &Path) -> Option<String> {
-    let v: Value = serde_json::from_str(
-        &std::fs::read_to_string(home.join(".claude").join(".credentials.json")).ok()?,
-    )
-    .ok()?;
-    v["claudeAiOauth"]["accessToken"]
-        .as_str()
-        .map(str::to_string)
-}
-
-fn header_fraction(headers: &HeaderMap, name: &str) -> Option<f64> {
-    headers
-        .get(name)?
-        .to_str()
-        .ok()?
-        .parse::<f64>()
-        .ok()
-        .map(|v| v.clamp(0.0, 1.0))
 }
 
 // ── Brodex: ChatGPT usage-endpoint ──────────────────────────────────────────

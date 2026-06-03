@@ -30,9 +30,7 @@ use tokio_util::sync::CancellationToken;
 use crate::orchestration::{
     self as orch, AmbientContext,
     brofile::{enforce_provider_defaults, resolve_brofile, resolve_provider_env},
-    mcp::{
-        McpFilters, McpStore, global_store_path, project_store_path, resolve_effective,
-    },
+    mcp::{McpFilters, McpStore, global_store_path, project_store_path, resolve_effective},
     providers::{ExecOpts, Provider},
     team::{Team, TeamMember, load_all_teams},
 };
@@ -660,7 +658,7 @@ struct DispatchFilters {
 fn build_filter_args(
     provider: Provider,
     project_dir: Option<&str>,
-    task_id: &str,
+    _task_id: &str,
     extra: Option<&McpFilters>,
 ) -> DispatchFilters {
     let global = global_store_path()

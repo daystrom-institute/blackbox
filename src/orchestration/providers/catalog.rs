@@ -283,36 +283,3 @@ static VIBEBH_EFFORTS: &[EffortInfo] = &[
         default: true,
     },
 ];
-
-static GEMINI_MODELS: &[ModelInfo] = &[
-    ModelInfo {
-        id: "gemini-3.1-pro-preview",
-        description: "Gemini 3.1 Pro, flagship reasoning model (preview)",
-        default: true,
-    },
-    ModelInfo {
-        id: "gemini-3-flash-preview",
-        description: "Gemini 3 Flash, fast generalist (preview)",
-        default: false,
-    },
-    ModelInfo {
-        id: "gemini-3.1-flash-lite-preview",
-        description: "Gemini 3.1 Flash-Lite, lowest cost (preview)",
-        default: false,
-    },
-    ModelInfo {
-        id: "gemini-2.5-pro",
-        description: "Gemini 2.5 Pro, prior-gen flagship (GA)",
-        default: false,
-    },
-    ModelInfo {
-        id: "gemini-2.5-flash",
-        description: "Gemini 2.5 Flash, prior-gen fast (GA)",
-        default: false,
-    },
-    ModelInfo {
-        id: "gemini-2.5-flash-lite",
-        description: "Gemini 2.5 Flash-Lite, prior-gen low-cost (GA)",
-        default: false,
-    },
-];

@@ -137,7 +137,7 @@ pub(crate) fn resolve_dispatch_filters(
     provider: Provider,
     project_dir: Option<&str>,
     allow_recursion: bool,
-    task_id: &str,
+    _task_id: &str,
     extra: Option<&orchestration::mcp::McpFilters>,
 ) -> Result<DispatchFilters, String> {
     let global = orchestration::mcp::global_store_path()

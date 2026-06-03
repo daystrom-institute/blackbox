@@ -12,12 +12,7 @@ pub use catalog::{EffortInfo, ModelInfo};
 pub use events::{Disruption, EventSink, Usage};
 pub use exec_args::{ExecOpts, dispatch_path_env, exec_opts_with_provider_defaults, resolve_bin};
 #[cfg(test)]
-use mcp_args::{MatchState, copilot_format_mcp_tool, format_toml_string_array};
-#[cfg(test)]
-use session::{
-    discover_gemini_session_in, resolve_claude_session_cwd_in, resolve_codex_session_cwd_in,
-    resolve_gemini_session_cwd_in,
-};
+use mcp_args::MatchState;
 
 // ---------------------------------------------------------------------------
 // Provider enum
@@ -150,10 +145,7 @@ impl Provider {
     pub fn supports_resume(&self) -> bool {
         matches!(
             self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Brodex
-                | Provider::VibeBh
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
         )
     }
 

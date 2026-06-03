@@ -97,10 +97,7 @@ impl Provider {
     pub fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,
-            Provider::Glm
-                | Provider::Deepseek
-                | Provider::Brodex
-                | Provider::VibeBh
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
         )
     }
 
@@ -118,10 +115,7 @@ impl Provider {
             return Vec::new();
         }
         match self {
-            Provider::Glm
-            | Provider::Deepseek
-            | Provider::Brodex
-            | Provider::VibeBh => {
+            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
             Provider::Workflow => Vec::new(),
@@ -186,71 +180,6 @@ fn to_json_object(m: &BTreeMap<String, String>) -> Value {
     )
 }
 
-#[cfg(test)]
-fn emit_codex_filter_overrides(args: &mut Vec<String>, patterns: &[String], key: &str) {
-    if patterns.is_empty() {
-        return;
-    }
-    let groups = codex_group_patterns_by_server(patterns);
-    if groups.is_empty() {
-        tracing::warn!(target: "blackbox::filter",
-            "codex {key} patterns yielded zero matches: {patterns:?}");
-        return;
-    }
-    for (server, tools) in groups {
-        let toml_array = format_toml_string_array(&tools);
-        args.push("-c".into());
-        args.push(format!("mcp_servers.{server}.{key}={toml_array}"));
-    }
-}
-
-#[cfg(test)]
-fn codex_group_patterns_by_server(patterns: &[String]) -> Vec<(String, Vec<String>)> {
-    let universe: Vec<&str> = crate::tool_docs::all_tool_names();
-    let mut by_server: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for p in patterns.iter().map(|p| mcp::normalize_filter_pattern(p)) {
-        let Some(tool) = mcp::McpToolRef::parse(&p) else {
-            tracing::debug!(target: "blackbox::filter",
-                "codex skipping non-MCP pattern (filter scope is mcp_servers.*): {p}");
-            continue;
-        };
-        let group = by_server.entry(tool.server.clone()).or_default();
-        let names: Vec<String> = if tool.is_glob() {
-            if tool.is_blackbox() {
-                let expanded = mcp::expand_pattern(&tool.pattern, &universe);
-                if expanded.is_empty() {
-                    tracing::warn!(target: "blackbox::filter",
-                        "codex blackbox glob matched zero tools (typo or stale name?): {p}");
-                    continue;
-                }
-                expanded
-            } else {
-                tracing::warn!(target: "blackbox::filter",
-                    "codex glob on non-blackbox server (no tool universe to expand against): {p}");
-                continue;
-            }
-        } else {
-            vec![tool.pattern.clone()]
-        };
-        for t in names {
-            if !group.contains(&t) {
-                group.push(t);
-            }
-        }
-    }
-    by_server
-        .into_iter()
-        .filter(|(_, v)| !v.is_empty())
-        .collect()
-}
-
-#[cfg(test)]
-pub(super) fn copilot_format_mcp_tool(full: &str) -> Option<String> {
-    let rest = full.strip_prefix("mcp__")?;
-    let (server, tool) = rest.split_once("__")?;
-    Some(format!("{server}({tool})"))
-}
-
 fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
     let universe: Vec<&str> = crate::tool_docs::all_tool_names();
     let mut out = Vec::new();
@@ -271,40 +200,6 @@ fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
             }
         }
     }
-    out
-}
-
-#[cfg(test)]
-pub(super) fn format_toml_string_array(items: &[String]) -> String {
-    format_toml_string_array_impl(items)
-}
-
-#[cfg(test)]
-fn format_toml_string_array_impl(items: &[String]) -> String {
-    let quoted: Vec<String> = items.iter().map(|s| toml_basic_string(s)).collect();
-    format!("[{}]", quoted.join(","))
-}
-
-#[cfg(test)]
-fn toml_basic_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\t' => out.push_str("\\t"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\x08' => out.push_str("\\b"),
-            '\x0c' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 || (c as u32) == 0x7f => {
-                out.push_str(&format!("\\u{:04X}", c as u32));
-            }
-            c => out.push(c),
-        }
-    }
-    out.push('"');
     out
 }
 
