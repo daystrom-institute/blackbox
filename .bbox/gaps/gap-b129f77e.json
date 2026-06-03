@@ -1,0 +1,21 @@
+{
+  "id": "gap-b129f77e",
+  "title": "No runbook for an isolated throwaway blackboxd for live validation",
+  "gap_kind": "docs_runbook",
+  "domain": "interactive/dev-daemon-validation",
+  "wanted_capability": "A documented recipe for spinning up a lightweight, isolated blackboxd instance for live validation (HTTP routes, fleet TUI, dispatch) that does NOT touch the prod daemon (127.0.0.1:7264) or its state, and skips heavy startup indexing/edge-rebuild. The host-setup memory covers the managed prod/dev launchd daemons but not an ad-hoc throwaway for validation; an interactive agent validating route/dispatch/TUI changes currently reverse-engineers the env-var set from src/config.rs each time.",
+  "missing_primitive": "An isolated-daemon validation runbook: the env knobs (BBOX_PORT, BLACKBOX_CONFIG, BLACKBOX_STATE_DIR, TRANSCRIPT_SEARCH_ROOTS, BLACKBOX_KNOWLEDGE_PATH, BRO_HOME, BLACKBOX_REINDEX_INTERVAL_SECS) + a minimal config.toml + a non-prod port, plus teardown.",
+  "fallback_used": "Derived the incantation by reading src/config.rs, then ran blackboxd on BBOX_PORT=7299 with an isolated BLACKBOX_STATE_DIR/roots/knowledge/BRO_HOME, a 2-line config.toml, and BLACKBOX_REINDEX_INTERVAL_SECS=86400 to skip indexing; validated /control routes + the fleet TUI against it, then killed it and confirmed 7264 untouched.",
+  "evidence": [
+    "interactive retrospective",
+    "file:prompts/RETRO_INTERACTIVE.md",
+    "thread-7cba3fc5"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "docs_runbook/interactive/isolated-dev-daemon",
+  "resolution": "unresolved",
+  "thread_id": "thread-7cba3fc5",
+  "created_at": "2026-06-03T21:05:32Z",
+  "updated_at": "2026-06-03T21:05:32Z"
+}
