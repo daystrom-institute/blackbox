@@ -11,6 +11,15 @@ brief: "Desired UX and architecture for running multiple `bro fleet` TUIs on the
 
 # Fleet TUI — multi-instance coherent view (backlog)
 
+> **Superseded in part (2026-06-02).** The process-placement decision below — a
+> per-store local coordinator distinct from `blackboxd` — is superseded by
+> [`../bro-harness/harness-daemon-boundary.md`](../bro-harness/harness-daemon-boundary.md).
+> With the harness/daemon boundary relaxed, the fleet coordinator collapses into
+> the singleton daemon (TUI = thin view over `bro-protocol`, agents = bros). The
+> **seq-ordered command protocol** (§5–§6) and the UX requirements are kept (the
+> protocol now lives in `bro-protocol`). Read this doc for the protocol + UX; read
+> the boundary doc for the owning process.
+
 ## 1. Problem
 
 `bro fleet` is now useful enough that an operator can plausibly open it from two

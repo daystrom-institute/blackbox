@@ -95,6 +95,45 @@ deterministic code, and what the script's tool-calling surface looks like.**
   (`agent()`), each a full model call with its own context. The script orchestrates
   agents, not raw tools. Higher latency per leaf but richer reasoning per call.
 
+This divergence is usually read as a single spectrum (fine ↔ coarse) and a single
+open question (tradeoff or maturity gradient?). The atoms/NARF analysis below
+argues it is better modeled as a **separate, orthogonal dimension** — *leaf
+grain* — with a third value that subsumes both endpoints.
+
+### The orthogonal dimension: leaf grain
+
+The convergence table characterizes runtimes by their **composition substrate**
+(is there a programmable runtime — V8, Bun, none). But *what the script composes*
+— the **leaf grain** — is independent of the substrate. You could run a V8
+substrate over subagent leaves, or a Bun substrate over raw-tool leaves. The two
+reference harnesses happen to pair one substrate with one grain, which hides the
+independence.
+
+Three leaf grains, the third dominating:
+
+| Leaf grain | What the script composes | Seen in |
+|---|---|---|
+| **tool** | individual typed tool functions | Codex code-mode |
+| **subagent** | `agent()` spawns, one model call each | Claude Code Workflows |
+| **capability** (meta-grain) | a named, versioned, effect-declared contract whose *backend* may be a raw tool, a subagent, an ensemble, or an external adapter | bro-harness / NARF (proposed) |
+
+The **capability** grain is not a point on the tool↔subagent line — it is a
+*meta-grain* whose backend can be either, plus ensemble, plus external. In
+blackbox this is the **atom** (`AtomImplementation::{Deterministic, Adapter,
+Profile, Workflow}`, `../../src/orchestration/atoms/types.rs:136`): one call site,
+backend-polymorphic, with grain chosen by the runtime and hidden behind the
+manifest contract. A capability-grain runtime is strictly more expressive than
+either reference harness, because its leaf is the union of (raw tool ∪ subagent ∪
+ensemble ∪ external adapter). It also makes the leaf **self-hosting**: a proven
+composition distills into a new capability (`AtomProvenance::Distilled`,
+`types.rs:850`) that becomes a leaf in future scripts — bounded recursion, gated
+by composition policy + ancestor depth/budget (`../../src/tools/atoms/composition.rs:62-88`).
+
+> The full canon — capability-grain leaves, the deterministic↔bro↔ensemble
+> continuum, supervision-in-the-manifest, and the self-hosting distill→reuse loop
+> — lives in [narf-draft2.md](narf-draft2.md) (§2–§3). NARF is the concrete
+> bro-harness answer to this axis's last open invariant.
+
 ### Boundary case: bro-harness clipboard (not a metatool)
 
 bro-harness's clipboard achieves the same *goal* (keep intermediate results out of
@@ -123,13 +162,32 @@ model's context window. They diverge on *how*:
 <!-- TODO(synthesis): -->
 - Is "JS as the universal composition language" a genuine cross-harness invariant,
   or an accident of both Codex and Claude Code using JS/TypeScript internally?
-- Does the fine-grain (every-tool-as-JS-function) vs coarse-grain
-  (agent-as-leaf-call) split represent a fundamental tradeoff, or a maturity
-  gradient (code-mode → workflows over time)?
+- ~~Does the fine-grain vs coarse-grain split represent a fundamental tradeoff or a
+  maturity gradient?~~ **Reframed (2026-06-02):** the split is better modeled as
+  the orthogonal *leaf-grain* dimension above, not a single spectrum — and the
+  apparent dichotomy dissolves once **capability** (atom) is admitted as a third,
+  backend-polymorphic grain. The remaining tradeoff is real but narrower: a
+  capability leaf must declare its grain (cost, effects, supervision) so the
+  runtime can schedule it. See [narf-draft2.md](narf-draft2.md) §2.
 - Does the `code_mode_only` radical-gating pattern (ONLY exec/wait as direct tools)
-  have a Claude Workflows equivalent?
-- Is there a bro-harness path from ref-chaining to a scriptable composition
-  runtime, or does the harness's daemon-independence invariant preclude it?
+  have a Claude Workflows equivalent? *(NARF proposes adopting it as the default
+  primary-interface mode — `narf_exec`/`narf_wait` with all capability behind the
+  sandbox; see [narf-draft2.md](narf-draft2.md) §5.)*
+- ~~Is there a bro-harness path from ref-chaining to a scriptable composition
+  runtime, or does daemon-independence preclude it?~~ **Answered (proposed,
+  2026-06-02):** yes — NARF. The composition substrate (V8 + refs + promises +
+  local-file tx) stays harness-local and daemon-free; capability leaves (atoms,
+  code graph, refactor backend) arrive over the existing MCP injection seam and
+  fail closed when the daemon is absent. Daemon-independence is preserved, not
+  precluded. See [narf-draft2.md](narf-draft2.md) §6.
+
+## See also
+
+- [narf-draft2.md](narf-draft2.md) — the NARF canon: capability-grain leaves,
+  bounded-recursion self-hosting, and the authoring layer as primary harness
+  interface. The forward synthesis this axis feeds.
+- [narf.md](narf.md) — the v1 NARF braindump (breadcrumb map + exploratory
+  script sketches).
 
 ## Discovery provenance
 
