@@ -63,32 +63,76 @@ fn harness_controls(
     CONTROLS.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-pub fn steer_harness_task(task_id: &str, prompt: String) -> Result<(), String> {
+/// Translate a `bro_protocol::SessionCommand` — the daemon↔client control-plane
+/// contract (harness-daemon-boundary.md §8/§11) — into the harness's internal
+/// `SessionInput` and deliver it to a live in-process session. The protocol enum
+/// is the shared schema; this is the one place it crosses into harness-local
+/// types. Every variant maps to a genuinely-handled harness path (no acked
+/// no-ops): UserTurn→User, Interrupt→interrupt control, SetModel→set_model
+/// control, Compact→the `/compact` in-stream slash command.
+pub fn apply_session_command(
+    task_id: &str,
+    command: bro_protocol::SessionCommand,
+) -> Result<(), String> {
+    use bro_harness::agent_loop::SessionInput;
+    use bro_protocol::SessionCommand;
+
     let tx = harness_controls()
         .read()
         .get(task_id)
         .cloned()
         .ok_or_else(|| format!("task {task_id} has no live in-process harness control channel"))?;
-    tx.send(bro_harness::agent_loop::SessionInput::User(prompt))
+
+    let input = match command {
+        SessionCommand::UserTurn { text } => SessionInput::User(text),
+        SessionCommand::Interrupt => SessionInput::Control {
+            subtype: "interrupt".to_string(),
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+            raw: serde_json::json!({"type": "control_request", "subtype": "interrupt"}),
+        },
+        SessionCommand::SetModel { model } => SessionInput::Control {
+            subtype: "set_model".to_string(),
+            request_id: Some(uuid::Uuid::new_v4().to_string()),
+            raw: serde_json::json!({
+                "type": "control_request",
+                "subtype": "set_model",
+                "model": model,
+            }),
+        },
+        // `/compact` is an in-stream slash command, not a control_request.
+        SessionCommand::Compact => SessionInput::User("/compact".to_string()),
+    };
+
+    tx.send(input)
         .map_err(|_| format!("task {task_id} harness control channel is closed"))
 }
 
+pub fn steer_harness_task(task_id: &str, prompt: String) -> Result<(), String> {
+    apply_session_command(task_id, bro_protocol::SessionCommand::UserTurn { text: prompt })
+}
+
 pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result<(), String> {
-    let tx = harness_controls()
-        .read()
-        .get(task_id)
-        .cloned()
-        .ok_or_else(|| format!("task {task_id} has no live in-process harness control channel"))?;
-    let mut raw = serde_json::json!({"type": "control_request", "subtype": "interrupt"});
-    if let Some(prompt) = redirect {
-        raw["prompt"] = serde_json::json!(prompt);
+    match redirect {
+        // Interrupt-and-redirect (§8 op 3): the prompt rides the interrupt
+        // control's raw so the harness dequeues it immediately on cancel. This
+        // payload shape has no SessionCommand variant, so it stays inline.
+        Some(prompt) => {
+            let tx = harness_controls().read().get(task_id).cloned().ok_or_else(|| {
+                format!("task {task_id} has no live in-process harness control channel")
+            })?;
+            tx.send(bro_harness::agent_loop::SessionInput::Control {
+                subtype: "interrupt".to_string(),
+                request_id: Some(uuid::Uuid::new_v4().to_string()),
+                raw: serde_json::json!({
+                    "type": "control_request",
+                    "subtype": "interrupt",
+                    "prompt": prompt,
+                }),
+            })
+            .map_err(|_| format!("task {task_id} harness control channel is closed"))
+        }
+        None => apply_session_command(task_id, bro_protocol::SessionCommand::Interrupt),
     }
-    tx.send(bro_harness::agent_loop::SessionInput::Control {
-        subtype: "interrupt".to_string(),
-        request_id: Some(uuid::Uuid::new_v4().to_string()),
-        raw,
-    })
-    .map_err(|_| format!("task {task_id} harness control channel is closed"))
 }
 
 // ---------------------------------------------------------------------------
@@ -2549,6 +2593,59 @@ mod tests {
     // is single-threaded so this can't deadlock the runtime.
     #![allow(clippy::await_holding_lock)]
     use super::*;
+
+    #[test]
+    fn apply_session_command_maps_protocol_variants_to_harness_input() {
+        use bro_harness::agent_loop::{SessionInput, session_input_channel};
+        use bro_protocol::SessionCommand;
+
+        let task_id = "test-session-command-mapping";
+        let (tx, mut rx) = session_input_channel();
+        harness_controls().write().insert(task_id.to_string(), tx);
+
+        // UserTurn -> User
+        apply_session_command(task_id, SessionCommand::UserTurn { text: "hi".into() }).unwrap();
+        match rx.try_recv().unwrap() {
+            SessionInput::User(t) => assert_eq!(t, "hi"),
+            other => panic!("expected User, got {other:?}"),
+        }
+
+        // Interrupt -> interrupt control
+        apply_session_command(task_id, SessionCommand::Interrupt).unwrap();
+        match rx.try_recv().unwrap() {
+            SessionInput::Control { subtype, .. } => assert_eq!(subtype, "interrupt"),
+            other => panic!("expected interrupt control, got {other:?}"),
+        }
+
+        // SetModel -> set_model control carrying the model in raw
+        apply_session_command(task_id, SessionCommand::SetModel { model: "m2".into() }).unwrap();
+        match rx.try_recv().unwrap() {
+            SessionInput::Control { subtype, raw, .. } => {
+                assert_eq!(subtype, "set_model");
+                assert_eq!(raw["model"], "m2");
+            }
+            other => panic!("expected set_model control, got {other:?}"),
+        }
+
+        // Compact -> the /compact in-stream slash command (a genuine path, not a no-op)
+        apply_session_command(task_id, SessionCommand::Compact).unwrap();
+        match rx.try_recv().unwrap() {
+            SessionInput::User(t) => assert_eq!(t, "/compact"),
+            other => panic!("expected /compact user input, got {other:?}"),
+        }
+
+        harness_controls().write().remove(task_id);
+    }
+
+    #[test]
+    fn apply_session_command_errors_without_live_channel() {
+        let err = apply_session_command(
+            "no-such-live-task",
+            bro_protocol::SessionCommand::Interrupt,
+        )
+        .unwrap_err();
+        assert!(err.contains("no live in-process harness control channel"));
+    }
 
     #[test]
     fn test_task_status_is_terminal() {
