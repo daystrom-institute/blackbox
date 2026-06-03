@@ -179,6 +179,16 @@ filetime = "0.2"
 [profile.release]
 opt-level = 3
 lto = "thin"
+# In-process session isolation prerequisite (harness-daemon-boundary.md §5):
+# the daemon runs API-native sessions as tokio tasks, and a logic panic in one
+# session's turn must be caught at the task boundary so the daemon and sibling
+# sessions survive. That requires unwinding panics (not abort) AND non-poisoning
+# locks on shared corpus/atom state — the latter is satisfied by parking_lot
+# (see src/server/state.rs). `unwind` is the toolchain default, but it is
+# load-bearing here, so it is pinned explicitly: do NOT switch this to "abort"
+# without first relocating execution into a worker boundary (§12 corpus/execution
+# split), or a single session panic will take down the whole daemon.
+panic = "unwind"
 
 [lib]
 name = "blackbox"
