@@ -1176,9 +1176,16 @@ impl BlackboxServer {
                 effective_context,
             );
             // Per-member combined extra: brofile.filters + broadcast-level
-            // params overlay. Recursion guard is added inside
-            // resolve_dispatch_filters; both layers above merge on top.
+            // params overlay + the member brofile's surface verdict (§6).
+            // Recursion guard is added inside resolve_dispatch_filters; all
+            // layers above merge on top (disallow-wins).
+            let member_surface_filters = crate::server::surface::dispatch_surface_filters(
+                &self.state.packets.read(),
+                brofile.surface.as_deref(),
+                team.project_dir.as_deref(),
+            );
             let extra = combine_dispatch_filters(brofile.filters.as_ref(), params_extra.as_ref());
+            let extra = combine_dispatch_filters(extra.as_ref(), member_surface_filters.as_ref());
 
             // Build first-turn prompt with ambient scope + brofile lens.
             // Only applies on fresh-session exec paths; resumes use the
@@ -1774,13 +1781,24 @@ impl BlackboxServer {
                     let cwd = project_dir
                         .map(String::from)
                         .or(bro_match.team.project_dir.clone());
+                    // §6: fold the brofile's surface verdict into its filters so
+                    // every dispatch path inherits the same surface governance.
+                    let surface_filters = crate::server::surface::dispatch_surface_filters(
+                        &self.state.packets.read(),
+                        bf.surface.as_deref(),
+                        cwd.as_deref(),
+                    );
+                    let filters = crate::server::progress::combine_dispatch_filters(
+                        bf.filters.as_ref(),
+                        surface_filters.as_ref(),
+                    );
                     return Ok((
                         bf.provider,
                         bf.lens,
                         opts,
                         env,
                         cwd,
-                        bf.filters,
+                        filters,
                         bf.coerce_workspace.unwrap_or(false),
                         bf.context,
                     ));
@@ -1812,13 +1830,23 @@ impl BlackboxServer {
                 opts,
                 bf.context.as_ref(),
             );
+            // §6: fold the standalone brofile's surface verdict into its filters.
+            let surface_filters = crate::server::surface::dispatch_surface_filters(
+                &self.state.packets.read(),
+                bf.surface.as_deref(),
+                project_dir,
+            );
+            let filters = crate::server::progress::combine_dispatch_filters(
+                bf.filters.as_ref(),
+                surface_filters.as_ref(),
+            );
             return Ok((
                 bf.provider,
                 bf.lens,
                 opts,
                 env,
                 project_dir.map(String::from),
-                bf.filters,
+                filters,
                 bf.coerce_workspace.unwrap_or(false),
                 bf.context,
             ));
@@ -1956,6 +1984,16 @@ impl BlackboxServer {
             let cwd = project_dir
                 .map(String::from)
                 .or(bro_match.team.project_dir.clone());
+            // §6: fold the brofile's surface verdict into its filters on resume too.
+            let surface_filters = crate::server::surface::dispatch_surface_filters(
+                &self.state.packets.read(),
+                bf.surface.as_deref(),
+                cwd.as_deref(),
+            );
+            let filters = crate::server::progress::combine_dispatch_filters(
+                bf.filters.as_ref(),
+                surface_filters.as_ref(),
+            );
             return Ok((
                 provider,
                 sid.to_string(),
@@ -1963,7 +2001,7 @@ impl BlackboxServer {
                 opts,
                 env,
                 cwd,
-                bf.filters,
+                filters,
                 bf.coerce_workspace.unwrap_or(false),
                 lease,
             ));

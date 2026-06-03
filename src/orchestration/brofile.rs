@@ -821,6 +821,27 @@ mod tests {
     }
 
     #[test]
+    fn test_brofile_persists_surface() {
+        let dir = temp_store();
+        let bf = Brofile {
+            name: "readonly-persona".into(),
+            provider: Provider::Glm,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: None,
+            surface: Some("readonly".into()),
+            coerce_workspace: None,
+            runtime: None,
+            context: None,
+        };
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
+        let loaded = resolve_brofile("readonly-persona", dir.path(), None).unwrap();
+        assert_eq!(loaded.surface.as_deref(), Some("readonly"));
+    }
+
+    #[test]
     fn rust_refactor_persona_matches_design_spec() {
         let src =
             include_str!("../../system-defaults/brofiles/refactor/rust-refactor-persona.json");
