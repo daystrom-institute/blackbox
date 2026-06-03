@@ -14,20 +14,28 @@
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
-use bro_capabilities::{CorpusCapability, CorpusLookup};
+use bro_capabilities::{AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup};
+use bro_core::AtomRef;
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 
-/// Process-global corpus capability slot. The daemon is a singleton, so a
-/// single installed implementation is the whole story; standalone leaves it
-/// `None`. Pushed by the daemon (`blackbox` → `bro-harness`), never pulled —
-/// the harness keeps no dependency on the daemon.
+/// Process-global capability slots. The daemon is a singleton, so a single
+/// installed implementation per capability is the whole story; standalone
+/// leaves them `None`. Pushed by the daemon (`blackbox` → `bro-harness`), never
+/// pulled — the harness keeps no dependency on the daemon.
 static CORPUS: RwLock<Option<Arc<dyn CorpusCapability>>> = RwLock::new(None);
+static ATOMS: RwLock<Option<Arc<dyn AtomCapability>>> = RwLock::new(None);
 
 /// Install the daemon's in-memory corpus implementation. Called once, at daemon
 /// startup, from the `blackbox` crate. Last writer wins.
 pub fn install_corpus(capability: Arc<dyn CorpusCapability>) {
     *CORPUS.write().expect("corpus capability slot poisoned") = Some(capability);
+}
+
+/// Install the daemon's in-memory atom implementation. Called once, at daemon
+/// startup, from the `blackbox` crate. Last writer wins.
+pub fn install_atoms(capability: Arc<dyn AtomCapability>) {
+    *ATOMS.write().expect("atom capability slot poisoned") = Some(capability);
 }
 
 fn corpus() -> Option<Arc<dyn CorpusCapability>> {
@@ -37,12 +45,19 @@ fn corpus() -> Option<Arc<dyn CorpusCapability>> {
         .clone()
 }
 
+fn atoms() -> Option<Arc<dyn AtomCapability>> {
+    ATOMS.read().expect("atom capability slot poisoned").clone()
+}
+
 /// Capability-backed tools to merge into the registry. Empty when nothing was
-/// installed (standalone harness) → corpus tools fail closed by absence.
+/// installed (standalone harness) → these surfaces fail closed by absence.
 pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     if let Some(c) = corpus() {
         tools.push(Arc::new(CorpusSearchTool(c)));
+    }
+    if let Some(a) = atoms() {
+        tools.push(Arc::new(AtomInvokeTool(a)));
     }
     tools
 }
@@ -102,10 +117,64 @@ impl Tool for CorpusSearchTool {
     }
 }
 
+/// `atom_invoke`: dispatch a catalog atom via a direct in-memory trait call.
+/// The trait signature is input-JSON → output-JSON and stays neutral on the
+/// edit-effect (tx vs saga) question — that semantics lives behind the daemon
+/// impl, not in the seam (harness-daemon-boundary.md §12).
+struct AtomInvokeTool(Arc<dyn AtomCapability>);
+
+#[async_trait]
+impl Tool for AtomInvokeTool {
+    fn name(&self) -> &str {
+        "atom_invoke"
+    }
+
+    fn description(&self) -> &str {
+        "Invoke a catalog atom in-process (no MCP round-trip). Provide the atom \
+         ref and an args object; returns the atom's output JSON."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "atom": {
+                    "type": "string",
+                    "description": "Atom ref, e.g. \"atom:reviewer@v1\"."
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Atom input arguments (schema-validated by the atom)."
+                }
+            },
+            "required": ["atom"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let atom = match input.get("atom").and_then(Value::as_str) {
+            Some(a) if !a.trim().is_empty() => a.to_string(),
+            _ => return ToolResult::Error("atom_invoke: `atom` ref is required".into()),
+        };
+        let input_json = input.get("args").cloned().unwrap_or_else(|| json!({}));
+        match self
+            .0
+            .invoke_atom(AtomInvocation {
+                atom: AtomRef::new(atom),
+                input_json,
+            })
+            .await
+        {
+            Ok(out) => ToolResult::Json(out.output_json),
+            Err(e) => ToolResult::Error(format!("atom_invoke failed: {}: {}", e.code, e.message)),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bro_capabilities::{CapabilityResult, CorpusHit};
+    use bro_capabilities::{AtomOutput, CapabilityResult, CorpusHit};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Stub capability that records invocations — proves the tool dispatches to
@@ -168,6 +237,46 @@ mod tests {
             calls: AtomicUsize::new(0),
         }));
         let result = tool.call(json!({ "limit": 3 }), &test_cx()).await;
+        assert!(matches!(result, ToolResult::Error(_)));
+    }
+
+    /// Stub atom capability that echoes the ref + args it received.
+    struct StubAtoms;
+
+    #[async_trait]
+    impl AtomCapability for StubAtoms {
+        async fn invoke_atom(&self, invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
+            Ok(AtomOutput {
+                output_json: json!({
+                    "atom": invocation.atom.as_str(),
+                    "echo": invocation.input_json,
+                }),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn atom_invoke_tool_dispatches_to_injected_capability() {
+        let tool = AtomInvokeTool(Arc::new(StubAtoms));
+        let result = tool
+            .call(
+                json!({ "atom": "atom:reviewer@v1", "args": { "x": 1 } }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Json(v) => {
+                assert_eq!(v["atom"], "atom:reviewer@v1");
+                assert_eq!(v["echo"]["x"], 1);
+            }
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn atom_invoke_requires_ref() {
+        let tool = AtomInvokeTool(Arc::new(StubAtoms));
+        let result = tool.call(json!({ "args": {} }), &test_cx()).await;
         assert!(matches!(result, ToolResult::Error(_)));
     }
 }

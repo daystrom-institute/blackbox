@@ -10,10 +10,14 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use bro_capabilities::{CapabilityResult, CorpusCapability, CorpusHit, CorpusLookup};
+use bro_capabilities::{
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
+    CorpusLookup,
+};
 use bro_core::BroError;
 
-use crate::server::state::SharedState;
+use crate::server::state::{BlackboxServer, SharedState};
+use crate::tools::bro_params::AtomInvokeParams;
 
 /// Corpus capability backed by the daemon's live transcript index.
 pub(crate) struct DaemonCorpus {
@@ -44,11 +48,48 @@ impl CorpusCapability for DaemonCorpus {
     }
 }
 
+/// Atom capability backed by the daemon's real invocation path.
+pub(crate) struct DaemonAtoms {
+    pub(crate) state: Arc<SharedState>,
+}
+
+#[async_trait]
+impl AtomCapability for DaemonAtoms {
+    async fn invoke_atom(&self, invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
+        // Reuse the exact server-side invocation path the MCP `atom_invoke`
+        // tool uses, so policy (RX-V1/V2 governance, supervision, runtime
+        // allocation) is identical for in-process and wire callers. The seam
+        // stays input-JSON → output-JSON; edit-effect semantics (tx vs saga)
+        // live behind this impl, not in the trait.
+        let server = BlackboxServer::new(self.state.clone());
+        let params = AtomInvokeParams {
+            atom: invocation.atom.as_str().to_string(),
+            args: invocation.input_json,
+            project_dir: None,
+            owner: None,
+            parent_invocation_id: None,
+            runtime: None,
+            supervision_override: None,
+            suppress_auto_supervision: false,
+        };
+        let output = server
+            .atom_invoke_value(params, None)
+            .await
+            .map_err(|e| BroError::new("atom_invoke_failed", e))?;
+        Ok(AtomOutput {
+            output_json: output,
+        })
+    }
+}
+
 /// Install the daemon's in-memory capability implementations into the harness
 /// capability slots. Called once at startup; the standalone harness binary
 /// never calls this, so those surfaces fail closed by absence.
 pub(crate) fn install(state: &Arc<SharedState>) {
     bro_harness::capabilities::install_corpus(Arc::new(DaemonCorpus {
+        state: state.clone(),
+    }));
+    bro_harness::capabilities::install_atoms(Arc::new(DaemonAtoms {
         state: state.clone(),
     }));
 }
@@ -75,5 +116,25 @@ mod tests {
             .await
             .expect("search against live empty index should succeed");
         assert!(hits.is_empty(), "empty test index yields no hits");
+    }
+
+    /// Invoking an unknown atom drives the real server-side invocation path and
+    /// surfaces its error — proving the trait dispatch reaches live atom
+    /// machinery (not a stub), without needing a full atom + agent dispatch.
+    #[tokio::test]
+    async fn daemon_atoms_reaches_real_invocation_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(dir.path()));
+        let atoms = DaemonAtoms {
+            state: state.clone(),
+        };
+        let result = atoms
+            .invoke_atom(AtomInvocation {
+                atom: bro_core::AtomRef::new("atom:does-not-exist@v1"),
+                input_json: serde_json::json!({}),
+            })
+            .await;
+        let err = result.expect_err("unknown atom must error");
+        assert_eq!(err.code, "atom_invoke_failed");
     }
 }
