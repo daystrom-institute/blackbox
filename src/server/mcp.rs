@@ -58,20 +58,61 @@ pub(super) fn build_http_app(
             "/orchestrate/by-id",
             axum::routing::post(orchestrate_by_id_handler),
         )
-        .route("/irc/exec", axum::routing::post(irc_exec_handler))
-        .route("/irc/resume", axum::routing::post(irc_resume_handler))
-        .route("/irc/steer", axum::routing::post(irc_steer_handler))
-        .route("/irc/interrupt", axum::routing::post(irc_interrupt_handler))
-        .route("/irc/broadcast", axum::routing::post(irc_broadcast_handler))
+        // Generic orchestration control plane. These are thin HTTP adapters over
+        // the `bro_*` dispatch/control tools, shared by every external driver
+        // (the bro-irc sidecar, the fleet client, future bridges). The canonical
+        // namespace is `/control/*`; `/irc/*` is retained as a back-compat alias
+        // for the IRC bridge's historical contract. Nothing here is IRC-specific
+        // — consumers depend on the neutral control endpoint, not on each other's
+        // namespace.
+        .route("/control/exec", axum::routing::post(control_exec_handler))
+        .route("/control/resume", axum::routing::post(control_resume_handler))
+        .route("/control/steer", axum::routing::post(control_steer_handler))
+        .route(
+            "/control/interrupt",
+            axum::routing::post(control_interrupt_handler),
+        )
+        .route(
+            "/control/broadcast",
+            axum::routing::post(control_broadcast_handler),
+        )
+        .route(
+            "/control/status/{task_id}",
+            axum::routing::get(control_status_handler),
+        )
+        .route(
+            "/control/dashboard",
+            axum::routing::get(control_dashboard_handler),
+        )
+        .route("/control/cancel", axum::routing::post(control_cancel_handler))
+        .route(
+            "/control/team/{team_name}",
+            axum::routing::get(control_team_handler),
+        )
+        // Back-compat aliases (legacy `/irc/*` contract).
+        .route("/irc/exec", axum::routing::post(control_exec_handler))
+        .route("/irc/resume", axum::routing::post(control_resume_handler))
+        .route("/irc/steer", axum::routing::post(control_steer_handler))
+        .route(
+            "/irc/interrupt",
+            axum::routing::post(control_interrupt_handler),
+        )
+        .route(
+            "/irc/broadcast",
+            axum::routing::post(control_broadcast_handler),
+        )
         .route(
             "/irc/status/{task_id}",
-            axum::routing::get(irc_status_handler),
+            axum::routing::get(control_status_handler),
         )
-        .route("/irc/dashboard", axum::routing::get(irc_dashboard_handler))
-        .route("/irc/cancel", axum::routing::post(irc_cancel_handler))
+        .route(
+            "/irc/dashboard",
+            axum::routing::get(control_dashboard_handler),
+        )
+        .route("/irc/cancel", axum::routing::post(control_cancel_handler))
         .route(
             "/irc/team/{team_name}",
-            axum::routing::get(irc_team_handler),
+            axum::routing::get(control_team_handler),
         )
         .route(
             "/admin/packet/compile",
@@ -132,4 +173,66 @@ pub(super) fn build_http_app(
         )
         .with_state(shared)
         .nest_service("/mcp", mcp_service)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn test_app() -> axum::Router {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = Arc::new(SharedState::for_test(dir.path()));
+        let cfg = shared.config.read().clone();
+        let ct = CancellationToken::new();
+        build_http_app(shared.clone(), &cfg, &ct)
+    }
+
+    /// The generic control plane is reachable at the neutral `/control/*`
+    /// namespace AND the legacy `/irc/*` alias, both bound to the same handler
+    /// (harness-daemon-boundary.md /irc-decoupling). A typo in either path table
+    /// would surface here as a 404.
+    #[tokio::test]
+    async fn control_and_irc_dashboard_both_resolve_to_same_handler() {
+        for path in ["/control/dashboard", "/irc/dashboard"] {
+            let resp = test_app()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_ne!(
+                resp.status(),
+                StatusCode::NOT_FOUND,
+                "{path} must be mounted (route table regression)"
+            );
+            assert_eq!(resp.status(), StatusCode::OK, "{path} dashboard should 200");
+        }
+    }
+
+    /// Every control verb is mounted under both namespaces. GET on the POST-only
+    /// verbs yields 405 (not 404) — proving the path exists with a handler.
+    #[tokio::test]
+    async fn control_verbs_mounted_under_both_namespaces() {
+        let verbs = ["exec", "resume", "steer", "interrupt", "broadcast", "cancel"];
+        for ns in ["/control", "/irc"] {
+            for verb in verbs {
+                let path = format!("{ns}/{verb}");
+                let resp = test_app()
+                    .oneshot(Request::builder().uri(&path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_ne!(
+                    resp.status(),
+                    StatusCode::NOT_FOUND,
+                    "{path} must be mounted"
+                );
+            }
+        }
+    }
 }

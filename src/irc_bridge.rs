@@ -310,7 +310,7 @@ async fn handle_command(
     let reply = match verb {
         "help" => help_text(),
         "dashboard" | "tasks" => {
-            let result = get_tool(&client, daemon, "irc/dashboard?limit=8").await?;
+            let result = get_tool(&client, daemon, "control/dashboard?limit=8").await?;
             summarize_dashboard(&result)
         }
         "rooms" | "threads" => {
@@ -326,7 +326,7 @@ async fn handle_command(
         }
         "status" => {
             let task_id = require_arg(rest, "usage: !status <task-id>")?;
-            let path = format!("irc/status/{task_id}?tail=3");
+            let path = format!("control/status/{task_id}?tail=3");
             let result = get_tool(&client, daemon, &path).await?;
             summarize_status(&result)
         }
@@ -335,7 +335,7 @@ async fn handle_command(
             let result = post_tool(
                 &client,
                 daemon,
-                "irc/cancel",
+                "control/cancel",
                 &CancelRequest {
                     task_id: task_id.to_string(),
                 },
@@ -349,7 +349,7 @@ async fn handle_command(
             let result = post_tool(
                 &client,
                 daemon,
-                "irc/exec",
+                "control/exec",
                 &ExecRequest {
                     prompt,
                     bro: Some(bro.to_string()),
@@ -366,7 +366,7 @@ async fn handle_command(
             let result = post_tool(
                 &client,
                 daemon,
-                "irc/exec",
+                "control/exec",
                 &ExecRequest {
                     prompt,
                     bro: None,
@@ -383,7 +383,7 @@ async fn handle_command(
             let result = post_tool(
                 &client,
                 daemon,
-                "irc/broadcast",
+                "control/broadcast",
                 &BroadcastRequest {
                     team: team.to_string(),
                     prompt,
@@ -443,7 +443,7 @@ async fn handle_command(
                     project_dir: None,
                 }
             };
-            let result = post_tool(&client, daemon, "irc/resume", &req).await?;
+            let result = post_tool(&client, daemon, "control/resume", &req).await?;
             summarize_task_launch(target, &result)
         }
         "" => return Ok(()),
@@ -719,7 +719,7 @@ async fn ensure_council_instances(
     team: &str,
     channel: &str,
 ) -> Result<()> {
-    let roster: TeamMembersResponse = get_json(client, daemon, &format!("irc/team/{team}")).await?;
+    let roster: TeamMembersResponse = get_json(client, daemon, &format!("control/team/{team}")).await?;
     let mut used = HashSet::new();
     let mut to_spawn = Vec::new();
 
@@ -1382,7 +1382,7 @@ async fn fetch_task_result(
     daemon: &Url,
     task_id: &str,
 ) -> Option<String> {
-    let result = get_tool(client, daemon, &format!("irc/status/{task_id}?tail=0"))
+    let result = get_tool(client, daemon, &format!("control/status/{task_id}?tail=0"))
         .await
         .ok()?;
     result

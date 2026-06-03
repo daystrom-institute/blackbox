@@ -94,7 +94,11 @@ help an agent choose the right validation.
 `blackboxd` is a single long-lived user service, not a per-session stdio child.
 It listens on `127.0.0.1:${BBOX_PORT:-7264}/mcp` by default and also serves
 operator HTTP routes such as `/tail`, `/roster`, `/orchestrate`, `/webhook`,
-`/irc/*`, `/admin/*`, and `/council/*`.
+`/control/*`, `/admin/*`, and `/council/*`. `/control/*` is the neutral
+orchestration control plane (thin HTTP adapters over the `bro_*` dispatch/control
+tools) shared by every external driver — the bro-irc sidecar and the fleet
+client both depend on it. `/irc/*` is retained as a back-compat alias for the
+IRC bridge's historical contract; new consumers use `/control/*`.
 
 Prod and dev services intentionally use different installed daemon paths:
 

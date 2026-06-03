@@ -971,7 +971,7 @@ impl DaemonAgentHandle {
         let _ = self
             .client
             .post_json(
-                "/irc/steer",
+                "/control/steer",
                 json!({
                     "task_id": self.task_id,
                     "prompt": prompt,
@@ -986,7 +986,7 @@ impl DaemonAgentHandle {
         if let Some(prompt) = prompt {
             body["prompt"] = Value::String(prompt.to_string());
         }
-        let _ = self.client.post_json("/irc/interrupt", body).await?;
+        let _ = self.client.post_json("/control/interrupt", body).await?;
         Ok(())
     }
 }
@@ -1037,14 +1037,14 @@ impl DaemonFleetClient {
 
     fn dispatch(&self, spec: DispatchSpec, tail_tx: broadcast::Sender<TailEvent>) -> AgentHandle {
         let body = dispatch_body(&spec);
-        let value = block_on_fleet_http(self.post_json("/irc/exec", body))
+        let value = block_on_fleet_http(self.post_json("/control/exec", body))
             .unwrap_or_else(|err| json!({ "error": err.to_string() }));
         self.handle_from_response(value, spec.provider, spec.cwd, spec.name, tail_tx)
     }
 
     fn resume(&self, spec: ResumeSpec, tail_tx: broadcast::Sender<TailEvent>) -> AgentHandle {
         let body = resume_body(&spec);
-        let value = block_on_fleet_http(self.post_json("/irc/resume", body))
+        let value = block_on_fleet_http(self.post_json("/control/resume", body))
             .unwrap_or_else(|err| json!({ "error": err.to_string() }));
         self.handle_from_response(value, spec.provider, spec.cwd, spec.name, tail_tx)
     }
@@ -1216,7 +1216,7 @@ fn spawn_daemon_status_poller(
         let mut terminal_sent = false;
         loop {
             let status = client
-                .get_json(&format!("/irc/status/{task_id}?tail=200"))
+                .get_json(&format!("/control/status/{task_id}?tail=200"))
                 .await;
             match status {
                 Ok(value) => {
@@ -1649,7 +1649,7 @@ impl FleetOrchestrator {
             let result = block_on_fleet_http(
                 daemon
                     .client
-                    .post_json("/irc/cancel", json!({ "task_id": daemon.task_id })),
+                    .post_json("/control/cancel", json!({ "task_id": daemon.task_id })),
             )
             .map_err(|err| err.to_string());
             if result.is_ok() {

@@ -175,6 +175,8 @@ rusqlite = "0.32"
 
 [dev-dependencies]
 filetime = "0.2"
+# ServiceExt::oneshot for exercising axum route tables in tests.
+tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 opt-level = 3

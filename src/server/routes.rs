@@ -869,35 +869,35 @@ pub(crate) struct IrcStatusQuery {
     tail: Option<usize>,
 }
 
-pub(crate) async fn irc_exec_handler(
+pub(crate) async fn control_exec_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<ExecParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_exec(Parameters(req)).await)
 }
 
-pub(crate) async fn irc_resume_handler(
+pub(crate) async fn control_resume_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<ResumeParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_resume(Parameters(req)).await)
 }
 
-pub(crate) async fn irc_steer_handler(
+pub(crate) async fn control_steer_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<SteerParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_steer(Parameters(req)))
 }
 
-pub(crate) async fn irc_interrupt_handler(
+pub(crate) async fn control_interrupt_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<InterruptParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_interrupt(Parameters(req)))
 }
 
-pub(crate) async fn irc_broadcast_handler(
+pub(crate) async fn control_broadcast_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<BroadcastParams>,
 ) -> axum::Json<CallToolResult> {
@@ -908,7 +908,7 @@ pub(crate) async fn irc_broadcast_handler(
     )
 }
 
-pub(crate) async fn irc_status_handler(
+pub(crate) async fn control_status_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::extract::Path(task_id): axum::extract::Path<String>,
     Query(query): Query<IrcStatusQuery>,
@@ -921,21 +921,21 @@ pub(crate) async fn irc_status_handler(
     )
 }
 
-pub(crate) async fn irc_dashboard_handler(
+pub(crate) async fn control_dashboard_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     Query(query): Query<DashboardParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_dashboard(Parameters(query)))
 }
 
-pub(crate) async fn irc_cancel_handler(
+pub(crate) async fn control_cancel_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::Json(req): axum::Json<CancelParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_cancel(Parameters(req)))
 }
 
-pub(crate) async fn irc_team_handler(
+pub(crate) async fn control_team_handler(
     AxumState(state): AxumState<Arc<SharedState>>,
     axum::extract::Path(team_name): axum::extract::Path<String>,
 ) -> impl axum::response::IntoResponse {
