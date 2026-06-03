@@ -1,0 +1,20 @@
+{
+  "id": "gap-58e800c6",
+  "title": "bbox_bundle_evidence requires path_ids for entity-only bundles",
+  "gap_kind": "mcp_surface",
+  "domain": "evidence-bundling",
+  "wanted_capability": "bbox_bundle_evidence should allow callers to bundle only entity_refs without requiring an explicit path_ids field when no graph paths were traversed.",
+  "missing_primitive": "optional/default-empty path_ids parameter for bbox_bundle_evidence",
+  "fallback_used": "Retried the same bbox_bundle_evidence call with path_ids: [] even though no paths were being bundled.",
+  "evidence": [
+    "MCP call bbox_bundle_evidence(entity_refs=[...]) returned error.bad_input-style deserialize failure: missing field `path_ids`",
+    "Retry with path_ids: [] succeeded for an entity-only evidence bundle"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/evidence-bundling/path-ids-required-without-paths",
+  "notes": "This is small schema friction in the agentic opening/evidence close-loop. The tool docs imply path_ids are used after bbox_find_paths, but entity-only bundles should not require a dummy empty list.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-03T01:14:08Z",
+  "updated_at": "2026-06-03T01:14:08Z"
+}
