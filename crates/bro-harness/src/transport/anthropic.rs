@@ -31,19 +31,19 @@ enum Auth {
 
 impl AnthropicTransport {
     pub fn from_env() -> Result<Self> {
-        let base_url = std::env::var("ANTHROPIC_BASE_URL")
+        let base_url = super::session_var("ANTHROPIC_BASE_URL")
             .context("ANTHROPIC_BASE_URL not set")?
             .trim_end_matches('/')
             .to_string();
-        let auth = if let Ok(t) = std::env::var("ANTHROPIC_AUTH_TOKEN") {
+        let auth = if let Some(t) = super::session_var("ANTHROPIC_AUTH_TOKEN") {
             Auth::Bearer(t)
-        } else if let Ok(k) = std::env::var("ANTHROPIC_API_KEY") {
+        } else if let Some(k) = super::session_var("ANTHROPIC_API_KEY") {
             Auth::ApiKey(k)
         } else {
             anyhow::bail!("neither ANTHROPIC_AUTH_TOKEN nor ANTHROPIC_API_KEY set");
         };
         let version =
-            std::env::var("ANTHROPIC_VERSION").unwrap_or_else(|_| "2023-06-01".to_string());
+            super::session_var("ANTHROPIC_VERSION").unwrap_or_else(|| "2023-06-01".to_string());
         Ok(Self {
             http: reqwest::Client::new(),
             base_url,
@@ -1053,5 +1053,58 @@ mod tests {
         // ...but only the CLIENT tool_use is surfaced for dispatch.
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].name, "read_file");
+    }
+
+    /// LIVE: validates the §3 task-local credential path end-to-end against the
+    /// real GLM endpoint. The transport is constructed with creds present ONLY
+    /// in the per-session task-local (never process env), so a successful turn
+    /// proves the task-local is in scope at transport construction + the HTTP
+    /// call (the one risk a unit test can't cover — task-locals don't propagate
+    /// into spawned tasks). Ignored by default; run with creds in ~/.claude-zai:
+    ///   cargo test -p bro-harness live_glm_turn_resolves_creds_from_task_local -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "live: hits the real GLM endpoint; needs ~/.claude-zai/settings.json"]
+    async fn live_glm_turn_resolves_creds_from_task_local() {
+        let home = dirs::home_dir().expect("home dir");
+        let body = std::fs::read_to_string(home.join(".claude-zai/settings.json"))
+            .expect("GLM settings.json");
+        let v: Value = serde_json::from_str(&body).unwrap();
+
+        let mut vars = std::collections::BTreeMap::new();
+        vars.insert("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string());
+        for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+            if let Some(val) = v["env"][k].as_str() {
+                vars.insert(k.to_string(), val.to_string());
+            }
+        }
+        let model = v["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"]
+            .as_str()
+            .unwrap_or("glm-4.6")
+            .to_string();
+
+        crate::transport::with_session_env(vars, async move {
+            let mut tx = AnthropicTransport::from_env()
+                .expect("transport constructed from task-local creds (process env has none)");
+            tx.push_user_text("Reply with exactly: OK");
+            let opts = TurnOpts {
+                model,
+                max_tokens: 32,
+                system: SystemPrompt::default(),
+                effort: None,
+                web_search: false,
+                service_tier: None,
+            };
+            let sink = crate::emit::Emitter::new("live-probe".to_string());
+            let out = tx
+                .run_turn(&[], &opts, &sink)
+                .await
+                .expect("live GLM turn via task-local creds");
+            eprintln!("LIVE GLM RESPONSE: {:?}", out.text);
+            assert!(
+                !out.text.trim().is_empty(),
+                "expected a non-empty response from the live endpoint"
+            );
+        })
+        .await;
     }
 }

@@ -28,6 +28,40 @@ pub mod responses_common;
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+tokio::task_local! {
+    /// Per-session identity environment (auth token, base URL, account home,
+    /// transport kind, model). Bound by an in-process host around each session
+    /// future via [`with_session_env`]; the standalone binary never binds it.
+    static SESSION_ENV: Arc<BTreeMap<String, String>>;
+}
+
+/// Run `fut` with per-session identity env bound (harness-daemon-boundary.md §3).
+///
+/// This is how an in-process host (the daemon) passes per-session credentials as
+/// *explicit config* instead of mutating process-global env: the values live in
+/// a task-local scoped to the session's task, never in `std::env`. Concurrent
+/// sessions therefore cannot collide (no lock needed), and credentials never
+/// leak into the process env that shell-tool child processes inherit.
+pub async fn with_session_env<F>(vars: BTreeMap<String, String>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    SESSION_ENV.scope(Arc::new(vars), fut).await
+}
+
+/// Resolve a session-identity variable: per-session task-local config first,
+/// then process env. The env fallback is what lets the standalone `bro-harness`
+/// binary keep reading credentials from the user's shell environment.
+pub fn session_var(key: &str) -> Option<String> {
+    SESSION_ENV
+        .try_with(|m| m.get(key).cloned())
+        .ok()
+        .flatten()
+        .or_else(|| std::env::var(key).ok())
+}
 
 /// Normalized usage. Each transport maps its native counters into this.
 ///
@@ -302,7 +336,7 @@ pub enum TransportKind {
 
 impl TransportKind {
     pub fn from_env() -> Self {
-        match std::env::var("BRO_HARNESS_TRANSPORT")
+        match session_var("BRO_HARNESS_TRANSPORT")
             .unwrap_or_default()
             .to_ascii_lowercase()
             .as_str()
@@ -408,5 +442,46 @@ mod tests {
     fn extract_summary_is_case_insensitive_on_tags() {
         let raw = "<SUMMARY>tagged</SUMMARY>";
         assert_eq!(extract_summary(raw), "tagged");
+    }
+}
+
+#[cfg(test)]
+mod session_env_tests {
+    use super::*;
+
+    /// session_var prefers the per-session task-local over process env, falls
+    /// back to env when a key isn't scoped, and outside any scope reads env
+    /// directly — the standalone-binary path (harness-daemon-boundary.md §3).
+    #[tokio::test]
+    async fn session_var_prefers_task_local_then_env() {
+        // Unique keys so this never collides with another parallel test.
+        let scoped = "BRO_TEST_SESSION_SCOPED_K1";
+        let env_only = "BRO_TEST_SESSION_ENVONLY_K1";
+        // SAFETY: unique keys; no other test reads/writes these.
+        unsafe {
+            std::env::set_var(scoped, "from-env");
+            std::env::set_var(env_only, "env-value");
+        }
+
+        let mut vars = BTreeMap::new();
+        vars.insert(scoped.to_string(), "from-config".to_string());
+        with_session_env(vars, async {
+            // task-local wins over a conflicting process env value
+            assert_eq!(session_var(scoped).as_deref(), Some("from-config"));
+            // not in config → process env fallback
+            assert_eq!(session_var(env_only).as_deref(), Some("env-value"));
+            // absent everywhere → None
+            assert_eq!(session_var("BRO_TEST_SESSION_ABSENT_K1"), None);
+        })
+        .await;
+
+        // Outside any session scope → process env (standalone behavior).
+        assert_eq!(session_var(scoped).as_deref(), Some("from-env"));
+
+        // SAFETY: cleanup of this test's unique keys.
+        unsafe {
+            std::env::remove_var(scoped);
+            std::env::remove_var(env_only);
+        }
     }
 }

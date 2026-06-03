@@ -30,9 +30,9 @@ pub struct ChatGptAuth {
 }
 
 fn codex_home() -> PathBuf {
-    std::env::var("CODEX_HOME")
+    super::session_var("CODEX_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| dirs::home_dir().unwrap_or_default().join(".codex"))
+        .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join(".codex"))
 }
 
 /// Load auth, refreshing the access token if near expiry, and return the

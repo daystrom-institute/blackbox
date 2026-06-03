@@ -94,7 +94,7 @@ impl ResponsesState {
 /// OpenAI path; otherwise fall back to the Codex ChatGPT OAuth in
 /// `~/.codex/auth.json` (loading + refreshing cooperatively with the Codex CLI).
 pub(super) async fn resolve_auth(http: &reqwest::Client) -> Result<Auth> {
-    if let Ok(key) = std::env::var("OPENAI_API_KEY") {
+    if let Some(key) = super::session_var("OPENAI_API_KEY") {
         return Ok(Auth::ApiKey(key));
     }
     let auth = super::codex_auth::load_fresh(http)
@@ -111,14 +111,14 @@ pub(super) async fn resolve_auth(http: &reqwest::Client) -> Result<Auth> {
 pub(super) fn http_endpoint(auth: &Auth) -> String {
     match auth {
         Auth::ApiKey(_) => {
-            let base = std::env::var("OPENAI_BASE_URL")
-                .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+            let base = super::session_var("OPENAI_BASE_URL")
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
                 .trim_end_matches('/')
                 .to_string();
             format!("{base}/responses")
         }
-        Auth::ChatGpt { .. } => std::env::var("OPENAI_RESPONSES_URL")
-            .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex/responses".to_string()),
+        Auth::ChatGpt { .. } => super::session_var("OPENAI_RESPONSES_URL")
+            .unwrap_or_else(|| "https://chatgpt.com/backend-api/codex/responses".to_string()),
     }
 }
 

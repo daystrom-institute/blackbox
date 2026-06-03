@@ -36,7 +36,7 @@ fn project_doc_max_bytes() -> usize {
 /// Resolve `$CODEX_HOME`, defaulting to `~/.codex` — the same base the daemon's
 /// Codex arm uses (`orchestration::brofile`).
 fn codex_home() -> Option<PathBuf> {
-    if let Ok(h) = std::env::var("CODEX_HOME") {
+    if let Some(h) = crate::transport::session_var("CODEX_HOME") {
         let h = h.trim();
         if !h.is_empty() {
             return Some(PathBuf::from(h));

@@ -1512,6 +1512,14 @@ async fn run_harness_in_process(
         std::env::set_current_dir(cwd)?;
     }
 
+    // Per-session identity (auth token, base URL, account home, transport kind,
+    // model) is passed as EXPLICIT CONFIG via a task-local bound around the
+    // session future (harness-daemon-boundary.md §3) — never mutated into the
+    // process-global env. This both honors the invariant and stops credentials
+    // from leaking into the process env that shell-tool child processes inherit.
+    let session_env: std::collections::BTreeMap<String, String> =
+        env_overrides.unwrap_or_default().into_iter().collect();
+
     let mut keys: Vec<String> = BLACKBOX_SERVICE_ENV_VARS
         .iter()
         .map(|key| key.to_string())
@@ -1522,9 +1530,6 @@ async fn run_harness_in_process(
         "TERM".to_string(),
         "FORCE_COLOR".to_string(),
     ]);
-    if let Some(overrides) = &env_overrides {
-        keys.extend(overrides.keys().cloned());
-    }
     keys.sort();
     keys.dedup();
     let saved: Vec<(String, Option<std::ffi::OsString>)> = keys
@@ -1533,8 +1538,9 @@ async fn run_harness_in_process(
         .collect();
 
     let path_env = providers::dispatch_path_env();
-    // SAFETY: all in-process harness runs take harness_context_lock, serializing
-    // process-wide cwd/env mutation until transports accept explicit config.
+    // SAFETY: the lock still serializes the remaining process-wide cwd + PATH
+    // mutation (constant display/PATH context for spawned shell children). Per-
+    // session identity is no longer mutated here — it rides the task-local above.
     unsafe {
         std::env::set_var("PATH", path_env);
         std::env::set_var("NO_COLOR", "1");
@@ -1543,18 +1549,16 @@ async fn run_harness_in_process(
         for key in BLACKBOX_SERVICE_ENV_VARS {
             std::env::remove_var(key);
         }
-        if let Some(overrides) = &env_overrides {
-            for (key, value) in overrides {
-                std::env::set_var(key, value);
-            }
-        }
     }
 
     let cli = bro_harness::cli::Cli::try_parse_from(
         std::iter::once("bro-harness".to_string()).chain(args),
     )?;
-    let result =
-        bro_harness::agent_loop::run_with_event_callback_and_input(cli, input_rx, callback).await;
+    let result = bro_harness::transport::with_session_env(
+        session_env,
+        bro_harness::agent_loop::run_with_event_callback_and_input(cli, input_rx, callback),
+    )
+    .await;
 
     // SAFETY: still under harness_context_lock; restore the process context this
     // run borrowed for the env-driven transport implementation.

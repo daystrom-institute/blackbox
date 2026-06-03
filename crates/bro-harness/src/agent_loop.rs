@@ -573,7 +573,7 @@ impl Session {
             .model
             .clone()
             .or(restored_model)
-            .or_else(|| std::env::var("ANTHROPIC_MODEL").ok())
+            .or_else(|| transport::session_var("ANTHROPIC_MODEL"))
             .or_else(|| std::env::var("BRO_HARNESS_MODEL").ok())
             .context(
                 "no --model, no resumed session model, and no ANTHROPIC_MODEL/BRO_HARNESS_MODEL",

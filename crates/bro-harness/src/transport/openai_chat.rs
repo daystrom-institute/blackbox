@@ -92,12 +92,12 @@ pub struct OpenAiChatTransport {
 impl OpenAiChatTransport {
     pub fn from_env() -> Result<Self> {
         // Base carries the version segment: OpenAI = ".../v1", DeepSeek = root.
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string())
+        let base_url = super::session_var("OPENAI_BASE_URL")
+            .unwrap_or_else(|| "https://api.openai.com/v1".to_string())
             .trim_end_matches('/')
             .to_string();
-        let api_key = std::env::var("OPENAI_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN")) // DeepSeek: one key, both APIs
+        let api_key = super::session_var("OPENAI_API_KEY")
+            .or_else(|| super::session_var("ANTHROPIC_AUTH_TOKEN")) // DeepSeek: one key, both APIs
             .context("OPENAI_API_KEY not set")?;
         Ok(Self {
             http: reqwest::Client::new(),
