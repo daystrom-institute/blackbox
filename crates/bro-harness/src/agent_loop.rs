@@ -523,10 +523,20 @@ impl Session {
         //   absent    ⇒ not overridden ⇒ Codex-style AGENTS.md overlay
         //               (global $CODEX_HOME/AGENTS.md + repo AGENTS.md, project
         //               scope). Falls back to None when no AGENTS docs exist.
+        // Per-session working directory: explicit `--cwd` (the daemon's
+        // dispatch cwd, passed instead of mutating the process cwd) or the
+        // process cwd for the standalone binary. All file/shell tools and
+        // project-doc discovery resolve against this root, so concurrent
+        // in-process sessions never collide (harness-daemon-boundary.md §3).
+        let root = match cli.cwd.as_deref() {
+            Some(c) => std::fs::canonicalize(c).unwrap_or_else(|_| std::path::PathBuf::from(c)),
+            None => std::env::current_dir().context("cwd")?,
+        };
+
         let system = match cli.system_prompt.as_deref() {
             Some("") => None,
             Some(s) => Some(s.to_string()),
-            None => crate::project_doc::discover(),
+            None => crate::project_doc::discover(&root),
         };
 
         let kind = TransportKind::from_env();
@@ -581,7 +591,7 @@ impl Session {
 
         let edits = Arc::new(std::sync::Mutex::new(bro_tools::EditSink::default()));
         let cx = ToolCx {
-            root: std::env::current_dir().context("cwd")?,
+            root: root.clone(),
             safety: Arc::new(SafetyPolicy::new()),
             http: reqwest::Client::new(),
             todos: todos.clone(),

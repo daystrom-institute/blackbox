@@ -218,9 +218,8 @@ fn truncate_on_char_boundary(s: &mut String, cap: usize) {
 /// Assemble the Codex-equivalent overlay from the process cwd + `$CODEX_HOME`.
 /// Returns `None` when no AGENTS docs exist, in which case the caller sends no
 /// system prompt (identical to the prior provider-defaults behavior).
-pub(crate) fn discover() -> Option<String> {
-    let cwd = std::env::current_dir().ok()?;
-    assemble(&cwd, codex_home().as_deref())
+pub(crate) fn discover(cwd: &Path) -> Option<String> {
+    assemble(cwd, codex_home().as_deref())
 }
 
 /// Pure assembly seam: explicit `cwd` and `codex_home` make this testable

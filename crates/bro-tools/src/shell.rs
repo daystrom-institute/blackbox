@@ -421,6 +421,44 @@ fn shell_path_env() -> Option<OsString> {
     )
 }
 
+tokio::task_local! {
+    /// Env var names to scrub from spawned child processes — bound by an
+    /// in-process host (the daemon) so its own service config does not leak
+    /// into the user shell commands an agent runs. Unbound for the standalone
+    /// binary, where there's nothing host-internal to hide.
+    static SPAWN_SCRUB: std::sync::Arc<Vec<String>>;
+}
+
+/// Run `fut` with a child-process env scrub list bound. Spawned shell children
+/// get these env vars removed (harness-daemon-boundary.md §3) — the in-process
+/// replacement for the daemon's old "remove service env, restore after" dance
+/// that forced sessions to serialize under a lock.
+pub async fn with_spawn_scrub<F>(keys: Vec<String>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    SPAWN_SCRUB.scope(std::sync::Arc::new(keys), fut).await
+}
+
+/// Apply the standard child-process environment for a non-interactive shell
+/// command: augmented PATH, clean/uncolored output, and the host scrub set.
+/// Per-command `args.env` is layered on top by the caller and wins.
+fn apply_child_env(cmd: &mut tokio::process::Command) {
+    // Non-interactive execution: deterministic, uncolored output for the model.
+    cmd.env("NO_COLOR", "1");
+    cmd.env("FORCE_COLOR", "0");
+    cmd.env("TERM", "dumb");
+    if let Some(path) = shell_path_env() {
+        cmd.env("PATH", path);
+    }
+    // No-op outside a with_spawn_scrub scope (the standalone binary).
+    let _ = SPAWN_SCRUB.try_with(|keys| {
+        for k in keys.iter() {
+            cmd.env_remove(k);
+        }
+    });
+}
+
 fn augmented_path_env(
     extra_path: Option<OsString>,
     home: Option<PathBuf>,
@@ -532,9 +570,7 @@ impl Tool for ShellRun {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if let Some(path) = shell_path_env() {
-            cmd.env("PATH", path);
-        }
+        apply_child_env(&mut cmd);
         for (k, v) in &args.env {
             cmd.env(k, v);
         }
@@ -940,6 +976,59 @@ mod tests {
         assert_eq!(v["timed_out"], false, "timed_out always present");
         assert!(v["session_id"].is_null(), "no session for a finished cmd");
         assert_eq!(v["stdout"], "hi\n");
+    }
+
+    #[tokio::test]
+    async fn spawn_scrub_hides_host_vars_from_shell_children() {
+        // SAFETY: unique key, not touched by any other test.
+        unsafe {
+            std::env::set_var("BRO_TEST_SCRUB_K9", "leaked-value");
+        }
+
+        // Under a scrub scope (the daemon's in-process session), the child must
+        // NOT inherit the scrubbed var.
+        let scrubbed = with_spawn_scrub(vec!["BRO_TEST_SCRUB_K9".to_string()], async {
+            as_json(
+                ShellRun
+                    .call(
+                        json!({"command": "printf '%s' \"$BRO_TEST_SCRUB_K9\""}),
+                        &cx(),
+                    )
+                    .await,
+            )
+        })
+        .await;
+        assert_eq!(
+            scrubbed["stdout"], "",
+            "scrubbed host var must not reach the child"
+        );
+
+        // Outside any scrub scope (standalone binary), the child inherits it.
+        let leaked = as_json(
+            ShellRun
+                .call(
+                    json!({"command": "printf '%s' \"$BRO_TEST_SCRUB_K9\""}),
+                    &cx(),
+                )
+                .await,
+        );
+        assert_eq!(leaked["stdout"], "leaked-value");
+
+        // SAFETY: cleanup of this test's unique key.
+        unsafe {
+            std::env::remove_var("BRO_TEST_SCRUB_K9");
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_children_get_uncolored_output_env() {
+        // apply_child_env sets NO_COLOR regardless of scrub scope.
+        let v = as_json(
+            ShellRun
+                .call(json!({"command": "printf '%s' \"$NO_COLOR\""}), &cx())
+                .await,
+        );
+        assert_eq!(v["stdout"], "1");
     }
 
     #[tokio::test]

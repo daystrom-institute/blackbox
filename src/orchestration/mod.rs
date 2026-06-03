@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::Notify;
 
 use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
@@ -49,11 +49,6 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
 ];
 
 const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
-
-fn harness_context_lock() -> &'static AsyncMutex<()> {
-    static LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| AsyncMutex::new(()))
-}
 
 fn harness_controls(
 ) -> &'static RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>> {
@@ -1506,75 +1501,36 @@ async fn run_harness_in_process(
 ) -> anyhow::Result<()> {
     use clap::Parser;
 
-    let _guard = harness_context_lock().lock().await;
-    let previous_cwd = std::env::current_dir().ok();
-    if let Some(cwd) = cwd.as_deref() {
-        std::env::set_current_dir(cwd)?;
-    }
-
-    // Per-session identity (auth token, base URL, account home, transport kind,
-    // model) is passed as EXPLICIT CONFIG via a task-local bound around the
-    // session future (harness-daemon-boundary.md §3) — never mutated into the
-    // process-global env. This both honors the invariant and stops credentials
-    // from leaking into the process env that shell-tool child processes inherit.
+    // Fully per-session, no process-global mutation, no lock (harness-daemon-
+    // boundary.md §3): identity rides a task-local, the working directory is
+    // passed as `--cwd` (the harness uses it for ToolCx.root instead of the
+    // process cwd), shell children get their clean/augmented env from the shell
+    // tool itself, and the daemon's own service env is scrubbed from those
+    // children via with_spawn_scrub. Concurrent in-process sessions no longer
+    // collide, so the previous serialize-everything lock is gone.
     let session_env: std::collections::BTreeMap<String, String> =
         env_overrides.unwrap_or_default().into_iter().collect();
-
-    let mut keys: Vec<String> = BLACKBOX_SERVICE_ENV_VARS
+    let scrub: Vec<String> = BLACKBOX_SERVICE_ENV_VARS
         .iter()
-        .map(|key| key.to_string())
-        .collect();
-    keys.extend([
-        "PATH".to_string(),
-        "NO_COLOR".to_string(),
-        "TERM".to_string(),
-        "FORCE_COLOR".to_string(),
-    ]);
-    keys.sort();
-    keys.dedup();
-    let saved: Vec<(String, Option<std::ffi::OsString>)> = keys
-        .iter()
-        .map(|key| (key.clone(), std::env::var_os(key)))
+        .map(|k| k.to_string())
         .collect();
 
-    let path_env = providers::dispatch_path_env();
-    // SAFETY: the lock still serializes the remaining process-wide cwd + PATH
-    // mutation (constant display/PATH context for spawned shell children). Per-
-    // session identity is no longer mutated here — it rides the task-local above.
-    unsafe {
-        std::env::set_var("PATH", path_env);
-        std::env::set_var("NO_COLOR", "1");
-        std::env::set_var("TERM", "dumb");
-        std::env::set_var("FORCE_COLOR", "0");
-        for key in BLACKBOX_SERVICE_ENV_VARS {
-            std::env::remove_var(key);
-        }
+    let mut argv: Vec<String> = vec!["bro-harness".to_string()];
+    if let Some(cwd) = cwd.as_deref() {
+        argv.push("--cwd".to_string());
+        argv.push(cwd.to_string());
     }
+    argv.extend(args);
+    let cli = bro_harness::cli::Cli::try_parse_from(argv)?;
 
-    let cli = bro_harness::cli::Cli::try_parse_from(
-        std::iter::once("bro-harness".to_string()).chain(args),
-    )?;
-    let result = bro_harness::transport::with_session_env(
-        session_env,
-        bro_harness::agent_loop::run_with_event_callback_and_input(cli, input_rx, callback),
+    bro_tools::shell::with_spawn_scrub(
+        scrub,
+        bro_harness::transport::with_session_env(
+            session_env,
+            bro_harness::agent_loop::run_with_event_callback_and_input(cli, input_rx, callback),
+        ),
     )
-    .await;
-
-    // SAFETY: still under harness_context_lock; restore the process context this
-    // run borrowed for the env-driven transport implementation.
-    unsafe {
-        for (key, value) in saved {
-            match value {
-                Some(value) => std::env::set_var(key, value),
-                None => std::env::remove_var(key),
-            }
-        }
-    }
-    if let Some(previous_cwd) = previous_cwd {
-        let _ = std::env::set_current_dir(previous_cwd);
-    }
-
-    result
+    .await
 }
 
 /// Spawn a task in **persistent bidirectional mode** (fleet-tui.md item 6): the

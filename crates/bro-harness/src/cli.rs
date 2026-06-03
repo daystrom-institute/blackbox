@@ -43,6 +43,14 @@ pub struct Cli {
     #[arg(long = "model")]
     pub model: Option<String>,
 
+    /// Working directory for this session. File/shell tools resolve against it
+    /// (`ToolCx.root`) and project-doc discovery starts here. The daemon passes
+    /// the dispatch cwd here instead of mutating the process cwd, so concurrent
+    /// in-process sessions never collide (harness-daemon-boundary.md §3). Absent
+    /// ⇒ the process cwd (standalone binary).
+    #[arg(long = "cwd")]
+    pub cwd: Option<String>,
+
     /// Reasoning effort → mapped to a `thinking` budget when supported.
     #[arg(long = "effort")]
     pub effort: Option<String>,

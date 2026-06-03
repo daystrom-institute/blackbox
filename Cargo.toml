@@ -74,6 +74,9 @@ bro-core = { path = "crates/bro-core" }
 bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }
 bro-harness = { path = "crates/bro-harness" }
+# Direct dep for the in-process session's child-process env scrub
+# (bro_tools::with_spawn_scrub); shell tools live here.
+bro-tools = { path = "crates/bro-tools" }
 
 # Fast non-poisoning locks
 parking_lot = "0.12"
