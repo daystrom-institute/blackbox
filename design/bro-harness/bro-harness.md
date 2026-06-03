@@ -59,6 +59,9 @@ points to a backlog doc.
   escalate+justification; gated on unifying the privilege model.
 - [Neuralyze (rewind + carry a message)](bro-harness-neuralyze.md) — fully
   unbuilt: checkpoint substrate, context rewind, file inverse-diff journal.
+- [NARF capability library and prepared scripts](narf-capability-library.md) —
+  proposed authoring-layer middle tier: session-local helpers, decay-managed
+  reusable functions, capability scout, and prepare-before-run script refs.
 
 ## Cluster conventions
 

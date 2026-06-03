@@ -544,6 +544,10 @@ The direction above is argued; these forks are not settled:
 - **Refines** [`../../research/harness/narf-draft2.md`](../../research/harness/narf-draft2.md)
   §6 (in-memory `bro-capabilities` traits replace the MCP soft-dep seam when
   in-daemon).
+- **Siblings with** [`narf-capability-library.md`](./narf-capability-library.md)
+  — this doc owns topology and durability placement; the sibling owns
+  session-local helpers, decay-managed reusable functions, capability scout, and
+  prepare-before-run script refs.
 - **Extends** [`../surfaces/mcp/mcp-surfaces.md`](../surfaces/mcp/mcp-surfaces.md)
   with the in-process binding as a third consumer of `evaluate_tool_surface`.
 - **Spins out** [`leaf-sandbox-isolation.md`](./leaf-sandbox-isolation.md) —
