@@ -60,6 +60,8 @@ pub(super) fn build_http_app(
         )
         .route("/irc/exec", axum::routing::post(irc_exec_handler))
         .route("/irc/resume", axum::routing::post(irc_resume_handler))
+        .route("/irc/steer", axum::routing::post(irc_steer_handler))
+        .route("/irc/interrupt", axum::routing::post(irc_interrupt_handler))
         .route("/irc/broadcast", axum::routing::post(irc_broadcast_handler))
         .route(
             "/irc/status/{task_id}",

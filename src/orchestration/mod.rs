@@ -54,6 +54,42 @@ fn harness_context_lock() -> &'static AsyncMutex<()> {
     LOCK.get_or_init(|| AsyncMutex::new(()))
 }
 
+fn harness_controls(
+) -> &'static RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>> {
+    static CONTROLS: OnceLock<
+        RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>>,
+    > = OnceLock::new();
+    CONTROLS.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+pub fn steer_harness_task(task_id: &str, prompt: String) -> Result<(), String> {
+    let tx = harness_controls()
+        .read()
+        .get(task_id)
+        .cloned()
+        .ok_or_else(|| format!("task {task_id} has no live in-process harness control channel"))?;
+    tx.send(bro_harness::agent_loop::SessionInput::User(prompt))
+        .map_err(|_| format!("task {task_id} harness control channel is closed"))
+}
+
+pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result<(), String> {
+    let tx = harness_controls()
+        .read()
+        .get(task_id)
+        .cloned()
+        .ok_or_else(|| format!("task {task_id} has no live in-process harness control channel"))?;
+    let mut raw = serde_json::json!({"type": "control_request", "subtype": "interrupt"});
+    if let Some(prompt) = redirect {
+        raw["prompt"] = serde_json::json!(prompt);
+    }
+    tx.send(bro_harness::agent_loop::SessionInput::Control {
+        subtype: "interrupt".to_string(),
+        request_id: Some(uuid::Uuid::new_v4().to_string()),
+        raw,
+    })
+    .map_err(|_| format!("task {task_id} harness control channel is closed"))
+}
+
 // ---------------------------------------------------------------------------
 // Task
 // ---------------------------------------------------------------------------
@@ -1307,6 +1343,10 @@ fn spawn_harness_in_process_task(
     let system_events_for_finish = system_events.clone();
     let event_provider = provider;
     let event_task_id = task_id.clone();
+    let (control_tx, control_rx) = bro_harness::agent_loop::session_input_channel();
+    harness_controls()
+        .write()
+        .insert(task_id.clone(), control_tx);
     let callback = Arc::new(move |evt: Value| {
         ingest_harness_event(
             &task_for_events,
@@ -1319,11 +1359,12 @@ fn spawn_harness_in_process_task(
     });
 
     tokio::spawn(async move {
-        let result = run_harness_in_process(args, cwd, env_overrides, callback).await;
+        let result = run_harness_in_process(args, cwd, env_overrides, callback, control_rx).await;
         let (mut status, stderr) = match result {
             Ok(()) => (TaskStatus::Completed, None),
             Err(err) => (TaskStatus::Failed, Some(format!("{err:#}\n"))),
         };
+        harness_controls().write().remove(&task_id);
         {
             let inner = task_for_run.inner.lock();
             if matches!(inner.status, TaskStatus::Failed | TaskStatus::Cancelled) {
@@ -1416,6 +1457,7 @@ async fn run_harness_in_process(
     cwd: Option<String>,
     env_overrides: Option<HashMap<String, String>>,
     callback: bro_harness::emit::EventCallback,
+    input_rx: bro_harness::agent_loop::SessionInputReceiver,
 ) -> anyhow::Result<()> {
     use clap::Parser;
 
@@ -1466,7 +1508,8 @@ async fn run_harness_in_process(
     let cli = bro_harness::cli::Cli::try_parse_from(
         std::iter::once("bro-harness".to_string()).chain(args),
     )?;
-    let result = bro_harness::agent_loop::run_with_event_callback(cli, callback).await;
+    let result =
+        bro_harness::agent_loop::run_with_event_callback_and_input(cli, input_rx, callback).await;
 
     // SAFETY: still under harness_context_lock; restore the process context this
     // run borrowed for the env-driven transport implementation.

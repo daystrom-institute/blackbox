@@ -1639,6 +1639,63 @@ impl BlackboxServer {
         }
     }
 
+    #[tool(
+        name = "bro_steer",
+        description = "Queue a user steer into a running in-process bro task without cancelling the active turn."
+    )]
+    pub(crate) fn bro_steer(&self, Parameters(p): Parameters<SteerParams>) -> CallToolResult {
+        let task = match self.state.task_store.read().get(&p.task_id) {
+            Some(t) => t,
+            None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
+        };
+        {
+            let inner = task.inner.lock();
+            if inner.status != orch::TaskStatus::Running {
+                return Self::err_text(&format!(
+                    "task {} is {:?}, not running",
+                    inner.id, inner.status
+                ));
+            }
+        }
+        match orch::steer_harness_task(&p.task_id, p.prompt) {
+            Ok(()) => Self::ok_json(&json!({
+                "taskId": p.task_id,
+                "status": "steered",
+            })),
+            Err(e) => Self::err_text(&e),
+        }
+    }
+
+    #[tool(
+        name = "bro_interrupt",
+        description = "Interrupt a running in-process bro task; optionally queue redirect text to run after interruption repair."
+    )]
+    pub(crate) fn bro_interrupt(
+        &self,
+        Parameters(p): Parameters<InterruptParams>,
+    ) -> CallToolResult {
+        let task = match self.state.task_store.read().get(&p.task_id) {
+            Some(t) => t,
+            None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
+        };
+        {
+            let inner = task.inner.lock();
+            if inner.status != orch::TaskStatus::Running {
+                return Self::err_text(&format!(
+                    "task {} is {:?}, not running",
+                    inner.id, inner.status
+                ));
+            }
+        }
+        match orch::interrupt_harness_task(&p.task_id, p.prompt) {
+            Ok(()) => Self::ok_json(&json!({
+                "taskId": p.task_id,
+                "status": "interrupted",
+            })),
+            Err(e) => Self::err_text(&e),
+        }
+    }
+
     #[allow(clippy::type_complexity)]
     pub(crate) fn resolve_exec_brofile_for_allocator(
         &self,

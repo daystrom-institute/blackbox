@@ -440,6 +440,24 @@ pub(crate) struct CancelParams {
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct SteerParams {
+    /// Running task ID to steer.
+    pub(crate) task_id: String,
+    /// Text to queue into the live session.
+    pub(crate) prompt: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub(crate) struct InterruptParams {
+    /// Running task ID to interrupt.
+    pub(crate) task_id: String,
+    /// Optional redirect prompt to run immediately after the interrupted turn is
+    /// repaired. Omit for a plain interrupt.
+    #[serde(default)]
+    pub(crate) prompt: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
 pub(crate) struct PruneParams {
     /// Status to prune (failed, completed, cancelled). Defaults to
     /// "failed" — the only status that's almost always safe to drop

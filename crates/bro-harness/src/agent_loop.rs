@@ -100,6 +100,31 @@ pub async fn run_with_event_callback(cli: Cli, callback: EventCallback) -> Resul
     run_with_emitter(cli, Some(callback)).await
 }
 
+#[derive(Debug)]
+pub enum SessionInput {
+    User(String),
+    Control {
+        subtype: String,
+        request_id: Option<String>,
+        raw: Value,
+    },
+}
+
+pub type SessionInputSender = mpsc::UnboundedSender<SessionInput>;
+pub type SessionInputReceiver = mpsc::UnboundedReceiver<SessionInput>;
+
+pub fn session_input_channel() -> (SessionInputSender, SessionInputReceiver) {
+    mpsc::unbounded_channel()
+}
+
+pub async fn run_with_event_callback_and_input(
+    cli: Cli,
+    input_rx: SessionInputReceiver,
+    callback: EventCallback,
+) -> Result<()> {
+    run_controlled_session(cli, input_rx, Some(callback)).await
+}
+
 async fn run_with_emitter(cli: Cli, callback: Option<EventCallback>) -> Result<()> {
     if cli.input_format.as_deref() == Some("stream-json") {
         return run_session(cli, callback).await;
@@ -150,6 +175,66 @@ async fn run_session(cli: Cli, callback: Option<EventCallback>) -> Result<()> {
     session_loop(&mut session, input_rx, &ctrl_emitter, pending).await?;
     session.persist()?;
     Ok(())
+}
+
+async fn run_controlled_session(
+    cli: Cli,
+    input_rx: SessionInputReceiver,
+    callback: Option<EventCallback>,
+) -> Result<()> {
+    let mut session = Session::build(&cli, callback.clone()).await?;
+    session.emitter.system_init_session();
+    let sid = session.session_id().to_string();
+    let ctrl_emitter = make_emitter(sid, callback);
+
+    let mut pending: VecDeque<String> = VecDeque::new();
+    if let Some(p) = cli.prompt.clone() {
+        pending.push_back(p);
+    }
+    let input_rx = map_session_input(input_rx);
+
+    session_loop_until_idle(&mut session, input_rx, &ctrl_emitter, pending).await?;
+    session.persist()?;
+    Ok(())
+}
+
+fn map_session_input(mut external_rx: SessionInputReceiver) -> mpsc::UnboundedReceiver<Input> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(input) = external_rx.recv().await {
+            if tx.send(to_input(input)).is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+fn to_input(input: SessionInput) -> Input {
+    match input {
+        SessionInput::User(text) => Input::User(text),
+        SessionInput::Control {
+            subtype,
+            request_id,
+            raw,
+        } => Input::Control {
+            subtype,
+            req_id: request_id,
+            raw,
+        },
+    }
+}
+
+fn queue_redirect_from_control(raw: &Value, inputs: &Arc<StdMutex<VecDeque<String>>>) {
+    let prompt = raw["prompt"]
+        .as_str()
+        .or_else(|| raw["request"]["prompt"].as_str())
+        .map(str::to_string);
+    if let Some(prompt) = prompt
+        && let Ok(mut inputs) = inputs.lock()
+    {
+        inputs.push_back(prompt);
+    }
 }
 
 /// The core bidirectional loop, factored out of `run_session` so it can be
@@ -225,7 +310,8 @@ async fn session_loop(
                         break;
                     }
                     maybe = input_rx.recv() => match maybe {
-                        Some(Input::Control { subtype, req_id, .. }) if subtype == "interrupt" => {
+                        Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
+                            queue_redirect_from_control(&raw, &mid_turn_user_inputs);
                             let _ = cancel_tx.send(true);
                             ctrl_emitter.control_response_success(req_id.as_deref());
                         }
@@ -268,6 +354,101 @@ async fn session_loop(
         }
         if stdin_closed && pending.is_empty() {
             break;
+        }
+    }
+    Ok(())
+}
+
+async fn session_loop_until_idle(
+    session: &mut Session,
+    mut input_rx: mpsc::UnboundedReceiver<Input>,
+    ctrl_emitter: &Emitter,
+    mut pending: VecDeque<String>,
+) -> Result<()> {
+    loop {
+        let prompt = match pending.pop_front() {
+            Some(p) => p,
+            None => match input_rx.try_recv() {
+                Ok(Input::User(p)) => p,
+                Ok(Input::Control {
+                    subtype,
+                    req_id,
+                    raw,
+                }) => {
+                    session.apply_control(&subtype, &raw);
+                    ctrl_emitter.control_response_success(req_id.as_deref());
+                    continue;
+                }
+                Err(_) => break,
+            },
+        };
+
+        run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt).await?;
+        if let Err(e) = session.persist() {
+            tracing::warn!("failed to persist session after controlled turn: {e:#}");
+        }
+    }
+    Ok(())
+}
+
+async fn run_prompt_with_controls(
+    session: &mut Session,
+    input_rx: &mut mpsc::UnboundedReceiver<Input>,
+    ctrl_emitter: &Emitter,
+    pending: &mut VecDeque<String>,
+    prompt: String,
+) -> Result<()> {
+    if prompt.trim() == "/compact" {
+        if let Err(e) = session.compact_manual().await {
+            tracing::warn!("manual /compact failed: {e:#}");
+        }
+        return Ok(());
+    }
+
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let mut deferred: Vec<(String, Value)> = Vec::new();
+    let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
+        Arc::new(StdMutex::new(VecDeque::new()));
+    {
+        let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
+        tokio::pin!(turn);
+        loop {
+            tokio::select! {
+                biased;
+                res = &mut turn => {
+                    if let Err(e) = res {
+                        tracing::error!("turn failed: {e:#}");
+                    }
+                    break;
+                }
+                maybe = input_rx.recv() => match maybe {
+                    Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
+                        queue_redirect_from_control(&raw, &mid_turn_user_inputs);
+                        let _ = cancel_tx.send(true);
+                        ctrl_emitter.control_response_success(req_id.as_deref());
+                    }
+                    Some(Input::User(p)) => {
+                        if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+                            inputs.push_back(p);
+                        }
+                    }
+                    Some(Input::Control { subtype, req_id, raw }) => {
+                        ctrl_emitter.control_response_success(req_id.as_deref());
+                        deferred.push((subtype, raw));
+                    }
+                    None => {
+                        let _ = cancel_tx.send(true);
+                    }
+                }
+            }
+        }
+    }
+    for (subtype, raw) in deferred {
+        session.apply_control(&subtype, &raw);
+    }
+    if let Ok(mut inputs) = mid_turn_user_inputs.lock() {
+        while let Some(p) = inputs.pop_back() {
+            pending.push_front(p);
         }
     }
     Ok(())

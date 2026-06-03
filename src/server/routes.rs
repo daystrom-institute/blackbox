@@ -33,7 +33,8 @@ use crate::tools::bro_helpers::{
     build_member_entry, infer_provider_from_path, roster_entry_key, split_csv,
 };
 use crate::tools::bro_params::{
-    BroadcastParams, CancelParams, DashboardParams, ExecParams, ResumeParams, StatusParams,
+    BroadcastParams, CancelParams, DashboardParams, ExecParams, InterruptParams, ResumeParams,
+    StatusParams, SteerParams,
 };
 use crate::tools::bro_runtime_params::{
     BroRosterEntry, OrchestrateListEntry, OrchestrateRequest, OrchestrateStatusQuery,
@@ -880,6 +881,20 @@ pub(crate) async fn irc_resume_handler(
     axum::Json(req): axum::Json<ResumeParams>,
 ) -> axum::Json<CallToolResult> {
     axum::Json(BlackboxServer::new(state).bro_resume(Parameters(req)).await)
+}
+
+pub(crate) async fn irc_steer_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<SteerParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(BlackboxServer::new(state).bro_steer(Parameters(req)))
+}
+
+pub(crate) async fn irc_interrupt_handler(
+    AxumState(state): AxumState<Arc<SharedState>>,
+    axum::Json(req): axum::Json<InterruptParams>,
+) -> axum::Json<CallToolResult> {
+    axum::Json(BlackboxServer::new(state).bro_interrupt(Parameters(req)))
 }
 
 pub(crate) async fn irc_broadcast_handler(
