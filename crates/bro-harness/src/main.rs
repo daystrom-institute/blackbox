@@ -1,27 +1,10 @@
-//! `bro-harness` — Anthropic-shaped headless coding agent.
+//! `bro-harness` — headless coding agent.
 //!
-//! Spawned as a subprocess by the daemon exactly like `claude`. Speaks the
-//! Anthropic Messages API directly (clean request body — no schema-violating
-//! CLI scaffolding), runs its own tool-calling loop, and emits the Claude
-//! stream-json envelope on stdout.
+//! Spawned as a subprocess by the daemon today; the same logic is also exposed
+//! as the `bro_harness` library for in-process execution.
 //!
 //! INVARIANT: stdout is the protocol channel — only NDJSON protocol lines go
 //! there. All diagnostics go to stderr.
-
-mod agent_loop;
-mod bound;
-mod cli;
-mod compaction;
-mod diagnostics;
-mod emit;
-mod hooks;
-mod lsp_baselines;
-mod mcp;
-mod project_doc;
-mod registry;
-mod report;
-mod session;
-mod transport;
 
 use clap::Parser;
 
@@ -35,8 +18,8 @@ async fn main() {
         )
         .init();
 
-    let cli = cli::Cli::parse();
-    if let Err(e) = agent_loop::run(cli).await {
+    let cli = bro_harness::cli::Cli::parse();
+    if let Err(e) = bro_harness::agent_loop::run(cli).await {
         // Surface the failure on stderr; the daemon captures it as the task's
         // stderr and marks the task failed on non-zero exit.
         tracing::error!("harness error: {e:#}");

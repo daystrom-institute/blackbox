@@ -1,9 +1,15 @@
 [workspace]
 # The root `blackbox` package is implicitly a member; these are the
-# Anthropic-harness crates (see design/orchestration/anthropic-harness.md).
-# They intentionally do NOT depend on the `blackbox` lib — the daemon↔harness
-# contract is the Claude stream-json envelope on stdout, not shared types.
-members = ["crates/bro-tools", "crates/bro-harness", "crates/bro-lsp"]
+# bro-harness crates. The contract-bottom crates are dependency-only schema/
+# trait crates; implementation crates point down at them, never sideways.
+members = [
+    "crates/bro-core",
+    "crates/bro-protocol",
+    "crates/bro-capabilities",
+    "crates/bro-tools",
+    "crates/bro-harness",
+    "crates/bro-lsp",
+]
 
 [package]
 name = "blackbox"
@@ -64,6 +70,10 @@ tera = "1"
 
 # Error handling
 anyhow = "1"
+bro-core = { path = "crates/bro-core" }
+bro-protocol = { path = "crates/bro-protocol" }
+bro-capabilities = { path = "crates/bro-capabilities" }
+bro-harness = { path = "crates/bro-harness" }
 
 # Fast non-poisoning locks
 parking_lot = "0.12"

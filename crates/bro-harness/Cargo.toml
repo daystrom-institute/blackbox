@@ -3,16 +3,22 @@ name = "bro-harness"
 version = "0.0.1"
 edition = "2024"
 
-# The Anthropic-shaped headless coding agent. Spawned as a subprocess by the
-# daemon exactly like `claude`; speaks the Anthropic Messages API directly,
-# runs its own tool-calling loop, and emits the Claude stream-json envelope on
-# stdout. See design/orchestration/anthropic-harness.md.
+# The bro-harness headless coding agent. It can run as a daemon-spawned
+# subprocess or, in later slices, as a linked library while preserving the same
+# stdout stream envelope. See design/orchestration/anthropic-harness.md.
 
 [[bin]]
 name = "bro-harness"
 path = "src/main.rs"
 
+[lib]
+name = "bro_harness"
+path = "src/lib.rs"
+
 [dependencies]
+bro-core = { path = "../bro-core" }
+bro-protocol = { path = "../bro-protocol" }
+bro-capabilities = { path = "../bro-capabilities" }
 bro-tools = { path = "../bro-tools" }
 bro-lsp = { path = "../bro-lsp" }
 lsp-types = "0.94.1"
@@ -25,9 +31,9 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
 futures-util = "0.3"
 async-trait = "0.1"
-# WebSocket Responses transport (codex's responses_websockets path). rustls is a
-# direct dep only to install a process-default crypto provider (rustls 0.23
-# requires one before a ClientConfig can be built); see openai_responses_ws.rs.
+# WebSocket Responses transport. rustls is a direct dep only to install a
+# process-default crypto provider (rustls 0.23 requires one before a
+# ClientConfig can be built); see openai_responses_ws.rs.
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 tracing = "0.1"

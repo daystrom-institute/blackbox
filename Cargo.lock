@@ -331,6 +331,10 @@ dependencies = [
  "async-trait",
  "axum",
  "bincode",
+ "bro-capabilities",
+ "bro-core",
+ "bro-harness",
+ "bro-protocol",
  "chrono",
  "clap",
  "cron",
@@ -415,13 +419,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "bro-capabilities"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "bro-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "bro-core"
+version = "0.0.1"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "bro-harness"
 version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "bro-capabilities",
+ "bro-core",
  "bro-lsp",
+ "bro-protocol",
  "bro-tools",
  "chrono",
  "clap",
@@ -451,6 +475,14 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "bro-protocol"
+version = "0.0.1"
+dependencies = [
+ "bro-core",
+ "serde",
 ]
 
 [[package]]
