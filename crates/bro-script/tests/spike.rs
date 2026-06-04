@@ -114,6 +114,21 @@ impl CorpusCapability for ErrCorpus {
     }
 }
 
+// A corpus whose single hit carries a large body, to exercise the ref/egress
+// boundary: the full value must stay host-side, only the envelope crosses, and
+// `text()` egress is budget-bounded.
+struct BigCorpus;
+#[async_trait]
+impl CorpusCapability for BigCorpus {
+    async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
+        tokio::task::yield_now().await;
+        Ok(vec![CorpusHit {
+            id: "big".to_string(),
+            text: "x".repeat(5000),
+        }])
+    }
+}
+
 fn caps_with(
     corpus: Arc<dyn CorpusCapability>,
     atoms: Arc<dyn AtomCapability>,
@@ -171,12 +186,38 @@ async fn denied_globals() {
 // Real capability bridges (criterion #4) — one per trait method.
 // ---------------------------------------------------------------------------
 
+// Each capability op now returns a `{ ref, size, preview }` envelope; the full
+// value stays host-side and is retrievable ONLY via `narf.ref.text`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corpus_search_bridge() {
+async fn corpus_search_returns_ref_envelope() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "redis", limit: 2 }); return r[0].text;"#,
+            r#"const r = await corpus.search({ query: "redis", limit: 2 });
+               return JSON.stringify({
+                 hasRef: typeof r.ref === 'string' && r.ref.startsWith('ref:cap/'),
+                 hasSize: typeof r.size === 'number' && r.size > 0,
+                 previewHasText: r.preview.includes('found:redis'),
+                 noFullValue: r[0] === undefined,
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"hasRef\":true,\"hasSize\":true,\"previewHasText\":true,\"noFullValue\":true}""#
+    );
+}
+
+// Ref round-trip: the handle materializes the REAL value via bounded egress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corpus_search_ref_roundtrip_via_text() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const r = await corpus.search({ query: "redis", limit: 2 });
+               const hits = JSON.parse(narf.ref.text(r));
+               return hits[0].text;"#,
         )
         .await
         .unwrap();
@@ -184,12 +225,14 @@ async fn corpus_search_bridge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn atom_invoke_bridge() {
+async fn atom_invoke_returns_envelope_and_materializes() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
             r#"const r = await atoms.invoke("my-atom", { x: 1 });
-               return r.output_json.atom + ":" + r.output_json.echo.x;"#,
+               if (r.output_json !== undefined) return 'LEAKED_FULL_VALUE';
+               const v = JSON.parse(narf.ref.text(r));
+               return v.output_json.atom + ":" + v.output_json.echo.x;"#,
         )
         .await
         .unwrap();
@@ -197,13 +240,17 @@ async fn atom_invoke_bridge() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refactor_plan_and_materialize_bridge() {
+async fn refactor_plan_and_materialize_via_refs() {
     let rt = stub_runtime().await;
+    // plan() and materialize() both return ref envelopes; the real plan id is
+    // only reachable through explicit egress of the plan ref.
     let out = rt
         .execute(
             r#"const h = await refactor.plan({ kind: "rename", input_json: { sym: "foo" } });
-               const m = await refactor.materialize(h);
-               return h.preview + "|" + m.materialized;"#,
+               const plan = JSON.parse(narf.ref.text(h));
+               const m = await refactor.materialize(plan.id);
+               const mat = JSON.parse(narf.ref.text(m));
+               return plan.preview + "|" + mat.materialized;"#,
         )
         .await
         .unwrap();
@@ -356,6 +403,7 @@ async fn heap_oom_containment_process_survives() {
     let policy = SupervisionPolicy {
         heap_limit_bytes: 24 * 1024 * 1024,
         execution_timeout: None,
+        ..SupervisionPolicy::default()
     };
     let rt = ScriptRuntime::new(stub_caps(), policy).await.unwrap();
     let result = rt
@@ -382,6 +430,7 @@ async fn runaway_loop_killed_by_external_watchdog_and_runtime_reusable() {
     let policy = SupervisionPolicy {
         heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
         execution_timeout: None,
+        ..SupervisionPolicy::default()
     };
     let rt = ScriptRuntime::new(stub_caps(), policy).await.unwrap();
     let handle = rt.isolate_handle();
@@ -413,6 +462,7 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
     let policy = SupervisionPolicy {
         heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
         execution_timeout: Some(Duration::from_millis(300)),
+        ..SupervisionPolicy::default()
     };
     let rt = ScriptRuntime::new(stub_caps(), policy).await.unwrap();
 
@@ -431,8 +481,152 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
     assert_eq!(rt.execute("return 'alive';").await.unwrap(), "\"alive\"");
     // And a fast capability call still completes well under the timeout.
     let out = rt
-        .execute(r#"const r = await corpus.search({ query: "q", limit: 1 }); return r[0].text;"#)
+        .execute(
+            r#"const r = await corpus.search({ query: "q", limit: 1 });
+               return JSON.parse(narf.ref.text(r))[0].text;"#,
+        )
         .await
         .unwrap();
     assert_eq!(out, "\"found:q\"");
+}
+
+// ---------------------------------------------------------------------------
+// §9-1: Ref substrate + bounded egress.
+// ---------------------------------------------------------------------------
+
+fn big_caps() -> Capabilities {
+    caps_with(
+        Arc::new(BigCorpus),
+        Arc::new(StubAtoms),
+        Arc::new(StubRefactor),
+    )
+}
+
+// `peek` returns metadata (kind, size, content type, preview) — never the bytes,
+// and never charges egress budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ref_peek_returns_metadata_not_bytes() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const r = await corpus.search({ query: "redis", limit: 1 });
+               const m = narf.ref.peek(r);
+               return JSON.stringify({
+                 kind: m.kind,
+                 hasSize: typeof m.size === 'number',
+                 contentType: m.content_type,
+                 hasPreview: typeof m.preview === 'string',
+                 noValue: m.value === undefined,
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"kind\":\"cap\",\"hasSize\":true,\"contentType\":\"application/json\",\"hasPreview\":true,\"noValue\":true}""#
+    );
+}
+
+// A large capability result does NOT appear in the op's direct JS return: the
+// envelope is tiny, while the (host-side) full value is large.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_result_does_not_enter_js_via_op_return() {
+    let rt = ScriptRuntime::new(big_caps(), SupervisionPolicy::default())
+        .await
+        .unwrap();
+    let out = rt
+        .execute(
+            r#"const r = await corpus.search({ query: "big", limit: 1 });
+               const envelopeStr = JSON.stringify(r);
+               return JSON.stringify({
+                 envelopeSmall: envelopeStr.length < 1500,
+                 sizeLarge: r.size > 4000,
+                 noFullValue: r[0] === undefined,
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"envelopeSmall\":true,\"sizeLarge\":true,\"noFullValue\":true}""#
+    );
+}
+
+// The cumulative egress budget is enforced: once spent, a further `text()` that
+// would exceed the remainder fails closed with a catchable JS error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn egress_budget_enforced_cumulatively() {
+    let policy = SupervisionPolicy {
+        egress_budget_bytes: 4096,
+        ..SupervisionPolicy::default()
+    };
+    let rt = ScriptRuntime::new(big_caps(), policy).await.unwrap();
+    let out = rt
+        .execute(
+            r#"const r = await corpus.search({ query: "big", limit: 1 });
+               const a = narf.ref.text(r, 4000);   // 4000 <= 4096 remaining: ok
+               let threw = false, msg = '';
+               try { narf.ref.text(r, 4000); }      // 4000 > 96 remaining: fails closed
+               catch (e) { threw = true; msg = String(e); }
+               return JSON.stringify({
+                 firstLen: a.length,
+                 threw,
+                 budgetErr: msg.includes('egress budget'),
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"firstLen\":4000,\"threw\":true,\"budgetErr\":true}""#
+    );
+}
+
+// `text()` honors its per-call cap and the default cap, charging only what it
+// returns; a small ref under the default cap materializes whole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ref_text_respects_per_call_cap() {
+    let rt = ScriptRuntime::new(big_caps(), SupervisionPolicy::default())
+        .await
+        .unwrap();
+    let out = rt
+        .execute(
+            r#"const r = await corpus.search({ query: "big", limit: 1 });
+               const capped = narf.ref.text(r, 100);   // explicit small cap
+               const dflt = narf.ref.text(r);          // default 8 KiB cap >= size
+               return JSON.stringify({
+                 cappedLen: capped.length,
+                 defaultLen: dflt.length,
+                 fullSize: r.size,
+                 defaultIsFull: dflt.length === r.size,
+               });"#,
+        )
+        .await
+        .unwrap();
+    // size = serialized [{"id":"big","text":"x"*5000}] which is > 5000 bytes and
+    // < the 8 KiB default cap, so the default-cap read returns the whole value.
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(v["cappedLen"], 100);
+    assert_eq!(v["defaultIsFull"], true);
+    assert_eq!(v["defaultLen"], v["fullSize"]);
+}
+
+// Unknown / wrong ref handles fail closed with a clean catchable JS error on both
+// egress entry points.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unknown_ref_handle_errors() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"let textThrew = false, peekThrew = false;
+               try { narf.ref.text("ref:cap/9999", 100); }
+               catch (e) { textThrew = String(e).includes('unknown ref'); }
+               try { narf.ref.peek("ref:cap/9999"); }
+               catch (e) { peekThrew = String(e).includes('unknown ref'); }
+               return JSON.stringify({ textThrew, peekThrew });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, r#""{\"textThrew\":true,\"peekThrew\":true}""#);
 }
