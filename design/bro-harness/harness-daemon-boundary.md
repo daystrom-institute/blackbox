@@ -744,15 +744,40 @@ roster render.
     pin-tools / `ProviderMcp::build_fleet_mcp_args` translation — both candidates
     to wire into daemon-side `/control/exec` (forwarding fleet.json MCP/pin tools)
     or delete when the daemon dispatch is consolidated.
-  - NOT done: **1c** relocate the view/wire DTOs (`TaskStatus`/`AgentHandle`/
-    `DispatchSpec`/`ResumeSpec`/`TranscriptItem`/`Todo*`/`ClassifierConfig`/
-    `FleetConfig`) into `bro-protocol` and the parser transcript types into a
-    shared crate; **1d** point `bro-cli` at the contract bottom + a thin client
-    crate and DROP the `blackbox = { path = ... }` dependency. (The remaining
-    `bro-cli → blackbox` surface is `blackbox::fleet::*` (the now daemon-only
-    `FleetOrchestrator` + DTOs + `intern_rider`/`provider_supports_bidi`),
-    `blackbox::parser::*`, and `blackbox::config::load`.) Still a durable-bro +
-    reviewer effort, not a single sprint.
+  - **Step 1c — DONE: pure view/wire DTOs relocated to `bro-protocol`; client
+    `TaskStatus` unified.** The genuinely-pure command-plane + transcript DTOs
+    now live at the contract bottom: `DispatchSpec`/`ResumeSpec`
+    (`crates/bro-protocol/src/dispatch.rs`) and `TranscriptItem`/`TodoState`/
+    `TodoItem`/`TodoItemStatus` (`crates/bro-protocol/src/transcript.rs`).
+    `blackbox::fleet` re-exports all six (`pub use bro_protocol::{…}`) so the
+    `bro-cli` consumers don't churn. **TaskStatus unification:**
+    `blackbox::fleet::TaskStatus` now re-exports `bro_protocol::TaskStatus` (the
+    5-variant wire enum with `Pending`), so the client settles on one enum; the
+    fleet engine's task mirror still speaks the daemon-internal
+    `orchestration::TaskStatus` (4 variants, aliased `OrchStatus` inside
+    `fleet.rs`) and maps to the wire enum at the `snapshot()` boundary
+    (`orch_status_to_wire`). When the mirror extracts into the client crate (1d)
+    its status field becomes `bro_protocol::TaskStatus` directly and the map
+    disappears. `bro-cli`'s only consequent edit: a `Pending` arm folded into the
+    live Running buckets in `fleet_state_from_snapshot`.
+    **Deliberately NOT moved to `bro-protocol`:** `ClassifierConfig`/`FleetConfig`
+    (fleet.json config the daemon never reads — client-local, not a daemon↔client
+    wire contract; they travel into the client crate in 1d), the transcript
+    *parser* (`parse_transcript` + helpers — logic, stays daemon-side for 1c,
+    moves with the engine in 1d), and `AgentHandle`/`TaskSnapshot`/
+    `FleetOrchestrator` (live handles + the engine itself — 1d). Validated:
+    `bro-protocol` checks standalone; `blackbox`+`bro-cli` `cargo check` clean;
+    26 fleet + 27 provider lib tests pass; 0 new clippy.
+  - NOT done: **1d** extract the fleet client engine (`FleetOrchestrator`/
+    `AgentHandle`/`DaemonFleetClient` + the client `Task`/`TaskStore` mirror +
+    `parse_transcript` + `ClassifierConfig`/`FleetConfig` IO + the needed
+    transcript parsers) out of `blackbox` into a client crate; point `bro-cli` at
+    the contract bottom + that crate and DROP the `blackbox = { path = ... }`
+    dependency. (The remaining `bro-cli → blackbox` surface is
+    `blackbox::fleet::*` (the now daemon-only `FleetOrchestrator` + engine +
+    `intern_rider`/`provider_supports_bidi`), `blackbox::parser::*`, and
+    `blackbox::config::load`.) Still a durable-bro + reviewer effort, not a single
+    sprint.
 - **§5 in-process V8 + supervised shell (execution isolation).** Not started;
   no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
   per-child env hook but not timeout/cap supervision.

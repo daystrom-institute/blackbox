@@ -37,9 +37,37 @@ use super::{Task, TaskInner, TaskStore, format_elapsed, now_ms};
 // cockpit handles agents through the opaque [`AgentHandle`] and reads state via
 // [`TaskSnapshot`], so the crate-private `TaskInner` (and its private-typed
 // fields) never leak into the public API.
-pub use super::TaskStatus;
+// The client (`bro fleet`) settles on the wire `bro_protocol::TaskStatus` (the
+// superset with `Pending`); the engine's task mirror still speaks the daemon's
+// internal `orchestration::TaskStatus` (4 variants) and maps to the wire enum at
+// the `snapshot()` boundary. When the mirror extracts into the client crate (1d)
+// its status field becomes `bro_protocol::TaskStatus` directly and the map goes
+// away. Internally this module names the orchestration enum `OrchStatus`.
+pub use bro_protocol::TaskStatus;
+use super::TaskStatus as OrchStatus;
 pub use super::providers::Provider;
 pub use super::tail::TailEvent;
+
+// The pure view/wire DTOs now live at the contract bottom (`bro-protocol`) so
+// the thin fleet client can name them without linking the daemon
+// (harness-daemon-boundary.md §2/§7). Re-exported here so existing
+// `blackbox::fleet::*` consumers don't churn while the engine still lives in the
+// daemon crate.
+pub use bro_protocol::{
+    DispatchSpec, ResumeSpec, TodoItem, TodoItemStatus, TodoState, TranscriptItem,
+};
+
+/// Map the daemon's internal task status onto the wire `bro_protocol::TaskStatus`
+/// the cockpit consumes. Lossless (the orchestration enum is a subset — it has
+/// no `Pending`). The fleet client never surfaces the daemon's internal enum.
+fn orch_status_to_wire(status: OrchStatus) -> TaskStatus {
+    match status {
+        OrchStatus::Running => TaskStatus::Running,
+        OrchStatus::Completed => TaskStatus::Completed,
+        OrchStatus::Failed => TaskStatus::Failed,
+        OrchStatus::Cancelled => TaskStatus::Cancelled,
+    }
+}
 
 /// TUI-local fleet config — `fleet.json` beside the selected blackbox
 /// `config.toml` but read entirely daemon-free. Deliberately
@@ -308,72 +336,7 @@ impl FleetConfig {
     }
 }
 
-/// What to dispatch as a new top-level entrypoint agent. The cockpit's
-/// composer fills this in; cwd/model are optional and resolved per dispatch
-/// (no stickiness on the agent itself — provider is fixed at spawn, §4).
-#[derive(Debug, Clone)]
-pub struct DispatchSpec {
-    pub provider: Provider,
-    pub prompt: String,
-    pub cwd: Option<String>,
-    pub model: Option<String>,
-    /// Effort/thinking level passed to the provider CLI's `--effort`.
-    pub effort: Option<String>,
-    /// Extra env overrides for the child (e.g. MCP injection wiring). The
-    /// cockpit's TUI-local config (§5.2) feeds this; `None` for a bare launch.
-    pub env_overrides: Option<HashMap<String, String>>,
-    /// Display name persisted with the task (stored in `bro_label`) so it
-    /// survives a cockpit reload. Defaults to the initial prompt's head.
-    pub name: Option<String>,
-}
-
-impl DispatchSpec {
-    pub fn new(provider: Provider, prompt: impl Into<String>) -> Self {
-        Self {
-            provider,
-            prompt: prompt.into(),
-            cwd: None,
-            model: None,
-            effort: None,
-            env_overrides: None,
-            name: None,
-        }
-    }
-}
-
-/// Resume a prior (Interrupted / reloaded) session and continue it with a new
-/// turn — `--resume <session_id> -p <prompt>` (§5: steering an Interrupted
-/// session auto-resumes). The harness/Claude CLI reloads the on-disk transcript.
-#[derive(Debug, Clone)]
-pub struct ResumeSpec {
-    pub provider: Provider,
-    pub session_id: String,
-    pub prompt: String,
-    pub cwd: Option<String>,
-    pub model: Option<String>,
-    pub effort: Option<String>,
-    pub name: Option<String>,
-    pub env_overrides: Option<HashMap<String, String>>,
-}
-
-impl ResumeSpec {
-    pub fn new(
-        provider: Provider,
-        session_id: impl Into<String>,
-        prompt: impl Into<String>,
-    ) -> Self {
-        Self {
-            provider,
-            session_id: session_id.into(),
-            prompt: prompt.into(),
-            cwd: None,
-            model: None,
-            effort: None,
-            name: None,
-            env_overrides: None,
-        }
-    }
-}
+// `DispatchSpec` / `ResumeSpec` now live in `bro_protocol` (re-exported above).
 
 /// Opaque handle to a dispatched entrypoint agent. Wraps the live task mirror
 /// (fed by the daemon status poller); the cockpit holds these and reads state
@@ -451,7 +414,7 @@ impl AgentHandle {
         // parser ignores `report` lines, so the cockpit derives them here.
         let stream = derive_stream_state(&inner.events);
         TaskSnapshot {
-            status: inner.status,
+            status: orch_status_to_wire(inner.status),
             provider: inner.provider,
             session_id: inner.session_id.clone(),
             last_assistant_message: inner.last_assistant_message.clone(),
@@ -487,62 +450,9 @@ impl AgentHandle {
     }
 }
 
-/// One rendered item in the verbose inline transcript (§5.4). The fleet layer
-/// owns this model rather than reusing `transcripts/types.rs` so the live
-/// cockpit view stays decoupled from the stored-transcript schema.
-#[derive(Debug, Clone, PartialEq)]
-pub enum TranscriptItem {
-    /// An operator steer / reply (`▌ you ›`).
-    UserSteer(String),
-    /// Assistant prose (rendered as markdown).
-    AssistantText(String),
-    /// Extended-thinking block (`✻`, dim).
-    Thinking(String),
-    /// A tool call with its raw JSON arguments (`⏺ name`).
-    ToolCall { name: String, args: String },
-    /// A tool result. `tool` is the originating tool name (correlated by
-    /// tool_use_id) so the renderer can show change-making tools (Edit/MCP)
-    /// verbosely while suppressing noisy output (Bash). `is_error` renders red.
-    ToolResult {
-        tool: Option<String>,
-        content: String,
-        is_error: bool,
-        /// The window-0 diagnostics rider split off the tool body, when the
-        /// harness appended one (Rust file edits). Rendered distinctly.
-        rider: Option<String>,
-    },
-    /// The builtin `report` tool's status line (`◆`, §2.2).
-    Report { message: String, needs_input: bool },
-    /// Current shared TodoWrite state, parsed from the `todo_write` tool result.
-    TodoState(TodoState),
-    /// A `/compact` or auto-compaction boundary divider (§2.4).
-    CompactBoundary { trigger: String },
-    /// End-of-turn footer with usage/cost.
-    TurnFooter {
-        num_turns: Option<u64>,
-        cost_usd: Option<f64>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct TodoState {
-    pub total: usize,
-    pub completed: usize,
-    pub items: Vec<TodoItem>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TodoItem {
-    pub status: TodoItemStatus,
-    pub text: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TodoItemStatus {
-    Pending,
-    InProgress,
-    Completed,
-}
+// `TranscriptItem` / `TodoState` / `TodoItem` / `TodoItemStatus` now live in
+// `bro_protocol` (re-exported above). The parser below stays daemon-side for 1c
+// and moves with the engine into the client crate in 1d.
 
 /// Parse the raw stream-json buffer into ordered transcript items (§5.4 — the
 /// net-new live-stream parser). Handles the harness/Claude envelope: assistant
@@ -1050,7 +960,7 @@ impl DaemonFleetClient {
                     "pending".to_string(),
                     cwd,
                     name,
-                    TaskStatus::Failed,
+                    OrchStatus::Failed,
                     error.to_string(),
                 ),
                 daemon: None,
@@ -1072,7 +982,7 @@ impl DaemonFleetClient {
             session_id,
             cwd,
             name,
-            TaskStatus::Running,
+            OrchStatus::Running,
             String::new(),
         );
         let daemon = DaemonAgentHandle {
@@ -1156,7 +1066,7 @@ fn daemon_task(
     session_id: String,
     cwd: Option<String>,
     name: Option<String>,
-    status: TaskStatus,
+    status: OrchStatus,
     stderr: String,
 ) -> Arc<Task> {
     Arc::new(Task {
@@ -1208,7 +1118,7 @@ fn spawn_daemon_status_poller(
                         terminal_sent = true;
                         let inner = task.inner.lock();
                         match inner.status {
-                            TaskStatus::Completed => {
+                            OrchStatus::Completed => {
                                 let _ = tail_tx.send(TailEvent::TaskCompleted {
                                     task_id: inner.id.clone(),
                                     elapsed: format_elapsed(inner.started_at, inner.completed_at),
@@ -1217,20 +1127,20 @@ fn spawn_daemon_status_poller(
                                     task_kind: inner.bro_label.clone(),
                                 });
                             }
-                            TaskStatus::Failed => {
+                            OrchStatus::Failed => {
                                 let _ = tail_tx.send(TailEvent::TaskFailed {
                                     task_id: inner.id.clone(),
                                     elapsed: format_elapsed(inner.started_at, inner.completed_at),
                                     error: inner.stderr.clone(),
                                 });
                             }
-                            TaskStatus::Cancelled => {
+                            OrchStatus::Cancelled => {
                                 let _ = tail_tx.send(TailEvent::TaskCancelled {
                                     task_id: inner.id.clone(),
                                     elapsed: String::new(),
                                 });
                             }
-                            TaskStatus::Running => {}
+                            OrchStatus::Running => {}
                         }
                     }
                     if terminal {
@@ -1261,12 +1171,12 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
             inner.session_id = sid.as_str().to_string();
         }
         inner.status = match snap.status {
-            bro_protocol::TaskStatus::Completed => TaskStatus::Completed,
-            bro_protocol::TaskStatus::Failed => TaskStatus::Failed,
-            bro_protocol::TaskStatus::Cancelled => TaskStatus::Cancelled,
+            bro_protocol::TaskStatus::Completed => OrchStatus::Completed,
+            bro_protocol::TaskStatus::Failed => OrchStatus::Failed,
+            bro_protocol::TaskStatus::Cancelled => OrchStatus::Cancelled,
             // Pending/Running both map to the daemon's Running.
             bro_protocol::TaskStatus::Pending | bro_protocol::TaskStatus::Running => {
-                TaskStatus::Running
+                OrchStatus::Running
             }
         };
     } else {
@@ -1275,10 +1185,10 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
         }
         if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
             inner.status = match status {
-                "completed" => TaskStatus::Completed,
-                "failed" => TaskStatus::Failed,
-                "cancelled" => TaskStatus::Cancelled,
-                _ => TaskStatus::Running,
+                "completed" => OrchStatus::Completed,
+                "failed" => OrchStatus::Failed,
+                "cancelled" => OrchStatus::Cancelled,
+                _ => OrchStatus::Running,
             };
         }
     }
@@ -1547,7 +1457,7 @@ impl FleetOrchestrator {
         .map_err(|err| err.to_string());
         if result.is_ok() {
             let mut inner = handle.task.inner.lock();
-            inner.status = TaskStatus::Cancelled;
+            inner.status = OrchStatus::Cancelled;
             inner.completed_at = Some(now_ms());
             handle.task.notify.notify_waiters();
         }

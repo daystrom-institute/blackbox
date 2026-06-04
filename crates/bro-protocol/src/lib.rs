@@ -6,6 +6,12 @@
 use bro_core::{BroError, SessionId, TaskId};
 use serde::{Deserialize, Serialize};
 
+mod dispatch;
+mod transcript;
+
+pub use dispatch::{DispatchSpec, ResumeSpec};
+pub use transcript::{TodoItem, TodoItemStatus, TodoState, TranscriptItem};
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "type")]
 pub enum SessionCommand {

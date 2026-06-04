@@ -205,10 +205,12 @@ fn fleet_state_from_snapshot(
         // a turn in flight is Active; finished-but-blocked is Waiting;
         // finished-and-free is Idle. Alerting (supervision loop/stall/burn)
         // is a follow-on, not yet derived.
-        TaskStatus::Running if turn_active => FleetState::Active,
-        TaskStatus::Running if needs_input => FleetState::Waiting,
-        TaskStatus::Running if stale_finished => FleetState::Finished,
-        TaskStatus::Running => FleetState::Idle,
+        // `Pending` (wire-only; the daemon hasn't started the turn yet) shares
+        // the live, non-terminal Running buckets.
+        TaskStatus::Running | TaskStatus::Pending if turn_active => FleetState::Active,
+        TaskStatus::Running | TaskStatus::Pending if needs_input => FleetState::Waiting,
+        TaskStatus::Running | TaskStatus::Pending if stale_finished => FleetState::Finished,
+        TaskStatus::Running | TaskStatus::Pending => FleetState::Idle,
         TaskStatus::Completed => FleetState::Finished,
         TaskStatus::Failed | TaskStatus::Cancelled if stale_finished => FleetState::Finished,
         TaskStatus::Failed | TaskStatus::Cancelled => FleetState::Interrupted,
