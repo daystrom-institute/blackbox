@@ -1024,6 +1024,13 @@ roster render.
     `ScriptRuntime::define/prepare/run` directly (import stays in-cell); harness
     adds `narf_define→exec(import)` shared-session + `narf_prepare→narf_run`
     2-step tests. bro-script 32, bro-harness lib 142; clippy clean; daemon links.
+  - **LIVE 2-STEP SMOKE PASSED** (isolated daemon 7299, real glm-5.1, prod 7264
+    untouched): the agent called `narf_prepare(source)` → got back
+    `{ref:"ref:narf-script/0", status:"ready", source:"…"}` with the **rendered
+    source in its context**, then called `narf_run({ref:"ref:narf-script/0"})` →
+    the prepared script ran (`fs.read` → sentinel bytes). It did NOT reach for
+    `narf_exec` — it 2-stepped through the now-model-facing controls, and the
+    shared per-session runtime carried the prepared ref across the two calls.
 - **Supervised shell (§5a).** Still only `with_spawn_scrub` + per-child env hook;
   timeout/ulimit-cgroup cap supervision not built (deferred behind §5b/§9 per the
   operator's sequencing).
