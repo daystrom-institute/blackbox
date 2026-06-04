@@ -876,17 +876,41 @@ roster render.
   `catch_unwind` wrapper is structural for the full build. Cost blackboxd inherits:
   +59 transitive crates, prebuilt `librusty_v8` ~196 MB, cold dep build ~165s /
   incremental ~6s. Independently re-verified by the orchestrator (`cargo test -p
-  bro-script` 6/6). NOT yet wired into bro-harness/agent-loop/daemon dispatch — that
-  is the full build (real `bro-capabilities` ops, supervision policy, ref-result
-  handles, then live daemon integration + tmux smoke).
+  bro-script` 6/6). The spike was then HARDENED into a real standalone runtime
+  (still zero `blackbox`, NOT yet daemon-wired):
+  - **`5048d22` (§5b-2):** the three real `bro-capabilities` traits
+    (`CorpusCapability`/`AtomCapability`/`RefactorCapability`) injected via a
+    `Capabilities` struct and bridged to JS (`corpus.search`/`atoms.invoke`/
+    `refactor.plan`/`refactor.materialize`) over a generalized 4-variant typed
+    `CapRequest` enum on the proven mpsc→outer-executor→oneshot path. The panic
+    guard is now **structural**: `guard_op` (sync) + `guard_async`/`Guarded<F>`
+    (wraps EVERY poll, incl. post-`await` resumption on the V8 thread, in
+    `catch_unwind`→`JsErrorBox`); every cap op routes through it. `SupervisionPolicy
+    { heap_limit_bytes=256 MiB, execution_timeout=30s }` default-ON; the timeout
+    auto-kills via the cross-thread `IsolateHandle`, runtime stays reusable.
+    Orchestrator-verified 14/14.
+  - **`ba2ae02` (§9-1, first NARF primitive):** the **Ref substrate + bounded
+    egress**. A per-runtime host-side `RefStore` (`Rc<RefCell<RefState>>` in
+    `OpState`) keyed by opaque `ref:cap/<id>` tokens; the 4 capability ops now store
+    their full output host-side and return ONLY a `{ref,size,preview}` envelope —
+    the value never enters the V8 heap/context. `narf.ref.text(handle,maxBytes?)`
+    is the only path bytes egress (UTF-8-safe, default 8 KiB cap); `narf.ref.peek`
+    returns metadata only. A per-runtime **cumulative** egress budget
+    (`SupervisionPolicy.egress_budget_bytes`, 256 KiB default-ON) fails closed on
+    overflow (narf-draft2 §7). Orchestrator-verified 20/20.
+  REMAINING for §5b/§9: the rest of the NARF substrate (`Promise`/`Plan`/`Tx`/
+  `Atom`/`Script` + the `narf_exec`/`narf_wait` model-facing surface) — note `Tx`
+  hits the §12 tx-vs-saga open fork, do not bake it in; then live daemon-agent-loop
+  integration + tmux smoke (operator-attended).
 - **Supervised shell (§5a).** Still only `with_spawn_scrub` + per-child env hook;
   timeout/ulimit-cgroup cap supervision not built (deferred behind §5b/§9 per the
   operator's sequencing).
-- **NARF substrate (§9).** Authoring layer (`Ref`/`Promise`/`Plan`/`Tx`/`Atom`/
-  `Script`, JS/TS bindings, `narf_exec`/`narf_wait`) is unbuilt; the V8 container it
-  rides on now exists (spike) and the capability seam it rides is in place. (The
-  peer `Design NARF capability library` commit is now `narf-capability-library.md` —
-  design, owning the query/authorship-surface layer that lands after the substrate.)
+- **NARF substrate (§9) — FOUNDATION STARTED.** The V8 container (§5b) + real
+  capability bindings + the `Ref`/bounded-egress primitive now exist in
+  `crates/bro-script` (see above). Still unbuilt: `Promise`/`Plan`/`Tx`/`Atom`/
+  `Script`, JS/TS bindings, `narf_exec`/`narf_wait`, and the
+  query/authorship-surface layer owned by `narf-capability-library.md` (session
+  helpers, prepare→run, grounding/route-cards) that lands on top.
 - **§4 deletion ledger.** The CLI-hole providers / tmux / opencode scrub landed
   earlier on the branch; verify no live CLI-shaped dispatch path remains before
   treating §4 as fully closed.
