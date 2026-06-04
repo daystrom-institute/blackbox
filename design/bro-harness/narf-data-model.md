@@ -297,12 +297,65 @@ opt-in kv"):
 - **Provenance depth** — what `origin`/`tags` carry, and whether anything reads
   them beyond audit.
 
-## 10. Relationship
+## 10. MCP tool placement (config++)
+
+The MVP needs external MCP tools usable **in-box**, not just as model-facing
+tools. This restates `narf-tool-placement.md` §4 in the post-rework idiom (values,
+not refs; reuse the host-tool seam, not a new trait). The reasoning is unchanged:
+the runtime can't infer whether an external MCP tool is exact-deref (in-box
+eligible) or interpretive (out-box) — that's a property of its semantics only the
+author knows — so it must be **declared**.
+
+**Config.** A flat, top-level `tool_placement` map in fleet.json (mirrors
+`pinTools`), keyed by fully-qualified tool name → `"in-box" | "out-box" | "both"`:
+
+```jsonc
+"tool_placement": {
+  "mcp__blackbox__bbox_code_node_describe": "in-box",  // exact deref → composable
+  "mcp__blackbox__bbox_hybrid_search":      "out-box", // interpretive → model judges
+  "mcp__blackbox__bbox_slice_read":         "both"
+  // everything unlisted defaults to out-box
+}
+```
+
+**Rules.**
+- **Default fail-safe → `out-box`.** An undeclared MCP tool is model-facing only.
+  Never silently admit an unknown tool in-box — an unproven-exact result laundered
+  into a cell is the soundness footgun (and "the box never selects" — an
+  interpretive search tool stays out-box unless the author explicitly, knowingly
+  places it in-box). No name heuristics; in-box admission is a stated trust
+  decision. This is also why a *placed-in-box* MCP tool is reachable in the cell
+  by **exact name only** — there is no in-box "discover what MCP tools exist."
+- **In-box MCP tools RETURN VALUES** (no ref envelopes — refs are retired). They
+  ride the **existing `ToolCapability`/HostTools seam**: a placed-in-box MCP tool
+  is just another `Tool` added to the per-session filtered host map, invoked via
+  the same `op_tool_invoke` path as `fs.*`/`shell.*` and exposed in the cell as
+  `narf.mcp.call(fqName, input)` (or `mcp(fqName, input)`). It reuses the existing
+  MCP client in `bro-harness/mcp.rs` — **no new `McpInvoke` trait, no
+  `blackbox`-crate MCP proxy** (the host-tool seam already exists, unlike when §4
+  was written). The returned value lands in the cell (out-of-context); an oversized
+  cell *return* is bounded by the §5 rider.
+- **`both`** = the tool is a model-facing registry tool **and** in the in-box host
+  map.
+- **The filter gates the capability, not a presence** (§4.5 carries forward):
+  `ToolFilter`/`exclude_tools` decide whether a tool exists at all; `placement`
+  only assigns the box side(s) of a survivor. A denied tool is neither in-box nor
+  out-box. The in-box host map MUST be built behind the **same `ToolFilter`** as
+  the flat surface (already true for builtins post-rework) — an unfiltered in-box
+  surface is a deny-bypass.
+- **Placement ≠ MCP surface** (§4.4): a surface decides *visibility*; placement
+  decides *box side* of a visible tool. Order: filter → placement.
+
+**Out of MVP scope:** placing `bro_*` orchestration tools (e.g. `bro_exec`)
+in-box (the §4.6 ref-in dispatch example — now value-in, recursion-guard
+unchanged); per-presence filter targeting (`name:in`/`:out`). Add when needed.
+
+## 11. Relationship
 
 - **Supersedes** [`narf-tool-placement.md`](./narf-tool-placement.md): its
   clip-fold (§5 step 6), Ref/Promise lattice (§3.1), and automatic ref-resolution
   (§3) are retired here. Its still-live parts carry forward: the in-box tool
-  taxonomy (§2 — implemented) and **MCP placement** (§4 — pending; see §9 here).
+  taxonomy (§2 — implemented) and **MCP placement** (§4 — reconciled here in §10).
 - **Supersedes** the **§9-1 ref substrate** (commit `ba2ae02`) recorded in
   [`harness-daemon-boundary.md`](./harness-daemon-boundary.md) §15, and refines
   that doc's §9 ref taxonomy (durable KV replaces the `ref:*` namespaces;
