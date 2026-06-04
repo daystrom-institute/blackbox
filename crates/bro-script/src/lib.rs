@@ -66,7 +66,7 @@ use anyhow::{anyhow, Result};
 use deno_core::v8;
 use deno_core::{op2, OpState, PollEventLoopOptions, RuntimeOptions};
 use deno_error::JsErrorBox;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 pub use bro_capabilities::{
@@ -253,6 +253,20 @@ impl RefState {
         }
     }
 
+    fn get_value(&self, handle: &str, expected_kind: &str) -> Result<String, String> {
+        let entry = self
+            .entries
+            .get(handle)
+            .ok_or_else(|| format!("unknown ref handle: {handle}"))?;
+        if entry.kind != expected_kind {
+            return Err(format!(
+                "ref {handle} has kind {}, expected {expected_kind}",
+                entry.kind
+            ));
+        }
+        Ok(entry.value.clone())
+    }
+
     /// Explicit, bounded egress: materialize up to `max_bytes` (0 → default
     /// [`DEFAULT_EGRESS_TEXT_BYTES`]) of the ref's value into JS, charging the
     /// cumulative budget. Fails closed (does NOT truncate) if the materialized
@@ -300,6 +314,165 @@ impl RefState {
 }
 
 type RefStateCell = Rc<RefCell<RefState>>;
+
+// ---------------------------------------------------------------------------
+// Session-local authoring state + prepared-script trace (§4 / §6)
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct SessionHelper {
+    pub source: String,
+    pub exports: Vec<String>,
+}
+
+/// Host-side per-session frame. Helpers are source, not V8 globals: imports
+/// re-inject source into the current cell/prepared artifact.
+#[derive(Clone, Debug, Default)]
+pub struct SessionState {
+    pub helpers: HashMap<String, SessionHelper>,
+    pub import_aliases: HashMap<String, String>,
+}
+
+type SessionStateCell = Rc<RefCell<SessionState>>;
+type TraceStateCell = Rc<RefCell<Vec<TraceEntry>>>;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TraceEntry {
+    #[serde(rename = "ref")]
+    pub ref_handle: String,
+    pub sequence: usize,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PrepareDiagnostic {
+    pub kind: String,
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PrepareResponse {
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub ref_handle: Option<String>,
+    pub status: String,
+    pub diagnostics: Vec<PrepareDiagnostic>,
+}
+
+#[derive(Deserialize)]
+struct SessionDefineInput {
+    name: String,
+    source: String,
+    exports: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct PrepareInput {
+    source: String,
+    #[serde(default)]
+    imports: Option<ImportSpec>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ImportSpec {
+    List(Vec<String>),
+    Map(HashMap<String, String>),
+}
+
+fn diagnostic(kind: &str, message: impl Into<String>) -> PrepareDiagnostic {
+    PrepareDiagnostic {
+        kind: kind.to_string(),
+        message: message.into(),
+    }
+}
+
+fn blocked(kind: &str, message: impl Into<String>) -> PrepareResponse {
+    PrepareResponse {
+        ref_handle: None,
+        status: "blocked".to_string(),
+        diagnostics: vec![diagnostic(kind, message)],
+    }
+}
+
+fn ready(handle: String) -> PrepareResponse {
+    PrepareResponse {
+        ref_handle: Some(handle),
+        status: "ready".to_string(),
+        diagnostics: vec![],
+    }
+}
+
+fn is_js_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c == '_' || c == '$' || c.is_ascii_alphabetic() => {}
+        _ => return false,
+    }
+    chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric())
+}
+
+fn strip_export_keywords(source: &str) -> String {
+    source
+        .replace("export async function ", "async function ")
+        .replace("export function ", "function ")
+        .replace("export const ", "const ")
+        .replace("export let ", "let ")
+        .replace("export var ", "var ")
+}
+
+fn helper_expression(helper: &SessionHelper) -> Result<String, String> {
+    if helper.exports.is_empty() {
+        return Err("session helper must declare at least one export".to_string());
+    }
+    for export in &helper.exports {
+        if !is_js_identifier(export) {
+            return Err(format!("invalid helper export identifier: {export}"));
+        }
+    }
+    let source = strip_export_keywords(&helper.source);
+    Ok(format!(
+        "(() => {{\n{source}\nreturn {{ {} }};\n}})()",
+        helper.exports.join(", ")
+    ))
+}
+
+fn resolve_imports(session: &SessionState, imports: Option<ImportSpec>) -> Result<String, String> {
+    let imports = match imports {
+        Some(ImportSpec::List(items)) => items
+            .into_iter()
+            .map(|alias| (alias.clone(), alias))
+            .collect::<Vec<_>>(),
+        Some(ImportSpec::Map(map)) => map.into_iter().collect::<Vec<_>>(),
+        None => vec![],
+    };
+
+    let mut rendered = String::new();
+    for (alias, target) in imports {
+        if !is_js_identifier(&alias) {
+            return Err(format!("invalid import alias identifier: {alias}"));
+        }
+        let helper_name = session
+            .import_aliases
+            .get(&target)
+            .or_else(|| session.helpers.contains_key(&target).then_some(&target))
+            .ok_or_else(|| format!("unknown import alias: {target}"))?;
+        let helper = session
+            .helpers
+            .get(helper_name)
+            .ok_or_else(|| format!("unknown session helper: {helper_name}"))?;
+        rendered.push_str("const ");
+        rendered.push_str(&alias);
+        rendered.push_str(" = ");
+        rendered.push_str(&helper_expression(helper)?);
+        rendered.push_str(";\n");
+    }
+    Ok(rendered)
+}
+
+fn render_prepare(session: &SessionState, input: PrepareInput) -> Result<String, String> {
+    let mut assembled = resolve_imports(session, input.imports)?;
+    assembled.push_str(&input.source);
+    Ok(assembled)
+}
 
 // ---------------------------------------------------------------------------
 // Capability request channel (V8-thread op -> outer-runtime executor)
@@ -575,6 +748,142 @@ fn op_ref_peek(state: &mut OpState, #[string] handle: String) -> Result<String, 
     })
 }
 
+/// `narf.session.define(name, { source, exports })` — store helper source in the
+/// host-side session frame and create the default import alias `name -> name`.
+#[op2(fast)]
+fn op_session_define(state: &mut OpState, #[string] input_json: String) -> Result<(), JsErrorBox> {
+    guard_op(|| {
+        let input: SessionDefineInput = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid session.define input: {e}")))?;
+        if !is_js_identifier(&input.name) {
+            return Err(JsErrorBox::generic(format!(
+                "invalid helper name identifier: {}",
+                input.name
+            )));
+        }
+        let helper = SessionHelper {
+            source: input.source,
+            exports: input.exports,
+        };
+        // Validate export names early; syntax is validated on import/prepare.
+        let _ = helper_expression(&helper).map_err(JsErrorBox::generic)?;
+        let session = state.borrow::<SessionStateCell>().clone();
+        let mut session = session.borrow_mut();
+        session
+            .import_aliases
+            .insert(input.name.clone(), input.name.clone());
+        session.helpers.insert(input.name, helper);
+        Ok(())
+    })
+}
+
+/// `narf.session.import(name)` support: return a source expression that injects
+/// the helper into the current cell. The expression is evaluated by the JS shim.
+#[op2]
+#[string]
+fn op_session_import(state: &mut OpState, #[string] name: String) -> Result<String, JsErrorBox> {
+    guard_op(|| {
+        let session = state.borrow::<SessionStateCell>().clone();
+        let session = session.borrow();
+        let helper_name = session
+            .import_aliases
+            .get(&name)
+            .or_else(|| session.helpers.contains_key(&name).then_some(&name))
+            .ok_or_else(|| JsErrorBox::generic(format!("unknown import alias: {name}")))?;
+        let helper = session
+            .helpers
+            .get(helper_name)
+            .ok_or_else(|| JsErrorBox::generic(format!("unknown session helper: {helper_name}")))?;
+        helper_expression(helper).map_err(JsErrorBox::generic)
+    })
+}
+
+/// Render a prepared script candidate without storing it. The JS shim validates
+/// syntax parse-only with `new Function(...)` and calls `op_prepare_store` only
+/// when parsing succeeds.
+#[op2]
+#[string]
+fn op_prepare_render(
+    state: &mut OpState,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_op(|| {
+        let input: PrepareInput = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid narf.prepare input: {e}")))?;
+        let session = state.borrow::<SessionStateCell>().clone();
+        let rendered = match render_prepare(&session.borrow(), input) {
+            Ok(source) => serde_json::json!({
+                "status": "ready",
+                "diagnostics": [],
+                "source": source,
+            }),
+            Err(e) => serde_json::json!({
+                "status": "blocked",
+                "diagnostics": [diagnostic("import", e)],
+            }),
+        };
+        serde_json::to_string(&rendered)
+            .map_err(|e| JsErrorBox::generic(format!("failed to serialize prepare render: {e}")))
+    })
+}
+
+/// Store a parse-validated prepared artifact in the existing ref store under
+/// `ref:narf-script/<id>`.
+#[op2]
+#[string]
+fn op_prepare_store(
+    state: &mut OpState,
+    #[string] assembled_source: String,
+) -> Result<String, JsErrorBox> {
+    guard_op(|| {
+        let refs = state.borrow::<RefStateCell>().clone();
+        let envelope =
+            refs.borrow_mut()
+                .put("narf-script", "application/javascript", assembled_source);
+        serde_json::to_string(&ready(envelope.handle))
+            .map_err(|e| JsErrorBox::generic(format!("failed to serialize prepare response: {e}")))
+    })
+}
+
+/// Return a stored prepared artifact's exact source for `narf.run(ref)`.
+#[op2]
+#[string]
+fn op_prepared_source(state: &mut OpState, #[string] handle: String) -> Result<String, JsErrorBox> {
+    guard_op(|| {
+        let refs = state.borrow::<RefStateCell>().clone();
+        let source = refs
+            .borrow()
+            .get_value(&handle, "narf-script")
+            .map_err(JsErrorBox::generic)?;
+        Ok(source)
+    })
+}
+
+#[op2(fast)]
+fn op_trace_record(state: &mut OpState, #[string] handle: String) -> Result<(), JsErrorBox> {
+    guard_op(|| {
+        let trace = state.borrow::<TraceStateCell>().clone();
+        let mut trace = trace.borrow_mut();
+        let sequence = trace.len();
+        trace.push(TraceEntry {
+            ref_handle: handle,
+            sequence,
+        });
+        Ok(())
+    })
+}
+
+#[op2]
+#[string]
+fn op_trace_entries(state: &mut OpState) -> Result<String, JsErrorBox> {
+    guard_op(|| {
+        let trace = state.borrow::<TraceStateCell>().clone();
+        let entries = trace.borrow().clone();
+        serde_json::to_string(&entries)
+            .map_err(|e| JsErrorBox::generic(format!("failed to serialize trace: {e}")))
+    })
+}
+
 /// Boundary-proof op: a synchronous panic, caught by [`guard_op`]. Proves the
 /// structural guard prevents a V8-frame unwind (criterion #5, sync path).
 #[op2(fast)]
@@ -603,6 +912,13 @@ deno_core::extension!(
         op_refactor_materialize,
         op_ref_text,
         op_ref_peek,
+        op_session_define,
+        op_session_import,
+        op_prepare_render,
+        op_prepare_store,
+        op_prepared_source,
+        op_trace_record,
+        op_trace_entries,
         op_panic_guarded,
         op_panic_guarded_async,
     ],
@@ -610,6 +926,8 @@ deno_core::extension!(
     state = |state, options| {
         state.put::<CapTx>(options.tx);
         state.put::<RefStateCell>(Rc::new(RefCell::new(RefState::new(options.egress_budget_bytes))));
+        state.put::<SessionStateCell>(Rc::new(RefCell::new(SessionState::default())));
+        state.put::<TraceStateCell>(Rc::new(RefCell::new(Vec::new())));
     },
 );
 
@@ -621,6 +939,17 @@ enum Job {
     Execute {
         body: String,
         reply: oneshot::Sender<Result<String>>,
+    },
+    Prepare {
+        input: String,
+        reply: oneshot::Sender<Result<PrepareResponse>>,
+    },
+    Run {
+        handle: String,
+        reply: oneshot::Sender<Result<String>>,
+    },
+    TraceLen {
+        reply: oneshot::Sender<usize>,
     },
     Shutdown,
 }
@@ -666,6 +995,11 @@ const BOOTSTRAP: &str = r#"
     // envelope (the full value stays host-side). `narf.ref` is the explicit,
     // bounded egress surface — `text()` is the only way a ref's bytes enter JS.
     const refToken = (h) => (typeof h === 'string' ? h : (h && h.ref));
+    const parsePrepared = (source) => {
+        // Parse-only validation of a body that will later run inside the same
+        // async-IIFE shape as ScriptRuntime::execute/run_one.
+        new Function(`return (async () => {\n${source}\n})`);
+    };
     globalThis.narf = {
         ref: {
             text: (handle, maxBytes) =>
@@ -674,6 +1008,43 @@ const BOOTSTRAP: &str = r#"
                     (maxBytes === undefined || maxBytes === null) ? 0 : maxBytes),
             peek: (handle) =>
                 JSON.parse(Deno.core.ops.op_ref_peek(refToken(handle))),
+        },
+        session: {
+            define: (name, helper) => {
+                Deno.core.ops.op_session_define(JSON.stringify({
+                    name,
+                    source: helper && helper.source,
+                    exports: helper && helper.exports,
+                }));
+            },
+            import: (name) => {
+                const expr = Deno.core.ops.op_session_import(name);
+                return (0, eval)(expr);
+            },
+        },
+        prepare: (args) => {
+            const rendered = JSON.parse(Deno.core.ops.op_prepare_render(JSON.stringify(args ?? {})));
+            if (rendered.status === 'blocked') {
+                return { status: 'blocked', diagnostics: rendered.diagnostics ?? [] };
+            }
+            try {
+                parsePrepared(rendered.source);
+            } catch (e) {
+                return {
+                    status: 'blocked',
+                    diagnostics: [{ kind: 'syntax', message: String(e) }],
+                };
+            }
+            return JSON.parse(Deno.core.ops.op_prepare_store(rendered.source));
+        },
+        run: async (handle) => {
+            const ref = refToken(handle);
+            const source = Deno.core.ops.op_prepared_source(ref);
+            Deno.core.ops.op_trace_record(ref);
+            return await (0, eval)(`(async () => {\n${source}\n})()`);
+        },
+        trace: {
+            entries: () => JSON.parse(Deno.core.ops.op_trace_entries()),
         },
     };
 "#;
@@ -770,6 +1141,52 @@ impl ScriptRuntime {
                 .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
         }
     }
+
+    pub async fn prepare(&self, source: impl Into<String>) -> Result<PrepareResponse> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(Job::Prepare {
+                input: source.into(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("V8 thread dropped the reply"))?
+    }
+
+    pub async fn run(&self, handle: impl Into<String>) -> Result<String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(Job::Run {
+                handle: handle.into(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+
+        match self.execution_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
+                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+                Err(_elapsed) => {
+                    self.isolate_handle.terminate_execution();
+                    Err(anyhow!("script execution timed out after {timeout:?}"))
+                }
+            },
+            None => reply_rx
+                .await
+                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+        }
+    }
+
+    pub async fn trace_len(&self) -> Result<usize> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(Job::TraceLen { reply: reply_tx })
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("V8 thread dropped the reply"))
+    }
 }
 
 impl Drop for ScriptRuntime {
@@ -853,6 +1270,28 @@ fn v8_thread_main(
                     runtime.v8_isolate().cancel_terminate_execution();
                     let _ = reply.send(result);
                 }
+                Job::Prepare { input, reply } => {
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let result = prepare_one(&mut runtime, &input);
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let _ = reply.send(result);
+                }
+                Job::Run { handle, reply } => {
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let result = run_prepared(&mut runtime, &handle).await;
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let _ = reply.send(result);
+                }
+                Job::TraceLen { reply } => {
+                    let trace = {
+                        let op_state = runtime.op_state();
+                        let state = op_state.borrow();
+                        let trace = state.borrow::<TraceStateCell>().clone();
+                        let len = trace.borrow().len();
+                        len
+                    };
+                    let _ = reply.send(trace);
+                }
             }
         }
     });
@@ -881,4 +1320,82 @@ async fn run_one(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<Strin
     let value: serde_json::Value = deno_core::serde_v8::from_v8(scope, local)
         .map_err(|e| anyhow!("failed to deserialize result: {e}"))?;
     Ok(value.to_string())
+}
+
+fn prepare_one(runtime: &mut deno_core::JsRuntime, source: &str) -> Result<PrepareResponse> {
+    let input = PrepareInput {
+        source: source.to_string(),
+        imports: None,
+    };
+    let assembled = {
+        let op_state = runtime.op_state();
+        let state = op_state.borrow();
+        let session = state.borrow::<SessionStateCell>().borrow();
+        match render_prepare(&session, input) {
+            Ok(source) => source,
+            Err(e) => return Ok(blocked("import", e)),
+        }
+    };
+
+    if let Err(message) = validate_script_syntax(runtime, &assembled) {
+        return Ok(blocked("syntax", message));
+    }
+
+    let handle = {
+        let op_state = runtime.op_state();
+        let state = op_state.borrow();
+        let refs = state.borrow::<RefStateCell>().clone();
+        let handle = refs
+            .borrow_mut()
+            .put("narf-script", "application/javascript", assembled)
+            .handle;
+        handle
+    };
+    Ok(ready(handle))
+}
+
+async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<String> {
+    let source = {
+        let op_state = runtime.op_state();
+        let state = op_state.borrow();
+        let refs = state.borrow::<RefStateCell>().clone();
+        let source = refs
+            .borrow()
+            .get_value(handle, "narf-script")
+            .map_err(|e| anyhow!(e))?;
+        source
+    };
+    {
+        let op_state = runtime.op_state();
+        let state = op_state.borrow();
+        let trace = state.borrow::<TraceStateCell>().clone();
+        let mut trace = trace.borrow_mut();
+        let sequence = trace.len();
+        trace.push(TraceEntry {
+            ref_handle: handle.to_string(),
+            sequence,
+        });
+    }
+    run_one(runtime, &source).await
+}
+
+fn validate_script_syntax(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<(), String> {
+    let wrapped = format!("(async () => {{\n{body}\n}})");
+    deno_core::scope!(scope, runtime);
+    let source = v8::String::new(scope, &wrapped)
+        .ok_or_else(|| "failed to allocate V8 source string".to_string())?;
+    v8::tc_scope!(let tc_scope, scope);
+    match v8::Script::compile(tc_scope, source, None) {
+        Some(_) => Ok(()),
+        None => {
+            let exception = tc_scope
+                .exception()
+                .ok_or_else(|| "unknown JavaScript syntax error".to_string())?;
+            let message = exception
+                .to_string(tc_scope)
+                .map(|s| s.to_rust_string_lossy(tc_scope))
+                .unwrap_or_else(|| "unknown JavaScript syntax error".to_string());
+            Err(message)
+        }
+    }
 }

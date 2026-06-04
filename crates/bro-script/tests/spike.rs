@@ -258,6 +258,124 @@ async fn refactor_plan_and_materialize_via_refs() {
 }
 
 // ---------------------------------------------------------------------------
+// v1 authoring surface: session helpers + prepare -> run.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_define_then_import_roundtrip() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"await narf.session.define("math", {
+                 source: `export function add(a, b) { return a + b; }`,
+                 exports: ["add"],
+               });
+               const math = await narf.session.import("math");
+               return math.add(2, 3);"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "5");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_rejects_invalid_js_syntax() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const prepared = await narf.prepare({ source: "const =" });
+               return JSON.stringify({
+                 status: prepared.status,
+                 kind: prepared.diagnostics[0].kind,
+                 noRef: prepared.ref === undefined,
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"status\":\"blocked\",\"kind\":\"syntax\",\"noRef\":true}""#
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_rejects_unknown_import_alias() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const prepared = await narf.prepare({
+                 imports: ["missingHelper"],
+                 source: "return 1;",
+               });
+               return JSON.stringify({
+                 status: prepared.status,
+                 kind: prepared.diagnostics[0].kind,
+                 mentionsAlias: prepared.diagnostics[0].message.includes("missingHelper"),
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"status\":\"blocked\",\"kind\":\"import\",\"mentionsAlias\":true}""#
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_run_composes_session_helper_and_capability_binding() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"await narf.session.define("lookup", {
+                 source: `
+                   export async function run(query) {
+                     return await corpus.search({ query, limit: 3 });
+                   }
+                 `,
+                 exports: ["run"],
+               });
+               const prepared = await narf.prepare({
+                 imports: ["lookup"],
+                 source: `return await lookup.run("narf");`,
+               });
+               if (prepared.status !== "ready") return "BLOCKED";
+               const result = await narf.run(prepared.ref);
+               return JSON.stringify({
+                 preparedRef: prepared.ref.startsWith("ref:narf-script/"),
+                 resultRef: result.ref.startsWith("ref:cap/"),
+                 preview: result.preview.includes("found:narf"),
+               });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        out,
+        r#""{\"preparedRef\":true,\"resultRef\":true,\"preview\":true}""#
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_records_trace_entry() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const prepared = await narf.prepare({ source: "return 42;" });
+               await narf.run(prepared.ref);
+               return JSON.stringify(narf.trace.entries());"#,
+        )
+        .await
+        .unwrap();
+    let entries: Vec<serde_json::Value> =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["sequence"], 0);
+    assert!(entries[0]["ref"]
+        .as_str()
+        .unwrap()
+        .starts_with("ref:narf-script/"));
+}
+
+// ---------------------------------------------------------------------------
 // Structural panic guard (criterion #5) — sync and async op paths.
 // ---------------------------------------------------------------------------
 
