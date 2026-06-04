@@ -961,9 +961,15 @@ roster render.
     tool-error JS-throw, fail-closed-when-absent); bro-harness capabilities 9→11
     (denied-tool fail-closed through the real `ToolFilter`; a NARF cell reading a
     real tempfile end-to-end through `fs.read`→`HostTools`→`FileRead`→ref→
-    `narf.ref.text`). `cargo check -p blackbox` links; clippy clean. **Live
-    daemon smoke still TODO** (prior steps' bar) to confirm the agent_loop
-    injection in a real dispatched session.
+    `narf.ref.text`). `cargo check -p blackbox` links; clippy clean. **LIVE SMOKE
+    PASSED** (isolated daemon port 7299 via `dev-agent-home.sh`, glm creds linked,
+    prod 7264 confirmed 200 throughout, exact-PID teardown): a real glm-5.1 agent
+    dispatched via `/control/exec` called `narf_exec` with
+    `const e = await fs.read('SMOKE.txt'); return narf.ref.text(e)` and returned
+    the sentinel file bytes — proving `agent_loop` builds + injects `HostTools`
+    in a real in-process session and the cell reaches the host-tool seam
+    end-to-end (model→narf_exec→in-daemon-V8→fs.read→op_tool_invoke→HostTools→
+    real FileRead against the session ToolCx→ref→bounded egress).
   - **Decision recorded:** took the §5.1 "one generic invoke-by-name bridge +
     ergonomic wrappers" fork over N bespoke capability traits — simplest, and
     steps 2–4 collapse to JS wrappers over the single op. Reversible.
