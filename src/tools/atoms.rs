@@ -19,6 +19,94 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
 
+fn atom_route_handle(name: &str, version: &str) -> String {
+    format!("atom:{name}@v{version}")
+}
+
+fn atom_route_fit(rank: usize) -> &'static str {
+    match rank {
+        0 => "high",
+        1 => "medium",
+        _ => "fallback",
+    }
+}
+
+fn atom_route_next() -> serde_json::Value {
+    serde_json::json!([
+        {
+            "tool": "atom_describe",
+            "reason": "review schema/effects"
+        }
+    ])
+}
+
+fn atom_required_inputs(manifest: &orchestration::atoms::types::AtomManifest) -> Vec<String> {
+    manifest
+        .inputs
+        .as_ref()
+        .and_then(|inputs| inputs.schema.as_ref())
+        .and_then(|schema| schema.get("required"))
+        .and_then(serde_json::Value::as_array)
+        .map(|required| {
+            required
+                .iter()
+                .filter_map(|field| field.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn normalized_field_text(text: &str) -> String {
+    text.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                ' '
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn compact_field_text(text: &str) -> String {
+    text.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+fn query_supplies_field(query: &str, field: &str) -> bool {
+    let query_lower = query.to_ascii_lowercase();
+    if query_lower.contains(&field.to_ascii_lowercase()) {
+        return true;
+    }
+    let query_words = normalized_field_text(query);
+    let field_words = normalized_field_text(field);
+    if !field_words.is_empty() && query_words.contains(&field_words) {
+        return true;
+    }
+    let query_compact = compact_field_text(query);
+    let field_compact = compact_field_text(field);
+    !field_compact.is_empty() && query_compact.contains(&field_compact)
+}
+
+fn atom_missing_facts(
+    query: &str,
+    manifest: &orchestration::atoms::types::AtomManifest,
+) -> Vec<String> {
+    atom_required_inputs(manifest)
+        .into_iter()
+        .filter(|field| !query_supplies_field(query, field))
+        .collect()
+}
+
+fn atom_stop_if(_manifest: &orchestration::atoms::types::AtomManifest) -> Vec<String> {
+    Vec::new()
+}
+
 pub(crate) fn router() -> ToolRouter<BlackboxServer> {
     BlackboxServer::atoms_tools()
 }
@@ -231,7 +319,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "atom_search",
-        description = "Search installed atoms by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores and provenance."
+        description = "Search installed atoms by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and v1 route-card fields: handle, kind, fit, next, missing_facts, stop_if."
     )]
     pub(crate) fn atom_search(
         &self,
@@ -265,11 +353,18 @@ impl BlackboxServer {
         };
         let json_results: Vec<serde_json::Value> = results
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(rank, r)| {
                 let mut obj = serde_json::json!({
                     "name": r.name,
                     "version": r.version,
                     "score": (r.score * 1000.0).round() / 1000.0,
+                    "handle": atom_route_handle(&r.name, &r.version),
+                    "kind": "existing_atom",
+                    "fit": atom_route_fit(rank),
+                    "next": atom_route_next(),
+                    "missing_facts": atom_missing_facts(query, &r.manifest),
+                    "stop_if": atom_stop_if(&r.manifest),
                     "description": r.description,
                     "when_to_use": r.when_to_use,
                     "anti_patterns": r.anti_patterns,

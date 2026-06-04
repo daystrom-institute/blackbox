@@ -448,6 +448,120 @@ fn workflow_wrapper_atom(name: &str, workflow_ref: &str) -> serde_json::Value {
         }
     })
 }
+
+fn route_card_search_atom(name: &str, repeated_keyword_count: usize) -> serde_json::Value {
+    let description = std::iter::repeat_n("alpha", repeated_keyword_count)
+        .collect::<Vec<_>>()
+        .join(" ");
+    serde_json::json!({
+        "_contract": "atom/v1",
+        "kind": "atom",
+        "name": name,
+        "version": 1,
+        "manifest": {
+            "description": description,
+            "when_to_use": ["alpha route-card search fixture"],
+            "inputs": {
+                "schema": {
+                    "type": "object",
+                    "required": ["project_dir", "source_file", "target_file"],
+                    "properties": {
+                        "project_dir": {"type": "string"},
+                        "source_file": {"type": "string"},
+                        "target_file": {"type": "string"}
+                    }
+                }
+            },
+            "effects": {
+                "writes_files": false,
+                "dispatches_runs": 0,
+                "max_depth": 0,
+                "uses_network": false
+            },
+            "composition": {
+                "may_invoke_atoms": {"kind": "none"}
+            },
+            "implementation": {
+                "kind": "deterministic",
+                "runner": "echo"
+            }
+        }
+    })
+}
+
+#[test]
+fn atom_search_returns_v1_route_card_fields_for_each_result() {
+    let tmp = tempfile::tempdir().unwrap();
+    let server = test_server(&tmp);
+    let cat = server.state.artifacts.read();
+    for (name, repeated_keyword_count) in [
+        ("route-card-high", 4),
+        ("route-card-medium", 2),
+        ("route-card-fallback", 1),
+    ] {
+        cat.install_value(
+            artifacts::ArtifactKind::Atom,
+            format!("{name}.json"),
+            &route_card_search_atom(name, repeated_keyword_count),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+    }
+    drop(cat);
+
+    let result = server.atom_search(Parameters(AtomSearchParams {
+        query: "alpha project_dir".into(),
+        limit: Some(3),
+        cost_class: None,
+        provenance_kind: None,
+        subcontract: None,
+        exclude_anti_pattern_matches: None,
+    }));
+    assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
+    let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+
+    let fits = results
+        .iter()
+        .map(|r| r["fit"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(fits, vec!["high", "medium", "fallback"]);
+
+    for result in results {
+        for field in ["handle", "kind", "fit", "next", "missing_facts", "stop_if"] {
+            assert!(
+                result.get(field).is_some(),
+                "missing field {field}: {result}"
+            );
+        }
+        for field in ["fit_reason", "nonfit_reason", "requires", "effects"] {
+            assert!(
+                result.get(field).is_none(),
+                "v2-only field {field} should not be present: {result}"
+            );
+        }
+        assert_eq!(result["kind"], "existing_atom");
+        assert!(
+            result["handle"]
+                .as_str()
+                .unwrap()
+                .starts_with("atom:route-card-")
+        );
+        assert!(result["handle"].as_str().unwrap().ends_with("@v1"));
+        assert!(result["next"].as_array().unwrap().iter().any(|step| {
+            step["tool"] == "atom_describe" && step["reason"] == "review schema/effects"
+        }));
+        assert_eq!(
+            result["missing_facts"],
+            serde_json::json!(["source_file", "target_file"])
+        );
+        assert_eq!(result["stop_if"], serde_json::json!([]));
+    }
+}
+
 #[tokio::test]
 async fn atom_invoke_deterministic_runner_returns_terminal_trace() {
     let tmp = tempfile::tempdir().unwrap();

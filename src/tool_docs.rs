@@ -1332,7 +1332,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "atom_search",
         category: ToolCategory::Orchestration,
-        summary: "Search installed atoms by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores and provenance.",
+        summary: "Search installed atoms by query string. Matches against description and when_to_use; penalizes or excludes results matching anti_patterns. Returns ranked results with scores, provenance, and v1 route-card fields: handle, kind, fit, next, missing_facts, stop_if.",
         when_to_use: "Discovery: find atoms relevant to a task. Call with the task description to get ranked candidates. Set exclude_anti_pattern_matches=false to see all matches including anti-pattern hits. Filter by cost_class, provenance_kind, or subcontract to narrow results.",
         example: Some(r#"atom_search(query="extract inline tests from Rust files", limit=3)"#),
     },
