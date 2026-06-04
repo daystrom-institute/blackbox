@@ -301,9 +301,14 @@ the layer earns its keep on the multi-step work, and never taxes the single step
 v1 §8 relaxed the no-daemon-runtime-dependency invariant for exploration but left
 the seam vague. Canon, made precise by the code:
 
-- **Harness-local substrate is daemon-free.** V8 runtime, refs, promises, shell,
-  workspace, and a *local-file* `Tx` are workspace-crate code both processes can
-  link. bro-harness runs alone, exactly as the existing invariant requires.
+- **Harness-local substrate is daemon-free *at the crate level*.** V8 runtime,
+  refs, promises, shell, workspace are workspace-crate code (`bro-script`,
+  `bro-tools`) that does not depend on `blackbox` — independently *buildable*. That
+  buildability is the entire content of "runs alone"; it is **not** a separate
+  runtime. In the live path the daemon **links and runs the harness in-process**
+  (one process), and daemon-free standalone mode was de-escalated to a test
+  artifact (boundary doc §11/§12; thread note 11). (`Tx` is parked —
+  `../../design/bro-harness/narf-effects-and-safety.md`.)
 
 - **Capability leaves arrive over the existing MCP injection seam.** Daemon-backed
   bindings — atoms (daemon-resident: everything in `composition.rs` lives on
@@ -387,11 +392,12 @@ built.
   built; the **edit-rollback composition is not**. Pick: shared-worktree
   transaction, or compensate-forward saga.
 
-- **Where V8 lives.** Inside bro-harness (keeps "harness runs alone," pays the
-  `v8` + `deno_core_icudata` binary/build cost and the thread-per-isolate ↔
-  `async ToolCx` bridge, `runtime/mod.rs:204`) vs a daemon-side runtime the
-  harness talks to (cheaper harness, bends the no-daemon-dep invariant harder than
-  §6's seam allows).
+- **Where V8 lives. RESOLVED (2026-06-04):** its own workspace crate
+  `crates/bro-script`, which `bro-harness` links and the daemon runs **in-process**
+  (the daemon links bro-harness). There is no separate harness process to "talk
+  to"; the crate boundary (bro-script depends only on the contract bottom, never
+  `blackbox`) is compile-time, not a runtime split. Pays the `v8`/`deno_core`
+  binary cost in `blackboxd`, accepted. See boundary doc §15 + thread note 12/16.
 
 - **Ref store backend.** Harness-session-local, daemon-backed, or a shared
   abstraction with both — and the GC/persistence rules for refs, traces,
@@ -470,6 +476,18 @@ The split is enforced **mechanically, in the type signature**, not by convention
   *direct* tools (`atom_search`, `hybrid_search`) backs the in-box `atom(ref)`
   facade; the facade strips interpretive capability from a store that has it. The
   box's surface stays exact even though storage is a search index.
+
+The same logic forbids **authoring / launch controls** in the box. `prepare`,
+`run`, `exec`, `wait`, and session-`define` are how the model *enters and exits* a
+cell and *reviews* what it is about to run — they require a model awake in the
+loop, which a running cell does not have. They are therefore **model-facing
+tools**, never `narf.*` bindings callable from authored JS. Putting the door
+(the controls that open the box) inside the room is the same category error as an
+in-box search. The discriminator is one line: *can this run to completion with the
+model asleep, and can downstream code trust the result without a model having
+looked?* — yes → in-box; no → model-facing. See
+[`../../design/bro-harness/narf-capability-library.md`](../../design/bro-harness/narf-capability-library.md)
+§0.1.
 
 **The model is the only bridge that collapses non-exact → exact.** Interpretive
 query → direct tool → context → model judges → model emits an exact ref → ref

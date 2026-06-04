@@ -44,6 +44,44 @@ next query/action round.
 The runtime should make the right path easy to continue, not merely rank text
 matches.
 
+## 0.1 Invariant — the box edge (model-facing controls vs in-box bindings)
+
+A running cell executes with **no model in the loop**: while it runs, the model
+is suspended, so nothing inside it can perceive, review, or decide. That fixes a
+hard line, and it is the load-bearing rule of this whole doc.
+
+- **Model-facing tools (outside the box; their results land in the model's
+  context).** Everything that *informs or constitutes a model decision*:
+  **discovery** (search / describe / scout — interpretive results the model must
+  adjudicate), **review** (`narf_prepare` returning the rendered, assembled
+  script so the model sees exactly what it is about to run), and **launch / await
+  / author** (`narf_exec`, `narf_run`, `narf_wait`, and `narf_define` to register
+  a session helper). These are ordinary tool calls the model issues in its turn
+  loop. They are **never** `narf.*` functions callable from inside a cell.
+- **In-box bindings (inside the box; no model required).** Only what a running
+  program composes mechanically over **exact, already-adjudicated** inputs:
+  capability dereference (`atoms.invoke(exactRef, …)`, `refactor.plan` /
+  `refactor.materialize`) and bounded ref egress (`narf.ref.text` /
+  `narf.ref.peek`). The box dereferences; it never selects, reviews, or launches.
+
+The discriminator, stated as a test: **can this run to completion inside a cell
+with the model asleep, and can downstream code trust the result without the model
+having looked?** Yes → in-box. No → model-facing.
+
+A `narf.prepare(...)` / `narf.run(...)` / `narf.capabilities.scout(...)` written
+as authored JS is therefore a **category error** — it puts the door (how the
+model enters and exits the box) *inside the room*. The controls that open the box
+cannot live inside the box, because using them requires the one thing a running
+cell does not have: a model, awake, in the loop.
+
+> **Reading the examples below.** Several were originally written in that
+> `await narf.X(...)` JS shape. Read every prepare / run / scout / session-define
+> as a **model-facing tool call** (now shown as `narf_prepare` / `narf_run` /
+> `narf_define` / a direct orientation tool), not an in-box binding. And `tx.*` in
+> the §4/§6 helper bodies predates the parked-`Tx` decision
+> ([`narf-effects-and-safety.md`](./narf-effects-and-safety.md)): a v1 cell carries
+> no transaction — ignore `tx` as a binding.
+
 ## 1. Why this exists
 
 NARF draft 2 already has the promotion endpoint: a proven program can be
@@ -121,7 +159,9 @@ by writing refs, traces, session metadata, or library telemetry.
 The opening move is a statement of intent, not a package lookup:
 
 ```ts
-const scout = await narf.capabilities.scout({
+// DIRECT model-facing orientation tool (e.g. atom_search), NOT an in-box call.
+// The model reads the route-card response (below) in its own context.
+const request = {
   intent:
     "Move a Rust item into a new module, preserve imports, run cargo check, " +
     "and repair compiler fallout if possible.",
@@ -134,7 +174,7 @@ const scout = await narf.capabilities.scout({
       "LSP-backed refactors fail closed"
     ]
   }
-});
+};
 ```
 
 The response is a set of route cards, not a ranked list of documents:
@@ -170,7 +210,7 @@ The response is a set of route cards, not a ranked list of documents:
       "next": [
         {"tool": "code.symbols", "reason": "ground item identity"},
         {"tool": "refactor.plan", "reason": "produce typed edit plan"},
-        {"tool": "narf.session.define", "reason": "save successful composition"}
+        {"tool": "narf_define", "reason": "save successful composition"}
       ]
     }
   ],
@@ -319,10 +359,15 @@ telemetry pressure pull in the rest.
 
 ## 4. Session-local helpers
 
-Agents should be able to keep a helper for the session without publishing it:
+Agents should be able to keep a helper for the session without publishing it.
+Registration is the **model-facing `narf_define` tool** (name + source in, a
+confirmation the model reads out) — not an in-box `narf.*` binding. The helper
+*body* below is in-box composition that runs later inside a cell; its `tx.*`
+predates the parked-`Tx` decision (§0.1), ignore it as a binding.
 
 ```ts
-await narf.session.define("rustCheckAndRepair", {
+// model-facing tool call: narf_define(name, spec) — shown as its argument payload
+narf_define("rustCheckAndRepair", {
   source: `
     export async function run(narf, { project, tx }) {
       const check = await narf.shell.run({
@@ -350,11 +395,17 @@ await narf.session.define("rustCheckAndRepair", {
 });
 ```
 
-Later cells import it by session name:
+Later cells recall it by session name with the in-box `session.import` — the
+helper *source stays host-side* and never re-enters context, exactly the
+bloat-minimization discipline refs use. Recall-by-exact-name is a dereference, not
+a selection, so it is cleanly in-box. (`narf_prepare` *can* also inline a helper
+into the assembled script for review, but that re-materializes the body into
+context every use, so it is a deliberate tradeoff, not the default.)
 
 ```ts
-const repair = await narf.session.import("rustCheckAndRepair");
-await repair.run(narf, { project, tx });
+// in-box recall: source stays host-side, only the name crosses into the cell
+const repair = session.import("rustCheckAndRepair");
+repair.run({ project });
 ```
 
 The session helper can be promoted to a NARF-lib candidate when it is used
@@ -433,32 +484,36 @@ authoring should be two-step:
 > `@vN` here at prepare).
 
 ```text
-prepare(source)
+narf_prepare(source)            # model-facing tool
   -> resolves imports/session aliases/refs/policy
   -> renders the full assembled script
   -> validates syntax, imports, effects, refs, and policy
   -> stores a prepared script ref
+  -> RETURNS the rendered script + diagnostics to the model's context
+     (this is the whole point: the model sees exactly what it will run)
 
-run(prepared_ref)
+narf_run(prepared_ref)          # model-facing tool
   -> executes exactly the prepared artifact
   -> records trace and telemetry
 ```
 
-The agent submits authored JS:
+The model issues the `narf_prepare` tool call, passing the authored source as an
+argument (the in-box body composes capabilities; `tx` here predates parked-`Tx`):
 
 ```ts
-const prepared = await narf.prepare({
+// model-facing tool: narf_prepare({ source, imports })
+narf_prepare({
   source: `
     const plan = await route.plan({ item, destination });
     await tx.apply(plan);
-    await repair.run(narf, { project, tx });
+    await repair.run({ project });
   `,
-  imports: ["route", "repair"],
-  tx: "required"
+  imports: ["route", "repair"]
 });
 ```
 
-The tool returns a prepared ref plus compact diagnostics:
+The tool returns the rendered script plus compact diagnostics — both into the
+model's context:
 
 ```json
 {
@@ -466,11 +521,12 @@ The tool returns a prepared ref plus compact diagnostics:
   "status": "ready",
   "diagnostics": [],
   "effects": ["writes_files", "runs_shell"],
-  "next": {"tool": "narf.run", "args": {"ref": "ref:narf-script/prep-8f31"}}
+  "rendered_source": "…the full assembled script, returned for the model to review before running…",
+  "next": {"tool": "narf_run", "args": {"ref": "ref:narf-script/prep-8f31"}}
 }
 ```
 
-For read-only one-liners, direct `narf.exec` may be allowed, but internally it
+For read-only one-liners, direct `narf_exec` may be allowed, but internally it
 should still create an implicit prepared ref for trace and replay.
 
 ## 7. Inline annotations in rendered scripts
@@ -508,8 +564,8 @@ Rules:
   them.
 - Include annotations only for imports, session aliases, refs, effects, and
   policy caveats that change how the script should be reviewed.
-- Full metadata remains inspectable through `narf.prepare.inspect(ref,
-  full=true)`.
+- Full metadata remains inspectable through a model-facing `narf_prepare`
+  inspect mode (`ref`, `full=true`).
 
 ## 8. Prepare-time validation
 
@@ -630,11 +686,13 @@ A narrow spike should prove the lifecycle without building the whole catalog:
    a small fixed universe — one atom, one session helper, one tool-sequence
    recipe — returning route-card-shaped responses the model reads. Not an in-box
    `narf.capabilities.scout` binding.
-2. Add `narf.session.define` / `narf.session.import` for session-local helpers.
-3. Add `narf.prepare` that renders a full script with inline annotations and
-   syntax/import diagnostics.
-4. Add `narf.run(ref)` for prepared refs, read-only first, then one `Tx`-bounded
-   mutating flow.
+2. Add the model-facing `narf_define` tool for session-local helpers (and decide
+   the `session.import` box-edge case, §0.1).
+3. Add the model-facing `narf_prepare` tool that renders a full script with inline
+   annotations + syntax/import diagnostics and **returns the rendered script to
+   the model's context**.
+4. Add the model-facing `narf_run(ref)` tool for prepared refs (read-only first).
+   No `Tx` — a v1 cell carries no transaction (narf-effects-and-safety.md).
 5. Record helper-use telemetry in the trace.
 6. Add manual `narf.lib.promote_candidate(ref)` from a successful session helper.
 
