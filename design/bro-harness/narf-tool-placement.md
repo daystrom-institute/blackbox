@@ -361,8 +361,11 @@ explicit MCP placement, recursion-guarded.
 > (promise primitive) have **landed** on `beta/blackbox-v2`. Step 5 shipped the
 > in-box join (`all`/`any`/`wait`/`status`/`list`/`cancel`) + a pure-JS
 > `pipeline`; the strict per-promise `Promise<Ref<T>>` split is deferred as 5b.
-> Remaining: step 6 (clip→ref fold), step 7 (MCP config++), and the independent
-> authoring-mislayer fix.
+> The **authoring-mislayer fix has landed**: `narf_exec`/`narf_prepare`/`narf_run`/
+> `narf_define` are now model-facing tools over a shared per-session runtime
+> (`narf_prepare` returns the rendered source for review), and only
+> `narf.session.import` remains in-box. Remaining: step 6 (clip→ref fold), step 7
+> (MCP config++).
 
 Ordered by capability delivered, smallest correct increments. Each is
 standalone-buildable in `bro-script` unless noted.

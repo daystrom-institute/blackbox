@@ -149,7 +149,20 @@ pub fn capability_tools(host_tools: Option<Arc<dyn ToolCapability>>) -> Vec<Arc<
         tools.push(Arc::new(RefactorPlanGetTool(r)));
     }
     if let (Some(atoms), Some(refactor)) = (atom_cap, refactor_cap) {
-        tools.push(Arc::new(NarfExecTool::new(atoms, refactor, host_tools)));
+        // One shared per-session runtime behind the four model-facing NARF
+        // controls, so helpers + prepared scripts persist across exec/prepare/
+        // run/define (box-edge invariant, narf-capability-library.md §0.1).
+        let session = Arc::new(NarfSession::new(atoms, refactor, host_tools));
+        tools.push(Arc::new(NarfExecTool {
+            session: session.clone(),
+        }));
+        tools.push(Arc::new(NarfPrepareTool {
+            session: session.clone(),
+        }));
+        tools.push(Arc::new(NarfRunTool {
+            session: session.clone(),
+        }));
+        tools.push(Arc::new(NarfDefineTool { session }));
     }
     tools
 }
@@ -356,16 +369,20 @@ impl Tool for RefactorPlanGetTool {
     }
 }
 
-/// `narf_exec`: run a NARF JavaScript composition cell against the injected
-/// in-process capability runtime.
-struct NarfExecTool {
+/// The per-session NARF runtime, shared by the four model-facing control tools
+/// (`narf_exec`/`narf_prepare`/`narf_run`/`narf_define`). One lazily-built
+/// `ScriptRuntime` per session means session helpers (`narf_define`) and prepared
+/// scripts (`narf_prepare` → `narf_run`) persist across those tools' calls. The
+/// box-edge invariant (`narf-capability-library.md` §0.1): authoring/launch
+/// controls are model-facing tools, never in-box `narf.*` bindings.
+struct NarfSession {
     atoms: Arc<dyn AtomCapability>,
     refactor: Arc<dyn RefactorCapability>,
     tools: Option<Arc<dyn ToolCapability>>,
-    runtime: Arc<tokio::sync::Mutex<Option<bro_script::ScriptRuntime>>>,
+    runtime: tokio::sync::Mutex<Option<bro_script::ScriptRuntime>>,
 }
 
-impl NarfExecTool {
+impl NarfSession {
     fn new(
         atoms: Arc<dyn AtomCapability>,
         refactor: Arc<dyn RefactorCapability>,
@@ -375,9 +392,45 @@ impl NarfExecTool {
             atoms,
             refactor,
             tools,
-            runtime: Arc::new(tokio::sync::Mutex::new(None)),
+            runtime: tokio::sync::Mutex::new(None),
         }
     }
+
+    /// Lock the session and lazily build the runtime. The returned guard holds
+    /// the lock across the caller's runtime call, serializing the session's NARF
+    /// tools onto its single V8 isolate.
+    async fn ensure(
+        &self,
+    ) -> Result<tokio::sync::MutexGuard<'_, Option<bro_script::ScriptRuntime>>, String> {
+        let mut guard = self.runtime.lock().await;
+        if guard.is_none() {
+            let caps = bro_script::Capabilities {
+                atoms: self.atoms.clone(),
+                refactor: self.refactor.clone(),
+                tools: self.tools.clone(),
+            };
+            match bro_script::ScriptRuntime::new(caps, bro_script::SupervisionPolicy::default())
+                .await
+            {
+                Ok(rt) => *guard = Some(rt),
+                Err(e) => return Err(format!("narf runtime init failed: {e:#}")),
+            }
+        }
+        Ok(guard)
+    }
+}
+
+/// Serialize a cell/script string result: JSON when it parses, else text.
+fn narf_result(output: String) -> ToolResult {
+    match serde_json::from_str::<Value>(&output) {
+        Ok(value) => ToolResult::Json(value),
+        Err(_) => ToolResult::Text(output),
+    }
+}
+
+/// `narf_exec`: run a NARF JavaScript composition cell against the session runtime.
+struct NarfExecTool {
+    session: Arc<NarfSession>,
 }
 
 #[async_trait]
@@ -408,35 +461,150 @@ impl Tool for NarfExecTool {
             Some(s) if !s.trim().is_empty() => s.to_string(),
             _ => return ToolResult::Error("narf_exec: `source` is required".into()),
         };
-
-        let mut runtime = self.runtime.lock().await;
-        if runtime.is_none() {
-            let caps = bro_script::Capabilities {
-                atoms: self.atoms.clone(),
-                refactor: self.refactor.clone(),
-                tools: self.tools.clone(),
-            };
-            match bro_script::ScriptRuntime::new(caps, bro_script::SupervisionPolicy::default())
-                .await
-            {
-                Ok(new_runtime) => *runtime = Some(new_runtime),
-                Err(e) => {
-                    return ToolResult::Error(format!("narf_exec runtime init failed: {e:#}"));
-                }
-            }
-        }
-
-        match runtime
-            .as_ref()
-            .expect("runtime initialized")
-            .execute(source)
-            .await
-        {
-            Ok(output) => match serde_json::from_str::<Value>(&output) {
-                Ok(value) => ToolResult::Json(value),
-                Err(_) => ToolResult::Text(output),
-            },
+        let guard = match self.session.ensure().await {
+            Ok(g) => g,
+            Err(e) => return ToolResult::Error(e),
+        };
+        match guard.as_ref().expect("runtime").execute(source).await {
+            Ok(output) => narf_result(output),
             Err(e) => ToolResult::Error(format!("narf_exec failed: {e:#}")),
+        }
+    }
+}
+
+/// `narf_prepare`: render + syntax-validate a script (optionally importing session
+/// helpers) and return BOTH a `ref:narf-script/*` handle AND the rendered source,
+/// so the model reviews exactly what `narf_run` will execute (the §0.1 review
+/// step). This is the model-facing replacement for the mislayered in-box
+/// `narf.prepare`.
+struct NarfPrepareTool {
+    session: Arc<NarfSession>,
+}
+
+#[async_trait]
+impl Tool for NarfPrepareTool {
+    fn name(&self) -> &str {
+        "narf_prepare"
+    }
+
+    fn description(&self) -> &str {
+        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Returns {ref, status, diagnostics, source} — review the rendered source, then narf_run the ref."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "source": { "type": "string", "description": "Script body." },
+                "imports": {
+                    "description": "Session helper names to inject (array), or {alias: name} map.",
+                    "type": ["array", "object"]
+                }
+            },
+            "required": ["source"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        if input.get("source").and_then(Value::as_str).is_none() {
+            return ToolResult::Error("narf_prepare: `source` is required".into());
+        }
+        let guard = match self.session.ensure().await {
+            Ok(g) => g,
+            Err(e) => return ToolResult::Error(e),
+        };
+        match guard.as_ref().expect("runtime").prepare(input).await {
+            Ok(resp) => match serde_json::to_value(&resp) {
+                Ok(v) => ToolResult::Json(v),
+                Err(e) => ToolResult::Error(format!("narf_prepare serialize failed: {e}")),
+            },
+            Err(e) => ToolResult::Error(format!("narf_prepare failed: {e:#}")),
+        }
+    }
+}
+
+/// `narf_run`: execute a prepared `ref:narf-script/*` script and return its result.
+/// Model-facing replacement for the mislayered in-box `narf.run`.
+struct NarfRunTool {
+    session: Arc<NarfSession>,
+}
+
+#[async_trait]
+impl Tool for NarfRunTool {
+    fn name(&self) -> &str {
+        "narf_run"
+    }
+
+    fn description(&self) -> &str {
+        "Run a prepared NARF script by its ref:narf-script/* handle (from narf_prepare); returns the script's result value."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": { "type": "string", "description": "Prepared script handle (ref:narf-script/*)." }
+            },
+            "required": ["ref"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let handle = match input.get("ref").and_then(Value::as_str) {
+            Some(h) if !h.trim().is_empty() => h.to_string(),
+            _ => return ToolResult::Error("narf_run: `ref` is required".into()),
+        };
+        let guard = match self.session.ensure().await {
+            Ok(g) => g,
+            Err(e) => return ToolResult::Error(e),
+        };
+        match guard.as_ref().expect("runtime").run(handle).await {
+            Ok(output) => narf_result(output),
+            Err(e) => ToolResult::Error(format!("narf_run failed: {e:#}")),
+        }
+    }
+}
+
+/// `narf_define`: register a reusable session helper that later cells recall in-box
+/// via `narf.session.import(name)`. Authoring is a control → model-facing.
+struct NarfDefineTool {
+    session: Arc<NarfSession>,
+}
+
+#[async_trait]
+impl Tool for NarfDefineTool {
+    fn name(&self) -> &str {
+        "narf_define"
+    }
+
+    fn description(&self) -> &str {
+        "Register a reusable NARF session helper {name, source, exports}. Later cells recall it in-box with narf.session.import(name) — keeping the helper source out of context."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Helper name (JS identifier)." },
+                "source": { "type": "string", "description": "Helper module source (uses `export`)." },
+                "exports": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Exported binding names to expose on import."
+                }
+            },
+            "required": ["name", "source", "exports"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let guard = match self.session.ensure().await {
+            Ok(g) => g,
+            Err(e) => return ToolResult::Error(e),
+        };
+        match guard.as_ref().expect("runtime").define(input).await {
+            Ok(()) => ToolResult::Json(json!({ "ok": true })),
+            Err(e) => ToolResult::Error(format!("narf_define failed: {e:#}")),
         }
     }
 }
@@ -622,8 +790,21 @@ mod tests {
         assert!(matches!(result, ToolResult::Error(_)));
     }
 
+    fn narf_session_with(
+        atoms: Arc<dyn AtomCapability>,
+        tools: Option<Arc<dyn ToolCapability>>,
+    ) -> Arc<NarfSession> {
+        Arc::new(NarfSession::new(
+            atoms,
+            Arc::new(StubRefactor::default()),
+            tools,
+        ))
+    }
+
     fn narf_tool(atoms: Arc<dyn AtomCapability>) -> NarfExecTool {
-        NarfExecTool::new(atoms, Arc::new(StubRefactor::default()), None)
+        NarfExecTool {
+            session: narf_session_with(atoms, None),
+        }
     }
 
     #[tokio::test]
@@ -715,7 +896,9 @@ mod tests {
         let host: Arc<dyn ToolCapability> =
             Arc::new(HostTools::new(bro_tools::builtin_tools(), cx));
 
-        let tool = NarfExecTool::new(Arc::new(StubAtoms), Arc::new(StubRefactor::default()), Some(host));
+        let tool = NarfExecTool {
+            session: narf_session_with(Arc::new(StubAtoms), Some(host)),
+        };
 
         let result = tool
             .call(
@@ -737,28 +920,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn narf_exec_reuses_runtime_across_calls() {
-        let tool = narf_tool(Arc::new(StubAtoms));
+    async fn narf_define_then_exec_import_shares_session_runtime() {
+        // The corrected authoring flow (mislayer fix): narf_define is a
+        // model-facing control; the cell recalls the helper in-box via
+        // session.import. Both tools share one session runtime, so the helper
+        // defined out-of-cell is visible to the later cell.
+        let session = narf_session_with(Arc::new(StubAtoms), None);
+        let define = NarfDefineTool {
+            session: session.clone(),
+        };
+        let exec = NarfExecTool { session };
 
-        let define = tool
+        let defined = define
             .call(
                 json!({
-                    "source": "\
-                        narf.session.define('math', { \
-                            source: 'export function add(a, b) { return a + b; }', \
-                            exports: ['add'] \
-                        }); \
-                        return 'defined';"
+                    "name": "math",
+                    "source": "export function add(a, b) { return a + b; }",
+                    "exports": ["add"],
                 }),
                 &test_cx(),
             )
             .await;
-        match define {
-            ToolResult::Json(v) => assert_eq!(v, json!("defined")),
-            other => panic!("expected Json result, got {other:?}"),
+        match defined {
+            ToolResult::Json(v) => assert_eq!(v["ok"], true),
+            other => panic!("expected Json ok, got {other:?}"),
         }
 
-        let reuse = tool
+        let reuse = exec
             .call(
                 json!({
                     "source": "const math = narf.session.import('math'); return math.add(2, 3);"
@@ -766,9 +954,39 @@ mod tests {
                 &test_cx(),
             )
             .await;
-
         match reuse {
             ToolResult::Json(v) => assert_eq!(v, json!(5)),
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn narf_prepare_returns_source_then_run_executes() {
+        // 2-step authoring: narf_prepare returns the rendered source for review +
+        // a handle; narf_run executes it. Shared session runtime.
+        let session = narf_session_with(Arc::new(StubAtoms), None);
+        let prepare = NarfPrepareTool {
+            session: session.clone(),
+        };
+        let run = NarfRunTool { session };
+
+        let prepared = prepare
+            .call(json!({ "source": "return 6 * 7;" }), &test_cx())
+            .await;
+        let handle = match prepared {
+            ToolResult::Json(v) => {
+                assert_eq!(v["status"], "ready");
+                // prepare returns the rendered source to the model's context.
+                assert!(v["source"].as_str().unwrap().contains("6 * 7"));
+                v["ref"].as_str().unwrap().to_string()
+            }
+            other => panic!("expected Json prepare, got {other:?}"),
+        };
+        assert!(handle.starts_with("ref:narf-script/"));
+
+        let result = run.call(json!({ "ref": handle }), &test_cx()).await;
+        match result {
+            ToolResult::Json(v) => assert_eq!(v, json!(42)),
             other => panic!("expected Json result, got {other:?}"),
         }
     }

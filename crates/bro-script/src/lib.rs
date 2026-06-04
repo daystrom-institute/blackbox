@@ -359,6 +359,11 @@ pub struct PrepareResponse {
     pub ref_handle: Option<String>,
     pub status: String,
     pub diagnostics: Vec<PrepareDiagnostic>,
+    /// The rendered, import-assembled script — returned to the MODEL's context so
+    /// it sees exactly what `narf_run` will execute (the §0.1 review step). Only
+    /// present on a `ready` response.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -394,14 +399,16 @@ fn blocked(kind: &str, message: impl Into<String>) -> PrepareResponse {
         ref_handle: None,
         status: "blocked".to_string(),
         diagnostics: vec![diagnostic(kind, message)],
+        source: None,
     }
 }
 
-fn ready(handle: String) -> PrepareResponse {
+fn ready(handle: String, source: String) -> PrepareResponse {
     PrepareResponse {
         ref_handle: Some(handle),
         status: "ready".to_string(),
         diagnostics: vec![],
+        source: Some(source),
     }
 }
 
@@ -825,33 +832,28 @@ fn op_ref_peek(state: &mut OpState, #[string] handle: String) -> Result<String, 
     })
 }
 
-/// `narf.session.define(name, { source, exports })` — store helper source in the
-/// host-side session frame and create the default import alias `name -> name`.
-#[op2(fast)]
-fn op_session_define(state: &mut OpState, #[string] input_json: String) -> Result<(), JsErrorBox> {
-    guard_op(|| {
-        let input: SessionDefineInput = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid session.define input: {e}")))?;
-        if !is_js_identifier(&input.name) {
-            return Err(JsErrorBox::generic(format!(
-                "invalid helper name identifier: {}",
-                input.name
-            )));
-        }
-        let helper = SessionHelper {
-            source: input.source,
-            exports: input.exports,
-        };
-        // Validate export names early; syntax is validated on import/prepare.
-        let _ = helper_expression(&helper).map_err(JsErrorBox::generic)?;
-        let session = state.borrow::<SessionStateCell>().clone();
-        let mut session = session.borrow_mut();
-        session
-            .import_aliases
-            .insert(input.name.clone(), input.name.clone());
-        session.helpers.insert(input.name, helper);
-        Ok(())
-    })
+/// Store a helper in the host-side session frame and create the default import
+/// alias `name -> name`. Shared host-side logic behind the **model-facing**
+/// `narf_define` tool (via `Job::Define`) — NOT an in-box op: authoring a session
+/// helper is a control, so it lives outside the box (the box-edge invariant,
+/// `narf-capability-library.md` §0.1). The in-box side keeps only
+/// `narf.session.import` (recall by exact name). Validates the name and export
+/// identifiers; helper *syntax* is validated on import/prepare.
+fn define_session_helper(session: &SessionStateCell, input: SessionDefineInput) -> Result<(), String> {
+    if !is_js_identifier(&input.name) {
+        return Err(format!("invalid helper name identifier: {}", input.name));
+    }
+    let helper = SessionHelper {
+        source: input.source,
+        exports: input.exports,
+    };
+    helper_expression(&helper)?;
+    let mut session = session.borrow_mut();
+    session
+        .import_aliases
+        .insert(input.name.clone(), input.name.clone());
+    session.helpers.insert(input.name, helper);
+    Ok(())
 }
 
 /// `narf.session.import(name)` support: return a source expression that injects
@@ -872,92 +874,6 @@ fn op_session_import(state: &mut OpState, #[string] name: String) -> Result<Stri
             .get(helper_name)
             .ok_or_else(|| JsErrorBox::generic(format!("unknown session helper: {helper_name}")))?;
         helper_expression(helper).map_err(JsErrorBox::generic)
-    })
-}
-
-/// Render a prepared script candidate without storing it. The JS shim validates
-/// syntax parse-only with `new Function(...)` and calls `op_prepare_store` only
-/// when parsing succeeds.
-#[op2]
-#[string]
-fn op_prepare_render(
-    state: &mut OpState,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let input: PrepareInput = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid narf.prepare input: {e}")))?;
-        let session = state.borrow::<SessionStateCell>().clone();
-        let rendered = match render_prepare(&session.borrow(), input) {
-            Ok(source) => serde_json::json!({
-                "status": "ready",
-                "diagnostics": [],
-                "source": source,
-            }),
-            Err(e) => serde_json::json!({
-                "status": "blocked",
-                "diagnostics": [diagnostic("import", e)],
-            }),
-        };
-        serde_json::to_string(&rendered)
-            .map_err(|e| JsErrorBox::generic(format!("failed to serialize prepare render: {e}")))
-    })
-}
-
-/// Store a parse-validated prepared artifact in the existing ref store under
-/// `ref:narf-script/<id>`.
-#[op2]
-#[string]
-fn op_prepare_store(
-    state: &mut OpState,
-    #[string] assembled_source: String,
-) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let refs = state.borrow::<RefStateCell>().clone();
-        let envelope =
-            refs.borrow_mut()
-                .put("narf-script", "application/javascript", assembled_source);
-        serde_json::to_string(&ready(envelope.handle))
-            .map_err(|e| JsErrorBox::generic(format!("failed to serialize prepare response: {e}")))
-    })
-}
-
-/// Return a stored prepared artifact's exact source for `narf.run(ref)`.
-#[op2]
-#[string]
-fn op_prepared_source(state: &mut OpState, #[string] handle: String) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let refs = state.borrow::<RefStateCell>().clone();
-        let source = refs
-            .borrow()
-            .get_value(&handle, "narf-script")
-            .map_err(JsErrorBox::generic)?;
-        Ok(source)
-    })
-}
-
-#[op2(fast)]
-fn op_trace_record(state: &mut OpState, #[string] handle: String) -> Result<(), JsErrorBox> {
-    guard_op(|| {
-        let trace = state.borrow::<TraceStateCell>().clone();
-        let mut trace = trace.borrow_mut();
-        let sequence = trace.len();
-        trace.push(TraceEntry {
-            ref_handle: handle,
-            sequence,
-        });
-        Ok(())
-    })
-}
-
-#[op2]
-#[string]
-fn op_trace_entries(state: &mut OpState) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let trace = state.borrow::<TraceStateCell>().clone();
-        let entries = trace.borrow().clone();
-        serde_json::to_string(&entries)
-            .map_err(|e| JsErrorBox::generic(format!("failed to serialize trace: {e}")))
     })
 }
 
@@ -990,13 +906,7 @@ deno_core::extension!(
         op_tool_invoke_inline,
         op_ref_text,
         op_ref_peek,
-        op_session_define,
         op_session_import,
-        op_prepare_render,
-        op_prepare_store,
-        op_prepared_source,
-        op_trace_record,
-        op_trace_entries,
         op_panic_guarded,
         op_panic_guarded_async,
     ],
@@ -1019,12 +929,16 @@ enum Job {
         reply: oneshot::Sender<Result<String>>,
     },
     Prepare {
-        input: String,
+        input_json: serde_json::Value,
         reply: oneshot::Sender<Result<PrepareResponse>>,
     },
     Run {
         handle: String,
         reply: oneshot::Sender<Result<String>>,
+    },
+    Define {
+        input_json: serde_json::Value,
+        reply: oneshot::Sender<Result<()>>,
     },
     TraceLen {
         reply: oneshot::Sender<usize>,
@@ -1123,12 +1037,10 @@ const BOOTSTRAP: &str = r#"
     // §9-1 Ref substrate: capability ops now return a `{ ref, size, preview }`
     // envelope (the full value stays host-side). `narf.ref` is the explicit,
     // bounded egress surface — `text()` is the only way a ref's bytes enter JS.
+    // §9-1 Ref substrate: capability ops return a `{ ref, size, preview }`
+    // envelope (the full value stays host-side). `narf.ref` is the explicit,
+    // bounded egress surface — `text()` is the only way a ref's bytes enter JS.
     const refToken = (h) => (typeof h === 'string' ? h : (h && h.ref));
-    const parsePrepared = (source) => {
-        // Parse-only validation of a body that will later run inside the same
-        // async-IIFE shape as ScriptRuntime::execute/run_one.
-        new Function(`return (async () => {\n${source}\n})`);
-    };
     globalThis.narf = {
         ref: {
             text: (handle, maxBytes) =>
@@ -1139,41 +1051,15 @@ const BOOTSTRAP: &str = r#"
                 JSON.parse(Deno.core.ops.op_ref_peek(refToken(handle))),
         },
         session: {
-            define: (name, helper) => {
-                Deno.core.ops.op_session_define(JSON.stringify({
-                    name,
-                    source: helper && helper.source,
-                    exports: helper && helper.exports,
-                }));
-            },
+            // §2.2 in-box EXCEPTION: recall a cached helper by exact name — a
+            // dereference (keeps the helper source host-side, out of context),
+            // NOT a control. `define`/`prepare`/`run` are MODEL-FACING tools
+            // (narf_define/narf_prepare/narf_run): the box must not hold the
+            // controls that open or author it (the box-edge invariant, §0.1).
             import: (name) => {
                 const expr = Deno.core.ops.op_session_import(name);
                 return (0, eval)(expr);
             },
-        },
-        prepare: (args) => {
-            const rendered = JSON.parse(Deno.core.ops.op_prepare_render(JSON.stringify(args ?? {})));
-            if (rendered.status === 'blocked') {
-                return { status: 'blocked', diagnostics: rendered.diagnostics ?? [] };
-            }
-            try {
-                parsePrepared(rendered.source);
-            } catch (e) {
-                return {
-                    status: 'blocked',
-                    diagnostics: [{ kind: 'syntax', message: String(e) }],
-                };
-            }
-            return JSON.parse(Deno.core.ops.op_prepare_store(rendered.source));
-        },
-        run: async (handle) => {
-            const ref = refToken(handle);
-            const source = Deno.core.ops.op_prepared_source(ref);
-            Deno.core.ops.op_trace_record(ref);
-            return await (0, eval)(`(async () => {\n${source}\n})()`);
-        },
-        trace: {
-            entries: () => JSON.parse(Deno.core.ops.op_trace_entries()),
         },
     };
     // §5 promise join: all/any/wait carry producer output → ref-out (bounded
@@ -1291,11 +1177,33 @@ impl ScriptRuntime {
         }
     }
 
-    pub async fn prepare(&self, source: impl Into<String>) -> Result<PrepareResponse> {
+    /// Render + syntax-validate + store a prepared script, returning a handle and
+    /// the **rendered source** for the model to review (the §0.1 review step).
+    /// `input_json` is `{ source, imports? }` — `imports` resolves session helpers
+    /// (defined via [`ScriptRuntime::define`]) into the assembled script. Backs the
+    /// model-facing `narf_prepare` tool; never an in-box binding.
+    pub async fn prepare(&self, input_json: serde_json::Value) -> Result<PrepareResponse> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.job_tx
             .send(Job::Prepare {
-                input: source.into(),
+                input_json,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("V8 thread dropped the reply"))?
+    }
+
+    /// Register a session helper (`{ name, source, exports }`) in the host-side
+    /// session frame so a later in-box `narf.session.import(name)` can recall it.
+    /// Backs the model-facing `narf_define` tool (authoring is a control → outside
+    /// the box, §0.1).
+    pub async fn define(&self, input_json: serde_json::Value) -> Result<()> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(Job::Define {
+                input_json,
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("V8 thread is gone"))?;
@@ -1419,9 +1327,9 @@ fn v8_thread_main(
                     runtime.v8_isolate().cancel_terminate_execution();
                     let _ = reply.send(result);
                 }
-                Job::Prepare { input, reply } => {
+                Job::Prepare { input_json, reply } => {
                     runtime.v8_isolate().cancel_terminate_execution();
-                    let result = prepare_one(&mut runtime, &input);
+                    let result = prepare_one(&mut runtime, input_json);
                     runtime.v8_isolate().cancel_terminate_execution();
                     let _ = reply.send(result);
                 }
@@ -1429,6 +1337,10 @@ fn v8_thread_main(
                     runtime.v8_isolate().cancel_terminate_execution();
                     let result = run_prepared(&mut runtime, &handle).await;
                     runtime.v8_isolate().cancel_terminate_execution();
+                    let _ = reply.send(result);
+                }
+                Job::Define { input_json, reply } => {
+                    let result = define_one(&mut runtime, input_json);
                     let _ = reply.send(result);
                 }
                 Job::TraceLen { reply } => {
@@ -1471,10 +1383,13 @@ async fn run_one(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<Strin
     Ok(value.to_string())
 }
 
-fn prepare_one(runtime: &mut deno_core::JsRuntime, source: &str) -> Result<PrepareResponse> {
-    let input = PrepareInput {
-        source: source.to_string(),
-        imports: None,
+fn prepare_one(
+    runtime: &mut deno_core::JsRuntime,
+    input_json: serde_json::Value,
+) -> Result<PrepareResponse> {
+    let input: PrepareInput = match serde_json::from_value(input_json) {
+        Ok(i) => i,
+        Err(e) => return Ok(blocked("input", format!("invalid narf_prepare input: {e}"))),
     };
     let assembled = {
         let op_state = runtime.op_state();
@@ -1496,11 +1411,24 @@ fn prepare_one(runtime: &mut deno_core::JsRuntime, source: &str) -> Result<Prepa
         let refs = state.borrow::<RefStateCell>().clone();
         let handle = refs
             .borrow_mut()
-            .put("narf-script", "application/javascript", assembled)
+            .put("narf-script", "application/javascript", assembled.clone())
             .handle;
         handle
     };
-    Ok(ready(handle))
+    // Return the rendered source so the model reviews exactly what narf_run runs.
+    Ok(ready(handle, assembled))
+}
+
+/// Host-side `narf_define`: deserialize `{ name, source, exports }` and register
+/// the session helper. Runs on the V8 thread (the session frame lives in
+/// `OpState`); no script execution, so no terminate-state dance.
+fn define_one(runtime: &mut deno_core::JsRuntime, input_json: serde_json::Value) -> Result<()> {
+    let input: SessionDefineInput = serde_json::from_value(input_json)
+        .map_err(|e| anyhow!("invalid narf_define input: {e}"))?;
+    let op_state = runtime.op_state();
+    let state = op_state.borrow();
+    let session = state.borrow::<SessionStateCell>().clone();
+    define_session_helper(&session, input).map_err(|e| anyhow!(e))
 }
 
 async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<String> {

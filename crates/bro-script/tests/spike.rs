@@ -320,21 +320,25 @@ async fn refactor_plan_and_materialize_via_refs() {
 }
 
 // ---------------------------------------------------------------------------
-// v1 authoring surface: session helpers + prepare -> run.
+// v1 authoring surface: session helpers + prepare -> run. After the mislayer
+// fix these are MODEL-FACING host methods (ScriptRuntime::define/prepare/run);
+// only `narf.session.import` remains an in-box binding (recall by exact name).
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn session_define_then_import_roundtrip() {
     let rt = stub_runtime().await;
+    // define is a model-facing control (out-of-cell)…
+    rt.define(serde_json::json!({
+        "name": "math",
+        "source": "export function add(a, b) { return a + b; }",
+        "exports": ["add"],
+    }))
+    .await
+    .unwrap();
+    // …import is the in-box dereference inside the cell.
     let out = rt
-        .execute(
-            r#"await narf.session.define("math", {
-                 source: `export function add(a, b) { return a + b; }`,
-                 exports: ["add"],
-               });
-               const math = await narf.session.import("math");
-               return math.add(2, 3);"#,
-        )
+        .execute(r#"const math = narf.session.import("math"); return math.add(2, 3);"#)
         .await
         .unwrap();
     assert_eq!(out, "5");
@@ -343,98 +347,66 @@ async fn session_define_then_import_roundtrip() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepare_rejects_invalid_js_syntax() {
     let rt = stub_runtime().await;
-    let out = rt
-        .execute(
-            r#"const prepared = await narf.prepare({ source: "const =" });
-               return JSON.stringify({
-                 status: prepared.status,
-                 kind: prepared.diagnostics[0].kind,
-                 noRef: prepared.ref === undefined,
-               });"#,
-        )
+    let resp = rt
+        .prepare(serde_json::json!({ "source": "const =" }))
         .await
         .unwrap();
-    assert_eq!(
-        out,
-        r#""{\"status\":\"blocked\",\"kind\":\"syntax\",\"noRef\":true}""#
-    );
+    assert_eq!(resp.status, "blocked");
+    assert_eq!(resp.diagnostics[0].kind, "syntax");
+    assert!(resp.ref_handle.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepare_rejects_unknown_import_alias() {
     let rt = stub_runtime().await;
-    let out = rt
-        .execute(
-            r#"const prepared = await narf.prepare({
-                 imports: ["missingHelper"],
-                 source: "return 1;",
-               });
-               return JSON.stringify({
-                 status: prepared.status,
-                 kind: prepared.diagnostics[0].kind,
-                 mentionsAlias: prepared.diagnostics[0].message.includes("missingHelper"),
-               });"#,
-        )
+    let resp = rt
+        .prepare(serde_json::json!({ "imports": ["missingHelper"], "source": "return 1;" }))
         .await
         .unwrap();
-    assert_eq!(
-        out,
-        r#""{\"status\":\"blocked\",\"kind\":\"import\",\"mentionsAlias\":true}""#
-    );
+    assert_eq!(resp.status, "blocked");
+    assert_eq!(resp.diagnostics[0].kind, "import");
+    assert!(resp.diagnostics[0].message.contains("missingHelper"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn prepare_run_composes_session_helper_and_capability_binding() {
     let rt = stub_runtime().await;
-    let out = rt
-        .execute(
-            r#"await narf.session.define("lookup", {
-                 source: `
-                   export async function run(query) {
-                     return await atoms.invoke("lookup", { query, limit: 3 });
-                   }
-                 `,
-                 exports: ["run"],
-               });
-               const prepared = await narf.prepare({
-                 imports: ["lookup"],
-                 source: `return await lookup.run("narf");`,
-               });
-               if (prepared.status !== "ready") return "BLOCKED";
-               const result = await narf.run(prepared.ref);
-               return JSON.stringify({
-                 preparedRef: prepared.ref.startsWith("ref:narf-script/"),
-                 resultRef: result.ref.startsWith("ref:cap/"),
-                 preview: result.preview.includes("found:narf"),
-               });"#,
-        )
+    rt.define(serde_json::json!({
+        "name": "lookup",
+        "source": "export async function run(query) { return await atoms.invoke(\"lookup\", { query, limit: 3 }); }",
+        "exports": ["run"],
+    }))
+    .await
+    .unwrap();
+    let resp = rt
+        .prepare(serde_json::json!({
+            "imports": ["lookup"],
+            "source": "return await lookup.run(\"narf\");",
+        }))
         .await
         .unwrap();
-    assert_eq!(
-        out,
-        r#""{\"preparedRef\":true,\"resultRef\":true,\"preview\":true}""#
-    );
+    assert_eq!(resp.status, "ready");
+    let handle = resp.ref_handle.clone().unwrap();
+    assert!(handle.starts_with("ref:narf-script/"));
+    // prepare returns the rendered, import-assembled source for model review.
+    assert!(resp.source.as_ref().unwrap().contains("atoms.invoke"));
+
+    // run executes the prepared script; the cell's atoms.invoke yields a ref env.
+    let result = rt.run(handle).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert!(v["ref"].as_str().unwrap().starts_with("ref:cap/"));
+    assert!(v["preview"].as_str().unwrap().contains("found:narf"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_records_trace_entry() {
     let rt = stub_runtime().await;
-    let out = rt
-        .execute(
-            r#"const prepared = await narf.prepare({ source: "return 42;" });
-               await narf.run(prepared.ref);
-               return JSON.stringify(narf.trace.entries());"#,
-        )
+    let resp = rt
+        .prepare(serde_json::json!({ "source": "return 42;" }))
         .await
         .unwrap();
-    let entries: Vec<serde_json::Value> =
-        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0]["sequence"], 0);
-    assert!(entries[0]["ref"]
-        .as_str()
-        .unwrap()
-        .starts_with("ref:narf-script/"));
+    rt.run(resp.ref_handle.unwrap()).await.unwrap();
+    assert_eq!(rt.trace_len().await.unwrap(), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -991,8 +991,8 @@ roster render.
   whole `{promises:[…]}` envelope, which still keeps big output out of context.
   `narf_wait`/durable promises remain the §10 lever.
 
-  REMAINING for §5b/§9 — **NEXT: clip→ref fold (step 6), MCP config++ (step 7),
-  and the authoring mislayer fix.** The
+  REMAINING for §5b/§9 — **NEXT: clip→ref fold (step 6), MCP config++ (step 7).**
+  The
   restore-parity plan (host-access seam → read core → `shell.run` →
   mutation → promise → clip-fold → MCP config++), the in-box/out-box taxonomy over
   all 35 pre-beta bro-tools built-ins, the `Ref`/`Promise` type model, and
@@ -1002,15 +1002,28 @@ roster render.
   narf.md OQ#2); `Tx` parked (`narf-effects-and-safety.md`); §5a supervised shell
   still open.
 
-  LAYERING CORRECTION (independent, non-blocking track): the §9-auth authoring
-  surface (`narf.prepare`/`run`/`session.define`, commit `8a86e75`) was mislayered
-  as IN-BOX bindings — they are MODEL-FACING controls (the box-edge invariant,
-  `narf-capability-library.md` §0.1 / `narf-draft2.md` §9.2; the box must not hold
-  the controls that open it, and `prepare` must return the rendered script to the
-  model's context). Fix = pull them out of the bootstrap, wire the dead
-  `ScriptRuntime::prepare/run` to real model-facing tools; KEEP `session.import`
-  in-box (recall-by-name minimizes context bloat). No parity value → off the MVP
-  critical path.
+  LAYERING CORRECTION — **FIXED.** The §9-auth authoring surface
+  (`narf.prepare`/`run`/`session.define`, commit `8a86e75`) had been mislayered as
+  IN-BOX bindings; they are MODEL-FACING controls (the box-edge invariant,
+  `narf-capability-library.md` §0.1 — the box must not hold the controls that open
+  or author it). Now corrected:
+  - **bro-script:** `narf.prepare`/`narf.run`/`narf.session.define` removed from
+    the bootstrap (and the in-box-only ops `op_prepare_render`/`op_prepare_store`/
+    `op_prepared_source`/`op_session_define`/`op_trace_record`/`op_trace_entries`
+    deleted). `narf.session.import` **stays in-box** (recall a cached helper by
+    exact name = a dereference, not a control — the §2.2 exception, keeps helper
+    source out of context). `ScriptRuntime::prepare` now takes `{source, imports?}`
+    and returns the **rendered source** alongside the handle (the §0.1 review
+    step); new `ScriptRuntime::define`. `define_session_helper` is the shared
+    host-side define logic.
+  - **bro-harness:** the four NARF controls (`narf_exec`/`narf_prepare`/`narf_run`/
+    `narf_define`) are now model-facing `Tool`s over one shared per-session
+    `NarfSession` runtime, so helpers + prepared scripts persist across them.
+    `narf_prepare` returns `{ref,status,diagnostics,source}`.
+  - Tests rewritten to the corrected layering: bro-script authoring tests drive
+    `ScriptRuntime::define/prepare/run` directly (import stays in-cell); harness
+    adds `narf_define→exec(import)` shared-session + `narf_prepare→narf_run`
+    2-step tests. bro-script 32, bro-harness lib 142; clippy clean; daemon links.
 - **Supervised shell (§5a).** Still only `with_spawn_scrub` + per-child env hook;
   timeout/ulimit-cgroup cap supervision not built (deferred behind §5b/§9 per the
   operator's sequencing).
