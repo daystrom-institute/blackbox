@@ -189,6 +189,18 @@ out explicitly under `Changed` or `Removed`.
 
 ### Changed
 
+- The `bro` CLI (fleet / tail / council) no longer depends on the `blackbox`
+  daemon crate. It links the extracted fleet engine (`bro-fleet-client`), the
+  shared transcript parser (`bro-transcript`), and the contract bottom
+  (`bro-protocol` + `bro-core`), reaching the daemon only over HTTP. The
+  harness–daemon thin-client boundary is now structural and compiler-enforced
+  (`design/bro-harness/harness-daemon-boundary.md` §7/§11).
+- `bro fleet` is now **daemon-only**: the in-process dispatch fallback is gone,
+  so the cockpit always drives the daemon singleton over `/control/*`. With no
+  `--daemon-url` (or `BLACKBOX_FLEET_DAEMON_URL`) it defaults to the local daemon
+  (`BBOX_PORT`, else 7264). Steer/interrupt now ride the daemon control plane;
+  live `set_model` on a fleet session is temporarily unsupported pending the
+  control-plane extension.
 - Project provider files (`<repo>/{CLAUDE,AGENTS,GEMINI}.md`) and project-scoped
   knowledge are now a one-way projection of the committed `.bbox/`, not a
   bidirectional sync. The system of record for project durable knowledge is the

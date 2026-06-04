@@ -1,7 +1,7 @@
 ---
 title: "The harness–daemon boundary: in-process consolidation"
 kind: design
-lifecycle: proposed
+lifecycle: partial
 corpus: blackbox-design
 topic:
   - bro-harness
