@@ -142,8 +142,8 @@ fn parse_servers(cfg: &str) -> anyhow::Result<Vec<(String, McpTransportConfig)>>
             let transport_type = sc
                 .get("type")
                 .and_then(|t| t.as_str())
-                .or_else(|| sc.get("command").and_then(|_| Some("stdio")))
-                .or_else(|| sc.get("url").and_then(|_| Some("http")));
+                .or_else(|| sc.get("command").map(|_| "stdio"))
+                .or_else(|| sc.get("url").map(|_| "http"));
             let Some(transport_type) = transport_type else {
                 tracing::warn!(server = %name, "ignoring MCP server with no transport fields");
                 continue;

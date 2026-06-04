@@ -312,6 +312,6 @@ mod tests {
     fn defaults_lift_the_summary_cap_above_the_old_2048() {
         // Regression guard: the inline summary budget must not regress to the
         // old hardcoded 2048 that squeezed long threads.
-        assert!(DEFAULT_SUMMARY_MAX_TOKENS > 2048);
+        const { assert!(DEFAULT_SUMMARY_MAX_TOKENS > 2048) };
     }
 }

@@ -73,12 +73,17 @@ pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
     if let Some(c) = corpus() {
         tools.push(Arc::new(CorpusSearchTool(c)));
     }
-    if let Some(a) = atoms() {
+    let atom_cap = atoms();
+    let refactor_cap = refactor();
+    if let Some(a) = atom_cap.clone() {
         tools.push(Arc::new(AtomInvokeTool(a)));
     }
-    if let Some(r) = refactor() {
+    if let Some(r) = refactor_cap.clone() {
         tools.push(Arc::new(RefactorPlanTool(r.clone())));
         tools.push(Arc::new(RefactorPlanGetTool(r)));
+    }
+    if let (Some(atoms), Some(refactor)) = (atom_cap, refactor_cap) {
+        tools.push(Arc::new(NarfExecTool::new(atoms, refactor)));
     }
     tools
 }
@@ -131,9 +136,7 @@ impl Tool for CorpusSearchTool {
                     .map(|h| json!({ "id": h.id, "text": h.text }))
                     .collect::<Vec<_>>(),
             })),
-            Err(e) => {
-                ToolResult::Error(format!("corpus_search failed: {}: {}", e.code, e.message))
-            }
+            Err(e) => ToolResult::Error(format!("corpus_search failed: {}: {}", e.code, e.message)),
         }
     }
 }
@@ -279,9 +282,88 @@ impl Tool for RefactorPlanGetTool {
         };
         match self.0.materialize_plan(id).await {
             Ok(plan) => ToolResult::Json(plan),
-            Err(e) => {
-                ToolResult::Error(format!("refactor_plan_get failed: {}: {}", e.code, e.message))
+            Err(e) => ToolResult::Error(format!(
+                "refactor_plan_get failed: {}: {}",
+                e.code, e.message
+            )),
+        }
+    }
+}
+
+/// `narf_exec`: run a NARF JavaScript composition cell against the injected
+/// in-process capability runtime.
+struct NarfExecTool {
+    atoms: Arc<dyn AtomCapability>,
+    refactor: Arc<dyn RefactorCapability>,
+    runtime: Arc<tokio::sync::Mutex<Option<bro_script::ScriptRuntime>>>,
+}
+
+impl NarfExecTool {
+    fn new(atoms: Arc<dyn AtomCapability>, refactor: Arc<dyn RefactorCapability>) -> Self {
+        Self {
+            atoms,
+            refactor,
+            runtime: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for NarfExecTool {
+    fn name(&self) -> &str {
+        "narf_exec"
+    }
+
+    fn description(&self) -> &str {
+        "runs a NARF JS composition cell in-process; the cell composes capabilities over refs and returns a value."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "description": "NARF JavaScript composition cell body."
+                }
+            },
+            "required": ["source"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let source = match input.get("source").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => s.to_string(),
+            _ => return ToolResult::Error("narf_exec: `source` is required".into()),
+        };
+
+        let mut runtime = self.runtime.lock().await;
+        if runtime.is_none() {
+            let caps = bro_script::Capabilities {
+                atoms: self.atoms.clone(),
+                refactor: self.refactor.clone(),
+            };
+            match bro_script::ScriptRuntime::new(caps, bro_script::SupervisionPolicy::default())
+                .await
+            {
+                Ok(new_runtime) => *runtime = Some(new_runtime),
+                Err(e) => {
+                    return ToolResult::Error(format!("narf_exec runtime init failed: {e:#}"));
+                }
             }
+        }
+
+        match runtime
+            .as_ref()
+            .expect("runtime initialized")
+            .execute(source)
+            .await
+        {
+            Ok(output) => match serde_json::from_str::<Value>(&output) {
+                Ok(value) => ToolResult::Json(value),
+                Err(_) => ToolResult::Text(output),
+            },
+            Err(e) => ToolResult::Error(format!("narf_exec failed: {e:#}")),
         }
     }
 }
@@ -465,5 +547,88 @@ mod tests {
         let get_tool = RefactorPlanGetTool(cap);
         let result = get_tool.call(json!({ "id": "nope" }), &test_cx()).await;
         assert!(matches!(result, ToolResult::Error(_)));
+    }
+
+    fn narf_tool(atoms: Arc<dyn AtomCapability>) -> NarfExecTool {
+        NarfExecTool::new(atoms, Arc::new(StubRefactor::default()))
+    }
+
+    #[tokio::test]
+    async fn narf_exec_runs_trivial_cell() {
+        let tool = narf_tool(Arc::new(StubAtoms));
+
+        let result = tool
+            .call(json!({ "source": "return 1 + 1;" }), &test_cx())
+            .await;
+
+        match result {
+            ToolResult::Json(v) => assert_eq!(v, json!(2)),
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn narf_exec_runs_atom_binding_and_returns_ref_envelope() {
+        let tool = narf_tool(Arc::new(StubAtoms));
+
+        let result = tool
+            .call(
+                json!({
+                    "source": "const r = await atoms.invoke('atom:x@v1', {}); return r;"
+                }),
+                &test_cx(),
+            )
+            .await;
+
+        match result {
+            ToolResult::Json(v) => {
+                assert!(v["ref"].as_str().unwrap().starts_with("ref:cap/"));
+                assert!(v["size"].as_u64().unwrap() > 0);
+
+                let preview = v["preview"].as_str().expect("preview string");
+                let preview_json: Value =
+                    serde_json::from_str(preview).expect("preview should be JSON");
+                assert_eq!(preview_json["output_json"]["atom"], "atom:x@v1");
+                assert_eq!(preview_json["output_json"]["echo"], json!({}));
+            }
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn narf_exec_reuses_runtime_across_calls() {
+        let tool = narf_tool(Arc::new(StubAtoms));
+
+        let define = tool
+            .call(
+                json!({
+                    "source": "\
+                        narf.session.define('math', { \
+                            source: 'export function add(a, b) { return a + b; }', \
+                            exports: ['add'] \
+                        }); \
+                        return 'defined';"
+                }),
+                &test_cx(),
+            )
+            .await;
+        match define {
+            ToolResult::Json(v) => assert_eq!(v, json!("defined")),
+            other => panic!("expected Json result, got {other:?}"),
+        }
+
+        let reuse = tool
+            .call(
+                json!({
+                    "source": "const math = narf.session.import('math'); return math.add(2, 3);"
+                }),
+                &test_cx(),
+            )
+            .await;
+
+        match reuse {
+            ToolResult::Json(v) => assert_eq!(v, json!(5)),
+            other => panic!("expected Json result, got {other:?}"),
+        }
     }
 }

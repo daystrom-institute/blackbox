@@ -567,6 +567,7 @@ dependencies = [
  "bro-core",
  "bro-lsp",
  "bro-protocol",
+ "bro-script",
  "bro-tools",
  "chrono",
  "clap",
