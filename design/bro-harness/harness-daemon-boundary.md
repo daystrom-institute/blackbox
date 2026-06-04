@@ -259,11 +259,16 @@ on the operator's machine) deflates most of it.
   kill hangs, and a **ulimit/cgroup cap** on the spawned child so a runaway makes
   the OOM-killer target *it*, not the daemon. Ref I/O stays the existing clipboard
   ABI (`shell_run stdin_from`/`stdout_to`).
-- **Cell-bounded `Tx` → rollback on abort.** `Tx` lifetime is the cell (narf-draft2
-  §4); if a cell is terminated (heap-limit `terminate_execution`, a caught panic, a
-  timeout), its uncommitted `Tx` rolls back. In-process, this is a drop-guard, not
-  a cross-process protocol — the worker-leaf bridge an earlier draft sketched here
-  is unnecessary once V8 is in-process.
+- **No cell transaction in v1 (corrected).** An earlier draft put a "cell-bounded
+  `Tx` → rollback on abort" here. That over-claims: the only rollback we can
+  actually perform is the refactor runner's worktree snapshot/restore (reversible
+  *local* state), and on a trusted, attended, YOLO-mode single-user box a NARF cell
+  is arbitrary code at the same trust level as the shell — so wrapping it in a
+  transaction or mutation guard is theater, not safety. v1 is capability bindings +
+  refs; local edits are netted by git, external effects by operator attention. The
+  `Tx`/saga/effect-class reasoning (correct but premature) is parked in
+  [`narf-effects-and-safety.md`](./narf-effects-and-safety.md), shelved until the
+  threat model changes (untrusted or unattended agents).
 - **OS sandboxing is not in the v1 picture.** Wrapping shell children in
   namespaces/Seatbelt confines *scope* (worktree, network, PIDs) but does **not**
   deny capability — a trusted agent with file-write + execute can do anything
@@ -535,10 +540,13 @@ The direction above is argued; these forks are not settled:
   newline-delimited JSON (coherence doc) vs riding the daemon's existing
   SSE `/tail` + HTTP. gRPC is **decided against** (§2). This is a thin, reversible
   pick.
-- **NARF tx vs saga** for nested atoms — the edit-rollback composition question
-  from narf-draft2 §8 (transaction unwind vs compensate-forward). Constraint: the
-  `bro-capabilities` seam must **not bake in one accidentally** — keep the trait
-  signatures neutral so either semantics stays buildable.
+- **NARF tx vs saga — RESOLVED BY DEFERRAL (neither in v1).** The edit-rollback
+  composition question from narf-draft2 §8 is parked: on a trusted, attended,
+  YOLO-mode box a NARF cell adds no trust boundary, so neither a transaction nor a
+  saga is built in v1. The reasoning is preserved in
+  [`narf-effects-and-safety.md`](./narf-effects-and-safety.md). Standing constraint
+  unchanged: keep the `bro-capabilities` trait signatures neutral so either
+  semantics stays buildable if the threat model ever un-parks it.
 - **Standalone harness scope — leaning lib-only; gated on §5.** Does the
   standalone binary stay a maintained product (degraded, absent capability impls)
   or a test/edge artifact only? Current reasoning: **daemon-free mode is weakly
