@@ -277,6 +277,46 @@ an inspect tool should say "use this before import/run"; a prepare tool should
 say "mutating scripts run by prepared ref, not by reconstructed source." These
 are not documentation flourishes. They are part of the navigation contract.
 
+### 3.2 v1 vs v2 — what to build now
+
+The route-card envelope and grounding sequence above describe the *mature* shape.
+Most of it is not wrong, but it is **not right for right now**: it presumes a
+large catalog and cross-session telemetry to navigate. With a fixed v1 universe
+and no cross-session corpus, the expanded form is machinery with nothing to
+manage. Build the loop and the convergence-bearing fields now; let catalog and
+telemetry pressure pull in the rest.
+
+**v1 — build now:**
+
+- **Enrich the *existing* model-facing tools** (`atom_search`, `atom_describe`) to
+  return route-card-shaped responses. No new scout tool; no
+  `narf.capabilities.scout` binding.
+- **Route-card fields = `{handle, kind, fit, next, stop_if, missing_facts}`.** The
+  three signpost fields (`next` / `stop_if` / `missing_facts`) carry the
+  convergence value; `fit` is a coarse `high|medium|fallback` tag. Nothing else.
+- **Fixed, small universe** — one atom, one session helper, one tool-sequence
+  recipe (per §11). Prove the loop, not the catalog. No ranking/scoring (ordering
+  is trivial over a fixed set).
+- **Sequence:** intent → routes+signposts → narrow (`atom_describe` / code
+  grounding) → select handle + resolve `missing_facts` → hand to the authoring
+  cell. The cell dereferences by **exact handle only** (the §3-correction CQRS
+  line: the model selects on the orientation surface; the box never searches).
+
+**v2 — build later (correct, premature):**
+
+- Expanded route-card fields — `fit_reason` / `nonfit_reason` / `requires` /
+  `effects` as structured fields (v1 lets the model infer these from
+  `atom_describe`, not a pre-rendered envelope).
+- A dedicated scout surface / formalized `narf.capabilities.scout` contract.
+- The **pre-narrowing retrieval engine** (RRF / vector / BM25 / decay) over a large
+  catalog — the deferred lever a fixed universe needs none of.
+- Ranking/scoring (the `accepted_uses*3 + …` shape) and the cross-session NARF-lib
+  lifecycle + decay (§5) — nothing to rank or decay until cross-session usage
+  accumulates.
+- Persisted, searchable tool-sequence recipes (v1: static/inline).
+- Tool descriptions as a formalized "navigation-contract" *system* (v1: a couple of
+  directive description lines, not a framework).
+
 ## 4. Session-local helpers
 
 Agents should be able to keep a helper for the session without publishing it:
