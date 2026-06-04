@@ -57,6 +57,7 @@ pub fn find_session_file(
     for provider in [
         crate::orchestration::providers::Provider::Glm,
         crate::orchestration::providers::Provider::Deepseek,
+        crate::orchestration::providers::Provider::Minimax,
         crate::orchestration::providers::Provider::Brodex,
         crate::orchestration::providers::Provider::VibeBh,
     ] {

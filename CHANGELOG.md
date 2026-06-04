@@ -10,6 +10,10 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `minimax` provider: MiniMax M3 ridden through `bro-harness` on the Anthropic
+  transport. Credentials/base URL are lifted from `~/.claude-mm/settings.json`
+  (the same config selected by the `yolom` alias); default model is
+  `MiniMax-M3`.
 - `vibebh` provider: Mistral (vibe) ridden through `bro-harness` on the OpenAI
   chat-completions transport, parallel to the existing `vibe` CLI provider
   (which is unchanged). Aliased `vibe-bh`; dispatchable via `bro_exec`,

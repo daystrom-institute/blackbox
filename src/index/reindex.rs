@@ -742,6 +742,7 @@ fn provider_label(provider: Provider) -> &'static str {
         Provider::VibeBh => "vibebh",
         Provider::Glm => "glm",
         Provider::Deepseek => "deepseek",
+        Provider::Minimax => "minimax",
         Provider::Workflow => "workflow",
     }
 }
@@ -793,7 +794,8 @@ mod tests {
             0,
             0,
         );
-        let normalized = NormalizedTranscriptEvent::from_parsed_event(Provider::Brodex, parsed, raw);
+        let normalized =
+            NormalizedTranscriptEvent::from_parsed_event(Provider::Brodex, parsed, raw);
         let doc = normalized_to_doc(
             &normalized,
             "codex",

@@ -411,6 +411,7 @@ impl NormalizedTranscriptEvent {
             Provider::VibeBh => "vibebh",
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
+            Provider::Minimax => "minimax",
             Provider::Workflow => "workflow",
         };
         Some(format!(

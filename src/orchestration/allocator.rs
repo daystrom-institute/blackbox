@@ -10,8 +10,8 @@ use serde_json::Value;
 
 use super::TaskStore;
 use super::brofile::BroConfig;
-use super::providers::{self, Capability, ExecOpts, Provider};
 use super::providers::dispatch_prelude::*;
+use super::providers::{self, Capability, ExecOpts, Provider};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct PoolRef {
@@ -396,6 +396,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Brodex, Some("gpt-5.3-codex-spark"), Some("low"), None),
             (Glm, Some("glm-4.5-air"), Some("low"), None),
             (Deepseek, Some("deepseek-v4-flash"), Some("low"), None),
+            (Minimax, Some("MiniMax-M3"), Some("low"), None),
             (VibeBh, Some("devstral-small-latest"), Some("none"), None),
         ],
     );
@@ -405,6 +406,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Brodex, Some("gpt-5.5"), Some("medium"), None),
             (Glm, Some("glm-5-turbo"), Some("medium"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("medium"), None),
+            (Minimax, Some("MiniMax-M3"), Some("medium"), None),
             (VibeBh, Some("mistral-medium-3.5"), Some("high"), None),
         ],
     );
@@ -414,6 +416,7 @@ pub fn built_in_config() -> AllocatorConfig {
             (Brodex, Some("gpt-5.5"), Some("high"), None),
             (Glm, Some("glm-5.1"), Some("high"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("high"), None),
+            (Minimax, Some("MiniMax-M3"), Some("high"), None),
             (VibeBh, Some("magistral-medium-latest"), Some("high"), None),
         ],
     );
@@ -422,6 +425,7 @@ pub fn built_in_config() -> AllocatorConfig {
         vec![
             (Brodex, Some("gpt-5.5"), Some("xhigh"), None),
             (Deepseek, Some("deepseek-v4-pro"), Some("max"), None),
+            (Minimax, Some("MiniMax-M3"), Some("max"), None),
             (VibeBh, Some("magistral-medium-latest"), Some("high"), None),
         ],
     );
@@ -431,7 +435,13 @@ pub fn built_in_config() -> AllocatorConfig {
             (Brodex, Some("gpt-5.3-codex-spark"), Some("low"), Some(1.0)),
             (Glm, Some("glm-4.5-air"), Some("low"), Some(0.8)),
             (Deepseek, Some("deepseek-v4-flash"), Some("low"), Some(0.8)),
-            (VibeBh, Some("devstral-small-latest"), Some("none"), Some(0.8)),
+            (Minimax, Some("MiniMax-M3"), Some("low"), Some(0.8)),
+            (
+                VibeBh,
+                Some("devstral-small-latest"),
+                Some("none"),
+                Some(0.8),
+            ),
         ],
     );
 
@@ -439,11 +449,12 @@ pub fn built_in_config() -> AllocatorConfig {
     pools.insert(
         "coding".into(),
         PoolConfig {
-            providers: vec![Brodex, Glm, Deepseek, VibeBh],
+            providers: vec![Brodex, Glm, Deepseek, Minimax, VibeBh],
             provider_weights: provider_weights(&[
                 (Brodex, 1.0),
                 (Glm, 1.0),
                 (Deepseek, 0.55),
+                (Minimax, 0.55),
                 (VibeBh, 0.45),
             ]),
             max_concurrent_per_account: Some(1),
@@ -452,11 +463,12 @@ pub fn built_in_config() -> AllocatorConfig {
     pools.insert(
         "any".into(),
         PoolConfig {
-            providers: vec![Glm, Brodex, Deepseek, VibeBh],
+            providers: vec![Glm, Brodex, Deepseek, Minimax, VibeBh],
             provider_weights: provider_weights(&[
                 (Glm, 1.0),
                 (Brodex, 0.68),
                 (Deepseek, 0.55),
+                (Minimax, 0.55),
                 (VibeBh, 0.45),
             ]),
             max_concurrent_per_account: Some(1),

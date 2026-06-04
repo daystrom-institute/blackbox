@@ -144,8 +144,8 @@ copy full model inventories into `PROJECT.md`; they go stale. Keep this file to
 routing facts:
 
 - Claude dispatches through the Claude Code CLI.
-- GLM, DeepSeek, and Brodex dispatch through `bro-harness` (the custom
-  provider harness, `crates/bro-harness`): GLM/DeepSeek on the Anthropic
+- GLM, DeepSeek, MiniMax, and Brodex dispatch through `bro-harness` (the custom
+  provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax on the Anthropic
   transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
   backend). The harness emits the Claude stream-json envelope, so it slots
   into the existing dispatch seam. Needs `bro-harness` on PATH or

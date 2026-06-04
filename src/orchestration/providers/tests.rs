@@ -2,8 +2,8 @@ use std::str::FromStr;
 
 use crate::orchestration::mcp::{McpFilters, McpServerConfig, SecretString};
 
-use super::*;
 use super::dispatch_prelude::*;
+use super::*;
 
 fn empty_sink() -> EventSink {
     EventSink {
@@ -56,6 +56,17 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(deepseek.contains(&"--model".to_string()));
     assert!(deepseek.contains(&"deepseek-v4-pro".to_string()));
     assert!(!deepseek.contains(&"deepseek/deepseek-v4-pro".to_string()));
+
+    let minimax_opts = ExecOpts {
+        model: Some("minimax/MiniMax-M3".into()),
+        effort: Some("medium".into()),
+        provider_defaults: None,
+    };
+    let minimax =
+        Provider::Minimax.build_exec_args("hello minimax", "sid-3", None, Some(&minimax_opts));
+    assert!(minimax.contains(&"--model".to_string()));
+    assert!(minimax.contains(&"MiniMax-M3".to_string()));
+    assert!(!minimax.contains(&"minimax/MiniMax-M3".to_string()));
 }
 
 #[test]

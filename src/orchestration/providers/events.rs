@@ -97,7 +97,7 @@ pub trait ProviderEvents {
 impl ProviderEvents for Provider {
     /// Detect a rate-limit / overload disruption from a single streaming event.
     /// Structured `apiErrorStatus` (429/529) first — surfaced by the Claude CLI
-    /// and the bro-harness Anthropic envelope (GLM/DeepSeek/Brodex) — then the
+    /// and the bro-harness Anthropic envelope (GLM/DeepSeek/MiniMax/Brodex) — then the
     /// provider's explicit error text on error records only.
     fn detect_disruption(&self, evt: &Value) -> Option<Disruption> {
         let status = evt["apiErrorStatus"]
@@ -127,9 +127,11 @@ impl ProviderEvents for Provider {
     /// Parse a streaming JSON event and update the sink.
     fn parse_event(&self, evt: &Value, sink: &mut EventSink) {
         match self {
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
-                parse_claude_event(evt, sink)
-            }
+            Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh => parse_claude_event(evt, sink),
             Provider::Workflow => {}
         }
     }
@@ -226,7 +228,8 @@ fn parse_claude_event(evt: &Value, sink: &mut EventSink) {
             // Anthropic's `input_tokens` is already fresh (cache-exclusive);
             // cache reads/writes are reported separately. This matches our
             // normalized convention directly. Harness providers (glm/deepseek/
-            // brodex) emit the same Anthropic-native shape via bro-harness.
+            // minimax/brodex) emit the same Anthropic-native shape via
+            // bro-harness.
             sink.usage = Some(Usage {
                 input_tokens: usage
                     .get("input_tokens")

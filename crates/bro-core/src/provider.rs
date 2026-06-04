@@ -31,11 +31,17 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 #[strum(serialize_all = "lowercase")]
 pub enum Provider {
+    #[serde(alias = "claude")]
     #[strum(serialize = "glm")]
     Glm,
     Deepseek,
+    /// MiniMax ridden through `bro-harness` on the Anthropic Messages
+    /// transport. Credentials/base URL are lifted from the operator's
+    /// `~/.claude-mm/settings.json` env block.
+    Minimax,
     /// Codex/ChatGPT backend ridden through `bro-harness` (OpenAI Responses
     /// transport).
+    #[serde(alias = "codex")]
     Brodex,
     /// Mistral (vibe) ridden through `bro-harness` on the OpenAI
     /// **chat-completions** transport. `vibebh` launches the harness with
@@ -94,6 +100,7 @@ impl Provider {
     pub const ALL: &[Provider] = &[
         Provider::Glm,
         Provider::Deepseek,
+        Provider::Minimax,
         Provider::Brodex,
         Provider::VibeBh,
     ];
@@ -118,6 +125,7 @@ impl Provider {
             Provider::Brodex => &[ToolUse, Resume],
             Provider::Glm => &[ToolUse, Resume],
             Provider::Deepseek => &[ToolUse, Resume],
+            Provider::Minimax => &[ToolUse, Resume],
             // Mistral via bro-harness (chat-completions transport). Native tool
             // use + resume (harness transcript persistence). Structured output
             // is not yet implemented in the harness, so it is intentionally
@@ -133,6 +141,7 @@ impl Provider {
         match self {
             Provider::Glm => "glm",
             Provider::Deepseek => "deepseek",
+            Provider::Minimax => "minimax",
             Provider::Brodex => "brodex",
             Provider::VibeBh => "vibebh",
             Provider::Workflow => "workflow",
@@ -142,14 +151,22 @@ impl Provider {
     pub fn supports_resume(&self) -> bool {
         matches!(
             self,
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+            Provider::Glm
+                | Provider::Deepseek
+                | Provider::Minimax
+                | Provider::Brodex
+                | Provider::VibeBh
         )
     }
 
     pub fn is_streaming_json(&self) -> bool {
         matches!(
             self,
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+            Provider::Glm
+                | Provider::Deepseek
+                | Provider::Minimax
+                | Provider::Brodex
+                | Provider::VibeBh
         )
     }
 
@@ -190,6 +207,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
     match provider {
         Provider::Glm => GLM_MODELS,
         Provider::Deepseek => DEEPSEEK_MODELS,
+        Provider::Minimax => MINIMAX_MODELS,
         Provider::Brodex => CODEX_MODELS,
         Provider::VibeBh => VIBEBH_MODELS,
         Provider::Workflow => &[],
@@ -198,7 +216,7 @@ fn models_for(provider: Provider) -> &'static [ModelInfo] {
 
 fn efforts_for(provider: Provider) -> &'static [EffortInfo] {
     match provider {
-        Provider::Glm | Provider::Deepseek => CLAUDE_EFFORTS,
+        Provider::Glm | Provider::Deepseek | Provider::Minimax => CLAUDE_EFFORTS,
         Provider::Brodex => CODEX_EFFORTS,
         Provider::VibeBh => VIBEBH_EFFORTS,
         Provider::Workflow => &[],
@@ -323,6 +341,12 @@ static DEEPSEEK_MODELS: &[ModelInfo] = &[
         default: false,
     },
 ];
+
+static MINIMAX_MODELS: &[ModelInfo] = &[ModelInfo {
+    id: "MiniMax-M3",
+    description: "MiniMax M3 via Anthropic-compatible bro-harness transport",
+    default: true,
+}];
 
 static CODEX_MODELS: &[ModelInfo] = &[
     ModelInfo {

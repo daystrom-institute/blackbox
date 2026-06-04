@@ -6,12 +6,16 @@ use std::path::PathBuf;
 use super::Provider;
 use super::mcp_args::{claude_mcp_config_json, transient_blackbox_name, transient_blackbox_url};
 
-/// Resolve the harness/provider binary name from env. GLM/DeepSeek/Brodex/VibeBh
-/// ride the custom harness instead of a vendor CLI; transport + credentials are
-/// selected via env (see brofile::resolve_provider_env).
+/// Resolve the harness/provider binary name from env. GLM/DeepSeek/MiniMax/
+/// Brodex/VibeBh ride the custom harness instead of a vendor CLI; transport +
+/// credentials are selected via env (see brofile::resolve_provider_env).
 fn bin_with_env(provider: Provider) -> String {
     match provider {
-        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+        Provider::Glm
+        | Provider::Deepseek
+        | Provider::Minimax
+        | Provider::Brodex
+        | Provider::VibeBh => {
             std::env::var("BRO_HARNESS_BIN").unwrap_or_else(|_| "bro-harness".into())
         }
         Provider::Workflow => "workflow".into(),
@@ -115,6 +119,7 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
             .unwrap_or(model)
             .to_string(),
         Provider::Deepseek => model.strip_prefix("deepseek/").unwrap_or(model).to_string(),
+        Provider::Minimax => model.strip_prefix("minimax/").unwrap_or(model).to_string(),
         _ => model.to_string(),
     }
 }
@@ -130,7 +135,11 @@ fn normalize_model_for_provider(provider: Provider, model: &str) -> String {
 fn harness_default_model(provider: Provider) -> Option<String> {
     if !matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+        Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh
     ) {
         return None;
     }
@@ -175,9 +184,11 @@ impl ProviderExec for Provider {
         match self {
             // Harness providers resolve via BRO_HARNESS_BIN (bin_with_env);
             // no dedicated config override today.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
-                bin_with_env(*self)
-            }
+            Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh => bin_with_env(*self),
             Provider::Workflow => "workflow".into(),
         }
     }
@@ -201,6 +212,7 @@ impl ProviderExec for Provider {
         match self {
             Provider::Glm
             | Provider::Deepseek
+            | Provider::Minimax
             | Provider::Brodex
             | Provider::VibeBh => {
                 let mut args = vec![
@@ -257,6 +269,7 @@ impl ProviderExec for Provider {
         match self {
             Provider::Glm
             | Provider::Deepseek
+            | Provider::Minimax
             | Provider::Brodex
             | Provider::VibeBh => {
                 let mut args = vec![

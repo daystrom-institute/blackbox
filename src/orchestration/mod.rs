@@ -3,8 +3,8 @@ pub mod agents;
 pub mod allocator;
 pub mod atoms;
 pub mod badgey;
-pub mod capabilities;
 pub mod brofile;
+pub mod capabilities;
 pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
@@ -25,8 +25,8 @@ use tokio::sync::Notify;
 
 use crate::transcripts::adapters::TranscriptAdapterRegistry;
 use crate::transcripts::types::{TranscriptCursor, TranscriptLocation};
-use providers::{EventSink, Provider, Usage};
 use providers::dispatch_prelude::*;
+use providers::{EventSink, Provider, Usage};
 use supervision::SupervisionState;
 
 const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
@@ -50,8 +50,8 @@ const BLACKBOX_SERVICE_ENV_VARS: &[&str] = &[
 
 const PROMPT_STDIN_ARG_BYTES_THRESHOLD: usize = 64 * 1024;
 
-fn harness_controls(
-) -> &'static RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>> {
+fn harness_controls()
+-> &'static RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>> {
     static CONTROLS: OnceLock<
         RwLock<HashMap<String, bro_harness::agent_loop::SessionInputSender>>,
     > = OnceLock::new();
@@ -103,7 +103,10 @@ pub fn apply_session_command(
 }
 
 pub fn steer_harness_task(task_id: &str, prompt: String) -> Result<(), String> {
-    apply_session_command(task_id, bro_protocol::SessionCommand::UserTurn { text: prompt })
+    apply_session_command(
+        task_id,
+        bro_protocol::SessionCommand::UserTurn { text: prompt },
+    )
 }
 
 pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result<(), String> {
@@ -112,9 +115,13 @@ pub fn interrupt_harness_task(task_id: &str, redirect: Option<String>) -> Result
         // control's raw so the harness dequeues it immediately on cancel. This
         // payload shape has no SessionCommand variant, so it stays inline.
         Some(prompt) => {
-            let tx = harness_controls().read().get(task_id).cloned().ok_or_else(|| {
-                format!("task {task_id} has no live in-process harness control channel")
-            })?;
+            let tx = harness_controls()
+                .read()
+                .get(task_id)
+                .cloned()
+                .ok_or_else(|| {
+                    format!("task {task_id} has no live in-process harness control channel")
+                })?;
             tx.send(bro_harness::agent_loop::SessionInput::Control {
                 subtype: "interrupt".to_string(),
                 request_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -1299,7 +1306,11 @@ pub fn spawn_task(
 ) -> Arc<Task> {
     if matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+        Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh
     ) {
         return spawn_harness_in_process_task(
             task_id,
@@ -1612,7 +1623,10 @@ pub fn spawn_task_interactive(
 }
 
 fn move_large_prompt_arg_to_stdin(provider: Provider, args: &mut Vec<String>) -> Option<String> {
-    if !matches!(provider, Provider::Glm | Provider::Deepseek) {
+    if !matches!(
+        provider,
+        Provider::Glm | Provider::Deepseek | Provider::Minimax
+    ) {
         return None;
     }
     let mut idx = 0usize;
@@ -2647,11 +2661,9 @@ mod tests {
 
     #[test]
     fn apply_session_command_errors_without_live_channel() {
-        let err = apply_session_command(
-            "no-such-live-task",
-            bro_protocol::SessionCommand::Interrupt,
-        )
-        .unwrap_err();
+        let err =
+            apply_session_command("no-such-live-task", bro_protocol::SessionCommand::Interrupt)
+                .unwrap_err();
         assert!(err.contains("no live in-process harness control channel"));
     }
 
@@ -2662,7 +2674,10 @@ mod tests {
         t.inner.lock().last_assistant_message = Some("OK".to_string());
         let snap = protocol_task_snapshot(&t.inner.lock());
         assert_eq!(snap.task_id.as_str(), "t1");
-        assert_eq!(snap.session_id.as_ref().map(|s| s.as_str()), Some("sess-t1"));
+        assert_eq!(
+            snap.session_id.as_ref().map(|s| s.as_str()),
+            Some("sess-t1")
+        );
         assert_eq!(snap.status, bro_protocol::TaskStatus::Completed);
         assert_eq!(snap.last_message.as_deref(), Some("OK"));
         assert!(snap.error.is_none());
@@ -2679,13 +2694,21 @@ mod tests {
 
         // Cancelled maps through; running maps to wire Running.
         assert_eq!(
-            protocol_task_snapshot(&test_task("t3", TaskStatus::Cancelled, Provider::Glm).inner.lock())
-                .status,
+            protocol_task_snapshot(
+                &test_task("t3", TaskStatus::Cancelled, Provider::Glm)
+                    .inner
+                    .lock()
+            )
+            .status,
             bro_protocol::TaskStatus::Cancelled
         );
         assert_eq!(
-            protocol_task_snapshot(&test_task("t4", TaskStatus::Running, Provider::Glm).inner.lock())
-                .status,
+            protocol_task_snapshot(
+                &test_task("t4", TaskStatus::Running, Provider::Glm)
+                    .inner
+                    .lock()
+            )
+            .status,
             bro_protocol::TaskStatus::Running
         );
     }
@@ -2855,6 +2878,11 @@ mod tests {
                 "stream-json"
             ]
         );
+
+        let mut minimax_args = vec!["-p".into(), prompt.clone()];
+        let minimax_stdin = move_large_prompt_arg_to_stdin(Provider::Minimax, &mut minimax_args);
+        assert_eq!(minimax_stdin.as_deref(), Some(prompt.as_str()));
+        assert_eq!(minimax_args, vec!["-p"]);
     }
 
     #[test]

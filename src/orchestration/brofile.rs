@@ -105,7 +105,11 @@ impl ProviderDefaultsMode {
 pub fn provider_supports_defaults_suppression(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+        Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh
     )
 }
 
@@ -358,10 +362,10 @@ fn prepare_codex_suppressed_home(base_home: &Path, store_dir: &Path) -> std::io:
     Ok(overlay)
 }
 
-/// Harness env for the Anthropic-transport providers (GLM, DeepSeek). These
-/// no longer run the `claude` CLI; they run `bro-harness`, which reads
+/// Harness env for the Anthropic-transport providers (GLM, DeepSeek, MiniMax).
+/// These no longer run the `claude` CLI; they run `bro-harness`, which reads
 /// `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` from its own env. We lift
-/// those out of the operator's existing `~/.claude-{zai,ds}/settings.json`
+/// those out of the operator's existing `~/.claude-{zai,ds,mm}/settings.json`
 /// `env` block (the same credentials the CLI used) and select the transport.
 fn default_claude_compatible_env(
     provider: Provider,
@@ -370,6 +374,7 @@ fn default_claude_compatible_env(
     let rel_path = match provider {
         Provider::Glm => ".claude-zai",
         Provider::Deepseek => ".claude-ds",
+        Provider::Minimax => ".claude-mm",
         _ => return None,
     };
     let mut env = HashMap::from([("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string())]);
@@ -485,9 +490,14 @@ fn synthesized_account_env_for_home(
 
     let (env_key, rel_path) = match provider {
         Provider::Brodex => ("CODEX_HOME", format!(".codex{suffix}")),
-        // GLM/DeepSeek inherit credentials from fixed Claude-compatible config
-        // dirs; vibe-bh authenticates via MISTRAL_API_KEY, not accounts.
-        Provider::Glm | Provider::Deepseek | Provider::VibeBh | Provider::Workflow => return None,
+        // GLM/DeepSeek/MiniMax inherit credentials from fixed
+        // Claude-compatible config dirs; vibe-bh authenticates via
+        // MISTRAL_API_KEY, not accounts.
+        Provider::Glm
+        | Provider::Deepseek
+        | Provider::Minimax
+        | Provider::VibeBh
+        | Provider::Workflow => return None,
     };
 
     Some(HashMap::from([(
@@ -522,7 +532,7 @@ fn resolve_provider_env_inner(
         .map(ProviderDefaultsMode::suppresses)
         .unwrap_or(false);
     let mut env = match provider {
-        Provider::Glm | Provider::Deepseek => dirs::home_dir()
+        Provider::Glm | Provider::Deepseek | Provider::Minimax => dirs::home_dir()
             .as_deref()
             .and_then(|home| default_claude_compatible_env(provider, home))
             .unwrap_or_default(),
@@ -544,7 +554,10 @@ fn resolve_provider_env_inner(
     };
 
     if let Some(account_name) = account_name.as_deref() {
-        if !matches!(provider, Provider::Glm | Provider::Deepseek | Provider::VibeBh) {
+        if !matches!(
+            provider,
+            Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::VibeBh
+        ) {
             if let Some(account_env) = dirs::home_dir()
                 .as_deref()
                 .and_then(|home| synthesized_account_env_for_home(provider, account_name, home))
@@ -1172,16 +1185,18 @@ mod tests {
     }
 
     #[test]
-    fn test_synthesized_account_env_for_claude_aliases() {
-        let env = synthesized_account_env_for_home(
-            Provider::Glm,
-            "yolo2",
-            Path::new("/tmp/fake-home"),
-        )
-        .unwrap();
-        assert_eq!(
-            env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
-            Some("/tmp/fake-home/.claude-account2")
+    fn test_synthesized_account_env_skips_fixed_claude_compatible_dirs() {
+        assert!(
+            synthesized_account_env_for_home(Provider::Glm, "yolo2", Path::new("/tmp/fake-home"))
+                .is_none()
+        );
+        assert!(
+            synthesized_account_env_for_home(
+                Provider::Minimax,
+                "yolo2",
+                Path::new("/tmp/fake-home"),
+            )
+            .is_none()
         );
     }
 
@@ -1216,11 +1231,7 @@ mod tests {
             resolve_provider_env(Provider::Glm, Some("account2"), None, store.path(), None)
                 .unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-account2"))
-        );
+        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
     }
 
     #[test]
@@ -1258,14 +1269,9 @@ mod tests {
         );
         save_config(&config, store.path());
 
-        let resolved =
-            resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap();
+        let resolved = resolve_provider_env(Provider::Glm, None, None, store.path(), None).unwrap();
         assert_eq!(resolved.get("EXTRA_FLAG").map(String::as_str), Some("1"));
-        assert!(
-            resolved
-                .get("CLAUDE_CONFIG_DIR")
-                .is_some_and(|path| path.ends_with("/.claude-account2"))
-        );
+        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
     }
 
     #[test]
@@ -1286,7 +1292,44 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_provider_env_glm_account_override_updates_claude_config() {
+    fn test_resolve_provider_env_minimax_claude_config() {
+        let store = temp_store();
+        let home = temp_store();
+        let settings_dir = home.path().join(".claude-mm");
+        fs::create_dir_all(&settings_dir).unwrap();
+        fs::write(
+            settings_dir.join("settings.json"),
+            r#"{
+              "env": {
+                "ANTHROPIC_BASE_URL": "https://api.minimax.io/anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "test-token",
+                "ANTHROPIC_MODEL": "MiniMax-M3"
+              },
+              "model": "MiniMax-M3"
+            }"#,
+        )
+        .unwrap();
+
+        let resolved = with_fake_home(home.path(), || {
+            resolve_provider_env(Provider::Minimax, None, None, store.path(), None).unwrap()
+        });
+        assert_eq!(
+            resolved.get("BRO_HARNESS_TRANSPORT").map(String::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            resolved.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://api.minimax.io/anthropic")
+        );
+        assert_eq!(
+            resolved.get("ANTHROPIC_AUTH_TOKEN").map(String::as_str),
+            Some("test-token")
+        );
+        assert!(!resolved.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
+    #[test]
+    fn test_resolve_provider_env_glm_account_override_can_set_claude_config() {
         let store = temp_store();
         let home = temp_store();
         let mut config = load_config(store.path());
@@ -1327,11 +1370,10 @@ mod tests {
         let ctx = BrofileContext {
             provider_defaults: Some(ProviderDefaultsMode::StrictSuppress),
         };
-        let err = enforce_provider_defaults(Provider::VibeBh, Some(&ctx)).expect_err(
-            "strict_suppress on Copilot should fail closed until verified controls exist",
-        );
+        let err = enforce_provider_defaults(Provider::Workflow, Some(&ctx))
+            .expect_err("strict_suppress on workflow should fail closed");
         assert!(err.contains("error.provider_defaults_unsupported"));
-        assert!(err.contains("copilot"));
+        assert!(err.contains("workflow"));
     }
 
     #[test]
@@ -1345,6 +1387,8 @@ mod tests {
             .expect("strict_suppress on Claude is honored via --system-prompt override");
         enforce_provider_defaults(Provider::Brodex, Some(&ctx))
             .expect("strict_suppress on Codex is honored via config overrides");
+        enforce_provider_defaults(Provider::Minimax, Some(&ctx))
+            .expect("strict_suppress on MiniMax is honored via --system-prompt override");
     }
 
     #[test]
@@ -1430,7 +1474,11 @@ mod tests {
             }
             let vibe_dir = home.path().join(".vibe");
             fs::create_dir_all(&vibe_dir).unwrap();
-            fs::write(vibe_dir.join(".env"), "MISTRAL_API_KEY=\"test-mistral-key\"\n").unwrap();
+            fs::write(
+                vibe_dir.join(".env"),
+                "MISTRAL_API_KEY=\"test-mistral-key\"\n",
+            )
+            .unwrap();
 
             let resolved =
                 resolve_provider_env(Provider::VibeBh, None, None, store.path(), None).unwrap();
@@ -1445,7 +1493,9 @@ mod tests {
             Some("openai-chat")
         );
         assert_eq!(
-            resolved.get("BRO_HARNESS_CHAT_REASONING").map(String::as_str),
+            resolved
+                .get("BRO_HARNESS_CHAT_REASONING")
+                .map(String::as_str),
             Some("mistral")
         );
         assert_eq!(
@@ -1458,5 +1508,4 @@ mod tests {
             Some("test-mistral-key")
         );
     }
-
 }

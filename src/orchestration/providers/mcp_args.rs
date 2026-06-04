@@ -47,10 +47,8 @@ pub trait ProviderMcp {
     /// injection moved to the daemon; kept for daemon-side wiring of fleet.json
     /// `mcpServers` into `/control/exec`.
     #[allow(dead_code)]
-    fn build_fleet_mcp_args(
-        &self,
-        servers: &BTreeMap<String, mcp::McpServerConfig>,
-    ) -> Vec<String>;
+    fn build_fleet_mcp_args(&self, servers: &BTreeMap<String, mcp::McpServerConfig>)
+    -> Vec<String>;
 }
 
 impl ProviderMcp for Provider {
@@ -123,7 +121,11 @@ impl ProviderMcp for Provider {
             // accept claude's --allowedTools. This is the client permission
             // plane (recursion guard + brofile + per-dispatch); surface is
             // separate and server-side via the MCP URL.
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+            Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh => {
                 let deny = expand_filter_patterns(&filters.disallow);
                 if !deny.is_empty() {
                     args.push("--deny-tools".into());
@@ -144,7 +146,11 @@ impl ProviderMcp for Provider {
     fn supports_dispatch_filter(&self) -> bool {
         matches!(
             self,
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+            Provider::Glm
+                | Provider::Deepseek
+                | Provider::Minimax
+                | Provider::Brodex
+                | Provider::VibeBh
         )
     }
 
@@ -163,7 +169,11 @@ impl ProviderMcp for Provider {
             return Vec::new();
         }
         match self {
-            Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh => {
+            Provider::Glm
+            | Provider::Deepseek
+            | Provider::Minimax
+            | Provider::Brodex
+            | Provider::VibeBh => {
                 vec!["--mcp-config".into(), fleet_mcp_config_json(servers)]
             }
             Provider::Workflow => Vec::new(),
