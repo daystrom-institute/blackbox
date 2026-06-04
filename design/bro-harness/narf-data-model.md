@@ -195,14 +195,21 @@ tool_result; plus an uncaught error string, an edge the author controls). So:
 
 - **Internal reads** (`kv.get`, a tool's returned value) are bounded only by
   **memory** (the isolate heap limit) — they never reach context.
-- **The cell's return** is what must be bounded: a cap on the returned value, and
-  the discipline "**return a summary or a kv name, not a blob**." Previews/
-  summaries are small by construction.
+- **The cell's return** is what must be bounded — and it **already is**, by the
+  existing **oversized-tool-result rider**. `narf_exec`/`narf_run` are builtin
+  tools, so their return flows through `crate::bound::bound_tool_result`
+  (`agent_loop.rs:933`, applied uniformly to every builtin + MCP tool result):
+  a return over `cap_bytes()` is **spilled to the harness dump dir**
+  (`$BRO_HOME/harness-dumps`) and the model gets a **head + a path rider** it can
+  `file_read`. So an oversized cell return behaves exactly like any other large
+  tool response — "too big; here's the path" — no NARF-specific cap. The
+  authoring discipline still stands ("**return a summary or a kv name, not a
+  blob**"), but it is *belt-and-suspenders* over a mechanism that already exists.
 - The out-box `narf_kv_get` retrieval *does* enter context, so it stays
-  **egress-bounded** — that is the one place a "context budget" genuinely applies.
+  **egress-bounded** — that is the one place a NARF-specific bound applies.
 
-Net: one rule — *bound what crosses back to the model* — replaces a cumulative
-read budget that was policing the wrong boundary.
+Net: one rule — *bound what crosses back to the model* — and it is satisfied by
+the existing uniform tool-result rider, not a new cumulative read budget.
 
 ## 6. Serialization, resume, restart
 
@@ -274,9 +281,16 @@ opt-in kv"):
   enumeration/selection path, §2.1). The open part is *writes*: expose
   model-facing `narf_kv_set`/`delete`, or keep out-box inspect-only and route all
   writes through cells? (Lean: inspect-only first.)
-- **`narf.encode` format set** — yaml/csv/toml/markdown-table? Which ship v1.
-- **Return cap** — the concrete bound on a cell's return value, and how summaries
-  are surfaced when it is exceeded (no silent truncation).
+- **`narf.encode` format set — DECIDED (v1): YAML + Markdown**, scoped to "what an
+  agent needs to author a frontmatter'd design doc": `narf.encode.yaml(obj)` (the
+  frontmatter encoder), `narf.encode.frontmatter(meta, body)` (assembles
+  `---\n<yaml>---\n\n<body>`), and `narf.encode.mdTable(rows)` (object[] → GFM
+  table). csv/toml deferred until needed.
+- **Return cap — RESOLVED (no new code).** The cell's return is bounded by the
+  existing oversized-tool-result rider (`crate::bound::bound_tool_result`,
+  `agent_loop.rs:933`): an oversized return spills to `$BRO_HOME/harness-dumps`
+  and the model gets a head + `file_read`-able path rider — same as any large tool
+  response (§5).
 - **Large-value heap path** — the niche where a value exceeds the isolate heap:
   raise the limit, a host-side splice for that case, or a tool that deposits to
   the store and returns a name. Deferred until it bites.
