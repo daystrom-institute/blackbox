@@ -11,6 +11,44 @@ brief: "A harness-owned time-travel primitive: rewind the agent loop's context (
 
 # bro-harness neuralyze (rewind + carry a message)
 
+> **Reframe (2026-06-04, post-harness-in-daemon — read the rest through this
+> lens).** This doc predates the harness-in-daemon consolidation and the NARF
+> substrate, and on re-read it splits into a sound half and a parked half along the
+> exact line drawn by [`narf-effects-and-safety.md`](./narf-effects-and-safety.md):
+>
+> - **Context rewind is the sound, primary half — build it.** Truncating the
+>   message vec to a watermark and appending one inbound `user` turn is **pure
+>   conversation state**: it has *no* externality or idempotence problem, because
+>   rewinding the attention window has zero world-side effect. It is cheap
+>   (`tx.snapshot()`/`restore()`, already owned) and it carries the headline value
+>   (rewind the *talk*, keep the *work* — an operator steering a discussion past a
+>   bad instruction). v1 is the checkpoint substrate + context-only rewind + the
+>   carry message + advised/self callers + guards (build steps 1–2 and 4).
+> - **File revert (`keep_files=false`, the inverse-diff journal, build step 3) is
+>   the parked Tx/rollback apparatus — do NOT build it.** It is a worktree
+>   transaction by another name and carries the same flaws: (1) it can only invert
+>   what it journaled, so externalities — an undeclared `curl`, a `git push`, a
+>   spawned bro, spend, a sent message — never revert (the `shell_run` `touches`
+>   snapshot covers only *declared* effects); (2) on a trusted, attended,
+>   git-backed box it reimplements, worse, what git already does; (3) reverting
+>   files while externalities stand makes the disk/context mismatch it is meant to
+>   fix *worse*, not better. So `keep_files=true` (context-only) is the honest
+>   default and only mode; file revert, if ever wanted, is git's job, not a
+>   harness journal that pretends to undo the world. A NARF cell is arbitrary code
+>   at shell trust — the same reason a v1 cell carries no transaction.
+> - **Unify the checkpoint substrate with NARF's journal/replay, don't build a
+>   second time-machine.** Neuralyze's per-turn checkpoints and NARF's
+>   `resumeFromRunId` journal (cached settled calls) are the *same shape* — watermark
+>   the loop, truncate to a point, replay or re-emit. They should share one
+>   substrate. And NARF replay is the **sound answer to the idempotence flaw** the
+>   inverse-diff journal lacks: it caches settled results and never re-executes them,
+>   sidestepping "re-run an external effect" by not re-running at all.
+>
+> Net: neuralyze v1 = checkpoint substrate + context-only rewind + carry +
+> callers/guards, sharing NARF's replay substrate; the file inverse-diff journal is
+> dropped. Sections below describing `keep_files=false` and the inverse-diff journal
+> are retained as the parked design, not v1 scope.
+
 > **Status.** Proposed. Verified against code 2026-05-29:
 > `crates/bro-harness/src/{agent_loop.rs,session.rs,transport/anthropic.rs}`,
 > `src/orchestration/supervision.rs`. Depends on the file inverse-diff journal
