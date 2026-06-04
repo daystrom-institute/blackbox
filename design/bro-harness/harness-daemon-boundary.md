@@ -282,7 +282,17 @@ on the operator's machine) deflates most of it.
   panic that unwinds across a V8 callback into C++ frames (no `catch_unwind`) is
   UB. In-process V8 trades a process boundary for **config discipline** — get it
   wrong and a cell *can* crash the daemon. This is the residual the trusted-agent
-  model accepts.
+  model accepts. **The §5b spike (`crates/bro-script`, deno_core `=0.403.0`)
+  confirmed both halves of this and proved the mitigations hold:** an
+  `add_near_heap_limit_callback` that flags + `terminate_execution`s + grants
+  doubling headroom contains a runaway allocator with the process surviving (no
+  `abort()`), and a cross-thread `IsolateHandle::terminate_execution` kills
+  `while(true){}`. Crucially the spike found **deno_core 0.403 wraps op dispatch in
+  zero `catch_unwind`** — so under the workspace's load-bearing `panic = "unwind"`,
+  an *unguarded* op panic unwinds across V8 C++ frames = UB. Mitigation proven and
+  now **mandatory**: every NARF capability op body must wrap its work in
+  `catch_unwind` → `JsErrorBox`. This is a structural rule for the full build, not a
+  per-op nicety.
 - **A low-probability V8 embedding/internal fault has no process boundary to catch
   it** — it would take the daemon (corpus + all sessions). Accepted as
   low-prob-with-a-mature-crate; revisit if it ever bites.
@@ -849,13 +859,34 @@ roster render.
     (linking `bro-fleet-client`, no `blackbox`) rendered the roster + provider/
     model/effort selector, dispatched a brodex gpt-5.5 agent end-to-end (TUI →
     `/control/exec` → daemon → agent → ✓ Finished).
-- **§5 in-process V8 + supervised shell (execution isolation).** Not started;
-  no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
-  per-child env hook but not timeout/cap supervision.
+- **§5b in-process V8 (execution isolation) — SPIKE DONE; full build next.** The
+  de-risking spike landed as a new workspace crate `crates/bro-script` (commit
+  `7b170de`): deno_core `=0.403.0` (v8 `149.2.0`) embedded on a dedicated OS thread
+  (the `!Send` `JsRuntime` owns the thread; a current-thread tokio runtime +
+  `LocalSet` drives the event loop; jobs/replies cross via mpsc+oneshot; the only
+  outward handle is the `Send+Sync` `v8::IsolateHandle`). All four daemon-safety
+  properties + the async bridge are proven by 6 passing tests (zero `blackbox`
+  dep): heap-bound OOM containment (process survives, no `abort()`), cross-thread
+  runaway-loop kill (+ runtime reusable after `cancel_terminate_execution`), denied
+  globals (`console`/`Atomics`/`SharedArrayBuffer`/`WebAssembly` deleted per-isolate),
+  the `!Send`-isolate ↔ async-Rust capability bridge (`await cap.echo` → executor on
+  the outer runtime → back to JS), and the panic boundary (`catch_unwind` → JS
+  error). KEY RESIDUAL (now in §5 Future concerns): deno_core 0.403 has **zero**
+  op-dispatch `catch_unwind`, so under `panic = "unwind"` a mandatory per-op
+  `catch_unwind` wrapper is structural for the full build. Cost blackboxd inherits:
+  +59 transitive crates, prebuilt `librusty_v8` ~196 MB, cold dep build ~165s /
+  incremental ~6s. Independently re-verified by the orchestrator (`cargo test -p
+  bro-script` 6/6). NOT yet wired into bro-harness/agent-loop/daemon dispatch — that
+  is the full build (real `bro-capabilities` ops, supervision policy, ref-result
+  handles, then live daemon integration + tmux smoke).
+- **Supervised shell (§5a).** Still only `with_spawn_scrub` + per-child env hook;
+  timeout/ulimit-cgroup cap supervision not built (deferred behind §5b/§9 per the
+  operator's sequencing).
 - **NARF substrate (§9).** Authoring layer (`Ref`/`Promise`/`Plan`/`Tx`/`Atom`/
-  `Script`, JS/TS bindings) is unbuilt; the capability seam it would ride is in
-  place. (A peer `Design NARF capability library` commit on this branch is design,
-  not implementation.)
+  `Script`, JS/TS bindings, `narf_exec`/`narf_wait`) is unbuilt; the V8 container it
+  rides on now exists (spike) and the capability seam it rides is in place. (The
+  peer `Design NARF capability library` commit is now `narf-capability-library.md` —
+  design, owning the query/authorship-surface layer that lands after the substrate.)
 - **§4 deletion ledger.** The CLI-hole providers / tmux / opencode scrub landed
   earlier on the branch; verify no live CLI-shaped dispatch path remains before
   treating §4 as fully closed.
