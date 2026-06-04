@@ -73,7 +73,7 @@ impl RefactorCapability for StubRefactor {
 
 // Stub host built-in tool seam (§5): echoes back the tool name + input so a test
 // can prove the in-box `fs.*`/`shell.*`/... bindings route through op_tool_invoke
-// to the injected ToolCapability, store host-side as a ref, and egress on demand.
+// to the injected ToolCapability and return values directly.
 // A `name` of "boom" yields an is_error result to exercise the JS-throw path.
 struct StubTools;
 #[async_trait]
@@ -112,10 +112,12 @@ impl bro_capabilities::ToolCapability for StubTools {
                     .unwrap_or_default();
                 let promises: Vec<_> = ids
                     .iter()
-                    .map(|id| serde_json::json!({
-                        "promise_id": id, "state": "completed",
-                        "result": { "stdout": "done" }
-                    }))
+                    .map(|id| {
+                        serde_json::json!({
+                            "promise_id": id, "state": "completed",
+                            "result": { "stdout": "done" }
+                        })
+                    })
                     .collect();
                 ok(serde_json::json!({ "promises": promises }))
             }
@@ -131,7 +133,9 @@ impl bro_capabilities::ToolCapability for StubTools {
             "promise_status" => ok(serde_json::json!({
                 "promise_id": inp.get("promise_id"), "state": "completed"
             })),
-            "promise_list" => ok(serde_json::json!([{ "promise_id": "pr-7", "state": "completed" }])),
+            "promise_list" => {
+                ok(serde_json::json!([{ "promise_id": "pr-7", "state": "completed" }]))
+            }
             "promise_cancel" => ok(serde_json::json!({
                 "promise_id": inp.get("promise_id"), "state": "cancelled"
             })),
@@ -179,9 +183,8 @@ impl AtomCapability for ErrAtoms {
     }
 }
 
-// An atom whose output carries a large body, to exercise the ref/egress
-// boundary: the full value must stay host-side, only the envelope crosses, and
-// `text()` egress is budget-bounded.
+// An atom whose output carries a large body, proving Phase A returns values
+// directly into the cell. Return-value caps are a later phase.
 struct BigAtoms;
 #[async_trait]
 impl AtomCapability for BigAtoms {
@@ -248,38 +251,34 @@ async fn denied_globals() {
 // Real capability bridges (criterion #4) — one per trait method.
 // ---------------------------------------------------------------------------
 
-// Each capability op now returns a `{ ref, size, preview }` envelope; the full
-// value stays host-side and is retrievable ONLY via `narf.ref.text`.
+// Capability ops return values directly into the cell.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn atom_invoke_lookup_returns_ref_envelope() {
+async fn atom_invoke_lookup_returns_value() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
             r#"const r = await atoms.invoke("lookup", { query: "redis", limit: 2 });
                return JSON.stringify({
-                 hasRef: typeof r.ref === 'string' && r.ref.startsWith('ref:cap/'),
-                 hasSize: typeof r.size === 'number' && r.size > 0,
-                 previewHasText: r.preview.includes('found:redis'),
-                 noFullValue: r[0] === undefined,
+                 atom: r.atom,
+                 echoQuery: r.echo.query,
+                 hitText: r.hit.text,
                });"#,
         )
         .await
         .unwrap();
     assert_eq!(
         out,
-        r#""{\"hasRef\":true,\"hasSize\":true,\"previewHasText\":true,\"noFullValue\":true}""#
+        r#""{\"atom\":\"lookup\",\"echoQuery\":\"redis\",\"hitText\":\"found:redis\"}""#
     );
 }
 
-// Ref round-trip: the handle materializes the REAL value via bounded egress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn atom_invoke_lookup_ref_roundtrip_via_text() {
+async fn atom_invoke_lookup_value_can_be_used_directly() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
             r#"const r = await atoms.invoke("lookup", { query: "redis", limit: 2 });
-               const value = JSON.parse(narf.ref.text(r));
-               return value.output_json.hit.text;"#,
+               return r.hit.text;"#,
         )
         .await
         .unwrap();
@@ -287,14 +286,12 @@ async fn atom_invoke_lookup_ref_roundtrip_via_text() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn atom_invoke_returns_envelope_and_materializes() {
+async fn atom_invoke_returns_atom_output_value() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
             r#"const r = await atoms.invoke("my-atom", { x: 1 });
-               if (r.output_json !== undefined) return 'LEAKED_FULL_VALUE';
-               const v = JSON.parse(narf.ref.text(r));
-               return v.output_json.atom + ":" + v.output_json.echo.x;"#,
+               return r.atom + ":" + r.echo.x;"#,
         )
         .await
         .unwrap();
@@ -302,17 +299,13 @@ async fn atom_invoke_returns_envelope_and_materializes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn refactor_plan_and_materialize_via_refs() {
+async fn refactor_plan_and_materialize_return_values() {
     let rt = stub_runtime().await;
-    // plan() and materialize() both return ref envelopes; the real plan id is
-    // only reachable through explicit egress of the plan ref.
     let out = rt
         .execute(
             r#"const h = await refactor.plan({ kind: "rename", input_json: { sym: "foo" } });
-               const plan = JSON.parse(narf.ref.text(h));
-               const m = await refactor.materialize(plan.id);
-               const mat = JSON.parse(narf.ref.text(m));
-               return plan.preview + "|" + mat.materialized;"#,
+               const mat = await refactor.materialize(h.id);
+               return h.preview + "|" + mat.materialized;"#,
         )
         .await
         .unwrap();
@@ -387,15 +380,14 @@ async fn prepare_run_composes_session_helper_and_capability_binding() {
         .unwrap();
     assert_eq!(resp.status, "ready");
     let handle = resp.ref_handle.clone().unwrap();
-    assert!(handle.starts_with("ref:narf-script/"));
+    assert!(handle.starts_with("narf-script:"));
     // prepare returns the rendered, import-assembled source for model review.
     assert!(resp.source.as_ref().unwrap().contains("atoms.invoke"));
 
-    // run executes the prepared script; the cell's atoms.invoke yields a ref env.
+    // run executes the prepared script; the cell's atoms.invoke yields a value.
     let result = rt.run(handle).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
-    assert!(v["ref"].as_str().unwrap().starts_with("ref:cap/"));
-    assert!(v["preview"].as_str().unwrap().contains("found:narf"));
+    assert_eq!(v["hit"]["text"], "found:narf");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -600,7 +592,7 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
     let out = rt
         .execute(
             r#"const r = await atoms.invoke("lookup", { query: "q", limit: 1 });
-               return JSON.parse(narf.ref.text(r)).output_json.hit.text;"#,
+               return r.hit.text;"#,
         )
         .await
         .unwrap();
@@ -608,140 +600,29 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
 }
 
 // ---------------------------------------------------------------------------
-// §9-1: Ref substrate + bounded egress.
+// Phase A value-return behavior.
 // ---------------------------------------------------------------------------
 
 fn big_caps() -> Capabilities {
     caps_with(Arc::new(BigAtoms), Arc::new(StubRefactor))
 }
 
-// `peek` returns metadata (kind, size, content type, preview) — never the bytes,
-// and never charges egress budget.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ref_peek_returns_metadata_not_bytes() {
-    let rt = stub_runtime().await;
-    let out = rt
-        .execute(
-            r#"const r = await atoms.invoke("lookup", { query: "redis", limit: 1 });
-               const m = narf.ref.peek(r);
-               return JSON.stringify({
-                 kind: m.kind,
-                 hasSize: typeof m.size === 'number',
-                 contentType: m.content_type,
-                 hasPreview: typeof m.preview === 'string',
-                 noValue: m.value === undefined,
-               });"#,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        out,
-        r#""{\"kind\":\"cap\",\"hasSize\":true,\"contentType\":\"application/json\",\"hasPreview\":true,\"noValue\":true}""#
-    );
-}
-
-// A large capability result does NOT appear in the op's direct JS return: the
-// envelope is tiny, while the (host-side) full value is large.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn large_result_does_not_enter_js_via_op_return() {
+async fn large_result_returns_direct_value_in_phase_a() {
     let rt = ScriptRuntime::new(big_caps(), SupervisionPolicy::default())
         .await
         .unwrap();
     let out = rt
         .execute(
             r#"const r = await atoms.invoke("big", { query: "big", limit: 1 });
-               const envelopeStr = JSON.stringify(r);
                return JSON.stringify({
-                 envelopeSmall: envelopeStr.length < 1500,
-                 sizeLarge: r.size > 4000,
-                 noFullValue: r[0] === undefined,
+                 id: r.id,
+                 textLen: r.text.length,
                });"#,
         )
         .await
         .unwrap();
-    assert_eq!(
-        out,
-        r#""{\"envelopeSmall\":true,\"sizeLarge\":true,\"noFullValue\":true}""#
-    );
-}
-
-// The cumulative egress budget is enforced: once spent, a further `text()` that
-// would exceed the remainder fails closed with a catchable JS error.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn egress_budget_enforced_cumulatively() {
-    let policy = SupervisionPolicy {
-        egress_budget_bytes: 4096,
-        ..SupervisionPolicy::default()
-    };
-    let rt = ScriptRuntime::new(big_caps(), policy).await.unwrap();
-    let out = rt
-        .execute(
-            r#"const r = await atoms.invoke("big", { query: "big", limit: 1 });
-               const a = narf.ref.text(r, 4000);   // 4000 <= 4096 remaining: ok
-               let threw = false, msg = '';
-               try { narf.ref.text(r, 4000); }      // 4000 > 96 remaining: fails closed
-               catch (e) { threw = true; msg = String(e); }
-               return JSON.stringify({
-                 firstLen: a.length,
-                 threw,
-                 budgetErr: msg.includes('egress budget'),
-               });"#,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        out,
-        r#""{\"firstLen\":4000,\"threw\":true,\"budgetErr\":true}""#
-    );
-}
-
-// `text()` honors its per-call cap and the default cap, charging only what it
-// returns; a small ref under the default cap materializes whole.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn ref_text_respects_per_call_cap() {
-    let rt = ScriptRuntime::new(big_caps(), SupervisionPolicy::default())
-        .await
-        .unwrap();
-    let out = rt
-        .execute(
-            r#"const r = await atoms.invoke("big", { query: "big", limit: 1 });
-               const capped = narf.ref.text(r, 100);   // explicit small cap
-               const dflt = narf.ref.text(r);          // default 8 KiB cap >= size
-               return JSON.stringify({
-                 cappedLen: capped.length,
-                 defaultLen: dflt.length,
-                 fullSize: r.size,
-                 defaultIsFull: dflt.length === r.size,
-               });"#,
-        )
-        .await
-        .unwrap();
-    // size = serialized [{"id":"big","text":"x"*5000}] which is > 5000 bytes and
-    // < the 8 KiB default cap, so the default-cap read returns the whole value.
-    let v: serde_json::Value =
-        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
-    assert_eq!(v["cappedLen"], 100);
-    assert_eq!(v["defaultIsFull"], true);
-    assert_eq!(v["defaultLen"], v["fullSize"]);
-}
-
-// Unknown / wrong ref handles fail closed with a clean catchable JS error on both
-// egress entry points.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unknown_ref_handle_errors() {
-    let rt = stub_runtime().await;
-    let out = rt
-        .execute(
-            r#"let textThrew = false, peekThrew = false;
-               try { narf.ref.text("ref:cap/9999", 100); }
-               catch (e) { textThrew = String(e).includes('unknown ref'); }
-               try { narf.ref.peek("ref:cap/9999"); }
-               catch (e) { peekThrew = String(e).includes('unknown ref'); }
-               return JSON.stringify({ textThrew, peekThrew });"#,
-        )
-        .await
-        .unwrap();
-    assert_eq!(out, r#""{\"textThrew\":true,\"peekThrew\":true}""#);
+    assert_eq!(out, r#""{\"id\":\"big\",\"textLen\":5000}""#);
 }
 
 // ---------------------------------------------------------------------------
@@ -762,32 +643,23 @@ async fn tools_runtime() -> ScriptRuntime {
         .unwrap()
 }
 
-// fs.read routes through op_tool_invoke to the injected ToolCapability, stores the
-// result host-side as a `tool` ref, and returns a `{ref,size,preview}` envelope.
-// The bytes enter the cell only via explicit egress (narf.ref.text).
+// fs.read routes through op_tool_invoke to the injected ToolCapability and
+// returns the tool value directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn fs_read_routes_through_tool_seam_and_returns_ref() {
+async fn fs_read_routes_through_tool_seam_and_returns_value() {
     let rt = tools_runtime().await;
     let out = rt
         .execute(
             r#"const env = await fs.read("src/foo.rs");
-               const meta = narf.ref.peek(env);
-               const body = JSON.parse(narf.ref.text(env));
                return JSON.stringify({
-                   isRef: env.ref.startsWith("ref:tool/"),
-                   kind: meta.kind,
-                   contentType: meta.content_type,
-                   tool: body.tool,
-                   filePath: body.input.file_path,
+                   tool: env.tool,
+                   filePath: env.input.file_path,
                });"#,
         )
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
-        .unwrap();
-    assert_eq!(v["isRef"], true);
-    assert_eq!(v["kind"], "tool");
-    assert_eq!(v["contentType"], "application/json");
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
     assert_eq!(v["tool"], "file_read");
     assert_eq!(v["filePath"], "src/foo.rs");
 }
@@ -799,9 +671,9 @@ async fn host_tool_sugar_maps_primary_field() {
     let rt = tools_runtime().await;
     let out = rt
         .execute(
-            r#"const sh = JSON.parse(narf.ref.text(await shell.run("ls -la")));
-               const gr = JSON.parse(narf.ref.text(await search.content("TODO")));
-               const gs = JSON.parse(narf.ref.text(await git.show("HEAD")));
+            r#"const sh = await shell.run("ls -la");
+               const gr = await search.content("TODO");
+               const gs = await git.show("HEAD");
                return JSON.stringify({
                    command: sh.input.command,
                    pattern: gr.input.pattern,
@@ -810,8 +682,8 @@ async fn host_tool_sugar_maps_primary_field() {
         )
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
-        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
     assert_eq!(v["command"], "ls -la");
     assert_eq!(v["pattern"], "TODO");
     assert_eq!(v["rev"], "HEAD");
@@ -833,8 +705,8 @@ async fn host_tool_error_throws_catchable() {
         )
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
-        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
     assert_eq!(v["threw"], true);
     assert_eq!(v["hasMsg"], true);
 }
@@ -853,8 +725,8 @@ async fn host_tools_fail_closed_when_absent() {
         )
         .await
         .unwrap();
-    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
-        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
     assert_eq!(v["threw"], true);
     assert_eq!(v["failClosed"], true);
 }
@@ -863,22 +735,19 @@ async fn host_tools_fail_closed_when_absent() {
 // §5 in-box promise primitive: narf.promise.{all,any,wait,status,list,cancel,pipeline}.
 // ---------------------------------------------------------------------------
 
-// shell.run(mode:'promise') returns a by-value {promise_id} ticket (inline, NOT
-// a ref) so it composes with narf.promise.*; narf.promise.all joins and returns
-// a ref-out envelope (producer output stays host-side, bounded egress).
+// shell.run(mode:'promise') returns a by-value {promise_id} ticket, and
+// narf.promise.all joins by returning the producer values directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn promise_ticket_is_inline_and_join_is_ref() {
+async fn promise_ticket_and_join_return_values() {
     let rt = tools_runtime().await;
     let out = rt
         .execute(
             r#"const h = await shell.run({ command: 'echo hi', mode: 'promise' });
                const joined = await narf.promise.all([h]);
-               const body = JSON.parse(narf.ref.text(joined));
                return JSON.stringify({
                    ticketInline: h.promise_id === 'pr-7',
-                   joinIsRef: joined.ref.startsWith('ref:tool/'),
-                   firstResult: body.promises[0].result.stdout,
-                   joinedId: body.promises[0].promise_id,
+                   firstResult: joined.promises[0].result.stdout,
+                   joinedId: joined.promises[0].promise_id,
                });"#,
         )
         .await
@@ -886,7 +755,6 @@ async fn promise_ticket_is_inline_and_join_is_ref() {
     let v: serde_json::Value =
         serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
     assert_eq!(v["ticketInline"], true);
-    assert_eq!(v["joinIsRef"], true);
     assert_eq!(v["firstResult"], "done");
     assert_eq!(v["joinedId"], "pr-7");
 }
@@ -922,15 +790,14 @@ async fn promise_control_ops_are_inline() {
     assert_eq!(v["cancelState"], "cancelled");
 }
 
-// narf.promise.any returns the first settled promise (ref-out).
+// narf.promise.any returns the first settled promise value.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn promise_any_returns_first() {
     let rt = tools_runtime().await;
     let out = rt
         .execute(
             r#"const env = await narf.promise.any(['pr-1', 'pr-2']);
-               const body = JSON.parse(narf.ref.text(env));
-               return JSON.stringify({ id: body.promise.promise_id, state: body.promise.state });"#,
+               return JSON.stringify({ id: env.promise.promise_id, state: env.promise.state });"#,
         )
         .await
         .unwrap();

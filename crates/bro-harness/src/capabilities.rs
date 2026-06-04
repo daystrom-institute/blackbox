@@ -111,16 +111,16 @@ impl ToolCapability for HostTools {
                 ),
             )
         })?;
-        let (content, is_error, content_type) = match tool.call(invocation.input_json, &self.cx).await
-        {
-            ToolResult::Text(t) => (t, false, "text/plain"),
-            ToolResult::Json(v) => (
-                serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
-                false,
-                "application/json",
-            ),
-            ToolResult::Error(e) => (e, true, "text/plain"),
-        };
+        let (content, is_error, content_type) =
+            match tool.call(invocation.input_json, &self.cx).await {
+                ToolResult::Text(t) => (t, false, "text/plain"),
+                ToolResult::Json(v) => (
+                    serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
+                    false,
+                    "application/json",
+                ),
+                ToolResult::Error(e) => (e, true, "text/plain"),
+            };
         Ok(ToolCallOutput {
             content,
             is_error,
@@ -440,7 +440,7 @@ impl Tool for NarfExecTool {
     }
 
     fn description(&self) -> &str {
-        "runs a NARF JS composition cell in-process; the cell composes capabilities over refs and returns a value."
+        "runs a NARF JS composition cell in-process; the cell composes capability/tool values and returns a value."
     }
 
     fn input_schema(&self) -> Value {
@@ -473,10 +473,9 @@ impl Tool for NarfExecTool {
 }
 
 /// `narf_prepare`: render + syntax-validate a script (optionally importing session
-/// helpers) and return BOTH a `ref:narf-script/*` handle AND the rendered source,
-/// so the model reviews exactly what `narf_run` will execute (the §0.1 review
-/// step). This is the model-facing replacement for the mislayered in-box
-/// `narf.prepare`.
+/// helpers) and return BOTH a prepared-script handle AND the rendered source, so
+/// the model reviews exactly what `narf_run` will execute (the §0.1 review step).
+/// This is the model-facing replacement for the mislayered in-box `narf.prepare`.
 struct NarfPrepareTool {
     session: Arc<NarfSession>,
 }
@@ -488,7 +487,7 @@ impl Tool for NarfPrepareTool {
     }
 
     fn description(&self) -> &str {
-        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Returns {ref, status, diagnostics, source} — review the rendered source, then narf_run the ref."
+        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Returns {ref, status, diagnostics, source} — review the rendered source, then narf_run the handle."
     }
 
     fn input_schema(&self) -> Value {
@@ -523,7 +522,7 @@ impl Tool for NarfPrepareTool {
     }
 }
 
-/// `narf_run`: execute a prepared `ref:narf-script/*` script and return its result.
+/// `narf_run`: execute a prepared script by handle and return its result.
 /// Model-facing replacement for the mislayered in-box `narf.run`.
 struct NarfRunTool {
     session: Arc<NarfSession>,
@@ -536,14 +535,14 @@ impl Tool for NarfRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run a prepared NARF script by its ref:narf-script/* handle (from narf_prepare); returns the script's result value."
+        "Run a prepared NARF script by its handle (from narf_prepare); returns the script's result value."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "ref": { "type": "string", "description": "Prepared script handle (ref:narf-script/*)." }
+                "ref": { "type": "string", "description": "Prepared script handle." }
             },
             "required": ["ref"]
         })
@@ -822,7 +821,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn narf_exec_runs_atom_binding_and_returns_ref_envelope() {
+    async fn narf_exec_runs_atom_binding_and_returns_value() {
         let tool = narf_tool(Arc::new(StubAtoms));
 
         let result = tool
@@ -836,14 +835,8 @@ mod tests {
 
         match result {
             ToolResult::Json(v) => {
-                assert!(v["ref"].as_str().unwrap().starts_with("ref:cap/"));
-                assert!(v["size"].as_u64().unwrap() > 0);
-
-                let preview = v["preview"].as_str().expect("preview string");
-                let preview_json: Value =
-                    serde_json::from_str(preview).expect("preview should be JSON");
-                assert_eq!(preview_json["output_json"]["atom"], "atom:x@v1");
-                assert_eq!(preview_json["output_json"]["echo"], json!({}));
+                assert_eq!(v["atom"], "atom:x@v1");
+                assert_eq!(v["echo"], json!({}));
             }
             other => panic!("expected Json result, got {other:?}"),
         }
@@ -886,7 +879,7 @@ mod tests {
     #[tokio::test]
     async fn narf_exec_reads_file_through_host_tool_seam() {
         // End-to-end: a NARF cell calls fs.read (in-box) → op_tool_invoke →
-        // HostTools → real FileRead built-in → ref envelope → narf.ref.text.
+        // HostTools → real FileRead built-in → value returned to the cell.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
         std::fs::write(root.join("hello.txt"), "in-box bytes\n").unwrap();
@@ -904,7 +897,7 @@ mod tests {
             .call(
                 json!({
                     "source": "const env = await fs.read('hello.txt'); \
-                               return narf.ref.text(env);"
+                               return env;"
                 }),
                 &test_cx(),
             )
@@ -912,7 +905,7 @@ mod tests {
 
         match result {
             ToolResult::Json(v) => {
-                let body = v.as_str().expect("text egress is a string");
+                let body = v.as_str().expect("fs.read returns a string");
                 assert!(body.contains("in-box bytes"), "got: {body}");
             }
             other => panic!("expected Json result, got {other:?}"),
@@ -982,7 +975,7 @@ mod tests {
             }
             other => panic!("expected Json prepare, got {other:?}"),
         };
-        assert!(handle.starts_with("ref:narf-script/"));
+        assert!(handle.starts_with("narf-script:"));
 
         let result = run.call(json!({ "ref": handle }), &test_cx()).await;
         match result {

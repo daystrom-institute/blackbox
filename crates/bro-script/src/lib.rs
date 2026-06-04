@@ -89,22 +89,6 @@ pub const DEFAULT_HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 /// timeout test passes a deliberately short value instead.
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Default per-runtime cumulative egress budget (bytes). Caps the total bytes
-/// that `narf.ref.text()` may pull out of host-side refs into the JS heap (i.e.
-/// model context) over the lifetime of the runtime. Generous for ordinary
-/// scripts; the egress-budget test passes a deliberately tiny value.
-pub const DEFAULT_EGRESS_BUDGET_BYTES: usize = 256 * 1024;
-
-/// Default per-call `narf.ref.text()` materialization cap (bytes) when the
-/// caller omits `maxBytes`. A single `text()` never pulls more than this even if
-/// the ref is larger and the cumulative budget has room.
-pub const DEFAULT_EGRESS_TEXT_BYTES: usize = 8 * 1024;
-
-/// Byte length of the bounded preview head stored on each ref and surfaced in the
-/// capability envelope / `narf.ref.peek()`. The preview is the only ref content
-/// that crosses into JS without spending egress budget; keep it small.
-const PREVIEW_BYTES: usize = 512;
-
 // ---------------------------------------------------------------------------
 // Capability injection
 // ---------------------------------------------------------------------------
@@ -132,12 +116,6 @@ pub struct Capabilities {
 pub struct SupervisionPolicy {
     pub heap_limit_bytes: usize,
     pub execution_timeout: Option<Duration>,
-    /// Per-runtime cumulative cap on bytes egressed from host-side refs into JS
-    /// via `narf.ref.text()`. Default-ON (see [`DEFAULT_EGRESS_BUDGET_BYTES`]);
-    /// a `text()` that would push cumulative egress past this cap fails closed
-    /// with a catchable JS error. This is the NARF "egress is explicit and
-    /// bounded" governance non-negotiable (narf-draft2 §7).
-    pub egress_budget_bytes: usize,
 }
 
 impl Default for SupervisionPolicy {
@@ -145,179 +123,41 @@ impl Default for SupervisionPolicy {
         Self {
             heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
             execution_timeout: Some(DEFAULT_EXECUTION_TIMEOUT),
-            egress_budget_bytes: DEFAULT_EGRESS_BUDGET_BYTES,
         }
     }
 }
 
 // ---------------------------------------------------------------------------
-// Ref substrate (§9-1, narf-draft2 §4 `Ref<T>`) + bounded egress (§7)
+// Prepared script storage
 // ---------------------------------------------------------------------------
-//
-// NARF discipline: a big capability result must NOT flow straight into the V8
-// heap / model context. Instead the full serialized value lives HOST-SIDE in a
-// per-runtime `RefState`, keyed by an opaque `ref:<kind>/<id>` token, and only a
-// compact envelope (handle + size + bounded preview) crosses into JS. The bytes
-// enter context only via explicit, budget-bounded egress (`narf.ref.text`).
-//
-// `RefState` lives on the V8 thread inside `OpState` as `Rc<RefCell<RefState>>` —
-// ops run on that thread, so no cross-thread sharing is needed and values never
-// auto-enter JS.
 
-/// A take a byte-bounded prefix of `s` that respects UTF-8 char boundaries. Never
-/// splits a multi-byte codepoint (walks the boundary down). Returns all of `s`
-/// when it is already within `max`.
-fn byte_prefix(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
-}
-
-/// Build the bounded, truncation-marked preview head stored on a ref. Bounded to
-/// [`PREVIEW_BYTES`]; this is the only ref content that crosses into JS for free
-/// (envelope + `peek`), so it is deliberately small.
-fn make_preview(value: &str) -> String {
-    if value.len() <= PREVIEW_BYTES {
-        return value.to_string();
-    }
-    let head = byte_prefix(value, PREVIEW_BYTES);
-    format!(
-        "{head}…[+{} bytes truncated; narf.ref.text(handle) to materialize]",
-        value.len() - head.len()
-    )
-}
-
-/// One stored ref: the FULL serialized value (held host-side, never auto-egressed)
-/// plus metadata. `kind` is `cap` for capability results to start.
-struct RefEntry {
-    kind: String,
-    content_type: String,
-    value: String,
-    size: usize,
-    preview: String,
-}
-
-/// The compact envelope returned to JS in place of a capability op's full output.
-/// The full value stays host-side under [`RefEntry`]; only this crosses into V8.
-#[derive(Serialize)]
-struct RefEnvelope {
-    #[serde(rename = "ref")]
-    handle: String,
-    size: usize,
-    preview: String,
-}
-
-/// Per-runtime ref store + cumulative egress accounting. Lives on the V8 thread.
-/// Ids are a simple monotonic counter (deterministic; no uuid/rng needed since
-/// this is host-side Rust state, not script-observable nondeterminism).
-struct RefState {
+/// Minimal per-runtime store for model-reviewed prepared scripts. This is not
+/// the retired data-ref substrate; it only backs `narf_prepare` -> `narf_run`
+/// identifier handles until the later KV phase provides the durable home.
+#[derive(Default)]
+struct PreparedScripts {
     next_id: u64,
-    entries: HashMap<String, RefEntry>,
-    egress_used: usize,
-    egress_budget_bytes: usize,
+    scripts: HashMap<String, String>,
 }
 
-impl RefState {
-    fn new(egress_budget_bytes: usize) -> Self {
-        Self {
-            next_id: 0,
-            entries: HashMap::new(),
-            egress_used: 0,
-            egress_budget_bytes,
-        }
-    }
-
-    /// Store a full serialized value host-side and return the JS-facing envelope.
-    /// The value itself never crosses into JS here.
-    fn put(&mut self, kind: &str, content_type: &str, value: String) -> RefEnvelope {
+impl PreparedScripts {
+    fn put(&mut self, source: String) -> String {
         let id = self.next_id;
         self.next_id += 1;
-        let handle = format!("ref:{kind}/{id}");
-        let size = value.len();
-        let preview = make_preview(&value);
-        self.entries.insert(
-            handle.clone(),
-            RefEntry {
-                kind: kind.to_string(),
-                content_type: content_type.to_string(),
-                value,
-                size,
-                preview: preview.clone(),
-            },
-        );
-        RefEnvelope {
-            handle,
-            size,
-            preview,
-        }
+        let handle = format!("narf-script:{id}");
+        self.scripts.insert(handle.clone(), source);
+        handle
     }
 
-    fn get_value(&self, handle: &str, expected_kind: &str) -> Result<String, String> {
-        let entry = self
-            .entries
+    fn get(&self, handle: &str) -> Result<String, String> {
+        self.scripts
             .get(handle)
-            .ok_or_else(|| format!("unknown ref handle: {handle}"))?;
-        if entry.kind != expected_kind {
-            return Err(format!(
-                "ref {handle} has kind {}, expected {expected_kind}",
-                entry.kind
-            ));
-        }
-        Ok(entry.value.clone())
-    }
-
-    /// Explicit, bounded egress: materialize up to `max_bytes` (0 → default
-    /// [`DEFAULT_EGRESS_TEXT_BYTES`]) of the ref's value into JS, charging the
-    /// cumulative budget. Fails closed (does NOT truncate) if the materialized
-    /// slice would push cumulative egress past `egress_budget_bytes`, and on an
-    /// unknown handle. Returns `Err(message)` for a catchable JS error.
-    fn text(&mut self, handle: &str, max_bytes: usize) -> Result<String, String> {
-        let cap = if max_bytes == 0 {
-            DEFAULT_EGRESS_TEXT_BYTES
-        } else {
-            max_bytes
-        };
-        let entry = self
-            .entries
-            .get(handle)
-            .ok_or_else(|| format!("unknown ref handle: {handle}"))?;
-        // Owned copy ends the immutable borrow of `self.entries` before we mutate
-        // the egress counter below.
-        let out = byte_prefix(&entry.value, cap).to_string();
-        let want = out.len();
-        let remaining = self.egress_budget_bytes.saturating_sub(self.egress_used);
-        if want > remaining {
-            return Err(format!(
-                "egress budget exceeded: requested {want} bytes, {remaining} of {} byte budget remaining",
-                self.egress_budget_bytes
-            ));
-        }
-        self.egress_used += want;
-        Ok(out)
-    }
-
-    /// Metadata-only view of a ref (kind, size, content type, bounded preview).
-    /// Never returns the full value and never charges egress budget.
-    fn peek(&self, handle: &str) -> Result<serde_json::Value, String> {
-        let entry = self
-            .entries
-            .get(handle)
-            .ok_or_else(|| format!("unknown ref handle: {handle}"))?;
-        Ok(serde_json::json!({
-            "kind": entry.kind,
-            "size": entry.size,
-            "content_type": entry.content_type,
-            "preview": entry.preview,
-        }))
+            .cloned()
+            .ok_or_else(|| format!("unknown prepared script handle: {handle}"))
     }
 }
 
-type RefStateCell = Rc<RefCell<RefState>>;
+type PreparedScriptsCell = Rc<RefCell<PreparedScripts>>;
 
 // ---------------------------------------------------------------------------
 // Session-local authoring state + prepared-script trace (§4 / §6)
@@ -622,44 +462,35 @@ where
 // ---------------------------------------------------------------------------
 
 /// Forward a typed capability request to the outer-runtime executor and await its
-/// typed reply, serializing the output to a JSON string for JS. The whole body
+/// typed reply. The whole body
 /// runs under [`guard_async`] in the caller op, so the synchronous channel work
 /// (and any panic in it) is contained on the V8 thread.
-async fn bridge<O: Serialize>(
+async fn bridge<O>(
     tx: CapTx,
     make: impl FnOnce(oneshot::Sender<CapabilityResult<O>>) -> CapRequest,
-) -> Result<String, JsErrorBox> {
+) -> Result<O, JsErrorBox> {
     let (reply_tx, reply_rx) = oneshot::channel();
     tx.send(make(reply_tx))
         .map_err(|_| JsErrorBox::generic("capability executor is gone"))?;
-    let output = reply_rx
+    reply_rx
         .await
         .map_err(|_| JsErrorBox::generic("capability executor dropped the reply"))?
-        .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))?;
-    serde_json::to_string(&output)
-        .map_err(|e| JsErrorBox::generic(format!("failed to serialize capability output: {e}")))
+        .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))
 }
 
-/// Store a full serialized capability output host-side as a `cap` ref and return
-/// the compact envelope JSON (`{ "ref", "size", "preview" }`) — the only thing
-/// that crosses into JS. The full value stays in [`RefState`]; it enters context
-/// only via explicit `narf.ref.text` egress.
-fn store_and_envelope(refs: &RefStateCell, full: String) -> Result<String, JsErrorBox> {
-    store_and_envelope_kind(refs, "cap", "application/json", full)
+fn serialize_value(value: impl Serialize) -> Result<String, JsErrorBox> {
+    serde_json::to_string(&value)
+        .map_err(|e| JsErrorBox::generic(format!("failed to serialize output: {e}")))
 }
 
-/// Like [`store_and_envelope`] but with an explicit ref kind + content type, so
-/// host built-in tool output (`narf-tool-placement.md` §5) is stored under the
-/// `tool` kind with the tool's own content type rather than the `cap` default.
-fn store_and_envelope_kind(
-    refs: &RefStateCell,
-    kind: &str,
-    content_type: &str,
-    full: String,
-) -> Result<String, JsErrorBox> {
-    let envelope = refs.borrow_mut().put(kind, content_type, full);
-    serde_json::to_string(&envelope)
-        .map_err(|e| JsErrorBox::generic(format!("failed to serialize ref envelope: {e}")))
+fn serialize_tool_output(out: ToolCallOutput) -> Result<String, JsErrorBox> {
+    if out.content_type == "application/json" {
+        let value: serde_json::Value = serde_json::from_str(&out.content)
+            .map_err(|e| JsErrorBox::generic(format!("tool returned invalid JSON: {e}")))?;
+        serialize_value(value)
+    } else {
+        serialize_value(out.content)
+    }
 }
 
 /// Forward a host built-in tool invocation to the outer-runtime executor and
@@ -679,15 +510,10 @@ async fn bridge_tool(tx: CapTx, input: ToolInvocation) -> Result<ToolCallOutput,
         .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))
 }
 
-/// Pull the two per-runtime handles a capability op needs (the capability
-/// executor channel + the host-side ref store) out of `OpState` in one short
+/// Pull the capability executor channel out of `OpState` in one short
 /// borrow, BEFORE any `await`, so no `OpState` borrow is held across a suspend.
-fn caps_handles(state: &Rc<RefCell<OpState>>) -> (CapTx, RefStateCell) {
-    let s = state.borrow();
-    (
-        s.borrow::<CapTx>().clone(),
-        s.borrow::<RefStateCell>().clone(),
-    )
+fn cap_tx(state: &Rc<RefCell<OpState>>) -> CapTx {
+    state.borrow().borrow::<CapTx>().clone()
 }
 
 /// `await atoms.invoke(handle, input)` — JSON in, JSON out, over the async bridge.
@@ -698,11 +524,11 @@ async fn op_atom_invoke(
     #[string] input_json: String,
 ) -> Result<String, JsErrorBox> {
     guard_async(async move {
-        let (tx, refs) = caps_handles(&state);
+        let tx = cap_tx(&state);
         let input: AtomInvocation = serde_json::from_str(&input_json)
             .map_err(|e| JsErrorBox::generic(format!("invalid atoms.invoke input: {e}")))?;
-        let full = bridge(tx, move |reply| CapRequest::AtomInvoke { input, reply }).await?;
-        store_and_envelope(&refs, full)
+        let output = bridge(tx, move |reply| CapRequest::AtomInvoke { input, reply }).await?;
+        serialize_value(output.output_json)
     })
     .await
 }
@@ -715,11 +541,11 @@ async fn op_refactor_plan(
     #[string] input_json: String,
 ) -> Result<String, JsErrorBox> {
     guard_async(async move {
-        let (tx, refs) = caps_handles(&state);
+        let tx = cap_tx(&state);
         let input: RefactorRequest = serde_json::from_str(&input_json)
             .map_err(|e| JsErrorBox::generic(format!("invalid refactor.plan input: {e}")))?;
-        let full = bridge(tx, move |reply| CapRequest::RefactorPlan { input, reply }).await?;
-        store_and_envelope(&refs, full)
+        let handle = bridge(tx, move |reply| CapRequest::RefactorPlan { input, reply }).await?;
+        serialize_value(handle)
     })
     .await
 }
@@ -732,22 +558,22 @@ async fn op_refactor_materialize(
     #[string] id: String,
 ) -> Result<String, JsErrorBox> {
     guard_async(async move {
-        let (tx, refs) = caps_handles(&state);
-        let full = bridge(tx, move |reply| CapRequest::RefactorMaterialize {
+        let tx = cap_tx(&state);
+        let plan = bridge(tx, move |reply| CapRequest::RefactorMaterialize {
             id,
             reply,
         })
         .await?;
-        store_and_envelope(&refs, full)
+        serialize_value(plan)
     })
     .await
 }
 
 /// `op_tool_invoke(name, input)` — the generic host built-in seam
 /// (`narf-tool-placement.md` §5). Bridges to the injected [`ToolCapability`],
-/// stores the tool's content host-side as a `tool` ref, and returns the bounded
-/// `{ref,size,preview}` envelope. A tool that reports `is_error` surfaces as a
-/// catchable JS exception (so a cell can `try/catch`); an unknown / denied /
+/// and returns the tool value directly into the cell: JSON content becomes a JS
+/// value, non-JSON content becomes a JS string. A tool that reports `is_error`
+/// surfaces as a catchable JS exception (so a cell can `try/catch`); an unknown / denied /
 /// uninstalled tool fails closed via the capability error.
 #[op2(async(lazy), fast)]
 #[string]
@@ -756,7 +582,7 @@ async fn op_tool_invoke(
     #[string] input_json: String,
 ) -> Result<String, JsErrorBox> {
     guard_async(async move {
-        let (tx, refs) = caps_handles(&state);
+        let tx = cap_tx(&state);
         let input: ToolInvocation = serde_json::from_str(&input_json)
             .map_err(|e| JsErrorBox::generic(format!("invalid host tool invocation: {e}")))?;
         let name = input.name.clone();
@@ -764,7 +590,7 @@ async fn op_tool_invoke(
         if out.is_error {
             return Err(JsErrorBox::generic(format!("{name}: {}", out.content)));
         }
-        store_and_envelope_kind(&refs, "tool", &out.content_type, out.content)
+        serialize_tool_output(out)
     })
     .await
 }
@@ -775,7 +601,7 @@ async fn op_tool_invoke(
 /// content string directly (JS `JSON.parse`s it) instead of ref-wrapping it, so a
 /// promise handle (`{promise_id}`), a `promise_status`/`list`/`cancel` snapshot,
 /// or a `shell.run(mode:'promise')` ticket stays usable in the cell rather than
-/// hiding behind a ref. Big-result tools keep using [`op_tool_invoke`] (ref-out).
+/// hiding behind an extra wrapper.
 /// A tool `is_error` still throws; unknown/denied still fails closed.
 #[op2(async(lazy), fast)]
 #[string]
@@ -784,7 +610,7 @@ async fn op_tool_invoke_inline(
     #[string] input_json: String,
 ) -> Result<String, JsErrorBox> {
     guard_async(async move {
-        let (tx, _refs) = caps_handles(&state);
+        let tx = cap_tx(&state);
         let input: ToolInvocation = serde_json::from_str(&input_json)
             .map_err(|e| JsErrorBox::generic(format!("invalid host tool invocation: {e}")))?;
         let name = input.name.clone();
@@ -797,41 +623,6 @@ async fn op_tool_invoke_inline(
     .await
 }
 
-/// `narf.ref.text(handle, maxBytes)` — explicit, bounded egress. Materialize up
-/// to `max_bytes` (0 → [`DEFAULT_EGRESS_TEXT_BYTES`]) of the ref's host-side
-/// value into JS, charging the per-runtime cumulative egress budget. This is the
-/// ONLY path a ref's bytes enter context. Fails closed (catchable JS error) when
-/// the slice would exceed the remaining budget, or on an unknown handle. Sync op
-/// (pure host-state), still routed through the structural panic guard.
-#[op2]
-#[string]
-fn op_ref_text(
-    state: &mut OpState,
-    #[string] handle: String,
-    #[smi] max_bytes: u32,
-) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let refs = state.borrow::<RefStateCell>().clone();
-        let mut rs = refs.borrow_mut();
-        rs.text(&handle, max_bytes as usize)
-            .map_err(JsErrorBox::generic)
-    })
-}
-
-/// `narf.ref.peek(handle)` — metadata only (kind, size, content type, bounded
-/// preview). Never returns the full value and never charges egress budget.
-/// Unknown handle → catchable JS error.
-#[op2]
-#[string]
-fn op_ref_peek(state: &mut OpState, #[string] handle: String) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let refs = state.borrow::<RefStateCell>().clone();
-        let meta = refs.borrow().peek(&handle).map_err(JsErrorBox::generic)?;
-        serde_json::to_string(&meta)
-            .map_err(|e| JsErrorBox::generic(format!("failed to serialize ref metadata: {e}")))
-    })
-}
-
 /// Store a helper in the host-side session frame and create the default import
 /// alias `name -> name`. Shared host-side logic behind the **model-facing**
 /// `narf_define` tool (via `Job::Define`) — NOT an in-box op: authoring a session
@@ -839,7 +630,10 @@ fn op_ref_peek(state: &mut OpState, #[string] handle: String) -> Result<String, 
 /// `narf-capability-library.md` §0.1). The in-box side keeps only
 /// `narf.session.import` (recall by exact name). Validates the name and export
 /// identifiers; helper *syntax* is validated on import/prepare.
-fn define_session_helper(session: &SessionStateCell, input: SessionDefineInput) -> Result<(), String> {
+fn define_session_helper(
+    session: &SessionStateCell,
+    input: SessionDefineInput,
+) -> Result<(), String> {
     if !is_js_identifier(&input.name) {
         return Err(format!("invalid helper name identifier: {}", input.name));
     }
@@ -904,16 +698,14 @@ deno_core::extension!(
         op_refactor_materialize,
         op_tool_invoke,
         op_tool_invoke_inline,
-        op_ref_text,
-        op_ref_peek,
         op_session_import,
         op_panic_guarded,
         op_panic_guarded_async,
     ],
-    options = { tx: CapTx, egress_budget_bytes: usize },
+    options = { tx: CapTx },
     state = |state, options| {
         state.put::<CapTx>(options.tx);
-        state.put::<RefStateCell>(Rc::new(RefCell::new(RefState::new(options.egress_budget_bytes))));
+        state.put::<PreparedScriptsCell>(Rc::new(RefCell::new(PreparedScripts::default())));
         state.put::<SessionStateCell>(Rc::new(RefCell::new(SessionState::default())));
         state.put::<TraceStateCell>(Rc::new(RefCell::new(Vec::new())));
     },
@@ -980,10 +772,9 @@ const BOOTSTRAP: &str = r#"
                 typeof handle === 'string' ? handle : handle.id)),
     };
     // §5 host built-in tool parity: each binding rides the single op_tool_invoke
-    // seam, returns a `{ ref, size, preview }` envelope (output stays host-side;
-    // egress via narf.ref.text), and throws on tool error. Selection-from-result
-    // is interpretive and must round-trip the model — these are for mechanical
-    // complete-set composition, not enumerate-then-pick (narf-tool-placement.md §3).
+    // seam, returns a value directly into the cell, and throws on tool error.
+    // Selection-from-result is interpretive and must round-trip the model —
+    // these are for mechanical complete-set composition, not enumerate-then-pick.
     const hostTool = async (name, input) =>
         JSON.parse(await Deno.core.ops.op_tool_invoke(
             JSON.stringify({ name, input_json: input ?? {} })));
@@ -1013,9 +804,6 @@ const BOOTSTRAP: &str = r#"
                     typeof a === 'string' ? { message: a, paths: paths ?? [] } : a),
     };
     globalThis.shell = {
-        // Promise mode returns a small {promise_id} ticket → keep it by-value
-        // (inline) so it composes with narf.promise.*; inline mode is a big
-        // result → ref.
         run:  (a) => {
             const input = typeof a === 'string' ? { command: a } : a;
             return (input && input.mode === 'promise')
@@ -1034,22 +822,7 @@ const BOOTSTRAP: &str = r#"
     // by-value {promise_id} tickets producers return (e.g. shell.run mode:promise).
     const promiseId = (h) =>
         (typeof h === 'string' ? h : (h && (h.promise_id ?? (h.detail && h.detail.promise_id))));
-    // §9-1 Ref substrate: capability ops now return a `{ ref, size, preview }`
-    // envelope (the full value stays host-side). `narf.ref` is the explicit,
-    // bounded egress surface — `text()` is the only way a ref's bytes enter JS.
-    // §9-1 Ref substrate: capability ops return a `{ ref, size, preview }`
-    // envelope (the full value stays host-side). `narf.ref` is the explicit,
-    // bounded egress surface — `text()` is the only way a ref's bytes enter JS.
-    const refToken = (h) => (typeof h === 'string' ? h : (h && h.ref));
     globalThis.narf = {
-        ref: {
-            text: (handle, maxBytes) =>
-                Deno.core.ops.op_ref_text(
-                    refToken(handle),
-                    (maxBytes === undefined || maxBytes === null) ? 0 : maxBytes),
-            peek: (handle) =>
-                JSON.parse(Deno.core.ops.op_ref_peek(refToken(handle))),
-        },
         session: {
             // §2.2 in-box EXCEPTION: recall a cached helper by exact name — a
             // dereference (keeps the helper source host-side, out of context),
@@ -1062,8 +835,8 @@ const BOOTSTRAP: &str = r#"
             },
         },
     };
-    // §5 promise join: all/any/wait carry producer output → ref-out (bounded
-    // egress); status/list/cancel are small control snapshots → inline.
+    // §5 promise join: all/any/wait return producer values; status/list/cancel
+    // are small control snapshots.
     globalThis.narf.promise = {
         all:    (handles, timeoutMs) => hostTool('promise_when_all',
                     { promise_ids: (handles ?? []).map(promiseId), timeout_ms: timeoutMs }),
@@ -1076,8 +849,7 @@ const BOOTSTRAP: &str = r#"
         cancel: (handle) => hostToolInline('promise_cancel', { promise_id: promiseId(handle) }),
         // Pure-JS no-barrier staging: each item flows through ALL stages
         // independently (wall-clock = slowest single chain, not sum-of-stages).
-        // A stage may be sync or async; a ref/promise a stage returns passes
-        // straight to the next. (narf-tool-placement.md §5 step 5 "pipeline".)
+        // A stage may be sync or async; each returned value passes to the next.
         pipeline: (items, ...stages) => Promise.all(
             (items ?? []).map((item) =>
                 stages.reduce((acc, stage) => acc.then(stage), Promise.resolve(item)))),
@@ -1107,17 +879,10 @@ impl ScriptRuntime {
             oneshot::channel::<Result<(v8::IsolateHandle, Arc<AtomicBool>)>>();
 
         let heap_limit_bytes = policy.heap_limit_bytes;
-        let egress_budget_bytes = policy.egress_budget_bytes;
         let thread = std::thread::Builder::new()
             .name("bro-script-v8".to_string())
             .spawn(move || {
-                v8_thread_main(
-                    cap_tx,
-                    job_rx,
-                    setup_tx,
-                    heap_limit_bytes,
-                    egress_budget_bytes,
-                );
+                v8_thread_main(cap_tx, job_rx, setup_tx, heap_limit_bytes);
             })?;
 
         let (isolate_handle, heap_oom) = setup_rx
@@ -1262,14 +1027,13 @@ fn v8_thread_main(
     mut job_rx: mpsc::UnboundedReceiver<Job>,
     setup_tx: oneshot::Sender<Result<(v8::IsolateHandle, Arc<AtomicBool>)>>,
     heap_limit_bytes: usize,
-    egress_budget_bytes: usize,
 ) {
     // V8's platform is process-global; `JsRuntime::new` initializes it through an
     // internal `Once`, so concurrent first-construction across threads is safe.
     let create_params = v8::CreateParams::default().heap_limits(0, heap_limit_bytes);
     let mut runtime = deno_core::JsRuntime::new(RuntimeOptions {
         create_params: Some(create_params),
-        extensions: vec![bro_script_ext::init(cap_tx, egress_budget_bytes)],
+        extensions: vec![bro_script_ext::init(cap_tx)],
         ..Default::default()
     });
 
@@ -1408,11 +1172,8 @@ fn prepare_one(
     let handle = {
         let op_state = runtime.op_state();
         let state = op_state.borrow();
-        let refs = state.borrow::<RefStateCell>().clone();
-        let handle = refs
-            .borrow_mut()
-            .put("narf-script", "application/javascript", assembled.clone())
-            .handle;
+        let scripts = state.borrow::<PreparedScriptsCell>().clone();
+        let handle = scripts.borrow_mut().put(assembled.clone());
         handle
     };
     // Return the rendered source so the model reviews exactly what narf_run runs.
@@ -1435,11 +1196,8 @@ async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Resul
     let source = {
         let op_state = runtime.op_state();
         let state = op_state.borrow();
-        let refs = state.borrow::<RefStateCell>().clone();
-        let source = refs
-            .borrow()
-            .get_value(handle, "narf-script")
-            .map_err(|e| anyhow!(e))?;
+        let scripts = state.borrow::<PreparedScriptsCell>().clone();
+        let source = scripts.borrow().get(handle).map_err(|e| anyhow!(e))?;
         source
     };
     {
