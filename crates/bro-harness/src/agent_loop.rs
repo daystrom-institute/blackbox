@@ -604,19 +604,32 @@ impl Session {
         // status signal on the stream) and holds its own emitter handle. It is
         // registered always but only pinned in fleet (bidirectional) mode.
         let fleet = cli.input_format.as_deref() == Some("stream-json");
+        let tool_filter =
+            mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
         let mut builtins = builtin_tools_for_mode(fleet);
         builtins.push(Arc::new(crate::report::ReportTool::new(make_emitter(
             store.id.clone(),
             callback.clone(),
         ))));
+        // §5 host built-in seam (narf-tool-placement.md): a NARF cell's in-box
+        // fs/shell/search/git/web bindings dispatch to the parity built-ins via
+        // HostTools, gated by the SAME ToolFilter as the flat surface (§4.5 — an
+        // unfiltered in-box surface would be a deny-bypass) and run against this
+        // session's ToolCx. Built from a fresh, filtered built-in set (the tool
+        // structs are stateless; state comes from `cx` at call time).
+        let host_builtins: Vec<Arc<dyn Tool>> = builtin_tools_for_mode(fleet)
+            .into_iter()
+            .filter(|t| tool_filter.permits(t.name()))
+            .collect();
+        let host_tools: Arc<dyn bro_capabilities::ToolCapability> =
+            Arc::new(crate::capabilities::HostTools::new(host_builtins, cx.clone()));
         // In-process capability bindings (harness-daemon-boundary.md §6): when the
         // daemon has installed corpus/atom/refactor impls, expose them as direct
-        // trait-dispatch tools. Empty (no-op) for the standalone binary, so those
-        // surfaces fail closed by absence. Registered as builtins so the surface
-        // ToolFilter still gates them.
-        builtins.extend(crate::capabilities::capability_tools());
-        let tool_filter =
-            mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
+        // trait-dispatch tools, and inject the host seam into the NARF runtime.
+        // Empty (no-op) for the standalone binary, so those surfaces fail closed
+        // by absence. Registered as builtins so the surface ToolFilter still gates
+        // them.
+        builtins.extend(crate::capabilities::capability_tools(Some(host_tools)));
         let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
         let mut pin = PinPolicy::from_env();
         if fleet {

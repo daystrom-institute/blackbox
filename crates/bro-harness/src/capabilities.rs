@@ -11,14 +11,15 @@
 //! fail-closed behaviour the boundary doc requires (§2 — "the standalone binary
 //! injects absent impls → corpus capabilities fail closed").
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bro_capabilities::{
     AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, RefactorCapability,
-    RefactorRequest,
+    RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
 };
-use bro_core::AtomRef;
+use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 
@@ -66,9 +67,74 @@ fn refactor() -> Option<Arc<dyn RefactorCapability>> {
         .clone()
 }
 
+/// The generic host built-in tool seam (`narf-tool-placement.md` §5): a NARF
+/// cell's `fs.*`/`shell.*`/`search.*`/`git.*`/`web.*` in-box bindings dispatch
+/// here, and this runs the matching pre-beta bro-tools built-in by name against
+/// the per-session [`ToolCx`] — the same `Tool::call` path the flat model-facing
+/// surface uses.
+///
+/// §4.5 invariant: the callable set is gated by the **same** `ToolFilter` as the
+/// flat surface (an unfiltered in-box surface would be a deny-bypass). The
+/// caller constructs `HostTools` from the already-filtered built-in set, so a
+/// denied capability is absent here and fails closed.
+pub struct HostTools {
+    tools: HashMap<String, Arc<dyn Tool>>,
+    cx: ToolCx,
+}
+
+impl HostTools {
+    /// Build the host-tool seam from a pre-filtered built-in set + the session
+    /// context. `filtered_builtins` MUST already have had the session's
+    /// `ToolFilter` applied by the caller (§4.5); capability/control tools
+    /// (`narf_exec`, `atom_invoke`, `report`, …) are intentionally NOT included —
+    /// they have their own in-box bindings or are out-box-only.
+    pub fn new(filtered_builtins: Vec<Arc<dyn Tool>>, cx: ToolCx) -> Self {
+        let tools = filtered_builtins
+            .into_iter()
+            .map(|t| (t.name().to_string(), t))
+            .collect();
+        Self { tools, cx }
+    }
+}
+
+#[async_trait]
+impl ToolCapability for HostTools {
+    async fn call_tool(&self, invocation: ToolInvocation) -> Result<ToolCallOutput, BroError> {
+        let tool = self.tools.get(&invocation.name).ok_or_else(|| {
+            // Unknown OR filtered-out → fail closed (no in-box route around the
+            // ToolFilter, §4.5).
+            BroError::new(
+                "tool_unavailable",
+                format!(
+                    "host tool '{}' is not available in-box (unknown or denied)",
+                    invocation.name
+                ),
+            )
+        })?;
+        let (content, is_error, content_type) = match tool.call(invocation.input_json, &self.cx).await
+        {
+            ToolResult::Text(t) => (t, false, "text/plain"),
+            ToolResult::Json(v) => (
+                serde_json::to_string(&v).unwrap_or_else(|_| v.to_string()),
+                false,
+                "application/json",
+            ),
+            ToolResult::Error(e) => (e, true, "text/plain"),
+        };
+        Ok(ToolCallOutput {
+            content,
+            is_error,
+            content_type: content_type.to_string(),
+        })
+    }
+}
+
 /// Capability-backed tools to merge into the registry. Empty when nothing was
 /// installed (standalone harness) → these surfaces fail closed by absence.
-pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
+///
+/// `host_tools` is the per-session generic built-in seam (§5); when present it is
+/// injected into the NARF runtime so a cell can call `fs.*`/`shell.*`/… in-box.
+pub fn capability_tools(host_tools: Option<Arc<dyn ToolCapability>>) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     if let Some(c) = corpus() {
         tools.push(Arc::new(CorpusSearchTool(c)));
@@ -83,7 +149,7 @@ pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
         tools.push(Arc::new(RefactorPlanGetTool(r)));
     }
     if let (Some(atoms), Some(refactor)) = (atom_cap, refactor_cap) {
-        tools.push(Arc::new(NarfExecTool::new(atoms, refactor)));
+        tools.push(Arc::new(NarfExecTool::new(atoms, refactor, host_tools)));
     }
     tools
 }
@@ -295,14 +361,20 @@ impl Tool for RefactorPlanGetTool {
 struct NarfExecTool {
     atoms: Arc<dyn AtomCapability>,
     refactor: Arc<dyn RefactorCapability>,
+    tools: Option<Arc<dyn ToolCapability>>,
     runtime: Arc<tokio::sync::Mutex<Option<bro_script::ScriptRuntime>>>,
 }
 
 impl NarfExecTool {
-    fn new(atoms: Arc<dyn AtomCapability>, refactor: Arc<dyn RefactorCapability>) -> Self {
+    fn new(
+        atoms: Arc<dyn AtomCapability>,
+        refactor: Arc<dyn RefactorCapability>,
+        tools: Option<Arc<dyn ToolCapability>>,
+    ) -> Self {
         Self {
             atoms,
             refactor,
+            tools,
             runtime: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -342,6 +414,7 @@ impl Tool for NarfExecTool {
             let caps = bro_script::Capabilities {
                 atoms: self.atoms.clone(),
                 refactor: self.refactor.clone(),
+                tools: self.tools.clone(),
             };
             match bro_script::ScriptRuntime::new(caps, bro_script::SupervisionPolicy::default())
                 .await
@@ -550,7 +623,7 @@ mod tests {
     }
 
     fn narf_tool(atoms: Arc<dyn AtomCapability>) -> NarfExecTool {
-        NarfExecTool::new(atoms, Arc::new(StubRefactor::default()))
+        NarfExecTool::new(atoms, Arc::new(StubRefactor::default()), None)
     }
 
     #[tokio::test]
@@ -590,6 +663,74 @@ mod tests {
                     serde_json::from_str(preview).expect("preview should be JSON");
                 assert_eq!(preview_json["output_json"]["atom"], "atom:x@v1");
                 assert_eq!(preview_json["output_json"]["echo"], json!({}));
+            }
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn host_tools_filtered_set_fails_closed_on_denied() {
+        // HostTools built from a filtered built-in set: file_read survives, but a
+        // tool excluded by the filter (e.g. shell_run denied) is absent → calling
+        // it in-box fails closed (no deny-bypass, §4.5).
+        let filter = crate::mcp::ToolFilter::from_csv(Some("shell_run"), None);
+        let allowed: Vec<Arc<dyn Tool>> = bro_tools::builtin_tools()
+            .into_iter()
+            .filter(|t| filter.permits(t.name()))
+            .collect();
+        let host = HostTools::new(allowed, test_cx());
+
+        // file_read is permitted (no real file needed — it returns a tool error
+        // for a missing path, which is is_error=true, NOT tool_unavailable).
+        let read = host
+            .call_tool(ToolInvocation {
+                name: "file_read".to_string(),
+                input_json: json!({ "file_path": "definitely-missing.xyz" }),
+            })
+            .await
+            .expect("file_read is in the filtered set");
+        assert!(read.is_error, "missing file → tool-level error");
+
+        // shell_run was denied → absent from the in-box set → fail closed.
+        let denied = host
+            .call_tool(ToolInvocation {
+                name: "shell_run".to_string(),
+                input_json: json!({ "command": "echo nope" }),
+            })
+            .await;
+        let err = denied.expect_err("denied tool must fail closed");
+        assert_eq!(err.code, "tool_unavailable");
+    }
+
+    #[tokio::test]
+    async fn narf_exec_reads_file_through_host_tool_seam() {
+        // End-to-end: a NARF cell calls fs.read (in-box) → op_tool_invoke →
+        // HostTools → real FileRead built-in → ref envelope → narf.ref.text.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::write(root.join("hello.txt"), "in-box bytes\n").unwrap();
+
+        let mut cx = test_cx();
+        cx.root = root.clone();
+        let host: Arc<dyn ToolCapability> =
+            Arc::new(HostTools::new(bro_tools::builtin_tools(), cx));
+
+        let tool = NarfExecTool::new(Arc::new(StubAtoms), Arc::new(StubRefactor::default()), Some(host));
+
+        let result = tool
+            .call(
+                json!({
+                    "source": "const env = await fs.read('hello.txt'); \
+                               return narf.ref.text(env);"
+                }),
+                &test_cx(),
+            )
+            .await;
+
+        match result {
+            ToolResult::Json(v) => {
+                let body = v.as_str().expect("text egress is a string");
+                assert!(body.contains("in-box bytes"), "got: {body}");
             }
             other => panic!("expected Json result, got {other:?}"),
         }

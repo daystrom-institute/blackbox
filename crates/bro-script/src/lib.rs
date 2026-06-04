@@ -71,7 +71,7 @@ use tokio::sync::{mpsc, oneshot};
 
 pub use bro_capabilities::{
     AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, RefactorCapability,
-    RefactorPlanHandle, RefactorRequest,
+    RefactorPlanHandle, RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
 };
 use bro_core::BroError;
 
@@ -116,6 +116,11 @@ const PREVIEW_BYTES: usize = 512;
 pub struct Capabilities {
     pub atoms: Arc<dyn AtomCapability>,
     pub refactor: Arc<dyn RefactorCapability>,
+    /// The generic host built-in tool seam (§5.1). `None` for the standalone
+    /// runtime / tests that exercise only atom+refactor composition — the
+    /// `fs.*`/`shell.*`/`search.*`/`git.*`/`web.*` in-box bindings then fail
+    /// closed (§4.5 fail-safe by absence).
+    pub tools: Option<Arc<dyn ToolCapability>>,
 }
 
 /// Configurable, default-ON supervision. The heap limit bounds isolate memory;
@@ -493,6 +498,10 @@ enum CapRequest {
         id: String,
         reply: oneshot::Sender<CapabilityResult<serde_json::Value>>,
     },
+    ToolInvoke {
+        input: ToolInvocation,
+        reply: oneshot::Sender<CapabilityResult<ToolCallOutput>>,
+    },
 }
 
 type CapTx = mpsc::UnboundedSender<CapRequest>;
@@ -532,6 +541,17 @@ async fn dispatch_cap(caps: Capabilities, req: CapRequest) {
             let cap = caps.refactor.clone();
             let _ = reply.send(run_caught(async move { cap.materialize_plan(id).await }).await);
         }
+        CapRequest::ToolInvoke { input, reply } => match caps.tools.clone() {
+            Some(cap) => {
+                let _ = reply.send(run_caught(async move { cap.call_tool(input).await }).await);
+            }
+            None => {
+                let _ = reply.send(Err(BroError::new(
+                    "host_tools_unavailable",
+                    "host built-in tools are not installed in this runtime (fail-closed)",
+                )));
+            }
+        },
     }
 }
 
@@ -618,9 +638,38 @@ async fn bridge<O: Serialize>(
 /// that crosses into JS. The full value stays in [`RefState`]; it enters context
 /// only via explicit `narf.ref.text` egress.
 fn store_and_envelope(refs: &RefStateCell, full: String) -> Result<String, JsErrorBox> {
-    let envelope = refs.borrow_mut().put("cap", "application/json", full);
+    store_and_envelope_kind(refs, "cap", "application/json", full)
+}
+
+/// Like [`store_and_envelope`] but with an explicit ref kind + content type, so
+/// host built-in tool output (`narf-tool-placement.md` §5) is stored under the
+/// `tool` kind with the tool's own content type rather than the `cap` default.
+fn store_and_envelope_kind(
+    refs: &RefStateCell,
+    kind: &str,
+    content_type: &str,
+    full: String,
+) -> Result<String, JsErrorBox> {
+    let envelope = refs.borrow_mut().put(kind, content_type, full);
     serde_json::to_string(&envelope)
         .map_err(|e| JsErrorBox::generic(format!("failed to serialize ref envelope: {e}")))
+}
+
+/// Forward a host built-in tool invocation to the outer-runtime executor and
+/// await the typed reply. Unlike [`bridge`], the reply is inspected by the op
+/// (an `is_error` result becomes a catchable JS exception), so this returns the
+/// typed [`ToolCallOutput`] rather than a pre-serialized string.
+async fn bridge_tool(tx: CapTx, input: ToolInvocation) -> Result<ToolCallOutput, JsErrorBox> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(CapRequest::ToolInvoke {
+        input,
+        reply: reply_tx,
+    })
+    .map_err(|_| JsErrorBox::generic("capability executor is gone"))?;
+    reply_rx
+        .await
+        .map_err(|_| JsErrorBox::generic("capability executor dropped the reply"))?
+        .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))
 }
 
 /// Pull the two per-runtime handles a capability op needs (the capability
@@ -683,6 +732,32 @@ async fn op_refactor_materialize(
         })
         .await?;
         store_and_envelope(&refs, full)
+    })
+    .await
+}
+
+/// `op_tool_invoke(name, input)` — the generic host built-in seam
+/// (`narf-tool-placement.md` §5). Bridges to the injected [`ToolCapability`],
+/// stores the tool's content host-side as a `tool` ref, and returns the bounded
+/// `{ref,size,preview}` envelope. A tool that reports `is_error` surfaces as a
+/// catchable JS exception (so a cell can `try/catch`); an unknown / denied /
+/// uninstalled tool fails closed via the capability error.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_tool_invoke(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let (tx, refs) = caps_handles(&state);
+        let input: ToolInvocation = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid host tool invocation: {e}")))?;
+        let name = input.name.clone();
+        let out = bridge_tool(tx, input).await?;
+        if out.is_error {
+            return Err(JsErrorBox::generic(format!("{name}: {}", out.content)));
+        }
+        store_and_envelope_kind(&refs, "tool", &out.content_type, out.content)
     })
     .await
 }
@@ -883,6 +958,7 @@ deno_core::extension!(
         op_atom_invoke,
         op_refactor_plan,
         op_refactor_materialize,
+        op_tool_invoke,
         op_ref_text,
         op_ref_peek,
         op_session_define,
@@ -959,6 +1035,43 @@ const BOOTSTRAP: &str = r#"
         materialize: async (handle) =>
             JSON.parse(await Deno.core.ops.op_refactor_materialize(
                 typeof handle === 'string' ? handle : handle.id)),
+    };
+    // §5 host built-in tool parity: each binding rides the single op_tool_invoke
+    // seam, returns a `{ ref, size, preview }` envelope (output stays host-side;
+    // egress via narf.ref.text), and throws on tool error. Selection-from-result
+    // is interpretive and must round-trip the model — these are for mechanical
+    // complete-set composition, not enumerate-then-pick (narf-tool-placement.md §3).
+    const hostTool = async (name, input) =>
+        JSON.parse(await Deno.core.ops.op_tool_invoke(
+            JSON.stringify({ name, input_json: input ?? {} })));
+    globalThis.fs = {
+        read:      (a) => hostTool('file_read',  typeof a === 'string' ? { file_path: a } : a),
+        smartRead: (a) => hostTool('smart_read', typeof a === 'string' ? { file_path: a } : a),
+        list:      (a) => hostTool('list_dir',   typeof a === 'string' ? { path: a } : (a ?? {})),
+        write:     (a, content) => hostTool('file_write',
+                       typeof a === 'string' ? { file_path: a, content } : a),
+        edit:      (a) => hostTool('file_edit', a),
+    };
+    globalThis.search = {
+        content: (a) => hostTool('content_search', typeof a === 'string' ? { pattern: a } : a),
+        glob:    (a) => hostTool('glob',           typeof a === 'string' ? { pattern: a } : a),
+    };
+    globalThis.git = {
+        status: (a) => hostTool('git_status', a ?? {}),
+        log:    (a) => hostTool('git_log',    a ?? {}),
+        diff:   (a) => hostTool('git_diff',   a ?? {}),
+        show:   (a) => hostTool('git_show',   typeof a === 'string' ? { rev: a } : (a ?? {})),
+        commit: (a, paths) => hostTool('git_commit',
+                    typeof a === 'string' ? { message: a, paths: paths ?? [] } : a),
+    };
+    globalThis.shell = {
+        run:  (a) => hostTool('shell_run', typeof a === 'string' ? { command: a } : a),
+        poll: (a) => hostTool('shell_poll', a),
+        kill: (a) => hostTool('shell_kill', a),
+        list: (a) => hostTool('shell_list', a ?? {}),
+    };
+    globalThis.web = {
+        fetch: (a) => hostTool('web_fetch', typeof a === 'string' ? { url: a } : a),
     };
     // §9-1 Ref substrate: capability ops now return a `{ ref, size, preview }`
     // envelope (the full value stays host-side). `narf.ref` is the explicit,

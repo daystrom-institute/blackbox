@@ -50,3 +50,6 @@ rmcp = { version = "1.4", features = [
     "transport-streamable-http-client-reqwest",
     "reqwest",
 ] }
+
+[dev-dependencies]
+tempfile = "3"

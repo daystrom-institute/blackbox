@@ -71,6 +71,37 @@ impl RefactorCapability for StubRefactor {
     }
 }
 
+// Stub host built-in tool seam (§5): echoes back the tool name + input so a test
+// can prove the in-box `fs.*`/`shell.*`/... bindings route through op_tool_invoke
+// to the injected ToolCapability, store host-side as a ref, and egress on demand.
+// A `name` of "boom" yields an is_error result to exercise the JS-throw path.
+struct StubTools;
+#[async_trait]
+impl bro_capabilities::ToolCapability for StubTools {
+    async fn call_tool(
+        &self,
+        invocation: bro_capabilities::ToolInvocation,
+    ) -> CapabilityResult<bro_capabilities::ToolCallOutput> {
+        tokio::task::yield_now().await;
+        if invocation.name == "boom" {
+            return Ok(bro_capabilities::ToolCallOutput {
+                content: "the tool blew up".to_string(),
+                is_error: true,
+                content_type: "text/plain".to_string(),
+            });
+        }
+        Ok(bro_capabilities::ToolCallOutput {
+            content: serde_json::json!({
+                "tool": invocation.name,
+                "input": invocation.input_json,
+            })
+            .to_string(),
+            is_error: false,
+            content_type: "application/json".to_string(),
+        })
+    }
+}
+
 // Panicking variants: prove a capability panic is contained on the executor and
 // surfaces as a catchable JS error (the outer-runtime guard complementing the
 // V8-thread structural guard).
@@ -128,7 +159,11 @@ fn caps_with(
     atoms: Arc<dyn AtomCapability>,
     refactor: Arc<dyn RefactorCapability>,
 ) -> Capabilities {
-    Capabilities { atoms, refactor }
+    Capabilities {
+        atoms,
+        refactor,
+        tools: None,
+    }
 }
 
 fn stub_caps() -> Capabilities {
@@ -694,4 +729,119 @@ async fn unknown_ref_handle_errors() {
         .await
         .unwrap();
     assert_eq!(out, r#""{\"textThrew\":true,\"peekThrew\":true}""#);
+}
+
+// ---------------------------------------------------------------------------
+// §5 host built-in tool seam: in-box fs.*/shell.*/search.*/git.*/web.* parity.
+// ---------------------------------------------------------------------------
+
+fn tools_caps() -> Capabilities {
+    Capabilities {
+        atoms: Arc::new(StubAtoms),
+        refactor: Arc::new(StubRefactor),
+        tools: Some(Arc::new(StubTools)),
+    }
+}
+
+async fn tools_runtime() -> ScriptRuntime {
+    ScriptRuntime::new(tools_caps(), SupervisionPolicy::default())
+        .await
+        .unwrap()
+}
+
+// fs.read routes through op_tool_invoke to the injected ToolCapability, stores the
+// result host-side as a `tool` ref, and returns a `{ref,size,preview}` envelope.
+// The bytes enter the cell only via explicit egress (narf.ref.text).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fs_read_routes_through_tool_seam_and_returns_ref() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"const env = await fs.read("src/foo.rs");
+               const meta = narf.ref.peek(env);
+               const body = JSON.parse(narf.ref.text(env));
+               return JSON.stringify({
+                   isRef: env.ref.startsWith("ref:tool/"),
+                   kind: meta.kind,
+                   contentType: meta.content_type,
+                   tool: body.tool,
+                   filePath: body.input.file_path,
+               });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
+        .unwrap();
+    assert_eq!(v["isRef"], true);
+    assert_eq!(v["kind"], "tool");
+    assert_eq!(v["contentType"], "application/json");
+    assert_eq!(v["tool"], "file_read");
+    assert_eq!(v["filePath"], "src/foo.rs");
+}
+
+// shell.run / search.content / git.show ergonomic sugar maps the single string arg
+// onto the tool's primary input field.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_tool_sugar_maps_primary_field() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"const sh = JSON.parse(narf.ref.text(await shell.run("ls -la")));
+               const gr = JSON.parse(narf.ref.text(await search.content("TODO")));
+               const gs = JSON.parse(narf.ref.text(await git.show("HEAD")));
+               return JSON.stringify({
+                   command: sh.input.command,
+                   pattern: gr.input.pattern,
+                   rev: gs.input.rev,
+               });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
+        .unwrap();
+    assert_eq!(v["command"], "ls -la");
+    assert_eq!(v["pattern"], "TODO");
+    assert_eq!(v["rev"], "HEAD");
+}
+
+// A tool that reports is_error surfaces as a catchable JS exception carrying the
+// tool's message — a cell can try/catch and recover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_tool_error_throws_catchable() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"let threw = false, msg = "";
+               try { await fs.read("x"); } catch (_) {}
+               try {
+                   await Deno.core.ops.op_tool_invoke(JSON.stringify({ name: "boom", input_json: {} }));
+               } catch (e) { threw = true; msg = String(e); }
+               return JSON.stringify({ threw, hasMsg: msg.includes('blew up') });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
+        .unwrap();
+    assert_eq!(v["threw"], true);
+    assert_eq!(v["hasMsg"], true);
+}
+
+// With no ToolCapability installed (standalone / non-host runtime), the in-box
+// host bindings fail closed: the call throws rather than silently succeeding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_tools_fail_closed_when_absent() {
+    let rt = stub_runtime().await; // tools: None
+    let out = rt
+        .execute(
+            r#"let threw = false, msg = "";
+               try { await fs.read("x"); }
+               catch (e) { threw = true; msg = String(e); }
+               return JSON.stringify({ threw, failClosed: msg.includes('host_tools_unavailable') || msg.includes('not installed') });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap())
+        .unwrap();
+    assert_eq!(v["threw"], true);
+    assert_eq!(v["failClosed"], true);
 }

@@ -57,6 +57,39 @@ pub struct RefactorPlanHandle {
     pub preview: String,
 }
 
+/// One host built-in tool invocation: the tool's registered name plus its raw
+/// JSON input. This is the generic "invoke a bro-tools built-in by name" seam
+/// (`narf-tool-placement.md` §5.1) — one bridge rather than N bespoke traits.
+/// The implementer (the harness) owns the `Tool::call` dispatch and the
+/// per-session `ToolCx`; bro-script (contract-bottom) can only call down here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolInvocation {
+    pub name: String,
+    pub input_json: serde_json::Value,
+}
+
+/// The result of a host tool call, flattened to the `tool_result` shape: a
+/// content string, whether the tool reported an error, and a MIME-ish content
+/// type so the caller can decide how to treat the stored bytes. The content is
+/// stored host-side as a ref by the runtime; only a bounded envelope crosses
+/// into the cell (§9 ref-handle model).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallOutput {
+    pub content: String,
+    pub is_error: bool,
+    pub content_type: String,
+}
+
+/// Invoke a host built-in tool by name. The implementer MUST gate the callable
+/// set by the same `ToolFilter` as the flat model-facing surface
+/// (`narf-tool-placement.md` §4.5 — an unfiltered in-box surface is a
+/// deny-bypass), and runs the tool against the per-session execution context.
+/// An unknown / denied / unavailable tool fails closed with a [`BroError`].
+#[async_trait]
+pub trait ToolCapability: Send + Sync {
+    async fn call_tool(&self, invocation: ToolInvocation) -> CapabilityResult<ToolCallOutput>;
+}
+
 #[async_trait]
 pub trait RefactorCapability: Send + Sync {
     /// Produce a dry-run plan, store it host-side, and return a handle. The

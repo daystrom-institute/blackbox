@@ -932,9 +932,45 @@ roster render.
     not found` surfaced back through the cell as a JS exception with a bro-script
     stack trace. The model→narf_exec→in-daemon-V8→exact-capability→daemon-caps→result
     loop is proven end-to-end.
-  REMAINING for §5b/§9 — **NEXT PRIORITY: tool-calling MVP parity.** A cell can
-  invoke atoms + plan refactors but cannot yet read a file / run shell / grep /
-  edit. The restore-parity plan (host-access seam → read core → `shell.run` →
+  TOOL-CALLING MVP PARITY — **host-access seam + read/shell/mutation bindings
+  LANDED (steps 1–4).** A cell can now read files / grep / glob / git-read /
+  fetch / run shell / write / edit / commit in-box, not just compose atoms. The
+  build collapsed steps 1–4 of [`narf-tool-placement.md`](./narf-tool-placement.md)
+  §5 onto the §5.1 generic seam:
+  - **`bro-capabilities`:** new `ToolCapability` trait (`call_tool(ToolInvocation)
+    -> ToolCallOutput`) — the "invoke a bro-tools built-in by name" contract-bottom
+    seam (§5.1), one bridge not N bespoke traits.
+  - **`bro-script`:** `Capabilities.tools: Option<Arc<dyn ToolCapability>>`, a
+    `CapRequest::ToolInvoke` variant + `op_tool_invoke` riding the proven
+    mpsc→outer-executor→oneshot bridge and structural panic guard. Success stores
+    the tool's content host-side as a **`tool` ref** and returns the
+    `{ref,size,preview}` envelope (bounded egress unchanged); an `is_error` result
+    throws a catchable JS exception; `tools: None` fails closed. JS bindings:
+    `fs.{read,smartRead,list,write,edit}`, `search.{content,glob}`,
+    `git.{status,log,diff,show,commit}`, `shell.{run,poll,kill,list}`, `web.fetch`
+    — ergonomic single-string sugar mapping onto each tool's primary input field.
+  - **`bro-harness`:** `HostTools` implements `ToolCapability` over a per-session
+    `HashMap<name, Tool>` + the session `ToolCx`, mapping `ToolResult`→
+    `ToolCallOutput`. Wired in `agent_loop` from a **`ToolFilter`-filtered**
+    built-in set (§4.5 — the in-box set is gated by the same filter as the flat
+    surface; a denied tool is absent in-box → `tool_unavailable`, no deny-bypass)
+    and injected into `NarfExecTool`/the runtime. The tool structs are stateless,
+    so the in-box set shares the flat surface's `cx` (same shell sessions /
+    clipboard / safety).
+  - Tests: bro-script 24→28 (fs.read ref round-trip, single-string sugar mapping,
+    tool-error JS-throw, fail-closed-when-absent); bro-harness capabilities 9→11
+    (denied-tool fail-closed through the real `ToolFilter`; a NARF cell reading a
+    real tempfile end-to-end through `fs.read`→`HostTools`→`FileRead`→ref→
+    `narf.ref.text`). `cargo check -p blackbox` links; clippy clean. **Live
+    daemon smoke still TODO** (prior steps' bar) to confirm the agent_loop
+    injection in a real dispatched session.
+  - **Decision recorded:** took the §5.1 "one generic invoke-by-name bridge +
+    ergonomic wrappers" fork over N bespoke capability traits — simplest, and
+    steps 2–4 collapse to JS wrappers over the single op. Reversible.
+
+  REMAINING for §5b/§9 — **NEXT: promise primitive (step 5), clip→ref fold
+  (step 6), MCP config++ (step 7), and the authoring mislayer fix.** The
+  restore-parity plan (host-access seam → read core → `shell.run` →
   mutation → promise → clip-fold → MCP config++), the in-box/out-box taxonomy over
   all 35 pre-beta bro-tools built-ins, the `Ref`/`Promise` type model, and
   automatic ref resolution (parameter substitutability) are specified in the new
@@ -960,10 +996,12 @@ roster render.
   `Ref`/bounded-egress primitive, and `narf_exec` run in the daemon
   (`crates/bro-script`; `c034ad8` smoke above). The authoring surface (session
   helpers, prepare→run, trace) is built (`8a86e75`) but MISLAYERED in-box —
-  correction tracked above. Unbuilt and now the **MVP priority**: the in-box
-  tool-calling parity bindings (`fs`/`search`/`git`/`shell`/`web`/`promise`/
-  `clip→ref`) per [`narf-tool-placement.md`](./narf-tool-placement.md) §5. Also
-  unbuilt: `Promise`/`Plan`/`Atom`/`Script`, `narf_wait`, JS/TS bindings. `Tx`
+  correction tracked above. **LANDED (steps 1–4):** the in-box read/shell/mutation
+  parity bindings (`fs`/`search`/`git`/`shell`/`web`) over the generic
+  `ToolCapability` seam, ToolFilter-gated, per
+  [`narf-tool-placement.md`](./narf-tool-placement.md) §5. **Still unbuilt:**
+  in-box `promise` (step 5) and the `clip→ref` fold (step 6), MCP config++
+  (step 7); `Promise`/`Plan`/`Atom`/`Script`, `narf_wait`, JS/TS bindings. `Tx`
   parked (`narf-effects-and-safety.md`).
 - **§4 deletion ledger.** The CLI-hole providers / tmux / opencode scrub landed
   earlier on the branch; verify no live CLI-shaped dispatch path remains before
