@@ -701,8 +701,12 @@ roster render.
 
 ### Remaining
 
-- **§7 thin-client crate (stage 2).** A multi-stage, ~50-file refactor; the
-  sub-steps land as independent compiling commits.
+- **§7 thin-client crate (stage 2) — COMPLETE.** The `bro` CLI no longer
+  depends on the `blackbox` daemon crate; it links the fleet engine
+  (`bro-fleet-client`), the shared transcript parser (`bro-transcript`), and the
+  contract bottom (`bro-protocol` + `bro-core`) transitively, reaching the daemon
+  only over HTTP. The thin-client invariant (§7/§11) is now structural and
+  compiler-enforced. Sub-steps landed as independent compiling commits:
   - **Step 1a — DONE: `Provider` relocated to the contract bottom.** The enum +
     `Capability` + the model/effort catalog (`ModelInfo`/`EffortInfo` + tables)
     and the *pure* methods (`ALL`/`is_dispatchable`/`capabilities`/`as_str`/
@@ -809,11 +813,24 @@ roster render.
     `bro-cli`'s `bro tail` imports `bro_transcript::{…}` directly. All parsers
     retained (dropping them would break daemon indexing of historical
     codex/gemini transcripts). Validated: `cargo check --workspace` clean.
-  - NOT done: **1d-iii** repoint `council_tui` + `main` daemon-port resolution to
-    `bro_fleet_client::daemon_port()` (all four call sites read only
-    `daemon.port`) and DROP `blackbox = { path = ... }` from
-    `crates/bro-cli/Cargo.toml`; live fleet-TUI validation against an isolated
-    daemon.
+  - **Step 1d-iii — DONE: `blackbox` dependency DROPPED from `bro-cli`.** The
+    last coupling was `blackbox::config::load` (daemon-port resolution); all four
+    call sites (`main` ×3, `council_tui` ×1) read only `daemon.port`, so they now
+    use `bro_fleet_client::daemon_port()` (reads `[daemon].port` from the
+    selected `config.toml`, else 7264). `blackbox = { path = "../.." }` removed
+    from `crates/bro-cli/Cargo.toml`. The remaining `"blackbox"` string matches in
+    bro-cli are benign (help text, an error message, a path literal, test
+    fixtures) — zero `blackbox::` crate references. Also fixed a latent
+    provider-removal-arc test (`clap_parses_agent_launch_args` passed
+    `--provider claude`, a dropped provider clap now rejects → changed to `glm`);
+    it only became runnable once the `tempfile` dev-dep (1d-i) unblocked the
+    bro-cli test target. Validated: `cargo check/test/clippy -p bro-cli` clean
+    (60 tests pass, 0 new clippy); **live fleet-TUI smoke** against an isolated
+    daemon (port 7299, isolated state, `BLACKBOX_REINDEX_INTERVAL_SECS=999999`,
+    exact-PID teardown, prod 7264 confirmed http 200 throughout): `bro fleet`
+    (linking `bro-fleet-client`, no `blackbox`) rendered the roster + provider/
+    model/effort selector, dispatched a brodex gpt-5.5 agent end-to-end (TUI →
+    `/control/exec` → daemon → agent → ✓ Finished).
 - **§5 in-process V8 + supervised shell (execution isolation).** Not started;
   no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
   per-child env hook but not timeout/cap supervision.

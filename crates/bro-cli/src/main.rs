@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
-use blackbox::config;
 use bro_fleet_client::Provider;
 
 use clap::{Args, Parser, Subcommand};
@@ -394,7 +393,7 @@ enum LaneSignal {
 }
 
 async fn run_sse_subscriber(sel: TailSelectors, tx: mpsc::Sender<LaneSignal>) {
-    let port = config::load().map(|c| c.daemon.port).unwrap_or(7264);
+    let port = bro_fleet_client::daemon_port();
     let mut url = format!("http://127.0.0.1:{port}/tail");
     let mut params = Vec::new();
     if !sel.bros.is_empty() {
@@ -542,7 +541,7 @@ fn parse_lane_signal(v: &serde_json::Value) -> Option<LaneSignal> {
 }
 
 async fn fetch_roster(sel: TailSelectors) -> anyhow::Result<Vec<RosterEntry>> {
-    let port = config::load().map(|c| c.daemon.port).unwrap_or(7264);
+    let port = bro_fleet_client::daemon_port();
     let mut url = format!("http://127.0.0.1:{port}/roster");
     let mut params = Vec::new();
     if !sel.bros.is_empty() {
@@ -961,8 +960,10 @@ fn council_base_url(url: Option<String>) -> String {
 }
 
 fn default_base_url() -> anyhow::Result<String> {
-    let cfg = config::load()?;
-    Ok(format!("http://127.0.0.1:{}", cfg.daemon.port))
+    Ok(format!(
+        "http://127.0.0.1:{}",
+        bro_fleet_client::daemon_port()
+    ))
 }
 
 async fn run_council(args: CouncilArgs) -> anyhow::Result<()> {
@@ -2463,11 +2464,13 @@ mod tests {
 
     #[test]
     fn clap_parses_agent_launch_args() {
+        // `glm` (a surviving provider): `claude` and the other CLI-shaped
+        // providers were dropped in §4, so clap's value parser rejects them.
         let cli = BroCli::parse_from([
             "bro",
             "agent",
             "--provider",
-            "claude",
+            "glm",
             "--model",
             "sonnet",
             "--effort",

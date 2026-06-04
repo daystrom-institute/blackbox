@@ -1,11 +1,10 @@
 # The `bro` terminal client (fleet cockpit, tail, council TUI).
 #
-# Stage 1 of the §7 thin-client extraction (harness-daemon-boundary.md §7): the
-# `bro` binary is split out of the `blackbox` package into its own crate. It
-# still depends on `blackbox` today — the boundary now makes that dependency
-# surface explicit and measurable. Stage 2 cuts the `blackbox` dep by relocating
-# the wire/view types (gated on the pervasive `Provider`) into the contract
-# bottom so this links only `bro-protocol` + `bro-core`.
+# §7 thin-client extraction COMPLETE (harness-daemon-boundary.md §7): the `bro`
+# binary no longer depends on the `blackbox` daemon crate. It links the fleet
+# engine (`bro-fleet-client`), the shared transcript parser (`bro-transcript`),
+# and the contract bottom (`bro-protocol` + `bro-core`) transitively — never the
+# daemon. The daemon is reached only over HTTP (`/control/*`, `/tail`, etc.).
 [package]
 name = "bro-cli"
 version = "0.0.1"
@@ -16,7 +15,6 @@ name = "bro"
 path = "src/main.rs"
 
 [dependencies]
-blackbox = { path = "../.." }
 bro-fleet-client = { path = "../bro-fleet-client" }
 bro-transcript = { path = "../bro-transcript" }
 

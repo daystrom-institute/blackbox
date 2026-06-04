@@ -436,7 +436,6 @@ name = "bro-cli"
 version = "0.0.1"
 dependencies = [
  "anyhow",
- "blackbox",
  "bro-fleet-client",
  "bro-transcript",
  "clap",
