@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
-    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, RefactorCapability,
+    RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
 use bro_script::{
@@ -23,28 +23,29 @@ use bro_script::{
 // Stub capability impls — exercise the real traits without any daemon coupling.
 // ---------------------------------------------------------------------------
 
-struct StubCorpus;
-#[async_trait]
-impl CorpusCapability for StubCorpus {
-    async fn search_corpus(&self, lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
-        // Force a real await point so the bridge genuinely suspends.
-        tokio::task::yield_now().await;
-        Ok(vec![CorpusHit {
-            id: format!("hit-{}", lookup.limit),
-            text: format!("found:{}", lookup.query),
-        }])
-    }
-}
-
 struct StubAtoms;
 #[async_trait]
 impl AtomCapability for StubAtoms {
     async fn invoke_atom(&self, invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
         tokio::task::yield_now().await;
+        let query = invocation
+            .input_json
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let limit = invocation
+            .input_json
+            .get("limit")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
         Ok(AtomOutput {
             output_json: serde_json::json!({
                 "atom": invocation.atom.as_str(),
                 "echo": invocation.input_json,
+                "hit": {
+                    "id": format!("hit-{limit}"),
+                    "text": format!("found:{query}"),
+                },
             }),
         })
     }
@@ -73,14 +74,6 @@ impl RefactorCapability for StubRefactor {
 // Panicking variants: prove a capability panic is contained on the executor and
 // surfaces as a catchable JS error (the outer-runtime guard complementing the
 // V8-thread structural guard).
-struct PanicCorpus;
-#[async_trait]
-impl CorpusCapability for PanicCorpus {
-    async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
-        panic!("corpus capability boom");
-    }
-}
-
 struct PanicAtoms;
 #[async_trait]
 impl AtomCapability for PanicAtoms {
@@ -104,49 +97,42 @@ impl RefactorCapability for PanicRefactor {
     }
 }
 
-// An error-returning corpus: prove a normal CapabilityResult error surfaces as a
+// An error-returning atom capability: prove a normal CapabilityResult error surfaces as a
 // catchable JS error too (distinct from a panic).
-struct ErrCorpus;
+struct ErrAtoms;
 #[async_trait]
-impl CorpusCapability for ErrCorpus {
-    async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
-        Err(BroError::new("corpus_unavailable", "index offline"))
+impl AtomCapability for ErrAtoms {
+    async fn invoke_atom(&self, _invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
+        Err(BroError::new("atom_unavailable", "atom offline"))
     }
 }
 
-// A corpus whose single hit carries a large body, to exercise the ref/egress
+// An atom whose output carries a large body, to exercise the ref/egress
 // boundary: the full value must stay host-side, only the envelope crosses, and
 // `text()` egress is budget-bounded.
-struct BigCorpus;
+struct BigAtoms;
 #[async_trait]
-impl CorpusCapability for BigCorpus {
-    async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
+impl AtomCapability for BigAtoms {
+    async fn invoke_atom(&self, _invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
         tokio::task::yield_now().await;
-        Ok(vec![CorpusHit {
-            id: "big".to_string(),
-            text: "x".repeat(5000),
-        }])
+        Ok(AtomOutput {
+            output_json: serde_json::json!({
+                "id": "big",
+                "text": "x".repeat(5000),
+            }),
+        })
     }
 }
 
 fn caps_with(
-    corpus: Arc<dyn CorpusCapability>,
     atoms: Arc<dyn AtomCapability>,
     refactor: Arc<dyn RefactorCapability>,
 ) -> Capabilities {
-    Capabilities {
-        corpus,
-        atoms,
-        refactor,
-    }
+    Capabilities { atoms, refactor }
 }
 
 fn stub_caps() -> Capabilities {
-    caps_with(
-        Arc::new(StubCorpus),
-        Arc::new(StubAtoms),
-        Arc::new(StubRefactor),
-    )
+    caps_with(Arc::new(StubAtoms), Arc::new(StubRefactor))
 }
 
 async fn stub_runtime() -> ScriptRuntime {
@@ -189,11 +175,11 @@ async fn denied_globals() {
 // Each capability op now returns a `{ ref, size, preview }` envelope; the full
 // value stays host-side and is retrievable ONLY via `narf.ref.text`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corpus_search_returns_ref_envelope() {
+async fn atom_invoke_lookup_returns_ref_envelope() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "redis", limit: 2 });
+            r#"const r = await atoms.invoke("lookup", { query: "redis", limit: 2 });
                return JSON.stringify({
                  hasRef: typeof r.ref === 'string' && r.ref.startsWith('ref:cap/'),
                  hasSize: typeof r.size === 'number' && r.size > 0,
@@ -211,13 +197,13 @@ async fn corpus_search_returns_ref_envelope() {
 
 // Ref round-trip: the handle materializes the REAL value via bounded egress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn corpus_search_ref_roundtrip_via_text() {
+async fn atom_invoke_lookup_ref_roundtrip_via_text() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "redis", limit: 2 });
-               const hits = JSON.parse(narf.ref.text(r));
-               return hits[0].text;"#,
+            r#"const r = await atoms.invoke("lookup", { query: "redis", limit: 2 });
+               const value = JSON.parse(narf.ref.text(r));
+               return value.output_json.hit.text;"#,
         )
         .await
         .unwrap();
@@ -329,7 +315,7 @@ async fn prepare_run_composes_session_helper_and_capability_binding() {
             r#"await narf.session.define("lookup", {
                  source: `
                    export async function run(query) {
-                     return await corpus.search({ query, limit: 3 });
+                     return await atoms.invoke("lookup", { query, limit: 3 });
                    }
                  `,
                  exports: ["run"],
@@ -416,39 +402,12 @@ async fn panic_boundary_async_op_surfaced_as_js_error() {
     assert_eq!(rt.execute("return 'alive';").await.unwrap(), "\"alive\"");
 }
 
-// A panic inside ANY of the three capability paths is contained and surfaced as
+// A panic inside exposed capability paths is contained and surfaced as
 // a catchable JS error, and the isolate stays usable.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn capability_panic_corpus_surfaced_and_runtime_survives() {
-    let rt = ScriptRuntime::new(
-        caps_with(
-            Arc::new(PanicCorpus),
-            Arc::new(StubAtoms),
-            Arc::new(StubRefactor),
-        ),
-        SupervisionPolicy::default(),
-    )
-    .await
-    .unwrap();
-    let out = rt
-        .execute(
-            r#"try { await corpus.search({ query: "x", limit: 1 }); return 'NO_THROW'; }
-               catch (e) { return 'caught'; }"#,
-        )
-        .await
-        .unwrap();
-    assert_eq!(out, "\"caught\"");
-    assert_eq!(rt.execute("return 6 * 7;").await.unwrap(), "42");
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_panic_atom_surfaced_and_runtime_survives() {
     let rt = ScriptRuntime::new(
-        caps_with(
-            Arc::new(StubCorpus),
-            Arc::new(PanicAtoms),
-            Arc::new(StubRefactor),
-        ),
+        caps_with(Arc::new(PanicAtoms), Arc::new(StubRefactor)),
         SupervisionPolicy::default(),
     )
     .await
@@ -467,11 +426,7 @@ async fn capability_panic_atom_surfaced_and_runtime_survives() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_panic_refactor_surfaced_and_runtime_survives() {
     let rt = ScriptRuntime::new(
-        caps_with(
-            Arc::new(StubCorpus),
-            Arc::new(StubAtoms),
-            Arc::new(PanicRefactor),
-        ),
+        caps_with(Arc::new(StubAtoms), Arc::new(PanicRefactor)),
         SupervisionPolicy::default(),
     )
     .await
@@ -492,19 +447,15 @@ async fn capability_panic_refactor_surfaced_and_runtime_survives() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn capability_error_surfaced_as_js_error() {
     let rt = ScriptRuntime::new(
-        caps_with(
-            Arc::new(ErrCorpus),
-            Arc::new(StubAtoms),
-            Arc::new(StubRefactor),
-        ),
+        caps_with(Arc::new(ErrAtoms), Arc::new(StubRefactor)),
         SupervisionPolicy::default(),
     )
     .await
     .unwrap();
     let out = rt
         .execute(
-            r#"try { await corpus.search({ query: "x", limit: 1 }); return 'NO_THROW'; }
-               catch (e) { return String(e).includes('corpus_unavailable') ? 'coded' : 'caught'; }"#,
+            r#"try { await atoms.invoke("lookup", { query: "x", limit: 1 }); return 'NO_THROW'; }
+               catch (e) { return String(e).includes('atom_unavailable') ? 'coded' : 'caught'; }"#,
         )
         .await
         .unwrap();
@@ -600,8 +551,8 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
     // And a fast capability call still completes well under the timeout.
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "q", limit: 1 });
-               return JSON.parse(narf.ref.text(r))[0].text;"#,
+            r#"const r = await atoms.invoke("lookup", { query: "q", limit: 1 });
+               return JSON.parse(narf.ref.text(r)).output_json.hit.text;"#,
         )
         .await
         .unwrap();
@@ -613,11 +564,7 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
 // ---------------------------------------------------------------------------
 
 fn big_caps() -> Capabilities {
-    caps_with(
-        Arc::new(BigCorpus),
-        Arc::new(StubAtoms),
-        Arc::new(StubRefactor),
-    )
+    caps_with(Arc::new(BigAtoms), Arc::new(StubRefactor))
 }
 
 // `peek` returns metadata (kind, size, content type, preview) — never the bytes,
@@ -627,7 +574,7 @@ async fn ref_peek_returns_metadata_not_bytes() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "redis", limit: 1 });
+            r#"const r = await atoms.invoke("lookup", { query: "redis", limit: 1 });
                const m = narf.ref.peek(r);
                return JSON.stringify({
                  kind: m.kind,
@@ -654,7 +601,7 @@ async fn large_result_does_not_enter_js_via_op_return() {
         .unwrap();
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "big", limit: 1 });
+            r#"const r = await atoms.invoke("big", { query: "big", limit: 1 });
                const envelopeStr = JSON.stringify(r);
                return JSON.stringify({
                  envelopeSmall: envelopeStr.length < 1500,
@@ -681,7 +628,7 @@ async fn egress_budget_enforced_cumulatively() {
     let rt = ScriptRuntime::new(big_caps(), policy).await.unwrap();
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "big", limit: 1 });
+            r#"const r = await atoms.invoke("big", { query: "big", limit: 1 });
                const a = narf.ref.text(r, 4000);   // 4000 <= 4096 remaining: ok
                let threw = false, msg = '';
                try { narf.ref.text(r, 4000); }      // 4000 > 96 remaining: fails closed
@@ -709,7 +656,7 @@ async fn ref_text_respects_per_call_cap() {
         .unwrap();
     let out = rt
         .execute(
-            r#"const r = await corpus.search({ query: "big", limit: 1 });
+            r#"const r = await atoms.invoke("big", { query: "big", limit: 1 });
                const capped = narf.ref.text(r, 100);   // explicit small cap
                const dflt = narf.ref.text(r);          // default 8 KiB cap >= size
                return JSON.stringify({

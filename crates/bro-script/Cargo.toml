@@ -15,7 +15,7 @@ edition = "2021"
 
 [dependencies]
 # The pure contract-bottom capability crate (async-trait + bro-core, ZERO
-# blackbox). bro-script consumes the real CorpusCapability/AtomCapability/
+# blackbox). bro-script consumes the exact-handle AtomCapability/
 # RefactorCapability traits by injection; it must never link the daemon.
 bro-capabilities = { path = "../bro-capabilities" }
 bro-core = { path = "../bro-core" }

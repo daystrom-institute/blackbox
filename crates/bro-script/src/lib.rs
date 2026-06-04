@@ -5,7 +5,7 @@
 //! standalone runtime. It still proves, in ISOLATION (zero `blackbox`
 //! dependency), the daemon-safety properties and the async-bridge property that
 //! gate embedding V8 inside the long-lived blackbox daemon — but the single
-//! local echo capability has been replaced with the THREE real
+//! local echo capability has been replaced with exact-handle atom and refactor
 //! `bro-capabilities` traits, the panic guard is now structural, and supervision
 //! is configurable.
 //!
@@ -16,7 +16,7 @@
 //!      execution-timeout supervisor).
 //!   3. denied globals               — no `WebAssembly`/`Atomics`/
 //!      `SharedArrayBuffer`/`console` ambient host access.
-//!   4. async capability bridge      — a JS `await corpus.search(x)` suspends the
+//!   4. async capability bridge      — a JS `await atoms.invoke(x)` suspends the
 //!      script, hops from the `!Send` isolate thread into async Rust on a
 //!      *different* executor, runs a real `bro-capabilities` trait method, and
 //!      returns the result into JS.
@@ -46,9 +46,9 @@
 //! `await`s a `oneshot` reply. While the op future is pending, `run_event_loop`
 //! keeps polling it; the cross-runtime oneshot waker resolves it when async Rust
 //! finishes. This is the genuine `!Send`-isolate ↔ async-capability round trip.
-//! The three real capability traits ([`CorpusCapability`], [`AtomCapability`],
-//! [`RefactorCapability`]) are injected as `Arc<dyn Trait>` exactly as the daemon
-//! will later install them.
+//! The real exact-handle capability traits ([`AtomCapability`],
+//! [`RefactorCapability`]) are injected as `Arc<dyn Trait>` exactly as the
+//! daemon will later install them.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -70,8 +70,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 pub use bro_capabilities::{
-    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
-    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, RefactorCapability,
+    RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
 
@@ -109,12 +109,11 @@ const PREVIEW_BYTES: usize = 512;
 // Capability injection
 // ---------------------------------------------------------------------------
 
-/// The three real `bro-capabilities` trait objects the runtime exposes to JS.
+/// The exact-handle `bro-capabilities` trait objects the runtime exposes to JS.
 /// Injected by the caller (the daemon, later; tests, now) so the runtime never
 /// hard-codes an implementation.
 #[derive(Clone)]
 pub struct Capabilities {
-    pub corpus: Arc<dyn CorpusCapability>,
     pub atoms: Arc<dyn AtomCapability>,
     pub refactor: Arc<dyn RefactorCapability>,
 }
@@ -482,10 +481,6 @@ fn render_prepare(session: &SessionState, input: PrepareInput) -> Result<String,
 /// outer runtime. Each variant carries the real `bro-capabilities` typed input
 /// and a typed `oneshot` reply, generalizing the spike's single echo request.
 enum CapRequest {
-    CorpusSearch {
-        input: CorpusLookup,
-        reply: oneshot::Sender<CapabilityResult<Vec<CorpusHit>>>,
-    },
     AtomInvoke {
         input: AtomInvocation,
         reply: oneshot::Sender<CapabilityResult<AtomOutput>>,
@@ -525,10 +520,6 @@ where
 /// the outer multi-thread runtime; each call is panic-isolated via [`run_caught`].
 async fn dispatch_cap(caps: Capabilities, req: CapRequest) {
     match req {
-        CapRequest::CorpusSearch { input, reply } => {
-            let cap = caps.corpus.clone();
-            let _ = reply.send(run_caught(async move { cap.search_corpus(input).await }).await);
-        }
         CapRequest::AtomInvoke { input, reply } => {
             let cap = caps.atoms.clone();
             let _ = reply.send(run_caught(async move { cap.invoke_atom(input).await }).await);
@@ -641,23 +632,6 @@ fn caps_handles(state: &Rc<RefCell<OpState>>) -> (CapTx, RefStateCell) {
         s.borrow::<CapTx>().clone(),
         s.borrow::<RefStateCell>().clone(),
     )
-}
-
-/// `await corpus.search(args)` — JSON in, ref envelope out, over the async bridge.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_corpus_search(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let (tx, refs) = caps_handles(&state);
-        let input: CorpusLookup = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid corpus.search input: {e}")))?;
-        let full = bridge(tx, move |reply| CapRequest::CorpusSearch { input, reply }).await?;
-        store_and_envelope(&refs, full)
-    })
-    .await
 }
 
 /// `await atoms.invoke(handle, input)` — JSON in, JSON out, over the async bridge.
@@ -906,7 +880,6 @@ async fn op_panic_guarded_async() -> Result<(), JsErrorBox> {
 deno_core::extension!(
     bro_script_ext,
     ops = [
-        op_corpus_search,
         op_atom_invoke,
         op_refactor_plan,
         op_refactor_materialize,
@@ -975,10 +948,6 @@ const BOOTSTRAP: &str = r#"
     delete globalThis.SharedArrayBuffer;
     delete globalThis.Atomics;
     delete globalThis.console;
-    globalThis.corpus = {
-        search: async (args) =>
-            JSON.parse(await Deno.core.ops.op_corpus_search(JSON.stringify(args))),
-    };
     globalThis.atoms = {
         invoke: async (handle, input) =>
             JSON.parse(await Deno.core.ops.op_atom_invoke(
