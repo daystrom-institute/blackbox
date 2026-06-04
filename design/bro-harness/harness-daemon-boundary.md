@@ -974,8 +974,25 @@ roster render.
     ergonomic wrappers" fork over N bespoke capability traits — simplest, and
     steps 2–4 collapse to JS wrappers over the single op. Reversible.
 
-  REMAINING for §5b/§9 — **NEXT: promise primitive (step 5), clip→ref fold
-  (step 6), MCP config++ (step 7), and the authoring mislayer fix.** The
+  TOOL-CALLING MVP — **promise primitive (step 5) LANDED.** In-box
+  `narf.promise.{all,any,wait,status,list,cancel,pipeline}` over the shared
+  per-session `PromiseStore` (`narf-tool-placement.md` §2/§5). Key shape: a
+  promise *handle* is a small by-value `{promise_id}` ticket (so it composes),
+  but a joined *result* can carry producer output → ref-out (bounded egress).
+  Implemented with a second seam variant `op_tool_invoke_inline` (value-out, for
+  control-shaped results) alongside the ref-out `op_tool_invoke`: `shell.run`
+  switches to inline when `mode:'promise'`; `all`/`any`/`wait` are ref-out;
+  `status`/`list`/`cancel` are inline. `pipeline` is a pure-JS no-barrier staging
+  combinator (each item through all stages independently). bro-script 28→32 tests
+  (ticket-inline + join-ref, inline control ops + handle/id normalization, any,
+  pipeline); clippy clean; `cargo check -p blackbox` links. **5b refinement
+  deferred:** strict per-promise `Promise<Ref<T>>` (splitting each joined result
+  into its own ref via a host-side `op_promise_join`) — today `all`/`any` ref the
+  whole `{promises:[…]}` envelope, which still keeps big output out of context.
+  `narf_wait`/durable promises remain the §10 lever.
+
+  REMAINING for §5b/§9 — **NEXT: clip→ref fold (step 6), MCP config++ (step 7),
+  and the authoring mislayer fix.** The
   restore-parity plan (host-access seam → read core → `shell.run` →
   mutation → promise → clip-fold → MCP config++), the in-box/out-box taxonomy over
   all 35 pre-beta bro-tools built-ins, the `Ref`/`Promise` type model, and
@@ -1005,10 +1022,12 @@ roster render.
   correction tracked above. **LANDED (steps 1–4):** the in-box read/shell/mutation
   parity bindings (`fs`/`search`/`git`/`shell`/`web`) over the generic
   `ToolCapability` seam, ToolFilter-gated, per
-  [`narf-tool-placement.md`](./narf-tool-placement.md) §5. **Still unbuilt:**
-  in-box `promise` (step 5) and the `clip→ref` fold (step 6), MCP config++
-  (step 7); `Promise`/`Plan`/`Atom`/`Script`, `narf_wait`, JS/TS bindings. `Tx`
-  parked (`narf-effects-and-safety.md`).
+  [`narf-tool-placement.md`](./narf-tool-placement.md) §5; plus the in-box
+  `narf.promise.{all,any,wait,status,list,cancel,pipeline}` primitive (step 5).
+  **Still unbuilt:** the `clip→ref` fold (step 6), MCP config++ (step 7); strict
+  per-promise `Promise<Ref<T>>` splitting (5b), `Plan`/`Atom`/`Script`,
+  `narf_wait`/durable promises, JS/TS bindings. `Tx` parked
+  (`narf-effects-and-safety.md`).
 - **§4 deletion ledger.** The CLI-hole providers / tmux / opencode scrub landed
   earlier on the branch; verify no live CLI-shaped dispatch path remains before
   treating §4 as fully closed.

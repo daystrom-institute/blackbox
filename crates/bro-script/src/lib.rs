@@ -762,6 +762,34 @@ async fn op_tool_invoke(
     .await
 }
 
+/// `op_tool_invoke_inline(name, input)` — value-out variant of the seam for
+/// **control-shaped** results (`narf-tool-placement.md` §3.1 — the small
+/// `Promise`/control lane that is by-value, not by-reference). Returns the tool's
+/// content string directly (JS `JSON.parse`s it) instead of ref-wrapping it, so a
+/// promise handle (`{promise_id}`), a `promise_status`/`list`/`cancel` snapshot,
+/// or a `shell.run(mode:'promise')` ticket stays usable in the cell rather than
+/// hiding behind a ref. Big-result tools keep using [`op_tool_invoke`] (ref-out).
+/// A tool `is_error` still throws; unknown/denied still fails closed.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_tool_invoke_inline(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let (tx, _refs) = caps_handles(&state);
+        let input: ToolInvocation = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid host tool invocation: {e}")))?;
+        let name = input.name.clone();
+        let out = bridge_tool(tx, input).await?;
+        if out.is_error {
+            return Err(JsErrorBox::generic(format!("{name}: {}", out.content)));
+        }
+        Ok(out.content)
+    })
+    .await
+}
+
 /// `narf.ref.text(handle, maxBytes)` — explicit, bounded egress. Materialize up
 /// to `max_bytes` (0 → [`DEFAULT_EGRESS_TEXT_BYTES`]) of the ref's host-side
 /// value into JS, charging the per-runtime cumulative egress budget. This is the
@@ -959,6 +987,7 @@ deno_core::extension!(
         op_refactor_plan,
         op_refactor_materialize,
         op_tool_invoke,
+        op_tool_invoke_inline,
         op_ref_text,
         op_ref_peek,
         op_session_define,
@@ -1044,6 +1073,11 @@ const BOOTSTRAP: &str = r#"
     const hostTool = async (name, input) =>
         JSON.parse(await Deno.core.ops.op_tool_invoke(
             JSON.stringify({ name, input_json: input ?? {} })));
+    // Value-out variant for control-shaped results (promise handles/snapshots):
+    // small metadata stays usable in the cell rather than hiding behind a ref.
+    const hostToolInline = async (name, input) =>
+        JSON.parse(await Deno.core.ops.op_tool_invoke_inline(
+            JSON.stringify({ name, input_json: input ?? {} })));
     globalThis.fs = {
         read:      (a) => hostTool('file_read',  typeof a === 'string' ? { file_path: a } : a),
         smartRead: (a) => hostTool('smart_read', typeof a === 'string' ? { file_path: a } : a),
@@ -1065,14 +1099,27 @@ const BOOTSTRAP: &str = r#"
                     typeof a === 'string' ? { message: a, paths: paths ?? [] } : a),
     };
     globalThis.shell = {
-        run:  (a) => hostTool('shell_run', typeof a === 'string' ? { command: a } : a),
+        // Promise mode returns a small {promise_id} ticket → keep it by-value
+        // (inline) so it composes with narf.promise.*; inline mode is a big
+        // result → ref.
+        run:  (a) => {
+            const input = typeof a === 'string' ? { command: a } : a;
+            return (input && input.mode === 'promise')
+                ? hostToolInline('shell_run', input)
+                : hostTool('shell_run', input);
+        },
         poll: (a) => hostTool('shell_poll', a),
-        kill: (a) => hostTool('shell_kill', a),
-        list: (a) => hostTool('shell_list', a ?? {}),
+        kill: (a) => hostToolInline('shell_kill', a),
+        list: (a) => hostToolInline('shell_list', a ?? {}),
     };
     globalThis.web = {
         fetch: (a) => hostTool('web_fetch', typeof a === 'string' ? { url: a } : a),
     };
+    // §5 in-box promise primitive (narf-tool-placement.md §2/§5): join a cell's
+    // OWN same-dispatch promises over the shared PromiseStore. Handles are the
+    // by-value {promise_id} tickets producers return (e.g. shell.run mode:promise).
+    const promiseId = (h) =>
+        (typeof h === 'string' ? h : (h && (h.promise_id ?? (h.detail && h.detail.promise_id))));
     // §9-1 Ref substrate: capability ops now return a `{ ref, size, preview }`
     // envelope (the full value stays host-side). `narf.ref` is the explicit,
     // bounded egress surface — `text()` is the only way a ref's bytes enter JS.
@@ -1128,6 +1175,26 @@ const BOOTSTRAP: &str = r#"
         trace: {
             entries: () => JSON.parse(Deno.core.ops.op_trace_entries()),
         },
+    };
+    // §5 promise join: all/any/wait carry producer output → ref-out (bounded
+    // egress); status/list/cancel are small control snapshots → inline.
+    globalThis.narf.promise = {
+        all:    (handles, timeoutMs) => hostTool('promise_when_all',
+                    { promise_ids: (handles ?? []).map(promiseId), timeout_ms: timeoutMs }),
+        any:    (handles, timeoutMs) => hostTool('promise_when_any',
+                    { promise_ids: (handles ?? []).map(promiseId), timeout_ms: timeoutMs }),
+        wait:   (handle, timeoutMs) => hostTool('promise_wait',
+                    { promise_id: promiseId(handle), timeout_ms: timeoutMs }),
+        status: (handle) => hostToolInline('promise_status', { promise_id: promiseId(handle) }),
+        list:   () => hostToolInline('promise_list', {}),
+        cancel: (handle) => hostToolInline('promise_cancel', { promise_id: promiseId(handle) }),
+        // Pure-JS no-barrier staging: each item flows through ALL stages
+        // independently (wall-clock = slowest single chain, not sum-of-stages).
+        // A stage may be sync or async; a ref/promise a stage returns passes
+        // straight to the next. (narf-tool-placement.md §5 step 5 "pipeline".)
+        pipeline: (items, ...stages) => Promise.all(
+            (items ?? []).map((item) =>
+                stages.reduce((acc, stage) => acc.then(stage), Promise.resolve(item)))),
     };
 "#;
 

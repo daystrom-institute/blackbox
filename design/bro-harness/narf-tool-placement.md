@@ -356,6 +356,14 @@ explicit MCP placement, recursion-guarded.
 
 ## 5. MVP sequencing (next steps)
 
+> **Status (see `harness-daemon-boundary.md` §15 for the canonical ledger).**
+> Steps 1–4 (host-access seam + read/shell/mutation bindings) and step 5
+> (promise primitive) have **landed** on `beta/blackbox-v2`. Step 5 shipped the
+> in-box join (`all`/`any`/`wait`/`status`/`list`/`cancel`) + a pure-JS
+> `pipeline`; the strict per-promise `Promise<Ref<T>>` split is deferred as 5b.
+> Remaining: step 6 (clip→ref fold), step 7 (MCP config++), and the independent
+> authoring-mislayer fix.
+
 Ordered by capability delivered, smallest correct increments. Each is
 standalone-buildable in `bro-script` unless noted.
 

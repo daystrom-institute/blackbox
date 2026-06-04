@@ -90,15 +90,56 @@ impl bro_capabilities::ToolCapability for StubTools {
                 content_type: "text/plain".to_string(),
             });
         }
-        Ok(bro_capabilities::ToolCallOutput {
-            content: serde_json::json!({
+        // Simulate the promise builtins so the in-box narf.promise.* bindings can
+        // be exercised without a live PromiseStore producer.
+        let ok = |v: serde_json::Value| {
+            Ok(bro_capabilities::ToolCallOutput {
+                content: v.to_string(),
+                is_error: false,
+                content_type: "application/json".to_string(),
+            })
+        };
+        let inp = &invocation.input_json;
+        match invocation.name.as_str() {
+            // shell.run promise mode → small by-value ticket
+            "shell_run" if inp.get("mode").and_then(|m| m.as_str()) == Some("promise") => {
+                ok(serde_json::json!({ "promise_id": "pr-7", "running": true }))
+            }
+            "promise_when_all" => {
+                let ids: Vec<String> = inp
+                    .get("promise_ids")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let promises: Vec<_> = ids
+                    .iter()
+                    .map(|id| serde_json::json!({
+                        "promise_id": id, "state": "completed",
+                        "result": { "stdout": "done" }
+                    }))
+                    .collect();
+                ok(serde_json::json!({ "promises": promises }))
+            }
+            "promise_when_any" => {
+                let id = inp
+                    .get("promise_ids")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                ok(serde_json::json!({ "promise": { "promise_id": id, "state": "completed" } }))
+            }
+            "promise_status" => ok(serde_json::json!({
+                "promise_id": inp.get("promise_id"), "state": "completed"
+            })),
+            "promise_list" => ok(serde_json::json!([{ "promise_id": "pr-7", "state": "completed" }])),
+            "promise_cancel" => ok(serde_json::json!({
+                "promise_id": inp.get("promise_id"), "state": "cancelled"
+            })),
+            _ => ok(serde_json::json!({
                 "tool": invocation.name,
                 "input": invocation.input_json,
-            })
-            .to_string(),
-            is_error: false,
-            content_type: "application/json".to_string(),
-        })
+            })),
+        }
     }
 }
 
@@ -844,4 +885,105 @@ async fn host_tools_fail_closed_when_absent() {
         .unwrap();
     assert_eq!(v["threw"], true);
     assert_eq!(v["failClosed"], true);
+}
+
+// ---------------------------------------------------------------------------
+// §5 in-box promise primitive: narf.promise.{all,any,wait,status,list,cancel,pipeline}.
+// ---------------------------------------------------------------------------
+
+// shell.run(mode:'promise') returns a by-value {promise_id} ticket (inline, NOT
+// a ref) so it composes with narf.promise.*; narf.promise.all joins and returns
+// a ref-out envelope (producer output stays host-side, bounded egress).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promise_ticket_is_inline_and_join_is_ref() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"const h = await shell.run({ command: 'echo hi', mode: 'promise' });
+               const joined = await narf.promise.all([h]);
+               const body = JSON.parse(narf.ref.text(joined));
+               return JSON.stringify({
+                   ticketInline: h.promise_id === 'pr-7',
+                   joinIsRef: joined.ref.startsWith('ref:tool/'),
+                   firstResult: body.promises[0].result.stdout,
+                   joinedId: body.promises[0].promise_id,
+               });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(v["ticketInline"], true);
+    assert_eq!(v["joinIsRef"], true);
+    assert_eq!(v["firstResult"], "done");
+    assert_eq!(v["joinedId"], "pr-7");
+}
+
+// status/list/cancel are small control snapshots → inline (by-value), and the
+// handle normalizer accepts both a ticket object and a bare id string.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promise_control_ops_are_inline() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"const h = await shell.run({ command: 'sleep 1', mode: 'promise' });
+               const st = await narf.promise.status(h);          // ticket object
+               const stById = await narf.promise.status('pr-9'); // bare id
+               const list = await narf.promise.list();
+               const cancelled = await narf.promise.cancel(h);
+               return JSON.stringify({
+                   statusState: st.state,
+                   statusId: st.promise_id,
+                   byIdId: stById.promise_id,
+                   listLen: list.length,
+                   cancelState: cancelled.state,
+               });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(v["statusState"], "completed");
+    assert_eq!(v["statusId"], "pr-7");
+    assert_eq!(v["byIdId"], "pr-9");
+    assert_eq!(v["listLen"], 1);
+    assert_eq!(v["cancelState"], "cancelled");
+}
+
+// narf.promise.any returns the first settled promise (ref-out).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promise_any_returns_first() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"const env = await narf.promise.any(['pr-1', 'pr-2']);
+               const body = JSON.parse(narf.ref.text(env));
+               return JSON.stringify({ id: body.promise.promise_id, state: body.promise.state });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(v["id"], "pr-1");
+    assert_eq!(v["state"], "completed");
+}
+
+// narf.promise.pipeline is pure-JS no-barrier staging: each item flows through
+// all stages independently; sync and async stages compose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn promise_pipeline_stages_each_item() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"return await narf.promise.pipeline(
+                   [1, 2, 3],
+                   (x) => x + 1,
+                   async (x) => x * 10,
+               );"#,
+        )
+        .await
+        .unwrap();
+    // execute() serializes the result value; the array round-trips directly.
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v, serde_json::json!([20, 30, 40]));
 }
