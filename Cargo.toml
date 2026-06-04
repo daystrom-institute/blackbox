@@ -10,6 +10,7 @@ members = [
     "crates/bro-harness",
     "crates/bro-lsp",
     "crates/bro-cli",
+    "crates/bro-fleet-client",
 ]
 
 [package]

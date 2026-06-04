@@ -13,13 +13,13 @@
 //! mechanical tap, this monitor is the cheap observe-only classifier, and the
 //! "action" is the lowest-stakes one there is — inject an advisory turn. Voice
 //! disambiguation + self-echo detection both ride the single `[INTERN]` prefix
-//! (see `blackbox::fleet::intern_rider` and `DEFAULT_CLASSIFIER_PROMPT`).
+//! (see `bro_fleet_client::intern_rider` and `DEFAULT_CLASSIFIER_PROMPT`).
 
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use blackbox::fleet::{
+use bro_fleet_client::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetOrchestrator,
     INTERN_PREFIX, TaskStatus, TranscriptItem,
 };

@@ -21,7 +21,7 @@ pub enum SessionCommand {
     Compact,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Pending,
@@ -29,6 +29,18 @@ pub enum TaskStatus {
     Completed,
     Failed,
     Cancelled,
+}
+
+impl TaskStatus {
+    /// A terminal status is one the task will not leave on its own — the
+    /// process has exited (cleanly, in error, or by cancellation). `Pending`
+    /// and `Running` are live.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

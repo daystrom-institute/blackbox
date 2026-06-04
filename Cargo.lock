@@ -436,6 +436,7 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "blackbox",
+ "bro-fleet-client",
  "clap",
  "crossterm",
  "dirs",
@@ -446,6 +447,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tui-markdown",
@@ -459,6 +461,25 @@ version = "0.0.1"
 dependencies = [
  "serde",
  "strum 0.26.3",
+]
+
+[[package]]
+name = "bro-fleet-client"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "bro-core",
+ "bro-protocol",
+ "dirs",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

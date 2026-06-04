@@ -1,0 +1,31 @@
+# The fleet client engine — the daemon-driving half of `bro fleet`.
+#
+# Stage 2 step 1d of the §7 thin-client extraction
+# (harness-daemon-boundary.md §7): the `FleetOrchestrator` / `AgentHandle` /
+# `DaemonFleetClient` engine that the `bro` cockpit drives lifts OUT of the
+# `blackbox` daemon crate into this client crate. It links only the contract
+# bottom (`bro-protocol` + `bro-core`) plus its own transport/runtime deps —
+# never `blackbox`. The daemon owns dispatch/execution; this crate is a thin
+# HTTP client over `/control/*` plus the view/mirror state the cockpit renders.
+[package]
+name = "bro-fleet-client"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+bro-core = { path = "../bro-core" }
+bro-protocol = { path = "../bro-protocol" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "time", "macros"] }
+reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
+parking_lot = "0.12"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+dirs = "6"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"

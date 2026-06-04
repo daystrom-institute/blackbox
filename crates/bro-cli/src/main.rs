@@ -24,7 +24,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant, SystemTime};
 
 use blackbox::config;
-use blackbox::fleet::Provider;
+use bro_fleet_client::Provider;
 
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{

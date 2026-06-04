@@ -5,7 +5,6 @@ pub mod atoms;
 pub mod badgey;
 pub mod capabilities;
 pub mod brofile;
-pub mod fleet;
 pub mod http_fetch;
 pub mod mcp;
 pub mod providers;
@@ -420,6 +419,11 @@ impl TaskStore {
         self.persist_with_event_limit(store_dir, MAX_PERSISTED_EVENTS);
     }
 
+    /// Full-history persist (no per-task event cap). The fleet client was the
+    /// only production caller; with the §7 fleet-daemon-only cut its own mirror
+    /// store owns this now (`bro-fleet-client`). Retained (allow-dead) for the
+    /// persistence-contract test and any future full-history daemon path.
+    #[allow(dead_code)]
     pub fn persist_all_events(&self, store_dir: &std::path::Path) {
         self.persist_with_event_limit(store_dir, usize::MAX);
     }

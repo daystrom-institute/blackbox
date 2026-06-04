@@ -39,7 +39,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use blackbox::fleet::{
+use bro_fleet_client::{
     AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DispatchSpec, FleetConfig,
     FleetOrchestrator, Provider, ResumeSpec, TailEvent, TaskStatus, TodoItemStatus, TodoState,
     TranscriptItem, intern_rider, provider_supports_bidi,
@@ -5985,7 +5985,7 @@ mod tests {
             TranscriptItem::TodoState(TodoState {
                 total: 1,
                 completed: 0,
-                items: vec![blackbox::fleet::TodoItem {
+                items: vec![bro_fleet_client::TodoItem {
                     status: TodoItemStatus::Pending,
                     text: "keep visible".into(),
                 }],

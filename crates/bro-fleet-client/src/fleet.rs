@@ -1,20 +1,11 @@
-//! `FleetOrchestrator` — the daemon-free façade the `bro fleet` cockpit drives.
+//! `FleetOrchestrator` — the daemon-driving façade the `bro fleet` cockpit uses.
 //!
-//! The cockpit links the `blackbox` lib and spawns top-level entrypoint agents
-//! **in-process** — no HTTP to a running `blackboxd` (design
-//! `design/fleet-tui/fleet-tui.md` §3). This façade owns the three plain
-//! values `spawn_task` needs — a `TaskStore`, a tail `broadcast::Sender`, and a
-//! `store_dir` — and hands the cockpit a single `dispatch` entry point plus a
-//! tail subscription. Ownership is clean: the cockpit owns exactly the tasks it
-//! spawned (it keeps the returned `Arc<Task>` handles), so the façade stays
-//! intentionally thin.
-//!
-//! Net-new item 7 in the design's "what needs to be added" list. The keystone
-//! bidirectional control protocol (persistent stdin, `control_request`,
-//! `/compact`) is **not** here — that is harness + dispatch-seam work tracked
-//! separately. v1 dispatch reuses the existing one-shot `build_exec_args` /
-//! `spawn_task` path so the cockpit shell is buildable and runnable today; live
-//! steering lands once the bidirectional seam exists.
+//! The fleet client is **daemon-only** (harness-daemon-boundary.md §7): every
+//! dispatch/resume/stop is an HTTP call to the daemon singleton's `/control/*`
+//! routes. This crate links only the contract bottom (`bro-protocol` +
+//! `bro-core`) plus its own transport/runtime deps — never the `blackbox`
+//! daemon crate. View-local mirror state (the `Task` store the cockpit reloads,
+//! the live transcript parse) lives here; system state lives in the daemon.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -25,62 +16,29 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, broadcast};
 
-use super::mcp::McpServerConfig;
-use super::providers::EventSink;
-use super::providers::dispatch_prelude::*;
-use super::supervision::SupervisionState;
-use super::{Task, TaskInner, TaskStore, format_elapsed, now_ms};
+use crate::config;
+use crate::events::{EventSink, parse_claude_event};
+use crate::mcp::McpServerConfig;
+use crate::tail::TailEvent;
+use crate::task::{Task, TaskInner, TaskStore, format_elapsed, now_ms};
 
-// Re-export the consumer-facing types so the `bro fleet` cockpit depends only
-// on `blackbox::fleet::*` and never reaches into the crate-private
-// `orchestration` module directly. `Task` itself is NOT re-exported — the
-// cockpit handles agents through the opaque [`AgentHandle`] and reads state via
-// [`TaskSnapshot`], so the crate-private `TaskInner` (and its private-typed
-// fields) never leak into the public API.
-// The client (`bro fleet`) settles on the wire `bro_protocol::TaskStatus` (the
-// superset with `Pending`); the engine's task mirror still speaks the daemon's
-// internal `orchestration::TaskStatus` (4 variants) and maps to the wire enum at
-// the `snapshot()` boundary. When the mirror extracts into the client crate (1d)
-// its status field becomes `bro_protocol::TaskStatus` directly and the map goes
-// away. Internally this module names the orchestration enum `OrchStatus`.
-pub use bro_protocol::TaskStatus;
-use super::TaskStatus as OrchStatus;
-pub use super::providers::Provider;
-pub use super::tail::TailEvent;
-
-// The pure view/wire DTOs now live at the contract bottom (`bro-protocol`) so
-// the thin fleet client can name them without linking the daemon
-// (harness-daemon-boundary.md §2/§7). Re-exported here so existing
-// `blackbox::fleet::*` consumers don't churn while the engine still lives in the
-// daemon crate.
+// The contract-bottom view/wire DTOs (harness-daemon-boundary.md §2/§7). Status
+// is the wire `bro_protocol::TaskStatus` directly — there is no daemon-internal
+// enum on the client side.
+pub use bro_core::Provider;
 pub use bro_protocol::{
-    DispatchSpec, ResumeSpec, TodoItem, TodoItemStatus, TodoState, TranscriptItem,
+    DispatchSpec, ResumeSpec, TaskStatus, TodoItem, TodoItemStatus, TodoState, TranscriptItem,
 };
-
-/// Map the daemon's internal task status onto the wire `bro_protocol::TaskStatus`
-/// the cockpit consumes. Lossless (the orchestration enum is a subset — it has
-/// no `Pending`). The fleet client never surfaces the daemon's internal enum.
-fn orch_status_to_wire(status: OrchStatus) -> TaskStatus {
-    match status {
-        OrchStatus::Running => TaskStatus::Running,
-        OrchStatus::Completed => TaskStatus::Completed,
-        OrchStatus::Failed => TaskStatus::Failed,
-        OrchStatus::Cancelled => TaskStatus::Cancelled,
-    }
-}
 
 /// TUI-local fleet config — `fleet.json` beside the selected blackbox
 /// `config.toml` but read entirely daemon-free. Deliberately
 /// **not** the bbox project registry or the daemon's `mcp.json`: those drag in
 /// the daemon plus per-project indexing, inappropriate for the cockpit.
 ///
-/// v1 holds one thing — a normalized MCP server map injected into **every**
-/// dispatched agent regardless of provider (`fleet-tui.md` §5.2). The
-/// normalization is `McpServerConfig` (the same Http/Sse/Stdio shape the rest of
-/// the codebase uses); the only per-provider work is translating it to CLI args
-/// at dispatch (`Provider::build_fleet_mcp_args`). The `projects` map is the
-/// fleet-local `@project` cwd selector (`keyword -> absolute dir`) used by the
-/// roster composer.
+/// `mcpServers` / `pinTools` are parsed and round-tripped but not interpreted by
+/// the client: since 1b the daemon owns MCP/tool injection, so these are kept so
+/// a user's `fleet.json` survives a config-panel save and can later be forwarded
+/// to `/control/exec`.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct FleetConfig {
     #[serde(default, rename = "mcpServers")]
@@ -95,8 +53,8 @@ pub struct FleetConfig {
     pub projects: BTreeMap<String, String>,
 
     /// Extra harness tools to pin into the hot tool surface for every fleet
-    /// agent. Fleet also contributes [`DEFAULT_FLEET_PIN_TOOLS`], so this field
-    /// is additive rather than replacing the core grounding surface.
+    /// agent. Round-tripped but not interpreted by the client (daemon owns tool
+    /// injection since 1b).
     #[serde(
         default,
         rename = "pinTools",
@@ -219,29 +177,6 @@ pub const INTERN_PREFIX: &str = "[INTERN]";
 /// cockpit can keep them out of the roster (and skip them on reload).
 pub const CLASSIFIER_NAME_PREFIX: &str = "\u{27c2}intern:";
 
-/// Fleet-mode hot tools. Setting `BRO_HARNESS_PIN_TOOLS` replaces the harness
-/// defaults, so fleet supplies both the existing clipboard/slice affordances
-/// and its mandatory grounding tools when launching Brodex/GLM/DeepSeek agents.
-// Parsed/resolved but not yet forwarded to the daemon: with the fleet client
-// daemon-only (§7), per-session env/tool injection is the daemon's job. Kept so
-// fleet.json `pinTools` still round-trips and can be wired into `/control/exec`.
-#[allow(dead_code)]
-const DEFAULT_FLEET_PIN_TOOLS: &[&str] = &[
-    "bbox_slice_*",
-    "clip_yank",
-    "clip_paste",
-    "clip_transform",
-    "clip_slice",
-    "clip_grep",
-    "bbox_describe_schema",
-    "bbox_hybrid_search",
-    "bbox_inspect_entity",
-    "bbox_find_paths",
-    "bbox_bundle_evidence",
-    "enter_worktree",
-    "exit_worktree",
-];
-
 /// Default classifier prompt. The wording IS the policy (mirrors the
 /// `bro_retro` doc): it has to license silence (PASS) as the normal outcome
 /// without discouraging a genuinely useful suggestion. Calibration phrases here
@@ -273,7 +208,7 @@ impl FleetConfig {
     /// `~/Library/Application Support`, while many operators set
     /// `BLACKBOX_CONFIG` or use a dot-config file.
     pub fn path() -> Option<PathBuf> {
-        crate::config::selected_config_path().and_then(|p| p.parent().map(|d| d.join("fleet.json")))
+        config::selected_config_path().and_then(|p| p.parent().map(|d| d.join("fleet.json")))
     }
 
     /// Best-effort load: a missing file is an empty config; a malformed file is
@@ -317,30 +252,9 @@ impl FleetConfig {
     }
 }
 
-impl FleetConfig {
-    #[allow(dead_code)] // see DEFAULT_FLEET_PIN_TOOLS: daemon-side forwarding TODO (§7)
-    fn resolved_pin_tools(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for tool in DEFAULT_FLEET_PIN_TOOLS
-            .iter()
-            .copied()
-            .map(str::to_string)
-            .chain(self.pin_tools.iter().cloned())
-        {
-            let tool = tool.trim();
-            if !tool.is_empty() && !out.iter().any(|existing| existing == tool) {
-                out.push(tool.to_string());
-            }
-        }
-        out
-    }
-}
-
-// `DispatchSpec` / `ResumeSpec` now live in `bro_protocol` (re-exported above).
-
 /// Opaque handle to a dispatched entrypoint agent. Wraps the live task mirror
 /// (fed by the daemon status poller); the cockpit holds these and reads state
-/// through [`AgentHandle::snapshot`] without touching crate-private internals.
+/// through [`AgentHandle::snapshot`].
 ///
 /// Control flows through the daemon over HTTP (`/control/*`): `daemon` is
 /// `Some` while the session is live and steerable, and `None` for a
@@ -414,15 +328,13 @@ impl AgentHandle {
         // parser ignores `report` lines, so the cockpit derives them here.
         let stream = derive_stream_state(&inner.events);
         TaskSnapshot {
-            status: orch_status_to_wire(inner.status),
+            status: inner.status,
             provider: inner.provider,
             session_id: inner.session_id.clone(),
             last_assistant_message: inner.last_assistant_message.clone(),
-            // Prefer the harness `report` line; fall back to the daemon BroReport
-            // (populated only for bro_exec-style tasks, never fleet agents).
-            report_message: stream
-                .report_message
-                .or_else(|| inner.report.as_ref().map(|r| r.message.clone())),
+            // The harness `report` line. (The daemon BroReport fallback that
+            // existed in-process never populated for fleet agents.)
+            report_message: stream.report_message,
             needs_input: stream.needs_input,
             turn_active: stream.turn_active,
             worktree_finished: stream.worktree_finished,
@@ -430,9 +342,9 @@ impl AgentHandle {
             num_turns: inner.num_turns,
             started_at: inner.started_at,
             // Wall-clock of the last observed stream event — "last interaction",
-            // a roster timing column + sort axis. Stamped by the reader on every
-            // event via supervision.observe_event.
-            last_event_at_ms: inner.supervision.last_event_at_ms,
+            // a roster timing column + sort axis. Stamped by the poller on every
+            // event-count increase.
+            last_event_at_ms: inner.last_event_at_ms,
             cwd: inner.cwd.clone(),
             stderr: inner.stderr.clone(),
             model: model_from_events(&inner.events),
@@ -449,10 +361,6 @@ impl AgentHandle {
         parse_transcript(&self.task.inner.lock().events)
     }
 }
-
-// `TranscriptItem` / `TodoState` / `TodoItem` / `TodoItemStatus` now live in
-// `bro_protocol` (re-exported above). The parser below stays daemon-side for 1c
-// and moves with the engine into the client crate in 1d.
 
 /// Parse the raw stream-json buffer into ordered transcript items (§5.4 — the
 /// net-new live-stream parser). Handles the harness/Claude envelope: assistant
@@ -675,11 +583,10 @@ fn parse_assistant_event(
     }
 }
 
-/// tool_result `content` may be a bare string or an array of text blocks.
 /// Opening marker of the window-0 diagnostics rider the harness appends to a
 /// tool-result body. WIRE CONTRACT: must match `RIDER_MARKER` in
-/// `crates/bro-harness/src/diagnostics/render.rs` (the harness crate is a
-/// sibling, so the string is duplicated rather than shared).
+/// `crates/bro-harness/src/diagnostics/render.rs` (the string is duplicated
+/// rather than shared).
 const WINDOW0_RIDER_MARKER: &str = "window-0 diagnostics:";
 
 /// Split a tool-result body into `(body, rider)` on the window-0 marker. The
@@ -708,14 +615,14 @@ fn extract_content_text(content: Option<&Value>) -> String {
 }
 
 /// Read-only snapshot of a dispatched agent's live state — the cockpit's window
-/// into a task without naming the crate-private `Task`/`TaskInner`.
+/// into a task without naming the mirror `Task`/`TaskInner`.
 #[derive(Debug, Clone)]
 pub struct TaskSnapshot {
     pub status: TaskStatus,
     pub provider: Provider,
     pub session_id: String,
     pub last_assistant_message: Option<String>,
-    /// Latest status line from the harness `report` tool (or daemon BroReport).
+    /// Latest status line from the harness `report` tool.
     pub report_message: Option<String>,
     /// The latest `report` flagged needs-input — drives the Waiting bucket (§2.2).
     pub needs_input: bool,
@@ -848,7 +755,6 @@ fn user_event_has_successful_tool_result(
     })
 }
 
-/// Best-effort model id from an `init`/assistant event in the stream-json buffer.
 #[derive(Clone)]
 struct DaemonFleetClient {
     base_url: Arc<str>,
@@ -960,7 +866,7 @@ impl DaemonFleetClient {
                     "pending".to_string(),
                     cwd,
                     name,
-                    OrchStatus::Failed,
+                    TaskStatus::Failed,
                     error.to_string(),
                 ),
                 daemon: None,
@@ -982,7 +888,7 @@ impl DaemonFleetClient {
             session_id,
             cwd,
             name,
-            OrchStatus::Running,
+            TaskStatus::Running,
             String::new(),
         );
         let daemon = DaemonAgentHandle {
@@ -1066,7 +972,7 @@ fn daemon_task(
     session_id: String,
     cwd: Option<String>,
     name: Option<String>,
-    status: OrchStatus,
+    status: TaskStatus,
     stderr: String,
 ) -> Arc<Task> {
     Arc::new(Task {
@@ -1076,25 +982,18 @@ fn daemon_task(
             session_id,
             events: Vec::new(),
             last_assistant_message: None,
-            usage: None,
             cost_usd: None,
             num_turns: None,
             stderr,
             status,
             started_at: now_ms(),
             completed_at: status.is_terminal().then(now_ms),
-            exit_code: None,
             cwd,
             bro_label: name,
-            agent_label: None,
-            report: None,
             recoverable: false,
-            transcript_location: None,
-            transcript_cursor: None,
-            supervision: SupervisionState::default(),
+            last_event_at_ms: None,
         }),
         notify: Arc::new(Notify::new()),
-        child_id: Mutex::new(None),
     })
 }
 
@@ -1118,7 +1017,7 @@ fn spawn_daemon_status_poller(
                         terminal_sent = true;
                         let inner = task.inner.lock();
                         match inner.status {
-                            OrchStatus::Completed => {
+                            TaskStatus::Completed => {
                                 let _ = tail_tx.send(TailEvent::TaskCompleted {
                                     task_id: inner.id.clone(),
                                     elapsed: format_elapsed(inner.started_at, inner.completed_at),
@@ -1127,20 +1026,20 @@ fn spawn_daemon_status_poller(
                                     task_kind: inner.bro_label.clone(),
                                 });
                             }
-                            OrchStatus::Failed => {
+                            TaskStatus::Failed => {
                                 let _ = tail_tx.send(TailEvent::TaskFailed {
                                     task_id: inner.id.clone(),
                                     elapsed: format_elapsed(inner.started_at, inner.completed_at),
                                     error: inner.stderr.clone(),
                                 });
                             }
-                            OrchStatus::Cancelled => {
+                            TaskStatus::Cancelled => {
                                 let _ = tail_tx.send(TailEvent::TaskCancelled {
                                     task_id: inner.id.clone(),
                                     elapsed: String::new(),
                                 });
                             }
-                            OrchStatus::Running => {}
+                            TaskStatus::Running | TaskStatus::Pending => {}
                         }
                     }
                     if terminal {
@@ -1170,25 +1069,17 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
         if let Some(sid) = &snap.session_id {
             inner.session_id = sid.as_str().to_string();
         }
-        inner.status = match snap.status {
-            bro_protocol::TaskStatus::Completed => OrchStatus::Completed,
-            bro_protocol::TaskStatus::Failed => OrchStatus::Failed,
-            bro_protocol::TaskStatus::Cancelled => OrchStatus::Cancelled,
-            // Pending/Running both map to the daemon's Running.
-            bro_protocol::TaskStatus::Pending | bro_protocol::TaskStatus::Running => {
-                OrchStatus::Running
-            }
-        };
+        inner.status = snap.status;
     } else {
         if let Some(session_id) = value.get("sessionId").and_then(|v| v.as_str()) {
             inner.session_id = session_id.to_string();
         }
         if let Some(status) = value.get("status").and_then(|v| v.as_str()) {
             inner.status = match status {
-                "completed" => OrchStatus::Completed,
-                "failed" => OrchStatus::Failed,
-                "cancelled" => OrchStatus::Cancelled,
-                _ => OrchStatus::Running,
+                "completed" => TaskStatus::Completed,
+                "failed" => TaskStatus::Failed,
+                "cancelled" => TaskStatus::Cancelled,
+                _ => TaskStatus::Running,
             };
         }
     }
@@ -1201,41 +1092,20 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
         .map(|v| v as usize)
         .unwrap_or(inner.events.len());
     if event_count > *last_event_count {
-        inner.supervision.last_event_at_ms = Some(now_ms());
+        inner.last_event_at_ms = Some(now_ms());
         *last_event_count = event_count;
     }
-    let mut sink = EventSink {
-        last_assistant_message: None,
-        usage: None,
-        cost_usd: None,
-        num_turns: None,
-        session_id: None,
-    };
+    let mut sink = EventSink::default();
     for evt in &inner.events {
-        inner.provider.parse_event(evt, &mut sink);
+        parse_claude_event(evt, &mut sink);
     }
     inner.last_assistant_message = sink.last_assistant_message;
-    inner.usage = sink.usage;
     inner.cost_usd = sink.cost_usd;
     inner.num_turns = sink.num_turns;
     if let Some(result) = value.get("result").and_then(|v| v.as_str())
         && !result.is_empty()
     {
         inner.last_assistant_message = Some(result.to_string());
-    }
-    if let Some(usage) = value.get("usage") {
-        if let Some(input) = usage.get("input_tokens").and_then(|v| v.as_u64()) {
-            inner
-                .usage
-                .get_or_insert_with(Default::default)
-                .input_tokens = input;
-        }
-        if let Some(output) = usage.get("output_tokens").and_then(|v| v.as_u64()) {
-            inner
-                .usage
-                .get_or_insert_with(Default::default)
-                .output_tokens = output;
-        }
     }
     if inner.status.is_terminal() && inner.completed_at.is_none() {
         inner.completed_at = Some(now_ms());
@@ -1246,6 +1116,7 @@ fn update_daemon_task(task: &Task, value: &Value, last_event_count: &mut usize) 
     terminal
 }
 
+/// Best-effort model id from an `init`/assistant event in the stream-json buffer.
 fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
     events.iter().find_map(|e| {
         e.get("model")
@@ -1255,9 +1126,9 @@ fn model_from_events(events: &[serde_json::Value]) -> Option<String> {
     })
 }
 
-/// Daemon-free orchestration core for the fleet cockpit. Holds the `TaskStore`,
-/// the tail broadcast channel, and the on-disk `store_dir` that `spawn_task`
-/// persists task state into.
+/// Daemon-driving orchestration core for the fleet cockpit. Holds the
+/// `TaskStore` mirror, the tail broadcast channel, and the on-disk `store_dir`
+/// the cockpit reloads from.
 pub struct FleetOrchestrator {
     task_store: Arc<RwLock<TaskStore>>,
     tail_tx: broadcast::Sender<TailEvent>,
@@ -1277,7 +1148,11 @@ impl FleetOrchestrator {
     /// daemon. Tests and embedders use this; the cockpit normally goes through
     /// [`FleetOrchestrator::from_config`].
     pub fn new(store_dir: PathBuf) -> Self {
-        Self::with_store(store_dir, TaskStore::new(), DaemonFleetClient::new(default_daemon_url()))
+        Self::with_store(
+            store_dir,
+            TaskStore::new(),
+            DaemonFleetClient::new(default_daemon_url()),
+        )
     }
 
     fn with_store(store_dir: PathBuf, store: TaskStore, daemon: DaemonFleetClient) -> Self {
@@ -1312,8 +1187,7 @@ impl FleetOrchestrator {
     }
 
     fn from_config_store(store_name: &str, daemon_url: Option<String>) -> anyhow::Result<Self> {
-        let cfg = crate::config::load()?;
-        let store_dir = cfg.paths.bro_home.join(store_name);
+        let store_dir = config::bro_home().join(store_name);
         // No age-based eviction: the cockpit's model is manual cleanup (§5), so
         // historical sessions persist until explicitly deleted, not by TTL.
         let store = TaskStore::load(&store_dir, u64::MAX);
@@ -1364,7 +1238,7 @@ impl FleetOrchestrator {
 
     /// Flush the current task store to disk so a later cockpit launch can
     /// reload these sessions. The cockpit calls this after each dispatch and on
-    /// quit (spawn_task only persists at task-terminal on its own).
+    /// quit.
     pub fn persist(&self) {
         self.task_store.read().persist_all_events(&self.store_dir);
     }
@@ -1385,10 +1259,7 @@ impl FleetOrchestrator {
             .read()
             .all_tasks()
             .into_iter()
-            .map(|task| AgentHandle {
-                task,
-                daemon: None,
-            })
+            .map(|task| AgentHandle { task, daemon: None })
             .collect()
     }
 
@@ -1396,12 +1267,9 @@ impl FleetOrchestrator {
         &self.store_dir
     }
 
-    /// Spawn a new top-level entrypoint agent. Bidi-capable providers (Claude,
-    /// GLM, DeepSeek, Brodex) launch a **persistent bidirectional session**
-    /// (`--input-format stream-json --replay-user-messages`, keystone §2) with
-    /// stdin kept open for steering; other providers fall back to one-shot
-    /// dispatch (no steering, §2.1). Returns an [`AgentHandle`] — the cockpit
-    /// holds it to read state and drive the session.
+    /// Spawn a new top-level entrypoint agent over the daemon control plane.
+    /// Returns an [`AgentHandle`] — the cockpit holds it to read state and drive
+    /// the session.
     pub fn dispatch(&self, mut spec: DispatchSpec) -> AgentHandle {
         // Fleet agents are entrypoint agents, not bros; the cockpit reuses
         // `name` as the durable roster display name (an explicit name, else the
@@ -1412,24 +1280,18 @@ impl FleetOrchestrator {
             spec.name = Some(prompt_head(&spec.prompt));
         }
         let handle = self.daemon.dispatch(spec, self.tail_tx.clone());
-        let _ = self
-            .task_store
+        self.task_store
             .write()
             .insert(handle.id(), handle.task.clone());
         handle
     }
 
-    /// Resume a prior session (§5). Builds `--resume <id> -p <prompt>` and
-    /// relaunches a persistent bidirectional session continuing the same
-    /// `session_id`; the prompt is the first turn of the resumed conversation.
-    /// Bidi-capable providers only.
+    /// Resume a prior session (§5) over the daemon control plane: the daemon
+    /// owns the session store and its transcript; the poller repopulates the
+    /// mirror task's recent events from `/control/status` after the resume lands.
     pub fn resume(&self, spec: ResumeSpec) -> AgentHandle {
-        // Daemon-only: the daemon owns the session store and its transcript; the
-        // poller repopulates the mirror task's recent events from
-        // `/control/status` after the resume lands.
         let handle = self.daemon.resume(spec, self.tail_tx.clone());
-        let _ = self
-            .task_store
+        self.task_store
             .write()
             .insert(handle.id(), handle.task.clone());
         handle
@@ -1443,8 +1305,9 @@ impl FleetOrchestrator {
         self.persist();
     }
 
-    /// Stop a running session (Ctrl+X): SIGTERM the child and mark it Cancelled
-    /// (→ Interrupted). The provider session survives on disk for resume.
+    /// Stop a running session (Ctrl+X): the daemon SIGTERMs the child and marks
+    /// it Cancelled (→ Interrupted). The provider session survives on disk for
+    /// resume.
     pub fn stop(&self, handle: &AgentHandle) -> Result<(), String> {
         let Some(daemon) = &handle.daemon else {
             return Err("agent has no live daemon session — nothing to cancel".to_string());
@@ -1457,13 +1320,12 @@ impl FleetOrchestrator {
         .map_err(|err| err.to_string());
         if result.is_ok() {
             let mut inner = handle.task.inner.lock();
-            inner.status = OrchStatus::Cancelled;
+            inner.status = TaskStatus::Cancelled;
             inner.completed_at = Some(now_ms());
             handle.task.notify.notify_waiters();
         }
         result.map(|_| ())
     }
-
 }
 
 /// First line of the prompt, capped — the durable display name for a session.
@@ -1486,8 +1348,8 @@ fn default_daemon_url() -> String {
 
 /// Providers that speak the persistent bidirectional stream-json control
 /// protocol: the bro-harness providers GLM / DeepSeek / Brodex / VibeBh (§2).
-/// Others are one-shot only. Public so the
-/// cockpit can tell whether a non-live agent is resumable.
+/// Others are one-shot only. Public so the cockpit can tell whether a non-live
+/// agent is resumable.
 pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
@@ -1538,7 +1400,26 @@ mod tests {
     }
 
     #[test]
-    fn fleet_config_parses_project_alias_map() {
+    fn fleet_config_round_trips_mcp_servers() {
+        // The client doesn't interpret mcpServers but MUST preserve them across a
+        // save — model the secret/header values as opaque JSON so a config-panel
+        // write doesn't drop a user's fleet.json mcpServers.
+        let src = r#"{
+            "mcpServers": {
+                "ctx": { "type": "http", "url": "https://x/mcp",
+                         "headers": { "Authorization": { "$secret": "TOKEN" } } }
+            }
+        }"#;
+        let cfg: FleetConfig = serde_json::from_str(src).unwrap();
+        let out = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            out["mcpServers"]["ctx"]["headers"]["Authorization"]["$secret"],
+            "TOKEN"
+        );
+    }
+
+    #[test]
+    fn fleet_config_missing_mcp_servers_is_empty_with_projects() {
         let cfg: FleetConfig = serde_json::from_str(
             r#"{
                 "projects": {
@@ -1556,15 +1437,6 @@ mod tests {
             cfg.projects.get("tools").map(String::as_str),
             Some("/Users/me/repos/transcript-search/crates/bro-tools")
         );
-    }
-
-    #[test]
-    fn fleet_config_pin_tools_are_additive_to_grounding_defaults() {
-        let cfg: FleetConfig = serde_json::from_str(r#"{ "pinTools": ["extra_tool"] }"#).unwrap();
-        let pins = cfg.resolved_pin_tools();
-        assert!(pins.iter().any(|p| p == "bbox_describe_schema"));
-        assert!(pins.iter().any(|p| p == "bbox_hybrid_search"));
-        assert!(pins.iter().any(|p| p == "extra_tool"));
     }
 
     #[test]
@@ -1803,7 +1675,7 @@ mod tests {
 
     #[test]
     fn fleet_config_path_sits_next_to_selected_config() {
-        let _guard = crate::util::test_env_lock();
+        let _guard = crate::test_env_lock();
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().canonicalize().unwrap().join("custom.toml");
         unsafe {

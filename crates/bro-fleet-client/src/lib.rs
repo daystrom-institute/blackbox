@@ -1,0 +1,38 @@
+//! `bro-fleet-client` — the daemon-driving engine behind `bro fleet`.
+//!
+//! The fleet cockpit (`bro-cli`) links this crate, not `blackbox`. It holds the
+//! `FleetOrchestrator` that POSTs `/control/*` to the daemon singleton, the live
+//! task mirror the cockpit reloads/persists, the stream-json transcript parser,
+//! and the `fleet.json` config types — all over the contract bottom
+//! (`bro-protocol` + `bro-core`) plus transport deps, never the daemon crate
+//! (harness-daemon-boundary.md §7).
+
+// Match the `blackbox` crate idiom: opt out of edition-2024's stylistic
+// collapsible_if so the engine code ported from `orchestration::fleet` stays
+// verbatim (nested guards kept as-is).
+#![allow(clippy::collapsible_if)]
+
+mod config;
+mod events;
+mod fleet;
+mod mcp;
+mod tail;
+mod task;
+
+pub use config::daemon_port;
+pub use fleet::{
+    AgentHandle, CLASSIFIER_NAME_PREFIX, ClassifierConfig, DEFAULT_CLASSIFIER_PROMPT, DispatchSpec,
+    FleetConfig, FleetOrchestrator, INTERN_PREFIX, Provider, ResumeSpec, TaskSnapshot, TaskStatus,
+    TodoItem, TodoItemStatus, TodoState, TranscriptItem, intern_rider, parse_transcript,
+    provider_supports_bidi,
+};
+pub use mcp::McpServerConfig;
+pub use tail::TailEvent;
+
+/// Serialize tests that mutate process-global env (e.g. `BLACKBOX_CONFIG`).
+/// Non-reentrant — do not double-take.
+#[cfg(test)]
+pub(crate) fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

@@ -768,16 +768,42 @@ roster render.
     `FleetOrchestrator` (live handles + the engine itself — 1d). Validated:
     `bro-protocol` checks standalone; `blackbox`+`bro-cli` `cargo check` clean;
     26 fleet + 27 provider lib tests pass; 0 new clippy.
-  - NOT done: **1d** extract the fleet client engine (`FleetOrchestrator`/
-    `AgentHandle`/`DaemonFleetClient` + the client `Task`/`TaskStore` mirror +
-    `parse_transcript` + `ClassifierConfig`/`FleetConfig` IO + the needed
-    transcript parsers) out of `blackbox` into a client crate; point `bro-cli` at
-    the contract bottom + that crate and DROP the `blackbox = { path = ... }`
-    dependency. (The remaining `bro-cli → blackbox` surface is
-    `blackbox::fleet::*` (the now daemon-only `FleetOrchestrator` + engine +
-    `intern_rider`/`provider_supports_bidi`), `blackbox::parser::*`, and
-    `blackbox::config::load`.) Still a durable-bro + reviewer effort, not a single
-    sprint.
+  - **Step 1d-i — DONE: fleet engine extracted into `bro-fleet-client`.** New
+    crate `crates/bro-fleet-client` (links only `bro-protocol` + `bro-core` +
+    reqwest/tokio/parking_lot/uuid/dirs/toml — never `blackbox`) now owns the
+    engine that lifted out of `blackbox::fleet`: `FleetOrchestrator` /
+    `AgentHandle` / `DaemonFleetClient`, the `TaskSnapshot` view model, the
+    stream-json `parse_transcript` + `derive_stream_state`, and the
+    `FleetConfig` / `ClassifierConfig` + IO. Blackbox-internal couplings were
+    replaced with client-owned equivalents: a lean `Task`/`TaskInner`/`TaskStore`
+    mirror typed directly on `bro_protocol::TaskStatus` with its own
+    `tasks.json` persistence (subset of the daemon's `PersistedTask`; serde
+    ignores the daemon-only fields in any pre-existing store), a single field
+    `last_event_at_ms` replacing `SupervisionState`, a client-local 3-variant
+    `TailEvent`, a provider-agnostic port of `parse_claude_event` (events.rs —
+    all surviving providers share the Claude envelope, confirmed in the daemon's
+    `ProviderEvents::parse_event` match), a client-local `McpServerConfig`
+    (opaque-JSON secrets, round-trip only), and a minimal `config` sliver
+    (`selected_config_path` / `bro_home` / `daemon_port`, faithful to the
+    daemon's precedence). `TaskStatus` is now the wire enum end-to-end on the
+    client — the `OrchStatus` map from 1c is gone. `bro-cli`'s fleet_tui /
+    fleet_classifier / main(Provider) point at `bro_fleet_client`. `blackbox`
+    dropped `pub mod fleet` + the `pub use orchestration::fleet` re-export;
+    `src/orchestration/fleet.rs` deleted. Orphan sweep: `TaskStore::persist_all_events`
+    (fleet was its only production caller) kept `#[allow(dead_code)]` for its
+    persistence-contract test; `spawn_task_interactive` + `SpawnedTask.stdin`
+    left (still referenced by the shared `spawn_task_reserved` machinery) and
+    the `build_fleet_mcp_args` family left (still test-covered). `bro-cli` still
+    depends on `blackbox` for `parser` (1d-ii) and `config::load` (1d-iii).
+    Validated: `cargo check --workspace` clean 0/0.
+  - NOT done: **1d-ii** relocate the `blackbox::parser` surface `bro tail` uses
+    (`TranscriptEvent`/`EventDetail`/`MessageRole`/`SystemSignalKind` +
+    `parse_transcript_line_rich`) and DROP the dropped-provider parsers
+    (`parse_codex/copilot/vibe/gemini_line_rich` — §4 dead code; parser.rs is
+    self-contained, no `crate::`/`super::` coupling). **1d-iii** repoint
+    `council_tui` + `main` config to `bro_fleet_client::config` and DROP
+    `blackbox = { path = ... }` from `crates/bro-cli/Cargo.toml`; live fleet-TUI
+    validation against an isolated daemon.
 - **§5 in-process V8 + supervised shell (execution isolation).** Not started;
   no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
   per-child env hook but not timeout/cap supervision.
