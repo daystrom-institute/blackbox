@@ -991,16 +991,22 @@ roster render.
   whole `{promises:[…]}` envelope, which still keeps big output out of context.
   `narf_wait`/durable promises remain the §10 lever.
 
-  REMAINING for §5b/§9 — **NEXT: clip→ref fold (step 6), MCP config++ (step 7).**
-  The
-  restore-parity plan (host-access seam → read core → `shell.run` →
-  mutation → promise → clip-fold → MCP config++), the in-box/out-box taxonomy over
-  all 35 pre-beta bro-tools built-ins, the `Ref`/`Promise` type model, and
-  automatic ref resolution (parameter substitutability) are specified in the new
-  [`narf-tool-placement.md`](./narf-tool-placement.md) (design pass `9e05f88`).
-  `Promise`/`narf_wait` durable surface = deferred lever (store home open,
-  narf.md OQ#2); `Tx` parked (`narf-effects-and-safety.md`); §5a supervised shell
-  still open.
+  DATA MODEL SUPERSEDED + REWORKED — see
+  [`narf-data-model.md`](./narf-data-model.md) (canon). The `ref`-as-data-
+  composition system and the `clip_*`/chaining ABI were **both retired** and
+  replaced by ONE durable session KV (a cell is out-of-context → tools return
+  values; JS composes; the KV holds working state). Landed on `beta/blackbox-v2`:
+  ref system removed (`f467234`), durable KV core (`2dff0bd`, live-smoked —
+  persistence across resume), `clip_*` + `into`/`from` retired (`6065d14`),
+  `narf.encode` yaml/frontmatter/mdTable (`d0ba426`); the return-value cap needed
+  no code (the existing oversized-tool-result rider, `crate::bound`, already
+  spills oversized cell returns to a `file_read`-able path). The KV surface is
+  box-edge-split: in-box `narf.kv.{set,get,peek,delete}` by exact name, out-box
+  `narf_kv_{list,peek,get}` (no in-box enumeration — the box never selects).
+  `narf-tool-placement.md` is archived. STILL OPEN: MCP placement (step 7, the
+  surviving live part of the archived doc §4); `Promise`/`narf_wait` durable
+  surface = deferred lever; `Tx` parked (`narf-effects-and-safety.md`); §5a
+  supervised shell still open.
 
   LAYERING CORRECTION — **FIXED.** The §9-auth authoring surface
   (`narf.prepare`/`run`/`session.define`, commit `8a86e75`) had been mislayered as
