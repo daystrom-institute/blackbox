@@ -1,0 +1,20 @@
+{
+  "id": "gap-bcbdcc6d",
+  "title": "bbox_knowledge has no compact/titles-only mode for dedup checks; broad queries spill oversized payloads over the token cap",
+  "gap_kind": "mcp_surface",
+  "domain": "knowledge/dedup",
+  "wanted_capability": "A titles/summaries-only (or count-only) mode for bbox_knowledge so the standard \"check existing memory before learning\" dedup step is cheap. With limit=8 a broad query still returned full entry bodies totalling ~81KB and spilled to a file over the token cap, blocking a quick dedup scan; a tighter query was needed to get readable output. A `fields=title,summary` / `compact=true` projection would make pre-learn dedup reliable regardless of query breadth.",
+  "missing_primitive": "A compact/titles-only projection on bbox_knowledge.",
+  "fallback_used": "Narrowed the query with quoted phrases + a tighter limit until the result fit.",
+  "evidence": [
+    "interactive retrospective",
+    "prompts/RETRO_INTERACTIVE.md"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/knowledge-dedup/oversized-no-compact-mode",
+  "notes": "Sibling pattern to gap-55be3518 (oversized escaped bro_wait/workflow envelope over the token cap) — same \"MCP payload exceeds token cap, spills to file\" shape on a different surface.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-04T17:19:00Z",
+  "updated_at": "2026-06-04T17:19:00Z"
+}
