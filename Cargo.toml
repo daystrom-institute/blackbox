@@ -12,6 +12,7 @@ members = [
     "crates/bro-cli",
     "crates/bro-fleet-client",
     "crates/bro-transcript",
+    "crates/bro-script",
 ]
 
 [package]
