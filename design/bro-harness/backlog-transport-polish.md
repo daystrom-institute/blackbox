@@ -45,6 +45,11 @@ gap. These are independently pickup-able polish items; grab any one.
 
 ## Extensibility / later
 
+> The two `web_search` bullets below are now given a fuller treatment in
+> [`search-provider-abstraction.md`](./search-provider-abstraction.md) (the
+> hosted-backend = its Axis B; result-normalization = its OQ-3). Retire them here
+> once that doc lands.
+
 - **Client-side `web_search` fallback backend.** Only needed for providers
   without a server-side search tool; GLM and DeepSeek both have one, so this is
   not required for the current provider set. `crates/bro-tools/src/web.rs`

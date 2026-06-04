@@ -42,6 +42,12 @@ points to a backlog doc.
   delivery, Nudger v1 + four rules.
 - [Diagnostics (window-0)](bro-harness-diagnostics.md) — the instant/error-tier
   MVP (`bro-lsp` + per-mutation rider); upper tiers deferred.
+- [Search provider abstraction](search-provider-abstraction.md) — proposed:
+  replace the bare `web_search: bool` (default-ON, ungoverned, three divergent
+  per-transport spellings, vibe-bh hole) with a normalized `SearchConfig` + two
+  axes (native emission shape vs hosted backend) folded back through the
+  `ToolFilter`. Subsumes the backlog web_search-fallback + result-normalization
+  bullets.
 
 ## Backlog (proposed — pick this up)
 
