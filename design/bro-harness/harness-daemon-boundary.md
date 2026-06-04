@@ -906,10 +906,37 @@ roster render.
     returns metadata only. A per-runtime **cumulative** egress budget
     (`SupervisionPolicy.egress_budget_bytes`, 256 KiB default-ON) fails closed on
     overflow (narf-draft2 §7). Orchestrator-verified 20/20.
-  REMAINING for §5b/§9: the rest of the NARF substrate (`Promise`/`Plan`/`Tx`/
-  `Atom`/`Script` + the `narf_exec`/`narf_wait` model-facing surface) — note `Tx`
-  hits the §12 tx-vs-saga open fork, do not bake it in; then live daemon-agent-loop
-  integration + tmux smoke (operator-attended).
+  - **`b6abcc4` (§9-fix):** removed the in-box `corpus.search` binding — search is
+    interpretive (the box never selects), so it stays model-facing; the cell takes
+    exact, model-grounded refs as inputs. In-box surface is now exact-deref only
+    (`atoms.invoke`/`refactor.*`). 24 tests. (Follow-up parked in the thread:
+    revisit an exact `corpus.get(ref)` only when a real executing cell needs it.)
+  - **`8a86e75` (§9 authoring) + `b1c497d` (§3 query):** the v1 surfaces, built by
+    codex gpt-5.5 bros. Authoring = `narf.session.define/import` + `narf.prepare`
+    (parse/alias validation → `ref:narf-script/*`) + `narf.run` + trace (25 tests).
+    Query = `atom_search` route-card fields `{handle,kind,fit,next,stop_if,
+    missing_facts}` derived from `AtomManifest`, `stop_if` honestly empty (no
+    fabricated disqualifiers). v1/v2 cut recorded in `narf-capability-library.md`
+    §3.2.
+  - **`c034ad8` (§9 wiring) — narf_exec LIVE IN THE DAEMON.** `bro-harness` now
+    links `bro-script`; a `NarfExecTool` (capabilities.rs) builds a per-session
+    `ScriptRuntime` lazily from the installed Atom+Refactor caps and runs a cell via
+    `narf_exec(source)`, gated by the existing `ToolFilter`, registered only when
+    both caps are installed (fail-closed by absence). `cargo check -p blackbox`
+    confirms the daemon links bro-script (deno_core in the daemon dep tree, as
+    accepted). 3 unit tests. **LIVE SMOKE PASSED** (isolated daemon port 7299, real
+    glm agent in-process, exact-PID teardown, prod 7264 untouched): (1)
+    `narf_exec("return 1+1;")` → `2` (V8 runs in the daemon); (2)
+    `narf_exec("await atoms.invoke('atom:smoke-nonexistent@v1',{})")` → reached the
+    real `DaemonAtoms` capability, real catalog lookup, `atom_invoke_failed: atom
+    not found` surfaced back through the cell as a JS exception with a bro-script
+    stack trace. The model→narf_exec→in-daemon-V8→exact-capability→daemon-caps→result
+    loop is proven end-to-end.
+  REMAINING for §5b/§9: the rest of the NARF substrate (`Promise`/`Plan`/`Atom`/
+  `Script` + a `narf_wait` async surface once `Promise` exists). `Tx` is NOT on this
+  list — the tx/saga/guard apparatus is parked (`narf-effects-and-safety.md`); a v1
+  cell is arbitrary code at shell trust, no transaction. §5a supervised shell still
+  open.
 - **Supervised shell (§5a).** Still only `with_spawn_scrub` + per-child env hook;
   timeout/ulimit-cgroup cap supervision not built (deferred behind §5b/§9 per the
   operator's sequencing).
