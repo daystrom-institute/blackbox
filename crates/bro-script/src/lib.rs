@@ -1,22 +1,29 @@
-//! bro-script — §5b de-risking spike: V8 in-process via deno_core as the NARF
+//! bro-script — §5b runtime: V8 in-process via deno_core as the NARF
 //! script-execution container.
 //!
-//! This crate proves, in ISOLATION (zero `blackbox` dependency), the four
-//! daemon-safety properties and the one async-bridge property that gate
-//! embedding V8 inside the long-lived blackbox daemon:
+//! Originally a §5b de-risking spike, this crate is now hardened into a real
+//! standalone runtime. It still proves, in ISOLATION (zero `blackbox`
+//! dependency), the daemon-safety properties and the async-bridge property that
+//! gate embedding V8 inside the long-lived blackbox daemon — but the single
+//! local echo capability has been replaced with the THREE real
+//! `bro-capabilities` traits, the panic guard is now structural, and supervision
+//! is configurable.
 //!
 //!   1. heap-bound OOM containment   — a runaway allocator is terminated, the
 //!      process survives (no V8 `abort()`).
 //!   2. runaway-loop kill            — `while(true){}` is interrupted cross-thread
-//!      via the V8 `IsolateHandle`.
+//!      via the V8 `IsolateHandle` (either an external watchdog or the built-in
+//!      execution-timeout supervisor).
 //!   3. denied globals               — no `WebAssembly`/`Atomics`/
 //!      `SharedArrayBuffer`/`console` ambient host access.
-//!   4. async capability bridge      — a JS `await cap.echo(x)` suspends the
+//!   4. async capability bridge      — a JS `await corpus.search(x)` suspends the
 //!      script, hops from the `!Send` isolate thread into async Rust on a
-//!      *different* executor, and returns the result into JS.
-//!   5. panic boundary               — a panic inside an op body is caught
+//!      *different* executor, runs a real `bro-capabilities` trait method, and
+//!      returns the result into JS.
+//!   5. panic boundary               — a panic inside ANY op body is caught
 //!      (`catch_unwind`) and surfaced as a JS error, never unwound across V8
-//!      C++ frames (which would be UB / daemon abort).
+//!      C++ frames (which would be UB / daemon abort). This is structural: every
+//!      op routes through one guard helper.
 //!
 //! ## Thread <-> async pattern
 //!
@@ -28,32 +35,47 @@
 //! * inbound jobs (`Job`) arrive on a tokio mpsc; each job carries a `oneshot`
 //!   reply sender, so async callers `await` a normal future.
 //! * the only handle shared *outward* is the cross-thread `v8::IsolateHandle`
-//!   (`Send + Sync`), used by the watchdog and the near-heap-limit callback to
-//!   terminate execution from another thread.
+//!   (`Send + Sync`), used by the supervisor watchdog and the near-heap-limit
+//!   callback to terminate execution from another thread.
 //!
 //! ## Capability bridge
 //!
 //! An op invoked from JS does **not** run the capability inline on the V8 thread.
-//! It forwards a `CapRequest` over an mpsc channel to a *capability executor*
-//! task running on the **outer** multi-thread tokio runtime, then `await`s a
-//! `oneshot` reply. While the op future is pending, `run_event_loop` keeps
-//! polling it; the cross-runtime oneshot waker resolves it when async Rust
+//! It forwards a typed [`CapRequest`] over an mpsc channel to a *capability
+//! executor* task running on the **outer** multi-thread tokio runtime, then
+//! `await`s a `oneshot` reply. While the op future is pending, `run_event_loop`
+//! keeps polling it; the cross-runtime oneshot waker resolves it when async Rust
 //! finishes. This is the genuine `!Send`-isolate ↔ async-capability round trip.
+//! The three real capability traits ([`CorpusCapability`], [`AtomCapability`],
+//! [`RefactorCapability`]) are injected as `Arc<dyn Trait>` exactly as the daemon
+//! will later install them.
 
 use std::cell::RefCell;
+use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use deno_core::v8;
 use deno_core::{op2, OpState, PollEventLoopOptions, RuntimeOptions};
 use deno_error::JsErrorBox;
+use serde::Serialize;
 use tokio::sync::{mpsc, oneshot};
 
-/// deno_core version this spike pins. Reported by the spike for the §5 cost
-/// accounting (this dep later lands in blackboxd).
+pub use bro_capabilities::{
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
+    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
+};
+use bro_core::BroError;
+
+/// deno_core version this crate pins. Reported for the §5 cost accounting (this
+/// dep later lands in blackboxd).
 pub const DENO_CORE_VERSION: &str = "0.403.0";
 
 /// Default per-isolate hard heap ceiling (bytes). Generous enough that ordinary
@@ -61,87 +83,288 @@ pub const DENO_CORE_VERSION: &str = "0.403.0";
 /// limit instead.
 pub const DEFAULT_HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Default wall-clock ceiling for a single `execute` call. Generous enough that
+/// ordinary scripts (including a few capability round trips) never trip it; the
+/// timeout test passes a deliberately short value instead.
+pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
-// Capability stub — shaped like a bro-capabilities async trait, but LOCAL.
-// The spike must build with zero blackbox/bro-capabilities coupling.
+// Capability injection
 // ---------------------------------------------------------------------------
 
-/// Local stand-in for a `bro-capabilities`-style async trait. Real capabilities
-/// (corpus, refactor, …) would expose async methods like this; the spike only
-/// needs one to prove the bridge.
-#[async_trait::async_trait]
-pub trait ScriptCapability: Send + Sync + 'static {
-    async fn echo(&self, input: String) -> Result<String>;
+/// The three real `bro-capabilities` trait objects the runtime exposes to JS.
+/// Injected by the caller (the daemon, later; tests, now) so the runtime never
+/// hard-codes an implementation.
+#[derive(Clone)]
+pub struct Capabilities {
+    pub corpus: Arc<dyn CorpusCapability>,
+    pub atoms: Arc<dyn AtomCapability>,
+    pub refactor: Arc<dyn RefactorCapability>,
 }
 
-/// Trivial echo capability used by the bridge test.
-pub struct EchoCapability;
+/// Configurable, default-ON supervision. The heap limit bounds isolate memory;
+/// the execution timeout bounds wall-clock per `execute` and auto-terminates a
+/// runaway script via the cross-thread `IsolateHandle` (no caller-supplied
+/// watchdog needed). `execution_timeout = None` disables only the timer (the
+/// heap guard always stays on).
+#[derive(Clone, Debug)]
+pub struct SupervisionPolicy {
+    pub heap_limit_bytes: usize,
+    pub execution_timeout: Option<Duration>,
+}
 
-#[async_trait::async_trait]
-impl ScriptCapability for EchoCapability {
-    async fn echo(&self, input: String) -> Result<String> {
-        // Force an actual await point so the round trip genuinely suspends.
-        tokio::task::yield_now().await;
-        Ok(format!("echo:{input}"))
+impl Default for SupervisionPolicy {
+    fn default() -> Self {
+        Self {
+            heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
+            execution_timeout: Some(DEFAULT_EXECUTION_TIMEOUT),
+        }
     }
 }
 
-/// A capability call handed off from the V8-thread op to the async executor.
-struct CapRequest {
-    method: String,
-    input: String,
-    reply: oneshot::Sender<Result<String>>,
+// ---------------------------------------------------------------------------
+// Capability request channel (V8-thread op -> outer-runtime executor)
+// ---------------------------------------------------------------------------
+
+/// A capability call handed off from a V8-thread op to the async executor on the
+/// outer runtime. Each variant carries the real `bro-capabilities` typed input
+/// and a typed `oneshot` reply, generalizing the spike's single echo request.
+enum CapRequest {
+    CorpusSearch {
+        input: CorpusLookup,
+        reply: oneshot::Sender<CapabilityResult<Vec<CorpusHit>>>,
+    },
+    AtomInvoke {
+        input: AtomInvocation,
+        reply: oneshot::Sender<CapabilityResult<AtomOutput>>,
+    },
+    RefactorPlan {
+        input: RefactorRequest,
+        reply: oneshot::Sender<CapabilityResult<RefactorPlanHandle>>,
+    },
+    RefactorMaterialize {
+        id: String,
+        reply: oneshot::Sender<CapabilityResult<serde_json::Value>>,
+    },
 }
 
 type CapTx = mpsc::UnboundedSender<CapRequest>;
 
-// ---------------------------------------------------------------------------
-// Ops + extension
-// ---------------------------------------------------------------------------
-
-/// `await cap.echo(x)` from JS: suspend, hop to async Rust on the outer runtime,
-/// return the result into JS. This is criterion #4 (the core risk).
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_cap_echo(
-    state: Rc<RefCell<OpState>>,
-    #[string] input: String,
-) -> Result<String, JsErrorBox> {
-    // Clone the sender out under a short synchronous borrow; never hold an
-    // OpState borrow across an await.
-    let tx = state.borrow().borrow::<CapTx>().clone();
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(CapRequest {
-        method: "echo".to_string(),
-        input,
-        reply: reply_tx,
-    })
-    .map_err(|_| JsErrorBox::generic("capability executor is gone"))?;
-    reply_rx
-        .await
-        .map_err(|_| JsErrorBox::generic("capability executor dropped the reply"))?
-        .map_err(|e| JsErrorBox::generic(e.to_string()))
+/// Run a capability future on the outer runtime with panic isolation. A
+/// capability that panics must not kill the executor or abort the process: the
+/// inner `tokio::spawn` converts a panic into a clean [`BroError`] that surfaces
+/// as a catchable JS error. This is the outer-runtime complement to the
+/// V8-thread structural guard ([`guard_async`]).
+async fn run_caught<T, F>(fut: F) -> CapabilityResult<T>
+where
+    F: Future<Output = CapabilityResult<T>> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::spawn(fut).await {
+        Ok(result) => result,
+        Err(_join_err) => Err(BroError::new(
+            "capability_panic",
+            "capability panicked during execution; contained on the executor",
+        )),
+    }
 }
 
-/// Proves the panic boundary (criterion #5): a panic raised inside the op body is
-/// caught with `catch_unwind` and converted to an error that becomes a JS
-/// exception — it is never allowed to unwind across V8's C++ frames.
-#[op2(fast)]
-fn op_panic_guarded() -> Result<(), JsErrorBox> {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        panic!("intentional panic inside op handler");
-    }));
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(_) => Err(JsErrorBox::generic(
+/// Dispatch one capability request to the matching injected trait impl. Runs on
+/// the outer multi-thread runtime; each call is panic-isolated via [`run_caught`].
+async fn dispatch_cap(caps: Capabilities, req: CapRequest) {
+    match req {
+        CapRequest::CorpusSearch { input, reply } => {
+            let cap = caps.corpus.clone();
+            let _ = reply.send(run_caught(async move { cap.search_corpus(input).await }).await);
+        }
+        CapRequest::AtomInvoke { input, reply } => {
+            let cap = caps.atoms.clone();
+            let _ = reply.send(run_caught(async move { cap.invoke_atom(input).await }).await);
+        }
+        CapRequest::RefactorPlan { input, reply } => {
+            let cap = caps.refactor.clone();
+            let _ = reply.send(run_caught(async move { cap.plan_refactor(input).await }).await);
+        }
+        CapRequest::RefactorMaterialize { id, reply } => {
+            let cap = caps.refactor.clone();
+            let _ = reply.send(run_caught(async move { cap.materialize_plan(id).await }).await);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Structural panic guard (criterion #5)
+// ---------------------------------------------------------------------------
+//
+// deno_core 0.403 has ZERO op-dispatch `catch_unwind`. Under the workspace's
+// `panic = "unwind"`, an unguarded op panic unwinds across V8's C++ frames =
+// UB / daemon abort. Every op routes its body through ONE of these two guards so
+// no op work executes outside a `catch_unwind` boundary.
+
+/// Guard a synchronous op body. A panic becomes a catchable JS error.
+fn guard_op<T>(body: impl FnOnce() -> Result<T, JsErrorBox>) -> Result<T, JsErrorBox> {
+    match catch_unwind(AssertUnwindSafe(body)) {
+        Ok(result) => result,
+        Err(_panic) => Err(JsErrorBox::generic(
             "op panicked; contained at the boundary (catch_unwind)",
         )),
     }
 }
 
+/// Future wrapper that guards EVERY poll of an async op body with `catch_unwind`.
+/// A panic on any poll — including resumption code that runs on the V8 thread
+/// after an `await` — is caught and the future resolves to a catchable JS error.
+/// This is the async analogue of [`guard_op`]; all capability ops route through
+/// it via [`guard_async`].
+struct Guarded<F> {
+    inner: F,
+}
+
+impl<F, T> Future for Guarded<F>
+where
+    F: Future<Output = Result<T, JsErrorBox>>,
+{
+    type Output = Result<T, JsErrorBox>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // SAFETY: standard pin projection — `inner` is never moved out, and the
+        // wrapper adds no `Unpin`-violating fields.
+        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
+        match catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
+            Ok(poll) => poll,
+            Err(_panic) => Poll::Ready(Err(JsErrorBox::generic(
+                "op panicked; contained at the boundary (catch_unwind)",
+            ))),
+        }
+    }
+}
+
+/// Wrap an async op body in the structural panic guard.
+fn guard_async<F, T>(inner: F) -> Guarded<F>
+where
+    F: Future<Output = Result<T, JsErrorBox>>,
+{
+    Guarded { inner }
+}
+
+// ---------------------------------------------------------------------------
+// Capability ops + extension
+// ---------------------------------------------------------------------------
+
+/// Forward a typed capability request to the outer-runtime executor and await its
+/// typed reply, serializing the output to a JSON string for JS. The whole body
+/// runs under [`guard_async`] in the caller op, so the synchronous channel work
+/// (and any panic in it) is contained on the V8 thread.
+async fn bridge<O: Serialize>(
+    tx: CapTx,
+    make: impl FnOnce(oneshot::Sender<CapabilityResult<O>>) -> CapRequest,
+) -> Result<String, JsErrorBox> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    tx.send(make(reply_tx))
+        .map_err(|_| JsErrorBox::generic("capability executor is gone"))?;
+    let output = reply_rx
+        .await
+        .map_err(|_| JsErrorBox::generic("capability executor dropped the reply"))?
+        .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))?;
+    serde_json::to_string(&output)
+        .map_err(|e| JsErrorBox::generic(format!("failed to serialize capability output: {e}")))
+}
+
+/// `await corpus.search(args)` — JSON in, JSON out, over the async bridge.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_corpus_search(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = state.borrow().borrow::<CapTx>().clone();
+        let input: CorpusLookup = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid corpus.search input: {e}")))?;
+        bridge(tx, move |reply| CapRequest::CorpusSearch { input, reply }).await
+    })
+    .await
+}
+
+/// `await atoms.invoke(handle, input)` — JSON in, JSON out, over the async bridge.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_atom_invoke(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = state.borrow().borrow::<CapTx>().clone();
+        let input: AtomInvocation = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid atoms.invoke input: {e}")))?;
+        bridge(tx, move |reply| CapRequest::AtomInvoke { input, reply }).await
+    })
+    .await
+}
+
+/// `await refactor.plan(args)` — JSON in, JSON out, over the async bridge.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_refactor_plan(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = state.borrow().borrow::<CapTx>().clone();
+        let input: RefactorRequest = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid refactor.plan input: {e}")))?;
+        bridge(tx, move |reply| CapRequest::RefactorPlan { input, reply }).await
+    })
+    .await
+}
+
+/// `await refactor.materialize(handle)` — handle id in, JSON plan out.
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_refactor_materialize(
+    state: Rc<RefCell<OpState>>,
+    #[string] id: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = state.borrow().borrow::<CapTx>().clone();
+        bridge(tx, move |reply| CapRequest::RefactorMaterialize {
+            id,
+            reply,
+        })
+        .await
+    })
+    .await
+}
+
+/// Boundary-proof op: a synchronous panic, caught by [`guard_op`]. Proves the
+/// structural guard prevents a V8-frame unwind (criterion #5, sync path).
+#[op2(fast)]
+fn op_panic_guarded() -> Result<(), JsErrorBox> {
+    guard_op(|| panic!("intentional panic inside op handler"))
+}
+
+/// Boundary-proof op: a panic raised AFTER an `await` point, caught by
+/// [`guard_async`]. This exercises the exact guard every capability op uses —
+/// the dangerous case where resumption code panics on the V8 thread mid-poll.
+#[op2(async(lazy), fast)]
+async fn op_panic_guarded_async() -> Result<(), JsErrorBox> {
+    guard_async(async {
+        tokio::task::yield_now().await;
+        panic!("intentional async panic inside op handler");
+    })
+    .await
+}
+
 deno_core::extension!(
     bro_script_ext,
-    ops = [op_cap_echo, op_panic_guarded],
+    ops = [
+        op_corpus_search,
+        op_atom_invoke,
+        op_refactor_plan,
+        op_refactor_materialize,
+        op_panic_guarded,
+        op_panic_guarded_async,
+    ],
     options = { tx: CapTx },
     state = |state, options| {
         state.put::<CapTx>(options.tx);
@@ -161,43 +384,58 @@ enum Job {
 }
 
 /// Owns a deno_core `JsRuntime` on a dedicated OS thread and exposes an async,
-/// channel-based API callable from tokio code.
+/// channel-based API callable from tokio code. Supervision (heap + timeout) is
+/// configured via [`SupervisionPolicy`] and is default-ON.
 pub struct ScriptRuntime {
     job_tx: mpsc::UnboundedSender<Job>,
     isolate_handle: v8::IsolateHandle,
     heap_oom: Arc<AtomicBool>,
+    execution_timeout: Option<Duration>,
     thread: Option<JoinHandle<()>>,
 }
 
 /// Bootstrap script run once per isolate: deny ambient host globals and install
-/// the `cap` shim that fronts the capability ops. `delete` is per-isolate (unlike
-/// process-wide V8 flags), so each isolate hardens itself. `Deno.core` is kept —
-/// it is the op transport, not an ambient host capability.
+/// the capability shims that front the capability ops. `delete` is per-isolate
+/// (unlike process-wide V8 flags), so each isolate hardens itself. `Deno.core`
+/// is kept — it is the op transport, not an ambient host capability. Each shim
+/// is JSON-in/JSON-out and parses the op's JSON reply back into a JS value.
 const BOOTSTRAP: &str = r#"
     delete globalThis.WebAssembly;
     delete globalThis.SharedArrayBuffer;
     delete globalThis.Atomics;
     delete globalThis.console;
-    globalThis.cap = {
-        echo: (x) => Deno.core.ops.op_cap_echo(x),
+    globalThis.corpus = {
+        search: async (args) =>
+            JSON.parse(await Deno.core.ops.op_corpus_search(JSON.stringify(args))),
+    };
+    globalThis.atoms = {
+        invoke: async (handle, input) =>
+            JSON.parse(await Deno.core.ops.op_atom_invoke(
+                JSON.stringify({ atom: handle, input_json: input ?? null }))),
+    };
+    globalThis.refactor = {
+        plan: async (args) =>
+            JSON.parse(await Deno.core.ops.op_refactor_plan(JSON.stringify(args))),
+        materialize: async (handle) =>
+            JSON.parse(await Deno.core.ops.op_refactor_materialize(
+                typeof handle === 'string' ? handle : handle.id)),
     };
 "#;
 
 impl ScriptRuntime {
-    /// Spawn the dedicated V8 thread and the capability executor.
-    pub async fn new(cap: Arc<dyn ScriptCapability>, heap_limit_bytes: usize) -> Result<Self> {
+    /// Spawn the dedicated V8 thread and the capability executor, injecting the
+    /// real capability impls and the supervision policy.
+    pub async fn new(caps: Capabilities, policy: SupervisionPolicy) -> Result<Self> {
         let (cap_tx, mut cap_rx) = mpsc::unbounded_channel::<CapRequest>();
 
         // Capability executor: runs on the OUTER (multi-thread) tokio runtime.
+        // One task per request so a slow or panicking capability cannot stall or
+        // poison the executor loop.
         tokio::spawn(async move {
             while let Some(req) = cap_rx.recv().await {
-                let cap = cap.clone();
+                let caps = caps.clone();
                 tokio::spawn(async move {
-                    let result = match req.method.as_str() {
-                        "echo" => cap.echo(req.input).await,
-                        other => Err(anyhow!("unknown capability method: {other}")),
-                    };
-                    let _ = req.reply.send(result);
+                    dispatch_cap(caps, req).await;
                 });
             }
         });
@@ -206,6 +444,7 @@ impl ScriptRuntime {
         let (setup_tx, setup_rx) =
             oneshot::channel::<Result<(v8::IsolateHandle, Arc<AtomicBool>)>>();
 
+        let heap_limit_bytes = policy.heap_limit_bytes;
         let thread = std::thread::Builder::new()
             .name("bro-script-v8".to_string())
             .spawn(move || {
@@ -220,11 +459,13 @@ impl ScriptRuntime {
             job_tx,
             isolate_handle,
             heap_oom,
+            execution_timeout: policy.execution_timeout,
             thread: Some(thread),
         })
     }
 
-    /// Cross-thread isolate handle for watchdog termination (criterion #2).
+    /// Cross-thread isolate handle for external watchdog termination (criterion
+    /// #2). The built-in execution-timeout supervisor uses this same handle.
     pub fn isolate_handle(&self) -> v8::IsolateHandle {
         self.isolate_handle.clone()
     }
@@ -237,6 +478,10 @@ impl ScriptRuntime {
     /// Execute a script body. The body is wrapped in an async IIFE, so it may use
     /// `await` and should `return` its result; the resolved value is serialized
     /// to a JSON string.
+    ///
+    /// If the policy sets an execution timeout, a script that overruns it is
+    /// auto-terminated via the cross-thread `IsolateHandle` and a timeout error
+    /// is returned; the runtime survives and stays reusable.
     pub async fn execute(&self, body: impl Into<String>) -> Result<String> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.job_tx
@@ -245,9 +490,22 @@ impl ScriptRuntime {
                 reply: reply_tx,
             })
             .map_err(|_| anyhow!("V8 thread is gone"))?;
-        reply_rx
-            .await
-            .map_err(|_| anyhow!("V8 thread dropped the reply"))?
+
+        match self.execution_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
+                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+                Err(_elapsed) => {
+                    // Cross-thread kill of the runaway job. The V8 thread clears
+                    // the terminate state before/after each job, so the runtime
+                    // stays reusable for the next `execute`.
+                    self.isolate_handle.terminate_execution();
+                    Err(anyhow!("script execution timed out after {timeout:?}"))
+                }
+            },
+            None => reply_rx
+                .await
+                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+        }
     }
 }
 
@@ -307,7 +565,8 @@ fn v8_thread_main(
     let local = tokio::task::LocalSet::new();
 
     let run = local.run_until(async move {
-        // Deny ambient globals + install the cap shim before any user script.
+        // Deny ambient globals + install the capability shims before any user
+        // script.
         if let Err(e) = runtime.execute_script("<bro-script:bootstrap>", BOOTSTRAP) {
             let _ = setup_tx.send(Err(anyhow!("bootstrap failed: {e}")));
             return;
@@ -320,9 +579,13 @@ fn v8_thread_main(
             match job {
                 Job::Shutdown => break,
                 Job::Execute { body, reply } => {
+                    // Clear any stale termination left by a prior timed-out job
+                    // BEFORE running so the next job starts on a clean isolate
+                    // (closes the timeout/finish race).
+                    runtime.v8_isolate().cancel_terminate_execution();
                     let result = run_one(&mut runtime, &body).await;
-                    // Clear any lingering termination state so the isolate is
-                    // reusable for the next job (see runtime-reusable finding).
+                    // And clear again AFTER so the isolate is reusable for the
+                    // next job (the runtime-reusable finding from the spike).
                     runtime.v8_isolate().cancel_terminate_execution();
                     let _ = reply.send(result);
                 }

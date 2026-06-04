@@ -1,4 +1,5 @@
-//! §5b spike acceptance tests. Each maps to one of the seven criteria.
+//! §5b acceptance tests. Each maps to a daemon-safety criterion or a real
+//! capability path.
 //!
 //! All tests use multi-thread tokio runtimes (the capability executor runs on
 //! the outer runtime, the V8 isolate on its own dedicated thread). The whole
@@ -8,32 +9,152 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
+use bro_capabilities::{
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
+    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
+};
+use bro_core::BroError;
 use bro_script::{
-    EchoCapability, ScriptCapability, ScriptRuntime, DEFAULT_HEAP_LIMIT_BYTES, DENO_CORE_VERSION,
+    Capabilities, ScriptRuntime, SupervisionPolicy, DEFAULT_HEAP_LIMIT_BYTES, DENO_CORE_VERSION,
 };
 
-fn echo_cap() -> Arc<dyn ScriptCapability> {
-    Arc::new(EchoCapability)
+// ---------------------------------------------------------------------------
+// Stub capability impls — exercise the real traits without any daemon coupling.
+// ---------------------------------------------------------------------------
+
+struct StubCorpus;
+#[async_trait]
+impl CorpusCapability for StubCorpus {
+    async fn search_corpus(&self, lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
+        // Force a real await point so the bridge genuinely suspends.
+        tokio::task::yield_now().await;
+        Ok(vec![CorpusHit {
+            id: format!("hit-{}", lookup.limit),
+            text: format!("found:{}", lookup.query),
+        }])
+    }
 }
 
-// Criterion #1 (build proof, basic execution): deno_core builds and a trivial
-// script round-trips a value.
+struct StubAtoms;
+#[async_trait]
+impl AtomCapability for StubAtoms {
+    async fn invoke_atom(&self, invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
+        tokio::task::yield_now().await;
+        Ok(AtomOutput {
+            output_json: serde_json::json!({
+                "atom": invocation.atom.as_str(),
+                "echo": invocation.input_json,
+            }),
+        })
+    }
+}
+
+struct StubRefactor;
+#[async_trait]
+impl RefactorCapability for StubRefactor {
+    async fn plan_refactor(
+        &self,
+        request: RefactorRequest,
+    ) -> CapabilityResult<RefactorPlanHandle> {
+        tokio::task::yield_now().await;
+        Ok(RefactorPlanHandle {
+            id: format!("plan-{}", request.kind),
+            preview: format!("preview of {}", request.kind),
+        })
+    }
+
+    async fn materialize_plan(&self, id: String) -> CapabilityResult<serde_json::Value> {
+        tokio::task::yield_now().await;
+        Ok(serde_json::json!({ "materialized": id }))
+    }
+}
+
+// Panicking variants: prove a capability panic is contained on the executor and
+// surfaces as a catchable JS error (the outer-runtime guard complementing the
+// V8-thread structural guard).
+struct PanicCorpus;
+#[async_trait]
+impl CorpusCapability for PanicCorpus {
+    async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
+        panic!("corpus capability boom");
+    }
+}
+
+struct PanicAtoms;
+#[async_trait]
+impl AtomCapability for PanicAtoms {
+    async fn invoke_atom(&self, _invocation: AtomInvocation) -> CapabilityResult<AtomOutput> {
+        panic!("atom capability boom");
+    }
+}
+
+struct PanicRefactor;
+#[async_trait]
+impl RefactorCapability for PanicRefactor {
+    async fn plan_refactor(
+        &self,
+        _request: RefactorRequest,
+    ) -> CapabilityResult<RefactorPlanHandle> {
+        panic!("refactor capability boom");
+    }
+
+    async fn materialize_plan(&self, _id: String) -> CapabilityResult<serde_json::Value> {
+        panic!("refactor materialize boom");
+    }
+}
+
+// An error-returning corpus: prove a normal CapabilityResult error surfaces as a
+// catchable JS error too (distinct from a panic).
+struct ErrCorpus;
+#[async_trait]
+impl CorpusCapability for ErrCorpus {
+    async fn search_corpus(&self, _lookup: CorpusLookup) -> CapabilityResult<Vec<CorpusHit>> {
+        Err(BroError::new("corpus_unavailable", "index offline"))
+    }
+}
+
+fn caps_with(
+    corpus: Arc<dyn CorpusCapability>,
+    atoms: Arc<dyn AtomCapability>,
+    refactor: Arc<dyn RefactorCapability>,
+) -> Capabilities {
+    Capabilities {
+        corpus,
+        atoms,
+        refactor,
+    }
+}
+
+fn stub_caps() -> Capabilities {
+    caps_with(
+        Arc::new(StubCorpus),
+        Arc::new(StubAtoms),
+        Arc::new(StubRefactor),
+    )
+}
+
+async fn stub_runtime() -> ScriptRuntime {
+    ScriptRuntime::new(stub_caps(), SupervisionPolicy::default())
+        .await
+        .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// Build proof + denied globals (criteria #1 build, #3)
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_proof_basic_execution() {
     assert_eq!(DENO_CORE_VERSION, "0.403.0");
-    let rt = ScriptRuntime::new(echo_cap(), DEFAULT_HEAP_LIMIT_BYTES)
-        .await
-        .unwrap();
+    let rt = stub_runtime().await;
     let out = rt.execute("return 1 + 1;").await.unwrap();
     assert_eq!(out, "2");
 }
 
-// Criterion #3: denied ambient globals.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn denied_globals() {
-    let rt = ScriptRuntime::new(echo_cap(), DEFAULT_HEAP_LIMIT_BYTES)
-        .await
-        .unwrap();
+    let rt = stub_runtime().await;
     let out = rt
         .execute(
             "return typeof WebAssembly === 'undefined' \
@@ -46,28 +167,56 @@ async fn denied_globals() {
     assert_eq!(out, "true", "ambient globals must be denied");
 }
 
-// Criterion #4: async capability bridge. JS `await cap.echo(x)` hops to async
-// Rust on the outer runtime and back.
+// ---------------------------------------------------------------------------
+// Real capability bridges (criterion #4) — one per trait method.
+// ---------------------------------------------------------------------------
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn async_capability_bridge() {
-    let rt = ScriptRuntime::new(echo_cap(), DEFAULT_HEAP_LIMIT_BYTES)
-        .await
-        .unwrap();
+async fn corpus_search_bridge() {
+    let rt = stub_runtime().await;
     let out = rt
-        .execute(r#"const r = await cap.echo("hi"); return r;"#)
+        .execute(
+            r#"const r = await corpus.search({ query: "redis", limit: 2 }); return r[0].text;"#,
+        )
         .await
         .unwrap();
-    // Serialized as a JSON string.
-    assert_eq!(out, "\"echo:hi\"");
+    assert_eq!(out, "\"found:redis\"");
 }
 
-// Criterion #5: a panic inside an op handler is caught at the boundary and
-// surfaced as a JS error — the process is NOT aborted by unwinding across V8.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn panic_boundary_surfaced_as_js_error() {
-    let rt = ScriptRuntime::new(echo_cap(), DEFAULT_HEAP_LIMIT_BYTES)
+async fn atom_invoke_bridge() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const r = await atoms.invoke("my-atom", { x: 1 });
+               return r.output_json.atom + ":" + r.output_json.echo.x;"#,
+        )
         .await
         .unwrap();
+    assert_eq!(out, "\"my-atom:1\"");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refactor_plan_and_materialize_bridge() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const h = await refactor.plan({ kind: "rename", input_json: { sym: "foo" } });
+               const m = await refactor.materialize(h);
+               return h.preview + "|" + m.materialized;"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "\"preview of rename|plan-rename\"");
+}
+
+// ---------------------------------------------------------------------------
+// Structural panic guard (criterion #5) — sync and async op paths.
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn panic_boundary_sync_op_surfaced_as_js_error() {
+    let rt = stub_runtime().await;
     let out = rt
         .execute(
             "try { Deno.core.ops.op_panic_guarded(); return 'NO_THROW'; } \
@@ -77,21 +226,138 @@ async fn panic_boundary_surfaced_as_js_error() {
         .unwrap();
     assert_eq!(
         out, "\"caught\"",
-        "panic must surface as a catchable JS error"
+        "sync op panic must surface as a catchable JS error"
     );
-    // And the isolate is still usable afterwards — the process survived.
-    let again = rt.execute("return 7 * 6;").await.unwrap();
-    assert_eq!(again, "42");
+    // Isolate still usable afterwards — the process survived.
+    assert_eq!(rt.execute("return 7 * 6;").await.unwrap(), "42");
 }
 
-// Criterion #1 (the dangerous one): heap-bound OOM containment. An unbounded
-// allocator is terminated by the near-heap-limit callback; THE TEST SURVIVES.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn heap_oom_containment_process_survives() {
-    // Small heap so it trips fast (kept above V8's practical floor).
-    let rt = ScriptRuntime::new(echo_cap(), 24 * 1024 * 1024)
+async fn panic_boundary_async_op_surfaced_as_js_error() {
+    // This op panics AFTER an await — the exact poll-resumption case that every
+    // capability op's `guard_async` wrapper must catch on the V8 thread.
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            "try { await Deno.core.ops.op_panic_guarded_async(); return 'NO_THROW'; } \
+             catch (e) { return 'caught'; }",
+        )
         .await
         .unwrap();
+    assert_eq!(
+        out, "\"caught\"",
+        "async op panic (post-await) must surface as a catchable JS error"
+    );
+    assert_eq!(rt.execute("return 'alive';").await.unwrap(), "\"alive\"");
+}
+
+// A panic inside ANY of the three capability paths is contained and surfaced as
+// a catchable JS error, and the isolate stays usable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_panic_corpus_surfaced_and_runtime_survives() {
+    let rt = ScriptRuntime::new(
+        caps_with(
+            Arc::new(PanicCorpus),
+            Arc::new(StubAtoms),
+            Arc::new(StubRefactor),
+        ),
+        SupervisionPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let out = rt
+        .execute(
+            r#"try { await corpus.search({ query: "x", limit: 1 }); return 'NO_THROW'; }
+               catch (e) { return 'caught'; }"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "\"caught\"");
+    assert_eq!(rt.execute("return 6 * 7;").await.unwrap(), "42");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_panic_atom_surfaced_and_runtime_survives() {
+    let rt = ScriptRuntime::new(
+        caps_with(
+            Arc::new(StubCorpus),
+            Arc::new(PanicAtoms),
+            Arc::new(StubRefactor),
+        ),
+        SupervisionPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let out = rt
+        .execute(
+            r#"try { await atoms.invoke("a", {}); return 'NO_THROW'; }
+               catch (e) { return 'caught'; }"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "\"caught\"");
+    assert_eq!(rt.execute("return 6 * 7;").await.unwrap(), "42");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_panic_refactor_surfaced_and_runtime_survives() {
+    let rt = ScriptRuntime::new(
+        caps_with(
+            Arc::new(StubCorpus),
+            Arc::new(StubAtoms),
+            Arc::new(PanicRefactor),
+        ),
+        SupervisionPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let out = rt
+        .execute(
+            r#"try { await refactor.plan({ kind: "k", input_json: {} }); return 'NO_THROW'; }
+               catch (e) { return 'caught'; }"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "\"caught\"");
+    assert_eq!(rt.execute("return 6 * 7;").await.unwrap(), "42");
+}
+
+// A normal CapabilityResult error (not a panic) also surfaces as a catchable JS
+// error carrying the BroError code/message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn capability_error_surfaced_as_js_error() {
+    let rt = ScriptRuntime::new(
+        caps_with(
+            Arc::new(ErrCorpus),
+            Arc::new(StubAtoms),
+            Arc::new(StubRefactor),
+        ),
+        SupervisionPolicy::default(),
+    )
+    .await
+    .unwrap();
+    let out = rt
+        .execute(
+            r#"try { await corpus.search({ query: "x", limit: 1 }); return 'NO_THROW'; }
+               catch (e) { return String(e).includes('corpus_unavailable') ? 'coded' : 'caught'; }"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "\"coded\"");
+}
+
+// ---------------------------------------------------------------------------
+// Supervision: heap OOM, runaway-loop kill, execution timeout.
+// ---------------------------------------------------------------------------
+
+// Criterion #1 (the dangerous one): heap-bound OOM containment. THE TEST SURVIVES.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn heap_oom_containment_process_survives() {
+    let policy = SupervisionPolicy {
+        heap_limit_bytes: 24 * 1024 * 1024,
+        execution_timeout: None,
+    };
+    let rt = ScriptRuntime::new(stub_caps(), policy).await.unwrap();
     let result = rt
         .execute("const a = []; for (;;) { a.push(new Array(10000).fill(0)); }")
         .await;
@@ -103,24 +369,23 @@ async fn heap_oom_containment_process_survives() {
         rt.hit_heap_oom(),
         "near-heap-limit callback should have fired"
     );
-    // The decisive assertion is implicit: we are still running. Prove the
-    // process is healthy by doing more work on a fresh runtime.
-    let fresh = ScriptRuntime::new(echo_cap(), DEFAULT_HEAP_LIMIT_BYTES)
-        .await
-        .unwrap();
+    // Prove the process is healthy by doing more work on a fresh runtime.
+    let fresh = stub_runtime().await;
     assert_eq!(fresh.execute("return 'alive';").await.unwrap(), "\"alive\"");
 }
 
-// Criterion #2: runaway-loop kill via cross-thread terminate_execution, plus the
+// Criterion #2: runaway-loop kill via an EXTERNAL cross-thread watchdog (timeout
+// disabled so the raw IsolateHandle path is what kills it), plus the
 // runtime-reusable-after-terminate finding.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runaway_loop_killed_and_runtime_reusable() {
-    let rt = ScriptRuntime::new(echo_cap(), DEFAULT_HEAP_LIMIT_BYTES)
-        .await
-        .unwrap();
+async fn runaway_loop_killed_by_external_watchdog_and_runtime_reusable() {
+    let policy = SupervisionPolicy {
+        heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
+        execution_timeout: None,
+    };
+    let rt = ScriptRuntime::new(stub_caps(), policy).await.unwrap();
     let handle = rt.isolate_handle();
 
-    // Watchdog: terminate the infinite loop from another thread after a delay.
     let watchdog = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(500));
         handle.terminate_execution();
@@ -133,8 +398,41 @@ async fn runaway_loop_killed_and_runtime_reusable() {
         "infinite loop must be terminated, got {result:?}"
     );
 
-    // FINDING: after we clear the terminate state (cancel_terminate_execution,
-    // done by the V8 thread after each job), the SAME runtime is reusable.
-    let reuse = rt.execute("return 'reusable';").await.unwrap();
-    assert_eq!(reuse, "\"reusable\"");
+    // After the terminate state is cleared, the SAME runtime is reusable.
+    assert_eq!(
+        rt.execute("return 'reusable';").await.unwrap(),
+        "\"reusable\""
+    );
+}
+
+// Criterion #2 via the built-in supervisor: the execution timeout auto-kills a
+// runaway script (no caller-supplied watchdog), and the runtime survives + stays
+// reusable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn execution_timeout_auto_kills_and_runtime_reusable() {
+    let policy = SupervisionPolicy {
+        heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
+        execution_timeout: Some(Duration::from_millis(300)),
+    };
+    let rt = ScriptRuntime::new(stub_caps(), policy).await.unwrap();
+
+    let result = rt.execute("while (true) {}").await;
+    assert!(
+        result.is_err(),
+        "runaway script must hit the execution timeout, got {result:?}"
+    );
+    let msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        msg.contains("timed out"),
+        "expected a timeout error, got: {msg}"
+    );
+
+    // The SAME runtime is reusable after an auto-kill.
+    assert_eq!(rt.execute("return 'alive';").await.unwrap(), "\"alive\"");
+    // And a fast capability call still completes well under the timeout.
+    let out = rt
+        .execute(r#"const r = await corpus.search({ query: "q", limit: 1 }); return r[0].text;"#)
+        .await
+        .unwrap();
+    assert_eq!(out, "\"found:q\"");
 }

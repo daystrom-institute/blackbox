@@ -14,6 +14,11 @@ version = "0.0.1"
 edition = "2021"
 
 [dependencies]
+# The pure contract-bottom capability crate (async-trait + bro-core, ZERO
+# blackbox). bro-script consumes the real CorpusCapability/AtomCapability/
+# RefactorCapability traits by injection; it must never link the daemon.
+bro-capabilities = { path = "../bro-capabilities" }
+bro-core = { path = "../bro-core" }
 # Pinned exactly: V8 ABI + op2 macro surface churn fast; this dep will later
 # land in blackboxd, so the version is a deliberate, reported choice.
 deno_core = "=0.403.0"
@@ -29,3 +34,8 @@ async-trait = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+# Tests construct real capability inputs/outputs and impl the traits directly.
+bro-capabilities = { path = "../bro-capabilities" }
+bro-core = { path = "../bro-core" }
+async-trait = "0.1"
+serde_json = "1"
