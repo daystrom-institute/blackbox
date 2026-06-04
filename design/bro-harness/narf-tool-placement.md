@@ -1,8 +1,9 @@
 ---
 title: "NARF tool placement — built-in parity and the box-edge taxonomy"
 kind: design
-lifecycle: proposed
+lifecycle: archived
 corpus: blackbox-design
+superseded_by: "narf-data-model.md — the ref-as-data-composition model (clip-fold §5.6, Ref/Promise lattice §3.1, automatic ref-resolution §3) is retired in favor of one durable KV + values. The still-live parts carry forward there: the in-box built-in taxonomy (§2, implemented) and MCP placement (§4, pending)."
 topic:
   - bro-harness
   - narf
@@ -15,7 +16,19 @@ brief: "The next-steps plan to get NARF back to tool-calling MVP: restore parity
 
 # NARF tool placement — built-in parity and the box-edge taxonomy
 
-> **Status.** Proposed sibling to
+> **SUPERSEDED by [`narf-data-model.md`](./narf-data-model.md).** The data-model
+> thesis of this doc — fold `clip_*` into a ref-chaining substrate, the
+> `Ref`/`Promise` lattice (§3.1), and automatic ref-resolution (§3) — is retired:
+> a cell runs with the model asleep (the whole body is out-of-context), so refs,
+> by-reference splicing, and the chaining ABI are unnecessary; there is **one
+> durable KV**, tools return values, and JS is the transform/query language.
+> **Still live and carried forward** into the successor: the in-box built-in
+> taxonomy (§2 — fs/search/git/shell/web, implemented) and the **MCP placement**
+> proposal (§4 — `tool_placement`, still pending). Read §2/§4 as current; read the
+> `clip_*`/ref/`Promise`-lattice material as historical. Steps 1–5 of §5 landed;
+> step 6 (clip-fold) is replaced, not done.
+
+> **Status (historical).** Proposed sibling to
 > [`harness-daemon-boundary.md`](./harness-daemon-boundary.md) (topology),
 > [`narf-capability-library.md`](./narf-capability-library.md) (authoring layer +
 > the box-edge invariant §0.1), and

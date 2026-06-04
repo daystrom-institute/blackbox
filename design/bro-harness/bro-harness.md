@@ -68,6 +68,15 @@ points to a backlog doc.
 - [NARF capability library and prepared scripts](narf-capability-library.md) —
   proposed authoring-layer middle tier: session-local helpers, decay-managed
   reusable functions, capability scout, and prepare-before-run script refs.
+- [NARF data model: one durable KV, values not refs](narf-data-model.md) —
+  proposed: collapse the two half-built value systems (the `RefState` ref
+  substrate + the clipboard/`clip_*` chaining ABI) into ONE durable session KV.
+  A cell is out-of-context, so tools return values, JS transforms values the cell
+  holds, and the context discipline bounds the cell's *return*. KV surface is
+  box-edge-split on "the box never selects": in-box is exact-deref-by-known-name
+  (set/get/peek/delete, **no enumeration**); `list`/`keys` (discovery/selection)
+  are out-box. **Supersedes** [`narf-tool-placement.md`](narf-tool-placement.md)
+  (now archived) + the §9-1 ref substrate.
 
 ## Cluster conventions
 
