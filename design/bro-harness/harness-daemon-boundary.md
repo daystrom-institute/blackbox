@@ -529,8 +529,26 @@ The direction above is argued; these forks are not settled:
   from narf-draft2 §8 (transaction unwind vs compensate-forward). Constraint: the
   `bro-capabilities` seam must **not bake in one accidentally** — keep the trait
   signatures neutral so either semantics stays buildable.
-- **Standalone harness scope.** Does the standalone binary stay a maintained
-  product (degraded, absent capability impls) or a test/edge artifact only?
+- **Standalone harness scope — leaning lib-only; gated on §5.** Does the
+  standalone binary stay a maintained product (degraded, absent capability impls)
+  or a test/edge artifact only? Current reasoning: **daemon-free mode is weakly
+  justified and probably droppable.** Its supposed reasons mostly evaporate —
+  "proves the decoupling" is now compiler-enforced by the crate boundary (the lib
+  being independently *buildable* is the proof; it need not independently *run*);
+  "crash isolation" was already decided away in §3 (in-process + V8/supervised
+  shell is enough for a trusted single-user box). That leaves harness-only
+  dev/testing — a reason for a thin test artifact, not a maintained daemon-free
+  product. **The binary cannot be dropped yet** because today's harness-backed
+  dispatch *spawns* it (`BRO_HARNESS_BIN`) as the agent runtime — so removal is
+  gated on §5's in-process session execution landing. And even post-§5, the case
+  for keeping *a* process boundary is the **daemon-connected execution leaf**
+  (§12.1's corpus/execution split — a daemon-spawned isolation process), **not**
+  daemon-free standalone mode. So the likely endpoint: the daemon links
+  `bro-harness` as a library for the common path; daemon-free/no-op-caps mode is
+  retired or demoted to a test artifact; a subprocess survives (if at all) only as
+  a daemon-owned execution leaf. Accordingly the §11 invariant states only the
+  *compile* property ("fail closed when the daemon's capability impls aren't
+  present"), not daemon-free runtime as a supported product.
 - **Contract granularity beyond three.** Whether any of `bro-protocol`/
   `bro-capabilities` later splits further (e.g. a standalone atom-runner that
   links only atom contracts gives `bro-capabilities` a reason to subdivide). Defer

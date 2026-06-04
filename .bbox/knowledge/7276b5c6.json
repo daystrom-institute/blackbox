@@ -1,7 +1,7 @@
 {
   "id": "7276b5c6",
-  "title": "bro-harness shares code with daemon, never runtime",
-  "content": "bro-harness and the blackbox daemon are complementary sibling projects with orthogonal use cases. They may share code via workspace crates (e.g. bro-tools), but bro-harness must never have a runtime dependency on the daemon — no MCP/RPC backchannel from harness to daemon. Running blackbox without bro-harness is valid; running bro-harness without blackbox is valid. The only daemon↔harness contract is the Claude stream-json envelope on stdout. If a design reaches for an RPC to blackbox from the harness, it is going the wrong way. Shared capabilities the harness needs must be extracted into a workspace crate both processes link, not implemented by having the harness call a daemon service. The bro-harness Promise layer follows the same invariant: Promise producers are harness-local, and `bro_exec`/`bro_resume`/daemon orchestration are not Promise producers inside the harness.",
+  "title": "The bro-harness/daemon boundary: a shared contract bottom",
+  "content": "The shared **contract bottom** — `bro-core` (ids/refs/errors), `bro-protocol` (control plane + status/view DTOs), `bro-capabilities` (Atom/Corpus/Refactor traits) — holds the types and traits that cross the harness↔daemon boundary; it is pure (serde + traits, no I/O) and depends on nothing. `bro-harness` is a library (`[lib]`); `blackbox` (the daemon + the `bro`/fleet tooling) links it as a crate and/or spawns its binary (subprocess + Claude stream-json envelope), per consumer. The compile DAG is `blackbox → bro-harness → bro-tools`, all pointing **down** into the contract bottom — acyclic and compiler-enforced. **`bro-harness` must never depend on `blackbox`** — a compile error, not a convention. Daemon capabilities reach the harness only through `bro-capabilities` traits the daemon implements and the harness calls (dependency inversion, owned by neither) — never an RPC or compile edge *from* the harness — and **fail closed** when the daemon's capability impls aren't present. The thin **fleet client** (`bro-cli` via `bro-fleet-client`) depends on `bro-protocol` + `bro-core` only — never `blackbox`, `bro-capabilities`, or either implementer. Crate boundaries follow consumer cleavage, not topic. (The harness Promise layer keeps the same shape: Promise producers are harness-local; `bro_exec`/`bro_resume`/daemon orchestration are not Promise producers inside the harness.) See `design/bro-harness/harness-daemon-boundary.md` §2/§7/§11.",
   "variants": {},
   "category": "convention",
   "scope": "project",
@@ -14,6 +14,6 @@
   "decay": true,
   "source": "user",
   "created_at": "2026-05-30T18:14:08Z",
-  "updated_at": "2026-06-01T01:32:34Z",
+  "updated_at": "2026-06-04T02:04:08Z",
   "recall_count": 0
 }
