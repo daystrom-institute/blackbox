@@ -932,20 +932,39 @@ roster render.
     not found` surfaced back through the cell as a JS exception with a bro-script
     stack trace. The model→narf_exec→in-daemon-V8→exact-capability→daemon-caps→result
     loop is proven end-to-end.
-  REMAINING for §5b/§9: the rest of the NARF substrate (`Promise`/`Plan`/`Atom`/
-  `Script` + a `narf_wait` async surface once `Promise` exists). `Tx` is NOT on this
-  list — the tx/saga/guard apparatus is parked (`narf-effects-and-safety.md`); a v1
-  cell is arbitrary code at shell trust, no transaction. §5a supervised shell still
-  open.
+  REMAINING for §5b/§9 — **NEXT PRIORITY: tool-calling MVP parity.** A cell can
+  invoke atoms + plan refactors but cannot yet read a file / run shell / grep /
+  edit. The restore-parity plan (host-access seam → read core → `shell.run` →
+  mutation → promise → clip-fold → MCP config++), the in-box/out-box taxonomy over
+  all 35 pre-beta bro-tools built-ins, the `Ref`/`Promise` type model, and
+  automatic ref resolution (parameter substitutability) are specified in the new
+  [`narf-tool-placement.md`](./narf-tool-placement.md) (design pass `9e05f88`).
+  `Promise`/`narf_wait` durable surface = deferred lever (store home open,
+  narf.md OQ#2); `Tx` parked (`narf-effects-and-safety.md`); §5a supervised shell
+  still open.
+
+  LAYERING CORRECTION (independent, non-blocking track): the §9-auth authoring
+  surface (`narf.prepare`/`run`/`session.define`, commit `8a86e75`) was mislayered
+  as IN-BOX bindings — they are MODEL-FACING controls (the box-edge invariant,
+  `narf-capability-library.md` §0.1 / `narf-draft2.md` §9.2; the box must not hold
+  the controls that open it, and `prepare` must return the rendered script to the
+  model's context). Fix = pull them out of the bootstrap, wire the dead
+  `ScriptRuntime::prepare/run` to real model-facing tools; KEEP `session.import`
+  in-box (recall-by-name minimizes context bloat). No parity value → off the MVP
+  critical path.
 - **Supervised shell (§5a).** Still only `with_spawn_scrub` + per-child env hook;
   timeout/ulimit-cgroup cap supervision not built (deferred behind §5b/§9 per the
   operator's sequencing).
-- **NARF substrate (§9) — FOUNDATION STARTED.** The V8 container (§5b) + real
-  capability bindings + the `Ref`/bounded-egress primitive now exist in
-  `crates/bro-script` (see above). Still unbuilt: `Promise`/`Plan`/`Tx`/`Atom`/
-  `Script`, JS/TS bindings, `narf_exec`/`narf_wait`, and the
-  query/authorship-surface layer owned by `narf-capability-library.md` (session
-  helpers, prepare→run, grounding/route-cards) that lands on top.
+- **NARF substrate (§9) — FOUNDATION + v1 surfaces LIVE; tool-calling parity is the
+  gap.** The V8 container (§5b), exact capability bindings (`atoms`/`refactor`), the
+  `Ref`/bounded-egress primitive, and `narf_exec` run in the daemon
+  (`crates/bro-script`; `c034ad8` smoke above). The authoring surface (session
+  helpers, prepare→run, trace) is built (`8a86e75`) but MISLAYERED in-box —
+  correction tracked above. Unbuilt and now the **MVP priority**: the in-box
+  tool-calling parity bindings (`fs`/`search`/`git`/`shell`/`web`/`promise`/
+  `clip→ref`) per [`narf-tool-placement.md`](./narf-tool-placement.md) §5. Also
+  unbuilt: `Promise`/`Plan`/`Atom`/`Script`, `narf_wait`, JS/TS bindings. `Tx`
+  parked (`narf-effects-and-safety.md`).
 - **§4 deletion ledger.** The CLI-hole providers / tmux / opencode scrub landed
   earlier on the branch; verify no live CLI-shaped dispatch path remains before
   treating §4 as fully closed.
