@@ -70,9 +70,8 @@ pub struct ToolInvocation {
 
 /// The result of a host tool call, flattened to the `tool_result` shape: a
 /// content string, whether the tool reported an error, and a MIME-ish content
-/// type so the caller can decide how to treat the stored bytes. The content is
-/// stored host-side as a ref by the runtime; only a bounded envelope crosses
-/// into the cell (§9 ref-handle model).
+/// type so the caller can decide whether to parse it as JSON or treat it as
+/// text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallOutput {
     pub content: String,
@@ -90,15 +89,74 @@ pub trait ToolCapability: Send + Sync {
     async fn call_tool(&self, invocation: ToolInvocation) -> CapabilityResult<ToolCallOutput>;
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KvOrigin {
+    Agent,
+    Tool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvSummary {
+    pub lines: usize,
+    pub head: Vec<String>,
+    pub tail: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvEntryInfo {
+    pub name: String,
+    pub origin: KvOrigin,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tags: Option<serde_json::Value>,
+    pub content_type: String,
+    pub size: usize,
+    pub summary: KvSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvEntry {
+    #[serde(flatten)]
+    pub info: KvEntryInfo,
+    pub value_json: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KvGet {
+    pub name: String,
+    pub value_json: serde_json::Value,
+    pub size: usize,
+}
+
+/// Session KV contract. This trait deliberately says nothing about where the
+/// store lives; the current harness implementation persists through `side`, but
+/// a later daemon-side home can implement the same calls.
+#[async_trait]
+pub trait KvCapability: Send + Sync {
+    async fn set(
+        &self,
+        name: String,
+        value_json: serde_json::Value,
+        tags: Option<serde_json::Value>,
+    ) -> CapabilityResult<KvEntryInfo>;
+
+    async fn get(&self, name: String, max_bytes: Option<usize>) -> CapabilityResult<KvGet>;
+
+    async fn peek(&self, name: String) -> CapabilityResult<KvEntryInfo>;
+
+    async fn list(&self) -> CapabilityResult<Vec<KvEntryInfo>>;
+
+    async fn delete(&self, name: String) -> CapabilityResult<bool>;
+}
+
 #[async_trait]
 pub trait RefactorCapability: Send + Sync {
     /// Produce a dry-run plan, store it host-side, and return a handle. The
     /// full plan JSON is *not* returned — it is dereferenced on demand via
     /// [`RefactorCapability::materialize_plan`].
-    async fn plan_refactor(
-        &self,
-        request: RefactorRequest,
-    ) -> CapabilityResult<RefactorPlanHandle>;
+    async fn plan_refactor(&self, request: RefactorRequest)
+    -> CapabilityResult<RefactorPlanHandle>;
 
     /// Materialize a previously produced plan by its handle id. Errors if the
     /// id is unknown (e.g. evicted, or never produced on this host).

@@ -70,8 +70,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 pub use bro_capabilities::{
-    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, RefactorCapability,
-    RefactorPlanHandle, RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, KvCapability, KvEntryInfo, KvGet,
+    RefactorCapability, RefactorPlanHandle, RefactorRequest, ToolCallOutput, ToolCapability,
+    ToolInvocation,
 };
 use bro_core::BroError;
 
@@ -105,6 +106,9 @@ pub struct Capabilities {
     /// `fs.*`/`shell.*`/`search.*`/`git.*`/`web.*` in-box bindings then fail
     /// closed (§4.5 fail-safe by absence).
     pub tools: Option<Arc<dyn ToolCapability>>,
+    /// Durable session KV. Exact in-box deref only; enumeration stays
+    /// model-facing in bro-harness tools.
+    pub kv: Arc<dyn KvCapability>,
 }
 
 /// Configurable, default-ON supervision. The heap limit bounds isolate memory;
@@ -218,6 +222,26 @@ struct PrepareInput {
     source: String,
     #[serde(default)]
     imports: Option<ImportSpec>,
+}
+
+#[derive(Deserialize)]
+struct KvSetInput {
+    name: String,
+    value_json: serde_json::Value,
+    #[serde(default)]
+    tags: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct KvGetInput {
+    name: String,
+    #[serde(default)]
+    max_bytes: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct KvNameInput {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -349,6 +373,25 @@ enum CapRequest {
         input: ToolInvocation,
         reply: oneshot::Sender<CapabilityResult<ToolCallOutput>>,
     },
+    KvSet {
+        name: String,
+        value_json: serde_json::Value,
+        tags: Option<serde_json::Value>,
+        reply: oneshot::Sender<CapabilityResult<KvEntryInfo>>,
+    },
+    KvGet {
+        name: String,
+        max_bytes: Option<usize>,
+        reply: oneshot::Sender<CapabilityResult<KvGet>>,
+    },
+    KvPeek {
+        name: String,
+        reply: oneshot::Sender<CapabilityResult<KvEntryInfo>>,
+    },
+    KvDelete {
+        name: String,
+        reply: oneshot::Sender<CapabilityResult<bool>>,
+    },
 }
 
 type CapTx = mpsc::UnboundedSender<CapRequest>;
@@ -399,6 +442,32 @@ async fn dispatch_cap(caps: Capabilities, req: CapRequest) {
                 )));
             }
         },
+        CapRequest::KvSet {
+            name,
+            value_json,
+            tags,
+            reply,
+        } => {
+            let cap = caps.kv.clone();
+            let _ =
+                reply.send(run_caught(async move { cap.set(name, value_json, tags).await }).await);
+        }
+        CapRequest::KvGet {
+            name,
+            max_bytes,
+            reply,
+        } => {
+            let cap = caps.kv.clone();
+            let _ = reply.send(run_caught(async move { cap.get(name, max_bytes).await }).await);
+        }
+        CapRequest::KvPeek { name, reply } => {
+            let cap = caps.kv.clone();
+            let _ = reply.send(run_caught(async move { cap.peek(name).await }).await);
+        }
+        CapRequest::KvDelete { name, reply } => {
+            let cap = caps.kv.clone();
+            let _ = reply.send(run_caught(async move { cap.delete(name).await }).await);
+        }
     }
 }
 
@@ -623,6 +692,89 @@ async fn op_tool_invoke_inline(
     .await
 }
 
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_kv_set(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = cap_tx(&state);
+        let input: KvSetInput = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.set input: {e}")))?;
+        let info = bridge(tx, move |reply| CapRequest::KvSet {
+            name: input.name,
+            value_json: input.value_json,
+            tags: input.tags,
+            reply,
+        })
+        .await?;
+        serialize_value(info)
+    })
+    .await
+}
+
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_kv_get(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = cap_tx(&state);
+        let input: KvGetInput = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.get input: {e}")))?;
+        let out = bridge(tx, move |reply| CapRequest::KvGet {
+            name: input.name,
+            max_bytes: input.max_bytes,
+            reply,
+        })
+        .await?;
+        serialize_value(out.value_json)
+    })
+    .await
+}
+
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_kv_peek(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = cap_tx(&state);
+        let input: KvNameInput = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.peek input: {e}")))?;
+        let info = bridge(tx, move |reply| CapRequest::KvPeek {
+            name: input.name,
+            reply,
+        })
+        .await?;
+        serialize_value(info)
+    })
+    .await
+}
+
+#[op2(async(lazy), fast)]
+#[string]
+async fn op_kv_delete(
+    state: Rc<RefCell<OpState>>,
+    #[string] input_json: String,
+) -> Result<String, JsErrorBox> {
+    guard_async(async move {
+        let tx = cap_tx(&state);
+        let input: KvNameInput = serde_json::from_str(&input_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.delete input: {e}")))?;
+        let deleted = bridge(tx, move |reply| CapRequest::KvDelete {
+            name: input.name,
+            reply,
+        })
+        .await?;
+        serialize_value(deleted)
+    })
+    .await
+}
+
 /// Store a helper in the host-side session frame and create the default import
 /// alias `name -> name`. Shared host-side logic behind the **model-facing**
 /// `narf_define` tool (via `Job::Define`) — NOT an in-box op: authoring a session
@@ -698,6 +850,10 @@ deno_core::extension!(
         op_refactor_materialize,
         op_tool_invoke,
         op_tool_invoke_inline,
+        op_kv_set,
+        op_kv_get,
+        op_kv_peek,
+        op_kv_delete,
         op_session_import,
         op_panic_guarded,
         op_panic_guarded_async,
@@ -823,6 +979,25 @@ const BOOTSTRAP: &str = r#"
     const promiseId = (h) =>
         (typeof h === 'string' ? h : (h && (h.promise_id ?? (h.detail && h.detail.promise_id))));
     globalThis.narf = {
+        kv: {
+            set: async (name, value, options) =>
+                JSON.parse(await Deno.core.ops.op_kv_set(
+                    JSON.stringify({
+                        name,
+                        value_json: value ?? null,
+                        tags: options && options.tags !== undefined ? options.tags : null,
+                    }))),
+            get: async (name, maxBytes) =>
+                JSON.parse(await Deno.core.ops.op_kv_get(
+                    JSON.stringify({
+                        name,
+                        max_bytes: (maxBytes === undefined || maxBytes === null) ? null : maxBytes,
+                    }))),
+            peek: async (name) =>
+                JSON.parse(await Deno.core.ops.op_kv_peek(JSON.stringify({ name }))),
+            delete: async (name) =>
+                JSON.parse(await Deno.core.ops.op_kv_delete(JSON.stringify({ name }))),
+        },
         session: {
             // §2.2 in-box EXCEPTION: recall a cached helper by exact name — a
             // dereference (keeps the helper source host-side, out of context),

@@ -474,6 +474,7 @@ struct Session {
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
     clipboard: Arc<std::sync::Mutex<bro_tools::Registers>>,
+    kv: Arc<crate::capabilities::KvStore>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
     /// diagnostics}` snapshots from the most recent analyzer pass, so a
     /// future differ can surface only NEW/CHANGED findings on the next edit.
@@ -561,6 +562,9 @@ impl Session {
         let clipboard = Arc::new(std::sync::Mutex::new(bro_tools::Registers::from_side(
             prior_side.get("clipboard").unwrap_or(&Value::Null),
         )));
+        let kv = Arc::new(crate::capabilities::KvStore::from_side(
+            prior_side.get("narf_kv").unwrap_or(&Value::Null),
+        ));
         let hooks = HookEngine::from_env(NudgeLedger::from_side(
             prior_side.get("nudges").unwrap_or(&Value::Null),
         ));
@@ -629,7 +633,11 @@ impl Session {
         // Empty (no-op) for the standalone binary, so those surfaces fail closed
         // by absence. Registered as builtins so the surface ToolFilter still gates
         // them.
-        builtins.extend(crate::capabilities::capability_tools(Some(host_tools)));
+        let kv_cap: Arc<dyn bro_capabilities::KvCapability> = kv.clone();
+        builtins.extend(crate::capabilities::capability_tools(
+            Some(host_tools),
+            Some(kv_cap),
+        ));
         let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
         let mut pin = PinPolicy::from_env();
         if fleet {
@@ -672,6 +680,7 @@ impl Session {
             prior_side,
             todos,
             clipboard,
+            kv,
             lsp_baselines,
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
             lsp_documents: BTreeMap::new(),
@@ -1168,6 +1177,7 @@ impl Session {
             .lock()
             .map(|c| c.to_side())
             .unwrap_or(Value::Null);
+        side["narf_kv"] = self.kv.to_side();
         side["lsp_baselines"] = self.lsp_baselines.to_side();
         self.store.save(&SaveState {
             transport: self.tx.name(),
@@ -1672,6 +1682,7 @@ mod tests {
         };
         let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
         let clipboard = Arc::new(Mutex::new(bro_tools::Registers::default()));
+        let kv = Arc::new(crate::capabilities::KvStore::default());
         let cx = ToolCx {
             root: std::env::temp_dir(),
             safety: Arc::new(SafetyPolicy::new()),
@@ -1718,6 +1729,7 @@ mod tests {
             prior_side: Value::Null,
             todos,
             clipboard,
+            kv,
             lsp_baselines: LspBaselines::default(),
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
             lsp_documents: BTreeMap::new(),

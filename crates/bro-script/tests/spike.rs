@@ -11,13 +11,15 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, RefactorCapability,
-    RefactorPlanHandle, RefactorRequest,
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, KvCapability, KvEntryInfo, KvGet,
+    KvOrigin, KvSummary, RefactorCapability, RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
 use bro_script::{
     Capabilities, ScriptRuntime, SupervisionPolicy, DEFAULT_HEAP_LIMIT_BYTES, DENO_CORE_VERSION,
 };
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Stub capability impls — exercise the real traits without any daemon coupling.
@@ -147,6 +149,88 @@ impl bro_capabilities::ToolCapability for StubTools {
     }
 }
 
+#[derive(Default)]
+struct StubKv {
+    values: Mutex<BTreeMap<String, serde_json::Value>>,
+}
+
+fn kv_info(name: String, value: &serde_json::Value) -> KvEntryInfo {
+    let rendered = value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| value.to_string());
+    let lines: Vec<String> = rendered.lines().map(str::to_string).collect();
+    KvEntryInfo {
+        name,
+        origin: KvOrigin::Agent,
+        tags: None,
+        content_type: "application/json".to_string(),
+        size: serde_json::to_vec(value).unwrap().len(),
+        summary: KvSummary {
+            lines: lines.len().max(1),
+            head: lines.iter().take(2).cloned().collect(),
+            tail: lines.iter().rev().take(2).cloned().collect(),
+            truncated: lines.len() > 4,
+        },
+    }
+}
+
+#[async_trait]
+impl KvCapability for StubKv {
+    async fn set(
+        &self,
+        name: String,
+        value_json: serde_json::Value,
+        _tags: Option<serde_json::Value>,
+    ) -> CapabilityResult<KvEntryInfo> {
+        let info = kv_info(name.clone(), &value_json);
+        self.values.lock().unwrap().insert(name, value_json);
+        Ok(info)
+    }
+
+    async fn get(&self, name: String, max_bytes: Option<usize>) -> CapabilityResult<KvGet> {
+        let value = self
+            .values
+            .lock()
+            .unwrap()
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| BroError::new("kv_missing", name.clone()))?;
+        let size = serde_json::to_vec(&value).unwrap().len();
+        if max_bytes.is_some_and(|m| size > m) {
+            return Err(BroError::new("kv_value_too_large", "too large"));
+        }
+        Ok(KvGet {
+            name,
+            value_json: value,
+            size,
+        })
+    }
+
+    async fn peek(&self, name: String) -> CapabilityResult<KvEntryInfo> {
+        let value = self
+            .values
+            .lock()
+            .unwrap()
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| BroError::new("kv_missing", name.clone()))?;
+        Ok(kv_info(name, &value))
+    }
+
+    async fn list(&self) -> CapabilityResult<Vec<KvEntryInfo>> {
+        let values = self.values.lock().unwrap();
+        Ok(values
+            .iter()
+            .map(|(name, value)| kv_info(name.clone(), value))
+            .collect())
+    }
+
+    async fn delete(&self, name: String) -> CapabilityResult<bool> {
+        Ok(self.values.lock().unwrap().remove(&name).is_some())
+    }
+}
+
 // Panicking variants: prove a capability panic is contained on the executor and
 // surfaces as a catchable JS error (the outer-runtime guard complementing the
 // V8-thread structural guard).
@@ -207,6 +291,7 @@ fn caps_with(
         atoms,
         refactor,
         tools: None,
+        kv: Arc::new(StubKv::default()),
     }
 }
 
@@ -625,6 +710,70 @@ async fn large_result_returns_direct_value_in_phase_a() {
     assert_eq!(out, r#""{\"id\":\"big\",\"textLen\":5000}""#);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_in_box_set_get_peek_delete_roundtrip() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"await narf.kv.set("note", "alpha\nbeta\ngamma\ndelta");
+               const value = await narf.kv.get("note");
+               const meta = await narf.kv.peek("note");
+               const deleted = await narf.kv.delete("note");
+               let missing = false;
+               try { await narf.kv.get("note"); } catch (_) { missing = true; }
+               return JSON.stringify({
+                   value,
+                   lines: meta.summary.lines,
+                   first: meta.summary.head[0],
+                   deleted,
+                   missing,
+               });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(v["value"], "alpha\nbeta\ngamma\ndelta");
+    assert_eq!(v["lines"], 4);
+    assert_eq!(v["first"], "alpha");
+    assert_eq!(v["deleted"], true);
+    assert_eq!(v["missing"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_accumulates_across_execute_calls() {
+    let rt = stub_runtime().await;
+    rt.execute(r#"await narf.kv.set("records", []); return true;"#)
+        .await
+        .unwrap();
+    let out = rt
+        .execute(
+            r#"const records = await narf.kv.get("records");
+               records.push({ id: 1 });
+               await narf.kv.set("records", records);
+               return await narf.kv.get("records");"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v, serde_json::json!([{ "id": 1 }]));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn kv_list_and_keys_are_absent_in_box() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"return JSON.stringify({
+                list: typeof narf.kv.list,
+                keys: typeof narf.kv.keys,
+            });"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, r#""{\"list\":\"undefined\",\"keys\":\"undefined\"}""#);
+}
+
 // ---------------------------------------------------------------------------
 // §5 host built-in tool seam: in-box fs.*/shell.*/search.*/git.*/web.* parity.
 // ---------------------------------------------------------------------------
@@ -634,6 +783,7 @@ fn tools_caps() -> Capabilities {
         atoms: Arc::new(StubAtoms),
         refactor: Arc::new(StubRefactor),
         tools: Some(Arc::new(StubTools)),
+        kv: Arc::new(StubKv::default()),
     }
 }
 
