@@ -796,14 +796,24 @@ roster render.
     the `build_fleet_mcp_args` family left (still test-covered). `bro-cli` still
     depends on `blackbox` for `parser` (1d-ii) and `config::load` (1d-iii).
     Validated: `cargo check --workspace` clean 0/0.
-  - NOT done: **1d-ii** relocate the `blackbox::parser` surface `bro tail` uses
-    (`TranscriptEvent`/`EventDetail`/`MessageRole`/`SystemSignalKind` +
-    `parse_transcript_line_rich`) and DROP the dropped-provider parsers
-    (`parse_codex/copilot/vibe/gemini_line_rich` — §4 dead code; parser.rs is
-    self-contained, no `crate::`/`super::` coupling). **1d-iii** repoint
-    `council_tui` + `main` config to `bro_fleet_client::config` and DROP
-    `blackbox = { path = ... }` from `crates/bro-cli/Cargo.toml`; live fleet-TUI
-    validation against an isolated daemon.
+  - **Step 1d-ii — DONE: transcript parser extracted into shared `bro-transcript`.**
+    Correction to the earlier plan: `parser` is NOT a bro-cli-only surface and
+    its per-provider parsers are NOT §4 dead code — the daemon's transcript
+    **indexer** (`src/index/search.rs`, `transcripts/*`, `index/tool_edges.rs`)
+    uses the basic `parse_codex_line` / `parse_transcript_line` API to index
+    historical transcripts, while `bro tail` uses the rich `*_rich` API. It is a
+    genuinely **shared** dependency, so `src/parser.rs` (self-contained — only
+    `serde_json` + `strum`) lifted wholesale into a new `crates/bro-transcript`
+    crate that BOTH link. `blackbox` keeps `crate::parser::*` working via
+    `pub use bro_transcript as parser` (zero churn in its ~8 internal users);
+    `bro-cli`'s `bro tail` imports `bro_transcript::{…}` directly. All parsers
+    retained (dropping them would break daemon indexing of historical
+    codex/gemini transcripts). Validated: `cargo check --workspace` clean.
+  - NOT done: **1d-iii** repoint `council_tui` + `main` daemon-port resolution to
+    `bro_fleet_client::daemon_port()` (all four call sites read only
+    `daemon.port`) and DROP `blackbox = { path = ... }` from
+    `crates/bro-cli/Cargo.toml`; live fleet-TUI validation against an isolated
+    daemon.
 - **§5 in-process V8 + supervised shell (execution isolation).** Not started;
   no V8/NARF execution exists yet. The shell side has the `with_spawn_scrub` +
   per-child env hook but not timeout/cap supervision.

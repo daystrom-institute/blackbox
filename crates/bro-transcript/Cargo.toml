@@ -1,0 +1,18 @@
+# Shared provider-transcript parser.
+#
+# Stage 2 step 1d-ii of the §7 thin-client extraction
+# (harness-daemon-boundary.md §7): the transcript parser that was
+# `blackbox::parser` is a shared dependency of TWO consumers — the daemon's
+# transcript indexer (`src/index/*`, the basic `parse_*_line` API) and the `bro`
+# cockpit's `bro tail` reader (the rich `*_rich` API). It is pure parsing logic
+# (serde_json + strum, no I/O), so it lifts into this shared crate that both
+# `blackbox` and `bro-cli` link, letting the cockpit drop its `blackbox`
+# dependency without duplicating the parser.
+[package]
+name = "bro-transcript"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+serde_json = "1"
+strum = { version = "0.26", features = ["derive"] }

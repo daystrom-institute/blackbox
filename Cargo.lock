@@ -336,6 +336,7 @@ dependencies = [
  "bro-harness",
  "bro-protocol",
  "bro-tools",
+ "bro-transcript",
  "chrono",
  "clap",
  "cron",
@@ -437,6 +438,7 @@ dependencies = [
  "anyhow",
  "blackbox",
  "bro-fleet-client",
+ "bro-transcript",
  "clap",
  "crossterm",
  "dirs",
@@ -555,6 +557,14 @@ dependencies = [
  "tokio",
  "tracing",
  "walkdir",
+]
+
+[[package]]
+name = "bro-transcript"
+version = "0.0.1"
+dependencies = [
+ "serde_json",
+ "strum 0.26.3",
 ]
 
 [[package]]

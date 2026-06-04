@@ -54,7 +54,10 @@ mod migration;
 mod notes;
 mod orchestration;
 mod packets;
-pub mod parser;
+/// The transcript parser lives in the shared `bro-transcript` crate (the
+/// daemon's indexer and the `bro` cockpit both link it). Re-exported as
+/// `crate::parser` so the ~8 in-crate `crate::parser::*` users don't churn.
+pub use bro_transcript as parser;
 mod path_cache;
 mod pins;
 mod pollers;

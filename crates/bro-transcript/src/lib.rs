@@ -1,7 +1,13 @@
-// Multi-bin crate: blackboxd uses the basic parser API (ParsedEvent,
-// parse_transcript_line, parse_codex_line, ...) via src/index/*;
-// bro uses the rich parser API (TranscriptEvent, *_rich functions)
-// via src/cli.rs. Each binary sees the other half as dead.
+//! Shared provider-transcript parser.
+//!
+//! Two consumers split this surface: the `blackbox` daemon's transcript indexer
+//! uses the basic API (`ParsedEvent`, `parse_transcript_line`,
+//! `parse_codex_line`, …) via `src/index/*`; the `bro` cockpit's `bro tail`
+//! reader uses the rich API (`TranscriptEvent`, `*_rich` functions). Each
+//! consumer sees the other half as dead, so dead-code is allowed crate-wide.
+//! The per-provider parsers (codex/copilot/vibe/gemini) are NOT §4 dead code —
+//! the daemon still indexes historical transcripts of formerly-dispatched
+//! providers, and `bro tail` still renders them.
 #![allow(dead_code)]
 
 use serde_json::Value;

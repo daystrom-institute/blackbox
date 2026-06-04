@@ -42,7 +42,7 @@ use serde::Deserialize;
 mod council_tui;
 mod fleet_classifier;
 mod fleet_tui;
-use blackbox::parser::{
+use bro_transcript::{
     EventDetail, MessageRole, SystemSignalKind, TranscriptEvent, parse_codex_line_rich,
     parse_copilot_line_rich, parse_gemini_file_rich, parse_transcript_line_rich,
     parse_vibe_line_rich,
