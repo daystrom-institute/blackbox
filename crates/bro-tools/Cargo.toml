@@ -22,10 +22,6 @@ globset = "0.4"
 tracing = "0.1"
 libc = "0.2"
 sha2 = "0.10"
-jaq-interpret = "1.5"
-jaq-parse = "1.0"
-jaq-core = "1.5"
-jaq-std = "1.5"
 
 [dev-dependencies]
 tempfile = "3"

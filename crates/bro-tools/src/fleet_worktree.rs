@@ -634,7 +634,6 @@ mod tests {
             todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
             promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
-            clipboard: Arc::new(Mutex::new(crate::clipboard::Registers::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
         }
     }

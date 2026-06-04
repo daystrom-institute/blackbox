@@ -199,14 +199,6 @@ struct FileReadInput {
     /// unambiguous. Default false.
     #[serde(default)]
     line_numbers: bool,
-    /// Ref ABI (chaining): when set, the read range is stored into this
-    /// clipboard register INSTEAD of being returned. The response carries
-    /// metadata (register, hashes, counts, preview_head) but not the content,
-    /// so a follow-up clip_paste / file_write{from} moves the bytes without
-    /// them ever entering your context. Ignores `line_numbers` (registers hold
-    /// raw text). See design/bro-harness/bro-harness-tool-chaining.md.
-    #[serde(default)]
-    into: Option<String>,
 }
 
 pub struct FileRead;
@@ -274,41 +266,11 @@ impl Tool for FileRead {
                 more_after_cap = true;
                 break;
             }
-            if args.line_numbers && args.into.is_none() {
+            if args.line_numbers {
                 collected.push(format!("{lineno}\t{line}"));
             } else {
                 collected.push(line);
             }
-        }
-
-        // Ref ABI: stash into a register instead of returning the content.
-        if let Some(register) = &args.into {
-            let text = collected.join("\n");
-            let range = format!(
-                "lines {}-{}",
-                start,
-                if end == usize::MAX {
-                    lineno
-                } else {
-                    end.min(lineno)
-                }
-            );
-            let provenance = crate::clipboard::Provenance {
-                path: args.file_path.clone(),
-                file_sha256: String::new(),
-                range,
-            };
-            let mut clip = cx.clipboard.lock().unwrap();
-            let evicted = match clip.put_slice(register, text, Some(provenance)) {
-                Ok(e) => e,
-                Err(e) => return ToolResult::Error(e.to_string()),
-            };
-            let mut meta = clip.meta_of(register).unwrap_or(Value::Null);
-            crate::clipboard::annotate_evicted(&mut meta, evicted);
-            if more_after_cap && let Some(obj) = meta.as_object_mut() {
-                obj.insert("truncated_at_max_lines".into(), json!(max_lines));
-            }
-            return ToolResult::Json(meta);
         }
 
         let mut out = collected.join("\n");
@@ -330,14 +292,9 @@ impl Tool for FileRead {
 struct FileWriteInput {
     /// Path to write, relative to the worktree root. Parent dirs are created.
     file_path: String,
-    /// Full new contents of the file. Provide this OR `from`, not both.
+    /// Full new contents of the file.
     #[serde(default)]
     content: Option<String>,
-    /// Ref ABI (chaining): write the contents of this clipboard register
-    /// instead of inlining `content`, so the bytes never pass through your
-    /// context. See design/bro-harness/bro-harness-tool-chaining.md.
-    #[serde(default)]
-    from: Option<String>,
 }
 
 pub struct FileWrite;
@@ -364,17 +321,9 @@ impl Tool for FileWrite {
             Ok(a) => a,
             Err(e) => return ToolResult::Error(format!("bad input: {e}")),
         };
-        // Resolve the body from exactly one of `content` / `from`.
-        let content = match (args.content, &args.from) {
-            (Some(_), Some(_)) => {
-                return ToolResult::Error("provide content OR from, not both".into());
-            }
-            (Some(c), None) => c,
-            (None, Some(register)) => match cx.clipboard.lock().unwrap().consume_text(register) {
-                Ok(t) => t,
-                Err(e) => return ToolResult::Error(e),
-            },
-            (None, None) => return ToolResult::Error("file_write needs content or from".into()),
+        let content = match args.content {
+            Some(c) => c,
+            None => return ToolResult::Error("file_write needs content".into()),
         };
         let path = match resolve_in_root(&cx.root, &args.file_path) {
             Ok(p) => p,
@@ -823,13 +772,6 @@ struct ContentSearchInput {
     /// Case-insensitive matching (like ripgrep `-i`). Default false.
     #[serde(default)]
     case_insensitive: bool,
-    /// Ref ABI (chaining): when set, the result is stored into this clipboard
-    /// register instead of being returned, so a large match set never costs
-    /// context tokens. The response carries metadata + preview; consume it with
-    /// clip_paste / file_write{from} / clip_peek. See
-    /// design/bro-harness/bro-harness-tool-chaining.md.
-    #[serde(default)]
-    into: Option<String>,
 }
 
 pub struct ContentSearch;
@@ -840,7 +782,7 @@ impl Tool for ContentSearch {
         "content_search"
     }
     fn description(&self) -> &str {
-        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, and case_insensitive. Ref ABI (chaining): set `into=\"<reg>\"` to stash a large match set into a clipboard register INSTEAD of returning it — the matches never cost context tokens, and you then narrow with clip_grep/clip_slice or consume with clip_paste / file_write{from} / shell_run{stdin_from}."
+        "Search file contents by regex across the worktree (respects .gitignore). Returns relpath:line:text. Optionally restrict by subdir and filename glob; set mode (content|files|count), context_lines, and case_insensitive."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ContentSearchInput>()
@@ -956,10 +898,6 @@ impl Tool for ContentSearch {
             ));
         }
         let output = hits.join("\n");
-        // Ref ABI: stash the match set into a register instead of returning it.
-        if let Some(register) = &args.into {
-            return crate::clipboard::deposit_tool_result(&cx.clipboard, register, output);
-        }
         ToolResult::Text(output)
     }
 }
@@ -1243,9 +1181,6 @@ mod tests {
             promises: std::sync::Arc::new(std::sync::Mutex::new(
                 crate::promise::PromiseStore::default(),
             )),
-            clipboard: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::clipboard::Registers::default(),
-            )),
             edits: std::sync::Arc::new(std::sync::Mutex::new(crate::edits::EditSink::default())),
         }
     }
@@ -1477,47 +1412,6 @@ mod tests {
             ToolResult::Text(t) => assert_eq!(t, "no matches", "case-sensitive default: {t}"),
             other => panic!("expected text, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn content_search_into_deposits_register_without_returning_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        // Enough matches that the 3-line preview_head is a strict subset of the
-        // full set — so the late match proves the body never round-trips.
-        let body_src: String = (1..=8).map(|n| format!("hit number {n}\n")).collect();
-        std::fs::write(dir.path().join("a.rs"), &body_src).unwrap();
-        let cx = cx_at(dir.path());
-
-        let r = ContentSearch
-            .call(json!({"pattern":"hit","mode":"content","into":"m"}), &cx)
-            .await;
-
-        // The response is metadata + bounded preview, NOT the full match set.
-        match r {
-            ToolResult::Json(v) => {
-                assert_eq!(v["register"], "m");
-                assert_eq!(v["kind"], "tool_result");
-                assert_eq!(v["line_count"], 8);
-                // A late match is past the 3-line preview, so it must be absent
-                // from the returned payload — the ref-ABI win.
-                assert!(
-                    !v.to_string().contains("hit number 8"),
-                    "full match set must not round-trip through the response: {v}"
-                );
-            }
-            other => panic!("expected json metadata, got {other:?}"),
-        }
-
-        // The full match set lives server-side in the register, addressable
-        // downstream by clip_grep/clip_paste/file_write{from}/etc.
-        let stored = cx
-            .clipboard
-            .lock()
-            .unwrap()
-            .consume_text("m")
-            .expect("register populated");
-        assert!(stored.contains("a.rs:1:hit number 1"), "got: {stored}");
-        assert!(stored.contains("a.rs:8:hit number 8"), "got: {stored}");
     }
 
     #[tokio::test]

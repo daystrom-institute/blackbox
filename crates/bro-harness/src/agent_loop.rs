@@ -473,7 +473,6 @@ struct Session {
     store: SessionStore,
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
-    clipboard: Arc<std::sync::Mutex<bro_tools::Registers>>,
     kv: Arc<crate::capabilities::KvStore>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
     /// diagnostics}` snapshots from the most recent analyzer pass, so a
@@ -559,9 +558,6 @@ impl Session {
         let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
             prior_side.get("todos").unwrap_or(&Value::Null),
         )));
-        let clipboard = Arc::new(std::sync::Mutex::new(bro_tools::Registers::from_side(
-            prior_side.get("clipboard").unwrap_or(&Value::Null),
-        )));
         let kv = Arc::new(crate::capabilities::KvStore::from_side(
             prior_side.get("narf_kv").unwrap_or(&Value::Null),
         ));
@@ -601,7 +597,6 @@ impl Session {
             todos: todos.clone(),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(std::sync::Mutex::new(bro_tools::PromiseStore::default())),
-            clipboard: clipboard.clone(),
             edits: edits.clone(),
         };
         // The builtin `report` tool is harness-owned (it emits the cockpit's
@@ -679,7 +674,6 @@ impl Session {
             store,
             prior_side,
             todos,
-            clipboard,
             kv,
             lsp_baselines,
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
@@ -1172,11 +1166,6 @@ impl Session {
             .map(|t| t.to_side())
             .unwrap_or(Value::Null);
         side["nudges"] = self.hooks.to_side();
-        side["clipboard"] = self
-            .clipboard
-            .lock()
-            .map(|c| c.to_side())
-            .unwrap_or(Value::Null);
         side["narf_kv"] = self.kv.to_side();
         side["lsp_baselines"] = self.lsp_baselines.to_side();
         self.store.save(&SaveState {
@@ -1377,18 +1366,6 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
         for (name, desc) in pinned {
             stable.push_str(&format!("- `{name}` — {desc}\n"));
         }
-        stable.push_str(
-            "\nWorking with content server-side (the ref ABI). Moving content through your \
-             context costs tokens twice — once to read it in, once to write it back out — for \
-             bytes you often never need to reason about. Keep it server-side instead: producers \
-             stash output into a named register (`file_read{into}`, `shell_run{stdout_to}`, \
-             `web_fetch{into}`); consumers read from one (`file_write{from}`, \
-             `shell_run{stdin_from}`, `clip_paste`); and `clip_transform` (jq) / `clip_slice` / \
-             `clip_grep` narrow or reshape a register without its content entering your context. \
-             Registers persist across turns. Reach for these whenever you're relocating or \
-             reshaping content rather than reasoning about it — `clip_peek` is the explicit, \
-             bounded way to look when you do.\n",
-        );
         if shell_promises_only {
             stable.push_str(
                 "\nShell promises: `shell_run` starts commands as harness-local Promises in fleet mode; \
@@ -1494,7 +1471,6 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
-            clipboard: Arc::new(Mutex::new(bro_tools::Registers::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
         };
 
@@ -1681,7 +1657,6 @@ mod tests {
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
         };
         let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
-        let clipboard = Arc::new(Mutex::new(bro_tools::Registers::default()));
         let kv = Arc::new(crate::capabilities::KvStore::default());
         let cx = ToolCx {
             root: std::env::temp_dir(),
@@ -1690,7 +1665,6 @@ mod tests {
             todos: todos.clone(),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
-            clipboard: clipboard.clone(),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
         };
         let nanos = std::time::SystemTime::now()
@@ -1728,7 +1702,6 @@ mod tests {
             store: SessionStore::open(Some(&id), None).unwrap(),
             prior_side: Value::Null,
             todos,
-            clipboard,
             kv,
             lsp_baselines: LspBaselines::default(),
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),

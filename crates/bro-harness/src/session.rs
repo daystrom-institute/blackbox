@@ -7,7 +7,7 @@
 //! - `snapshot` — transport-native conversation state. Opaque to the loop; the
 //!   transport owns its shape.
 //! - `side` — transport-agnostic loop-level state that must survive
-//!   `exec → resume` (the clipboard registers, the todo list). Opaque to
+//!   `exec → resume` (the todo list, NARF KV, diagnostics baselines). Opaque to
 //!   *session.rs*; the agent loop owns its shape. Kept a sibling of `snapshot`
 //!   (not nested inside it) precisely because it is transport-independent.
 
@@ -164,7 +164,7 @@ mod tests {
                 transport: "anthropic",
                 model: "m",
                 snapshot: json!({"msgs": 1}),
-                side: json!({"clipboard": {"@": "hello"}, "todos": []}),
+                side: json!({"narf_kv": {"entries": {}}, "todos": []}),
             })
             .unwrap();
 
@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(r.transport, "anthropic");
         assert_eq!(r.model.as_deref(), Some("m"));
         assert_eq!(r.snapshot, json!({"msgs": 1}));
-        assert_eq!(r.side["clipboard"]["@"], json!("hello"));
+        assert_eq!(r.side["narf_kv"]["entries"], json!({}));
 
         std::fs::remove_dir_all(&dir).ok();
     }

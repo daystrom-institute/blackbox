@@ -36,12 +36,8 @@ pub enum Tier {
 }
 
 /// Which tools get elevated to `Pinned`. Patterns are exact names or a
-/// trailing-`*` prefix glob. Default elevates the slice tools and the clipboard
-/// ACTION verbs (yank/paste/transform/slice/grep) so the
-/// context-copy-paste-avoiding surface is prominent — but NOT the clipboard
-/// utilities (`clip_set`/`clip_list`/`clip_peek`/`clip_clear`), which stay
-/// `Eager` (callable, just off the always-available callout) to keep that
-/// section focused. Override with `BRO_HARNESS_PIN_TOOLS` (comma-separated).
+/// trailing-`*` prefix glob. Override with `BRO_HARNESS_PIN_TOOLS`
+/// (comma-separated).
 pub struct PinPolicy {
     patterns: Vec<String>,
 }
@@ -54,17 +50,10 @@ impl PinPolicy {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            Err(_) => [
-                "bbox_slice_*",
-                "clip_yank",
-                "clip_paste",
-                "clip_transform",
-                "clip_slice",
-                "clip_grep",
-            ]
-            .into_iter()
-            .map(String::from)
-            .collect(),
+            Err(_) => ["bbox_slice_*"]
+                .into_iter()
+                .map(String::from)
+                .collect(),
         };
         Self { patterns }
     }

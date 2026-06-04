@@ -10,9 +10,8 @@
 //! substrate has zero LSP dependency: swapping it for typed
 //! `Vec<lsp_types::Diagnostic>` later is a small change.
 //!
-//! The `from_side` / `to_side` round-trip mirrors [`bro_tools::TodoList`] and
-//! [`bro_tools::Registers`] exactly: malformed or absent state yields an
-//! empty store rather than failing a resume.
+//! The `from_side` / `to_side` round-trip mirrors the other session side cells:
+//! malformed or absent state yields an empty store rather than failing a resume.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

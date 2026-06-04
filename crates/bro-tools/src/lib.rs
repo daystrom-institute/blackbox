@@ -9,10 +9,8 @@
 //! Nothing here knows about Anthropic, providers, or the stream-json wire
 //! format — those live in `bro-harness`.
 
-pub mod clipboard;
 pub mod edits;
 pub mod fleet_worktree;
-pub mod jq;
 pub mod promise;
 pub mod safety;
 pub mod shell;
@@ -22,7 +20,6 @@ pub mod tool;
 pub mod web;
 pub mod workspace;
 
-pub use clipboard::Registers;
 pub use edits::{EditEvent, EditSink};
 pub use promise::{PromiseProgress, PromiseStore, StreamKind, promise_tools};
 pub use safety::SafetyPolicy;
@@ -62,7 +59,6 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::fleet_worktree::ExitWorktree),
     ];
     let mut tools = tools;
-    tools.extend(crate::clipboard::clip_tools());
     tools.extend(crate::promise::promise_tools());
     tools
 }

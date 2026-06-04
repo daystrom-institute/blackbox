@@ -7,10 +7,8 @@
 //! machinery the harness has no business pulling in. The resolver itself is
 //! ~200 lines of pure `&str` math with no daemon coupling, so we copy the two
 //! selector enums + the resolver here and keep the wire vocabulary identical
-//! (same serde `tag`/`rename_all`), so `clip_*` selectors read exactly like
-//! `bbox_slice_*` selectors to the model. The clean end-state is a shared leaf
-//! crate both depend on; that extraction is deferred until this is proven.
-//! See `design/bro-harness/bro-harness-clipboard.md` §"Selector reuse".
+//! (same serde `tag`/`rename_all`). The clean end-state is a shared leaf crate
+//! both depend on; that extraction is deferred until this is proven.
 
 use anyhow::{Result, anyhow, bail};
 use schemars::JsonSchema;

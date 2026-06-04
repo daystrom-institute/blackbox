@@ -25,10 +25,6 @@ pub struct ToolCx {
     pub shell_sessions: Arc<std::sync::Mutex<crate::shell::ShellSessions>>,
     /// Harness-local async promises. In-memory, same-dispatch lifetime.
     pub promises: Arc<std::sync::Mutex<crate::promise::PromiseStore>>,
-    /// Clipboard registers: named, server-held value cells the `clip_*` tools
-    /// produce/consume, and the substrate other tools chain through (the ref
-    /// ABI). Durable across `exec → resume` via the `side` cell, like `todos`.
-    pub clipboard: Arc<std::sync::Mutex<crate::clipboard::Registers>>,
     /// Per-turn capture of file mutations: file-mutating tools push an
     /// [`crate::edits::EditEvent`] (pre-image + pre/post sha256 + path) here
     /// at mutation time, and the edit loop drains the sink after each

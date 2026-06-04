@@ -934,7 +934,6 @@ mod tests {
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
-            clipboard: Arc::new(Mutex::new(bro_tools::Registers::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
         }
     }

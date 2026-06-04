@@ -3,7 +3,7 @@
 //!
 //! The list is a single shared cell (`ToolCx.todos`) the harness seeds from the
 //! persisted session `side` blob at start and flushes back at turn end, so it
-//! survives `exec → resume` exactly like the clipboard. The tool fully replaces
+//! survives `exec → resume`. The tool fully replaces
 //! the list on each call (idempotent set-semantics), which is how both peer
 //! harnesses model it — the model re-emits the whole list with updated
 //! statuses rather than patching individual items.
@@ -152,7 +152,6 @@ mod tests {
             todos: Arc::new(Mutex::new(TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
             promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
-            clipboard: Arc::new(Mutex::new(crate::clipboard::Registers::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
         }
     }

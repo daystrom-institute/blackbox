@@ -2520,17 +2520,10 @@ fn draw(f: &mut Frame, app: &mut App) {
     let single_agent = app.zone == Zone::SingleAgent;
     let config = app.zone == Zone::Config;
     let composer_height = composer_height(app, f.area());
-    let constraints = if single_agent {
-        vec![
-            Constraint::Min(0),                  // transcript
-            Constraint::Length(composer_height), // composer
-        ]
-    } else {
-        vec![
-            Constraint::Min(0),                  // body
-            Constraint::Length(composer_height), // composer
-        ]
-    };
+    let constraints = vec![
+        Constraint::Min(0),                  // body/transcript
+        Constraint::Length(composer_height), // composer
+    ];
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
@@ -4336,14 +4329,6 @@ fn compact_builtin_tool_args(tool: &str, value: &serde_json::Value) -> Option<St
         "git_diff" => compact_named_args(value, &["include_untracked"]),
         "git_show" => compact_named_args(value, &["rev"]),
         "git_commit" => compact_named_args(value, &["paths", "message"]),
-        "clip_yank" => compact_clip_yank_args(value),
-        "clip_paste" => compact_clip_paste_args(value),
-        "clip_set" => compact_clip_set_args(value),
-        "clip_peek" => compact_named_args(value, &["register", "max_lines"]),
-        "clip_clear" => compact_named_args(value, &["register"]),
-        "clip_transform" => compact_clip_transform_args(value),
-        "clip_slice" => compact_clip_slice_args(value),
-        "clip_grep" => compact_clip_grep_args(value),
         "enter_worktree" => compact_named_args(value, &["purpose", "base", "branch_prefix"]),
         "exit_worktree" => compact_named_args(
             value,
@@ -4379,13 +4364,7 @@ fn compact_shell_run_args(value: &serde_json::Value) -> Option<String> {
     append_present_args(
         obj,
         &mut parts,
-        &[
-            "timeout_ms",
-            "yield_time_ms",
-            "max_output_tokens",
-            "stdout_to",
-            "stdin_from",
-        ],
+        &["timeout_ms", "yield_time_ms", "max_output_tokens"],
     );
     if let Some(stdin) = obj.get("stdin").and_then(|v| v.as_str()) {
         parts.push(format!("stdin={}", compact_text_summary(stdin)));
@@ -4437,7 +4416,6 @@ fn compact_file_write_args(value: &serde_json::Value) -> Option<String> {
     if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
         parts.push(format!("content={}", compact_text_summary(content)));
     }
-    push_string_arg(obj, &mut parts, "from", "from", false);
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
@@ -4463,66 +4441,7 @@ fn compact_web_fetch_args(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     let mut parts = Vec::new();
     push_string_arg(obj, &mut parts, "url", "", true);
-    append_present_args(obj, &mut parts, &["max_chars", "into"]);
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn compact_clip_yank_args(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    let mut parts = Vec::new();
-    push_string_arg(obj, &mut parts, "source", "", true);
-    push_range_arg(obj, &mut parts, "source_range", "range");
-    append_present_args(obj, &mut parts, &["register", "append"]);
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn compact_clip_paste_args(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    let mut parts = Vec::new();
-    push_string_arg(obj, &mut parts, "target", "", true);
-    push_insert_arg(obj, &mut parts, "insert");
-    append_present_args(
-        obj,
-        &mut parts,
-        &["register", "count", "confirm", "expected_sha256"],
-    );
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn compact_clip_set_args(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    let mut parts = Vec::new();
-    if let Some(text) = obj.get("text").and_then(|v| v.as_str()) {
-        parts.push(format!("text={}", compact_text_summary(text)));
-    }
-    append_present_args(obj, &mut parts, &["register", "append"]);
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn compact_clip_transform_args(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    let mut parts = Vec::new();
-    push_source_arg(obj, &mut parts);
-    push_string_arg(obj, &mut parts, "jq", "jq", false);
-    append_present_args(obj, &mut parts, &["into"]);
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn compact_clip_slice_args(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    let mut parts = Vec::new();
-    push_source_arg(obj, &mut parts);
-    push_range_arg(obj, &mut parts, "range", "range");
-    append_present_args(obj, &mut parts, &["into"]);
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-fn compact_clip_grep_args(value: &serde_json::Value) -> Option<String> {
-    let obj = value.as_object()?;
-    let mut parts = Vec::new();
-    push_source_arg(obj, &mut parts);
-    push_string_arg(obj, &mut parts, "pattern", "", true);
-    append_present_args(obj, &mut parts, &["case_insensitive", "invert", "into"]);
+    append_present_args(obj, &mut parts, &["max_chars"]);
     (!parts.is_empty()).then(|| parts.join(", "))
 }
 
@@ -4531,13 +4450,6 @@ fn compact_named_args(value: &serde_json::Value, keys: &[&str]) -> Option<String
     let mut parts = Vec::new();
     append_present_args(obj, &mut parts, keys);
     Some(parts.join(", "))
-}
-
-fn push_source_arg(obj: &serde_json::Map<String, serde_json::Value>, parts: &mut Vec<String>) {
-    if push_string_arg(obj, parts, "file", "file", false) {
-        return;
-    }
-    push_string_arg(obj, parts, "from", "from", false);
 }
 
 fn append_present_args(
@@ -4578,82 +4490,6 @@ fn push_string_arg(
         parts.push(format!("{label}={rendered}"));
     }
     true
-}
-
-fn push_range_arg(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    parts: &mut Vec<String>,
-    key: &str,
-    label: &str,
-) -> bool {
-    let Some(value) = obj.get(key).and_then(compact_range_value) else {
-        return false;
-    };
-    parts.push(format!("{label}={value}"));
-    true
-}
-
-fn push_insert_arg(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    parts: &mut Vec<String>,
-    key: &str,
-) -> bool {
-    let Some(value) = obj.get(key).and_then(compact_insert_value) else {
-        return false;
-    };
-    parts.push(format!("insert={value}"));
-    true
-}
-
-fn compact_range_value(value: &serde_json::Value) -> Option<String> {
-    if let Some(raw) = value.as_str()
-        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
-    {
-        return compact_range_value(&parsed);
-    }
-    let obj = value.as_object()?;
-    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("range");
-    match ty {
-        "lines" => Some(format!(
-            "lines:{}-{}",
-            compact_field(obj, "start_line")?,
-            compact_field(obj, "end_line")?
-        )),
-        "bytes" => Some(format!(
-            "bytes:{}-{}",
-            compact_field(obj, "start")?,
-            compact_field(obj, "end")?
-        )),
-        "markers" => Some("markers".into()),
-        "exact_text" => Some("exact_text".into()),
-        other => Some(other.to_string()),
-    }
-}
-
-fn compact_insert_value(value: &serde_json::Value) -> Option<String> {
-    if let Some(raw) = value.as_str()
-        && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw)
-    {
-        return compact_insert_value(&parsed);
-    }
-    let obj = value.as_object()?;
-    let ty = obj.get("type").and_then(|v| v.as_str()).unwrap_or("insert");
-    match ty {
-        "line" => Some(format!(
-            "{} line {}",
-            obj.get("placement")
-                .and_then(|v| v.as_str())
-                .unwrap_or("at"),
-            compact_field(obj, "line")?
-        )),
-        "before_marker" | "after_marker" => Some(ty.replace('_', " ")),
-        "prepend" | "append" => Some(ty.to_string()),
-        other => Some(other.to_string()),
-    }
-}
-
-fn compact_field(obj: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
-    obj.get(key).and_then(compact_json_value)
 }
 
 fn compact_array_summary(items: &[serde_json::Value], noun: &str) -> String {
@@ -5501,6 +5337,7 @@ fn provider_tag(p: Provider) -> &'static str {
         Provider::Deepseek => "ds",
         Provider::Brodex => "bdx",
         Provider::VibeBh => "vbh",
+        Provider::Minimax => "mmx",
         Provider::Workflow => "wf",
     }
 }
@@ -5511,6 +5348,7 @@ fn provider_color(p: Provider) -> Color {
         Provider::Deepseek => Color::LightCyan,
         Provider::Brodex => Color::LightGreen,
         Provider::VibeBh => Color::LightRed,
+        Provider::Minimax => Color::Yellow,
         Provider::Workflow => Color::Gray,
     }
 }
@@ -5890,28 +5728,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(line2, r#"▸ content_search("fn main")"#);
-    }
-
-    #[test]
-    fn compact_tool_call_line_summarizes_clip_ranges_and_inserts() {
-        let yank = compact_tool_call_line(
-            "clip_yank",
-            r#"{"source":"src/a.rs","source_range":{"type":"lines","start_line":10,"end_line":20},"register":"x"}"#,
-            120,
-        )
-        .unwrap();
-        assert_eq!(yank, "▸ clip_yank(src/a.rs, range=lines:10-20, register=x)");
-
-        let paste = compact_tool_call_line(
-            "clip_paste",
-            r#"{"target":"src/a.rs","insert":{"type":"line","line":12,"placement":"after"},"register":"x","confirm":true}"#,
-            120,
-        )
-        .unwrap();
-        assert_eq!(
-            paste,
-            "▸ clip_paste(src/a.rs, insert=after line 12, register=x, confirm=true)"
-        );
     }
 
     #[test]

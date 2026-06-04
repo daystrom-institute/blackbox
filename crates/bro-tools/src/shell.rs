@@ -214,7 +214,6 @@ async fn run_shell_promise(
     mut session: ShellSession,
     cx: ToolCx,
     promise_id: String,
-    stdout_to: Option<String>,
     max_tokens: usize,
     mut cancel_rx: watch::Receiver<bool>,
 ) {
@@ -222,11 +221,11 @@ async fn run_shell_promise(
     let (so, se) = drain_final(&mut session, max_tokens).await;
     match outcome {
         PromiseOutcome::Exited(code) => {
-            let result = terminal_result(&cx, stdout_to.as_deref(), code, so, se, false);
+            let result = terminal_result(code, so, se, false);
             settle_from_tool_result(&cx, &promise_id, result);
         }
         PromiseOutcome::TimedOut => {
-            let result = terminal_result(&cx, stdout_to.as_deref(), None, so, se, true);
+            let result = terminal_result(None, so, se, true);
             settle_from_tool_result(&cx, &promise_id, result);
         }
         PromiseOutcome::Cancelled => {
@@ -376,40 +375,14 @@ fn terminal_json(exit_code: Option<i32>, stdout: String, stderr: String, timed_o
     })
 }
 
-/// Build a terminal `shell_run` result, routing stdout into a clipboard
-/// register when `stdout_to` is set (the ref ABI producer path) instead of
-/// returning it inline. stderr always stays inline so failures are visible.
+/// Build a terminal `shell_run` result.
 fn terminal_result(
-    cx: &ToolCx,
-    stdout_to: Option<&str>,
     exit_code: Option<i32>,
     stdout: String,
     stderr: String,
     timed_out: bool,
 ) -> ToolResult {
-    let Some(register) = stdout_to else {
-        return ToolResult::Json(terminal_json(exit_code, stdout, stderr, timed_out));
-    };
-    let byte_len = stdout.len();
-    let mut clip = cx.clipboard.lock().unwrap();
-    let evicted = match clip.put_tool_result(register, stdout) {
-        Ok(e) => e,
-        Err(e) => return ToolResult::Error(e.to_string()),
-    };
-    let sha = clip
-        .meta_of(register)
-        .and_then(|m| m.get("slice_sha256").cloned());
-    let mut out = json!({
-        "exit_code": exit_code,
-        "stdout_register": register,
-        "stdout_bytes": byte_len,
-        "stdout_sha256": sha,
-        "stderr": stderr,
-        "running": false,
-        "timed_out": timed_out,
-    });
-    crate::clipboard::annotate_evicted(&mut out, evicted);
-    ToolResult::Json(out)
+    ToolResult::Json(terminal_json(exit_code, stdout, stderr, timed_out))
 }
 
 fn shell_path_env() -> Option<OsString> {
@@ -516,18 +489,6 @@ struct ShellRunInput {
     /// the command for things like `PORT`, `RUST_LOG`, etc.
     #[serde(default)]
     env: HashMap<String, String>,
-    /// Ref ABI (chaining): capture stdout into this clipboard register instead
-    /// of returning it, so large output never enters your context. The response
-    /// reports the register + byte count + sha; consume it with clip_paste /
-    /// file_write{from} / clip_peek. Only honored when the command finishes
-    /// within this call (not for yielded/background sessions). stderr is still
-    /// returned inline. See design/bro-harness/bro-harness-tool-chaining.md.
-    #[serde(default)]
-    stdout_to: Option<String>,
-    /// Ref ABI (chaining): feed this clipboard register's content as stdin
-    /// (after any literal `stdin`), without it passing through your context.
-    #[serde(default)]
-    stdin_from: Option<String>,
 }
 
 pub struct ShellRun;
@@ -597,20 +558,9 @@ impl Tool for ShellRun {
                 Some((StreamKind::Stderr, progress.clone())),
             ));
         }
-        // Ref ABI: resolve a stdin-feeding register before touching the child.
-        let stdin_from_data = match &args.stdin_from {
-            Some(reg) => match cx.clipboard.lock().unwrap().consume_text(reg) {
-                Ok(t) => Some(t),
-                Err(e) => return ToolResult::Error(e),
-            },
-            None => None,
-        };
         let mut stdin = child.stdin.take();
         if let Some(si) = stdin.as_mut() {
-            for data in [args.stdin.as_deref(), stdin_from_data.as_deref()]
-                .into_iter()
-                .flatten()
-            {
+            if let Some(data) = args.stdin.as_deref() {
                 let _ = si.write_all(data.as_bytes()).await;
             }
             let _ = si.flush().await;
@@ -646,17 +596,8 @@ impl Tool for ShellRun {
             let (promise_id, cancel_rx) = cx.promises.lock().unwrap().start("shell_run", detail, Some(progress));
             let cx_bg = cx.clone();
             let promise_id_bg = promise_id.clone();
-            let stdout_to = args.stdout_to.clone();
             tokio::spawn(async move {
-                run_shell_promise(
-                    session,
-                    cx_bg,
-                    promise_id_bg,
-                    stdout_to,
-                    max_tokens,
-                    cancel_rx,
-                )
-                .await;
+                run_shell_promise(session, cx_bg, promise_id_bg, max_tokens, cancel_rx).await;
             });
             return ToolResult::Json(json!({
                 "promise_id": promise_id,
@@ -669,11 +610,11 @@ impl Tool for ShellRun {
         match drive(&mut session.child, yield_at, kill_at).await {
             Outcome::Exited(code) => {
                 let (so, se) = drain_final(&mut session, max_tokens).await;
-                terminal_result(cx, args.stdout_to.as_deref(), code, so, se, false)
+                terminal_result(code, so, se, false)
             }
             Outcome::TimedOut => {
                 let (so, se) = drain_final(&mut session, max_tokens).await;
-                terminal_result(cx, args.stdout_to.as_deref(), None, so, se, true)
+                terminal_result(None, so, se, true)
             }
             Outcome::Yielded => {
                 let (so, se) = snapshot(&session, max_tokens);
@@ -956,7 +897,6 @@ mod tests {
             todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
             promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
-            clipboard: Arc::new(Mutex::new(crate::clipboard::Registers::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
         }
     }
