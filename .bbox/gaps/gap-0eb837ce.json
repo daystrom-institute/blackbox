@@ -1,0 +1,22 @@
+{
+  "id": "gap-0eb837ce",
+  "title": "Repo-owned knowledge operations can cross-contaminate git worktrees",
+  "gap_kind": "tooling",
+  "domain": "knowledge-render-worktree-isolation",
+  "wanted_capability": "Project-scoped repo-owned knowledge/render operations must target the caller's active worktree checkout, not another registered worktree or canonical project record for the same logical repo. Same knowledge IDs may legitimately diverge across branches until merge, so save/delete/render must be worktree-scoped and branch-safe.",
+  "missing_primitive": "worktree-scoped repo-owned knowledge path resolution and branch-aware safety checks",
+  "fallback_used": "Manually inspect git status and compare HEAD/main vs beta/blackbox-v2 copies of .bbox/knowledge/7276b5c6.json before restoring or merging; avoid automatic restore from beta because beta-only updated rule does not apply to main.",
+  "evidence": [
+    "/Users/invidious/repos/transcript-search: git status shows D .bbox/knowledge/7276b5c6.json on main",
+    "/Users/invidious/repos/transcript-search/.bbox/knowledge/7276b5c6.json: deleted active critical convention 'bro-harness shares code with daemon, never runtime'",
+    "/Users/invidious/repos/transcript-search-blackbox-v2/.bbox/knowledge/7276b5c6.json: same id exists with beta-only updated contract-bottom wording at beta/blackbox-v2"
+  ],
+  "impact": "high",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/knowledge/worktree-scoped-state-isolation",
+  "suggested_owner": "blackbox",
+  "notes": "Operator clarified beta is not ready to merge and the updated rule applies only to beta. This makes the deletion in main a defect in worktree-scoped operations rather than an intentional supersession. Risk: restoring by ID from the wrong worktree would silently apply beta-only invariants to main.",
+  "resolution": "unresolved",
+  "created_at": "2026-06-04T14:55:53Z",
+  "updated_at": "2026-06-04T14:55:53Z"
+}
