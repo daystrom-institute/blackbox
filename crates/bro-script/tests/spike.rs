@@ -332,6 +332,55 @@ async fn denied_globals() {
     assert_eq!(out, "true", "ambient globals must be denied");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encode_yaml_block_style_and_roundtrips() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(r#"return narf.encode.yaml({ a: 1, b: "x" });"#)
+        .await
+        .unwrap();
+    let yaml: String = serde_json::from_str(&out).unwrap();
+    assert!(yaml.contains("a: 1"), "{yaml}");
+    assert!(yaml.contains("b: x"), "{yaml}");
+
+    let reparsed: serde_norway::Value = serde_norway::from_str(&yaml).unwrap();
+    let expected: serde_norway::Value = serde_norway::from_str("a: 1\nb: x\n").unwrap();
+    assert_eq!(reparsed, expected);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encode_frontmatter_wraps_yaml_and_body() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(r##"return narf.encode.frontmatter({ title: "T", tags: ["a", "b"] }, "# Body");"##)
+        .await
+        .unwrap();
+    let doc: String = serde_json::from_str(&out).unwrap();
+    assert!(doc.starts_with("---\n"), "{doc}");
+    assert!(doc.contains("title: T\n"), "{doc}");
+    assert!(doc.contains("tags:\n- a\n- b\n"), "{doc}");
+    assert!(doc.contains("---\n\n# Body"), "{doc}");
+    assert!(!doc.contains("\n\n---\n\n# Body"), "{doc}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn encode_markdown_table_from_objects() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"return narf.encode.mdTable([
+                 { name: "a", n: 1, note: "x|y" },
+                 { name: "b", n: 2, note: "z" }
+               ]);"#,
+        )
+        .await
+        .unwrap();
+    let table: String = serde_json::from_str(&out).unwrap();
+    assert!(table.starts_with("| name | n | note |\n| --- | --- | --- |\n"));
+    assert!(table.contains("| a | 1 | x\\|y |"), "{table}");
+    assert!(table.contains("| b | 2 | z |"), "{table}");
+}
+
 // ---------------------------------------------------------------------------
 // Real capability bridges (criterion #4) — one per trait method.
 // ---------------------------------------------------------------------------

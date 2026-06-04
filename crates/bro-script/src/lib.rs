@@ -562,6 +562,17 @@ fn serialize_tool_output(out: ToolCallOutput) -> Result<String, JsErrorBox> {
     }
 }
 
+#[op2]
+#[string]
+fn op_encode_yaml(#[string] value_json: String) -> Result<String, JsErrorBox> {
+    guard_op(|| {
+        let value: serde_json::Value = serde_json::from_str(&value_json)
+            .map_err(|e| JsErrorBox::generic(format!("invalid YAML encode input: {e}")))?;
+        serde_norway::to_string(&value)
+            .map_err(|e| JsErrorBox::generic(format!("failed to encode YAML: {e}")))
+    })
+}
+
 /// Forward a host built-in tool invocation to the outer-runtime executor and
 /// await the typed reply. Unlike [`bridge`], the reply is inspected by the op
 /// (an `is_error` result becomes a catchable JS exception), so this returns the
@@ -854,6 +865,7 @@ deno_core::extension!(
         op_kv_get,
         op_kv_peek,
         op_kv_delete,
+        op_encode_yaml,
         op_session_import,
         op_panic_guarded,
         op_panic_guarded_async,
@@ -1008,6 +1020,41 @@ const BOOTSTRAP: &str = r#"
                 const expr = Deno.core.ops.op_session_import(name);
                 return (0, eval)(expr);
             },
+        },
+    };
+    const yaml = (value) =>
+        Deno.core.ops.op_encode_yaml(JSON.stringify(value ?? null));
+    const yamlForFrontmatter = (value) => {
+        const y = yaml(value);
+        return y.endsWith('\n') ? y : y + '\n';
+    };
+    const escapeTableCell = (value) =>
+        String(value === undefined || value === null
+            ? ''
+            : (typeof value === 'string' ? value : JSON.stringify(value)))
+            .replace(/\|/g, '\\|')
+            .replace(/\r?\n/g, '<br>');
+    globalThis.narf.encode = {
+        yaml,
+        frontmatter: (meta, body) =>
+            '---\n' + yamlForFrontmatter(meta ?? {}) + '---\n\n' + (body ?? ''),
+        mdTable: (rows, columns) => {
+            const data = Array.isArray(rows) ? rows : [];
+            const cols = Array.isArray(columns) && columns.length
+                ? columns
+                : Array.from(data.reduce((set, row) => {
+                    if (row && typeof row === 'object' && !Array.isArray(row)) {
+                        Object.keys(row).forEach((key) => set.add(key));
+                    }
+                    return set;
+                }, new Set()));
+            const line = (cells) => '| ' + cells.join(' | ') + ' |';
+            return [
+                line(cols.map(escapeTableCell)),
+                line(cols.map(() => '---')),
+                ...data.map((row) => line(cols.map((col) =>
+                    escapeTableCell(row && typeof row === 'object' ? row[col] : undefined)))),
+            ].join('\n');
         },
     };
     // §5 promise join: all/any/wait return producer values; status/list/cancel
