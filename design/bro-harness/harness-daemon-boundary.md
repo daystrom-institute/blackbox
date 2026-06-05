@@ -1003,10 +1003,16 @@ roster render.
   spills oversized cell returns to a `file_read`-able path). The KV surface is
   box-edge-split: in-box `narf.kv.{set,get,peek,delete}` by exact name, out-box
   `narf_kv_{list,peek,get}` (no in-box enumeration — the box never selects).
-  `narf-tool-placement.md` is archived. STILL OPEN: MCP placement (step 7, the
-  surviving live part of the archived doc §4); `Promise`/`narf_wait` durable
-  surface = deferred lever; `Tx` parked (`narf-effects-and-safety.md`); §5a
-  supervised shell still open.
+  `narf-tool-placement.md` is archived. **MCP placement (step 7) LANDED**
+  (`7340b37`, spec narf-data-model.md §10): a flat `tool_placement` map
+  (default fail-safe out-box) places external MCP tools in-box via the host-tool
+  seam, reachable as a non-enumerating `mcp.<server>.<tool>(args)` Proxy
+  (`mcp__server__tool` → `op_tool_invoke`, returns values), filter gating the
+  whole capability (in-box-only excluded from the model registry). **With this the
+  NARF tool-calling MVP is complete.** STILL OPEN (post-MVP): `bro_*` in-box
+  placement + per-presence filter targeting; out-box KV writes; `Promise`/
+  `narf_wait` durable surface; `Tx` parked (`narf-effects-and-safety.md`); §5a
+  supervised shell.
 
   LAYERING CORRECTION — **FIXED.** The §9-auth authoring surface
   (`narf.prepare`/`run`/`session.define`, commit `8a86e75`) had been mislayered as
