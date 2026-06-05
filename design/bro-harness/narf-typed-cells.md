@@ -317,18 +317,15 @@ the JSON surfaces are retained for the cases where a static graph is the point.
 
 The thesis is "mostly built." Precisely what is *not*:
 
-1. **Park/resume contract enforcement is not built yet.** The A1/A2/A3
+1. **Durable/workflow-tier contract enforcement is not built yet.** The A1/A2
    reusable-cell slices are live: `narf_prepare` accepts an optional declared
    `contract`, validates `entry`, validates `input`/`output` with JSON Schema
    Draft 2020-12, echoes the contract in `PrepareResponse`, and keeps it with
    the prepared script; `narf_register` persists reviewed source+contract as a
    **cell** artifact (`ArtifactKind::Cell`, not an atom backend), and
    registered-handle `narf_run` validates input before calling the declared
-   entry and output before returning. `narf_registerWorkflow` installs a
-   hook-only workflow wrapper around an exact cell handle, and
-   `narf_scheduleWorkflow` installs an existing cron/routing-packet trigger for
-   that wrapper. What does **not** exist yet is the `narf.wait` park/resume
-   boundary inside a cell body.
+   entry and output before returning. What does **not** exist yet is the durable
+   workflow-tier enforcement around park/resume boundaries.
 2. **No `narf.wait` in-box verb.** The park surface exists only as workflow
    `WaitSpec`/`run_wait_node`; there is no cell-facing `narf.wait` that lowers a
    known correlation into a `WaitSpec` and suspends the cell's owning arc.
@@ -342,10 +339,9 @@ The thesis is "mostly built." Precisely what is *not*:
    `WaitStore` (the struct is "designed serializable" already) + respawn parked
    arc-runners on boot so they re-enter their wait node and let the catch-up
    rescan re-resolve.
-4. **`narf.wait` is not wired into cell-authored durable bodies.** The durable
-   wrapper can run a registered cell through the workflow engine, and scheduling
-   can start that wrapper, but a cell body cannot yet call `narf.wait` to park
-   on a held correlation and resume within the owning arc.
+4. **`narf_registerWorkflow` / `narf_scheduleWorkflow` verbs do not exist.**
+   `narf_register` exists for named reusable cells and writes the cell catalog.
+   The durable workflow verbs and their trigger/arc wiring are still net-new.
 5. **No TS toolchain.** Restating §1: "typed" is a declared contract, validated;
    it is not an inferred TS signature. If inferred typing is ever wanted, it is a
    separate, scoped toolchain decision — not part of this doc's v1.

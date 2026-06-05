@@ -398,7 +398,6 @@ dependencies = [
  "bro-core",
  "bro-harness",
  "bro-protocol",
- "bro-script",
  "bro-tools",
  "bro-transcript",
  "chrono",

@@ -214,9 +214,6 @@ pub enum OpKind {
     /// Engine-state op handled by `WorkflowRunner`: apply a typed advisor
     /// action through code-owned lineage and compatibility checks.
     ExecuteSupervisionAction,
-    /// Engine-state op handled by `WorkflowRunner`: execute an exact registered
-    /// NARF cell handle and write the result into vars.
-    CellRun,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -338,7 +335,6 @@ pub async fn execute_op_with_hub(
         OpKind::ExecuteSupervisionAction => {
             bail!("execute_supervision_action op requires workflow engine state")
         }
-        OpKind::CellRun => bail!("cell_run op requires workflow engine state"),
         OpKind::SystemEventCompact => {
             let hub = hub.ok_or_else(|| {
                 anyhow!(

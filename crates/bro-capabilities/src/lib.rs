@@ -71,52 +71,6 @@ pub trait CellRegistryCapability: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CellWorkflowRegisterRequest {
-    pub name: String,
-    pub version: String,
-    pub cell_handle: String,
-    pub input_json: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CellWorkflowRegisterOutput {
-    pub workflow_id: String,
-    pub cell_handle: String,
-    pub name: String,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CellWorkflowScheduleRequest {
-    pub name: String,
-    pub workflow_id: String,
-    pub schedule: String,
-    pub input_json: Option<serde_json::Value>,
-    pub concurrency: Option<u32>,
-    pub default_project_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CellWorkflowScheduleOutput {
-    pub cron_name: String,
-    pub workflow_id: String,
-    pub routing_packet: String,
-}
-
-#[async_trait]
-pub trait CellWorkflowCapability: Send + Sync {
-    async fn register_workflow(
-        &self,
-        request: CellWorkflowRegisterRequest,
-    ) -> CapabilityResult<CellWorkflowRegisterOutput>;
-
-    async fn schedule_workflow(
-        &self,
-        request: CellWorkflowScheduleRequest,
-    ) -> CapabilityResult<CellWorkflowScheduleOutput>;
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusLookup {
     pub query: String,
     pub limit: usize,

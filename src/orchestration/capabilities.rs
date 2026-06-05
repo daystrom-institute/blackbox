@@ -9,25 +9,20 @@
 
 use std::sync::Arc;
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bro_capabilities::{
     AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CellLoadOutput, CellLoadRequest,
-    CellRegisterOutput, CellRegisterRequest, CellRegistryCapability, CellWorkflowCapability,
-    CellWorkflowRegisterOutput, CellWorkflowRegisterRequest, CellWorkflowScheduleOutput,
-    CellWorkflowScheduleRequest, CorpusCapability, CorpusHit, CorpusLookup, RefactorCapability,
-    RefactorPlanHandle, RefactorRequest,
+    CellRegisterOutput, CellRegisterRequest, CellRegistryCapability, CorpusCapability, CorpusHit,
+    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
 use parking_lot::RwLock;
-use serde_json::{Value, json};
 
 use crate::refactor::{self, RefactorPlanParams};
 use crate::server::state::{BlackboxServer, SharedState};
 use crate::tools::bro_params::AtomInvokeParams;
-use crate::workflow::ops::{HookOp, OnFailure, OpKind};
-use crate::workflow::schema::{NodeSpec, NodeTransition, Workflow};
 
 /// Corpus capability backed by the daemon's live transcript index.
 pub(crate) struct DaemonCorpus {
@@ -115,177 +110,6 @@ impl CellRegistryCapability for DaemonCells {
     }
 }
 
-/// Durable cell workflow registration/scheduling backed by existing workflow,
-/// packet, and cron substrate. The authorial unit is still a cell; the workflow
-/// spec generated here is the daemon-owned durable wrapper.
-pub(crate) struct DaemonCellWorkflows {
-    pub(crate) state: Arc<SharedState>,
-}
-
-#[async_trait]
-impl CellWorkflowCapability for DaemonCellWorkflows {
-    async fn register_workflow(
-        &self,
-        request: CellWorkflowRegisterRequest,
-    ) -> CapabilityResult<CellWorkflowRegisterOutput> {
-        register_cell_workflow(&self.state, request)
-            .map_err(|e| BroError::new("cell_workflow_register_failed", e.to_string()))
-    }
-
-    async fn schedule_workflow(
-        &self,
-        request: CellWorkflowScheduleRequest,
-    ) -> CapabilityResult<CellWorkflowScheduleOutput> {
-        schedule_cell_workflow(&self.state, request)
-            .map_err(|e| BroError::new("cell_workflow_schedule_failed", e.to_string()))
-    }
-}
-
-fn version_number(version: &str) -> u32 {
-    version
-        .strip_prefix('v')
-        .unwrap_or(version)
-        .parse::<u32>()
-        .unwrap_or(1)
-}
-
-fn register_cell_workflow(
-    state: &Arc<SharedState>,
-    request: CellWorkflowRegisterRequest,
-) -> anyhow::Result<CellWorkflowRegisterOutput> {
-    crate::cells::load_cell(
-        &state.artifacts.read(),
-        CellLoadRequest {
-            handle: request.cell_handle.clone(),
-        },
-    )?;
-    let workflow_id = request.name.clone();
-    let input_arg = request
-        .input_json
-        .clone()
-        .unwrap_or_else(|| Value::String("${vars.input}".to_string()));
-    let mut nodes = HashMap::new();
-    nodes.insert(
-        "RunCell".to_string(),
-        NodeSpec {
-            actor: String::new(),
-            on_enter: vec![HookOp {
-                op: OpKind::CellRun,
-                args: json!({
-                    "handle": request.cell_handle,
-                    "input": input_arg,
-                }),
-                when: None,
-                on_failure: OnFailure::Halt,
-                into_var: Some("cell_result".to_string()),
-            }],
-            next: NodeTransition::Terminal,
-            ..Default::default()
-        },
-    );
-    let spec = Workflow {
-        name: workflow_id.clone(),
-        version: version_number(&request.version),
-        actors: HashMap::new(),
-        atom_bindings: HashMap::new(),
-        nodes,
-        start: "RunCell".to_string(),
-        policy_packet: None,
-        vars_schema: None,
-        on_arc_exit: Vec::new(),
-        on_arc_cancel: Vec::new(),
-    };
-    let compiled = crate::workflow::compile(spec.clone())?;
-    crate::server::workflow_capabilities::validate_workflow_capabilities(&compiled, state)
-        .map_err(|e| anyhow::anyhow!(e))?;
-    let dir = state.store_dir.join("workflows");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join(format!("{workflow_id}.json")),
-        serde_json::to_string_pretty(&spec).unwrap_or_default(),
-    )?;
-    state
-        .workflow_registry
-        .write()
-        .insert(workflow_id.clone(), spec);
-    Ok(CellWorkflowRegisterOutput {
-        workflow_id,
-        cell_handle: compiled.spec.nodes["RunCell"].on_enter[0].args["handle"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        name: request.name,
-        version: request.version,
-    })
-}
-
-fn schedule_cell_workflow(
-    state: &Arc<SharedState>,
-    request: CellWorkflowScheduleRequest,
-) -> anyhow::Result<CellWorkflowScheduleOutput> {
-    if !state
-        .workflow_registry
-        .read()
-        .contains_key(&request.workflow_id)
-    {
-        anyhow::bail!("workflow `{}` is not registered", request.workflow_id);
-    }
-    crate::crons::validate_schedule(&request.schedule)?;
-    let domain = format!("narf-schedule/{}", request.name);
-    let packet = crate::packets::CompileParams {
-        domain: domain.clone(),
-        rules: json!([{
-            "id": "start_cell_workflow",
-            "classification": "start_arc",
-            "antecedent": { "op": "True" },
-            "consequent": serde_json::to_string(&json!({
-                "route": "start_arc",
-                "workflow": request.workflow_id,
-                "initial_vars": { "input": "${entity.input}" }
-            }))?,
-        }]),
-        classification_lattice: Some(vec!["start_arc".to_string()]),
-        prefix_inference: Some(BTreeMap::new()),
-        rank_table: None,
-        threshold_table: None,
-        rank_lookup_key: None,
-        threshold_lookup_key: None,
-        source_ids: Some(vec!["narf_scheduleWorkflow".to_string()]),
-        scope: Some("global".to_string()),
-        project: None,
-    };
-    state.packets.read().compile(&packet)?;
-
-    let mut payload = serde_json::Map::new();
-    payload.insert(
-        "input".to_string(),
-        request.input_json.clone().unwrap_or(Value::Null),
-    );
-    let spec = crate::crons::CronSpec {
-        name: request.name.clone(),
-        schedule: request.schedule,
-        payload,
-        concurrency: request.concurrency.unwrap_or(1),
-        routing_packet: format!("domain:{domain}"),
-        default_project_dir: request.default_project_dir,
-        tz: None,
-    };
-    let dir = state.store_dir.join("crons");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(
-        dir.join(format!("{}.json", spec.name)),
-        serde_json::to_string_pretty(&spec).unwrap_or_default(),
-    )?;
-    state.crons.install(spec.clone());
-    let handle = crate::crons::spawn_loop(state.clone(), spec.clone());
-    state.crons.track_handle(&spec.name, handle);
-    Ok(CellWorkflowScheduleOutput {
-        cron_name: spec.name,
-        workflow_id: request.workflow_id,
-        routing_packet: spec.routing_packet,
-    })
-}
-
 /// Refactor capability backed by the daemon's real plan path. Produced plans
 /// are kept host-side keyed by handle id; only the handle (id + preview)
 /// crosses into the agent's context (§6/§9 ref-handle model).
@@ -295,7 +119,7 @@ pub(crate) struct DaemonRefactor {
 }
 
 impl DaemonRefactor {
-    pub(crate) fn new(state: Arc<SharedState>) -> Self {
+    fn new(state: Arc<SharedState>) -> Self {
         Self {
             state,
             plans: RwLock::new(HashMap::new()),
@@ -369,9 +193,6 @@ pub(crate) fn install(state: &Arc<SharedState>) {
         state: state.clone(),
     }));
     bro_harness::capabilities::install_cells(Arc::new(DaemonCells {
-        state: state.clone(),
-    }));
-    bro_harness::capabilities::install_cell_workflows(Arc::new(DaemonCellWorkflows {
         state: state.clone(),
     }));
     bro_harness::capabilities::install_refactor(Arc::new(DaemonRefactor::new(state.clone())));
@@ -456,96 +277,6 @@ mod tests {
         assert_eq!(loaded.version, "v1");
         assert!(loaded.source.contains("input.n * 2"));
         assert_eq!(loaded.contract_json["entry"], "run");
-    }
-
-    #[tokio::test]
-    async fn daemon_cell_workflow_registers_runs_and_schedules() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = Arc::new(SharedState::for_test(dir.path()));
-        let cells = DaemonCells {
-            state: state.clone(),
-        };
-        cells
-            .register_cell(CellRegisterRequest {
-                name: "math/double".to_string(),
-                version: "v1".to_string(),
-                source: "function run(input) { return { doubled: input.n * 2 }; }".to_string(),
-                contract_json: serde_json::json!({
-                    "entry": "run",
-                    "input": {
-                        "type": "object",
-                        "properties": { "n": { "type": "integer" } },
-                        "required": ["n"]
-                    },
-                    "output": {
-                        "type": "object",
-                        "properties": { "doubled": { "type": "integer" } },
-                        "required": ["doubled"]
-                    }
-                }),
-                description: None,
-                supersedes: None,
-            })
-            .await
-            .expect("register cell");
-
-        let workflows = DaemonCellWorkflows {
-            state: state.clone(),
-        };
-        let registered = workflows
-            .register_workflow(CellWorkflowRegisterRequest {
-                name: "double-workflow".to_string(),
-                version: "v1".to_string(),
-                cell_handle: "atom:math/double@v1".to_string(),
-                input_json: None,
-            })
-            .await
-            .expect("register workflow");
-        assert_eq!(registered.workflow_id, "double-workflow");
-
-        let spec = state
-            .workflow_registry
-            .read()
-            .get("double-workflow")
-            .cloned()
-            .expect("workflow installed");
-        let compiled = crate::workflow::compile(spec).expect("workflow compiles");
-        let server = BlackboxServer::new(state.clone());
-        let mut vars = serde_json::Map::new();
-        vars.insert("input".to_string(), serde_json::json!({ "n": 21 }));
-        let result = crate::workflow::engine::run_workflow_with_initial_vars(
-            &server,
-            &compiled,
-            None,
-            Some(5),
-            vars,
-        )
-        .await;
-        assert_eq!(result.status, "completed");
-        assert_eq!(
-            result.vars["cell_result"],
-            serde_json::json!({ "doubled": 42 })
-        );
-
-        let scheduled = workflows
-            .schedule_workflow(CellWorkflowScheduleRequest {
-                name: "double-hourly".to_string(),
-                workflow_id: "double-workflow".to_string(),
-                schedule: "0 0 0 1 1 *".to_string(),
-                input_json: Some(serde_json::json!({ "n": 3 })),
-                concurrency: Some(1),
-                default_project_dir: None,
-            })
-            .await
-            .expect("schedule workflow");
-        assert_eq!(scheduled.cron_name, "double-hourly");
-        assert_eq!(scheduled.workflow_id, "double-workflow");
-        assert_eq!(
-            scheduled.routing_packet,
-            "domain:narf-schedule/double-hourly"
-        );
-        assert_eq!(state.crons.list().len(), 1);
-        state.crons.remove("double-hourly");
     }
 
     /// A bogus plan kind drives the real plan dispatch and surfaces its error —

@@ -1,7 +1,4 @@
 use anyhow::{Result, anyhow, bail};
-use std::sync::Arc;
-
-use bro_capabilities::CellLoadRequest;
 use serde_json::{Value, json};
 
 use crate::workflow::context::resolve_arg_value;
@@ -144,54 +141,6 @@ impl WorkflowRunner<'_> {
         })
     }
 
-    async fn execute_cell_run_op(&self, hook: &HookOp) -> Result<OpEffect> {
-        let rendered_args = resolve_arg_value(&self.ctx, &hook.args)
-            .map_err(|e| anyhow!("op {:?}: arg render failed: {e}", hook.op))?;
-        let handle = rendered_args
-            .get("handle")
-            .and_then(Value::as_str)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| anyhow!("cell_run requires args.handle"))?;
-        let input_json = rendered_args.get("input").cloned().unwrap_or(Value::Null);
-        let loaded = crate::cells::load_cell(
-            &self.server.state.artifacts.read(),
-            CellLoadRequest {
-                handle: handle.to_string(),
-            },
-        )
-        .map_err(|e| anyhow!("cell_run load: {e}"))?;
-        let contract: bro_script::CellContract = serde_json::from_value(loaded.contract_json)
-            .map_err(|e| anyhow!("cell_run contract parse: {e}"))?;
-        let caps = bro_script::Capabilities {
-            atoms: Arc::new(crate::orchestration::capabilities::DaemonAtoms {
-                state: self.server.state.clone(),
-            }),
-            refactor: Arc::new(crate::orchestration::capabilities::DaemonRefactor::new(
-                self.server.state.clone(),
-            )),
-            tools: None,
-            kv: Arc::new(bro_harness::capabilities::KvStore::default()),
-        };
-        let runtime =
-            bro_script::ScriptRuntime::new(caps, bro_script::SupervisionPolicy::default())
-                .await
-                .map_err(|e| anyhow!("cell_run runtime init: {e:#}"))?;
-        let output = runtime
-            .call_cell(loaded.source, contract, input_json)
-            .await
-            .map_err(|e| anyhow!("cell_run failed: {e:#}"))?;
-        let value: Value =
-            serde_json::from_str(&output).map_err(|e| anyhow!("cell_run output parse: {e}"))?;
-        Ok(OpEffect::SetVar {
-            key: hook
-                .into_var
-                .as_deref()
-                .unwrap_or("cell_result")
-                .to_string(),
-            value,
-        })
-    }
-
     /// Run a list of HookOps against the current ArcContext. Per-op `when`
     /// packet evaluates against the flattened entity; failure is handled per
     /// `on_failure`.
@@ -263,7 +212,6 @@ impl WorkflowRunner<'_> {
                     self.execute_poll_attached_invocation_op(hook).await
                 }
                 OpKind::ExecuteSupervisionAction => self.execute_supervision_action_op(hook).await,
-                OpKind::CellRun => self.execute_cell_run_op(hook).await,
                 _ => {
                     execute_op_with_hub(
                         hook,
