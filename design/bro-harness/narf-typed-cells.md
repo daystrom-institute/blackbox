@@ -189,15 +189,37 @@ selection → out-box):
   cells, inspecting a contract). Authoring, naming, and launching a durable thing
   are model judgement calls — they belong to the awake model.
 - **In-box (exact deref):** *invoking* an already-named cell by exact ref —
-  `atom:reviewer@v1(input)` — and, for a durable cell, *parking on a known
-  correlation* (`await narf.wait({ signal: "task-completed", task_id })` where
-  `task_id` is a value the cell already holds from its own dispatch). The box may
-  call what it was handed; it may not browse the catalog to decide what to call.
+  `atom:reviewer@v1(input)` — and **parking on a promise handle the cell holds**: a
+  dispatch like `bro.exec(...)` returns a `Promise`; awaiting it **parks the bro and
+  returns** (the turn ends), and the daemon wakes a *new* turn when the promise
+  settles (**wake-native**, §4.0). No in-box wait verb, no correlation authored
+  in-box — the promise handle *is* the wait token. The box may call/await what it
+  was handed; it may not browse the catalog to decide what to call.
 
 This is the same split the data-model doc draws for KV (`narf.kv.get(known-name)`
 in-box; `narf_kv_list` out-box) and tool-placement draws for `mcp.*`.
 
 ## 4. The durable tier rides the existing park/resolve seam (it's your IOCP picture, already built)
+
+### 4.0 Wake-native: one wake primitive, many producers
+
+The model underneath every tier is **wake-native**. There is ONE wake primitive:
+**park-on-promise-settle**. A bro/cell that hits a wait does NOT hold its isolate
+and block — it **parks and returns** (the turn/isolate ends) and is resumed in a
+**new turn** when the awaited promise settles, replayed with the settle payload +
+persisted KV state. child-bro / timer / signal / webhook are just different
+**producers** of a promise; "wake" is the pending→settled transition; the
+`Promise<T>` handle **is** the wait token. This dissolves the blocking-await vs
+durable-background fork — they are the same thing. `bro.exec` returns a Promise;
+`bro.wait`/`whenAll`/`whenAny`/`pipeline` compose on promise-settle; a durable
+promise is park-on-promise-settle; `/loop` is park-on-timer. **There is no separate
+`narf.wait` verb** — parking is awaiting a promise handle the cell already holds.
+This is how the workflow engine already runs (below) and how Claude Code itself
+runs (woken by notifications, act, persist, sleep); "make bros wake-native" lifts
+that primitive from authored workflow arcs up to every bro and NARF cell. The
+existing harness-local substrate is `crates/bro-tools/src/promise.rs` +
+`agent_loop.rs::session_loop`: completion auto-injects a hidden `HARNESS_EVENT`
+turn on settle, and `promise_wait` consumes that wake.
 
 The operator described the durable mechanism as "vaguely TPL IO-completion-port
 shaped: first cell awaits → under the covers an IRP/DPC → later the result comes
@@ -242,14 +264,16 @@ completion is already routed onto the signal bus.
 So a durable cell does:
 
 ```js
-const { task_id } = await bro.exec({ brofile: "reviewer", prompt });   // dispatch
-const result = await narf.wait({ signal: "task-completed",             // park
-                                 correlate: { task_id } });            // resolves via existing bridge
+const result = await bro.exec({ brofile: "reviewer", prompt });   // returns a Promise; await parks the bro
 ```
 
-…and the existing task-completed router + signal bridge resolve the park. The
-only *new* surface is `narf.wait` itself (an in-box verb that lowers to a
-`WaitSpec` and hands it to the engine) — not a new completion channel.
+`bro.exec` returns a **Promise** (the wait token). Awaiting it **parks the bro and
+returns** — the turn ends — and the existing task-completed router + signal bridge
+deliver the settle that wakes the *next* turn (replayed with the settle payload +
+persisted KV state). Child-bro completion is just one **producer** of a settle
+(timer / signal / webhook are others). There is **no `narf.wait` verb** and no new
+completion channel — the only new work is lifting the engine's park/resolve
+lifecycle up from authored workflow arcs to bros/cells.
 
 There are already three signal ingress points the durable cell inherits for free:
 `bro_arc_signal` (manual, `tools/orchestrate.rs:319`), webhook
@@ -269,7 +293,7 @@ LLM stops cosplaying a state machine; the daemon owns the loop"), now applied to
 the cell body instead of the model.
 
 The honest cost this imposes: a durable cell body must be **structured around its
-park points** — between two `narf.wait`s, the work must be either idempotent or
+park points** — between two park-on-promise-settle points, the work must be either idempotent or
 KV-checkpointed, because re-entry after restart re-runs from the last persisted
 node, not from the exact JS statement. This is the determinism discipline a
 `registerWorkflow` cell signs up for and an `exec` cell does not.
@@ -292,8 +316,8 @@ sandbox cannot own itself (because they outlive any one isolate):
 Everything else the atom/workflow systems do today — the four atom backends, the
 JSON node graph, the typed `next` edges — becomes *the cell body's business*, not
 the daemon's. A "deterministic atom" is a cell with no `effects`. A "profile
-atom" is a cell whose body is one `bro.exec` + `narf.wait`. An "ensemble
-workflow" is a cell that fans out N `bro.exec`s and `narf.wait`s on all of them
+atom" is a cell whose body is one awaited `bro.exec`. An "ensemble
+workflow" is a cell that fans out N `bro.exec`s and awaits them all (`whenAll`)
 (the existing `bro_when_all` semantics, expressed in JS). The taxonomy collapses
 into "what the body happens to do."
 
@@ -326,9 +350,14 @@ The thesis is "mostly built." Precisely what is *not*:
    registered-handle `narf_run` validates input before calling the declared
    entry and output before returning. What does **not** exist yet is the durable
    workflow-tier enforcement around park/resume boundaries.
-2. **No `narf.wait` in-box verb.** The park surface exists only as workflow
-   `WaitSpec`/`run_wait_node`; there is no cell-facing `narf.wait` that lowers a
-   known correlation into a `WaitSpec` and suspends the cell's owning arc.
+2. **Promise-settle wake is not lifted to the bro/cell level (the wake-native
+   gap).** The park/resolve lifecycle exists only as workflow
+   `WaitSpec`/`run_wait_node` for authored arcs, and the harness-local
+   promise-wake exists only live-loop (`promise.rs` + `agent_loop.rs`). What is
+   missing is the unification (§4.0): a bro/cell awaiting a **held promise** (e.g.
+   `bro.exec(...)`) parking-and-returning and being woken the next turn by the
+   existing settle producers. There is **no `narf.wait` verb to build** — by
+   design; the work is the lift, not a new verb.
 3. **WaitStore is not persisted; parked arcs do not survive restart.**
    `wait.rs:121` is explicit ("v1 — no persistence"), and `restore_runtime_state`
    (`src/server/restore.rs:6`) restores webhooks/pollers/crons/whiteboards/
@@ -374,11 +403,13 @@ The thesis is "mostly built." Precisely what is *not*:
 
 - **D1 — Contract schema dialect.** JSON Schema (verbose, standard, already used
   by atoms) vs a thinner bespoke shape. Leaning JSON Schema for atom parity.
-- **D2 — `narf.wait` correlation authority.** A cell may only park on
-  correlations built from values it *holds* (e.g. a `task_id` it got from its own
-  `bro.exec`). Can it park on an operator-supplied correlation it did not
-  originate? That edges toward in-box selection — probably out-box (the scheduling
-  verb supplies the correlation; the body derefs it). Needs a ruling.
+- **D2 — Wait authority — DECIDED (wake-native; no wait verb).** There is no
+  `narf.wait`/correlation verb. A cell parks only by awaiting a **promise handle it
+  holds** (e.g. its own `bro.exec(...)`); the promise *is* the wait token. A cell
+  never authors a `{signal, correlation}` selector in-box — that is correlation
+  *selection*, which stays out-box (an operator/scheduling trigger is bound out-box
+  and handed to the cell as a promise to await). Aligns parking with the box-edge
+  rule: the box awaits what it was handed; it never selects what to wait on.
 - **D3 — Determinism discipline enforcement.** §4.2 asks durable bodies to be
   checkpoint-structured. Is that a lint, a runtime guard (e.g. forbid
   non-idempotent effects between un-checkpointed park points), or just doc
