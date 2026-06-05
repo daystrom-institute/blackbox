@@ -1008,11 +1008,23 @@ roster render.
   (default fail-safe out-box) places external MCP tools in-box via the host-tool
   seam, reachable as a non-enumerating `mcp.<server>.<tool>(args)` Proxy
   (`mcp__server__tool` → `op_tool_invoke`, returns values), filter gating the
-  whole capability (in-box-only excluded from the model registry). **With this the
-  NARF tool-calling MVP is complete.** STILL OPEN (post-MVP): `bro_*` in-box
-  placement + per-presence filter targeting; out-box KV writes; `Promise`/
-  `narf_wait` durable surface; `Tx` parked (`narf-effects-and-safety.md`); §5a
-  supervised shell.
+  whole capability (in-box-only excluded from the model registry). **Typed
+  in-process MCP config** (`7c15da9`): the in-process dispatch no longer
+  round-trips config through argv — a typed `McpConfig { servers:
+  McpServerConfig::{Http,Sse,Stdio,InProcess}, tool_placement }` is injected per
+  dispatch (`ExecParams.tool_placement` threads in; `--mcp-config` stripped from
+  the in-process argv; standalone CLI fallback + codex/claude argv preserved).
+  This is what makes in-box MCP *reachable e2e*. **LIVE SMOKE PASSED** (isolated
+  daemon 7299, real glm, prod 7264 untouched): a dispatch with
+  `tool_placement:{"mcp__blackbox__bbox_stats":"in-box"}` ran a cell
+  `await mcp.blackbox.bbox_stats({})` and got the isolated daemon's stats back
+  (0 docs — confirming the real MCP round-trip hit the isolated daemon, not prod).
+  **With this the NARF tool-calling MVP is complete and live-validated.** STILL
+  OPEN (post-MVP): the §6 `InProcess`/`McpSurface` wiring (kill the self-MCP HTTP
+  hop for blackbox's own tools — defined, unwired); `bro_*` in-box placement +
+  per-presence filter targeting; out-box KV writes; fleet.json-wide
+  `tool_placement` default; `Promise`/`narf_wait` durable surface; `Tx` parked
+  (`narf-effects-and-safety.md`); §5a supervised shell.
 
   LAYERING CORRECTION — **FIXED.** The §9-auth authoring surface
   (`narf.prepare`/`run`/`session.define`, commit `8a86e75`) had been mislayered as
