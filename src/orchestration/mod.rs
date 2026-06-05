@@ -1038,10 +1038,10 @@ impl std::error::Error for BroSpawnError {}
 pub struct SpawnTaskParams {
     pub provider: Provider,
     pub args: Vec<String>,
-    /// Provider session id to record once known. Badgey callers must
-    /// not pre-mint provider session ids; this is only copied from the
-    /// provider path, or left as the existing provider-specific
-    /// placeholder such as Gemini's `pending`.
+    /// Provider session id to record. Harness-backed fresh dispatch normally
+    /// pre-mints this in the daemon and passes it to the harness; legacy or
+    /// provider-discovered paths may still use a temporary placeholder such as
+    /// `pending` until the first stream event.
     pub session_id: String,
     pub cwd: Option<String>,
     pub env_overrides: Option<HashMap<String, String>>,
@@ -1593,9 +1593,11 @@ fn ingest_harness_event(
         provider.parse_event(&evt, &mut sink);
         let emitted_session_id = sink.session_id.clone();
         let mut accepted = true;
+        let mut session_id_observed = false;
         if let Some(sid) = emitted_session_id {
             if inner.session_id == "pending" {
                 inner.session_id = sid;
+                session_id_observed = true;
             } else if inner.session_id != sid {
                 reject_forked_session(&mut inner, &sid);
                 accepted = false;
@@ -1621,9 +1623,17 @@ fn ingest_harness_event(
                 })
             })
             .flatten()
+            .map(|snippet| (snippet, session_id_observed))
+            .or_else(|| session_id_observed.then(|| (String::new(), true)))
     };
 
-    if let Some(snippet) = snippet_to_emit {
+    if let Some((snippet, session_id_observed)) = snippet_to_emit {
+        if session_id_observed {
+            task.notify.notify_waiters();
+        }
+        if snippet.is_empty() {
+            return;
+        }
         let _ = tail_tx.send(tail::TailEvent::TaskProgress {
             task_id: task_id.to_string(),
             activity: snippet.clone(),
@@ -2149,9 +2159,11 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                         provider.parse_event(&evt, &mut sink);
                         let emitted_session_id = sink.session_id.clone();
                         let mut accepted = true;
+                        let mut session_id_observed = false;
                         if let Some(sid) = emitted_session_id {
                             if inner.session_id == "pending" {
                                 inner.session_id = sid;
+                                session_id_observed = true;
                             } else if inner.session_id != sid {
                                 // Provider emitted a session_id that doesn't
                                 // match the one we asked to resume. Mark failed
@@ -2181,10 +2193,17 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                                 })
                             })
                             .flatten()
+                            .map(|snippet| (snippet, session_id_observed))
+                            .or_else(|| session_id_observed.then(|| (String::new(), true)))
                     };
 
-                    if let Some(snippet) = snippet_to_emit {
-                        if last_emitted_snippet.as_deref() != Some(snippet.as_str()) {
+                    if let Some((snippet, session_id_observed)) = snippet_to_emit {
+                        if session_id_observed {
+                            task_ref.notify.notify_waiters();
+                        }
+                        if !snippet.is_empty()
+                            && last_emitted_snippet.as_deref() != Some(snippet.as_str())
+                        {
                             let _ = tail_tx_clone.send(tail::TailEvent::TaskProgress {
                                 task_id: task_id_clone.clone(),
                                 activity: snippet.clone(),
@@ -2228,9 +2247,11 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                     session_id: None,
                 };
                 provider.parse_bulk_output(buf.trim(), &mut sink);
+                let mut session_id_observed = false;
                 if let Some(sid) = sink.session_id.clone() {
                     if inner.session_id == "pending" {
                         inner.session_id = sid;
+                        session_id_observed = true;
                         inner.supervision.observe_bulk_sink(&sink, now_ms());
                         apply_sink_updates(&mut inner, sink);
                     } else if inner.session_id != sid {
@@ -2242,6 +2263,10 @@ fn spawn_task_reserved(task_id: String, params: SpawnTaskParams) -> SpawnedTask 
                 } else {
                     inner.supervision.observe_bulk_sink(&sink, now_ms());
                     apply_sink_updates(&mut inner, sink);
+                }
+                if session_id_observed {
+                    drop(inner);
+                    task_ref_bulk.notify.notify_waiters();
                 }
             }
             let _ = stdout_done_tx.send(());
@@ -2434,6 +2459,46 @@ pub async fn wait_for_task_with_timeout(task: &Task, timeout_secs: Option<f64>) 
     }
 }
 
+/// Wait for a provider-backed task to publish its real session id.
+///
+/// Wait for a late-discovered provider session id.
+///
+/// Modern harness-backed fresh dispatch pre-mints a concrete id before spawn.
+/// This remains as a guard for legacy/provider-discovered paths: the
+/// placeholder is internal state, and public authorial surfaces should either
+/// return a concrete session id or diagnose the failed handshake.
+pub async fn wait_for_task_session_id_with_timeout(
+    task: &Task,
+    timeout_secs: f64,
+) -> Option<String> {
+    async fn wait_for_session_id(task: &Task) -> Option<String> {
+        loop {
+            let notified = task.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            {
+                let inner = task.inner.lock();
+                if !inner.session_id.is_empty() && inner.session_id != "pending" {
+                    return Some(inner.session_id.clone());
+                }
+                if inner.status.is_terminal() {
+                    return None;
+                }
+            }
+            notified.await;
+        }
+    }
+
+    tokio::time::timeout(
+        std::time::Duration::from_secs_f64(timeout_secs),
+        wait_for_session_id(task),
+    )
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Cancel a running task.
 pub fn cancel_task(
     task: &Task,
@@ -2615,6 +2680,7 @@ pub fn task_result_json(task: &Task) -> Value {
     if let Some(ref msg) = inner.last_assistant_message {
         obj["result"] = Value::String(msg.clone());
     }
+    obj["hasResult"] = Value::Bool(inner.last_assistant_message.is_some());
     if inner.status == TaskStatus::Completed || inner.status == TaskStatus::Failed {
         if let Some(ref u) = inner.usage {
             // `input_tokens` is fresh (cache-exclusive). Surface the cache
@@ -2635,6 +2701,16 @@ pub fn task_result_json(task: &Task) -> Value {
         }
         if let Some(turns) = inner.num_turns {
             obj["numTurns"] = Value::from(turns);
+        }
+        if inner.last_assistant_message.is_none() {
+            obj["resultCapture"] = serde_json::json!({
+                "status": "missing",
+                "message": "task reached a terminal state without a captured assistant result",
+                "eventCount": observed_event_count(&inner),
+                "exitCode": inner.exit_code,
+                "stderrPresent": !inner.stderr.trim().is_empty(),
+                "transcriptLocated": inner.transcript_location.is_some(),
+            });
         }
     }
     if let Some(ref label) = inner.bro_label {
@@ -3731,6 +3807,7 @@ mod tests {
         let json = task_result_json(&task);
         assert_eq!(json["taskId"], "t1");
         assert_eq!(json["result"], "Done!");
+        assert_eq!(json["hasResult"], true);
         assert_eq!(json["costUsd"], 0.05);
         assert_eq!(json["usage"]["input_tokens"], 100);
         assert!(json["supervision"].is_object());
@@ -3767,6 +3844,9 @@ mod tests {
         });
 
         let json = task_result_json(&task);
+        assert_eq!(json["hasResult"], false);
+        assert_eq!(json["resultCapture"]["status"], "missing");
+        assert_eq!(json["resultCapture"]["stderrPresent"], true);
         assert_eq!(json["exitCode"], 1);
         assert!(
             json["stderr"]
@@ -3774,6 +3854,48 @@ mod tests {
                 .unwrap()
                 .contains("something went wrong")
         );
+    }
+
+    #[test]
+    fn task_result_json_completed_without_result_surfaces_capture_diagnostic() {
+        let task = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "t-empty".into(),
+                provider: Provider::Minimax,
+                session_id: "s-empty".into(),
+                events: vec![serde_json::json!({"type": "system", "subtype": "init"})],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Completed,
+                started_at: 1000,
+                completed_at: Some(2000),
+                exit_code: Some(0),
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                supervision: SupervisionState::default(),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+
+        let json = task_result_json(&task);
+        assert_eq!(json["status"], "completed");
+        assert_eq!(json["hasResult"], false);
+        assert_eq!(json["resultCapture"]["status"], "missing");
+        assert_eq!(
+            json["resultCapture"]["message"],
+            "task reached a terminal state without a captured assistant result"
+        );
+        assert_eq!(json["resultCapture"]["eventCount"], 1);
+        assert_eq!(json["resultCapture"]["exitCode"], 0);
     }
 
     #[test]
@@ -4017,6 +4139,79 @@ mod async_tests {
         });
         // Should return immediately without blocking
         wait_for_task(&task).await;
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_task_session_id_observes_non_pending_id() {
+        let task = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "t-session".into(),
+                provider: Provider::Brodex,
+                session_id: "pending".into(),
+                events: vec![],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                supervision: SupervisionState::default(),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+        let task_clone = task.clone();
+        tokio::spawn(async move {
+            task_clone.inner.lock().session_id = "real-session".into();
+            task_clone.notify.notify_waiters();
+        });
+
+        let session_id = wait_for_task_session_id_with_timeout(&task, 2.0).await;
+        assert_eq!(session_id.as_deref(), Some("real-session"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_for_task_session_id_returns_none_on_terminal_pending() {
+        let task = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "t-session-terminal".into(),
+                provider: Provider::Brodex,
+                session_id: "pending".into(),
+                events: vec![],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Completed,
+                started_at: now_ms(),
+                completed_at: Some(now_ms()),
+                exit_code: Some(0),
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                supervision: SupervisionState::default(),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+
+        let session_id = wait_for_task_session_id_with_timeout(&task, 2.0).await;
+        assert_eq!(session_id, None);
     }
 
     #[tokio::test]

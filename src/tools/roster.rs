@@ -5,8 +5,8 @@ use std::sync::Arc;
 use crate::notes;
 use crate::orchestration;
 use crate::orchestration as orch;
-use crate::orchestration::providers::{ExecOpts, Provider};
 use crate::orchestration::providers::dispatch_prelude::*;
+use crate::orchestration::providers::{ExecOpts, Provider};
 use crate::packets::apply_with as apply_packet_with;
 use crate::server::progress::{
     cleanup_policy_file_when_done, extra_filters_from_params, release_resume_lease_when_done,
@@ -1277,9 +1277,10 @@ Next step: <one concrete steering suggestion>\n"
             }
             let member = &mut team.members[target_member_idx];
             member.task_history.push(tid.clone());
-            // Track the latest launch immediately, including "pending",
-            // so later team rounds fail closed instead of starting a
-            // second session before provider-side discovery completes.
+            // Track the latest launch immediately. Fresh harness dispatches
+            // should already carry a concrete pre-minted session id; legacy
+            // pending values are still preserved so later team rounds fail
+            // closed instead of forking a second session.
             member.session_id = Some(task_sid.clone());
             // Stamp a precise team::member label on the task so the
             // tail handler can attribute even when later resolution

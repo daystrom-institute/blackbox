@@ -294,7 +294,7 @@ impl BlackboxServer {
         );
 
         let task_id = uuid::Uuid::new_v4().to_string();
-        let session_id = "pending".to_string();
+        let session_id = uuid::Uuid::new_v4().to_string();
         let ambient_ctx = orch::AmbientContext {
             task_id: Some(task_id.clone()),
             session_id: Some(session_id.clone()),
@@ -455,6 +455,7 @@ impl BlackboxServer {
             }
         }
         let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
+        let lease_brofile_context = brofile_context.clone();
         let dispatched = match self.dispatch_fresh_bro_task(FreshDispatchRequest {
             prompt: p.prompt.clone(),
             provider,
@@ -480,11 +481,53 @@ impl BlackboxServer {
             Err(e) => return Self::err_text(&e),
         };
 
+        const SESSION_ID_HANDSHAKE_TIMEOUT_SECS: f64 = 15.0;
+        let Some(session_id) = orch::wait_for_task_session_id_with_timeout(
+            &dispatched.task,
+            SESSION_ID_HANDSHAKE_TIMEOUT_SECS,
+        )
+        .await
+        else {
+            let inner = dispatched.task.inner.lock();
+            return Self::err_text(&format!(
+                "bro_exec defect: provider did not publish a concrete session id within {SESSION_ID_HANDSHAKE_TIMEOUT_SECS:.0}s (taskId={}, provider={}, status={:?}, exitCode={:?}). Inspect with bro_status(task_id=\"{}\", tail=20).",
+                inner.id, inner.provider, inner.status, inner.exit_code, inner.id
+            ));
+        };
+
+        if let Some(allocation) = &dispatched.allocation {
+            let (task_id, cwd) = {
+                let inner = dispatched.task.inner.lock();
+                (inner.id.clone(), inner.cwd.clone())
+            };
+            orchestration::allocator::record_lease(
+                &self.state.store_dir,
+                orchestration::allocator::lease_from_allocation(
+                    task_id,
+                    session_id.clone(),
+                    allocation,
+                    p.project_dir.clone(),
+                    cwd,
+                    lease_brofile_context,
+                ),
+            );
+        }
+        if let Some(bro_name) = &p.bro {
+            let task_id = dispatched.task.id();
+            orchestration::team::propagate_session_id(&task_id, &session_id, &self.state.store_dir);
+            // Named-bro dispatches should remain labeled even before or after
+            // team resolution; record_task_to_bro already stamped the label and
+            // task history at spawn time.
+            if dispatched.task.inner.lock().bro_label.is_none() {
+                dispatched.task.inner.lock().bro_label = Some(bro_name.clone());
+            }
+        }
+
         let inner = dispatched.task.inner.lock();
         let mut response = json!({
             "taskId": inner.id,
-            "sessionId": inner.session_id,
-            "status": "running",
+            "sessionId": session_id,
+            "status": inner.status,
         });
         if let Some(allocation) = &dispatched.allocation {
             response["provider"] = json!(allocation.lane.provider);
