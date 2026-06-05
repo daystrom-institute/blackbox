@@ -16,8 +16,8 @@ use bro_capabilities::{
 };
 use bro_core::BroError;
 use bro_script::{
-    Capabilities, CellContract, ScriptRuntime, SupervisionPolicy, DEFAULT_HEAP_LIMIT_BYTES,
-    SCRIPT_RUNTIME_SUBSTRATE, V8_VERSION,
+    Capabilities, CellContract, DEFAULT_HEAP_LIMIT_BYTES, SCRIPT_RUNTIME_SUBSTRATE, ScriptRuntime,
+    SupervisionPolicy, V8_VERSION,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -577,6 +577,42 @@ async fn prepare_validates_and_echoes_contract() {
     let result = rt.run(resp.ref_handle.unwrap()).await.unwrap();
     let v: serde_json::Value = serde_json::from_str(&result).unwrap();
     assert_eq!(v["count"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn run_with_input_invokes_prepared_contract_entry() {
+    let rt = stub_runtime().await;
+    let resp = rt
+        .prepare(serde_json::json!({
+            "source": "function run(input) { return { count: input.repo.length }; }",
+            "contract": {
+                "entry": "run",
+                "input": {
+                    "type": "object",
+                    "properties": { "repo": { "type": "string" } },
+                    "required": ["repo"],
+                    "additionalProperties": false
+                },
+                "output": {
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"],
+                    "additionalProperties": false
+                }
+            }
+        }))
+        .await
+        .unwrap();
+
+    let result = rt
+        .run_with_input(
+            resp.ref_handle.unwrap(),
+            serde_json::json!({ "repo": "blackbox" }),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(v["count"], 8);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

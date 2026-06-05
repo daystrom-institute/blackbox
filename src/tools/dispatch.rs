@@ -393,7 +393,7 @@ impl BlackboxServer {
 impl BlackboxServer {
     #[tool(
         name = "bro_exec",
-        description = "Launch a fresh agent task/session and return {taskId, sessionId}; can target a named bro/provider or request runtime allocation by tier/pool/capabilities."
+        description = "Launch a fresh agent task/session and return {taskId, sessionId}. Required selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`."
     )]
     pub(crate) async fn bro_exec(&self, Parameters(p): Parameters<ExecParams>) -> CallToolResult {
         let allow_recursion = p.allow_recursion.unwrap_or(false);
@@ -429,7 +429,7 @@ impl BlackboxServer {
             )
         } else {
             return Self::err_text(
-                "Provide either bro, provider, or runtime allocation parameters",
+                "bro_exec requires a dispatch selector: provide either `bro`, `provider`, or runtime allocation fields such as `tier`, `pool_name`, `pin_provider`, `pin_model`, or `capabilities`",
             );
         };
         let brofile_runtime = p

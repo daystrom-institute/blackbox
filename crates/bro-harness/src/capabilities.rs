@@ -787,7 +787,7 @@ impl Tool for NarfExecTool {
     }
 
     fn description(&self) -> &str {
-        "Run a one-shot NARF JavaScript composition cell in-process. The cell receives values, not ref envelopes: host tools return values, JS handles transforms, `narf.encode.{yaml,frontmatter,mdTable}` formats output, `narf.kv.{set,get,peek,delete}` dereferences exact known names only, and the cell should return a compact value or KV name."
+        "Run a one-shot NARF JavaScript composition cell in-process. The cell receives values, not ref envelopes: host tools return values, JS handles transforms, `narf.encode.yaml(value)`, `narf.encode.frontmatter(attrs, body)`, and `narf.encode.mdTable(rows, columns?)` format output, `narf.kv.{set,get,peek,delete}` dereferences exact known names only, and the cell should return a compact value or KV name."
     }
 
     fn input_schema(&self) -> Value {
@@ -834,7 +834,7 @@ impl Tool for NarfPrepareTool {
     }
 
     fn description(&self) -> &str {
-        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Optionally validates and echoes a declared typed-cell contract. Returns {ref, status, diagnostics, source, contract} — review the rendered source, then narf_run the handle. The script has the same value-returning NARF dialect as narf_exec, including narf.encode.{yaml,frontmatter,mdTable} and exact-name narf.kv access."
+        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Optionally validates and echoes a declared typed-cell contract. Returns {ref, status, diagnostics, source, contract} — review the rendered source, then narf_run the handle. For a contracted prepared handle, pass input to narf_run to invoke the contract entry. The script has the same value-returning NARF dialect as narf_exec, including narf.encode.yaml(value), narf.encode.frontmatter(attrs, body), narf.encode.mdTable(rows, columns?), and exact-name narf.kv access."
     }
 
     fn input_schema(&self) -> Value {
@@ -1195,7 +1195,7 @@ impl Tool for NarfRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run a prepared NARF script handle, or run a registered exact cell handle with optional input; returns the result value."
+        "Run a prepared NARF script handle, or run a registered exact cell handle with optional input; returns the result value. For a prepared handle with a typed-cell contract, pass input to invoke the contract entry instead of executing the reviewed script body directly."
     }
 
     fn input_schema(&self) -> Value {
@@ -1203,7 +1203,7 @@ impl Tool for NarfRunTool {
             "type": "object",
             "properties": {
                 "ref": { "type": "string", "description": "Prepared script handle or registered cell handle." },
-                "input": { "description": "Input JSON for a registered contracted cell." }
+                "input": { "description": "Input JSON for a registered contracted cell or a prepared typed-cell contract entry." }
             },
             "required": ["ref"]
         })
@@ -1219,7 +1219,12 @@ impl Tool for NarfRunTool {
                 Ok(g) => g,
                 Err(e) => return ToolResult::Error(e),
             };
-            return match guard.as_ref().expect("runtime").run(handle).await {
+            let runtime = guard.as_ref().expect("runtime");
+            let result = match input.get("input") {
+                Some(input_json) => runtime.run_with_input(handle, input_json.clone()).await,
+                None => runtime.run(handle).await,
+            };
+            return match result {
                 Ok(output) => narf_result(output),
                 Err(e) => ToolResult::Error(format!("narf_run failed: {e:#}")),
             };
@@ -2020,6 +2025,57 @@ mod tests {
         let result = run.call(json!({ "ref": handle }), &test_cx()).await;
         match result {
             ToolResult::Json(v) => assert_eq!(v, json!(42)),
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn narf_run_prepared_contract_accepts_input() {
+        let session = narf_session_with(Arc::new(StubAtoms), None);
+        let prepare = NarfPrepareTool {
+            session: session.clone(),
+        };
+        let run = NarfRunTool { session };
+
+        let prepared = prepare
+            .call(
+                json!({
+                    "source": "function run(input) { return { count: input.repo.length }; }",
+                    "contract": {
+                        "entry": "run",
+                        "input": {
+                            "type": "object",
+                            "properties": { "repo": { "type": "string" } },
+                            "required": ["repo"],
+                            "additionalProperties": false
+                        },
+                        "output": {
+                            "type": "object",
+                            "properties": { "count": { "type": "integer" } },
+                            "required": ["count"],
+                            "additionalProperties": false
+                        }
+                    }
+                }),
+                &test_cx(),
+            )
+            .await;
+        let handle = match prepared {
+            ToolResult::Json(v) => v["ref"].as_str().unwrap().to_string(),
+            other => panic!("expected Json prepare, got {other:?}"),
+        };
+
+        let result = run
+            .call(
+                json!({
+                    "ref": handle,
+                    "input": { "repo": "blackbox" }
+                }),
+                &test_cx(),
+            )
+            .await;
+        match result {
+            ToolResult::Json(v) => assert_eq!(v, json!({ "count": 8 })),
             other => panic!("expected Json result, got {other:?}"),
         }
     }

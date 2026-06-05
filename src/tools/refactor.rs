@@ -1,6 +1,6 @@
 use crate::refactor::{
-    self, RefactorApplyParams, RefactorPlanParams, RefactorProjectRefsParams, RefactorRunParams,
-    RefactorStatusParams,
+    self, RefactorApplyParams, RefactorPlanKindsParams, RefactorPlanParams,
+    RefactorProjectRefsParams, RefactorRunParams, RefactorStatusParams,
 };
 use crate::server::BlackboxServer;
 
@@ -35,6 +35,17 @@ impl BlackboxServer {
         Parameters(p): Parameters<RefactorProjectRefsParams>,
     ) -> CallToolResult {
         Self::run("bbox_refactor_project_refs", || refactor::project_refs(&p))
+    }
+
+    #[tool(
+        name = "bbox_refactor_plan_kinds",
+        description = "List a compact machine-readable catalog of supported refactor plan kinds by language, safety class, backend, required fields, and suggested preflight."
+    )]
+    pub(crate) fn bbox_refactor_plan_kinds(
+        &self,
+        Parameters(p): Parameters<RefactorPlanKindsParams>,
+    ) -> CallToolResult {
+        Self::run("bbox_refactor_plan_kinds", || refactor::plan_kinds(&p))
     }
 
     #[tool(

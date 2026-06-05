@@ -120,6 +120,19 @@ pub struct RefactorProjectRefsParams {
     pub include_excerpt: Option<bool>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefactorPlanKindsParams {
+    /// Optional language filter, e.g. rust, java, csharp, elixir, generic.
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional safety filter: analysis_only, syntax_only, lsp_verified, sidecar_required, or generic_write.
+    #[serde(default)]
+    pub safety_class: Option<String>,
+    /// Optional backend filter: tree_sitter, lsp, text, toml, analysis, sidecar, or mixed.
+    #[serde(default)]
+    pub backend: Option<String>,
+}
+
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct JavaFieldSpec {
     #[serde(default)]
@@ -1267,6 +1280,268 @@ pub fn project_refs(p: &RefactorProjectRefsParams) -> Result<String> {
         chunks: refs,
     };
     Ok(serde_json::to_string_pretty(&response)?)
+}
+
+pub fn plan_kinds(p: &RefactorPlanKindsParams) -> Result<String> {
+    let mut kinds = vec![];
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "replace_text",
+            "write_file",
+            "create_file",
+            "move_file",
+            "ensure_toml_table",
+        ],
+        "generic",
+        "generic_write",
+        "text",
+        &[],
+        &["source"],
+        &["Review the dry-run plan before bbox_refactor_apply(confirm=true)."],
+        "Generic file/text/TOML primitives.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "rust_impl_partition_analysis",
+            "rust_top_level_dependency_analysis",
+            "rust_public_api_guard",
+        ],
+        "rust",
+        "analysis_only",
+        "analysis",
+        &[
+            "impl_item",
+            "impl_method",
+            "function_item",
+            "struct_item",
+            "enum_item",
+        ],
+        &["source"],
+        &["bbox_refactor_status", "bbox_code_symbols"],
+        "Read-only Rust analysis plans; return no FileEdits.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "extract_rust_items",
+            "extract_rust_section",
+            "move_rust_items_with_local_deps",
+            "extract_rust_impl_methods",
+            "extract_rust_function_region",
+            "delete_rust_items",
+            "add_rust_mod_decl",
+            "add_rust_use_decl",
+            "rust_module_wiring",
+            "rewrite_rust_item_visibility",
+            "rewrite_rust_field_visibility",
+            "inline_mod_to_file_submodule",
+            "extract_rust_items_to_submodule",
+            "move_rust_items_with_callers",
+            "rewrite_rust_error_type",
+            "migrate_rust_type_usages",
+            "extract_rust_trait",
+            "move_rust_struct_fields",
+            "update_rust_callers",
+            "rust_minimize_imports",
+        ],
+        "rust",
+        "syntax_only",
+        "tree_sitter",
+        &[
+            "mod_item",
+            "use_declaration",
+            "const_item",
+            "enum_item",
+            "impl_item",
+            "struct_item",
+            "function_item",
+            "impl_method",
+        ],
+        &["source"],
+        &["bbox_refactor_status", "sm-refactor-rust"],
+        "Rust structural plans. Some kinds require target, item_names, old_text/new_text, module_name, or operator opt-out flags; consult sm-refactor-rust for the exact contract.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "rust_lsp_rename",
+            "rust_organize_imports",
+            "rust_ra_classify_callbacks",
+            "rust_ra_move_item_to_module",
+        ],
+        "rust",
+        "lsp_verified",
+        "lsp",
+        &[],
+        &["source"],
+        &["bbox_refactor_status", "rust-analyzer availability"],
+        "Rust LSP-backed plans fail closed on rust-analyzer unavailability; rust_ra_move_item_to_module is discouraged unless explicitly investigating that path.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "java_class_dependency_analysis",
+            "java_public_api_guard",
+            "java_concurrency_antipattern_audit",
+            "java_vaadin_route_inventory",
+            "java_jooq_query_structure_analysis",
+        ],
+        "java",
+        "analysis_only",
+        "analysis",
+        &[
+            "class_declaration",
+            "method_declaration",
+            "field_declaration",
+        ],
+        &["source"],
+        &["bbox_refactor_status", "sm-refactor-java"],
+        "Read-only Java analysis/audit plans.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "extract_java_methods",
+            "extract_java_class",
+            "extract_java_nested_classes",
+            "move_java_field",
+            "move_java_constant",
+            "rewrite_java_visibility",
+            "add_java_implements",
+            "extract_java_interface",
+            "migrate_java_type_usages",
+            "extract_java_code_block_to_method",
+            "convert_method_to_class",
+            "inline_java_method",
+            "java_split_provider",
+            "replace_java_static_reference",
+        ],
+        "java",
+        "syntax_only",
+        "tree_sitter",
+        &[
+            "class_declaration",
+            "method_declaration",
+            "field_declaration",
+        ],
+        &["source"],
+        &["bbox_refactor_status", "sm-refactor-java"],
+        "Representative Java structural plans. Consult sm-refactor-java for the full long-tail catalog and exact arguments.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "java_lsp_organize_imports",
+            "find_java_usages",
+            "rename_java_symbol",
+        ],
+        "java",
+        "lsp_verified",
+        "lsp",
+        &[],
+        &["source"],
+        &["JDTLS availability", "sm-refactor-java"],
+        "Java LSP-backed plans require JDTLS and fail closed on unavailable semantic services.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "csharp_workspace_probe",
+            "csharp_public_api_guard",
+            "migrate_csharp_to_filescoped_namespace",
+            "move_csharp_type_to_file",
+            "csharp_lsp_rename",
+            "csharp_organize_usings",
+            "find_csharp_usages",
+        ],
+        "csharp",
+        "mixed",
+        "mixed",
+        &[
+            "class_declaration",
+            "namespace_declaration",
+            "method_declaration",
+        ],
+        &["source"],
+        &["bbox_refactor_status", "sm-refactor-csharp"],
+        "C# Phase 1 and adjacent plan kinds; sidecar-required kinds are documented in sm-refactor-csharp.",
+    );
+    add_plan_kind_group(
+        &mut kinds,
+        &[
+            "elixir_module_dependency_analysis",
+            "elixir_public_api_guard",
+            "extract_elixir_module",
+            "extract_genserver_callback_group",
+            "split_elixir_clauses_by_tag",
+            "rename_elixir_symbol",
+        ],
+        "elixir",
+        "mixed",
+        "tree_sitter",
+        &["module", "function", "call"],
+        &["source"],
+        &["bbox_refactor_status", "sm-refactor-elixir"],
+        "Representative Elixir analysis and structural plans.",
+    );
+
+    let language = p.language.as_deref().map(str::to_ascii_lowercase);
+    let safety_class = p.safety_class.as_deref().map(str::to_ascii_lowercase);
+    let backend = p.backend.as_deref().map(str::to_ascii_lowercase);
+    kinds.retain(|kind| {
+        language
+            .as_ref()
+            .is_none_or(|v| kind["language"].as_str() == Some(v.as_str()))
+            && safety_class
+                .as_ref()
+                .is_none_or(|v| kind["safety_class"].as_str() == Some(v.as_str()))
+            && backend
+                .as_ref()
+                .is_none_or(|v| kind["backend"].as_str() == Some(v.as_str()))
+    });
+
+    Ok(serde_json::to_string_pretty(&serde_json::json!({
+        "status": "ok",
+        "filters": {
+            "language": language,
+            "safety_class": safety_class,
+            "backend": backend,
+        },
+        "count": kinds.len(),
+        "kinds": kinds,
+        "notes": [
+            "This is a compact authoring catalog; language runbooks remain authoritative for exhaustive long-tail details.",
+            "All bbox_refactor_plan results are dry-run plans. Writes require bbox_refactor_apply(confirm=true).",
+            "Use bbox_refactor_status or bbox_code_symbols before syntax-aware plan kinds."
+        ]
+    }))?)
+}
+
+fn add_plan_kind_group(
+    kinds: &mut Vec<serde_json::Value>,
+    names: &[&str],
+    language: &str,
+    safety_class: &str,
+    backend: &str,
+    item_kinds: &[&str],
+    required_fields: &[&str],
+    suggested_preflight: &[&str],
+    notes: &str,
+) {
+    for name in names {
+        kinds.push(serde_json::json!({
+            "kind": name,
+            "language": language,
+            "safety_class": safety_class,
+            "backend": backend,
+            "item_kinds": item_kinds,
+            "required_fields": required_fields,
+            "suggested_preflight": suggested_preflight,
+            "notes": notes,
+        }));
+    }
 }
 
 #[allow(dead_code)] // test-only wrapper; production paths use plan_with_ctx

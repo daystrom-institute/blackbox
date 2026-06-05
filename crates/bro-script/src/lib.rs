@@ -14,14 +14,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
+use std::sync::{Arc, OnceLock, mpsc as std_mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -550,6 +550,7 @@ enum Job {
     },
     Run {
         handle: String,
+        input_json: Option<JsonValue>,
         reply: oneshot::Sender<Result<String>>,
     },
     Prepared {
@@ -835,6 +836,20 @@ impl ScriptRuntime {
     pub async fn run(&self, handle: impl Into<String>) -> Result<String> {
         self.execute_job(|reply| Job::Run {
             handle: handle.into(),
+            input_json: None,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn run_with_input(
+        &self,
+        handle: impl Into<String>,
+        input_json: JsonValue,
+    ) -> Result<String> {
+        self.execute_job(|reply| Job::Run {
+            handle: handle.into(),
+            input_json: Some(input_json),
             reply,
         })
         .await
@@ -997,10 +1012,14 @@ fn v8_thread_main(
                 scope.cancel_terminate_execution();
                 let _ = reply.send(result);
             }
-            Job::Run { handle, reply } => {
+            Job::Run {
+                handle,
+                input_json,
+                reply,
+            } => {
                 scope.cancel_terminate_execution();
                 drain_runtime_commands(&command_rx);
-                let result = run_prepared(scope, &command_rx, &handle);
+                let result = run_prepared(scope, &command_rx, &handle, input_json);
                 scope.cancel_terminate_execution();
                 let _ = reply.send(result);
             }
@@ -1489,6 +1508,7 @@ fn run_prepared(
     scope: &mut v8::PinScope<'_, '_>,
     command_rx: &std_mpsc::Receiver<RuntimeCommand>,
     handle: &str,
+    input_json: Option<JsonValue>,
 ) -> Result<String> {
     let script = get_prepared(scope, handle)?;
     {
@@ -1502,7 +1522,15 @@ fn run_prepared(
             sequence,
         });
     }
-    run_one(scope, command_rx, &script.source)
+    match (script.contract.as_ref(), input_json) {
+        (Some(contract), Some(input_json)) => {
+            call_cell(scope, command_rx, &script.source, contract, input_json)
+        }
+        (None, Some(_)) => Err(anyhow!(
+            "prepared script `{handle}` has no contract; input is only accepted for contracted prepared cells"
+        )),
+        _ => run_one(scope, command_rx, &script.source),
+    }
 }
 
 fn get_prepared(scope: &mut v8::PinScope<'_, '_>, handle: &str) -> Result<PreparedCell> {

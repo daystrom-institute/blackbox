@@ -723,9 +723,11 @@ cells; `narf_prepare` then `narf_run` when source/contract review matters; \
 `bro_exec` then `bro_wait`/`bro_status`/`bro_resume` for ad-hoc child agents. \
 NARF cells receive values, not ref envelopes; host tools return values; \
 `narf.encode.yaml`, `narf.encode.frontmatter`, and `narf.encode.mdTable` cover \
-non-JS-native formats; `narf.kv.*` is exact-name deref only and does not \
-enumerate in-box. If a child bro completes with an empty/suspicious result, or \
-an LSP-backed refactor plan stays `tool_running` after a wait timeout, call \
+non-JS-native formats (`mdTable(rows, columns?)` accepts object rows plus \
+optional column order); `narf.kv.*` is exact-name deref only and does not \
+enumerate in-box. Use `bbox_refactor_plan_kinds` after status inventory to pick \
+a safe planning kind. If a child bro completes with an empty/suspicious result, \
+or an LSP-backed refactor plan stays `tool_running` after a wait timeout, call \
 `bro_status(tail=N)` before resuming, cancelling, or filing a gap.\n\
   - Prefer `work_smart_read` over `Read` for file inspection.\n\
   - Prefer `work_bash` over `Bash` for shell commands.\n\

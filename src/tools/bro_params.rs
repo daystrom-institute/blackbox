@@ -11,11 +11,13 @@ use std::collections::BTreeMap;
 pub(crate) struct ExecParams {
     /// Task instruction for the agent
     pub(crate) prompt: String,
-    /// Named bro instance to target. Bare names must be unique across live
-    /// teams; use `team::bro` to disambiguate.
+    /// Dispatch selector option 1: named bro instance to target. Bare names
+    /// must be unique across live teams; use `team::bro` to disambiguate.
+    /// Exactly one selector family is required: bro, provider, or runtime
+    /// allocation fields such as tier/pool/pin_*.
     #[serde(default)]
     pub(crate) bro: Option<String>,
-    /// Raw provider for ad-hoc tasks
+    /// Dispatch selector option 2: raw provider for ad-hoc tasks.
     #[serde(default)]
     pub(crate) provider: Option<String>,
     /// Working directory (absolute path)
@@ -45,8 +47,9 @@ pub(crate) struct ExecParams {
     /// prefix. When false or absent, defers to the brofile setting.
     #[serde(default)]
     pub(crate) coerce_workspace: Option<bool>,
-    /// Runtime allocation tier key. When set, dispatch resolves a pooled
-    /// provider/account/model/effort lane before spawning.
+    /// Dispatch selector option 3: runtime allocation tier key. When set,
+    /// dispatch resolves a pooled provider/account/model/effort lane before
+    /// spawning.
     #[serde(default)]
     pub(crate) tier: Option<String>,
     /// Named tier ladder for at_least/bounded tier modes.
@@ -61,13 +64,13 @@ pub(crate) struct ExecParams {
     /// Upper tier bound for bounded mode.
     #[serde(default)]
     pub(crate) max_tier: Option<String>,
-    /// Named provider/account pool.
+    /// Runtime allocation selector: named provider/account pool.
     #[serde(default)]
     pub(crate) pool_name: Option<String>,
     /// Provider aliases that narrow the selected pool.
     #[serde(default)]
     pub(crate) pool_providers: Option<Vec<String>>,
-    /// Hard provider pin for runtime allocation.
+    /// Runtime allocation selector: hard provider pin.
     #[serde(default)]
     pub(crate) pin_provider: Option<String>,
     /// Hard account pin for runtime allocation.
