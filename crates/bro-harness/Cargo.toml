@@ -30,6 +30,7 @@ anyhow = "1"
 clap = { version = "4.5", features = ["derive"] }
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", features = ["stream", "rustls-tls", "json"], default-features = false }
+http = "1"
 futures-util = "0.3"
 async-trait = "0.1"
 # WebSocket Responses transport. rustls is a direct dep only to install a

@@ -263,25 +263,6 @@ fn expand_filter_patterns(patterns: &[String]) -> Vec<String> {
     out
 }
 
-pub fn transient_blackbox_url() -> Option<String> {
-    std::env::var("BLACKBOX_MCP_URL")
-        .ok()
-        .filter(|s| !s.is_empty())
-}
-
-pub fn transient_blackbox_name() -> String {
-    crate::util::blackbox_mcp_name()
-}
-
-pub fn claude_mcp_config_json(name: &str, url: &str) -> String {
-    serde_json::json!({
-        "mcpServers": {
-            name: { "type": "http", "url": url }
-        }
-    })
-    .to_string()
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatchState {

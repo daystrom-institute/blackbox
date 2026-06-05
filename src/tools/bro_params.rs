@@ -1,6 +1,7 @@
 use crate::orchestration;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // ---------------------------------------------------------------------------
 // Bro tools (orchestration)
@@ -34,6 +35,11 @@ pub(crate) struct ExecParams {
     /// surfaced dotted form (`mcp__blackbox__.bro_*`).
     #[serde(default)]
     pub(crate) disallow_tools: Option<Vec<String>>,
+    /// Per-dispatch MCP placement map for in-process harness providers.
+    /// Keys are fully-qualified MCP names (`mcp__server__tool`); values are
+    /// `in-box`, `out-box`, or `both`.
+    #[serde(default)]
+    pub(crate) tool_placement: Option<BTreeMap<String, String>>,
     /// Override the brofile's `coerce_workspace` setting for this dispatch.
     /// When true, injects the workspace-tools appendix into the ambient
     /// prefix. When false or absent, defers to the brofile setting.

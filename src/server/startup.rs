@@ -121,8 +121,8 @@ pub(super) fn resolve_codex_root(cfg: &config::Config, home: &Path) -> Option<Pa
 pub(super) fn configure_dispatch_mcp_env(cfg: &config::Config) {
     let bbox_url = dispatch_mcp_url(&cfg.daemon.bind, cfg.daemon.port);
     let bbox_mcp_name = cfg.daemon.mcp_name.clone();
-    // Export for provider arg-builders so they can inject `--mcp-config`
-    // etc. at dispatch time. Provider-owned MCP config files are never
+    // Export for dispatch builders so they can inject typed/CLI MCP config
+    // at dispatch time. Provider-owned MCP config files are never
     // rewritten on daemon startup; persistent registration is user-owned
     // or happens only through explicit `bro_mcp` calls.
     unsafe {

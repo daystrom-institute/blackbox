@@ -149,6 +149,7 @@ impl BlackboxServer {
                     allow_recursion: false,
                     allow_tools: None,
                     disallow_tools: None,
+                    tool_placement: None,
                     allocation_request: runtime,
                     project_dir_for_lease: project_dir.map(String::from),
                     ambient_bro_name: Some(brofile.to_string()),

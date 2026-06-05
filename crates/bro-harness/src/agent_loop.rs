@@ -93,11 +93,11 @@ const INTERRUPTED_TOOL_RESULT: &str = "[Request interrupted by user]";
 
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
-    run_with_emitter(cli, None).await
+    run_with_emitter(cli, None, None).await
 }
 
 pub async fn run_with_event_callback(cli: Cli, callback: EventCallback) -> Result<()> {
-    run_with_emitter(cli, Some(callback)).await
+    run_with_emitter(cli, Some(callback), None).await
 }
 
 #[derive(Debug)]
@@ -122,17 +122,30 @@ pub async fn run_with_event_callback_and_input(
     input_rx: SessionInputReceiver,
     callback: EventCallback,
 ) -> Result<()> {
-    run_controlled_session(cli, input_rx, Some(callback)).await
+    run_with_event_callback_and_input_mcp(cli, input_rx, callback, None).await
 }
 
-async fn run_with_emitter(cli: Cli, callback: Option<EventCallback>) -> Result<()> {
+pub async fn run_with_event_callback_and_input_mcp(
+    cli: Cli,
+    input_rx: SessionInputReceiver,
+    callback: EventCallback,
+    mcp_config: Option<mcp::McpConfig>,
+) -> Result<()> {
+    run_controlled_session(cli, input_rx, Some(callback), mcp_config).await
+}
+
+async fn run_with_emitter(
+    cli: Cli,
+    callback: Option<EventCallback>,
+    mcp_config: Option<mcp::McpConfig>,
+) -> Result<()> {
     if cli.input_format.as_deref() == Some("stream-json") {
-        return run_session(cli, callback).await;
+        return run_session(cli, callback, mcp_config).await;
     }
 
     // One-shot: a single prompt, one user turn, then persist and exit.
     let prompt = resolve_prompt(&cli)?;
-    let mut session = Session::build(&cli, callback).await?;
+    let mut session = Session::build(&cli, callback, mcp_config).await?;
     session.emitter.system_init();
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
@@ -151,9 +164,13 @@ fn make_emitter(session_id: String, callback: Option<EventCallback>) -> Emitter 
 }
 
 /// Bidirectional persistent session driven over stdin NDJSON.
-async fn run_session(cli: Cli, callback: Option<EventCallback>) -> Result<()> {
+async fn run_session(
+    cli: Cli,
+    callback: Option<EventCallback>,
+    mcp_config: Option<mcp::McpConfig>,
+) -> Result<()> {
     let replay = cli.replay_user_messages;
-    let mut session = Session::build(&cli, callback.clone()).await?;
+    let mut session = Session::build(&cli, callback.clone(), mcp_config).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
 
@@ -181,8 +198,9 @@ async fn run_controlled_session(
     cli: Cli,
     input_rx: SessionInputReceiver,
     callback: Option<EventCallback>,
+    mcp_config: Option<mcp::McpConfig>,
 ) -> Result<()> {
-    let mut session = Session::build(&cli, callback.clone()).await?;
+    let mut session = Session::build(&cli, callback.clone(), mcp_config).await?;
     session.emitter.system_init_session();
     let sid = session.session_id().to_string();
     let ctrl_emitter = make_emitter(sid, callback);
@@ -504,7 +522,11 @@ struct Session {
 }
 
 impl Session {
-    async fn build(cli: &Cli, callback: Option<EventCallback>) -> Result<Self> {
+    async fn build(
+        cli: &Cli,
+        callback: Option<EventCallback>,
+        injected_mcp: Option<mcp::McpConfig>,
+    ) -> Result<Self> {
         if let Some(fmt) = cli.output_format.as_deref()
             && fmt != "stream-json"
         {
@@ -611,8 +633,17 @@ impl Session {
             store.id.clone(),
             callback.clone(),
         ))));
-        let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
-        let tool_placement = mcp::parse_tool_placement(cli.mcp_config.as_deref());
+        let (mcp_tools, tool_placement) = match injected_mcp {
+            Some(config) => {
+                let tools = mcp::load_mcp_tools_from_config(&config, &tool_filter).await;
+                (tools, config.tool_placement)
+            }
+            None => {
+                let tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
+                let placement = mcp::parse_tool_placement(cli.mcp_config.as_deref());
+                (tools, placement)
+            }
+        };
         let (mcp_in_box, mcp_out_box) =
             mcp::split_mcp_tools_by_placement(&mcp_tools, &tool_placement);
         // §5 host built-in seam (narf-tool-placement.md): a NARF cell's in-box

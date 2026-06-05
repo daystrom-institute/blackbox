@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 
 use crate::orchestration;
 use crate::orchestration as orch;
-use crate::orchestration::providers::{ExecOpts, Provider};
 use crate::orchestration::providers::dispatch_prelude::*;
+use crate::orchestration::providers::{ExecOpts, Provider};
 use crate::orchestration::tail::TailEvent;
 use crate::server::BlackboxServer;
 use crate::server::progress::{
@@ -35,6 +35,7 @@ pub(crate) struct FreshDispatchRequest {
     pub(crate) allow_recursion: bool,
     pub(crate) allow_tools: Option<Vec<String>>,
     pub(crate) disallow_tools: Option<Vec<String>>,
+    pub(crate) tool_placement: Option<std::collections::BTreeMap<String, String>>,
     pub(crate) allocation_request: Option<orchestration::allocator::RuntimeRequest>,
     pub(crate) project_dir_for_lease: Option<String>,
     pub(crate) ambient_bro_name: Option<String>,
@@ -201,6 +202,7 @@ fn allocator_status_runtime_request(
         allow_recursion: None,
         allow_tools: None,
         disallow_tools: None,
+        tool_placement: None,
         coerce_workspace: None,
         tier: p.tier.clone(),
         tier_ladder: p.tier_ladder.clone(),
@@ -342,7 +344,7 @@ impl BlackboxServer {
         .map_err(|e| e.to_string())?;
         args.extend(dispatch_filters.args);
 
-        let task = orch::spawn_task(
+        let task = orch::spawn_task_with_tool_placement(
             task_id,
             request.provider,
             args,
@@ -354,6 +356,7 @@ impl BlackboxServer {
             self.state.tail_tx.clone(),
             request.spawn_bro_label,
             request.spawn_agent_label,
+            request.tool_placement,
             Some(self.state.system_events.clone()),
         );
         if let Some(allocation) = &allocation {
@@ -464,6 +467,7 @@ impl BlackboxServer {
             allow_recursion,
             allow_tools: p.allow_tools.clone(),
             disallow_tools: p.disallow_tools.clone(),
+            tool_placement: p.tool_placement.clone(),
             allocation_request,
             project_dir_for_lease: p.project_dir.clone(),
             ambient_bro_name: p.bro.clone(),
@@ -2260,6 +2264,7 @@ mod tests {
             allow_recursion: None,
             allow_tools: None,
             disallow_tools: None,
+            tool_placement: None,
             coerce_workspace: None,
             tier: None,
             tier_ladder: None,
@@ -2280,19 +2285,39 @@ mod tests {
     }
 
     #[test]
+    fn exec_params_tool_placement_parses() {
+        let params: ExecParams = serde_json::from_value(json!({
+            "prompt": "test",
+            "tool_placement": {
+                "mcp__sdk__placed": "in-box"
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            params
+                .tool_placement
+                .as_ref()
+                .and_then(|m| m.get("mcp__sdk__placed"))
+                .map(String::as_str),
+            Some("in-box")
+        );
+    }
+
+    #[test]
     fn exec_params_runtime_request_parses_operator_pins_and_preferences() {
         let mut params = params();
-        params.pin_provider = Some("codex".into());
-        params.pin_account = Some("codex-alt".into());
-        params.pin_model = Some("gpt-5.3-codex-spark".into());
+        params.pin_provider = Some("brodex".into());
+        params.pin_account = Some("brodex-alt".into());
+        params.pin_model = Some("gpt-5.3-brodex-spark".into());
         params.pin_effort = Some("low".into());
         params.prefer_provider = Some("glm".into());
         assert!(exec_params_have_runtime(&params));
         let request = exec_params_runtime_request(&params, None).unwrap().unwrap();
         let pin = request.pin.unwrap();
         assert_eq!(pin.provider, Some(Provider::Brodex));
-        assert_eq!(pin.account.as_deref(), Some("codex-alt"));
-        assert_eq!(pin.model.as_deref(), Some("gpt-5.3-codex-spark"));
+        assert_eq!(pin.account.as_deref(), Some("brodex-alt"));
+        assert_eq!(pin.model.as_deref(), Some("gpt-5.3-brodex-spark"));
         assert_eq!(pin.effort.as_deref(), Some("low"));
         assert_eq!(
             pin.authority,
@@ -2343,12 +2368,12 @@ mod tests {
             min_tier: None,
             max_tier: None,
             pool_name: Some("coding".into()),
-            pool_providers: Some(vec!["codex".into()]),
-            pin_provider: Some("codex".into()),
-            pin_account: Some("codex-alt".into()),
-            pin_model: Some("gpt-5.3-codex-spark".into()),
+            pool_providers: Some(vec!["brodex".into()]),
+            pin_provider: Some("brodex".into()),
+            pin_account: Some("brodex-alt".into()),
+            pin_model: Some("gpt-5.3-brodex-spark".into()),
             pin_effort: Some("low".into()),
-            prefer_provider: Some("codex".into()),
+            prefer_provider: Some("brodex".into()),
             capabilities: Some(vec!["tool_use".into()]),
             durable: Some(false),
             selection_policy: Some(serde_json::json!("availability")),
@@ -2370,7 +2395,7 @@ mod tests {
         );
         assert_eq!(
             request.pin.as_ref().and_then(|pin| pin.account.as_deref()),
-            Some("codex-alt")
+            Some("brodex-alt")
         );
         assert_eq!(
             request.prefer.and_then(|prefer| prefer.provider),

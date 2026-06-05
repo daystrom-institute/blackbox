@@ -4,7 +4,6 @@ use crate::orchestration::brofile::{BrofileContext, ProviderDefaultsMode};
 use std::path::PathBuf;
 
 use super::Provider;
-use super::mcp_args::{claude_mcp_config_json, transient_blackbox_name, transient_blackbox_url};
 
 /// Resolve the harness/provider binary name from env. GLM/DeepSeek/MiniMax/
 /// Brodex/VibeBh ride the custom harness instead of a vendor CLI; transport +
@@ -239,12 +238,6 @@ impl ProviderExec for Provider {
                 if let Some(e) = effort {
                     args.extend(["--effort".into(), e.into()]);
                 }
-                // Transient MCP inject ensures dispatched subprocesses see
-                // blackbox regardless of which config file the bare CLI loads.
-                if let Some(url) = transient_blackbox_url() {
-                    let name = transient_blackbox_name();
-                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&name, &url)]);
-                }
                 args
             }
             Provider::Workflow => Vec::new(),
@@ -294,10 +287,6 @@ impl ProviderExec for Provider {
                 }
                 if let Some(e) = effort {
                     args.extend(["--effort".into(), e.into()]);
-                }
-                if let Some(url) = transient_blackbox_url() {
-                    let name = transient_blackbox_name();
-                    args.extend(["--mcp-config".into(), claude_mcp_config_json(&name, &url)]);
                 }
                 args
             }

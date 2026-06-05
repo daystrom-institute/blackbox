@@ -13,7 +13,7 @@ pub mod supervision;
 pub mod tail;
 pub mod team;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use parking_lot::{Mutex, RwLock};
@@ -1304,6 +1304,39 @@ pub fn spawn_task(
     agent_label: Option<String>,
     system_events: Option<crate::system_events::SharedEventHub>,
 ) -> Arc<Task> {
+    spawn_task_with_tool_placement(
+        task_id,
+        provider,
+        args,
+        session_id,
+        cwd,
+        env_overrides,
+        store_dir,
+        task_store,
+        tail_tx,
+        bro_label,
+        agent_label,
+        None,
+        system_events,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_task_with_tool_placement(
+    task_id: String,
+    provider: Provider,
+    args: Vec<String>,
+    session_id: String,
+    cwd: Option<String>,
+    env_overrides: Option<HashMap<String, String>>,
+    store_dir: std::path::PathBuf,
+    task_store: Arc<RwLock<TaskStore>>,
+    tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
+    bro_label: Option<String>,
+    agent_label: Option<String>,
+    tool_placement: Option<BTreeMap<String, String>>,
+    system_events: Option<crate::system_events::SharedEventHub>,
+) -> Arc<Task> {
     if matches!(
         provider,
         Provider::Glm
@@ -1324,6 +1357,7 @@ pub fn spawn_task(
             tail_tx,
             bro_label,
             agent_label,
+            tool_placement,
             system_events,
         );
     }
@@ -1374,6 +1408,7 @@ fn spawn_harness_in_process_task(
     tail_tx: tokio::sync::broadcast::Sender<tail::TailEvent>,
     bro_label: Option<String>,
     agent_label: Option<String>,
+    tool_placement: Option<BTreeMap<String, String>>,
     system_events: Option<crate::system_events::SharedEventHub>,
 ) -> Arc<Task> {
     let task = spawn_in_process_task(
@@ -1418,7 +1453,12 @@ fn spawn_harness_in_process_task(
     });
 
     tokio::spawn(async move {
-        let result = run_harness_in_process(args, cwd, env_overrides, callback, control_rx).await;
+        let mut args = args;
+        let result = async {
+            let mcp_config = build_in_process_mcp_config(&mut args, tool_placement)?;
+            run_harness_in_process(args, cwd, env_overrides, callback, control_rx, mcp_config).await
+        }
+        .await;
         let (mut status, stderr) = match result {
             Ok(()) => (TaskStatus::Completed, None),
             Err(err) => (TaskStatus::Failed, Some(format!("{err:#}\n"))),
@@ -1517,6 +1557,7 @@ async fn run_harness_in_process(
     env_overrides: Option<HashMap<String, String>>,
     callback: bro_harness::emit::EventCallback,
     input_rx: bro_harness::agent_loop::SessionInputReceiver,
+    mcp_config: Option<bro_harness::mcp::McpConfig>,
 ) -> anyhow::Result<()> {
     use clap::Parser;
 
@@ -1546,10 +1587,91 @@ async fn run_harness_in_process(
         scrub,
         bro_harness::transport::with_session_env(
             session_env,
-            bro_harness::agent_loop::run_with_event_callback_and_input(cli, input_rx, callback),
+            bro_harness::agent_loop::run_with_event_callback_and_input_mcp(
+                cli, input_rx, callback, mcp_config,
+            ),
         ),
     )
     .await
+}
+
+fn build_in_process_mcp_config(
+    args: &mut Vec<String>,
+    tool_placement: Option<BTreeMap<String, String>>,
+) -> anyhow::Result<Option<bro_harness::mcp::McpConfig>> {
+    let raw_mcp_config = take_cli_value_arg(args, "--mcp-config");
+    let mut config = match raw_mcp_config {
+        Some(raw) => bro_harness::mcp::McpConfig::from_json(&raw)?,
+        None => bro_harness::mcp::McpConfig {
+            servers: Vec::new(),
+            tool_placement: Default::default(),
+        },
+    };
+    add_transient_blackbox_mcp_server(&mut config);
+    config.tool_placement = parse_dispatch_tool_placement(tool_placement)?;
+    if config.servers.is_empty() && config.tool_placement.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(config))
+    }
+}
+
+fn add_transient_blackbox_mcp_server(config: &mut bro_harness::mcp::McpConfig) {
+    let Some(url) = std::env::var("BLACKBOX_MCP_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let name = crate::util::blackbox_mcp_name();
+    if config.servers.iter().any(|server| server.name() == name) {
+        return;
+    }
+    config
+        .servers
+        .push(bro_harness::mcp::McpServerConfig::Http {
+            name,
+            url,
+            headers: BTreeMap::new(),
+            exclude_tools: Vec::new(),
+        });
+}
+
+fn take_cli_value_arg(args: &mut Vec<String>, flag: &str) -> Option<String> {
+    let mut idx = 0;
+    let mut found = None;
+    while idx < args.len() {
+        if args[idx] == flag {
+            args.remove(idx);
+            if idx < args.len() {
+                found = Some(args.remove(idx));
+            }
+            continue;
+        }
+        idx += 1;
+    }
+    found
+}
+
+fn parse_dispatch_tool_placement(
+    raw: Option<BTreeMap<String, String>>,
+) -> anyhow::Result<bro_harness::mcp::ToolPlacementMap> {
+    let mut out = bro_harness::mcp::ToolPlacementMap::new();
+    let Some(raw) = raw else {
+        return Ok(out);
+    };
+    for (name, placement) in raw {
+        let parsed = match placement.as_str() {
+            "in-box" => bro_harness::mcp::ToolPlacement::InBox,
+            "out-box" => bro_harness::mcp::ToolPlacement::OutBox,
+            "both" => bro_harness::mcp::ToolPlacement::Both,
+            other => anyhow::bail!(
+                "invalid tool_placement for {name}: {other}; expected in-box, out-box, or both"
+            ),
+        };
+        out.insert(name, parsed);
+    }
+    Ok(out)
 }
 
 /// Spawn a task in **persistent bidirectional mode** (fleet-tui.md item 6): the
@@ -2665,6 +2787,65 @@ mod tests {
             apply_session_command("no-such-live-task", bro_protocol::SessionCommand::Interrupt)
                 .unwrap_err();
         assert!(err.contains("no live in-process harness control channel"));
+    }
+
+    #[test]
+    fn in_process_mcp_config_strips_cli_arg_and_applies_dispatch_placement() {
+        let mut env = crate::util::TestEnvGuard::new();
+        env.set("BLACKBOX_MCP_URL", "http://127.0.0.1:7264/mcp");
+        env.set("BLACKBOX_MCP_NAME", "selfbox");
+
+        let mut args = vec![
+            "--model".to_string(),
+            "glm-test".to_string(),
+            "--mcp-config".to_string(),
+            serde_json::json!({
+                "mcpServers": {
+                    "external": {
+                        "type": "stdio",
+                        "command": "external-mcp",
+                        "args": ["--once"]
+                    }
+                },
+                "tool_placement": {
+                    "mcp__external__ignored_json_source": "both"
+                }
+            })
+            .to_string(),
+            "--effort".to_string(),
+            "low".to_string(),
+        ];
+        let config = build_in_process_mcp_config(
+            &mut args,
+            Some(BTreeMap::from([(
+                "mcp__external__placed".to_string(),
+                "in-box".to_string(),
+            )])),
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(
+            args,
+            vec![
+                "--model".to_string(),
+                "glm-test".to_string(),
+                "--effort".to_string(),
+                "low".to_string()
+            ]
+        );
+        assert_eq!(config.servers.len(), 2);
+        assert!(config.servers.iter().any(|s| s.name() == "external"));
+        assert!(config.servers.iter().any(|s| s.name() == "selfbox"));
+        assert_eq!(
+            config.tool_placement.get("mcp__external__placed"),
+            Some(&bro_harness::mcp::ToolPlacement::InBox)
+        );
+        assert!(
+            !config
+                .tool_placement
+                .contains_key("mcp__external__ignored_json_source")
+        );
     }
 
     #[test]

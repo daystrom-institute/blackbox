@@ -44,6 +44,10 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(glm.contains(&"glm-5.1".to_string()));
     assert!(!glm.contains(&"zai-coding-plan/glm-5.1".to_string()));
     assert!(glm.contains(&"--effort".to_string()));
+    assert!(
+        !glm.contains(&"--mcp-config".to_string()),
+        "in-process harness providers get typed MCP config, not CLI JSON"
+    );
 
     let deepseek_opts = ExecOpts {
         model: Some("deepseek/deepseek-v4-pro".into()),
@@ -56,6 +60,10 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(deepseek.contains(&"--model".to_string()));
     assert!(deepseek.contains(&"deepseek-v4-pro".to_string()));
     assert!(!deepseek.contains(&"deepseek/deepseek-v4-pro".to_string()));
+    assert!(
+        !deepseek.contains(&"--mcp-config".to_string()),
+        "in-process resume also avoids CLI MCP config"
+    );
 
     let minimax_opts = ExecOpts {
         model: Some("minimax/MiniMax-M3".into()),
