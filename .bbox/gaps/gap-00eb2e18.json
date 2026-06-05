@@ -1,0 +1,25 @@
+{
+  "id": "gap-00eb2e18",
+  "title": "Agentic schema reports zero project_file population during sandbox probe",
+  "gap_kind": "tooling",
+  "domain": "sandbox-observability",
+  "wanted_capability": "A sandbox probe should be able to rely on project_file/project_file_v2 graph population for the current registered project, or the schema should explain why it is intentionally unavailable and point to the right fallback.",
+  "missing_primitive": "project_file/project_file_v2 corpus population for current project in bbox_describe_schema",
+  "fallback_used": "Used bbox_refactor_status, bbox_code_symbols live mode, and work_smart_read for exact source inspection instead of indexed project_file graph evidence.",
+  "evidence": [
+    "bbox_describe_schema: project_file population_count=0; project_file_v2 population_count=0",
+    "task=70b7be69-7e7b-409e-b010-fb02e8bd53b9"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/sandbox-observability/project-file-population-zero",
+  "notes": "Filed during a read-only refactor-authoring surface probe; no files were edited.",
+  "superseded_by": "gap-22876b39",
+  "resolution": "addressed",
+  "task_id": "70b7be69-7e7b-409e-b010-fb02e8bd53b9",
+  "session_id": "a3e0e693-baff-49b2-ab32-5727bc67c5c3",
+  "created_at": "2026-06-05T22:10:02Z",
+  "updated_at": "2026-06-05T22:29:53Z",
+  "resolved_at": "2026-06-05T22:29:53Z",
+  "resolution_note": "Duplicate of existing sandbox grounding/project_file corpus gap gap-22876b39; the newer probe recurrence used a different dedupe key but describes the same missing project_file/project_file_v2 grounding capability."
+}

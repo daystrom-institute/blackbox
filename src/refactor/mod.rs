@@ -1642,7 +1642,9 @@ fn plan_kind_optional_fields(name: &str) -> Vec<&'static str> {
     match name {
         "rust_impl_partition_analysis" => vec!["impl_name", "module_name"],
         "rust_public_api_guard" => vec!["item_names", "item_kinds", "deep_analysis"],
-        "rust_top_level_dependency_analysis" => vec!["project_dir"],
+        "rust_top_level_dependency_analysis" => {
+            vec!["project_dir", "item_names", "item_kinds", "output_path"]
+        }
         "find_java_usages" | "find_csharp_usages" => {
             vec!["summary_only", "declaring_class", "output_path"]
         }
@@ -1720,7 +1722,7 @@ fn preflight_notes(name: &str) -> &'static str {
             "Run bbox_refactor_status first to find impl/module names; bbox_code_symbols is useful when the file is large."
         }
         "rust_top_level_dependency_analysis" => {
-            "bbox_refactor_status is enough for a first read-only graph; bbox_code_symbols is optional for symbol selection."
+            "bbox_refactor_status is enough for a first read-only graph; use item_names/item_kinds from status or bbox_code_symbols to narrow large files before relying on external reference scanning, or output_path when a broad graph may exceed the MCP response cap."
         }
         "rust_public_api_guard" => {
             "Use bbox_refactor_status or bbox_code_symbols to choose item_names before running the guard."
@@ -5571,6 +5573,32 @@ mod plan_kind_catalog_tests {
                 .as_str()
                 .unwrap()
                 .contains("requires impl_name or module_name")
+        );
+    }
+
+    #[test]
+    fn rust_top_level_catalog_signposts_narrowing_fields() {
+        let value = catalog(RefactorPlanKindsParams {
+            language: Some("rust".into()),
+            safety_class: Some("analysis_only".into()),
+            backend: None,
+        });
+        let kinds = value["kinds"].as_array().expect("kinds array");
+        let top_level = kinds
+            .iter()
+            .find(|kind| kind["kind"] == "rust_top_level_dependency_analysis")
+            .expect("top-level dependency kind");
+        let optional = top_level["optional_fields"]
+            .as_array()
+            .expect("optional fields");
+        assert!(optional.iter().any(|field| field == "item_names"));
+        assert!(optional.iter().any(|field| field == "item_kinds"));
+        assert!(optional.iter().any(|field| field == "output_path"));
+        assert!(
+            top_level["suggested_preflight"]["notes"]
+                .as_str()
+                .unwrap()
+                .contains("narrow large files")
         );
     }
 }

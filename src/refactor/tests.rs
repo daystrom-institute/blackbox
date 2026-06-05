@@ -6291,6 +6291,37 @@ impl Cache {
     }
 
     #[test]
+    fn rust_top_level_dependency_analysis_skips_broad_external_ref_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib.rs");
+        let mut source = String::new();
+        for idx in 0..45 {
+            source.push_str(&format!("pub fn helper_{idx}() {{}}\n"));
+        }
+        fs::write(&lib, source).unwrap();
+        fs::write(dir.path().join("other.rs"), "fn call() { helper_1(); }\n").unwrap();
+
+        let plan_text = plan(&RefactorPlanParams {
+            kind: "rust_top_level_dependency_analysis".into(),
+            source: path_string(&lib),
+            project_dir: Some(path_string(dir.path())),
+            ..Default::default()
+        })
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&plan_text).unwrap();
+        let graph = &value["top_level_dependency_graph"];
+        assert_eq!(graph["items"].as_array().unwrap().len(), 45);
+        assert!(graph["external_references"].as_array().unwrap().is_empty());
+        let warnings = graph["warnings"].as_array().unwrap();
+        assert!(warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .unwrap_or_default()
+                .contains("external reference scan skipped")
+        }));
+    }
+
+    #[test]
     fn plan_create_file_dry_run_produces_plan_with_one_file_create() {
         let dir = tempfile::tempdir().unwrap();
         let new_file = dir.path().join("new_module.rs");

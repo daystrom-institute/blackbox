@@ -16,6 +16,7 @@ use super::{
 };
 
 const MAX_EXTERNAL_REFS_PER_ITEM: usize = 12;
+const MAX_EXTERNAL_REF_SCAN_ITEMS: usize = 40;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TopLevelDependencyGraph {
@@ -142,10 +143,11 @@ pub fn analyze_top_level(
         .into_iter()
         .map(|(from, to, kind)| TopLevelDependencyEdge { from, to, kind })
         .collect::<Vec<_>>();
-    let external_references =
+    let (external_references, mut external_warnings) =
         collect_external_references(source_path, project_dir, &selected_names)?;
     let suggested_clusters = suggest_clusters(&nodes, &edges, &external_references);
-    let warnings = graph_warnings(&nodes);
+    let mut warnings = graph_warnings(&nodes);
+    warnings.append(&mut external_warnings);
 
     Ok(TopLevelDependencyGraph {
         items: nodes,
@@ -327,9 +329,19 @@ fn collect_external_references(
     source_path: &Path,
     project_dir: Option<&str>,
     item_names: &BTreeSet<String>,
-) -> Result<Vec<TopLevelExternalReference>> {
+) -> Result<(Vec<TopLevelExternalReference>, Vec<String>)> {
     if item_names.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if item_names.len() > MAX_EXTERNAL_REF_SCAN_ITEMS {
+        return Ok((
+            Vec::new(),
+            vec![format!(
+                "external reference scan skipped: {} selected item(s) exceeds cap {}; pass item_names/item_kinds to narrow the analysis",
+                item_names.len(),
+                MAX_EXTERNAL_REF_SCAN_ITEMS
+            )],
+        ));
     }
     let project_root = match project_dir {
         Some(dir) => resolve_project_dir(Some(dir))?,
@@ -392,7 +404,7 @@ fn collect_external_references(
             .then_with(|| a.path.cmp(&b.path))
             .then_with(|| a.line.cmp(&b.line))
     });
-    Ok(refs)
+    Ok((refs, Vec::new()))
 }
 
 fn line_contains_word(line: &str, needle: &str) -> bool {
