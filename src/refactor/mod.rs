@@ -1514,7 +1514,9 @@ pub fn plan_kinds(p: &RefactorPlanKindsParams) -> Result<String> {
         "notes": [
             "This is a compact authoring catalog; language runbooks remain authoritative for exhaustive long-tail details.",
             "All bbox_refactor_plan results are dry-run plans. Writes require bbox_refactor_apply(confirm=true).",
-            "Use bbox_refactor_status or bbox_code_symbols before syntax-aware plan kinds."
+            "Path fields resolve against project_dir when provided, otherwise the daemon working directory. Dispatched/sandbox agents should pass project_dir explicitly.",
+            "Preflight entries are ordered; start with the first entry unless the plan kind's when_to_use says otherwise.",
+            "semantic_status meanings: syntax_only = tree-sitter/text shape only, indexed_hints = syntax plus local/indexed heuristics but not binding proof, lsp_verified = language-server backed and should fail closed if unavailable."
         ]
     }))?)
 }
@@ -1538,9 +1540,251 @@ fn add_plan_kind_group(
             "backend": backend,
             "item_kinds": item_kinds,
             "required_fields": required_fields,
-            "suggested_preflight": suggested_preflight,
+            "optional_fields": plan_kind_optional_fields(name),
+            "suggested_preflight": {
+                "ordered": suggested_preflight,
+                "default_first": suggested_preflight.first().copied(),
+                "notes": preflight_notes(name),
+            },
+            "path_resolution": "Relative source/target paths resolve against project_dir when set; sandbox/dispatched agents should pass project_dir explicitly.",
+            "semantic_status_expected": semantic_status_expected(name, safety_class, backend),
+            "semantic_status_meaning": semantic_status_meaning(name, safety_class, backend),
+            "when_to_use": plan_kind_when_to_use(name),
             "notes": notes,
         }));
+    }
+}
+
+fn plan_kind_when_to_use(name: &str) -> &'static str {
+    match name {
+        "replace_text" => {
+            "Use for a small exact textual replacement when structural parsing is unnecessary."
+        }
+        "write_file" => {
+            "Use when the intended final file body is known and a whole-file dry-run diff is appropriate."
+        }
+        "create_file" => "Use to create a new file through a reviewable dry-run plan.",
+        "move_file" => "Use for file relocation/rename plans where path movement is the refactor.",
+        "ensure_toml_table" => "Use for minimal structured TOML table/key creation.",
+        "rust_impl_partition_analysis" => {
+            "Use when deciding whether an impl or named module cluster can be split; requires impl_name or module_name."
+        }
+        "rust_top_level_dependency_analysis" => {
+            "Use for a broad read-only map of top-level Rust item dependencies before choosing a move/extract strategy."
+        }
+        "rust_public_api_guard" => {
+            "Use before public-surface Rust edits to classify likely API exposure and caller risk for selected item_names."
+        }
+        "java_class_dependency_analysis" => {
+            "Use to map class/member dependencies before Java extraction or split work."
+        }
+        "java_public_api_guard" => {
+            "Use before Java public-surface edits to classify caller/API exposure risk."
+        }
+        "java_concurrency_antipattern_audit" => {
+            "Use for read-only Java concurrency smell discovery before planning mechanical changes."
+        }
+        "java_vaadin_route_inventory" => {
+            "Use to inventory Vaadin routes/navigation before route synthesis or access-policy work."
+        }
+        "java_jooq_query_structure_analysis" => {
+            "Use to inspect jOOQ query shapes before receiver/projection/refactor planning."
+        }
+        "java_lsp_organize_imports" | "rust_organize_imports" => {
+            "Use when import cleanup should be delegated to the language server and fail closed if LSP is unavailable."
+        }
+        "find_java_usages" => {
+            "Use when binding-aware Java usage lookup is required; prefer summary_only for broad scans."
+        }
+        "rename_java_symbol" | "rust_lsp_rename" => {
+            "Use for semantic rename only when the corresponding language server is available."
+        }
+        "rust_ra_classify_callbacks" => {
+            "Use to classify Rust callback candidates with rust-analyzer authority."
+        }
+        "rust_ra_move_item_to_module" => {
+            "Use only when explicitly investigating the RA move-item path; it is intentionally discouraged as a default."
+        }
+        "csharp_workspace_probe" => {
+            "Use first on unfamiliar C# workspaces to discover project/solution shape."
+        }
+        "csharp_public_api_guard" => {
+            "Use before C# public-surface edits to classify API exposure risk."
+        }
+        "migrate_csharp_to_filescoped_namespace" => {
+            "Use for syntax-only C# namespace modernization."
+        }
+        "move_csharp_type_to_file" => "Use to plan moving a C# top-level type into its own file.",
+        "csharp_lsp_rename" => "Use for C# semantic rename when Roslyn LSP is available.",
+        "csharp_organize_usings" => "Use for C# using cleanup when Roslyn LSP is available.",
+        "find_csharp_usages" => "Use for C# usage lookup when Roslyn LSP is available.",
+        "elixir_module_dependency_analysis" => {
+            "Use to map Elixir module dependencies before moving or extracting modules."
+        }
+        "elixir_public_api_guard" => {
+            "Use before Elixir public API edits to classify exposure risk."
+        }
+        "extract_elixir_module" => "Use to plan extracting functions into a new Elixir module.",
+        "extract_genserver_callback_group" => "Use to group GenServer callbacks before extraction.",
+        "split_elixir_clauses_by_tag" => {
+            "Use to split tagged Elixir function clauses into clearer groups."
+        }
+        "rename_elixir_symbol" => {
+            "Use for Elixir symbol rename plans where syntax/indexed hints are acceptable."
+        }
+        _ => {
+            "Use when the kind name matches the intended structural transformation; consult the language runbook for exact arguments."
+        }
+    }
+}
+
+fn plan_kind_optional_fields(name: &str) -> Vec<&'static str> {
+    match name {
+        "rust_impl_partition_analysis" => vec!["impl_name", "module_name"],
+        "rust_public_api_guard" => vec!["item_names", "item_kinds", "deep_analysis"],
+        "rust_top_level_dependency_analysis" => vec!["project_dir"],
+        "find_java_usages" | "find_csharp_usages" => {
+            vec!["summary_only", "declaring_class", "output_path"]
+        }
+        "rust_lsp_rename" | "rename_java_symbol" | "csharp_lsp_rename" | "rename_elixir_symbol" => {
+            vec!["old_text", "new_text", "item_names", "output_path"]
+        }
+        "rust_ra_move_item_to_module" => vec!["item_names", "module_name", "target", "output_path"],
+        "rust_ra_classify_callbacks" => vec!["item_names", "item_kinds", "deep_analysis"],
+        "extract_rust_items"
+        | "extract_rust_impl_methods"
+        | "delete_rust_items"
+        | "move_rust_items_with_local_deps"
+        | "move_rust_items_with_callers"
+        | "extract_rust_items_to_submodule" => {
+            vec![
+                "target",
+                "item_names",
+                "item_kinds",
+                "module_name",
+                "output_path",
+            ]
+        }
+        "extract_rust_section" | "extract_rust_function_region" => {
+            vec!["target", "old_text", "new_text", "output_path"]
+        }
+        "add_rust_mod_decl" | "add_rust_use_decl" | "rust_module_wiring" => {
+            vec!["module_name", "use_path", "target", "output_path"]
+        }
+        "rewrite_rust_item_visibility" | "rewrite_rust_field_visibility" => {
+            vec!["item_names", "visibility", "output_path"]
+        }
+        "rewrite_rust_error_type" => {
+            vec![
+                "target",
+                "new_text",
+                "acknowledge_public_api_change",
+                "output_path",
+            ]
+        }
+        "migrate_rust_type_usages" | "update_rust_callers" => {
+            vec![
+                "item_names",
+                "old_text",
+                "new_text",
+                "target",
+                "output_path",
+            ]
+        }
+        "extract_rust_trait" => vec!["item_names", "target", "visibility", "output_path"],
+        "move_rust_struct_fields" => {
+            vec!["item_names", "target", "acknowledge_repr", "output_path"]
+        }
+        "rust_minimize_imports" | "rust_organize_imports" | "java_lsp_organize_imports" => {
+            vec!["output_path"]
+        }
+        "replace_text" => vec!["old_text", "new_text", "replace_all", "output_path"],
+        "write_file" | "create_file" => vec!["new_text", "output_path"],
+        "move_file" => vec!["target", "output_path"],
+        "ensure_toml_table" => vec!["toml_table", "toml_entries", "output_path"],
+        _ => vec![
+            "target",
+            "item_names",
+            "item_kinds",
+            "old_text",
+            "new_text",
+            "deep_analysis",
+            "output_path",
+        ],
+    }
+}
+
+fn preflight_notes(name: &str) -> &'static str {
+    match name {
+        "rust_impl_partition_analysis" => {
+            "Run bbox_refactor_status first to find impl/module names; bbox_code_symbols is useful when the file is large."
+        }
+        "rust_top_level_dependency_analysis" => {
+            "bbox_refactor_status is enough for a first read-only graph; bbox_code_symbols is optional for symbol selection."
+        }
+        "rust_public_api_guard" => {
+            "Use bbox_refactor_status or bbox_code_symbols to choose item_names before running the guard."
+        }
+        "find_java_usages" | "rename_java_symbol" | "java_lsp_organize_imports" => {
+            "Verify JDTLS/LSP availability first; these kinds should fail closed rather than silently downgrade."
+        }
+        "rust_lsp_rename"
+        | "rust_organize_imports"
+        | "rust_ra_classify_callbacks"
+        | "rust_ra_move_item_to_module" => {
+            "Verify rust-analyzer availability first; these kinds should fail closed rather than silently downgrade."
+        }
+        _ => {
+            "Run the ordered preflight entries left-to-right until you have enough anchors to fill required and optional fields."
+        }
+    }
+}
+
+fn semantic_status_expected(name: &str, safety_class: &str, backend: &str) -> &'static str {
+    match name {
+        "rust_impl_partition_analysis"
+        | "rust_top_level_dependency_analysis"
+        | "rust_public_api_guard"
+        | "java_public_api_guard"
+        | "elixir_module_dependency_analysis"
+        | "elixir_public_api_guard"
+        | "rename_elixir_symbol"
+        | "split_elixir_clauses_by_tag" => "indexed_hints",
+        "rust_lsp_rename"
+        | "rust_organize_imports"
+        | "rust_ra_classify_callbacks"
+        | "rust_ra_move_item_to_module"
+        | "java_lsp_organize_imports"
+        | "find_java_usages"
+        | "rename_java_symbol"
+        | "csharp_lsp_rename"
+        | "csharp_organize_usings"
+        | "find_csharp_usages" => "lsp_verified",
+        _ if safety_class == "analysis_only" && backend == "analysis" => {
+            "syntax_only_or_indexed_hints"
+        }
+        _ if backend == "tree_sitter" || backend == "text" || backend == "toml" => "syntax_only",
+        _ => "plan_result_is_authoritative",
+    }
+}
+
+fn semantic_status_meaning(name: &str, safety_class: &str, backend: &str) -> &'static str {
+    match semantic_status_expected(name, safety_class, backend) {
+        "indexed_hints" => {
+            "Uses syntax plus local/indexed heuristics. Good for planning and risk discovery; not proof of binding correctness."
+        }
+        "lsp_verified" => {
+            "Language-server backed. Treat as binding-aware; unavailable LSP should produce a clear fail-closed error."
+        }
+        "syntax_only" => {
+            "Uses syntax/tree-sitter/text structure. Review compiler/test results for semantic confidence before apply."
+        }
+        "syntax_only_or_indexed_hints" => {
+            "Analysis plans vary between syntax-only and indexed heuristics; read the plan_result semantic_status field before relying on it."
+        }
+        _ => {
+            "Read the returned plan's semantic_status; this compact catalog cannot fully predict mixed plan families."
+        }
     }
 }
 
@@ -5257,4 +5501,76 @@ pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
 
 pub(crate) fn path_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod plan_kind_catalog_tests {
+    use super::*;
+
+    fn catalog(params: RefactorPlanKindsParams) -> serde_json::Value {
+        serde_json::from_str(&plan_kinds(&params).expect("plan kind catalog")).unwrap()
+    }
+
+    #[test]
+    fn rust_analysis_catalog_explains_choice_and_trust_level() {
+        let value = catalog(RefactorPlanKindsParams {
+            language: Some("rust".into()),
+            safety_class: Some("analysis_only".into()),
+            backend: None,
+        });
+        assert_eq!(value["count"], 3);
+        let kinds = value["kinds"].as_array().expect("kinds array");
+        let top_level = kinds
+            .iter()
+            .find(|kind| kind["kind"] == "rust_top_level_dependency_analysis")
+            .expect("top-level dependency kind");
+        assert!(
+            top_level["when_to_use"]
+                .as_str()
+                .unwrap()
+                .contains("broad read-only map")
+        );
+        assert_eq!(top_level["semantic_status_expected"], "indexed_hints");
+        assert!(
+            top_level["semantic_status_meaning"]
+                .as_str()
+                .unwrap()
+                .contains("not proof")
+        );
+        assert_eq!(
+            top_level["suggested_preflight"]["default_first"],
+            "bbox_refactor_status"
+        );
+        assert!(
+            top_level["path_resolution"]
+                .as_str()
+                .unwrap()
+                .contains("project_dir")
+        );
+    }
+
+    #[test]
+    fn rust_impl_partition_catalog_lists_selector_fields() {
+        let value = catalog(RefactorPlanKindsParams {
+            language: Some("rust".into()),
+            safety_class: Some("analysis_only".into()),
+            backend: None,
+        });
+        let kinds = value["kinds"].as_array().expect("kinds array");
+        let impl_partition = kinds
+            .iter()
+            .find(|kind| kind["kind"] == "rust_impl_partition_analysis")
+            .expect("impl partition kind");
+        let optional = impl_partition["optional_fields"]
+            .as_array()
+            .expect("optional fields");
+        assert!(optional.iter().any(|field| field == "impl_name"));
+        assert!(optional.iter().any(|field| field == "module_name"));
+        assert!(
+            impl_partition["when_to_use"]
+                .as_str()
+                .unwrap()
+                .contains("requires impl_name or module_name")
+        );
+    }
 }
