@@ -1448,34 +1448,41 @@ impl BlackboxServer {
         let retro_enabled = p.retro.unwrap_or(false) && !dry_run;
         let retro_min_turns = p.retro_min_turns.unwrap_or(2);
         let retro_max = p.retro_max.unwrap_or(10);
-        let mut retro_targets: Vec<(Provider, String, Option<String>)> = if retro_enabled {
-            self.state
-                .task_store
-                .read()
-                .all_tasks()
-                .iter()
-                .filter_map(|t| {
-                    let inner = t.inner.lock();
-                    if !matches_filter(&inner) {
-                        return None;
-                    }
-                    // Only sessions we can actually resume, with something
-                    // to reflect on.
-                    if !inner.provider.supports_resume() {
-                        return None;
-                    }
-                    if inner.session_id.is_empty() || inner.session_id == "pending" {
-                        return None;
-                    }
-                    if inner.num_turns.unwrap_or(0) < retro_min_turns {
-                        return None;
-                    }
-                    Some((inner.provider, inner.session_id.clone(), inner.cwd.clone()))
-                })
-                .collect()
-        } else {
-            Vec::new()
-        };
+        let mut retro_targets: Vec<(String, Provider, String, Option<String>, Option<String>)> =
+            if retro_enabled {
+                self.state
+                    .task_store
+                    .read()
+                    .all_tasks()
+                    .iter()
+                    .filter_map(|t| {
+                        let inner = t.inner.lock();
+                        if !matches_filter(&inner) {
+                            return None;
+                        }
+                        // Only sessions we can actually resume, with something
+                        // to reflect on.
+                        if !inner.provider.supports_resume() {
+                            return None;
+                        }
+                        if inner.session_id.is_empty() || inner.session_id == "pending" {
+                            return None;
+                        }
+                        if inner.num_turns.unwrap_or(0) < retro_min_turns {
+                            return None;
+                        }
+                        Some((
+                            inner.id.clone(),
+                            inner.provider,
+                            inner.session_id.clone(),
+                            inner.cwd.clone(),
+                            inner.bro_label.clone(),
+                        ))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let retro_candidate_total = retro_targets.len();
         let retro_capped = retro_candidate_total > retro_max;
         retro_targets.truncate(retro_max);
@@ -1509,8 +1516,14 @@ impl BlackboxServer {
         // session wasn't resumable at spawn time.
         let mut retros_queued = 0usize;
         let mut retros_skipped = 0usize;
-        for (provider, session_id, cwd) in retro_targets {
-            match self.spawn_workload_retro(provider, &session_id, cwd) {
+        for (source_task_id, provider, session_id, cwd, bro_label) in retro_targets {
+            match self.spawn_workload_retro(
+                &source_task_id,
+                provider,
+                &session_id,
+                cwd,
+                bro_label.as_deref(),
+            ) {
                 Ok(_) => retros_queued += 1,
                 Err(_) => retros_skipped += 1,
             }
@@ -1541,20 +1554,32 @@ impl BlackboxServer {
         description = "Ask a terminal bro for a workload retrospective: resume its session with a non-compelling reflection prompt; it self-files substrate gaps via bbox_gap only if something's worth surfacing. Does not delete the task."
     )]
     pub(crate) fn bro_retro(&self, Parameters(p): Parameters<RetroParams>) -> CallToolResult {
-        let (provider, session_id, cwd) = match self.state.task_store.read().get(&p.task_id) {
-            Some(task) => {
-                let inner = task.inner.lock();
-                (inner.provider, inner.session_id.clone(), inner.cwd.clone())
-            }
-            None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
-        };
+        let (provider, session_id, cwd, bro_label) =
+            match self.state.task_store.read().get(&p.task_id) {
+                Some(task) => {
+                    let inner = task.inner.lock();
+                    (
+                        inner.provider,
+                        inner.session_id.clone(),
+                        inner.cwd.clone(),
+                        inner.bro_label.clone(),
+                    )
+                }
+                None => return Self::err_text(&format!("Unknown task ID: {}", p.task_id)),
+            };
         if session_id.is_empty() || session_id == "pending" {
             return Self::err_text(&format!(
                 "task {} has no resumable session id yet",
                 p.task_id
             ));
         }
-        match self.spawn_workload_retro(provider, &session_id, cwd) {
+        match self.spawn_workload_retro(
+            &p.task_id,
+            provider,
+            &session_id,
+            cwd,
+            bro_label.as_deref(),
+        ) {
             Ok(retro_task_id) => Self::ok_json(&json!({
                 "retroTaskId": retro_task_id,
                 "sessionId": session_id,
@@ -1570,9 +1595,11 @@ impl BlackboxServer {
     /// as a skip (provider can't resume, session gone, lease contended).
     fn spawn_workload_retro(
         &self,
+        source_task_id: &str,
         provider: Provider,
         session_id: &str,
         cwd: Option<String>,
+        bro_label: Option<&str>,
     ) -> Result<String, String> {
         if !provider.supports_resume() {
             return Err(format!("{provider} does not support resume"));
@@ -1590,8 +1617,15 @@ impl BlackboxServer {
             provider,
             session_id,
         )?;
+        let (exec_opts, env_overrides) = self.resolve_workload_retro_runtime(
+            source_task_id,
+            provider,
+            session_id,
+            bro_label,
+            cwd.as_deref(),
+        )?;
         let prompt = orch::workload_retro_prompt(session_id, cwd.as_deref());
-        let mut args = provider.build_resume_args(session_id, &prompt, None);
+        let mut args = provider.build_resume_args(session_id, &prompt, exec_opts.as_ref());
         // Retro probes never orchestrate — keep the mechanical recursion
         // guard on so a probe can't fan out (or re-trigger prune-retro).
         let dispatch_filters =
@@ -1603,7 +1637,7 @@ impl BlackboxServer {
             args,
             session_id.to_string(),
             cwd,
-            None,
+            env_overrides,
             self.state.store_dir.clone(),
             self.state.task_store.clone(),
             self.state.tail_tx.clone(),
@@ -1614,6 +1648,108 @@ impl BlackboxServer {
         cleanup_policy_file_when_done(task.clone(), dispatch_filters.policy_file);
         release_resume_lease_when_done(task, resume_lease);
         Ok(task_id)
+    }
+
+    fn resolve_workload_retro_runtime(
+        &self,
+        source_task_id: &str,
+        provider: Provider,
+        session_id: &str,
+        bro_label: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<
+        (
+            Option<ExecOpts>,
+            Option<std::collections::HashMap<String, String>>,
+        ),
+        String,
+    > {
+        if let Some(lease) =
+            orchestration::allocator::lookup_lease_for_task(&self.state.store_dir, source_task_id)
+                .or_else(|| {
+                    orchestration::allocator::lookup_lease_for_session(
+                        &self.state.store_dir,
+                        &self.state.task_store.read(),
+                        provider,
+                        session_id,
+                    )
+                })
+        {
+            orchestration::brofile::enforce_provider_defaults(
+                provider,
+                lease.brofile_context.as_ref(),
+            )?;
+            let env = orchestration::brofile::resolve_provider_env(
+                provider,
+                lease.account.as_deref(),
+                lease.model.as_deref(),
+                &self.state.store_dir,
+                lease.brofile_context.as_ref(),
+            );
+            let opts = orchestration::allocator::exec_opts_for_lane(
+                &orchestration::allocator::RuntimeLane {
+                    provider,
+                    account: lease.account.clone(),
+                    tier: lease.tier.clone(),
+                    model: lease.model.clone(),
+                    effort: lease.effort.clone(),
+                    capabilities: lease.capabilities.clone(),
+                },
+            );
+            return Ok((opts, env));
+        }
+
+        if let Some(label) = bro_label {
+            let brofile = match orchestration::team::resolve_bro_selector(
+                label,
+                &orchestration::team::load_all_teams(&self.state.store_dir),
+            ) {
+                Ok(Some(bro_match)) => {
+                    let member = &bro_match.team.members[bro_match.member_idx];
+                    orchestration::brofile::resolve_brofile(
+                        &member.brofile,
+                        &self.state.store_dir,
+                        bro_match.team.project_dir.as_deref(),
+                    )
+                }
+                _ => orchestration::brofile::resolve_brofile(label, &self.state.store_dir, cwd),
+            };
+            if let Some(bf) = brofile {
+                orchestration::brofile::enforce_provider_defaults(provider, bf.context.as_ref())?;
+                let env = orchestration::brofile::resolve_provider_env(
+                    provider,
+                    bf.account.as_deref(),
+                    bf.model.as_deref(),
+                    &self.state.store_dir,
+                    bf.context.as_ref(),
+                );
+                let opts = if bf.model.is_some() || bf.effort.is_some() {
+                    Some(ExecOpts {
+                        model: bf.model.clone(),
+                        effort: bf.effort.clone(),
+                        provider_defaults: None,
+                    })
+                } else {
+                    None
+                };
+                let opts = orchestration::providers::exec_opts_with_provider_defaults(
+                    opts,
+                    bf.context.as_ref(),
+                );
+                return Ok((opts, env));
+            }
+        }
+
+        Ok((
+            None,
+            orchestration::brofile::resolve_provider_env(
+                provider,
+                None,
+                None,
+                &self.state.store_dir,
+                None,
+            ),
+        ))
     }
 
     #[tool(

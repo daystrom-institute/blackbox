@@ -37,6 +37,7 @@ use std::sync::Arc;
 pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
     use workspace::*;
     let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(SandboxStatus),
         Arc::new(FileRead),
         Arc::new(SmartRead),
         Arc::new(FileEdit),
@@ -55,6 +56,7 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitCommit),
         Arc::new(web::WebFetch),
         Arc::new(crate::todo::TodoWrite),
+        Arc::new(crate::fleet_worktree::SandboxGrounding),
         Arc::new(crate::fleet_worktree::EnterWorktree),
         Arc::new(crate::fleet_worktree::ExitWorktree),
     ];

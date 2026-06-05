@@ -1,0 +1,22 @@
+{
+  "id": "gap-dbbd1d2e",
+  "title": "work_bash RTK availability mismatch was hard to reconcile",
+  "gap_kind": "tooling",
+  "domain": "harness/sandbox",
+  "wanted_capability": "When project guidance requires shell commands to be prefixed with `rtk`, sandbox-native shell surfaces should make the effective PATH, HOME, command wrapper, and session/tool environment visible enough to reconcile a reported `rtk` failure with later direct validation that `rtk` is available.",
+  "missing_primitive": "work_bash command-environment provenance for PATH/tooling mismatches",
+  "fallback_used": "Added shell_path and tool_resolution to sandbox_status/sandbox_grounding so probes can see bounded PATH entries and command resolution for rtk, rg, git, cargo, and rustc without ad hoc shell forensics.",
+  "evidence": [
+    "note:note-d44b7b55",
+    "work_bash stderr: [rtk: No such file or directory (os error 2)]",
+    "direct dev MCP work_bash validation after retro: command -v rtk => /Users/invidious/.cargo/bin/rtk; rtk --version => rtk 0.40.0"
+  ],
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/harness-sandbox/work-bash-rtk-unavailable",
+  "notes": "Counter-evidence shows current dev work_bash resolves rtk with HOME=/Users/invidious and PATH including ~/.cargo/bin, including inside nested bash -lc. Addressed as an observability/reconciliation gap by exposing process_env_visible_to_shell.PATH, shell_path, and tool_resolution; tiny live probe confirmed rtk true at /Users/invidious/.cargo/bin/rtk and rg false/null.",
+  "resolution": "addressed",
+  "session_id": "6018ac5c-0e7e-4252-86a2-59064e47edc8",
+  "created_at": "2026-06-05T18:15:49Z",
+  "updated_at": "2026-06-05T18:33:13Z"
+}

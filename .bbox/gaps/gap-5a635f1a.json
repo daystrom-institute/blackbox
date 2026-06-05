@@ -1,0 +1,17 @@
+{
+  "id": "gap-5a635f1a",
+  "title": "Evidence bundles cannot cite system-memory runbooks directly",
+  "gap_kind": "mcp_surface",
+  "domain": "knowledge",
+  "wanted_capability": "Allow bbox_bundle_evidence to accept system memory/runbook refs returned by bbox_knowledge, or have bbox_knowledge return bundleable canonical refs for sm-* runbooks, so agents can cite runbook support without substituting a broader knowledge entry.",
+  "missing_primitive": "bundleable system_memory entity refs",
+  "fallback_used": "Addressed by introducing canonical system_memory:<id> entity refs and an inspect/bundle provider for system memories.",
+  "impact": "low",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/knowledge/bundle-system-memory-runbooks",
+  "notes": "During sandbox probe, bbox_knowledge(query=\"sm-agentic-opening-sequence\") returned the intended runbook body, but bbox_inspect_entity(\"knowledge:sm-agentic-opening-sequence\") was not_found and bbox_bundle_evidence therefore could not include the runbook as an entity. Implemented EntityType::SystemMemory plus SystemMemoryProvider; bbox_knowledge now advertises ref: system_memory:<id> in exact/listing/signpost/catalog surfaces. Validated with unit tests for parse round-trip, provider registry, inspect, catalog refs, and bundle_evidence. Live dev MCP smoke on 2026-06-05: bbox_knowledge returned ref: system_memory:sm-agentic-opening-sequence; bbox_inspect_entity and bbox_bundle_evidence both returned status ok; property_mode=summary compact bundling returned degraded.property_mode=summary.",
+  "resolution": "addressed",
+  "session_id": "0139b45d-d82f-4aee-957e-36e3348ce5cf",
+  "created_at": "2026-06-05T18:37:30Z",
+  "updated_at": "2026-06-05T18:54:51Z"
+}

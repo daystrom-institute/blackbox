@@ -1,0 +1,22 @@
+{
+  "id": "gap-22876b39",
+  "title": "Sandbox grounding cannot retrieve project code through bbox project_file corpus",
+  "gap_kind": "mcp_surface",
+  "domain": "sandbox-observability",
+  "wanted_capability": "During sandbox observability probes, the blackbox opening sequence should surface live project code/docs as project_file entities so agents can inspect and bundle implementation evidence without falling back to filesystem search.",
+  "missing_primitive": "indexed project_file/project_file_v2 entities for grounded cwd",
+  "fallback_used": "Used bbox_knowledge/describe/inspect/bundle for runbook/tool refs, then content_search and work_smart_read for source locations because bbox_describe_schema reported project_file/project_file_v2 population_count=0 and hybrid search returned only knowledge:bb-tool-reference.",
+  "evidence": [
+    "bbox_describe_schema: project_file=0 project_file_v2=0",
+    "bbox_hybrid_search(query='system_memory evidence bundle bbox_bundle_evidence'): only knowledge:bb-tool-reference; vector route degraded",
+    "work_smart_read src/mcp_tools/bundle_evidence.rs",
+    "work_smart_read src/providers/system_memory.rs"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/sandbox-observability/project-file-index-empty-for-grounding",
+  "resolution": "unresolved",
+  "task_id": "8243248d-e643-4681-8d7d-0b2411d731e9",
+  "created_at": "2026-06-05T18:59:29Z",
+  "updated_at": "2026-06-05T18:59:29Z"
+}

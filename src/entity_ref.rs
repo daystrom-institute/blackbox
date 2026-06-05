@@ -14,6 +14,7 @@ pub(crate) use crate::git::git_root_for_path;
 #[serde(rename_all = "snake_case")]
 pub enum EntityType {
     Knowledge,
+    SystemMemory,
     Transcript,
     File,
     ProjectFile,
@@ -35,8 +36,9 @@ pub enum EntityType {
 }
 
 impl EntityType {
-    pub const ALL: [EntityType; 19] = [
+    pub const ALL: [EntityType; 20] = [
         EntityType::Knowledge,
+        EntityType::SystemMemory,
         EntityType::Transcript,
         EntityType::File,
         EntityType::ProjectFile,
@@ -60,6 +62,7 @@ impl EntityType {
     pub fn as_str(self) -> &'static str {
         match self {
             EntityType::Knowledge => "knowledge",
+            EntityType::SystemMemory => "system_memory",
             EntityType::Transcript => "transcript",
             EntityType::File => "file",
             EntityType::ProjectFile => "project_file",
@@ -84,6 +87,7 @@ impl EntityType {
     pub fn example(self) -> &'static str {
         match self {
             EntityType::Knowledge => "knowledge:<entry_id>",
+            EntityType::SystemMemory => "system_memory:<sm-id>",
             EntityType::Transcript => {
                 "transcript:<provider>:<session_id>:<line_offset>:<event_idx>"
             }
@@ -139,6 +143,9 @@ impl fmt::Display for EntityType {
 /// `try_render` for boundary serialization that must reject invalid refs.
 pub enum EntityRef {
     Knowledge {
+        id: String,
+    },
+    SystemMemory {
         id: String,
     },
     Transcript {
@@ -243,6 +250,9 @@ impl EntityRef {
             EntityType::Knowledge => parse_single(input, rest, EntityType::Knowledge, |id| {
                 EntityRef::Knowledge { id }
             }),
+            EntityType::SystemMemory => parse_single(input, rest, EntityType::SystemMemory, |id| {
+                EntityRef::SystemMemory { id }
+            }),
             EntityType::Transcript => parse_transcript(input, rest),
             EntityType::File => parse_file(input, rest),
             EntityType::ProjectFile => parse_project_file(input, rest),
@@ -286,6 +296,7 @@ impl EntityRef {
     pub fn try_render(&self) -> Result<String, EntityRefRenderError> {
         match self {
             EntityRef::Knowledge { id } => Ok(format!("knowledge:{id}")),
+            EntityRef::SystemMemory { id } => Ok(format!("system_memory:{id}")),
             EntityRef::Transcript {
                 provider,
                 session_id,
@@ -370,6 +381,7 @@ impl EntityRef {
     pub fn entity_type(&self) -> EntityType {
         match self {
             EntityRef::Knowledge { .. } => EntityType::Knowledge,
+            EntityRef::SystemMemory { .. } => EntityType::SystemMemory,
             EntityRef::Transcript { .. } => EntityType::Transcript,
             EntityRef::File { .. } => EntityType::File,
             EntityRef::ProjectFile { .. } => EntityType::ProjectFile,
@@ -1173,39 +1185,42 @@ mod tests {
             0 => EntityRef::Knowledge {
                 id: rng.token("know-"),
             },
-            1 => EntityRef::Transcript {
+            1 => EntityRef::SystemMemory {
+                id: format!("sm-{}", rng.token("memory-")),
+            },
+            2 => EntityRef::Transcript {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("turn-")),
                 line_offset: rng.next(),
                 event_idx: rng.next() as u32,
             },
-            2 => EntityRef::File {
+            3 => EntityRef::File {
                 path: format!("{}/{}.rs", rng.token("src"), rng.token("mod")),
             },
-            3 => EntityRef::ProjectFile {
+            4 => EntityRef::ProjectFile {
                 project_id: rng.hex(8),
                 rel_path_hash: rng.hex(8),
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            4 => EntityRef::ProjectFileV2 {
+            5 => EntityRef::ProjectFileV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 rel_path_hash: rng.hex(8),
                 chunk_hash: rng.hex(64),
                 occurrence_idx: rng.next() as u32,
             },
-            5 => EntityRef::Session {
+            6 => EntityRef::Session {
                 provider: rng.provider("p", true),
                 session_id: format!("{}:{}", rng.token("sess-"), rng.token("sub-")),
             },
-            6 => EntityRef::Thread {
+            7 => EntityRef::Thread {
                 thread_id: rng.token("thread-"),
             },
-            7 => EntityRef::Note {
+            8 => EntityRef::Note {
                 note_id: rng.token("note-"),
             },
-            8 => EntityRef::Symbol {
+            9 => EntityRef::Symbol {
                 project_id: rng.hex(8),
                 qualified_name: format!(
                     "{}::{}::{}",
@@ -1215,7 +1230,7 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            9 => EntityRef::SymbolV2 {
+            10 => EntityRef::SymbolV2 {
                 project_id: rng.hex(8),
                 snapshot_id: format!("head-{}-{}", rng.hex(12), rng.hex(16)),
                 qualified_name: format!(
@@ -1226,36 +1241,36 @@ mod tests {
                 ),
                 defn_hash: rng.hex(64),
             },
-            10 => EntityRef::Brofile {
+            11 => EntityRef::Brofile {
                 name: rng.token("bro-"),
             },
-            11 => EntityRef::Whiteboard {
+            12 => EntityRef::Whiteboard {
                 board_id: rng.token("board-"),
             },
-            12 => EntityRef::Commit {
+            13 => EntityRef::Commit {
                 repo_id: rng.hex(8),
                 sha: rng.hex(40),
             },
-            13 => EntityRef::Task {
+            14 => EntityRef::Task {
                 task_id: rng.token("task-"),
             },
-            14 => EntityRef::BashCall {
+            15 => EntityRef::BashCall {
                 session: format!("{}:{}", rng.token("sess-"), rng.token("tool-")),
                 turn: rng.next() as u32,
             },
-            15 => EntityRef::Agent {
+            16 => EntityRef::Agent {
                 name: rng.token("agent-"),
                 version: 1 + (rng.next() as u32) % 10,
             },
-            16 => EntityRef::Packet {
+            17 => EntityRef::Packet {
                 selector: format!("domain:{}", rng.token("packet-domain-")),
             },
-            17 => EntityRef::Artifact {
+            18 => EntityRef::Artifact {
                 kind: "workflow".into(),
                 name: rng.token("workflow-"),
                 version: Some("1".into()),
             },
-            18 => EntityRef::RoadmapItem {
+            19 => EntityRef::RoadmapItem {
                 id: rng.token("roadmap-"),
             },
             _ => unreachable!(),

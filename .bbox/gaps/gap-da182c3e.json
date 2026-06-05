@@ -1,0 +1,24 @@
+{
+  "id": "gap-da182c3e",
+  "title": "Sandbox probes cannot clearly distinguish vector credential failures from queue saturation",
+  "gap_kind": "mcp_surface",
+  "domain": "sandbox-observability",
+  "wanted_capability": "During sandbox observability probes, vector degradation should expose a clear, current per-route reason so agents can tell whether hybrid search is degraded by missing credentials, queue saturation, stale retry errors, or empty corpus coverage without guessing from mixed messages.",
+  "missing_primitive": "current normalized vector-degradation reason in bbox_hybrid_search / bbox_embed_status",
+  "fallback_used": "Compared bbox_hybrid_search degradation text from probes with bbox_embed_status; inferred that most Voyage routes are available, code is queue-full, and notes still reports an older key-missing retry error.",
+  "evidence": [
+    "bbox_embed_status: code available=false queue_depth=10000 last_error='embedding route queue full'",
+    "bbox_embed_status: notes available=false last_error='VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required' while other Voyage routes are available",
+    "probe bc8d9fef: hybrid search reported degraded vector route/API key unavailable",
+    "probe ef008f5c: hybrid search reported degraded vector route while fallback remained usable"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "mcp_surface/sandbox-observability/vector-degradation-reason-ambiguous",
+  "suggested_owner": "blackbox",
+  "resolution": "addressed",
+  "created_at": "2026-06-05T19:25:51Z",
+  "updated_at": "2026-06-05T19:40:33Z",
+  "resolved_at": "2026-06-05T19:40:33Z",
+  "resolution_note": "Addressed in the sandbox-observability MCP surface: embedding RouteStatus now includes normalized health and health_reason fields; bbox_embed_status returns them after coverage merge; bbox_hybrid_search renders unhealthy route health summaries. Validation: cargo test -p blackbox route_health_classifies_common_failure_reasons --lib; cargo test -p blackbox render_text_names_unhealthy_vector_route_reasons --lib; cargo test -p blackbox tool_docs --lib; isolated debug daemon bbox_embed_status showed health/health_reason on every route; isolated Brodex probe aa892bee and retro 6b2a3d9f reported the surface visible/actionable with friction none."
+}

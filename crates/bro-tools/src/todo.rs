@@ -153,6 +153,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
             promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
+            session_env: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 

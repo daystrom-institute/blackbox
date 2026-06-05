@@ -621,6 +621,7 @@ impl Session {
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(std::sync::Mutex::new(bro_tools::PromiseStore::default())),
             edits: edits.clone(),
+            session_env: Arc::new(transport::session_env_snapshot()),
         };
         // The builtin `report` tool is harness-owned (it emits the cockpit's
         // status signal on the stream) and holds its own emitter handle. It is
@@ -1507,6 +1508,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(BTreeMap::new()),
         };
 
         let v = match FleetShellRun
@@ -1701,6 +1703,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(BTreeMap::new()),
         };
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

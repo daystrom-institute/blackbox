@@ -54,7 +54,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_embed_status",
-        description = "Return per-route embedding queue health."
+        description = "Return route embedding health and health_reason."
     )]
     pub(crate) fn bbox_embed_status(&self) -> CallToolResult {
         Self::run("bbox_embed_status", || {

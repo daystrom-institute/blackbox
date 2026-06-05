@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashSet};
 use anyhow::Result;
 use rmcp::schemars;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use serde_json::{Value, json};
 
 use crate::edge_index::EdgeIndex;
 use crate::entity_loader;
@@ -21,6 +21,10 @@ pub struct BundleEvidenceParams {
     pub question: String,
     pub entity_refs: Vec<String>,
     pub path_ids: Vec<String>,
+    /// Entity property payload mode. `full` preserves legacy behavior.
+    /// `summary` truncates long string properties. `none` omits properties.
+    #[serde(default)]
+    pub property_mode: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -95,6 +99,7 @@ pub fn bundle_evidence(
         &stale_path_ids,
         &unresolved_entity_refs,
     );
+    let property_mode = PropertyMode::from_param(p.property_mode.as_deref());
     Ok(serde_json::to_string_pretty(&json!({
         "status": "ok",
         "text": text,
@@ -102,7 +107,7 @@ pub fn bundle_evidence(
         "entities": entities.iter().map(|(r, properties)| json!({
             "entity_ref": r.to_string(),
             "label": render_node(ctx, r),
-            "properties": properties,
+            "properties": properties_for_mode(properties, property_mode),
         })).collect::<Vec<_>>(),
         "paths": paths.iter().map(|path| json!({
             "id": path.id,
@@ -118,8 +123,57 @@ pub fn bundle_evidence(
             "omitted_path_ids": omitted_path_ids,
             "intra_bundle_edges_truncated": intra_bundle_edges_truncated,
             "intra_bundle_convergences_truncated": intra_bundle_convergences_truncated,
+            "property_mode": property_mode.as_str(),
         }
     }))?)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PropertyMode {
+    Full,
+    Summary,
+    None,
+}
+
+impl PropertyMode {
+    fn from_param(raw: Option<&str>) -> Self {
+        match raw.unwrap_or("full").trim().to_ascii_lowercase().as_str() {
+            "summary" | "compact" => Self::Summary,
+            "none" | "omit" | "omitted" => Self::None,
+            _ => Self::Full,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Summary => "summary",
+            Self::None => "none",
+        }
+    }
+}
+
+fn properties_for_mode(properties: &BTreeMap<String, String>, mode: PropertyMode) -> Value {
+    match mode {
+        PropertyMode::Full => json!(properties),
+        PropertyMode::None => json!({}),
+        PropertyMode::Summary => json!(
+            properties
+                .iter()
+                .map(|(key, value)| (key.clone(), truncate_property(value, 600)))
+                .collect::<BTreeMap<_, _>>()
+        ),
+    }
+}
+
+fn truncate_property(value: &str, max_chars: usize) -> String {
+    let count = value.chars().count();
+    if count <= max_chars {
+        return value.to_string();
+    }
+    let mut out = value.chars().take(max_chars).collect::<String>();
+    out.push_str("...[truncated]");
+    out
 }
 
 fn intra_bundle_edges(edge_index: &EdgeIndex, refs: &[EntityRef]) -> Vec<serde_json::Value> {
@@ -276,6 +330,7 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec!["knowledge:abc123".into()],
             path_ids: vec!["P999".into()],
+            property_mode: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -303,6 +358,7 @@ mod tests {
                 "also-not-a-ref".into(),
             ],
             path_ids: Vec::new(),
+            property_mode: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -343,6 +399,7 @@ mod tests {
             question: "what changed?".into(),
             entity_refs: vec!["not-a-ref".into()],
             path_ids: Vec::new(),
+            property_mode: None,
         };
         let rendered = bundle_evidence(
             &params,
@@ -353,5 +410,65 @@ mod tests {
         .unwrap();
         let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(value["status"], "error.not_found");
+    }
+
+    #[test]
+    fn summary_property_mode_truncates_long_properties() {
+        let mut properties = BTreeMap::new();
+        properties.insert("content".to_string(), "x".repeat(700));
+        properties.insert("title".to_string(), "short".to_string());
+
+        let summarized = properties_for_mode(&properties, PropertyMode::Summary);
+
+        assert_eq!(summarized["title"], "short");
+        let content = summarized["content"].as_str().unwrap();
+        assert!(content.len() < 700);
+        assert!(content.ends_with("...[truncated]"));
+    }
+
+    #[test]
+    fn none_property_mode_omits_properties() {
+        let mut properties = BTreeMap::new();
+        properties.insert("content".to_string(), "x".repeat(700));
+
+        let omitted = properties_for_mode(&properties, PropertyMode::None);
+
+        assert!(omitted.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn system_memory_refs_are_bundleable() {
+        crate::system_memory::init_for_tests();
+        let params = BundleEvidenceParams {
+            question: "what is the opening sequence?".into(),
+            entity_refs: vec!["system_memory:sm-agentic-opening-sequence".into()],
+            path_ids: Vec::new(),
+            property_mode: Some("summary".into()),
+        };
+
+        let rendered = bundle_evidence(
+            &params,
+            &ProviderContext::empty_for_tests(),
+            &EdgeIndex::default(),
+            &mut PathCache::default(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "ok");
+        assert_eq!(
+            value["entities"][0]["entity_ref"],
+            "system_memory:sm-agentic-opening-sequence"
+        );
+        assert_eq!(
+            value["entities"][0]["properties"]["id"],
+            "sm-agentic-opening-sequence"
+        );
+        assert!(
+            value["entities"][0]["properties"]["content"]
+                .as_str()
+                .unwrap()
+                .ends_with("...[truncated]")
+        );
     }
 }

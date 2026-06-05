@@ -593,7 +593,11 @@ impl Tool for ShellRun {
                 "cwd": cwd.to_string_lossy(),
                 "timeout_ms": args.timeout_ms,
             });
-            let (promise_id, cancel_rx) = cx.promises.lock().unwrap().start("shell_run", detail, Some(progress));
+            let (promise_id, cancel_rx) =
+                cx.promises
+                    .lock()
+                    .unwrap()
+                    .start("shell_run", detail, Some(progress));
             let cx_bg = cx.clone();
             let promise_id_bg = promise_id.clone();
             tokio::spawn(async move {
@@ -898,6 +902,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
             promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
+            session_env: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -1003,7 +1008,10 @@ mod tests {
         );
         assert_eq!(v["running"], true, "should yield: {v}");
         let progress = &v["progress"];
-        assert!(progress.is_object(), "yielded response carries progress: {v}");
+        assert!(
+            progress.is_object(),
+            "yielded response carries progress: {v}"
+        );
         assert!(
             progress["stdout_bytes"].as_u64().unwrap_or(0) >= 3,
             "early `hi\\n` output should be counted: {v}"
@@ -1172,7 +1180,13 @@ mod tests {
         assert_eq!(waited["state"], "cancelled", "{waited}");
         assert_eq!(waited["completion_event_delivered"], true, "{waited}");
         assert_eq!(waited["result"]["cancelled"], true, "{waited}");
-        assert!(c.promises.lock().unwrap().drain_completion_events().is_empty());
+        assert!(
+            c.promises
+                .lock()
+                .unwrap()
+                .drain_completion_events()
+                .is_empty()
+        );
     }
 
     #[test]

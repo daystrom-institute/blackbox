@@ -85,6 +85,7 @@ pub(crate) fn status_response_for_buckets(
             Some(counts.indexed_count as f32 / counts.source_count as f32)
         };
     }
+    queue::normalize_route_statuses(&mut response);
     Ok(response)
 }
 

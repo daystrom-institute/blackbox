@@ -181,7 +181,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bbox_knowledge",
-        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (file-loaded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. Pass `category=\"system_memory\"` to list all system memories (metadata only). For structured packet discovery + filtering, use bbox_packet_list."
+        description = "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces matching rule-packets and system memories; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters."
     )]
     pub(crate) fn bbox_knowledge(
         &self,

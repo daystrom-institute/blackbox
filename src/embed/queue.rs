@@ -32,6 +32,8 @@ pub struct EmbedRequest {
 #[derive(Debug, Clone, Serialize, schemars::JsonSchema)]
 pub struct RouteStatus {
     pub available: bool,
+    pub health: String,
+    pub health_reason: Option<String>,
     pub provider: Option<String>,
     pub model: Option<String>,
     pub dim: Option<usize>,
@@ -49,6 +51,8 @@ impl Default for RouteStatus {
     fn default() -> Self {
         Self {
             available: true,
+            health: "ok".into(),
+            health_reason: None,
             provider: None,
             model: None,
             dim: None,
@@ -271,9 +275,11 @@ impl EmbedQueueHandle {
     }
 
     pub fn status(&self) -> EmbedStatusResponse {
-        EmbedStatusResponse {
+        let mut response = EmbedStatusResponse {
             routes: self.inner.statuses.read().clone(),
-        }
+        };
+        normalize_route_statuses(&mut response);
+        response
     }
 
     pub fn shutdown(&self) {
@@ -377,6 +383,8 @@ impl EmbedQueueHandle {
                 bucket.as_str().to_string(),
                 RouteStatus {
                     available: false,
+                    health: "unavailable".into(),
+                    health_reason: Some(classify_error_reason(&message).into()),
                     last_error: Some(message.clone()),
                     ..RouteStatus::default()
                 },
@@ -882,6 +890,8 @@ fn try_reserve_queue(
         || status.queue_bytes.saturating_add(bytes) > MAX_ROUTE_QUEUE_BYTES
     {
         status.available = false;
+        status.health = "unavailable".into();
+        status.health_reason = Some("queue_full".into());
         status.last_error = Some(format!(
             "embedding route queue full: depth={} bytes={} max_depth={} max_bytes={}",
             status.queue_depth, status.queue_bytes, MAX_ROUTE_QUEUE_DEPTH, MAX_ROUTE_QUEUE_BYTES
@@ -914,9 +924,11 @@ fn mark_success(
     let mut statuses = statuses.write();
     let status = statuses.entry(route.to_string()).or_default();
     status.available = true;
+    status.health = "ok".into();
     status.indexed_count = status.indexed_count.saturating_add(count);
     status.queue_depth = status.queue_depth.saturating_sub(count);
     status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
+    status.health_reason = None;
     status.last_error = None;
 }
 
@@ -938,6 +950,8 @@ fn mark_dropped(
     status.available = false;
     status.queue_depth = status.queue_depth.saturating_sub(count);
     status.queue_bytes = status.queue_bytes.saturating_sub(bytes);
+    status.health = "unavailable".into();
+    status.health_reason = Some(classify_error_reason(message).into());
     status.last_error = Some(message.to_string());
 }
 
@@ -945,7 +959,52 @@ fn mark_error(statuses: &RwLock<BTreeMap<String, RouteStatus>>, route: &str, mes
     let mut statuses = statuses.write();
     let status = statuses.entry(route.to_string()).or_default();
     status.available = false;
+    status.health = "unavailable".into();
+    status.health_reason = Some(classify_error_reason(message).into());
     status.last_error = Some(message.to_string());
+}
+
+pub(crate) fn normalize_route_statuses(response: &mut EmbedStatusResponse) {
+    for status in response.routes.values_mut() {
+        normalize_route_status(status);
+    }
+}
+
+fn normalize_route_status(status: &mut RouteStatus) {
+    if status.available {
+        status.health = "ok".into();
+        status.health_reason = None;
+        return;
+    }
+    status.health = "unavailable".into();
+    let reason = status
+        .last_error
+        .as_deref()
+        .map(classify_error_reason)
+        .unwrap_or("unavailable");
+    status.health_reason = Some(reason.into());
+}
+
+fn classify_error_reason(message: &str) -> &'static str {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("queue full") {
+        "queue_full"
+    } else if message.contains("VOYAGE_API_KEY")
+        || message.contains("DAYSTROM_VOYAGE_API_KEY")
+        || lower.contains("api key")
+        || lower.contains("token")
+        || lower.contains("credential")
+    {
+        "credential_missing"
+    } else if lower.contains("worker stopped") {
+        "worker_stopped"
+    } else if lower.contains("not configured") || lower.contains("config") {
+        "not_configured"
+    } else if lower.contains("unavailable") {
+        "provider_unavailable"
+    } else {
+        "error"
+    }
 }
 
 fn sanitize_error(err: &anyhow::Error) -> String {
@@ -1105,6 +1164,48 @@ mod tests {
                 .contains("dropped after 3 retries")
         );
         queue.shutdown();
+    }
+
+    #[test]
+    fn route_health_classifies_common_failure_reasons() {
+        let mut response = EmbedStatusResponse {
+            routes: BTreeMap::from([
+                (
+                    "code".to_string(),
+                    RouteStatus {
+                        available: false,
+                        queue_depth: MAX_ROUTE_QUEUE_DEPTH,
+                        last_error: Some(
+                            "embedding route queue full: depth=10000 max_depth=10000".into(),
+                        ),
+                        ..RouteStatus::default()
+                    },
+                ),
+                (
+                    "notes".to_string(),
+                    RouteStatus {
+                        available: false,
+                        last_error: Some(
+                            "VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required".into(),
+                        ),
+                        ..RouteStatus::default()
+                    },
+                ),
+            ]),
+        };
+
+        normalize_route_statuses(&mut response);
+
+        assert_eq!(response.routes["code"].health, "unavailable");
+        assert_eq!(
+            response.routes["code"].health_reason.as_deref(),
+            Some("queue_full")
+        );
+        assert_eq!(response.routes["notes"].health, "unavailable");
+        assert_eq!(
+            response.routes["notes"].health_reason.as_deref(),
+            Some("credential_missing")
+        );
     }
 
     #[test]

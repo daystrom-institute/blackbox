@@ -1347,6 +1347,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
             promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 

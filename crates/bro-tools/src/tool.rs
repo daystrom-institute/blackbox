@@ -3,6 +3,7 @@
 
 use async_trait::async_trait;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -31,6 +32,10 @@ pub struct ToolCx {
     /// dispatch to feed window-0 diagnostics. Ephemeral — never persisted to
     /// `side`.
     pub edits: Arc<std::sync::Mutex<crate::edits::EditSink>>,
+    /// Per-session daemon-supplied identity/config env. This is intentionally
+    /// separate from process env so shell children do not inherit credentials.
+    /// Tools that expose it must redact sensitive values.
+    pub session_env: Arc<BTreeMap<String, String>>,
 }
 
 /// Result of a tool call. Maps onto the content of an Anthropic

@@ -4,7 +4,10 @@
 //! is *absent*, not the empty-string suppress sentinel — it builds its base
 //! system prompt the same way Codex assembles project docs: a global
 //! `$CODEX_HOME/AGENTS.md` (+ `AGENTS.override.md`) followed by the repo's
-//! `AGENTS.md` files walked from the git root down to the cwd.
+//! project instruction docs walked from the git root down to the cwd. The
+//! default project instruction doc is `AGENTS.md`; sandbox/beta sessions can set
+//! `BRO_HARNESS_PROJECT_DOC_FILES=AGENTS_BETA.md` to load a different repo doc
+//! without changing global Codex instructions.
 //!
 //! `AGENTS.md` is the provider-agnostic project-doc filename. The harness backs
 //! Claude-compatible providers but reads `AGENTS.md` (not `CLAUDE.md`) so a
@@ -33,6 +36,23 @@ fn project_doc_max_bytes() -> usize {
         .unwrap_or(DEFAULT_PROJECT_DOC_MAX_BYTES)
 }
 
+fn project_doc_files() -> Vec<String> {
+    crate::transport::session_var("BRO_HARNESS_PROJECT_DOC_FILES")
+        .as_deref()
+        .map(parse_project_doc_files)
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| vec![AGENTS_FILE.to_string()])
+}
+
+fn parse_project_doc_files(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter(|s| !s.contains('/') && !s.contains('\\'))
+        .map(ToString::to_string)
+        .collect()
+}
+
 /// Resolve `$CODEX_HOME`, defaulting to `~/.codex` — the same base the daemon's
 /// Codex arm uses (`orchestration::brofile`).
 fn codex_home() -> Option<PathBuf> {
@@ -50,7 +70,7 @@ fn codex_home() -> Option<PathBuf> {
 /// lands last. If `cwd` is not inside a git repo, only `cwd/AGENTS.md` is
 /// considered — Codex does not walk arbitrarily up the filesystem outside a
 /// repo.
-fn project_agents_paths(cwd: &Path) -> Vec<PathBuf> {
+fn project_agents_paths(cwd: &Path, names: &[String]) -> Vec<PathBuf> {
     let mut git_root: Option<PathBuf> = None;
     let mut probe = Some(cwd);
     while let Some(d) = probe {
@@ -61,24 +81,26 @@ fn project_agents_paths(cwd: &Path) -> Vec<PathBuf> {
         probe = d.parent();
     }
 
-    let mut chain: Vec<PathBuf> = Vec::new();
-    match git_root {
+    let dirs = match git_root {
         Some(root) => {
+            let mut dirs = Vec::new();
             let mut d = Some(cwd);
             while let Some(cur) = d {
-                let candidate = cur.join(AGENTS_FILE);
-                if candidate.is_file() {
-                    chain.push(candidate);
-                }
+                dirs.push(cur.to_path_buf());
                 if cur == root {
                     break;
                 }
                 d = cur.parent();
             }
-            chain.reverse();
+            dirs.reverse();
+            dirs
         }
-        None => {
-            let candidate = cwd.join(AGENTS_FILE);
+        None => vec![cwd.to_path_buf()],
+    };
+    let mut chain: Vec<PathBuf> = Vec::new();
+    for dir in dirs {
+        for name in names {
+            let candidate = dir.join(name);
             if candidate.is_file() {
                 chain.push(candidate);
             }
@@ -219,12 +241,13 @@ fn truncate_on_char_boundary(s: &mut String, cap: usize) {
 /// Returns `None` when no AGENTS docs exist, in which case the caller sends no
 /// system prompt (identical to the prior provider-defaults behavior).
 pub(crate) fn discover(cwd: &Path) -> Option<String> {
-    assemble(cwd, codex_home().as_deref())
+    let project_doc_files = project_doc_files();
+    assemble(cwd, codex_home().as_deref(), &project_doc_files)
 }
 
 /// Pure assembly seam: explicit `cwd` and `codex_home` make this testable
 /// without touching process-global env/cwd.
-fn assemble(cwd: &Path, codex_home: Option<&Path>) -> Option<String> {
+fn assemble(cwd: &Path, codex_home: Option<&Path>, project_doc_files: &[String]) -> Option<String> {
     let mut sections: Vec<String> = Vec::new();
     let mut loaded: Vec<String> = Vec::new();
     let mut loaded_paths: HashSet<PathBuf> = HashSet::new();
@@ -240,7 +263,7 @@ fn assemble(cwd: &Path, codex_home: Option<&Path>) -> Option<String> {
     // Project scope: repo AGENTS.md, git root → cwd; the joined chain is capped
     // per Codex `project_doc_max_bytes`.
     let mut project: Vec<String> = Vec::new();
-    for p in project_agents_paths(cwd) {
+    for p in project_agents_paths(cwd, project_doc_files) {
         project.extend(read_doc_tree(&p, &mut loaded_paths, &mut loaded, 0));
     }
     if !project.is_empty() {
@@ -259,6 +282,16 @@ fn assemble(cwd: &Path, codex_home: Option<&Path>) -> Option<String> {
     if sections.is_empty() {
         return None;
     }
+    let manifest = format!(
+        "[project-docs]\nselected: {}\nloaded:\n{}\n[/project-docs]",
+        project_doc_files.join(", "),
+        loaded
+            .iter()
+            .map(|path| format!("  - {path}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    sections.insert(0, manifest);
     tracing::info!(files = ?loaded, "loaded AGENTS.md overlay as base system prompt");
     Some(sections.join("\n\n"))
 }
@@ -282,13 +315,17 @@ mod tests {
         fs::write(path, body).unwrap();
     }
 
+    fn default_docs() -> Vec<String> {
+        vec![AGENTS_FILE.to_string()]
+    }
+
     #[test]
     fn none_when_no_docs() {
         let root = scratch();
         write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
         let cwd = root.join("crate").join("sub");
         fs::create_dir_all(&cwd).unwrap();
-        assert!(assemble(&cwd, None).is_none());
+        assert!(assemble(&cwd, None, &default_docs()).is_none());
         fs::remove_dir_all(&root).ok();
     }
 
@@ -300,7 +337,7 @@ mod tests {
         let cwd = root.join("crate").join("sub");
         write(&cwd.join(AGENTS_FILE), "LEAF-DOC");
 
-        let out = assemble(&cwd, None).expect("docs present");
+        let out = assemble(&cwd, None, &default_docs()).expect("docs present");
         let root_at = out.find("ROOT-DOC").unwrap();
         let leaf_at = out.find("LEAF-DOC").unwrap();
         assert!(root_at < leaf_at, "git-root doc must precede cwd doc");
@@ -315,7 +352,7 @@ mod tests {
         let cwd = root.join("child");
         write(&cwd.join(AGENTS_FILE), "CHILD-DOC");
 
-        let out = assemble(&cwd, None).expect("cwd doc present");
+        let out = assemble(&cwd, None, &default_docs()).expect("cwd doc present");
         assert!(out.contains("CHILD-DOC"));
         assert!(
             !out.contains("PARENT-DOC"),
@@ -334,7 +371,7 @@ mod tests {
         write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
         write(&root.join(AGENTS_FILE), "PROJECT-DOC");
 
-        let out = assemble(&root, Some(&home)).expect("docs present");
+        let out = assemble(&root, Some(&home), &default_docs()).expect("docs present");
         let g = out.find("GLOBAL-DOC").unwrap();
         let o = out.find("OVERRIDE-DOC").unwrap();
         let p = out.find("PROJECT-DOC").unwrap();
@@ -355,7 +392,7 @@ mod tests {
         write(&root.join("docs").join("EXTRA.md"), "EXTRA-DOC");
         write(&root.join("docs").join("NESTED.md"), "NESTED-DOC");
 
-        let out = assemble(&root, None).expect("docs present");
+        let out = assemble(&root, None, &default_docs()).expect("docs present");
         let root_at = out.find("ROOT-DOC").unwrap();
         let project_at = out.find("PROJECT-DOC").unwrap();
         let extra_at = out.find("EXTRA-DOC").unwrap();
@@ -386,11 +423,26 @@ mod tests {
             ),
         );
 
-        let out = assemble(&root, None).expect("docs present");
+        let out = assemble(&root, None, &default_docs()).expect("docs present");
         assert!(out.contains("BLACKBOX-DOC"));
         assert_eq!(out.matches("BLACKBOX-DOC").count(), 1);
         assert!(!out.contains("SECRET"));
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&external).ok();
+    }
+
+    #[test]
+    fn alternate_project_doc_file_can_replace_agents_md() {
+        let root = scratch();
+        write(&root.join(".git").join("HEAD"), "ref: refs/heads/main\n");
+        write(&root.join(AGENTS_FILE), "NORMAL-DOC");
+        write(&root.join("AGENTS_BETA.md"), "BETA-DOC");
+
+        let docs = vec!["AGENTS_BETA.md".to_string()];
+        let out = assemble(&root, None, &docs).expect("docs present");
+        assert!(out.contains("selected: AGENTS_BETA.md"));
+        assert!(out.contains("BETA-DOC"));
+        assert!(!out.contains("NORMAL-DOC"));
+        fs::remove_dir_all(&root).ok();
     }
 }

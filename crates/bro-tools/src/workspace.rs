@@ -13,7 +13,9 @@ use regex::Regex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Effective workspace root. Normally this is the harness launch root. After
 /// `exit_worktree(publish)` removes a managed fleet worktree, the harness
@@ -47,6 +49,231 @@ fn effective_root_with_env(
     } else {
         root_norm
     }
+}
+
+#[derive(Deserialize, JsonSchema)]
+struct SandboxStatusInput {
+    /// Optional root to inspect. Use the `cwd` returned by enter_worktree to
+    /// inspect a managed worktree after entering it. Omit to inspect the
+    /// harness launch root.
+    #[serde(default)]
+    root: Option<String>,
+    /// Number of dirty git status entries to include. Default 12.
+    #[serde(default)]
+    status_limit: Option<usize>,
+}
+
+pub struct SandboxStatus;
+
+#[async_trait]
+impl Tool for SandboxStatus {
+    fn name(&self) -> &str {
+        "sandbox_status"
+    }
+
+    fn description(&self) -> &str {
+        "Return a compact sandbox grounding manifest: launch/effective root, git/worktree identity, selected project-doc env, redacted session env, and process env keys visible to shell children. Pass root=<enter_worktree cwd> to inspect a managed worktree after entering it."
+    }
+
+    fn input_schema(&self) -> Value {
+        schema_for::<SandboxStatusInput>()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            read_only: true,
+            ..Default::default()
+        }
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: SandboxStatusInput = match serde_json::from_value(input) {
+            Ok(args) => args,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        ToolResult::from_result(sandbox_status(cx, args))
+    }
+}
+
+fn sandbox_status(cx: &ToolCx, args: SandboxStatusInput) -> anyhow::Result<Value> {
+    sandbox_status_manifest(cx, args.root.as_deref(), args.status_limit)
+}
+
+pub(crate) fn sandbox_status_manifest(
+    cx: &ToolCx,
+    root: Option<&str>,
+    status_limit: Option<usize>,
+) -> anyhow::Result<Value> {
+    let (root, root_source) = match root {
+        Some(raw) if !raw.trim().is_empty() => (normalize_lexical(&PathBuf::from(raw)), "explicit"),
+        _ => (effective_root(&cx.root), "launch"),
+    };
+    if !root.exists() {
+        anyhow::bail!("root does not exist: {}", root.display());
+    }
+    let session_env = redact_env(&cx.session_env);
+    let process_env = visible_process_env();
+    let shell_path = shell_path_manifest();
+    let tool_resolution = tool_resolution_manifest(["rtk", "rg", "git", "cargo", "rustc"]);
+    Ok(json!({
+        "launch_root": cx.root,
+        "inspected_root": root,
+        "root_source": root_source,
+        "git": git_status_manifest(&root, status_limit.unwrap_or(12)),
+        "fleet_worktree": {
+            "base_repo": std::env::var("BRO_FLEET_BASE_REPO").ok(),
+            "parent_worktree": std::env::var("BRO_FLEET_PARENT_WORKTREE").ok(),
+            "worktree_root": std::env::var("BRO_FLEET_WORKTREE_ROOT").ok(),
+            "worktree_branch": std::env::var("BRO_FLEET_WORKTREE_BRANCH").ok(),
+        },
+        "project_docs": {
+            "selected": cx.session_env
+                .get("BRO_HARNESS_PROJECT_DOC_FILES")
+                .cloned()
+                .or_else(|| std::env::var("BRO_HARNESS_PROJECT_DOC_FILES").ok()),
+            "max_bytes": cx.session_env
+                .get("BRO_HARNESS_PROJECT_DOC_MAX_BYTES")
+                .cloned()
+                .or_else(|| std::env::var("BRO_HARNESS_PROJECT_DOC_MAX_BYTES").ok()),
+        },
+        "session_env": session_env,
+        "process_env_visible_to_shell": process_env,
+        "shell_path": shell_path,
+        "tool_resolution": tool_resolution,
+        "notes": [
+            "session_env values are task-local daemon config; sensitive values are redacted and are not inherited by shell children",
+            "process_env_visible_to_shell is the subset expected to be inherited by shell tools",
+            "tool_resolution checks common operator/project commands against PATH as seen by this harness process; MCP workspace shell tools may have their own path augmentation",
+        ],
+    }))
+}
+
+fn git_status_manifest(root: &Path, status_limit: usize) -> Value {
+    json!({
+        "toplevel": git_capture(root, &["rev-parse", "--show-toplevel"]),
+        "branch": git_capture(root, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        "head": git_capture(root, &["rev-parse", "--short=12", "HEAD"]),
+        "status": git_status_summary(root, status_limit),
+    })
+}
+
+fn git_status_summary(root: &Path, status_limit: usize) -> Value {
+    let Some(raw) = git_capture(root, &["status", "--short", "--branch"]) else {
+        return Value::Null;
+    };
+    let mut lines = raw.lines();
+    let branch = lines.next().unwrap_or_default().to_string();
+    let entries: Vec<String> = lines.map(str::to_string).collect();
+    let dirty_count = entries.len();
+    let limit = status_limit.max(1);
+    json!({
+        "branch_line": branch,
+        "dirty_count": dirty_count,
+        "entries": entries.iter().take(limit).cloned().collect::<Vec<_>>(),
+        "truncated": dirty_count > limit,
+    })
+}
+
+fn git_capture(root: &Path, args: &[&str]) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn visible_process_env() -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for key in [
+        "PATH",
+        "BRO_FLEET_BASE_REPO",
+        "BRO_FLEET_PARENT_WORKTREE",
+        "BRO_FLEET_WORKTREE_ROOT",
+        "BRO_FLEET_WORKTREE_BRANCH",
+        "BRO_HARNESS_PROJECT_DOC_FILES",
+        "BRO_HARNESS_PROJECT_DOC_MAX_BYTES",
+        "CARGO_TARGET_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            out.insert(key.to_string(), value);
+        }
+    }
+    out
+}
+
+fn shell_path_manifest() -> Value {
+    let raw = std::env::var_os("PATH").unwrap_or_default();
+    let entries: Vec<String> = std::env::split_paths(&raw)
+        .map(|path| path.display().to_string())
+        .collect();
+    let entry_count = entries.len();
+    let limit = 24;
+    json!({
+        "entry_count": entry_count,
+        "entries": entries.iter().take(limit).cloned().collect::<Vec<_>>(),
+        "truncated": entry_count > limit,
+    })
+}
+
+fn tool_resolution_manifest<const N: usize>(bins: [&str; N]) -> BTreeMap<String, Value> {
+    bins.into_iter()
+        .map(|bin| {
+            (
+                bin.to_string(),
+                match resolve_bin_on_path(bin) {
+                    Some(path) => json!({"available": true, "path": path.display().to_string()}),
+                    None => json!({"available": false, "path": Value::Null}),
+                },
+            )
+        })
+        .collect()
+}
+
+fn resolve_bin_on_path(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(bin);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn redact_env(env: &BTreeMap<String, String>) -> BTreeMap<String, Value> {
+    env.iter()
+        .map(|(key, value)| {
+            let redacted = is_sensitive_env_key(key);
+            (
+                key.clone(),
+                json!({
+                    "present": true,
+                    "value": if redacted { Value::String("<redacted>".to_string()) } else { Value::String(value.clone()) },
+                    "redacted": redacted,
+                    "visible_to_shell": std::env::var(key).is_ok_and(|process_value| process_value == *value),
+                }),
+            )
+        })
+        .collect()
+}
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "API_KEY",
+        "AUTH",
+        "CREDENTIAL",
+    ]
+    .iter()
+    .any(|needle| upper.contains(needle))
 }
 
 /// Resolve a caller-supplied path against the effective worktree root and
@@ -1182,7 +1409,45 @@ mod tests {
                 crate::promise::PromiseStore::default(),
             )),
             edits: std::sync::Arc::new(std::sync::Mutex::new(crate::edits::EditSink::default())),
+            session_env: std::sync::Arc::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    #[tokio::test]
+    async fn sandbox_status_reports_project_docs_and_redacts_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cx = cx_at(dir.path());
+        cx.session_env = std::sync::Arc::new(BTreeMap::from([
+            (
+                "BRO_HARNESS_PROJECT_DOC_FILES".to_string(),
+                "AGENTS_BETA.md".to_string(),
+            ),
+            (
+                "ANTHROPIC_AUTH_TOKEN".to_string(),
+                "secret-token".to_string(),
+            ),
+        ]));
+
+        let out = SandboxStatus
+            .call(
+                json!({"root": dir.path().display().to_string(), "status_limit": 2}),
+                &cx,
+            )
+            .await;
+        let ToolResult::Json(v) = out else {
+            panic!("expected json");
+        };
+        assert_eq!(v["root_source"], "explicit");
+        assert_eq!(v["inspected_root"], dir.path().display().to_string());
+        assert_eq!(v["project_docs"]["selected"], "AGENTS_BETA.md");
+        assert_eq!(
+            v["session_env"]["ANTHROPIC_AUTH_TOKEN"]["value"],
+            "<redacted>"
+        );
+        assert_eq!(
+            v["session_env"]["BRO_HARNESS_PROJECT_DOC_FILES"]["value"],
+            "AGENTS_BETA.md"
+        );
     }
 
     #[tokio::test]

@@ -812,6 +812,24 @@ fn render_text(
             out.push_str(&format!("  - {route}: {err}\n"));
         }
     }
+    let unhealthy_routes = vector_status
+        .queues
+        .iter()
+        .filter(|(_, status)| status.health != "ok")
+        .collect::<Vec<_>>();
+    if !unhealthy_routes.is_empty() {
+        out.push_str("Vector route health:\n");
+        for (route, status) in unhealthy_routes {
+            let reason = status.health_reason.as_deref().unwrap_or("unavailable");
+            out.push_str(&format!(
+                "  - {route}: {} ({reason}; queue_depth={}, indexed_count={})\n",
+                status.health, status.queue_depth, status.indexed_count
+            ));
+            if let Some(err) = status.last_error.as_deref() {
+                out.push_str(&format!("    last_error: {}\n", sanitize_status_error(err)));
+            }
+        }
+    }
     out
 }
 
@@ -834,6 +852,18 @@ fn sanitize_error(err: &anyhow::Error) -> String {
     }
     if value.len() > 200 {
         value.truncate(197);
+        value.push_str("...");
+    }
+    value
+}
+
+fn sanitize_status_error(err: &str) -> String {
+    let mut value = err.to_string();
+    if let Some((first, _)) = value.split_once('\n') {
+        value = first.to_string();
+    }
+    if value.len() > 160 {
+        value.truncate(157);
         value.push_str("...");
     }
     value
@@ -872,11 +902,58 @@ mod tests {
         assert!(text.contains("Hybrid search: fixture"));
         assert!(text.contains("Vector status"));
         // Breadcrumb names the top seed ref and points into the funnel.
-        assert!(text.contains("Next steps:"), "render should append breadcrumbs: {text}");
+        assert!(
+            text.contains("Next steps:"),
+            "render should append breadcrumbs: {text}"
+        );
         assert!(
             text.contains("bbox_inspect_entity(entity_ref=\"knowledge:a\")"),
             "breadcrumb should carry the top seed ref: {text}"
         );
+    }
+
+    #[test]
+    fn render_text_names_unhealthy_vector_route_reasons() {
+        let mut queues = BTreeMap::new();
+        queues.insert(
+            "code".into(),
+            crate::embed::queue::RouteStatus {
+                available: false,
+                health: "unavailable".into(),
+                health_reason: Some("queue_full".into()),
+                queue_depth: 10_000,
+                indexed_count: 12,
+                last_error: Some("embedding route queue full: depth=10000".into()),
+                ..crate::embed::queue::RouteStatus::default()
+            },
+        );
+        queues.insert(
+            "notes".into(),
+            crate::embed::queue::RouteStatus {
+                available: false,
+                health: "unavailable".into(),
+                health_reason: Some("credential_missing".into()),
+                last_error: Some("VOYAGE_API_KEY or DAYSTROM_VOYAGE_API_KEY is required".into()),
+                ..crate::embed::queue::RouteStatus::default()
+            },
+        );
+        let vector_status = HybridVectorStatus {
+            queues,
+            partitions: BTreeMap::new(),
+            searched_partitions: Vec::new(),
+        };
+
+        let text = render_text(
+            "fixture",
+            &[],
+            &[],
+            &vector_status,
+            &HybridDegraded::default(),
+        );
+
+        assert!(text.contains("Vector route health:"));
+        assert!(text.contains("code: unavailable (queue_full; queue_depth=10000"));
+        assert!(text.contains("notes: unavailable (credential_missing;"));
     }
 
     #[test]
@@ -913,10 +990,22 @@ mod tests {
             },
         ];
         let steps = build_next_steps(&results);
-        assert!(steps.iter().any(|s| s.contains("bbox_inspect_entity(entity_ref=\"knowledge:top\")")));
-        assert!(steps.iter().any(|s| s.contains("bbox_find_paths(from=\"knowledge:top\"")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("bbox_inspect_entity(entity_ref=\"knowledge:top\")"))
+        );
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("bbox_find_paths(from=\"knowledge:top\""))
+        );
         // Bundle step lists the top refs for direct paste.
-        assert!(steps.iter().any(|s| s.contains("\"knowledge:top\", \"thread:abc\"")));
+        assert!(
+            steps
+                .iter()
+                .any(|s| s.contains("\"knowledge:top\", \"thread:abc\""))
+        );
     }
 
     #[test]

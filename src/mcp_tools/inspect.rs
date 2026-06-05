@@ -419,4 +419,33 @@ mod tests {
         assert_eq!(value["error"]["code"], "error.not_found");
         assert_eq!(value["error"]["similar_refs"][0], "knowledge:nearby");
     }
+
+    #[test]
+    fn inspect_system_memory_ref() {
+        crate::system_memory::init_for_tests();
+        let params = InspectEntityParams {
+            entity_ref: "system_memory:sm-agentic-opening-sequence".into(),
+            edge_types: None,
+            direction: None,
+            per_type_limit: Some(0),
+            property_mode: Some("summary".into()),
+        };
+        let r = EntityRef::parse(&params.entity_ref).unwrap();
+        let rendered = inspect_entity(
+            &params,
+            &ProviderContext::empty_for_tests(),
+            &r,
+            &EdgeIndex::default(),
+        )
+        .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(value["status"], "ok");
+        assert_eq!(
+            value["entity_ref"],
+            "system_memory:sm-agentic-opening-sequence"
+        );
+        assert_eq!(value["properties"]["id"], "sm-agentic-opening-sequence");
+        assert!(value["properties"].get("content").is_none());
+    }
 }

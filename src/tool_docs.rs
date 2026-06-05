@@ -236,7 +236,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_embed_status",
         category: ToolCategory::Transcripts,
-        summary: "Return per-route embedding queue health.",
+        summary: "Return route embedding health and health_reason.",
         when_to_use: "Use when vector search degrades. Reports availability, queue depth, success count, and sanitized error",
         example: None,
     },
@@ -290,10 +290,10 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_bundle_evidence",
         category: ToolCategory::Graph,
-        summary: "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response.",
-        when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) — close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). This tool packages evidence only; it does not synthesize the answer for you.",
+        summary: "Package selected entity refs and cached path IDs into a structured evidence bundle. Use after bbox_find_paths to close the loop before answering; stale path IDs degrade explicitly under degraded.stale_path_ids instead of failing the whole response. Set property_mode=summary for compact provenance bundles over broad/long refs; default is full for compatibility.",
+        when_to_use: "Step 5 of the agentic opening sequence (`sm-agentic-opening-sequence`) — close the loop before answering. Pass `path_ids` from `bbox_find_paths` directly; do not reconstruct path text from memory (the server holds the validated graph). Use `property_mode=\"summary\"` when bundling broad knowledge/tool refs or other long entities. This tool packages evidence only; it does not synthesize the answer for you.",
         example: Some(
-            r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"])"#,
+            r#"bbox_bundle_evidence(question="Why was this replaced?", entity_refs=["knowledge:abc12345"], path_ids=["P1"], property_mode="summary")"#,
         ),
     },
     ToolDoc {
@@ -593,7 +593,7 @@ pub const TOOL_DOCS: &[ToolDoc] = &[
     ToolDoc {
         name: "bbox_knowledge",
         category: ToolCategory::Knowledge,
-        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces (a) rule-packets matching the query by id / domain / rule ids / classification values, and (b) system memories (file-loaded runbooks) marked `[system]`. Pass `category=\"packet\"` to list every compiled packet regardless of query. Pass `category=\"system_memory\"` to list all system memories (metadata only). For structured packet discovery + filtering, use bbox_packet_list.",
+        summary: "Query durable knowledge entries by free-text or filters. Use early when prior decisions, conventions, remembered facts, or system runbooks could change the answer. Also surfaces matching rule-packets and system memories; system memories include system_memory:<id> refs usable with bbox_inspect_entity or bbox_bundle_evidence. Pass category=\"packet\" to list compiled packets, category=\"system_memory\" to list memory metadata, or bbox_packet_list for structured packet filters.",
         when_to_use: "Use near the start of tasks where durable knowledge-store context could matter: prior decisions, project conventions, rendered rules, remembered facts, or system runbooks. This is not the surface for scoped pins (`bbox_pin`), side-channel notes (`bbox_notes`/`bbox_inbox`), active threads (`bbox_thread_list`), or transcript history (`bbox_search`). Prefer a short phrase from the user's request over a single generic keyword; adjacent terms broaden recall, quoted phrases stay exact, `AND` / `OR` work explicitly, and `-term` excludes. If the first query is empty or too broad, try one sharper phrase. Use `mode=substring` for literal whole-query matching. Add `project=<cwd>` when looking for a prior decision to supersede. System memories can also be fetched by canonical `sm-*` ID. Rule-packets appear in a separate section when the query hits their id / domain / rule ids / classifications — reach for bbox_packet_list when you want structured filters (scope, latest_per_domain) or richer per-packet previews.",
         example: Some(r#"bbox_knowledge(query="retry policy")"#),
     },

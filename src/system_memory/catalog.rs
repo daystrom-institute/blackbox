@@ -178,6 +178,7 @@ impl MemoryCatalog {
         );
         for memory in memories {
             out.push_str(&format!("[system] {} — {}\n", memory.id, memory.title));
+            out.push_str(&format!("  ref: system_memory:{}\n", memory.id));
             if !memory.tags.is_empty() {
                 let preview = memory
                     .tags
@@ -259,6 +260,7 @@ fn memory_collect_score(node: &QueryNode, corpus: &MemoryCorpus) -> f64 {
 pub fn format_for_listing(memory: &SystemMemory) -> String {
     let mut out = String::new();
     out.push_str(&format!("[system] {} — {}\n", memory.id, memory.title));
+    out.push_str(&format!("  ref: system_memory:{}\n", memory.id));
     if !memory.tags.is_empty() {
         out.push_str(&format!("  tags: {}\n", memory.tags.join(", ")));
     }
@@ -287,6 +289,7 @@ const SIGNPOST_PREVIEW_BYTES: usize = 160;
 pub fn format_for_signpost(memory: &SystemMemory) -> String {
     let mut out = String::new();
     out.push_str(&format!("[system] {} — {}\n", memory.id, memory.title));
+    out.push_str(&format!("  ref: system_memory:{}\n", memory.id));
     if !memory.tags.is_empty() {
         out.push_str(&format!("  tags: {}\n", memory.tags.join(", ")));
     }
@@ -294,8 +297,8 @@ pub fn format_for_signpost(memory: &SystemMemory) -> String {
         out.push_str(&format!("  {preview}\n"));
     }
     out.push_str(&format!(
-        "  → full runbook: bbox_knowledge(query=\"{}\")\n",
-        memory.id
+        "  → full runbook: bbox_knowledge(query=\"{}\"); bundle ref: system_memory:{}\n",
+        memory.id, memory.id
     ));
     out
 }
@@ -304,7 +307,10 @@ pub fn format_for_signpost(memory: &SystemMemory) -> String {
 /// lines and markdown heading/list markers), truncated at a UTF-8 boundary.
 fn signpost_preview(content: &str) -> Option<String> {
     let line = content.lines().map(str::trim).find(|line| {
-        !line.is_empty() && !line.chars().all(|c| matches!(c, '#' | '-' | '=' | '*' | '─' | ' '))
+        !line.is_empty()
+            && !line
+                .chars()
+                .all(|c| matches!(c, '#' | '-' | '=' | '*' | '─' | ' '))
     })?;
     let line = line.trim_start_matches(['#', '-', '*', '>', ' ']).trim();
     if line.is_empty() {
@@ -529,6 +535,7 @@ mod tests {
 
         assert!(summary.contains("sm-secret"));
         assert!(summary.contains("Secret"));
+        assert!(summary.contains("ref: system_memory:sm-secret"));
         assert!(summary.contains("tags: summary"));
         assert!(!summary.contains("body that must stay out of summary"));
     }
@@ -682,6 +689,7 @@ mod tests {
         let memory = catalog.get("sm-rule-packets").unwrap();
         let out = format_for_listing(memory);
         assert!(out.starts_with("[system] sm-rule-packets"));
+        assert!(out.contains("ref: system_memory:sm-rule-packets"));
         assert!(out.contains("Rule-packets"));
     }
 
@@ -691,8 +699,9 @@ mod tests {
         let memory = catalog.get("sm-refactor").unwrap();
         let out = format_for_signpost(memory);
 
-        // Header + breadcrumb present.
+        // Header + bundleable ref + breadcrumb present.
         assert!(out.starts_with("[system] sm-refactor"));
+        assert!(out.contains("ref: system_memory:sm-refactor"));
         assert!(
             out.contains("→ full runbook: bbox_knowledge(query=\"sm-refactor\")"),
             "signpost must point at the exact-id retrieval path: {out}"
@@ -707,8 +716,8 @@ mod tests {
             full.len()
         );
         assert!(
-            out.lines().count() <= 4,
-            "signpost should be at most header+tags+preview+breadcrumb: {out}"
+            out.lines().count() <= 5,
+            "signpost should be at most header+ref+tags+preview+breadcrumb: {out}"
         );
     }
 
@@ -736,7 +745,10 @@ mod tests {
             .iter()
             .map(|m| format_for_signpost(m).len())
             .sum();
-        assert!(all < 16_000, "all signposts should fit a small budget: {all} bytes");
+        assert!(
+            all < 16_000,
+            "all signposts should fit a small budget: {all} bytes"
+        );
     }
 
     #[test]

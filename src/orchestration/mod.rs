@@ -685,10 +685,45 @@ pub const WORKSPACE_TOOLS_APPENDIX: &str = "\
 [workspace-tools mode]\n\
 You are in workspace-tools mode. Prefer workspace-scoped tool surfaces over \
 raw filesystem access:\n\
+  - Treat injected project docs/tool guidance as already-present context, not \
+as a separate read-instructions ceremony. Open source files only when the next \
+step needs exact lines, the injected copy appears stale, or the file was not \
+injected.\n\
+  - Start with the agentic grounding sequence: accept injected context and scope; \
+run sandbox grounding; use blackbox retrieval/evidence bundling when claims \
+depend on prior decisions, design docs, threads, code graph facts, or \
+conversation history; then edit/validate in the grounded cwd.\n\
+  - For the sandbox boundary, call `sandbox_grounding` when available: \
+`sandbox_grounding(enter_worktree=false)` for read-only orientation, or \
+`sandbox_grounding(enter_worktree=true, purpose=<short reason>)` before work \
+that may edit files. It returns the launch manifest and, when a worktree is \
+entered, the managed worktree plus `sandbox_status(root=<worktree cwd>)`. If \
+that tool is unavailable, fall back to manual `sandbox_status`, `enter_worktree`, \
+then `sandbox_status(root=<returned cwd>)`.\n\
+  - For blackbox evidence, use the opening sequence instead of memory when \
+provenance matters: `bbox_describe_schema` once per session, \
+`bbox_hybrid_search`, `bbox_inspect_entity`, conditional `bbox_find_paths`, then \
+`bbox_bundle_evidence` before making provenance-sensitive claims. The detailed \
+question-shape runbook is `sm-agentic-opening-sequence`; pull it only when the \
+injected tool guidance is insufficient. Use `property_mode=\"summary\"` when \
+bundling broad tool/knowledge refs or other long entities. For fresh \
+probe/retro evidence, if \
+hybrid search returns only generic seeds, no results, or a degraded \
+BM25-only/vector-warming notice, pivot to `bbox_notes`/`bbox_gaps` with exact \
+task, project, bro, or short substrings before broadening to git/filesystem \
+evidence. If `bbox_describe_schema` reports `project_file` / `project_file_v2` \
+population `0`, do not investigate or patch indexing as part of a sandbox \
+probe. State the corpus gap, dedupe/file a `sandbox-observability` gap if one \
+does not already exist, and use `work_smart_read` or scoped file reads for exact \
+code locations while still bundling any non-code bbox evidence that resolved \
+cleanly.\n\
   - Prefer `work_smart_read` over `Read` for file inspection.\n\
   - Prefer `work_bash` over `Bash` for shell commands.\n\
   - Prefer `work_git_status` / `work_git_diff` / `work_git_log` over \
 bare `Bash(\"git …\")` invocations.\n\
+After `enter_worktree`, treat the returned `cwd` as authoritative. Generic \
+file tools may still be rooted at the original checkout; prefer work_* tools \
+or pass absolute paths under the returned worktree.\n\
 When a workspace tool is not available in the current session, fall back to \
 the standard tool and emit `bbox_note(kind=learned, body=\"work_* unavailable, \
 used <standard_tool> as fallback\")` so the orchestrator can track coverage.\n\
@@ -719,14 +754,42 @@ Do NOT add new workspace tool names under the `bbox_*` namespace.";
 /// Deliberately NOT routed through `apply_ambient` — its recall /
 /// task-shape nudges miscue a reflection turn (see `workload_retro_prompt`).
 pub const WORKLOAD_RETRO_PROMPT: &str = "\
-Quick optional reflection — the task itself is done, nothing more is needed on it.\n\
+Quick retrospective — the task itself is done, nothing more is needed on it.\n\
 \n\
-While it's still fresh, thinking only about the blackbox tooling you worked \
-through — the bbox_/bro_/work_ MCP tools, the guidance and memories blackbox \
-gave you, the workflow or dispatch path it ran you through — did any of *that* \
-get in your way? Worth a mention if it comes to mind:\n\
+While it's still fresh, give a short sandbox-focused assessment of the run. \
+Think only about the blackbox tooling you worked through — the bbox_/bro_/work_ \
+MCP tools, the sandbox/worktree boundary, the guidance and memories blackbox \
+gave you, and the workflow or dispatch path it ran you through.\n\
+\n\
+First answer these sandbox questions in prose, even if the answers are boring:\n\
+  • Did you know which cwd/base repo/managed worktree you were operating in, \
+and which roots were writable?\n\
+  • Could you tell which project docs, provider/account/session env, and MCP \
+surface shaped the sandbox? Did `sandbox_status` or an equivalent manifest make \
+that easy?\n\
+  • When the task depended on prior decisions, design docs, threads, code graph \
+facts, or history, was the blackbox opening sequence and `bbox_bundle_evidence` \
+path clear enough to ground claims? If you skipped it, was that because the task \
+did not need provenance or because the path was awkward?\n\
+  • Could an outside observer reconstruct the important file reads/writes, \
+shell commands, denials, cwd changes, env overrides, and tool calls from the \
+available output?\n\
+  • Did the sandbox encourage native idioms such as `note()`/`hybrid_search()`/\
+`smart_read()`/`work_bash()`, or did you have to translate through awkward \
+outside-daemon forms?\n\
+\n\
+Then, only if something concrete stands out, consider filing gaps for:\n\
   • a bbox_/bro_/work_ tool you reached for that didn't exist, or one that \
 existed but fought you — missing parameter, awkward output, wrong shape;\n\
+  • sandbox grounding that was missing or hard to trust — cwd/base repo/managed \
+worktree, writable roots, durable project scope, provider/session env, MCP \
+surface, denied paths, file writes, or shell commands weren't visible enough;\n\
+  • a sandbox-native idiom that would have been clearer than the outside-daemon \
+form you had to use, e.g. `note()`/`hybrid_search()`/`smart_read()`/`work_bash()` \
+instead of a fully-qualified MCP/tool spelling;\n\
+  • an evidence-bundling or blackbox-opening-sequence step that was unclear, \
+too easy to skip, or awkward to complete before making a provenance-sensitive \
+claim;\n\
   • something blackbox told you — a system memory, a rendered convention, a \
 runbook — that was missing, stale, or actively misleading;\n\
   • a blackbox workflow or dispatch step that was clumsier than it should be.\n\
@@ -743,10 +806,11 @@ with bbox_gap:\n\
   • title: one-line summary  (required)\n\
   • gap_kind: one of mcp_surface, tooling, workflow, agent, docs_runbook, \
 refactor_primitive, ontology, eval_coverage  (required) — mcp_surface for a \
-missing/awkward bbox_/bro_/work_ tool, docs_runbook for missing/stale guidance \
+missing/awkward bbox_/bro_/work_ tool or sandbox-native alias, tooling for a \
+missing sandbox observation primitive, docs_runbook for missing/stale guidance \
 or memory, workflow for dispatch/orchestration friction;\n\
   • domain: the blackbox subsystem it touches, e.g. orchestration, knowledge, \
-transcripts, refactor  (required)\n\
+transcripts, refactor, harness/sandbox  (required)\n\
   • wanted_capability: what you wished existed, concretely  (required)\n\
   • dedupe_key as \"<gap_kind>/<domain>/<slug>\" so duplicates from other runs \
 collapse, e.g. \"mcp_surface/transcripts/regex-search\"  (required)\n\
@@ -756,9 +820,16 @@ Run bbox_gaps first to dedupe — an open gap with the same dedupe_key collapses
 automatically. Keep each gap specific enough to act on.\n\
 \n\
 If nothing in-scope stands out, that's a completely normal way for a run to \
-end — just say so in a line and file nothing. No quota, no expectation; a quiet \
-run is a good run. File only when you'd genuinely want someone to see it, and \
-please don't manufacture friction just to have something to say.";
+end — say so and file nothing. No quota, no expectation; a quiet run is a good \
+run. File only when you'd genuinely want someone to see it, and please don't \
+manufacture friction just to have something to say.\n\
+\n\
+Return this shape:\n\
+Sandbox assessment: clear / mixed / unclear — one sentence.\n\
+Observation surface: what was visible enough, and the biggest missing surface \
+if any.\n\
+Friction: none, nitpick, wishlist, or actionable gap filed.\n\
+Gaps filed: list dedupe keys, or `none`.";
 
 /// Build the workload-retro probe prompt with a minimal `[scope]` block so
 /// any gap note the bro files carries the session/project correlation keys
@@ -2662,8 +2733,15 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
     let event_count = observed_event_count(&inner);
     obj["eventCount"] = Value::from(event_count);
     if tail > 0 && !inner.events.is_empty() {
-        let start = inner.events.len().saturating_sub(tail);
-        obj["recentEvents"] = Value::Array(inner.events[start..].to_vec());
+        let mut recent: Vec<Value> = inner
+            .events
+            .iter()
+            .rev()
+            .filter_map(compact_status_event)
+            .take(tail)
+            .collect();
+        recent.reverse();
+        obj["recentEvents"] = Value::Array(recent);
     }
     // Surface the captured stderr tail when the task failed or emitted no
     // stream events — otherwise a pre-stream bail (e.g. the harness exiting
@@ -2684,6 +2762,61 @@ pub fn task_status_json(task: &Task, tail: usize) -> Value {
         obj["stderrTail"] = Value::from(tail_str);
     }
     obj
+}
+
+fn compact_status_event(event: &Value) -> Option<Value> {
+    if event.get("type").and_then(Value::as_str) == Some("stream_event") {
+        return None;
+    }
+    let mut event = event.clone();
+    strip_thinking_blocks(&mut event);
+    bound_status_strings(&mut event);
+    Some(event)
+}
+
+fn strip_thinking_blocks(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            items.retain(|item| item.get("type").and_then(Value::as_str) != Some("thinking"));
+            for item in items {
+                strip_thinking_blocks(item);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                strip_thinking_blocks(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn bound_status_strings(value: &mut Value) {
+    const MAX: usize = 2000;
+    match value {
+        Value::String(s) => {
+            if s.len() > MAX {
+                let mut end = MAX;
+                while end > 0 && !s.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let omitted = s.len().saturating_sub(end);
+                s.truncate(end);
+                s.push_str(&format!("…[truncated {omitted} bytes]"));
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                bound_status_strings(item);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                bound_status_strings(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn timeout_snapshot_json(task: &Task) -> Value {

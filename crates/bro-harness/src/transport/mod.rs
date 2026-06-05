@@ -63,6 +63,15 @@ pub fn session_var(key: &str) -> Option<String> {
         .or_else(|| std::env::var(key).ok())
 }
 
+/// Snapshot the task-local session env for diagnostic surfaces. Values are
+/// still raw here; callers that expose this to agents must redact sensitive
+/// keys at the presentation boundary.
+pub fn session_env_snapshot() -> BTreeMap<String, String> {
+    SESSION_ENV
+        .try_with(|m| m.as_ref().clone())
+        .unwrap_or_default()
+}
+
 /// Normalized usage. Each transport maps its native counters into this.
 ///
 /// `input_tokens` is **fresh** (cache-exclusive) prompt input; cache reads and
@@ -414,7 +423,8 @@ mod tests {
 
     #[test]
     fn extract_summary_keeps_only_summary_block() {
-        let raw = "<analysis>\nstep through it\n</analysis>\n<summary>\n1. Intent: do X\n</summary>";
+        let raw =
+            "<analysis>\nstep through it\n</analysis>\n<summary>\n1. Intent: do X\n</summary>";
         assert_eq!(extract_summary(raw), "1. Intent: do X");
     }
 

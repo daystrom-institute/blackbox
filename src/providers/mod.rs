@@ -12,6 +12,7 @@ pub mod project_file;
 pub mod roadmap_item;
 pub mod session;
 pub mod symbol;
+pub mod system_memory;
 pub mod thread;
 pub mod transcript;
 pub mod virtual_bash_call;
@@ -123,6 +124,7 @@ fn registry() -> &'static Vec<Box<dyn InspectableEntityProvider>> {
     REGISTRY.get_or_init(|| {
         vec![
             Box::new(knowledge::KnowledgeProvider),
+            Box::new(system_memory::SystemMemoryProvider),
             Box::new(file::FileProvider),
             Box::new(project_file::ProjectFileProvider),
             Box::new(project_file::ProjectFileV2Provider),
@@ -233,6 +235,7 @@ mod tests {
     fn sample_refs() -> Vec<&'static str> {
         vec![
             "knowledge:abc12345",
+            "system_memory:sm-agentic-opening-sequence",
             "file:README.md",
             "project_file:proj1234:relhash:chunkhash:0",
             "transcript:claude:session123:42:0",
@@ -253,6 +256,7 @@ mod tests {
 
     #[test]
     fn registry_dispatches_every_entity_type() {
+        crate::system_memory::init_for_tests();
         let ctx = ProviderContext::empty_for_tests();
         for raw in sample_refs() {
             let parsed = EntityRef::parse(raw).unwrap();
@@ -267,6 +271,7 @@ mod tests {
 
     #[test]
     fn compact_labels_fit_inline_budget() {
+        crate::system_memory::init_for_tests();
         let ctx = ProviderContext::empty_for_tests();
         for raw in sample_refs() {
             let parsed = EntityRef::parse(raw).unwrap();

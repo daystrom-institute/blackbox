@@ -26,6 +26,109 @@ struct EnterWorktreeInput {
     branch_prefix: Option<String>,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+struct SandboxGroundingInput {
+    /// Whether to create a managed worktree as part of the grounding sequence.
+    /// Use true before tasks that may edit files. Use false for read-only
+    /// orientation.
+    #[serde(default)]
+    enter_worktree: Option<bool>,
+    /// Short human-readable reason for the isolated worktree. Used only when
+    /// enter_worktree=true.
+    #[serde(default)]
+    purpose: Option<String>,
+    /// Base ref for the optional worktree: current (default), main, or
+    /// parent_head.
+    #[serde(default)]
+    base: Option<String>,
+    /// Optional explicit branch prefix. Must still live under bro-fleet/.
+    #[serde(default)]
+    branch_prefix: Option<String>,
+    /// Number of dirty git status entries to include in each manifest.
+    /// Default 12.
+    #[serde(default)]
+    status_limit: Option<usize>,
+}
+
+pub struct SandboxGrounding;
+
+#[async_trait]
+impl Tool for SandboxGrounding {
+    fn name(&self) -> &str {
+        "sandbox_grounding"
+    }
+
+    fn description(&self) -> &str {
+        "Run the sandbox-boundary phase of the agentic grounding sequence. Returns launch sandbox_status, and when enter_worktree=true creates a managed worktree then returns sandbox_status(root=<worktree cwd>). Pair this with blackbox retrieval/evidence bundling when the task depends on prior decisions, design docs, threads, or code graph facts."
+    }
+
+    fn input_schema(&self) -> Value {
+        schema_for::<SandboxGroundingInput>()
+    }
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            destructive: true,
+            ..Default::default()
+        }
+    }
+
+    async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult {
+        let args: SandboxGroundingInput = match serde_json::from_value(input) {
+            Ok(args) => args,
+            Err(e) => return ToolResult::Error(format!("bad input: {e}")),
+        };
+        ToolResult::from_result(sandbox_grounding(cx, args))
+    }
+}
+
+fn sandbox_grounding(cx: &ToolCx, args: SandboxGroundingInput) -> anyhow::Result<Value> {
+    let before =
+        crate::workspace::sandbox_status_manifest(cx, None, args.status_limit).map_err(|err| {
+            anyhow::anyhow!("launch sandbox_status failed before worktree entry: {err:#}")
+        })?;
+    let mut out = json!({
+        "sequence": "sandbox_grounding_v1",
+        "launch": before,
+        "worktree": Value::Null,
+        "worktree_status": Value::Null,
+        "next_steps": [
+            "Use launch.inspected_root for read-only work unless a managed worktree was entered.",
+            "If the task depends on prior decisions, design docs, threads, or code graph facts, run the blackbox opening sequence and bundle evidence before making provenance-sensitive claims.",
+            "For edits, use worktree.cwd and prefer work_* tools or absolute paths under that cwd.",
+        ],
+    });
+    if args.enter_worktree.unwrap_or(false) {
+        let worktree = enter_worktree(
+            &cx.root,
+            EnterWorktreeInput {
+                purpose: args
+                    .purpose
+                    .unwrap_or_else(|| "sandbox grounding".to_string()),
+                base: args.base,
+                branch_prefix: args.branch_prefix,
+            },
+        )?;
+        let cwd = worktree
+            .get("cwd")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("enter_worktree did not return cwd"))?;
+        let after = crate::workspace::sandbox_status_manifest(cx, Some(cwd), args.status_limit)
+            .map_err(|err| {
+                anyhow::anyhow!("sandbox_status for entered worktree failed: {err:#}")
+            })?;
+        out["worktree"] = worktree;
+        out["worktree_status"] = after;
+        out["next_steps"] = json!([
+            "If the task depends on prior decisions, design docs, threads, or code graph facts, run the blackbox opening sequence and bundle evidence before making provenance-sensitive claims.",
+            "Treat worktree.cwd as authoritative for file reads, writes, shell commands, and project-scoped bbox calls.",
+            "Uncommitted parent-checkout files are not copied into this worktree; report that as context/filesystem divergence instead of editing the parent checkout.",
+            "Prefer work_* tools or absolute paths under worktree.cwd; generic file tools may still target the launch root.",
+        ]);
+    }
+    Ok(out)
+}
+
 pub struct EnterWorktree;
 
 #[async_trait]
@@ -185,6 +288,11 @@ Worktree branch: {}\n\
 Base repository: {}\n\
 Base branch/ref: {} @ {}\n\
 Make code changes only inside this worktree unless the operator explicitly redirects you.\n\
+This worktree was created from a committed git ref. Uncommitted files in the parent checkout \
+are not copied here; if injected project docs mention a file that is absent in the worktree, \
+treat that as a context/filesystem divergence to report rather than editing the parent checkout.\n\
+Generic file-edit/read tools may remain rooted at the original checkout after this call. Prefer \
+work_* tools or pass absolute paths under the returned Worktree path.\n\
 For project-scoped bbox calls (bbox_thread/_list, bbox_code_*, bbox_learn/decide/remember, \
 bbox_render, slice tools), pass THIS worktree path as project/project_dir — committed artifacts \
 (thread records, knowledge entries, rendered memory) then land in the worktree and travel with this \
@@ -635,6 +743,7 @@ mod tests {
             shell_sessions: Arc::new(Mutex::new(crate::shell::ShellSessions::default())),
             promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
+            session_env: Arc::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -672,6 +781,63 @@ mod tests {
         let (content, is_error) = result.into_content();
         assert!(!is_error, "{content}");
         serde_json::from_str(&content).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sandbox_grounding_can_report_launch_only() {
+        let repo = seed_repo();
+        let tool = SandboxGrounding;
+        let result = tool
+            .call(json!({"enter_worktree": false}), &cx(repo.path()))
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let value: Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(value["sequence"], "sandbox_grounding_v1");
+        assert_eq!(value["worktree"], Value::Null);
+        assert_eq!(value["launch"]["root_source"], "launch");
+        assert_eq!(value["launch"]["git"]["branch"], "main");
+    }
+
+    #[tokio::test]
+    async fn sandbox_grounding_can_enter_and_reground_worktree() {
+        let repo = seed_repo();
+        let tool = SandboxGrounding;
+        let result = tool
+            .call(
+                json!({
+                    "enter_worktree": true,
+                    "purpose": "grounding test",
+                    "status_limit": 3
+                }),
+                &cx(repo.path()),
+            )
+            .await;
+        let (content, is_error) = result.into_content();
+        assert!(!is_error, "{content}");
+        let value: Value = serde_json::from_str(&content).unwrap();
+        let cwd = PathBuf::from(value["worktree"]["cwd"].as_str().unwrap());
+        assert!(cwd.join("README.md").is_file());
+        assert_eq!(value["worktree_status"]["root_source"], "explicit");
+        assert_eq!(
+            value["worktree_status"]["inspected_root"].as_str().unwrap(),
+            cwd.to_str().unwrap()
+        );
+        assert!(
+            value["worktree_status"]["git"]["branch"]
+                .as_str()
+                .unwrap()
+                .starts_with("bro-fleet/grounding-test-")
+        );
+
+        run_git(
+            repo.path(),
+            &["worktree", "remove", "--force", cwd.to_str().unwrap()],
+        );
+        std::fs::remove_dir_all(PathBuf::from(
+            value["worktree"]["worktree_root"].as_str().unwrap(),
+        ))
+        .ok();
     }
 
     #[tokio::test]
