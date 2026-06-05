@@ -50,10 +50,7 @@ impl PinPolicy {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
-            Err(_) => ["bbox_slice_*"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
+            Err(_) => ["bbox_slice_*"].into_iter().map(String::from).collect(),
         };
         Self { patterns }
     }
@@ -89,10 +86,10 @@ impl Registry {
     ///
     /// `filter` gates **built-ins** by their bare name (`shell_run`, `git_*`,
     /// …) — the same allow/deny plane that filters MCP tools, applied uniformly
-    /// so a profile can deny a built-in family. (MCP tools arrive already
-    /// filtered by their fully-qualified name in `load_mcp_tools`, where the
-    /// `mcp__server__tool` name exists; here their `.name()` is bare, so they
-    /// are not re-filtered.) `tool_search` honors an explicit deny but ignores
+    /// so a profile can deny a built-in family. MCP tools arrive already
+    /// filtered by their fully-qualified `mcp__server__tool` name in
+    /// `load_mcp_tools`, then split by placement; only out-box/both survivors
+    /// are passed here. `tool_search` honors an explicit deny but ignores
     /// allow-list exclusion, so a narrow allow-list doesn't strand a bro that
     /// needs to load deferred tools.
     pub fn new(
@@ -488,5 +485,40 @@ mod tests {
             !all_known(&gone).contains(&TOOL_SEARCH.to_string()),
             "explicit deny must remove tool_search"
         );
+    }
+
+    #[test]
+    fn mcp_placement_splits_model_registry_and_denied_presence() {
+        let mcp = vec![
+            mk("mcp__srv__in_only", "in only"),
+            mk("mcp__srv__out_only", "out only"),
+            mk("mcp__srv__both", "both"),
+            mk("mcp__srv__denied", "denied"),
+        ];
+        let filter = ToolFilter::from_csv(Some("mcp__srv__denied"), None);
+        let filtered: Vec<_> = mcp
+            .into_iter()
+            .filter(|tool| filter.permits(tool.name()))
+            .collect();
+        let placements = crate::mcp::ToolPlacementMap::from([
+            (
+                "mcp__srv__in_only".to_string(),
+                crate::mcp::ToolPlacement::InBox,
+            ),
+            (
+                "mcp__srv__both".to_string(),
+                crate::mcp::ToolPlacement::Both,
+            ),
+        ]);
+        let (in_box, out_box) = crate::mcp::split_mcp_tools_by_placement(&filtered, &placements);
+        let in_names: Vec<_> = in_box.iter().map(|tool| tool.name()).collect();
+        assert_eq!(in_names, vec!["mcp__srv__in_only", "mcp__srv__both"]);
+
+        let reg = Registry::new(vec![], out_box, &PinPolicy { patterns: vec![] }, &filter);
+        assert!(!reg.contains("mcp__srv__in_only"));
+        assert!(reg.contains("mcp__srv__out_only"));
+        assert!(reg.contains("mcp__srv__both"));
+        assert!(!reg.contains("mcp__srv__denied"));
+        assert!(!in_names.contains(&"mcp__srv__denied"));
     }
 }

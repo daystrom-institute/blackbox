@@ -863,6 +863,33 @@ async fn fs_read_routes_through_tool_seam_and_returns_value() {
     assert_eq!(v["filePath"], "src/foo.rs");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_proxy_routes_by_fully_qualified_name_without_enumeration() {
+    let rt = tools_runtime().await;
+    let out = rt
+        .execute(
+            r#"const env = await mcp.blackbox.bbox_slice_read({ id: "slice-1" });
+               return JSON.stringify({
+                   tool: env.tool,
+                   id: env.input.id,
+                   rootKeys: Object.keys(mcp),
+                   serverKeys: Object.keys(mcp.blackbox),
+                   hasServer: "blackbox" in mcp,
+                   hasTool: "bbox_slice_read" in mcp.blackbox,
+               });"#,
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
+    assert_eq!(v["tool"], "mcp__blackbox__bbox_slice_read");
+    assert_eq!(v["id"], "slice-1");
+    assert_eq!(v["rootKeys"], serde_json::json!([]));
+    assert_eq!(v["serverKeys"], serde_json::json!([]));
+    assert_eq!(v["hasServer"], false);
+    assert_eq!(v["hasTool"], false);
+}
+
 // shell.run / search.content / git.show ergonomic sugar maps the single string arg
 // onto the tool's primary input field.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

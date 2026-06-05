@@ -1206,6 +1206,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn narf_exec_mcp_proxy_uses_host_map_and_fails_closed() {
+        struct EchoMcpTool;
+        #[async_trait]
+        impl Tool for EchoMcpTool {
+            fn name(&self) -> &str {
+                "mcp__blackbox__placed"
+            }
+            fn description(&self) -> &str {
+                "placed test MCP tool"
+            }
+            fn input_schema(&self) -> Value {
+                json!({"type": "object", "properties": {}})
+            }
+            async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+                ToolResult::Json(json!({
+                    "called": self.name(),
+                    "input": input,
+                }))
+            }
+        }
+
+        let host: Arc<dyn ToolCapability> =
+            Arc::new(HostTools::new(vec![Arc::new(EchoMcpTool)], test_cx()));
+        let tool = NarfExecTool {
+            session: narf_session_with(Arc::new(StubAtoms), Some(host)),
+        };
+
+        let result = tool
+            .call(
+                json!({
+                    "source": "const ok = await mcp.blackbox.placed({ x: 1 }); \
+                               let denied = false; \
+                               try { await mcp.blackbox.unplaced({ x: 2 }); } \
+                               catch (e) { denied = String(e).includes('tool_unavailable'); } \
+                               return { called: ok.called, x: ok.input.x, denied };"
+                }),
+                &test_cx(),
+            )
+            .await;
+
+        match result {
+            ToolResult::Json(v) => {
+                assert_eq!(v["called"], "mcp__blackbox__placed");
+                assert_eq!(v["x"], 1);
+                assert_eq!(v["denied"], true);
+            }
+            other => panic!("expected Json result, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn kv_store_side_round_trip_preserves_entries() {
         let kv = KvStore::default();
         kv.set(

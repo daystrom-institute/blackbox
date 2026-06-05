@@ -41,14 +41,12 @@ pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Ve
 
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     for (name, transport) in servers {
-        match list_server_tools(&transport).await {
+        match list_server_tools(&name, &transport).await {
             Ok(listed) => {
                 let total = listed.len();
                 let mut admitted = 0;
                 for t in listed {
-                    // Qualified name the daemon's filter patterns match against.
-                    let qualified = format!("mcp__{name}__{}", t.name);
-                    if filter.permits(&qualified) {
+                    if filter.permits(t.name()) {
                         admitted += 1;
                         tools.push(Arc::new(t));
                     }
@@ -64,6 +62,84 @@ pub async fn load_mcp_tools(mcp_config: Option<&str>, filter: &ToolFilter) -> Ve
         }
     }
     tools
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolPlacement {
+    InBox,
+    OutBox,
+    Both,
+}
+
+impl ToolPlacement {
+    pub fn in_box(self) -> bool {
+        matches!(self, Self::InBox | Self::Both)
+    }
+
+    pub fn out_box(self) -> bool {
+        matches!(self, Self::OutBox | Self::Both)
+    }
+}
+
+pub type ToolPlacementMap = BTreeMap<String, ToolPlacement>;
+pub type ToolList = Vec<Arc<dyn Tool>>;
+
+/// Parse the top-level `tool_placement` map from the same JSON blob that carries
+/// `mcpServers`. Missing and invalid entries fail safe to the default out-box
+/// placement; the caller applies this map only after [`ToolFilter`] admission.
+pub fn parse_tool_placement(mcp_config: Option<&str>) -> ToolPlacementMap {
+    let Some(cfg) = mcp_config else {
+        return ToolPlacementMap::new();
+    };
+    let v: Value = match serde_json::from_str(cfg) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("ignoring tool_placement (MCP config parse failed): {e:#}");
+            return ToolPlacementMap::new();
+        }
+    };
+    let mut out = ToolPlacementMap::new();
+    let Some(obj) = v.get("tool_placement").and_then(Value::as_object) else {
+        return out;
+    };
+    for (name, placement) in obj {
+        let Some(placement) = placement.as_str() else {
+            tracing::warn!(tool = %name, "ignoring non-string tool_placement entry");
+            continue;
+        };
+        let parsed = match placement {
+            "in-box" => ToolPlacement::InBox,
+            "out-box" => ToolPlacement::OutBox,
+            "both" => ToolPlacement::Both,
+            other => {
+                tracing::warn!(tool = %name, placement = %other, "ignoring unknown tool_placement");
+                continue;
+            }
+        };
+        out.insert(name.clone(), parsed);
+    }
+    out
+}
+
+pub fn split_mcp_tools_by_placement(
+    mcp_tools: &[Arc<dyn Tool>],
+    placements: &ToolPlacementMap,
+) -> (ToolList, ToolList) {
+    let mut in_box = Vec::new();
+    let mut out_box = Vec::new();
+    for tool in mcp_tools {
+        let placement = placements
+            .get(tool.name())
+            .copied()
+            .unwrap_or(ToolPlacement::OutBox);
+        if placement.in_box() {
+            in_box.push(tool.clone());
+        }
+        if placement.out_box() {
+            out_box.push(tool.clone());
+        }
+    }
+    (in_box, out_box)
 }
 
 /// Client-side allow/deny over the whole tool surface — the permission plane
@@ -200,7 +276,10 @@ fn parse_string_map(v: Option<&Value>) -> BTreeMap<String, String> {
         .collect()
 }
 
-async fn list_server_tools(transport: &McpTransportConfig) -> anyhow::Result<Vec<McpTool>> {
+async fn list_server_tools(
+    server_name: &str,
+    transport: &McpTransportConfig,
+) -> anyhow::Result<Vec<McpTool>> {
     let listed = match transport {
         McpTransportConfig::Http { url } => list_http_server_tools(url).await?,
         McpTransportConfig::Stdio { command, args, env } => {
@@ -211,7 +290,8 @@ async fn list_server_tools(transport: &McpTransportConfig) -> anyhow::Result<Vec
         .into_iter()
         .map(|t| McpTool {
             transport: transport.clone(),
-            name: t.name.to_string(),
+            call_name: t.name.to_string(),
+            name: format!("mcp__{server_name}__{}", t.name),
             description: t.description.map(|d| d.to_string()).unwrap_or_default(),
             schema: Value::Object((*t.input_schema).clone()),
         })
@@ -246,6 +326,7 @@ async fn list_stdio_server_tools(
 /// A single MCP tool, dispatched by re-dialing its server per call.
 struct McpTool {
     transport: McpTransportConfig,
+    call_name: String,
     name: String,
     description: String,
     schema: Value,
@@ -278,7 +359,7 @@ impl McpTool {
             Value::Object(m) => m,
             _ => serde_json::Map::new(),
         };
-        let params = CallToolRequestParams::new(self.name.clone())
+        let params = CallToolRequestParams::new(self.call_name.clone())
             .with_arguments(args.into_iter().collect());
         let resp = match &self.transport {
             McpTransportConfig::Http { url } => {
@@ -337,6 +418,26 @@ fn collect_text(content: &[Content]) -> String {
 mod tests {
     use super::*;
 
+    fn mock_tool(name: &'static str) -> Arc<dyn Tool> {
+        struct T(&'static str);
+        #[async_trait]
+        impl Tool for T {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn description(&self) -> &str {
+                "mock"
+            }
+            fn input_schema(&self) -> Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn call(&self, _input: Value, _cx: &ToolCx) -> ToolResult {
+                ToolResult::Text("ok".into())
+            }
+        }
+        Arc::new(T(name))
+    }
+
     #[test]
     fn tool_filter_deny_blocks_recursion_guard_patterns() {
         // What the daemon's recursion guard emits for a harness provider.
@@ -369,6 +470,58 @@ mod tests {
     }
 
     #[test]
+    fn tool_placement_parses_and_defaults_out_box() {
+        let placements = parse_tool_placement(Some(
+            r#"{
+                "mcpServers": {},
+                "tool_placement": {
+                    "mcp__blackbox__bbox_code_node_describe": "in-box",
+                    "mcp__blackbox__bbox_hybrid_search": "out-box",
+                    "mcp__blackbox__bbox_slice_read": "both"
+                }
+            }"#,
+        ));
+        assert_eq!(
+            placements.get("mcp__blackbox__bbox_code_node_describe"),
+            Some(&ToolPlacement::InBox)
+        );
+        assert_eq!(
+            placements.get("mcp__blackbox__bbox_hybrid_search"),
+            Some(&ToolPlacement::OutBox)
+        );
+        assert_eq!(
+            placements.get("mcp__blackbox__bbox_slice_read"),
+            Some(&ToolPlacement::Both)
+        );
+        assert_eq!(placements.get("mcp__blackbox__unlisted"), None);
+
+        let tools = vec![
+            mock_tool("mcp__blackbox__bbox_code_node_describe"),
+            mock_tool("mcp__blackbox__bbox_hybrid_search"),
+            mock_tool("mcp__blackbox__bbox_slice_read"),
+            mock_tool("mcp__blackbox__unlisted"),
+        ];
+        let (in_box, out_box) = split_mcp_tools_by_placement(&tools, &placements);
+        let in_names: Vec<_> = in_box.iter().map(|t| t.name()).collect();
+        let out_names: Vec<_> = out_box.iter().map(|t| t.name()).collect();
+        assert_eq!(
+            in_names,
+            vec![
+                "mcp__blackbox__bbox_code_node_describe",
+                "mcp__blackbox__bbox_slice_read"
+            ]
+        );
+        assert_eq!(
+            out_names,
+            vec![
+                "mcp__blackbox__bbox_hybrid_search",
+                "mcp__blackbox__bbox_slice_read",
+                "mcp__blackbox__unlisted"
+            ]
+        );
+    }
+
+    #[test]
     fn parse_servers_accepts_stdio_entries() {
         let parsed = parse_servers(
             r#"{
@@ -391,10 +544,7 @@ mod tests {
                 McpTransportConfig::Stdio {
                     command: "/opt/bin/local-tools".to_string(),
                     args: vec!["--scope".to_string(), "probe".to_string()],
-                    env: BTreeMap::from([(
-                        "LOCAL_TOOLS_SCOPE".to_string(),
-                        "probe".to_string()
-                    )]),
+                    env: BTreeMap::from([("LOCAL_TOOLS_SCOPE".to_string(), "probe".to_string())]),
                 },
             )]
         );
@@ -424,5 +574,4 @@ mod tests {
             )]
         );
     }
-
 }

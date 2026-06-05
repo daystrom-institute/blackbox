@@ -985,6 +985,24 @@ const BOOTSTRAP: &str = r#"
     globalThis.web = {
         fetch: (a) => hostTool('web_fetch', typeof a === 'string' ? { url: a } : a),
     };
+    const mcpServerProxy = (server) => new Proxy(Object.create(null), {
+        get: (_target, tool) => {
+            if (typeof tool !== 'string' || tool === 'then') return undefined;
+            return (args) => hostTool(`mcp__${server}__${tool}`, args ?? {});
+        },
+        has: () => false,
+        ownKeys: () => [],
+        getOwnPropertyDescriptor: () => undefined,
+    });
+    globalThis.mcp = new Proxy(Object.create(null), {
+        get: (_target, server) => {
+            if (typeof server !== 'string' || server === 'then') return undefined;
+            return mcpServerProxy(server);
+        },
+        has: () => false,
+        ownKeys: () => [],
+        getOwnPropertyDescriptor: () => undefined,
+    });
     // §5 in-box promise primitive (narf-tool-placement.md §2/§5): join a cell's
     // OWN same-dispatch promises over the shared PromiseStore. Handles are the
     // by-value {promise_id} tickets producers return (e.g. shell.run mode:promise).

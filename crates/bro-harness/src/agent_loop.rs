@@ -383,7 +383,8 @@ async fn session_loop_until_idle(
             },
         };
 
-        run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt).await?;
+        run_prompt_with_controls(session, &mut input_rx, ctrl_emitter, &mut pending, prompt)
+            .await?;
         if let Err(e) = session.persist() {
             tracing::warn!("failed to persist session after controlled turn: {e:#}");
         }
@@ -610,18 +611,24 @@ impl Session {
             store.id.clone(),
             callback.clone(),
         ))));
+        let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
+        let tool_placement = mcp::parse_tool_placement(cli.mcp_config.as_deref());
+        let (mcp_in_box, mcp_out_box) =
+            mcp::split_mcp_tools_by_placement(&mcp_tools, &tool_placement);
         // §5 host built-in seam (narf-tool-placement.md): a NARF cell's in-box
         // fs/shell/search/git/web bindings dispatch to the parity built-ins via
         // HostTools, gated by the SAME ToolFilter as the flat surface (§4.5 — an
         // unfiltered in-box surface would be a deny-bypass) and run against this
-        // session's ToolCx. Built from a fresh, filtered built-in set (the tool
-        // structs are stateless; state comes from `cx` at call time).
-        let host_builtins: Vec<Arc<dyn Tool>> = builtin_tools_for_mode(fleet)
+        // session's ToolCx. MCP tools first pass the same filter in load_mcp_tools;
+        // placement only assigns the box side of those survivors.
+        let mut host_builtins: Vec<Arc<dyn Tool>> = builtin_tools_for_mode(fleet)
             .into_iter()
             .filter(|t| tool_filter.permits(t.name()))
             .collect();
-        let host_tools: Arc<dyn bro_capabilities::ToolCapability> =
-            Arc::new(crate::capabilities::HostTools::new(host_builtins, cx.clone()));
+        host_builtins.extend(mcp_in_box);
+        let host_tools: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
+            crate::capabilities::HostTools::new(host_builtins, cx.clone()),
+        );
         // In-process capability bindings (harness-daemon-boundary.md §6): when the
         // daemon has installed corpus/atom/refactor impls, expose them as direct
         // trait-dispatch tools, and inject the host seam into the NARF runtime.
@@ -633,12 +640,11 @@ impl Session {
             Some(host_tools),
             Some(kv_cap),
         ));
-        let mcp_tools = mcp::load_mcp_tools(cli.mcp_config.as_deref(), &tool_filter).await;
         let mut pin = PinPolicy::from_env();
         if fleet {
             pin.also_pin(crate::report::REPORT_TOOL);
         }
-        let reg = Registry::new(builtins, mcp_tools, &pin, &tool_filter);
+        let reg = Registry::new(builtins, mcp_out_box, &pin, &tool_filter);
 
         let base_opts = TurnOpts {
             model,
@@ -790,7 +796,8 @@ impl Session {
                 {
                     Ok(Some(summary)) => {
                         tracing::info!(pre_tokens = projected_tokens, "compacted");
-                        self.emitter.compact_boundary("auto", projected_tokens, summary.len());
+                        self.emitter
+                            .compact_boundary("auto", projected_tokens, summary.len());
                         // The buffer was rewritten; its size will be re-measured
                         // by the upcoming call, so the appended-tail estimate no
                         // longer applies.
@@ -835,9 +842,7 @@ impl Session {
                             && crate::transport::is_context_window_exceeded(&e) =>
                     {
                         overflow_compacted = true;
-                        tracing::warn!(
-                            "context window exceeded mid-turn; compacting and retrying"
-                        );
+                        tracing::warn!("context window exceeded mid-turn; compacting and retrying");
                         match self
                             .tx
                             .compact(
@@ -1067,8 +1072,7 @@ impl Session {
         // for it we flag regardless of text.
         let produced_text = !final_text.trim().is_empty();
         let model_ended = matches!(break_reason, "model_stop" | "tool_calls_empty");
-        let empty_output_stop =
-            model_ended && last_model_tool_call_count == 0 && !produced_text;
+        let empty_output_stop = model_ended && last_model_tool_call_count == 0 && !produced_text;
 
         let mut suspicion_reasons: Vec<&str> = Vec::new();
         if !shell_ids.is_empty() {
@@ -1896,12 +1900,11 @@ mod tests {
     #[tokio::test]
     async fn settled_promise_completion_injects_hidden_turn() {
         let (mut session, shared) = mk_session(vec![MockTurn::Text("completion handled".into())]);
-        let (pid, _cancel_rx) = session
-            .cx
-            .promises
-            .lock()
-            .unwrap()
-            .start("shell_run", json!({"command": "echo done"}), None);
+        let (pid, _cancel_rx) = session.cx.promises.lock().unwrap().start(
+            "shell_run",
+            json!({"command": "echo done"}),
+            None,
+        );
         session
             .cx
             .promises
@@ -1926,12 +1929,11 @@ mod tests {
     #[test]
     fn turn_end_diagnostics_flags_running_async_work() {
         let (session, _shared) = mk_session(vec![]);
-        let (pid, _cancel_rx) = session
-            .cx
-            .promises
-            .lock()
-            .unwrap()
-            .start("shell_run", json!({"command": "cargo test"}), None);
+        let (pid, _cancel_rx) = session.cx.promises.lock().unwrap().start(
+            "shell_run",
+            json!({"command": "cargo test"}),
+            None,
+        );
 
         let trace = tool_result_trace(
             &transport::ToolCall {
@@ -1985,14 +1987,8 @@ mod tests {
         // no text and no tool calls, and there is no outstanding async work.
         let (session, _shared) = mk_session(vec![]);
 
-        let diag = session.turn_end_diagnostics(
-            "model_stop",
-            Some(&StopReason::Done),
-            0,
-            1,
-            &[],
-            "",
-        );
+        let diag =
+            session.turn_end_diagnostics("model_stop", Some(&StopReason::Done), 0, 1, &[], "");
 
         assert_eq!(diag["produced_text"], false);
         assert_eq!(diag["final_text_len"], 0);
