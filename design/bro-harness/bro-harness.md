@@ -77,18 +77,23 @@ points to a backlog doc.
   (set/get/peek/delete, **no enumeration**); `list`/`keys` (discovery/selection)
   are out-box. **Supersedes** [`narf-tool-placement.md`](narf-tool-placement.md)
   (now archived) + the §9-1 ref substrate.
-- [Workflow-JS: workflows as reactive cells](narf-workflow-js.md) — proposed:
-  finishes the [typed-cells](narf-typed-cells.md) subsumption for the workflow
-  engine. A durable workflow is a registered cell *template* — a static trigger
-  manifest (the closed alphabet of cron/webhook/signal names) + a handler table —
-  driven by the daemon via the embedded-host inversion-of-control pattern (game
-  Lua / CEF / RN). The per-instance container is today's `ArcContext` handed in as
-  `ctx`; state lives in the durable KV, never a frozen V8 stack, so it is
-  restart-proof by construction. `ctx.arm(knownSignal, runtimeCorrelation)` lifts
-  the existing `WaitStore`/`signal_arc_dispatch` IOCP seam from node-graph arcs up
-  to cells; the webhook routing *verdict* dissolves into instance-armed-handler
-  lookup; predicate/extractor/step are all cells. `effects` safety is elided
-  (purity by construction). Closes typed-cells §7 items 2/3.
+- [Workflow-JS: composable state machines as the workflow surface](narf-workflow-js.md)
+  — proposed: finishes the [typed-cells](narf-typed-cells.md) durable tier. The JSON
+  node graph is already a state machine, so replace it with a state-machine *library*
+  in the sandbox (Stateless/ZCrew.StateCraft-shaped core: states, transitions fired by
+  triggers, guards, entry/exit/action handlers) plus NARF-native child machines,
+  reusable at every scope (the verb sets the tier). The machine STRUCTURE is data the
+  daemon *validates* (transitions target declared states, trigger alphabet closed after
+  registration, reachable/`.terminal()` states, child machines resolve, child contracts
+  typecheck) and renders to mermaid; the BODIES are JS at shell trust (validation =
+  well-formedness, not safety). Composition lifts the hand-composed StateCraft
+  OrderProcessor pattern into a first-class primitive (parent owns N children, commands
+  down via actions, joins via WhenAll/WhenAny + guards on child state, children signal
+  up) — subworkflow/ensemble/foreach/fork all this.
+  Durability = a tree of independently-persisted `{state, KV}`; the daemon backs the
+  durable primitives, pure primitives stay JS. Agents learn it via tooldocs + signposts
+  + a `sm-state-machines` memory. `effects` elided (supersedes typed-cells §1.2).
+  Closes typed-cells §7 items 2/3.
 
 ## Cluster conventions
 
