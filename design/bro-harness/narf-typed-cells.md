@@ -293,9 +293,14 @@ the JSON surfaces are retained for the cases where a static graph is the point.
 
 The thesis is "mostly built." Precisely what is *not*:
 
-1. **No contract capture in prepare.** `prepare_one`/`PrepareResponse` have no
-   contract field and no schema validation (`bro-script/src/lib.rs:201`/`:1390`).
-   §1.1 is net-new (additive to prepare).
+1. **Register/invoke contract enforcement is not built yet.** The A1 prepare
+   slice is live: `narf_prepare` accepts an optional declared `contract`, validates
+   `entry`, validates `input`/`output` with JSON Schema Draft 2020-12, echoes the
+   contract in `PrepareResponse`, and keeps it with the prepared script
+   (`bro-script/src/lib.rs`, `bro-harness/src/capabilities.rs`). What does **not**
+   exist yet is the later enforcement point: `narf_register` must persist the
+   contract, and invocation must validate input before running and output before
+   returning.
 2. **No `narf.wait` in-box verb.** The park surface exists only as workflow
    `WaitSpec`/`run_wait_node`; there is no cell-facing `narf.wait` that lowers a
    known correlation into a `WaitSpec` and suspends the cell's owning arc.

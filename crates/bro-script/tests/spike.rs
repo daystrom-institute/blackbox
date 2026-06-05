@@ -525,6 +525,80 @@ async fn prepare_run_composes_session_helper_and_capability_binding() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_validates_and_echoes_contract() {
+    let rt = stub_runtime().await;
+    let resp = rt
+        .prepare(serde_json::json!({
+            "source": "const run = async (input) => ({ count: input.repo.length }); return await run({ repo: \"abc\" });",
+            "contract": {
+                "entry": "run",
+                "input": {
+                    "type": "object",
+                    "properties": { "repo": { "type": "string" } },
+                    "required": ["repo"]
+                },
+                "output": {
+                    "type": "object",
+                    "properties": { "count": { "type": "integer" } },
+                    "required": ["count"]
+                },
+                "effects": ["shell"],
+                "may_invoke": ["atom:reviewer@v1"],
+                "dispatch_budget": { "max_bros": 3, "max_depth": 2 }
+            }
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status, "ready");
+    let contract = resp.contract.as_ref().expect("contract echoed");
+    assert_eq!(contract.entry, "run");
+    assert_eq!(contract.effects, vec!["shell"]);
+    assert_eq!(contract.may_invoke, vec!["atom:reviewer@v1"]);
+
+    let result = rt.run(resp.ref_handle.unwrap()).await.unwrap();
+    let v: serde_json::Value = serde_json::from_str(&result).unwrap();
+    assert_eq!(v["count"], 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_blocks_contract_with_missing_entry() {
+    let rt = stub_runtime().await;
+    let resp = rt
+        .prepare(serde_json::json!({
+            "source": "return 42;",
+            "contract": { "entry": "run" }
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status, "blocked");
+    assert_eq!(resp.diagnostics[0].kind, "contract");
+    assert!(resp.diagnostics[0].message.contains("run"));
+    assert!(resp.ref_handle.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prepare_blocks_invalid_contract_json_schema() {
+    let rt = stub_runtime().await;
+    let resp = rt
+        .prepare(serde_json::json!({
+            "source": "function run(input) { return input; }",
+            "contract": {
+                "entry": "run",
+                "input": { "type": "definitely-not-a-json-schema-type" }
+            }
+        }))
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status, "blocked");
+    assert_eq!(resp.diagnostics[0].kind, "contract");
+    assert!(resp.diagnostics[0].message.contains("contract.input"));
+    assert!(resp.ref_handle.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_records_trace_entry() {
     let rt = stub_runtime().await;
     let resp = rt

@@ -729,6 +729,13 @@ before relying on any line here.
   fleet client and the bro-irc sidecar both consume; `/irc/*` is retained as a
   back-compat alias. (Not a numbered section here, but it removed the "fleet rides
   the IRC interface" smell and is the transport the fleet TUI uses.)
+- **Typed-cell contract capture (NARF typed-cells A1 prepare slice).**
+  `narf_prepare` now accepts an optional declared `contract`, validates its
+  `entry` identifier, validates `input`/`output` with JSON Schema Draft 2020-12,
+  echoes the contract in `PrepareResponse`, and keeps it with the prepared
+  script for the later register/invoke verbs. The harness tool schema exposes the
+  same field. This is not yet `narf_register` or invoke-time input/output
+  enforcement; those remain the next typed-cell steps.
 
 The whole stack was exercised live through the real fleet TUI (tmux): a dispatch
 flows TUI → `/control/exec` → in-process harness (task-local identity, `--cwd`,

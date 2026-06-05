@@ -66,6 +66,7 @@ use anyhow::{anyhow, Result};
 use deno_core::v8;
 use deno_core::{op2, OpState, PollEventLoopOptions, RuntimeOptions};
 use deno_error::JsErrorBox;
+use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -141,19 +142,26 @@ impl Default for SupervisionPolicy {
 #[derive(Default)]
 struct PreparedScripts {
     next_id: u64,
-    scripts: HashMap<String, String>,
+    scripts: HashMap<String, PreparedScript>,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedScript {
+    source: String,
+    contract: Option<CellContract>,
 }
 
 impl PreparedScripts {
-    fn put(&mut self, source: String) -> String {
+    fn put(&mut self, source: String, contract: Option<CellContract>) -> String {
         let id = self.next_id;
         self.next_id += 1;
         let handle = format!("narf-script:{id}");
-        self.scripts.insert(handle.clone(), source);
+        self.scripts
+            .insert(handle.clone(), PreparedScript { source, contract });
         handle
     }
 
-    fn get(&self, handle: &str) -> Result<String, String> {
+    fn get(&self, handle: &str) -> Result<PreparedScript, String> {
         self.scripts
             .get(handle)
             .cloned()
@@ -197,6 +205,22 @@ pub struct PrepareDiagnostic {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CellContract {
+    pub entry: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub may_invoke: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_budget: Option<serde_json::Value>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct PrepareResponse {
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
@@ -208,6 +232,10 @@ pub struct PrepareResponse {
     /// present on a `ready` response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Optional declared typed-cell contract. v1 contracts are explicit JSON
+    /// Schema-ish declarations, not inferred TypeScript signatures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<CellContract>,
 }
 
 #[derive(Deserialize)]
@@ -222,6 +250,8 @@ struct PrepareInput {
     source: String,
     #[serde(default)]
     imports: Option<ImportSpec>,
+    #[serde(default)]
+    contract: Option<CellContract>,
 }
 
 #[derive(Deserialize)]
@@ -264,15 +294,17 @@ fn blocked(kind: &str, message: impl Into<String>) -> PrepareResponse {
         status: "blocked".to_string(),
         diagnostics: vec![diagnostic(kind, message)],
         source: None,
+        contract: None,
     }
 }
 
-fn ready(handle: String, source: String) -> PrepareResponse {
+fn ready(handle: String, source: String, contract: Option<CellContract>) -> PrepareResponse {
     PrepareResponse {
         ref_handle: Some(handle),
         status: "ready".to_string(),
         diagnostics: vec![],
         source: Some(source),
+        contract,
     }
 }
 
@@ -347,6 +379,62 @@ fn render_prepare(session: &SessionState, input: PrepareInput) -> Result<String,
     let mut assembled = resolve_imports(session, input.imports)?;
     assembled.push_str(&input.source);
     Ok(assembled)
+}
+
+fn validate_cell_contract(contract: &CellContract, source: &str) -> Result<(), String> {
+    if !is_js_identifier(&contract.entry) {
+        return Err(format!(
+            "contract.entry must be a JavaScript identifier, got `{}`",
+            contract.entry
+        ));
+    }
+    if !source_declares_entry(source, &contract.entry) {
+        return Err(format!(
+            "contract.entry `{}` was not found as a function/const/let/var declaration",
+            contract.entry
+        ));
+    }
+    if contract.effects.iter().any(|s| s.trim().is_empty()) {
+        return Err("contract.effects entries must be non-empty strings".to_string());
+    }
+    if contract.may_invoke.iter().any(|s| s.trim().is_empty()) {
+        return Err("contract.may_invoke entries must be non-empty strings".to_string());
+    }
+    if let Some(schema) = &contract.input {
+        validate_json_schema("contract.input", schema)?;
+    }
+    if let Some(schema) = &contract.output {
+        validate_json_schema("contract.output", schema)?;
+    }
+    if let Some(budget) = &contract.dispatch_budget {
+        if !budget.is_object() {
+            return Err("contract.dispatch_budget must be an object".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_json_schema(label: &str, schema: &serde_json::Value) -> Result<(), String> {
+    JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(schema)
+        .map(|_| ())
+        .map_err(|e| format!("{label} is not a valid JSON Schema: {e}"))
+}
+
+fn source_declares_entry(source: &str, entry: &str) -> bool {
+    // prepare deliberately does not execute user code, and V8 does not expose a
+    // parser API here. This recognizes the declaration forms A1 supports until a
+    // future TS/AST toolchain exists.
+    [
+        format!("function {entry}("),
+        format!("async function {entry}("),
+        format!("const {entry} ="),
+        format!("let {entry} ="),
+        format!("var {entry} ="),
+    ]
+    .iter()
+    .any(|needle| source.contains(needle))
 }
 
 // ---------------------------------------------------------------------------
@@ -1395,6 +1483,7 @@ fn prepare_one(
         Ok(i) => i,
         Err(e) => return Ok(blocked("input", format!("invalid narf_prepare input: {e}"))),
     };
+    let contract = input.contract.clone();
     let assembled = {
         let op_state = runtime.op_state();
         let state = op_state.borrow();
@@ -1409,15 +1498,23 @@ fn prepare_one(
         return Ok(blocked("syntax", message));
     }
 
+    if let Some(contract) = &contract {
+        if let Err(message) = validate_cell_contract(contract, &assembled) {
+            return Ok(blocked("contract", message));
+        }
+    }
+
     let handle = {
         let op_state = runtime.op_state();
         let state = op_state.borrow();
         let scripts = state.borrow::<PreparedScriptsCell>().clone();
-        let handle = scripts.borrow_mut().put(assembled.clone());
+        let handle = scripts
+            .borrow_mut()
+            .put(assembled.clone(), contract.clone());
         handle
     };
     // Return the rendered source so the model reviews exactly what narf_run runs.
-    Ok(ready(handle, assembled))
+    Ok(ready(handle, assembled, contract))
 }
 
 /// Host-side `narf_define`: deserialize `{ name, source, exports }` and register
@@ -1433,13 +1530,15 @@ fn define_one(runtime: &mut deno_core::JsRuntime, input_json: serde_json::Value)
 }
 
 async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<String> {
-    let source = {
+    let script = {
         let op_state = runtime.op_state();
         let state = op_state.borrow();
         let scripts = state.borrow::<PreparedScriptsCell>().clone();
-        let source = scripts.borrow().get(handle).map_err(|e| anyhow!(e))?;
-        source
+        let script = scripts.borrow().get(handle).map_err(|e| anyhow!(e))?;
+        script
     };
+    let source = script.source;
+    let _contract = script.contract;
     {
         let op_state = runtime.op_state();
         let state = op_state.borrow();

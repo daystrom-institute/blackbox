@@ -22,7 +22,7 @@ use bro_capabilities::{
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 const DEFAULT_KV_GET_MAX_BYTES: usize = 256 * 1024;
 const KV_SUMMARY_LINES: usize = 2;
@@ -780,7 +780,7 @@ impl Tool for NarfPrepareTool {
     }
 
     fn description(&self) -> &str {
-        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Returns {ref, status, diagnostics, source} — review the rendered source, then narf_run the handle."
+        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Optionally validates and echoes a declared typed-cell contract. Returns {ref, status, diagnostics, source, contract} — review the rendered source, then narf_run the handle."
     }
 
     fn input_schema(&self) -> Value {
@@ -791,6 +791,35 @@ impl Tool for NarfPrepareTool {
                 "imports": {
                     "description": "Session helper names to inject (array), or {alias: name} map.",
                     "type": ["array", "object"]
+                },
+                "contract": {
+                    "description": "Optional typed-cell contract. JSON Schema fields are validated, and entry must name a declared JS function/variable in source.",
+                    "type": "object",
+                    "properties": {
+                        "entry": { "type": "string" },
+                        "input": {
+                            "description": "JSON Schema for the cell input.",
+                            "type": ["object", "boolean"]
+                        },
+                        "output": {
+                            "description": "JSON Schema for the cell output.",
+                            "type": ["object", "boolean"]
+                        },
+                        "effects": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "may_invoke": {
+                            "type": "array",
+                            "items": { "type": "string" }
+                        },
+                        "dispatch_budget": {
+                            "type": "object",
+                            "additionalProperties": true
+                        }
+                    },
+                    "required": ["entry"],
+                    "additionalProperties": false
                 }
             },
             "required": ["source"]

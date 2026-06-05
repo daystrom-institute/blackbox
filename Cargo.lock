@@ -619,6 +619,7 @@ dependencies = [
  "bro-core",
  "deno_core",
  "deno_error",
+ "jsonschema",
  "serde",
  "serde_json",
  "serde_norway",
