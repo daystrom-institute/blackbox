@@ -329,9 +329,14 @@ author knows — so it must be **declared**.
 - **In-box MCP tools RETURN VALUES** (no ref envelopes — refs are retired). They
   ride the **existing `ToolCapability`/HostTools seam**: a placed-in-box MCP tool
   is just another `Tool` added to the per-session filtered host map, invoked via
-  the same `op_tool_invoke` path as `fs.*`/`shell.*` and exposed in the cell as
-  `narf.mcp.call(fqName, input)` (or `mcp(fqName, input)`). It reuses the existing
-  MCP client in `bro-harness/mcp.rs` — **no new `McpInvoke` trait, no
+  the same `op_tool_invoke` path as `fs.*`/`shell.*`. The cell surface is
+  **`mcp.<server>.<tool>(args)`** (awaitable, returns the tool's value) — a
+  two-level JS **`Proxy`**: `mcp.blackbox.bbox_code_node_describe(args)` maps to
+  the fully-qualified `mcp__blackbox__bbox_code_node_describe` and calls
+  `op_tool_invoke` with it. The Proxy lets the author *name* an exact server.tool
+  but never *enumerate* (no in-box "what MCP tools exist?"), and an unplaced/denied
+  name **fails closed** at the host map — so the box-edge holds. It reuses the
+  existing MCP client in `bro-harness/mcp.rs` — **no new `McpInvoke` trait, no
   `blackbox`-crate MCP proxy** (the host-tool seam already exists, unlike when §4
   was written). The returned value lands in the cell (out-of-context); an oversized
   cell *return* is bounded by the §5 rider.
