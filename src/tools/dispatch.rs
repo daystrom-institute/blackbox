@@ -867,7 +867,7 @@ impl BlackboxServer {
 
     #[tool(
         name = "bro_wait",
-        description = "Block until one task completes; timeout returns a snapshot, not proof the task is dead."
+        description = "Block until one task completes; timeout returns a snapshot, not proof the task is dead. If the result is empty or suspicious, inspect bro_status(tail=N) before resuming, cancelling, or treating it as success."
     )]
     pub(crate) async fn bro_wait(
         &self,

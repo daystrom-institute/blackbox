@@ -84,6 +84,39 @@ Prefer sandbox-scoped tools and idioms over host/outside-daemon assumptions:
 - Keep tool outputs scoped and diagnostic. If a command or tool result is too
   large, narrow the query instead of flooding context.
 
+## Authorial Surface
+
+When the task is to author behavior, choose the lowest surface that matches the
+durability and control-plane shape:
+
+- **NARF cells** — use `narf_exec` for one-shot JS composition, or
+  `narf_prepare` followed by `narf_run` when the rendered source/contract needs
+  review before execution. A cell receives values, not ref envelopes. Host tools
+  return values into the cell; use JS for transforms and return a compact
+  summary, structured value, or KV name rather than a blob.
+- **NARF dialect** — cells have `narf.encode.yaml`,
+  `narf.encode.frontmatter`, and `narf.encode.mdTable` for non-JS-native output
+  formats. Use `narf.kv.set/get/peek/delete` only on exact names the author
+  already holds; in-box KV enumeration/search is intentionally absent. Use
+  model-facing KV list/peek/get tools, when present, to survey keys before
+  authoring a cell that dereferences them. Ordinary JS `await` is live within
+  the current activation; cross-turn or restart-safe waiting requires an
+  explicit durable handle from a host producer.
+- **Refactor work** — pull `sm-refactor` and the language memory when the
+  generic tool docs are not enough. Use `bbox_refactor_status` to inventory
+  exact items/kinds before `bbox_refactor_plan`; apply only after reviewing a
+  plan with `bbox_refactor_apply(confirm=true)`. LSP-backed kinds such as
+  `rust_lsp_rename` should return a plan or fail closed with a clear LSP
+  error/timeout. If an LSP-backed plan remains `tool_running` after a wait
+  timeout, inspect `bro_status`, cancel only your own task if needed, and file a
+  refactor gap with the tool call and idle timing.
+- **Ad-hoc bro dispatch** — use `bro_exec` for a fresh child task,
+  `bro_wait`/`bro_when_all` for joins, `bro_status(tail=N)` after timeouts or
+  empty/suspicious completions, and `bro_resume` for continuity in the same
+  session. Record `taskId` and the concrete `sessionId` once it resolves.
+  Nested dispatch from a sandbox probe should be explicitly authorized, bounded
+  to the requested fanout, and should instruct children not to recurse.
+
 ## Observability Contract
 
 For sandbox probes, make the boundary observable as part of the work:

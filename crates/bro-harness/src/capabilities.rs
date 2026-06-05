@@ -787,7 +787,7 @@ impl Tool for NarfExecTool {
     }
 
     fn description(&self) -> &str {
-        "runs a NARF JS composition cell in-process; the cell composes capability/tool values and returns a value."
+        "Run a one-shot NARF JavaScript composition cell in-process. The cell receives values, not ref envelopes: host tools return values, JS handles transforms, `narf.encode.{yaml,frontmatter,mdTable}` formats output, `narf.kv.{set,get,peek,delete}` dereferences exact known names only, and the cell should return a compact value or KV name."
     }
 
     fn input_schema(&self) -> Value {
@@ -834,7 +834,7 @@ impl Tool for NarfPrepareTool {
     }
 
     fn description(&self) -> &str {
-        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Optionally validates and echoes a declared typed-cell contract. Returns {ref, status, diagnostics, source, contract} — review the rendered source, then narf_run the handle."
+        "Render + validate a NARF script (optionally importing session helpers) WITHOUT running it. Optionally validates and echoes a declared typed-cell contract. Returns {ref, status, diagnostics, source, contract} — review the rendered source, then narf_run the handle. The script has the same value-returning NARF dialect as narf_exec, including narf.encode.{yaml,frontmatter,mdTable} and exact-name narf.kv access."
     }
 
     fn input_schema(&self) -> Value {
