@@ -317,7 +317,31 @@ The thesis is "mostly built." Precisely what is *not*:
    it is not an inferred TS signature. If inferred typing is ever wanted, it is a
    separate, scoped toolchain decision — not part of this doc's v1.
 
-## 8. Open decisions
+## 8. Decisions
+
+- **D6 — Authorial body channel — DECIDED (uniform JSON tool surface; freeform
+  grammar deferred).** The cell `source` (and the register/durable verbs' inputs)
+  cross as a standard JSON string arg in a normal function-tool schema, **identical
+  across every transport** — no freeform/grammar channel and no per-transport
+  channel adapter in v1. Correctness rests entirely on Layer B: `prepare`
+  syntax-check + (for contracted cells) server-side schema validation + the
+  rendered-source review step + a repair turn. The codex-style freeform-grammar
+  code-channel (raw JS, no JSON escaping — see `codex-rs/code-mode`,
+  `core/src/tools/handlers/apply_patch.lark`) is a **later, Brodex/Responses-scoped
+  enhancement** layered onto the same logical surface, not a v1 dependency.
+  *Why this is forced, not merely chosen:* a 2026-06-04 adversarial probe of the
+  actual fleet found the Anthropic-shaped clones **GLM / DeepSeek / MiniMax all
+  silently ignore `strict` and structured-output (`output_config.format`)** —
+  e.g. DeepSeek/MiniMax emitted tool args that directly violate a `strict` schema.
+  Only Vibe/Mistral (chat `response_format: json_schema` + tool `strict`) and
+  Brodex (Responses; freeform grammar + strict) enforce anything. So there is no
+  transport-portable constrained-decoding floor to build on — Layer-B server-side
+  validation + repair is the *only* mechanism available on most of the fleet, and
+  the cheap house-style rules (single-quote-preferring JS, single top-level
+  `source` arg, minimal nesting) carry the ergonomic load until the grammar
+  enhancement lands.
+
+### Open decisions
 
 - **D1 — Contract schema dialect.** JSON Schema (verbose, standard, already used
   by atoms) vs a thinner bespoke shape. Leaning JSON Schema for atom parity.
