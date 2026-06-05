@@ -246,7 +246,7 @@ on the operator's machine) deflates most of it.
   state uses **non-poisoning locks** (`parking_lot`). These two are prerequisites,
   not nice-to-haves.
 - **V8 runs in-process.** The isolate, not a process, is the containment unit —
-  the codex code-mode / Deno embedding model. A per-isolate heap bound +
+  the Codex-code-mode-shaped raw-V8 embedding model. A per-isolate heap bound +
   `add_near_heap_limit_callback` → `terminate_execution` contains script OOM;
   `terminate_execution` from another thread kills runaway loops; deleted globals
   (`console`/`Atomics`/`SharedArrayBuffer`/`WebAssembly`) deny ambient host access.
@@ -287,17 +287,21 @@ on the operator's machine) deflates most of it.
   panic that unwinds across a V8 callback into C++ frames (no `catch_unwind`) is
   UB. In-process V8 trades a process boundary for **config discipline** — get it
   wrong and a cell *can* crash the daemon. This is the residual the trusted-agent
-  model accepts. **The §5b spike (`crates/bro-script`, deno_core `=0.403.0`)
-  confirmed both halves of this and proved the mitigations hold:** an
+  model accepts. **The historical §5b deno_core spike confirmed both halves of
+  this and proved the mitigations hold, but deno_core is not the target lattice:**
+  an
   `add_near_heap_limit_callback` that flags + `terminate_execution`s + grants
   doubling headroom contains a runaway allocator with the process surviving (no
   `abort()`), and a cross-thread `IsolateHandle::terminate_execution` kills
   `while(true){}`. Crucially the spike found **deno_core 0.403 wraps op dispatch in
   zero `catch_unwind`** — so under the workspace's load-bearing `panic = "unwind"`,
   an *unguarded* op panic unwinds across V8 C++ frames = UB. Mitigation proven and
-  now **mandatory**: every NARF capability op body must wrap its work in
-  `catch_unwind` → `JsErrorBox`. This is a structural rule for the full build, not a
-  per-op nicety.
+  now **mandatory** for the raw-V8 build too: every host callback must wrap its
+  work in `catch_unwind` and surface a JS exception instead of unwinding across
+  V8 C++ frames. This is a structural rule for the full build, not a per-callback
+  nicety. The durable runtime direction is raw `v8`, Codex-code-mode shaped: a
+  live activation with host-call promises, explicit yield/poll/terminate control,
+  and separate daemon-owned durable handles for work that outlives the activation.
 - **A low-probability V8 embedding/internal fault has no process boundary to catch
   it** — it would take the daemon (corpus + all sessions). Accepted as
   low-prob-with-a-mature-crate; revisit if it ever bites.
@@ -888,35 +892,33 @@ roster render.
     (linking `bro-fleet-client`, no `blackbox`) rendered the roster + provider/
     model/effort selector, dispatched a brodex gpt-5.5 agent end-to-end (TUI →
     `/control/exec` → daemon → agent → ✓ Finished).
-- **§5b in-process V8 (execution isolation) — SPIKE DONE; full build next.** The
-  de-risking spike landed as a new workspace crate `crates/bro-script` (commit
-  `7b170de`): deno_core `=0.403.0` (v8 `149.2.0`) embedded on a dedicated OS thread
-  (the `!Send` `JsRuntime` owns the thread; a current-thread tokio runtime +
-  `LocalSet` drives the event loop; jobs/replies cross via mpsc+oneshot; the only
-  outward handle is the `Send+Sync` `v8::IsolateHandle`). All four daemon-safety
-  properties + the async bridge are proven by 6 passing tests (zero `blackbox`
-  dep): heap-bound OOM containment (process survives, no `abort()`), cross-thread
-  runaway-loop kill (+ runtime reusable after `cancel_terminate_execution`), denied
-  globals (`console`/`Atomics`/`SharedArrayBuffer`/`WebAssembly` deleted per-isolate),
-  the `!Send`-isolate ↔ async-Rust capability bridge (`await cap.echo` → executor on
-  the outer runtime → back to JS), and the panic boundary (`catch_unwind` → JS
-  error). KEY RESIDUAL (now in §5 Future concerns): deno_core 0.403 has **zero**
-  op-dispatch `catch_unwind`, so under `panic = "unwind"` a mandatory per-op
-  `catch_unwind` wrapper is structural for the full build. Cost blackboxd inherits:
-  +59 transitive crates, prebuilt `librusty_v8` ~196 MB, cold dep build ~165s /
-  incremental ~6s. Independently re-verified by the orchestrator (`cargo test -p
-  bro-script` 6/6). The spike was then HARDENED into a real standalone runtime
-  (still zero `blackbox`, NOT yet daemon-wired):
+- **§5b in-process V8 (execution isolation) — RAW-V8 RUNTIME LIVE.** The
+  original de-risking spike landed as a new workspace crate `crates/bro-script`
+  (commit `7b170de`) on deno_core `=0.403.0` (v8 `149.2.0`). That substrate proved
+  the daemon-safety properties and async bridge. The crate has now been reset to
+  the intended foundation: direct `v8 =149.2.0` + `deno_core_icudata` only, no
+  deno_core runtime/op layer. Current shape: host callbacks create stored
+  `PromiseResolver`s; async Rust capability work resolves/rejects those promises
+  into the same live activation; `ScriptRuntime` owns timeout/terminate and
+  stale-command cleanup; durability remains an explicit daemon-owned handle layer
+  above the runtime. The deno_core spike remains historical evidence for required
+  safety behavior: heap-bound OOM containment, cross-thread runaway-loop kill,
+  denied globals, async Rust bridge, and panic containment. KEY RESIDUAL (now in
+  §5 Future concerns): no host callback may unwind across V8 C++ frames. Cost
+  note: deno_core added +59 transitive crates and Deno-shaped runtime concepts;
+  the raw-V8 build keeps the conceptual surface Blackbox-owned.
+  Historical slice ledger (older entries may use superseded deno_core/op names):
   - **`5048d22` (§5b-2):** the three real `bro-capabilities` traits
     (`CorpusCapability`/`AtomCapability`/`RefactorCapability`) injected via a
     `Capabilities` struct and bridged to JS (`corpus.search`/`atoms.invoke`/
     `refactor.plan`/`refactor.materialize`) over a generalized 4-variant typed
     `CapRequest` enum on the proven mpsc→outer-executor→oneshot path. The panic
-    guard is now **structural**: `guard_op` (sync) + `guard_async`/`Guarded<F>`
-    (wraps EVERY poll, incl. post-`await` resumption on the V8 thread, in
-    `catch_unwind`→`JsErrorBox`); every cap op routes through it. `SupervisionPolicy
+    guard was **structural** in the deno_core spike (`guard_op` / `guard_async`);
+    in the raw-V8 runtime the equivalent rule is host-callback `catch_unwind` plus
+    panic-isolated capability executor tasks. `SupervisionPolicy
     { heap_limit_bytes=256 MiB, execution_timeout=30s }` default-ON; the timeout
-    auto-kills via the cross-thread `IsolateHandle`, runtime stays reusable.
+    auto-kills via the cross-thread `IsolateHandle` plus an explicit runtime
+    terminate command so a pending host promise cannot strand the V8 thread.
     Orchestrator-verified 14/14.
   - **`ba2ae02` (§9-1, first NARF primitive):** the **Ref substrate + bounded
     egress**. A per-runtime host-side `RefStore` (`Rc<RefCell<RefState>>` in
@@ -943,9 +945,11 @@ roster render.
     links `bro-script`; a `NarfExecTool` (capabilities.rs) builds a per-session
     `ScriptRuntime` lazily from the installed Atom+Refactor caps and runs a cell via
     `narf_exec(source)`, gated by the existing `ToolFilter`, registered only when
-    both caps are installed (fail-closed by absence). `cargo check -p blackbox`
-    confirms the daemon links bro-script (deno_core in the daemon dep tree, as
-    accepted). 3 unit tests. **LIVE SMOKE PASSED** (isolated daemon port 7299, real
+    both caps are installed (fail-closed by absence). The original `cargo check
+    -p blackbox` confirmed the daemon linked bro-script with deno_core in the dep
+    tree; the raw-V8 substrate now keeps that same public `ScriptRuntime` seam
+    while removing Deno-shaped runtime concepts. 3 unit tests. **LIVE SMOKE
+    PASSED** (isolated daemon port 7299, real
     glm agent in-process, exact-PID teardown, prod 7264 untouched): (1)
     `narf_exec("return 1+1;")` → `2` (V8 runs in the daemon); (2)
     `narf_exec("await atoms.invoke('atom:smoke-nonexistent@v1',{})")` → reached the
@@ -961,12 +965,13 @@ roster render.
   - **`bro-capabilities`:** new `ToolCapability` trait (`call_tool(ToolInvocation)
     -> ToolCallOutput`) — the "invoke a bro-tools built-in by name" contract-bottom
     seam (§5.1), one bridge not N bespoke traits.
-  - **`bro-script`:** `Capabilities.tools: Option<Arc<dyn ToolCapability>>`, a
-    `CapRequest::ToolInvoke` variant + `op_tool_invoke` riding the proven
-    mpsc→outer-executor→oneshot bridge and structural panic guard. Success stores
-    the tool's content host-side as a **`tool` ref** and returns the
-    `{ref,size,preview}` envelope (bounded egress unchanged); an `is_error` result
-    throws a catchable JS exception; `tools: None` fails closed. JS bindings:
+  - **`bro-script`:** `Capabilities.tools: Option<Arc<dyn ToolCapability>>`, with
+    JS bindings riding the raw-V8 `hostCall('tool.invoke', ...)` bridge. The
+    callback stores a `PromiseResolver`, the capability executor runs the injected
+    `ToolCapability`, and the runtime resolves/rejects back into the same live
+    activation. JSON tool content becomes a JS value, non-JSON content becomes a
+    JS string; an `is_error` result throws a catchable JS exception; `tools: None`
+    fails closed. JS bindings:
     `fs.{read,smartRead,list,write,edit}`, `search.{content,glob}`,
     `git.{status,log,diff,show,commit}`, `shell.{run,poll,kill,list}`, `web.fetch`
     — ergonomic single-string sugar mapping onto each tool's primary input field.
@@ -989,26 +994,26 @@ roster render.
     `const e = await fs.read('SMOKE.txt'); return narf.ref.text(e)` and returned
     the sentinel file bytes — proving `agent_loop` builds + injects `HostTools`
     in a real in-process session and the cell reaches the host-tool seam
-    end-to-end (model→narf_exec→in-daemon-V8→fs.read→op_tool_invoke→HostTools→
+    end-to-end (model→narf_exec→in-daemon-V8→fs.read→hostCall→HostTools→
     real FileRead against the session ToolCx→ref→bounded egress).
   - **Decision recorded:** took the §5.1 "one generic invoke-by-name bridge +
     ergonomic wrappers" fork over N bespoke capability traits — simplest, and
-    steps 2–4 collapse to JS wrappers over the single op. Reversible.
+    steps 2–4 collapse to JS wrappers over the single host-call ABI. Reversible.
 
   TOOL-CALLING MVP — **promise primitive (step 5) LANDED.** In-box
   `narf.promise.{all,any,wait,status,list,cancel,pipeline}` over the shared
   per-session `PromiseStore` (`narf-tool-placement.md` §2/§5). Key shape: a
   promise *handle* is a small by-value `{promise_id}` ticket (so it composes),
   but a joined *result* can carry producer output → ref-out (bounded egress).
-  Implemented with a second seam variant `op_tool_invoke_inline` (value-out, for
-  control-shaped results) alongside the ref-out `op_tool_invoke`: `shell.run`
-  switches to inline when `mode:'promise'`; `all`/`any`/`wait` are ref-out;
-  `status`/`list`/`cancel` are inline. `pipeline` is a pure-JS no-barrier staging
+  Implemented with a second host-call route `tool.invoke_inline` (value-out, for
+  control-shaped results) alongside the ordinary `tool.invoke`: `shell.run`
+  switches to inline when `mode:'promise'`; `status`/`list`/`cancel` are inline.
+  `pipeline` is a pure-JS no-barrier staging
   combinator (each item through all stages independently). bro-script 28→32 tests
   (ticket-inline + join-ref, inline control ops + handle/id normalization, any,
   pipeline); clippy clean; `cargo check -p blackbox` links. **5b refinement
   deferred:** strict per-promise `Promise<Ref<T>>` (splitting each joined result
-  into its own ref via a host-side `op_promise_join`) — today `all`/`any` ref the
+  into its own ref via a host-side promise-join helper) — today `all`/`any` ref the
   whole `{promises:[…]}` envelope, which still keeps big output out of context.
   `narf_wait`/durable promises remain the §10 lever.
 
@@ -1028,7 +1033,7 @@ roster render.
   (`7340b37`, spec narf-data-model.md §10): a flat `tool_placement` map
   (default fail-safe out-box) places external MCP tools in-box via the host-tool
   seam, reachable as a non-enumerating `mcp.<server>.<tool>(args)` Proxy
-  (`mcp__server__tool` → `op_tool_invoke`, returns values), filter gating the
+  (`mcp__server__tool` → raw-V8 `hostCall('tool.invoke', ...)`, returns values), filter gating the
   whole capability (in-box-only excluded from the model registry). **Typed
   in-process MCP config** (`7c15da9`): the in-process dispatch no longer
   round-trips config through argv — a typed `McpConfig { servers:
@@ -1053,9 +1058,7 @@ roster render.
   `narf-capability-library.md` §0.1 — the box must not hold the controls that open
   or author it). Now corrected:
   - **bro-script:** `narf.prepare`/`narf.run`/`narf.session.define` removed from
-    the bootstrap (and the in-box-only ops `op_prepare_render`/`op_prepare_store`/
-    `op_prepared_source`/`op_session_define`/`op_trace_record`/`op_trace_entries`
-    deleted). `narf.session.import` **stays in-box** (recall a cached helper by
+    the bootstrap. `narf.session.import` **stays in-box** (recall a cached helper by
     exact name = a dereference, not a control — the §2.2 exception, keeps helper
     source out of context). `ScriptRuntime::prepare` now takes `{source, imports?}`
     and returns the **rendered source** alongside the handle (the §0.1 review

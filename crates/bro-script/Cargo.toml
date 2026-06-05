@@ -1,13 +1,12 @@
-# bro-script — §5b de-risking spike (harness-daemon-boundary.md §5b).
+# bro-script — raw V8 NARF script runtime (harness-daemon-boundary.md §5b).
 #
-# Embeds V8 in-process via deno_core as the NARF script-execution container.
-# This crate is the SPIKE home only: it proves daemon-safety (heap-bound OOM
-# containment, runaway-loop kill, denied globals, panic boundary) and the
-# !Send-isolate <-> async-Rust capability bridge in ISOLATION.
+# Embeds V8 in-process as the NARF script-execution container. The runtime is
+# Codex-code-mode shaped: raw V8 isolate, Blackbox-owned host-call ABI, live JS
+# promises for ordinary async work, and explicit daemon-owned durable handles
+# above this crate when needed.
 #
 # INVARIANT: zero `blackbox` dependency. bro-script is a contract-bottom-adjacent
-# runtime crate — it couples only to deno_core + tokio + serde + anyhow and a
-# LOCAL stub trait shaped like bro-capabilities. It must never link the daemon.
+# runtime crate. It must never link the daemon.
 [package]
 name = "bro-script"
 version = "0.0.1"
@@ -19,13 +18,10 @@ edition = "2021"
 # RefactorCapability traits by injection; it must never link the daemon.
 bro-capabilities = { path = "../bro-capabilities" }
 bro-core = { path = "../bro-core" }
-# Pinned exactly: V8 ABI + op2 macro surface churn fast; this dep will later
-# land in blackboxd, so the version is a deliberate, reported choice.
-deno_core = "=0.403.0"
-# Op error type: deno_core ops must return an error implementing
-# `deno_error::JsErrorClass`; `JsErrorBox` is the catch-all. Pinned to the
-# version deno_core 0.403 itself depends on.
-deno_error = "=0.7.1"
+# Pinned exactly: V8 ABI churns fast; this dep lands in blackboxd, so the
+# version is a deliberate, reported choice.
+v8 = "=149.2.0"
+deno_core_icudata = "0.77.0"
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

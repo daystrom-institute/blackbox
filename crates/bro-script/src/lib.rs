@@ -1,73 +1,30 @@
-//! bro-script — §5b runtime: V8 in-process via deno_core as the NARF
-//! script-execution container.
+//! bro-script — raw V8 NARF script runtime.
 //!
-//! Originally a §5b de-risking spike, this crate is now hardened into a real
-//! standalone runtime. It still proves, in ISOLATION (zero `blackbox`
-//! dependency), the daemon-safety properties and the async-bridge property that
-//! gate embedding V8 inside the long-lived blackbox daemon — but the single
-//! local echo capability has been replaced with exact-handle atom and refactor
-//! `bro-capabilities` traits, the panic guard is now structural, and supervision
-//! is configurable.
+//! This crate embeds V8 directly, with a Blackbox-owned host-call ABI rather
+//! than Deno ops. The runtime shape is intentionally close to Codex code-mode:
+//! a live V8 activation creates JS promises for host calls, Rust capability work
+//! runs outside the isolate, and the result resolves/rejects the same JS promise
+//! back inside the live activation.
 //!
-//!   1. heap-bound OOM containment   — a runaway allocator is terminated, the
-//!      process survives (no V8 `abort()`).
-//!   2. runaway-loop kill            — `while(true){}` is interrupted cross-thread
-//!      via the V8 `IsolateHandle` (either an external watchdog or the built-in
-//!      execution-timeout supervisor).
-//!   3. denied globals               — no `WebAssembly`/`Atomics`/
-//!      `SharedArrayBuffer`/`console` ambient host access.
-//!   4. async capability bridge      — a JS `await atoms.invoke(x)` suspends the
-//!      script, hops from the `!Send` isolate thread into async Rust on a
-//!      *different* executor, runs a real `bro-capabilities` trait method, and
-//!      returns the result into JS.
-//!   5. panic boundary               — a panic inside ANY op body is caught
-//!      (`catch_unwind`) and surfaced as a JS error, never unwound across V8
-//!      C++ frames (which would be UB / daemon abort). This is structural: every
-//!      op routes through one guard helper.
-//!
-//! ## Thread <-> async pattern
-//!
-//! `deno_core::JsRuntime` is `!Send` and executes JS synchronously, so it owns a
-//! **dedicated OS thread**. On that thread a *current-thread* tokio runtime +
-//! `LocalSet` drives the V8 event loop. The outside world talks to it over
-//! channels:
-//!
-//! * inbound jobs (`Job`) arrive on a tokio mpsc; each job carries a `oneshot`
-//!   reply sender, so async callers `await` a normal future.
-//! * the only handle shared *outward* is the cross-thread `v8::IsolateHandle`
-//!   (`Send + Sync`), used by the supervisor watchdog and the near-heap-limit
-//!   callback to terminate execution from another thread.
-//!
-//! ## Capability bridge
-//!
-//! An op invoked from JS does **not** run the capability inline on the V8 thread.
-//! It forwards a typed [`CapRequest`] over an mpsc channel to a *capability
-//! executor* task running on the **outer** multi-thread tokio runtime, then
-//! `await`s a `oneshot` reply. While the op future is pending, `run_event_loop`
-//! keeps polling it; the cross-runtime oneshot waker resolves it when async Rust
-//! finishes. This is the genuine `!Send`-isolate ↔ async-capability round trip.
-//! The real exact-handle capability traits ([`AtomCapability`],
-//! [`RefactorCapability`]) are injected as `Arc<dyn Trait>` exactly as the
-//! daemon will later install them.
+//! Durability is deliberately not hidden in `await`. Plain JS promises are
+//! live-activation promises. Cross-turn or cross-restart waiting belongs above
+//! this crate as explicit daemon-owned durable handles.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::future::Future;
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::pin::Pin;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::task::{Context, Poll};
+use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
-use deno_core::v8;
-use deno_core::{OpState, PollEventLoopOptions, RuntimeOptions, op2};
-use deno_error::JsErrorBox;
+use anyhow::{anyhow, Result};
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
+use serde_json::Value as JsonValue;
 use tokio::sync::{mpsc, oneshot};
 
 pub use bro_capabilities::{
@@ -77,46 +34,26 @@ pub use bro_capabilities::{
 };
 use bro_core::BroError;
 
-/// deno_core version this crate pins. Reported for the §5 cost accounting (this
-/// dep later lands in blackboxd).
-pub const DENO_CORE_VERSION: &str = "0.403.0";
+/// Runtime substrate reported by tests and diagnostics.
+pub const SCRIPT_RUNTIME_SUBSTRATE: &str = "raw-v8";
 
-/// Default per-isolate hard heap ceiling (bytes). Generous enough that ordinary
-/// scripts never trip it; the OOM-containment test passes a deliberately small
-/// limit instead.
+/// Direct V8 crate version this runtime pins.
+pub const V8_VERSION: &str = "149.2.0";
+
+/// Default per-isolate hard heap ceiling (bytes).
 pub const DEFAULT_HEAP_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
-/// Default wall-clock ceiling for a single `execute` call. Generous enough that
-/// ordinary scripts (including a few capability round trips) never trip it; the
-/// timeout test passes a deliberately short value instead.
+/// Default wall-clock ceiling for a single execution job.
 pub const DEFAULT_EXECUTION_TIMEOUT: Duration = Duration::from_secs(30);
 
-// ---------------------------------------------------------------------------
-// Capability injection
-// ---------------------------------------------------------------------------
-
-/// The exact-handle `bro-capabilities` trait objects the runtime exposes to JS.
-/// Injected by the caller (the daemon, later; tests, now) so the runtime never
-/// hard-codes an implementation.
 #[derive(Clone)]
 pub struct Capabilities {
     pub atoms: Arc<dyn AtomCapability>,
     pub refactor: Arc<dyn RefactorCapability>,
-    /// The generic host built-in tool seam (§5.1). `None` for the standalone
-    /// runtime / tests that exercise only atom+refactor composition — the
-    /// `fs.*`/`shell.*`/`search.*`/`git.*`/`web.*` in-box bindings then fail
-    /// closed (§4.5 fail-safe by absence).
     pub tools: Option<Arc<dyn ToolCapability>>,
-    /// Durable session KV. Exact in-box deref only; enumeration stays
-    /// model-facing in bro-harness tools.
     pub kv: Arc<dyn KvCapability>,
 }
 
-/// Configurable, default-ON supervision. The heap limit bounds isolate memory;
-/// the execution timeout bounds wall-clock per `execute` and auto-terminates a
-/// runaway script via the cross-thread `IsolateHandle` (no caller-supplied
-/// watchdog needed). `execution_timeout = None` disables only the timer (the
-/// heap guard always stays on).
 #[derive(Clone, Debug)]
 pub struct SupervisionPolicy {
     pub heap_limit_bytes: usize,
@@ -132,20 +69,11 @@ impl Default for SupervisionPolicy {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Prepared script storage
-// ---------------------------------------------------------------------------
-
-/// Minimal per-runtime store for model-reviewed prepared scripts. This is not
-/// the retired data-ref substrate; it only backs `narf_prepare` -> `narf_run`
-/// identifier handles until the later KV phase provides the durable home.
 #[derive(Default)]
 struct PreparedScripts {
     next_id: u64,
-    scripts: HashMap<String, PreparedScript>,
+    scripts: HashMap<String, PreparedCell>,
 }
-
-type PreparedScript = PreparedCell;
 
 impl PreparedScripts {
     fn put(&mut self, source: String, contract: Option<CellContract>) -> String {
@@ -153,11 +81,11 @@ impl PreparedScripts {
         self.next_id += 1;
         let handle = format!("narf-script:{id}");
         self.scripts
-            .insert(handle.clone(), PreparedScript { source, contract });
+            .insert(handle.clone(), PreparedCell { source, contract });
         handle
     }
 
-    fn get(&self, handle: &str) -> Result<PreparedScript, String> {
+    fn get(&self, handle: &str) -> Result<PreparedCell, String> {
         self.scripts
             .get(handle)
             .cloned()
@@ -166,10 +94,8 @@ impl PreparedScripts {
 }
 
 type PreparedScriptsCell = Rc<RefCell<PreparedScripts>>;
-
-// ---------------------------------------------------------------------------
-// Session-local authoring state + prepared-script trace (§4 / §6)
-// ---------------------------------------------------------------------------
+type SessionStateCell = Rc<RefCell<SessionState>>;
+type TraceStateCell = Rc<RefCell<Vec<TraceEntry>>>;
 
 #[derive(Clone, Debug)]
 pub struct SessionHelper {
@@ -177,16 +103,11 @@ pub struct SessionHelper {
     pub exports: Vec<String>,
 }
 
-/// Host-side per-session frame. Helpers are source, not V8 globals: imports
-/// re-inject source into the current cell/prepared artifact.
 #[derive(Clone, Debug, Default)]
 pub struct SessionState {
     pub helpers: HashMap<String, SessionHelper>,
     pub import_aliases: HashMap<String, String>,
 }
-
-type SessionStateCell = Rc<RefCell<SessionState>>;
-type TraceStateCell = Rc<RefCell<Vec<TraceEntry>>>;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TraceEntry {
@@ -206,15 +127,15 @@ pub struct PrepareDiagnostic {
 pub struct CellContract {
     pub entry: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<serde_json::Value>,
+    pub input: Option<JsonValue>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub output: Option<serde_json::Value>,
+    pub output: Option<JsonValue>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub may_invoke: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dispatch_budget: Option<serde_json::Value>,
+    pub dispatch_budget: Option<JsonValue>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -223,13 +144,8 @@ pub struct PrepareResponse {
     pub ref_handle: Option<String>,
     pub status: String,
     pub diagnostics: Vec<PrepareDiagnostic>,
-    /// The rendered, import-assembled script — returned to the MODEL's context so
-    /// it sees exactly what `narf_run` will execute (the §0.1 review step). Only
-    /// present on a `ready` response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
-    /// Optional declared typed-cell contract. v1 contracts are explicit JSON
-    /// Schema-ish declarations, not inferred TypeScript signatures.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub contract: Option<CellContract>,
 }
@@ -259,9 +175,9 @@ struct PrepareInput {
 #[derive(Deserialize)]
 struct KvSetInput {
     name: String,
-    value_json: serde_json::Value,
+    value_json: JsonValue,
     #[serde(default)]
-    tags: Option<serde_json::Value>,
+    tags: Option<JsonValue>,
 }
 
 #[derive(Deserialize)]
@@ -416,7 +332,7 @@ fn validate_cell_contract(contract: &CellContract, source: &str) -> Result<(), S
     Ok(())
 }
 
-fn validate_json_schema(label: &str, schema: &serde_json::Value) -> Result<(), String> {
+fn validate_json_schema(label: &str, schema: &JsonValue) -> Result<(), String> {
     JSONSchema::options()
         .with_draft(Draft::Draft202012)
         .compile(schema)
@@ -424,11 +340,7 @@ fn validate_json_schema(label: &str, schema: &serde_json::Value) -> Result<(), S
         .map_err(|e| format!("{label} is not a valid JSON Schema: {e}"))
 }
 
-fn validate_json_value(
-    label: &str,
-    schema: &serde_json::Value,
-    value: &serde_json::Value,
-) -> Result<(), String> {
+fn validate_json_value(label: &str, schema: &JsonValue, value: &JsonValue) -> Result<(), String> {
     let compiled = JSONSchema::options()
         .with_draft(Draft::Draft202012)
         .compile(schema)
@@ -449,9 +361,6 @@ fn validate_json_value(
 }
 
 fn source_declares_entry(source: &str, entry: &str) -> bool {
-    // prepare deliberately does not execute user code, and V8 does not expose a
-    // parser API here. This recognizes the declaration forms A1 supports until a
-    // future TS/AST toolchain exists.
     [
         format!("function {entry}("),
         format!("async function {entry}("),
@@ -463,58 +372,17 @@ fn source_declares_entry(source: &str, entry: &str) -> bool {
     .any(|needle| source.contains(needle))
 }
 
-// ---------------------------------------------------------------------------
-// Capability request channel (V8-thread op -> outer-runtime executor)
-// ---------------------------------------------------------------------------
-
-/// A capability call handed off from a V8-thread op to the async executor on the
-/// outer runtime. Each variant carries the real `bro-capabilities` typed input
-/// and a typed `oneshot` reply, generalizing the spike's single echo request.
 enum CapRequest {
-    AtomInvoke {
-        input: AtomInvocation,
-        reply: oneshot::Sender<CapabilityResult<AtomOutput>>,
-    },
-    RefactorPlan {
-        input: RefactorRequest,
-        reply: oneshot::Sender<CapabilityResult<RefactorPlanHandle>>,
-    },
-    RefactorMaterialize {
+    HostCall {
         id: String,
-        reply: oneshot::Sender<CapabilityResult<serde_json::Value>>,
-    },
-    ToolInvoke {
-        input: ToolInvocation,
-        reply: oneshot::Sender<CapabilityResult<ToolCallOutput>>,
-    },
-    KvSet {
         name: String,
-        value_json: serde_json::Value,
-        tags: Option<serde_json::Value>,
-        reply: oneshot::Sender<CapabilityResult<KvEntryInfo>>,
-    },
-    KvGet {
-        name: String,
-        max_bytes: Option<usize>,
-        reply: oneshot::Sender<CapabilityResult<KvGet>>,
-    },
-    KvPeek {
-        name: String,
-        reply: oneshot::Sender<CapabilityResult<KvEntryInfo>>,
-    },
-    KvDelete {
-        name: String,
-        reply: oneshot::Sender<CapabilityResult<bool>>,
+        input_json: JsonValue,
+        command_tx: std_mpsc::Sender<RuntimeCommand>,
     },
 }
 
 type CapTx = mpsc::UnboundedSender<CapRequest>;
 
-/// Run a capability future on the outer runtime with panic isolation. A
-/// capability that panics must not kill the executor or abort the process: the
-/// inner `tokio::spawn` converts a panic into a clean [`BroError`] that surfaces
-/// as a catchable JS error. This is the outer-runtime complement to the
-/// V8-thread structural guard ([`guard_async`]).
 async fn run_caught<T, F>(fut: F) -> CapabilityResult<T>
 where
     F: Future<Output = CapabilityResult<T>> + Send + 'static,
@@ -529,473 +397,147 @@ where
     }
 }
 
-/// Dispatch one capability request to the matching injected trait impl. Runs on
-/// the outer multi-thread runtime; each call is panic-isolated via [`run_caught`].
 async fn dispatch_cap(caps: Capabilities, req: CapRequest) {
     match req {
-        CapRequest::AtomInvoke { input, reply } => {
-            let cap = caps.atoms.clone();
-            let _ = reply.send(run_caught(async move { cap.invoke_atom(input).await }).await);
-        }
-        CapRequest::RefactorPlan { input, reply } => {
-            let cap = caps.refactor.clone();
-            let _ = reply.send(run_caught(async move { cap.plan_refactor(input).await }).await);
-        }
-        CapRequest::RefactorMaterialize { id, reply } => {
-            let cap = caps.refactor.clone();
-            let _ = reply.send(run_caught(async move { cap.materialize_plan(id).await }).await);
-        }
-        CapRequest::ToolInvoke { input, reply } => match caps.tools.clone() {
-            Some(cap) => {
-                let _ = reply.send(run_caught(async move { cap.call_tool(input).await }).await);
-            }
-            None => {
-                let _ = reply.send(Err(BroError::new(
-                    "host_tools_unavailable",
-                    "host built-in tools are not installed in this runtime (fail-closed)",
-                )));
-            }
-        },
-        CapRequest::KvSet {
-            name,
-            value_json,
-            tags,
-            reply,
-        } => {
-            let cap = caps.kv.clone();
-            let _ =
-                reply.send(run_caught(async move { cap.set(name, value_json, tags).await }).await);
-        }
-        CapRequest::KvGet {
-            name,
-            max_bytes,
-            reply,
-        } => {
-            let cap = caps.kv.clone();
-            let _ = reply.send(run_caught(async move { cap.get(name, max_bytes).await }).await);
-        }
-        CapRequest::KvPeek { name, reply } => {
-            let cap = caps.kv.clone();
-            let _ = reply.send(run_caught(async move { cap.peek(name).await }).await);
-        }
-        CapRequest::KvDelete { name, reply } => {
-            let cap = caps.kv.clone();
-            let _ = reply.send(run_caught(async move { cap.delete(name).await }).await);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Structural panic guard (criterion #5)
-// ---------------------------------------------------------------------------
-//
-// deno_core 0.403 has ZERO op-dispatch `catch_unwind`. Under the workspace's
-// `panic = "unwind"`, an unguarded op panic unwinds across V8's C++ frames =
-// UB / daemon abort. Every op routes its body through ONE of these two guards so
-// no op work executes outside a `catch_unwind` boundary.
-
-/// Guard a synchronous op body. A panic becomes a catchable JS error.
-fn guard_op<T>(body: impl FnOnce() -> Result<T, JsErrorBox>) -> Result<T, JsErrorBox> {
-    match catch_unwind(AssertUnwindSafe(body)) {
-        Ok(result) => result,
-        Err(_panic) => Err(JsErrorBox::generic(
-            "op panicked; contained at the boundary (catch_unwind)",
-        )),
-    }
-}
-
-/// Future wrapper that guards EVERY poll of an async op body with `catch_unwind`.
-/// A panic on any poll — including resumption code that runs on the V8 thread
-/// after an `await` — is caught and the future resolves to a catchable JS error.
-/// This is the async analogue of [`guard_op`]; all capability ops route through
-/// it via [`guard_async`].
-struct Guarded<F> {
-    inner: F,
-}
-
-impl<F, T> Future for Guarded<F>
-where
-    F: Future<Output = Result<T, JsErrorBox>>,
-{
-    type Output = Result<T, JsErrorBox>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: standard pin projection — `inner` is never moved out, and the
-        // wrapper adds no `Unpin`-violating fields.
-        let inner = unsafe { self.map_unchecked_mut(|s| &mut s.inner) };
-        match catch_unwind(AssertUnwindSafe(|| inner.poll(cx))) {
-            Ok(poll) => poll,
-            Err(_panic) => Poll::Ready(Err(JsErrorBox::generic(
-                "op panicked; contained at the boundary (catch_unwind)",
-            ))),
-        }
-    }
-}
-
-/// Wrap an async op body in the structural panic guard.
-fn guard_async<F, T>(inner: F) -> Guarded<F>
-where
-    F: Future<Output = Result<T, JsErrorBox>>,
-{
-    Guarded { inner }
-}
-
-// ---------------------------------------------------------------------------
-// Capability ops + extension
-// ---------------------------------------------------------------------------
-
-/// Forward a typed capability request to the outer-runtime executor and await its
-/// typed reply. The whole body
-/// runs under [`guard_async`] in the caller op, so the synchronous channel work
-/// (and any panic in it) is contained on the V8 thread.
-async fn bridge<O>(
-    tx: CapTx,
-    make: impl FnOnce(oneshot::Sender<CapabilityResult<O>>) -> CapRequest,
-) -> Result<O, JsErrorBox> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(make(reply_tx))
-        .map_err(|_| JsErrorBox::generic("capability executor is gone"))?;
-    reply_rx
-        .await
-        .map_err(|_| JsErrorBox::generic("capability executor dropped the reply"))?
-        .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))
-}
-
-fn serialize_value(value: impl Serialize) -> Result<String, JsErrorBox> {
-    serde_json::to_string(&value)
-        .map_err(|e| JsErrorBox::generic(format!("failed to serialize output: {e}")))
-}
-
-fn serialize_tool_output(out: ToolCallOutput) -> Result<String, JsErrorBox> {
-    if out.content_type == "application/json" {
-        let value: serde_json::Value = serde_json::from_str(&out.content)
-            .map_err(|e| JsErrorBox::generic(format!("tool returned invalid JSON: {e}")))?;
-        serialize_value(value)
-    } else {
-        serialize_value(out.content)
-    }
-}
-
-#[op2]
-#[string]
-fn op_encode_yaml(#[string] value_json: String) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let value: serde_json::Value = serde_json::from_str(&value_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid YAML encode input: {e}")))?;
-        serde_norway::to_string(&value)
-            .map_err(|e| JsErrorBox::generic(format!("failed to encode YAML: {e}")))
-    })
-}
-
-/// Forward a host built-in tool invocation to the outer-runtime executor and
-/// await the typed reply. Unlike [`bridge`], the reply is inspected by the op
-/// (an `is_error` result becomes a catchable JS exception), so this returns the
-/// typed [`ToolCallOutput`] rather than a pre-serialized string.
-async fn bridge_tool(tx: CapTx, input: ToolInvocation) -> Result<ToolCallOutput, JsErrorBox> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    tx.send(CapRequest::ToolInvoke {
-        input,
-        reply: reply_tx,
-    })
-    .map_err(|_| JsErrorBox::generic("capability executor is gone"))?;
-    reply_rx
-        .await
-        .map_err(|_| JsErrorBox::generic("capability executor dropped the reply"))?
-        .map_err(|e| JsErrorBox::generic(format!("{}: {}", e.code, e.message)))
-}
-
-/// Pull the capability executor channel out of `OpState` in one short
-/// borrow, BEFORE any `await`, so no `OpState` borrow is held across a suspend.
-fn cap_tx(state: &Rc<RefCell<OpState>>) -> CapTx {
-    state.borrow().borrow::<CapTx>().clone()
-}
-
-/// `await atoms.invoke(handle, input)` — JSON in, JSON out, over the async bridge.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_atom_invoke(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: AtomInvocation = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid atoms.invoke input: {e}")))?;
-        let output = bridge(tx, move |reply| CapRequest::AtomInvoke { input, reply }).await?;
-        serialize_value(output.output_json)
-    })
-    .await
-}
-
-/// `await refactor.plan(args)` — JSON in, JSON out, over the async bridge.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_refactor_plan(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: RefactorRequest = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid refactor.plan input: {e}")))?;
-        let handle = bridge(tx, move |reply| CapRequest::RefactorPlan { input, reply }).await?;
-        serialize_value(handle)
-    })
-    .await
-}
-
-/// `await refactor.materialize(handle)` — handle id in, JSON plan out.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_refactor_materialize(
-    state: Rc<RefCell<OpState>>,
-    #[string] id: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let plan = bridge(tx, move |reply| CapRequest::RefactorMaterialize {
+        CapRequest::HostCall {
             id,
-            reply,
-        })
-        .await?;
-        serialize_value(plan)
-    })
-    .await
-}
-
-/// `op_tool_invoke(name, input)` — the generic host built-in seam
-/// (`narf-tool-placement.md` §5). Bridges to the injected [`ToolCapability`],
-/// and returns the tool value directly into the cell: JSON content becomes a JS
-/// value, non-JSON content becomes a JS string. A tool that reports `is_error`
-/// surfaces as a catchable JS exception (so a cell can `try/catch`); an unknown / denied /
-/// uninstalled tool fails closed via the capability error.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_tool_invoke(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: ToolInvocation = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid host tool invocation: {e}")))?;
-        let name = input.name.clone();
-        let out = bridge_tool(tx, input).await?;
-        if out.is_error {
-            return Err(JsErrorBox::generic(format!("{name}: {}", out.content)));
+            name,
+            input_json,
+            command_tx,
+        } => {
+            let response = dispatch_host_call(caps, &name, input_json).await;
+            let command = match response {
+                Ok(result) => RuntimeCommand::HostResponse { id, result },
+                Err(error_text) => RuntimeCommand::HostError { id, error_text },
+            };
+            let _ = command_tx.send(command);
         }
-        serialize_tool_output(out)
-    })
-    .await
-}
-
-/// `op_tool_invoke_inline(name, input)` — value-out variant of the seam for
-/// **control-shaped** results (`narf-tool-placement.md` §3.1 — the small
-/// `Promise`/control lane that is by-value, not by-reference). Returns the tool's
-/// content string directly (JS `JSON.parse`s it) instead of ref-wrapping it, so a
-/// promise handle (`{promise_id}`), a `promise_status`/`list`/`cancel` snapshot,
-/// or a `shell.run(mode:'promise')` ticket stays usable in the cell rather than
-/// hiding behind an extra wrapper.
-/// A tool `is_error` still throws; unknown/denied still fails closed.
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_tool_invoke_inline(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: ToolInvocation = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid host tool invocation: {e}")))?;
-        let name = input.name.clone();
-        let out = bridge_tool(tx, input).await?;
-        if out.is_error {
-            return Err(JsErrorBox::generic(format!("{name}: {}", out.content)));
-        }
-        Ok(out.content)
-    })
-    .await
-}
-
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_kv_set(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: KvSetInput = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.set input: {e}")))?;
-        let info = bridge(tx, move |reply| CapRequest::KvSet {
-            name: input.name,
-            value_json: input.value_json,
-            tags: input.tags,
-            reply,
-        })
-        .await?;
-        serialize_value(info)
-    })
-    .await
-}
-
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_kv_get(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: KvGetInput = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.get input: {e}")))?;
-        let out = bridge(tx, move |reply| CapRequest::KvGet {
-            name: input.name,
-            max_bytes: input.max_bytes,
-            reply,
-        })
-        .await?;
-        serialize_value(out.value_json)
-    })
-    .await
-}
-
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_kv_peek(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: KvNameInput = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.peek input: {e}")))?;
-        let info = bridge(tx, move |reply| CapRequest::KvPeek {
-            name: input.name,
-            reply,
-        })
-        .await?;
-        serialize_value(info)
-    })
-    .await
-}
-
-#[op2(async(lazy), fast)]
-#[string]
-async fn op_kv_delete(
-    state: Rc<RefCell<OpState>>,
-    #[string] input_json: String,
-) -> Result<String, JsErrorBox> {
-    guard_async(async move {
-        let tx = cap_tx(&state);
-        let input: KvNameInput = serde_json::from_str(&input_json)
-            .map_err(|e| JsErrorBox::generic(format!("invalid narf.kv.delete input: {e}")))?;
-        let deleted = bridge(tx, move |reply| CapRequest::KvDelete {
-            name: input.name,
-            reply,
-        })
-        .await?;
-        serialize_value(deleted)
-    })
-    .await
-}
-
-/// Store a helper in the host-side session frame and create the default import
-/// alias `name -> name`. Shared host-side logic behind the **model-facing**
-/// `narf_define` tool (via `Job::Define`) — NOT an in-box op: authoring a session
-/// helper is a control, so it lives outside the box (the box-edge invariant,
-/// `narf-capability-library.md` §0.1). The in-box side keeps only
-/// `narf.session.import` (recall by exact name). Validates the name and export
-/// identifiers; helper *syntax* is validated on import/prepare.
-fn define_session_helper(
-    session: &SessionStateCell,
-    input: SessionDefineInput,
-) -> Result<(), String> {
-    if !is_js_identifier(&input.name) {
-        return Err(format!("invalid helper name identifier: {}", input.name));
     }
-    let helper = SessionHelper {
-        source: input.source,
-        exports: input.exports,
+}
+
+async fn dispatch_host_call(
+    caps: Capabilities,
+    name: &str,
+    input_json: JsonValue,
+) -> Result<JsonValue, String> {
+    match name {
+        "atoms.invoke" => {
+            let input: AtomInvocation = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid atoms.invoke input: {e}"))?;
+            let cap = caps.atoms.clone();
+            let output = run_caught(async move { cap.invoke_atom(input).await })
+                .await
+                .map_err(bro_error_text)?;
+            Ok(output.output_json)
+        }
+        "refactor.plan" => {
+            let input: RefactorRequest = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid refactor.plan input: {e}"))?;
+            let cap = caps.refactor.clone();
+            serde_json::to_value(
+                run_caught(async move { cap.plan_refactor(input).await })
+                    .await
+                    .map_err(bro_error_text)?,
+            )
+            .map_err(|e| format!("failed to serialize refactor plan handle: {e}"))
+        }
+        "refactor.materialize" => {
+            let id = input_json
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| {
+                    input_json
+                        .get("id")
+                        .and_then(JsonValue::as_str)
+                        .map(str::to_string)
+                })
+                .ok_or_else(|| "invalid refactor.materialize handle".to_string())?;
+            let cap = caps.refactor.clone();
+            run_caught(async move { cap.materialize_plan(id).await })
+                .await
+                .map_err(bro_error_text)
+        }
+        "tool.invoke" => {
+            let input: ToolInvocation = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid host tool invocation: {e}"))?;
+            tool_result(caps, input, false).await
+        }
+        "tool.invoke_inline" => {
+            let input: ToolInvocation = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid host tool invocation: {e}"))?;
+            tool_result(caps, input, true).await
+        }
+        "kv.set" => {
+            let input: KvSetInput = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid narf.kv.set input: {e}"))?;
+            let cap = caps.kv.clone();
+            serde_json::to_value(
+                run_caught(async move { cap.set(input.name, input.value_json, input.tags).await })
+                    .await
+                    .map_err(bro_error_text)?,
+            )
+            .map_err(|e| format!("failed to serialize kv set output: {e}"))
+        }
+        "kv.get" => {
+            let input: KvGetInput = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid narf.kv.get input: {e}"))?;
+            let cap = caps.kv.clone();
+            let out = run_caught(async move { cap.get(input.name, input.max_bytes).await })
+                .await
+                .map_err(bro_error_text)?;
+            Ok(out.value_json)
+        }
+        "kv.peek" => {
+            let input: KvNameInput = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid narf.kv.peek input: {e}"))?;
+            let cap = caps.kv.clone();
+            serde_json::to_value(
+                run_caught(async move { cap.peek(input.name).await })
+                    .await
+                    .map_err(bro_error_text)?,
+            )
+            .map_err(|e| format!("failed to serialize kv peek output: {e}"))
+        }
+        "kv.delete" => {
+            let input: KvNameInput = serde_json::from_value(input_json)
+                .map_err(|e| format!("invalid narf.kv.delete input: {e}"))?;
+            let cap = caps.kv.clone();
+            serde_json::to_value(
+                run_caught(async move { cap.delete(input.name).await })
+                    .await
+                    .map_err(bro_error_text)?,
+            )
+            .map_err(|e| format!("failed to serialize kv delete output: {e}"))
+        }
+        other => Err(format!("unknown host call `{other}`")),
+    }
+}
+
+async fn tool_result(
+    caps: Capabilities,
+    input: ToolInvocation,
+    inline: bool,
+) -> Result<JsonValue, String> {
+    let name = input.name.clone();
+    let Some(cap) = caps.tools.clone() else {
+        return Err("host built-in tools are not installed in this runtime (fail-closed)".into());
     };
-    helper_expression(&helper)?;
-    let mut session = session.borrow_mut();
-    session
-        .import_aliases
-        .insert(input.name.clone(), input.name.clone());
-    session.helpers.insert(input.name, helper);
-    Ok(())
+    let out = run_caught(async move { cap.call_tool(input).await })
+        .await
+        .map_err(bro_error_text)?;
+    if out.is_error {
+        return Err(format!("{name}: {}", out.content));
+    }
+    if inline || out.content_type == "application/json" {
+        serde_json::from_str(&out.content).map_err(|e| format!("tool returned invalid JSON: {e}"))
+    } else {
+        Ok(JsonValue::String(out.content))
+    }
 }
 
-/// `narf.session.import(name)` support: return a source expression that injects
-/// the helper into the current cell. The expression is evaluated by the JS shim.
-#[op2]
-#[string]
-fn op_session_import(state: &mut OpState, #[string] name: String) -> Result<String, JsErrorBox> {
-    guard_op(|| {
-        let session = state.borrow::<SessionStateCell>().clone();
-        let session = session.borrow();
-        let helper_name = session
-            .import_aliases
-            .get(&name)
-            .or_else(|| session.helpers.contains_key(&name).then_some(&name))
-            .ok_or_else(|| JsErrorBox::generic(format!("unknown import alias: {name}")))?;
-        let helper = session
-            .helpers
-            .get(helper_name)
-            .ok_or_else(|| JsErrorBox::generic(format!("unknown session helper: {helper_name}")))?;
-        helper_expression(helper).map_err(JsErrorBox::generic)
-    })
+fn bro_error_text(e: BroError) -> String {
+    format!("{}: {}", e.code, e.message)
 }
-
-/// Boundary-proof op: a synchronous panic, caught by [`guard_op`]. Proves the
-/// structural guard prevents a V8-frame unwind (criterion #5, sync path).
-#[op2(fast)]
-fn op_panic_guarded() -> Result<(), JsErrorBox> {
-    guard_op(|| panic!("intentional panic inside op handler"))
-}
-
-/// Boundary-proof op: a panic raised AFTER an `await` point, caught by
-/// [`guard_async`]. This exercises the exact guard every capability op uses —
-/// the dangerous case where resumption code panics on the V8 thread mid-poll.
-#[op2(async(lazy), fast)]
-async fn op_panic_guarded_async() -> Result<(), JsErrorBox> {
-    guard_async(async {
-        tokio::task::yield_now().await;
-        panic!("intentional async panic inside op handler");
-    })
-    .await
-}
-
-deno_core::extension!(
-    bro_script_ext,
-    ops = [
-        op_atom_invoke,
-        op_refactor_plan,
-        op_refactor_materialize,
-        op_tool_invoke,
-        op_tool_invoke_inline,
-        op_kv_set,
-        op_kv_get,
-        op_kv_peek,
-        op_kv_delete,
-        op_encode_yaml,
-        op_session_import,
-        op_panic_guarded,
-        op_panic_guarded_async,
-    ],
-    options = { tx: CapTx },
-    state = |state, options| {
-        state.put::<CapTx>(options.tx);
-        state.put::<PreparedScriptsCell>(Rc::new(RefCell::new(PreparedScripts::default())));
-        state.put::<SessionStateCell>(Rc::new(RefCell::new(SessionState::default())));
-        state.put::<TraceStateCell>(Rc::new(RefCell::new(Vec::new())));
-    },
-);
-
-// ---------------------------------------------------------------------------
-// ScriptRuntime
-// ---------------------------------------------------------------------------
 
 enum Job {
     Execute {
@@ -1003,7 +545,7 @@ enum Job {
         reply: oneshot::Sender<Result<String>>,
     },
     Prepare {
-        input_json: serde_json::Value,
+        input_json: JsonValue,
         reply: oneshot::Sender<Result<PrepareResponse>>,
     },
     Run {
@@ -1017,11 +559,11 @@ enum Job {
     CallCell {
         source: String,
         contract: CellContract,
-        input_json: serde_json::Value,
+        input_json: JsonValue,
         reply: oneshot::Sender<Result<String>>,
     },
     Define {
-        input_json: serde_json::Value,
+        input_json: JsonValue,
         reply: oneshot::Sender<Result<()>>,
     },
     TraceLen {
@@ -1030,51 +572,50 @@ enum Job {
     Shutdown,
 }
 
-/// Owns a deno_core `JsRuntime` on a dedicated OS thread and exposes an async,
-/// channel-based API callable from tokio code. Supervision (heap + timeout) is
-/// configured via [`SupervisionPolicy`] and is default-ON.
+enum RuntimeCommand {
+    HostResponse { id: String, result: JsonValue },
+    HostError { id: String, error_text: String },
+    Terminate,
+}
+
+struct RuntimeState {
+    cap_tx: CapTx,
+    command_tx: std_mpsc::Sender<RuntimeCommand>,
+    pending_host_calls: HashMap<String, v8::Global<v8::PromiseResolver>>,
+    prepared: PreparedScriptsCell,
+    session: SessionStateCell,
+    trace: TraceStateCell,
+    next_host_call_id: u64,
+}
+
 pub struct ScriptRuntime {
     job_tx: mpsc::UnboundedSender<Job>,
+    runtime_tx: std_mpsc::Sender<RuntimeCommand>,
     isolate_handle: v8::IsolateHandle,
     heap_oom: Arc<AtomicBool>,
     execution_timeout: Option<Duration>,
     thread: Option<JoinHandle<()>>,
 }
 
-/// Bootstrap script run once per isolate: deny ambient host globals and install
-/// the capability shims that front the capability ops. `delete` is per-isolate
-/// (unlike process-wide V8 flags), so each isolate hardens itself. `Deno.core`
-/// is kept — it is the op transport, not an ambient host capability. Each shim
-/// is JSON-in/JSON-out and parses the op's JSON reply back into a JS value.
 const BOOTSTRAP: &str = r#"
     delete globalThis.WebAssembly;
     delete globalThis.SharedArrayBuffer;
     delete globalThis.Atomics;
     delete globalThis.console;
+    const hostCall = globalThis.__bb_host_call;
+    const hostTool = (name, input) =>
+        hostCall('tool.invoke', { name, input_json: input ?? {} });
+    const hostToolInline = (name, input) =>
+        hostCall('tool.invoke_inline', { name, input_json: input ?? {} });
     globalThis.atoms = {
-        invoke: async (handle, input) =>
-            JSON.parse(await Deno.core.ops.op_atom_invoke(
-                JSON.stringify({ atom: handle, input_json: input ?? null }))),
+        invoke: (handle, input) =>
+            hostCall('atoms.invoke', { atom: handle, input_json: input ?? null }),
     };
     globalThis.refactor = {
-        plan: async (args) =>
-            JSON.parse(await Deno.core.ops.op_refactor_plan(JSON.stringify(args))),
-        materialize: async (handle) =>
-            JSON.parse(await Deno.core.ops.op_refactor_materialize(
-                typeof handle === 'string' ? handle : handle.id)),
+        plan: (args) => hostCall('refactor.plan', args ?? {}),
+        materialize: (handle) =>
+            hostCall('refactor.materialize', typeof handle === 'string' ? handle : handle.id),
     };
-    // §5 host built-in tool parity: each binding rides the single op_tool_invoke
-    // seam, returns a value directly into the cell, and throws on tool error.
-    // Selection-from-result is interpretive and must round-trip the model —
-    // these are for mechanical complete-set composition, not enumerate-then-pick.
-    const hostTool = async (name, input) =>
-        JSON.parse(await Deno.core.ops.op_tool_invoke(
-            JSON.stringify({ name, input_json: input ?? {} })));
-    // Value-out variant for control-shaped results (promise handles/snapshots):
-    // small metadata stays usable in the cell rather than hiding behind a ref.
-    const hostToolInline = async (name, input) =>
-        JSON.parse(await Deno.core.ops.op_tool_invoke_inline(
-            JSON.stringify({ name, input_json: input ?? {} })));
     globalThis.fs = {
         read:      (a) => hostTool('file_read',  typeof a === 'string' ? { file_path: a } : a),
         smartRead: (a) => hostTool('smart_read', typeof a === 'string' ? { file_path: a } : a),
@@ -1127,45 +668,32 @@ const BOOTSTRAP: &str = r#"
         ownKeys: () => [],
         getOwnPropertyDescriptor: () => undefined,
     });
-    // §5 in-box promise primitive (narf-tool-placement.md §2/§5): join a cell's
-    // OWN same-dispatch promises over the shared PromiseStore. Handles are the
-    // by-value {promise_id} tickets producers return (e.g. shell.run mode:promise).
     const promiseId = (h) =>
         (typeof h === 'string' ? h : (h && (h.promise_id ?? (h.detail && h.detail.promise_id))));
     globalThis.narf = {
         kv: {
-            set: async (name, value, options) =>
-                JSON.parse(await Deno.core.ops.op_kv_set(
-                    JSON.stringify({
-                        name,
-                        value_json: value ?? null,
-                        tags: options && options.tags !== undefined ? options.tags : null,
-                    }))),
-            get: async (name, maxBytes) =>
-                JSON.parse(await Deno.core.ops.op_kv_get(
-                    JSON.stringify({
-                        name,
-                        max_bytes: (maxBytes === undefined || maxBytes === null) ? null : maxBytes,
-                    }))),
-            peek: async (name) =>
-                JSON.parse(await Deno.core.ops.op_kv_peek(JSON.stringify({ name }))),
-            delete: async (name) =>
-                JSON.parse(await Deno.core.ops.op_kv_delete(JSON.stringify({ name }))),
+            set: (name, value, options) =>
+                hostCall('kv.set', {
+                    name,
+                    value_json: value ?? null,
+                    tags: options && options.tags !== undefined ? options.tags : null,
+                }),
+            get: (name, maxBytes) =>
+                hostCall('kv.get', {
+                    name,
+                    max_bytes: (maxBytes === undefined || maxBytes === null) ? null : maxBytes,
+                }),
+            peek: (name) => hostCall('kv.peek', { name }),
+            delete: (name) => hostCall('kv.delete', { name }),
         },
         session: {
-            // §2.2 in-box EXCEPTION: recall a cached helper by exact name — a
-            // dereference (keeps the helper source host-side, out of context),
-            // NOT a control. `define`/`prepare`/`run` are MODEL-FACING tools
-            // (narf_define/narf_prepare/narf_run): the box must not hold the
-            // controls that open or author it (the box-edge invariant, §0.1).
             import: (name) => {
-                const expr = Deno.core.ops.op_session_import(name);
+                const expr = globalThis.__bb_session_import(name);
                 return (0, eval)(expr);
             },
         },
     };
-    const yaml = (value) =>
-        Deno.core.ops.op_encode_yaml(JSON.stringify(value ?? null));
+    const yaml = (value) => globalThis.__bb_encode_yaml(value ?? null);
     const yamlForFrontmatter = (value) => {
         const y = yaml(value);
         return y.endsWith('\n') ? y : y + '\n';
@@ -1199,8 +727,6 @@ const BOOTSTRAP: &str = r#"
             ].join('\n');
         },
     };
-    // §5 promise join: all/any/wait return producer values; status/list/cancel
-    // are small control snapshots.
     globalThis.narf.promise = {
         all:    (handles, timeoutMs) => hostTool('promise_when_all',
                     { promise_ids: (handles ?? []).map(promiseId), timeout_ms: timeoutMs }),
@@ -1211,24 +737,21 @@ const BOOTSTRAP: &str = r#"
         status: (handle) => hostToolInline('promise_status', { promise_id: promiseId(handle) }),
         list:   () => hostToolInline('promise_list', {}),
         cancel: (handle) => hostToolInline('promise_cancel', { promise_id: promiseId(handle) }),
-        // Pure-JS no-barrier staging: each item flows through ALL stages
-        // independently (wall-clock = slowest single chain, not sum-of-stages).
-        // A stage may be sync or async; each returned value passes to the next.
         pipeline: (items, ...stages) => Promise.all(
             (items ?? []).map((item) =>
                 stages.reduce((acc, stage) => acc.then(stage), Promise.resolve(item)))),
     };
+    globalThis.__bb_test = {
+        panicGuarded: () => globalThis.__bb_panic_guarded(),
+        panicGuardedAsync: () => hostCall('__bb_test.panic_async', {}),
+    };
 "#;
 
 impl ScriptRuntime {
-    /// Spawn the dedicated V8 thread and the capability executor, injecting the
-    /// real capability impls and the supervision policy.
     pub async fn new(caps: Capabilities, policy: SupervisionPolicy) -> Result<Self> {
-        let (cap_tx, mut cap_rx) = mpsc::unbounded_channel::<CapRequest>();
+        initialize_v8().map_err(|e| anyhow!(e))?;
 
-        // Capability executor: runs on the OUTER (multi-thread) tokio runtime.
-        // One task per request so a slow or panicking capability cannot stall or
-        // poison the executor loop.
+        let (cap_tx, mut cap_rx) = mpsc::unbounded_channel::<CapRequest>();
         tokio::spawn(async move {
             while let Some(req) = cap_rx.recv().await {
                 let caps = caps.clone();
@@ -1239,9 +762,13 @@ impl ScriptRuntime {
         });
 
         let (job_tx, job_rx) = mpsc::unbounded_channel::<Job>();
-        let (setup_tx, setup_rx) =
-            oneshot::channel::<Result<(v8::IsolateHandle, Arc<AtomicBool>)>>();
-
+        let (setup_tx, setup_rx) = oneshot::channel::<
+            Result<(
+                v8::IsolateHandle,
+                Arc<AtomicBool>,
+                std_mpsc::Sender<RuntimeCommand>,
+            )>,
+        >();
         let heap_limit_bytes = policy.heap_limit_bytes;
         let thread = std::thread::Builder::new()
             .name("bro-script-v8".to_string())
@@ -1249,12 +776,13 @@ impl ScriptRuntime {
                 v8_thread_main(cap_tx, job_rx, setup_tx, heap_limit_bytes);
             })?;
 
-        let (isolate_handle, heap_oom) = setup_rx
+        let (isolate_handle, heap_oom, runtime_tx) = setup_rx
             .await
             .map_err(|_| anyhow!("V8 thread exited before setup"))??;
 
         Ok(Self {
             job_tx,
+            runtime_tx,
             isolate_handle,
             heap_oom,
             execution_timeout: policy.execution_timeout,
@@ -1262,56 +790,23 @@ impl ScriptRuntime {
         })
     }
 
-    /// Cross-thread isolate handle for external watchdog termination (criterion
-    /// #2). The built-in execution-timeout supervisor uses this same handle.
     pub fn isolate_handle(&self) -> v8::IsolateHandle {
         self.isolate_handle.clone()
     }
 
-    /// True if the near-heap-limit callback fired (OOM containment, criterion #1).
     pub fn hit_heap_oom(&self) -> bool {
         self.heap_oom.load(Ordering::SeqCst)
     }
 
-    /// Execute a script body. The body is wrapped in an async IIFE, so it may use
-    /// `await` and should `return` its result; the resolved value is serialized
-    /// to a JSON string.
-    ///
-    /// If the policy sets an execution timeout, a script that overruns it is
-    /// auto-terminated via the cross-thread `IsolateHandle` and a timeout error
-    /// is returned; the runtime survives and stays reusable.
     pub async fn execute(&self, body: impl Into<String>) -> Result<String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.job_tx
-            .send(Job::Execute {
-                body: body.into(),
-                reply: reply_tx,
-            })
-            .map_err(|_| anyhow!("V8 thread is gone"))?;
-
-        match self.execution_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
-                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
-                Err(_elapsed) => {
-                    // Cross-thread kill of the runaway job. The V8 thread clears
-                    // the terminate state before/after each job, so the runtime
-                    // stays reusable for the next `execute`.
-                    self.isolate_handle.terminate_execution();
-                    Err(anyhow!("script execution timed out after {timeout:?}"))
-                }
-            },
-            None => reply_rx
-                .await
-                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
-        }
+        self.execute_job(|reply| Job::Execute {
+            body: body.into(),
+            reply,
+        })
+        .await
     }
 
-    /// Render + syntax-validate + store a prepared script, returning a handle and
-    /// the **rendered source** for the model to review (the §0.1 review step).
-    /// `input_json` is `{ source, imports? }` — `imports` resolves session helpers
-    /// (defined via [`ScriptRuntime::define`]) into the assembled script. Backs the
-    /// model-facing `narf_prepare` tool; never an in-box binding.
-    pub async fn prepare(&self, input_json: serde_json::Value) -> Result<PrepareResponse> {
+    pub async fn prepare(&self, input_json: JsonValue) -> Result<PrepareResponse> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.job_tx
             .send(Job::Prepare {
@@ -1324,11 +819,7 @@ impl ScriptRuntime {
             .map_err(|_| anyhow!("V8 thread dropped the reply"))?
     }
 
-    /// Register a session helper (`{ name, source, exports }`) in the host-side
-    /// session frame so a later in-box `narf.session.import(name)` can recall it.
-    /// Backs the model-facing `narf_define` tool (authoring is a control → outside
-    /// the box, §0.1).
-    pub async fn define(&self, input_json: serde_json::Value) -> Result<()> {
+    pub async fn define(&self, input_json: JsonValue) -> Result<()> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.job_tx
             .send(Job::Define {
@@ -1342,26 +833,11 @@ impl ScriptRuntime {
     }
 
     pub async fn run(&self, handle: impl Into<String>) -> Result<String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.job_tx
-            .send(Job::Run {
-                handle: handle.into(),
-                reply: reply_tx,
-            })
-            .map_err(|_| anyhow!("V8 thread is gone"))?;
-
-        match self.execution_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
-                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
-                Err(_elapsed) => {
-                    self.isolate_handle.terminate_execution();
-                    Err(anyhow!("script execution timed out after {timeout:?}"))
-                }
-            },
-            None => reply_rx
-                .await
-                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
-        }
+        self.execute_job(|reply| Job::Run {
+            handle: handle.into(),
+            reply,
+        })
+        .await
     }
 
     pub async fn prepared(&self, handle: impl Into<String>) -> Result<PreparedCell> {
@@ -1381,30 +857,15 @@ impl ScriptRuntime {
         &self,
         source: String,
         contract: CellContract,
-        input_json: serde_json::Value,
+        input_json: JsonValue,
     ) -> Result<String> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.job_tx
-            .send(Job::CallCell {
-                source,
-                contract,
-                input_json,
-                reply: reply_tx,
-            })
-            .map_err(|_| anyhow!("V8 thread is gone"))?;
-
-        match self.execution_timeout {
-            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
-                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
-                Err(_elapsed) => {
-                    self.isolate_handle.terminate_execution();
-                    Err(anyhow!("script execution timed out after {timeout:?}"))
-                }
-            },
-            None => reply_rx
-                .await
-                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
-        }
+        self.execute_job(|reply| Job::CallCell {
+            source,
+            contract,
+            input_json,
+            reply,
+        })
+        .await
     }
 
     pub async fn trace_len(&self) -> Result<usize> {
@@ -1416,182 +877,540 @@ impl ScriptRuntime {
             .await
             .map_err(|_| anyhow!("V8 thread dropped the reply"))
     }
+
+    async fn execute_job(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<String>>) -> Job,
+    ) -> Result<String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(make(reply_tx))
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+
+        match self.execution_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
+                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+                Err(_elapsed) => {
+                    let _ = self.runtime_tx.send(RuntimeCommand::Terminate);
+                    self.isolate_handle.terminate_execution();
+                    Err(anyhow!("script execution timed out after {timeout:?}"))
+                }
+            },
+            None => reply_rx
+                .await
+                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+        }
+    }
 }
 
 impl Drop for ScriptRuntime {
     fn drop(&mut self) {
         let _ = self.job_tx.send(Job::Shutdown);
-        // Nudge the isolate in case it is mid-execution.
+        let _ = self.runtime_tx.send(RuntimeCommand::Terminate);
         self.isolate_handle.terminate_execution();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
         }
+    }
+}
+
+fn initialize_v8() -> Result<(), String> {
+    static PLATFORM: OnceLock<Result<v8::SharedRef<v8::Platform>, String>> = OnceLock::new();
+    match PLATFORM.get_or_init(|| {
+        v8::icu::set_common_data_77(deno_core_icudata::ICU_DATA)
+            .map_err(|code| format!("failed to initialize ICU data: {code}"))?;
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform.clone());
+        v8::V8::initialize();
+        Ok(platform)
+    }) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(e.clone()),
     }
 }
 
 fn v8_thread_main(
     cap_tx: CapTx,
     mut job_rx: mpsc::UnboundedReceiver<Job>,
-    setup_tx: oneshot::Sender<Result<(v8::IsolateHandle, Arc<AtomicBool>)>>,
+    setup_tx: oneshot::Sender<
+        Result<(
+            v8::IsolateHandle,
+            Arc<AtomicBool>,
+            std_mpsc::Sender<RuntimeCommand>,
+        )>,
+    >,
     heap_limit_bytes: usize,
 ) {
-    // V8's platform is process-global; `JsRuntime::new` initializes it through an
-    // internal `Once`, so concurrent first-construction across threads is safe.
     let create_params = v8::CreateParams::default().heap_limits(0, heap_limit_bytes);
-    let mut runtime = deno_core::JsRuntime::new(RuntimeOptions {
-        create_params: Some(create_params),
-        extensions: vec![bro_script_ext::init(cap_tx)],
-        ..Default::default()
+    let isolate = &mut v8::Isolate::new(create_params);
+    let isolate_handle = isolate.thread_safe_handle();
+    let heap_oom = Arc::new(AtomicBool::new(false));
+    let heap_state = Box::leak(Box::new(HeapLimitState {
+        flag: heap_oom.clone(),
+        handle: isolate_handle.clone(),
+    }));
+    isolate.add_near_heap_limit_callback(
+        near_heap_limit_callback,
+        heap_state as *mut HeapLimitState as *mut c_void,
+    );
+
+    let (command_tx, command_rx) = std_mpsc::channel::<RuntimeCommand>();
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    scope.set_slot(RuntimeState {
+        cap_tx,
+        command_tx: command_tx.clone(),
+        pending_host_calls: HashMap::new(),
+        prepared: Rc::new(RefCell::new(PreparedScripts::default())),
+        session: Rc::new(RefCell::new(SessionState::default())),
+        trace: Rc::new(RefCell::new(Vec::new())),
+        next_host_call_id: 1,
     });
 
-    let isolate_handle = runtime.v8_isolate().thread_safe_handle();
-    let heap_oom = Arc::new(AtomicBool::new(false));
-
-    // Near-heap-limit callback: flag + terminate, then hand V8 extra headroom so
-    // it can unwind to us instead of calling abort(). Criterion #1.
+    if let Err(e) = install_globals(scope).and_then(|_| execute_script_no_result(scope, BOOTSTRAP))
     {
-        let flag = heap_oom.clone();
-        let handle = isolate_handle.clone();
-        runtime.add_near_heap_limit_callback(move |current, _initial| {
-            flag.store(true, Ordering::SeqCst);
-            handle.terminate_execution();
-            // Double the limit so V8 has room to propagate the termination.
-            current * 2
-        });
+        let _ = setup_tx.send(Err(anyhow!("bootstrap failed: {e}")));
+        return;
     }
 
-    // Current-thread runtime + LocalSet to drive the (non-Send) event loop.
-    let rt = match tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
+    if setup_tx
+        .send(Ok((isolate_handle, heap_oom, command_tx.clone())))
+        .is_err()
     {
-        Ok(rt) => rt,
-        Err(e) => {
-            let _ = setup_tx.send(Err(anyhow!("failed to build V8-thread runtime: {e}")));
-            return;
-        }
-    };
-    let local = tokio::task::LocalSet::new();
+        return;
+    }
 
-    let run = local.run_until(async move {
-        // Deny ambient globals + install the capability shims before any user
-        // script.
-        if let Err(e) = runtime.execute_script("<bro-script:bootstrap>", BOOTSTRAP) {
-            let _ = setup_tx.send(Err(anyhow!("bootstrap failed: {e}")));
-            return;
-        }
-        if setup_tx.send(Ok((isolate_handle, heap_oom))).is_err() {
-            return; // constructor went away
-        }
-
-        while let Some(job) = job_rx.recv().await {
-            match job {
-                Job::Shutdown => break,
-                Job::Execute { body, reply } => {
-                    // Clear any stale termination left by a prior timed-out job
-                    // BEFORE running so the next job starts on a clean isolate
-                    // (closes the timeout/finish race).
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let result = run_one(&mut runtime, &body).await;
-                    // And clear again AFTER so the isolate is reusable for the
-                    // next job (the runtime-reusable finding from the spike).
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let _ = reply.send(result);
-                }
-                Job::Prepare { input_json, reply } => {
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let result = prepare_one(&mut runtime, input_json);
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let _ = reply.send(result);
-                }
-                Job::Run { handle, reply } => {
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let result = run_prepared(&mut runtime, &handle).await;
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let _ = reply.send(result);
-                }
-                Job::Prepared { handle, reply } => {
-                    let result = get_prepared(&mut runtime, &handle);
-                    let _ = reply.send(result);
-                }
-                Job::CallCell {
-                    source,
-                    contract,
-                    input_json,
-                    reply,
-                } => {
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let result = call_cell(&mut runtime, &source, &contract, input_json).await;
-                    runtime.v8_isolate().cancel_terminate_execution();
-                    let _ = reply.send(result);
-                }
-                Job::Define { input_json, reply } => {
-                    let result = define_one(&mut runtime, input_json);
-                    let _ = reply.send(result);
-                }
-                Job::TraceLen { reply } => {
-                    let trace = {
-                        let op_state = runtime.op_state();
-                        let state = op_state.borrow();
-                        let trace = state.borrow::<TraceStateCell>().clone();
-                        let len = trace.borrow().len();
-                        len
-                    };
-                    let _ = reply.send(trace);
-                }
+    while let Some(job) = job_rx.blocking_recv() {
+        match job {
+            Job::Shutdown => break,
+            Job::Execute { body, reply } => {
+                scope.cancel_terminate_execution();
+                drain_runtime_commands(&command_rx);
+                let result = run_one(scope, &command_rx, &body);
+                scope.cancel_terminate_execution();
+                let _ = reply.send(result);
+            }
+            Job::Prepare { input_json, reply } => {
+                scope.cancel_terminate_execution();
+                let result = prepare_one(scope, input_json);
+                scope.cancel_terminate_execution();
+                let _ = reply.send(result);
+            }
+            Job::Run { handle, reply } => {
+                scope.cancel_terminate_execution();
+                drain_runtime_commands(&command_rx);
+                let result = run_prepared(scope, &command_rx, &handle);
+                scope.cancel_terminate_execution();
+                let _ = reply.send(result);
+            }
+            Job::Prepared { handle, reply } => {
+                let result = get_prepared(scope, &handle);
+                let _ = reply.send(result);
+            }
+            Job::CallCell {
+                source,
+                contract,
+                input_json,
+                reply,
+            } => {
+                scope.cancel_terminate_execution();
+                drain_runtime_commands(&command_rx);
+                let result = call_cell(scope, &command_rx, &source, &contract, input_json);
+                scope.cancel_terminate_execution();
+                let _ = reply.send(result);
+            }
+            Job::Define { input_json, reply } => {
+                let result = define_one(scope, input_json);
+                let _ = reply.send(result);
+            }
+            Job::TraceLen { reply } => {
+                let len = scope
+                    .get_slot::<RuntimeState>()
+                    .map(|state| state.trace.borrow().len())
+                    .unwrap_or_default();
+                let _ = reply.send(len);
             }
         }
-    });
-
-    rt.block_on(run);
+    }
 }
 
-async fn run_one(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<String> {
+macro_rules! install_fn {
+    ($scope:expr, $global:expr, $name:expr, $callback:expr) => {{
+        let key = v8::String::new($scope, $name)
+            .ok_or_else(|| format!("failed to allocate {}", $name))?;
+        let template = v8::FunctionTemplate::new($scope, $callback);
+        let function = template
+            .get_function($scope)
+            .ok_or_else(|| format!("failed to create {}", $name))?;
+        $global.set($scope, key.into(), function.into());
+        Ok::<(), String>(())
+    }};
+}
+
+macro_rules! exception_text {
+    ($tc:expr) => {{
+        $tc.exception()
+            .map(|exception| value_to_error_text(&mut $tc, exception))
+            .unwrap_or_else(|| "unknown JavaScript exception".to_string())
+    }};
+}
+
+fn install_globals(scope: &mut v8::PinScope<'_, '_>) -> Result<(), String> {
+    let global = scope.get_current_context().global(scope);
+    install_fn!(scope, global, "__bb_host_call", host_call_callback)?;
+    install_fn!(scope, global, "__bb_encode_yaml", encode_yaml_callback)?;
+    install_fn!(
+        scope,
+        global,
+        "__bb_session_import",
+        session_import_callback
+    )?;
+    install_fn!(scope, global, "__bb_panic_guarded", panic_guarded_callback)?;
+    Ok(())
+}
+
+struct HeapLimitState {
+    flag: Arc<AtomicBool>,
+    handle: v8::IsolateHandle,
+}
+
+unsafe extern "C" fn near_heap_limit_callback(
+    data: *mut c_void,
+    current_heap_limit: usize,
+    _initial_heap_limit: usize,
+) -> usize {
+    let state = unsafe { &*(data as *const HeapLimitState) };
+    state.flag.store(true, Ordering::SeqCst);
+    state.handle.terminate_execution();
+    current_heap_limit.saturating_mul(2)
+}
+
+fn host_call_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let name = args
+            .get(0)
+            .to_string(scope)
+            .ok_or_else(|| "host call name must be a string".to_string())?
+            .to_rust_string_lossy(scope);
+        if name == "__bb_test.panic_async" {
+            return Err("host call panicked; contained at the boundary (catch_unwind)".to_string());
+        }
+        let input_json = if args.length() < 2 {
+            JsonValue::Null
+        } else {
+            v8_value_to_json(scope, args.get(1))?
+        };
+        let resolver = v8::PromiseResolver::new(scope)
+            .ok_or_else(|| "failed to create host-call promise".to_string())?;
+        let promise = resolver.get_promise(scope);
+        let resolver = v8::Global::new(scope, resolver);
+
+        let state = scope
+            .get_slot_mut::<RuntimeState>()
+            .ok_or_else(|| "runtime state unavailable".to_string())?;
+        let id = format!("host-{}", state.next_host_call_id);
+        state.next_host_call_id = state.next_host_call_id.saturating_add(1);
+        state.pending_host_calls.insert(id.clone(), resolver);
+        state
+            .cap_tx
+            .send(CapRequest::HostCall {
+                id,
+                name,
+                input_json,
+                command_tx: state.command_tx.clone(),
+            })
+            .map_err(|_| "capability executor is gone".to_string())?;
+        Ok::<_, String>(promise)
+    }));
+
+    match result {
+        Ok(Ok(promise)) => retval.set(promise.into()),
+        Ok(Err(e)) => throw_error(scope, &e),
+        Err(_) => throw_error(
+            scope,
+            "callback panicked; contained at the boundary (catch_unwind)",
+        ),
+    }
+}
+
+fn encode_yaml_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let value = if args.length() == 0 {
+            JsonValue::Null
+        } else {
+            v8_value_to_json(scope, args.get(0))?
+        };
+        serde_norway::to_string(&value).map_err(|e| format!("failed to encode YAML: {e}"))
+    }));
+    match result {
+        Ok(Ok(yaml)) => {
+            if let Some(value) = v8::String::new(scope, &yaml) {
+                retval.set(value.into());
+            } else {
+                throw_error(scope, "failed to allocate YAML output");
+            }
+        }
+        Ok(Err(e)) => throw_error(scope, &e),
+        Err(_) => throw_error(
+            scope,
+            "callback panicked; contained at the boundary (catch_unwind)",
+        ),
+    }
+}
+
+fn session_import_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments,
+    mut retval: v8::ReturnValue<v8::Value>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let name = args
+            .get(0)
+            .to_string(scope)
+            .ok_or_else(|| "session import name must be a string".to_string())?
+            .to_rust_string_lossy(scope);
+        let state = scope
+            .get_slot::<RuntimeState>()
+            .ok_or_else(|| "runtime state unavailable".to_string())?;
+        let session = state.session.borrow();
+        let helper_name = session
+            .import_aliases
+            .get(&name)
+            .or_else(|| session.helpers.contains_key(&name).then_some(&name))
+            .ok_or_else(|| format!("unknown import alias: {name}"))?;
+        let helper = session
+            .helpers
+            .get(helper_name)
+            .ok_or_else(|| format!("unknown session helper: {helper_name}"))?;
+        helper_expression(helper)
+    }));
+    match result {
+        Ok(Ok(expr)) => {
+            if let Some(value) = v8::String::new(scope, &expr) {
+                retval.set(value.into());
+            } else {
+                throw_error(scope, "failed to allocate session import output");
+            }
+        }
+        Ok(Err(e)) => throw_error(scope, &e),
+        Err(_) => throw_error(
+            scope,
+            "callback panicked; contained at the boundary (catch_unwind)",
+        ),
+    }
+}
+
+fn panic_guarded_callback(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments,
+    _retval: v8::ReturnValue<v8::Value>,
+) {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        panic!("intentional panic inside host callback");
+    }));
+    if result.is_err() {
+        throw_error(
+            scope,
+            "host callback panicked; contained at the boundary (catch_unwind)",
+        );
+    }
+}
+
+fn throw_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
+    let Some(message) = v8::String::new(scope, message) else {
+        return;
+    };
+    let exception = v8::Exception::error(scope, message);
+    scope.throw_exception(exception);
+}
+
+fn execute_script_no_result(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Result<(), String> {
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let source =
+        v8::String::new(&tc, source).ok_or_else(|| "failed to allocate source".to_string())?;
+    let script = match v8::Script::compile(&tc, source, None) {
+        Some(script) => script,
+        None => return Err(exception_text!(tc)),
+    };
+    if script.run(&tc).is_none() {
+        return Err(exception_text!(tc));
+    }
+    Ok(())
+}
+
+fn run_one(
+    scope: &mut v8::PinScope<'_, '_>,
+    command_rx: &std_mpsc::Receiver<RuntimeCommand>,
+    body: &str,
+) -> Result<String> {
     let wrapped = format!("(async () => {{ {body} }})()");
-    run_wrapped(runtime, &wrapped).await
+    run_wrapped(scope, command_rx, &wrapped)
 }
 
-async fn run_wrapped(runtime: &mut deno_core::JsRuntime, wrapped: &str) -> Result<String> {
-    let promise = runtime
-        .execute_script("<bro-script>", wrapped.to_string())
-        .map_err(|e| anyhow!("{e}"))?;
-
-    // Drive the event loop while resolving the IIFE promise — this is what lets
-    // a pending async op (the capability bridge) make progress. `resolve` returns
-    // a future that does not borrow the runtime; box-pin it for the `Unpin`
-    // bound `with_event_loop_promise` requires.
-    let resolve = Box::pin(runtime.resolve(promise));
-    let global = runtime
-        .with_event_loop_promise(resolve, PollEventLoopOptions::default())
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-
-    deno_core::scope!(scope, runtime);
-    let local = v8::Local::new(scope, global);
-    let value: serde_json::Value = deno_core::serde_v8::from_v8(scope, local)
-        .map_err(|e| anyhow!("failed to deserialize result: {e}"))?;
-    Ok(value.to_string())
+fn drain_runtime_commands(command_rx: &std_mpsc::Receiver<RuntimeCommand>) {
+    while command_rx.try_recv().is_ok() {}
 }
 
-async fn call_cell(
-    runtime: &mut deno_core::JsRuntime,
+fn run_wrapped(
+    scope: &mut v8::PinScope<'_, '_>,
+    command_rx: &std_mpsc::Receiver<RuntimeCommand>,
+    wrapped: &str,
+) -> Result<String> {
+    enum InitialResult {
+        Promise(v8::Global<v8::Promise>),
+        Value(String),
+    }
+
+    let initial = {
+        let tc = std::pin::pin!(v8::TryCatch::new(scope));
+        let mut tc = tc.init();
+        let source =
+            v8::String::new(&tc, wrapped).ok_or_else(|| anyhow!("failed to allocate source"))?;
+        let script = match v8::Script::compile(&tc, source, None) {
+            Some(script) => script,
+            None => return Err(anyhow!(exception_text!(tc))),
+        };
+        let result = match script.run(&tc) {
+            Some(result) => result,
+            None => return Err(anyhow!(exception_text!(tc))),
+        };
+        tc.perform_microtask_checkpoint();
+
+        if result.is_promise() {
+            let promise = v8::Local::<v8::Promise>::try_from(result)
+                .map_err(|_| anyhow!("failed to read script promise"))?;
+            InitialResult::Promise(v8::Global::new(&tc, promise))
+        } else {
+            let value = v8_value_to_json(&mut tc, result).map_err(|e| anyhow!(e))?;
+            InitialResult::Value(value.to_string())
+        }
+    };
+
+    match initial {
+        InitialResult::Value(value) => Ok(value),
+        InitialResult::Promise(promise) => {
+            drive_promise(scope, command_rx, &promise)?;
+            let local = v8::Local::new(scope, &promise);
+            promise_to_json_string(scope, local)
+        }
+    }
+}
+
+fn drive_promise(
+    scope: &mut v8::PinScope<'_, '_>,
+    command_rx: &std_mpsc::Receiver<RuntimeCommand>,
+    promise: &v8::Global<v8::Promise>,
+) -> Result<()> {
+    loop {
+        let local = v8::Local::new(scope, promise);
+        match local.state() {
+            v8::PromiseState::Pending => {}
+            v8::PromiseState::Fulfilled => return Ok(()),
+            v8::PromiseState::Rejected => {
+                let result = local.result(scope);
+                return Err(anyhow!(value_to_error_text(scope, result)));
+            }
+        }
+
+        match command_rx.recv() {
+            Ok(RuntimeCommand::HostResponse { id, result }) => {
+                resolve_host_call(scope, &id, Ok(result)).map_err(|e| anyhow!(e))?;
+            }
+            Ok(RuntimeCommand::HostError { id, error_text }) => {
+                resolve_host_call(scope, &id, Err(error_text)).map_err(|e| anyhow!(e))?;
+            }
+            Ok(RuntimeCommand::Terminate) | Err(_) => {
+                return Err(anyhow!("script execution terminated"));
+            }
+        }
+        scope.perform_microtask_checkpoint();
+    }
+}
+
+fn resolve_host_call(
+    scope: &mut v8::PinScope<'_, '_>,
+    id: &str,
+    response: Result<JsonValue, String>,
+) -> Result<(), String> {
+    let Some(resolver) = ({
+        let state = scope
+            .get_slot_mut::<RuntimeState>()
+            .ok_or_else(|| "runtime state unavailable".to_string())?;
+        state.pending_host_calls.remove(id)
+    }) else {
+        // A timed-out activation may leave late host responses in the runtime
+        // command queue. Ignore them so a later activation is not poisoned by an
+        // already-abandoned host-call id.
+        return Ok(());
+    };
+
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let resolver = v8::Local::new(&tc, &resolver);
+    match response {
+        Ok(value) => {
+            let value = json_to_v8(&mut tc, &value)
+                .ok_or_else(|| "failed to serialize host response".to_string())?;
+            resolver.resolve(&tc, value);
+        }
+        Err(error_text) => {
+            let value = v8::String::new(&tc, &error_text)
+                .ok_or_else(|| "failed to allocate host error".to_string())?;
+            resolver.reject(&tc, value.into());
+        }
+    }
+    if tc.has_caught() {
+        return Err(exception_text!(tc));
+    }
+    Ok(())
+}
+
+fn promise_to_json_string(
+    scope: &mut v8::PinScope<'_, '_>,
+    promise: v8::Local<'_, v8::Promise>,
+) -> Result<String> {
+    match promise.state() {
+        v8::PromiseState::Fulfilled => {
+            let value = promise.result(scope);
+            let value = v8_value_to_json(scope, value).map_err(|e| anyhow!(e))?;
+            Ok(value.to_string())
+        }
+        v8::PromiseState::Rejected => {
+            Err(anyhow!(value_to_error_text(scope, promise.result(scope))))
+        }
+        v8::PromiseState::Pending => Err(anyhow!("script promise is still pending")),
+    }
+}
+
+fn call_cell(
+    scope: &mut v8::PinScope<'_, '_>,
+    command_rx: &std_mpsc::Receiver<RuntimeCommand>,
     source: &str,
     contract: &CellContract,
-    input_json: serde_json::Value,
+    input_json: JsonValue,
 ) -> Result<String> {
     validate_cell_contract(contract, source).map_err(|e| anyhow!("cell contract invalid: {e}"))?;
     if let Some(schema) = &contract.input {
         validate_json_value("cell input", schema, &input_json).map_err(|e| anyhow!(e))?;
     }
-
     let encoded_input =
         serde_json::to_string(&input_json).map_err(|e| anyhow!("cell input encode failed: {e}"))?;
     let wrapped = format!(
         "(async () => {{\n{source}\nreturn await {entry}({encoded_input});\n}})()",
         entry = contract.entry
     );
-    let output = run_wrapped(runtime, &wrapped).await?;
-    let output_json: serde_json::Value =
+    let output = run_wrapped(scope, command_rx, &wrapped)?;
+    let output_json: JsonValue =
         serde_json::from_str(&output).map_err(|e| anyhow!("cell output decode failed: {e}"))?;
     if let Some(schema) = &contract.output {
         validate_json_value("cell output", schema, &output_json).map_err(|e| anyhow!(e))?;
@@ -1599,29 +1418,26 @@ async fn call_cell(
     Ok(output_json.to_string())
 }
 
-fn prepare_one(
-    runtime: &mut deno_core::JsRuntime,
-    input_json: serde_json::Value,
-) -> Result<PrepareResponse> {
+fn prepare_one(scope: &mut v8::PinScope<'_, '_>, input_json: JsonValue) -> Result<PrepareResponse> {
     let input: PrepareInput = match serde_json::from_value(input_json) {
         Ok(i) => i,
         Err(e) => return Ok(blocked("input", format!("invalid narf_prepare input: {e}"))),
     };
     let contract = input.contract.clone();
     let assembled = {
-        let op_state = runtime.op_state();
-        let state = op_state.borrow();
-        let session = state.borrow::<SessionStateCell>().borrow();
+        let state = scope
+            .get_slot::<RuntimeState>()
+            .ok_or_else(|| anyhow!("runtime state unavailable"))?;
+        let session = state.session.borrow();
         match render_prepare(&session, input) {
             Ok(source) => source,
             Err(e) => return Ok(blocked("import", e)),
         }
     };
 
-    if let Err(message) = validate_script_syntax(runtime, &assembled) {
+    if let Err(message) = validate_script_syntax(scope, &assembled) {
         return Ok(blocked("syntax", message));
     }
-
     if let Some(contract) = &contract {
         if let Err(message) = validate_cell_contract(contract, &assembled) {
             return Ok(blocked("contract", message));
@@ -1629,73 +1445,132 @@ fn prepare_one(
     }
 
     let handle = {
-        let op_state = runtime.op_state();
-        let state = op_state.borrow();
-        let scripts = state.borrow::<PreparedScriptsCell>().clone();
-        let handle = scripts
+        let state = scope
+            .get_slot::<RuntimeState>()
+            .ok_or_else(|| anyhow!("runtime state unavailable"))?;
+        state
+            .prepared
             .borrow_mut()
-            .put(assembled.clone(), contract.clone());
-        handle
+            .put(assembled.clone(), contract.clone())
     };
-    // Return the rendered source so the model reviews exactly what narf_run runs.
     Ok(ready(handle, assembled, contract))
 }
 
-/// Host-side `narf_define`: deserialize `{ name, source, exports }` and register
-/// the session helper. Runs on the V8 thread (the session frame lives in
-/// `OpState`); no script execution, so no terminate-state dance.
-fn define_one(runtime: &mut deno_core::JsRuntime, input_json: serde_json::Value) -> Result<()> {
+fn define_one(scope: &mut v8::PinScope<'_, '_>, input_json: JsonValue) -> Result<()> {
     let input: SessionDefineInput = serde_json::from_value(input_json)
         .map_err(|e| anyhow!("invalid narf_define input: {e}"))?;
-    let op_state = runtime.op_state();
-    let state = op_state.borrow();
-    let session = state.borrow::<SessionStateCell>().clone();
-    define_session_helper(&session, input).map_err(|e| anyhow!(e))
+    let state = scope
+        .get_slot::<RuntimeState>()
+        .ok_or_else(|| anyhow!("runtime state unavailable"))?;
+    define_session_helper(&state.session, input).map_err(|e| anyhow!(e))
 }
 
-async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<String> {
-    let script = get_prepared(runtime, handle)?;
-    let source = script.source;
-    let _contract = script.contract;
+fn define_session_helper(
+    session: &SessionStateCell,
+    input: SessionDefineInput,
+) -> Result<(), String> {
+    if !is_js_identifier(&input.name) {
+        return Err(format!("invalid helper name identifier: {}", input.name));
+    }
+    let helper = SessionHelper {
+        source: input.source,
+        exports: input.exports,
+    };
+    helper_expression(&helper)?;
+    let mut session = session.borrow_mut();
+    session
+        .import_aliases
+        .insert(input.name.clone(), input.name.clone());
+    session.helpers.insert(input.name, helper);
+    Ok(())
+}
+
+fn run_prepared(
+    scope: &mut v8::PinScope<'_, '_>,
+    command_rx: &std_mpsc::Receiver<RuntimeCommand>,
+    handle: &str,
+) -> Result<String> {
+    let script = get_prepared(scope, handle)?;
     {
-        let op_state = runtime.op_state();
-        let state = op_state.borrow();
-        let trace = state.borrow::<TraceStateCell>().clone();
-        let mut trace = trace.borrow_mut();
+        let state = scope
+            .get_slot::<RuntimeState>()
+            .ok_or_else(|| anyhow!("runtime state unavailable"))?;
+        let mut trace = state.trace.borrow_mut();
         let sequence = trace.len();
         trace.push(TraceEntry {
             ref_handle: handle.to_string(),
             sequence,
         });
     }
-    run_one(runtime, &source).await
+    run_one(scope, command_rx, &script.source)
 }
 
-fn get_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<PreparedCell> {
-    let op_state = runtime.op_state();
-    let state = op_state.borrow();
-    let scripts = state.borrow::<PreparedScriptsCell>().clone();
-    let result = scripts.borrow().get(handle).map_err(|e| anyhow!(e));
-    result
+fn get_prepared(scope: &mut v8::PinScope<'_, '_>, handle: &str) -> Result<PreparedCell> {
+    let state = scope
+        .get_slot::<RuntimeState>()
+        .ok_or_else(|| anyhow!("runtime state unavailable"))?;
+    state.prepared.borrow().get(handle).map_err(|e| anyhow!(e))
 }
 
-fn validate_script_syntax(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<(), String> {
+fn validate_script_syntax(scope: &mut v8::PinScope<'_, '_>, body: &str) -> Result<(), String> {
     let wrapped = format!("(async () => {{\n{body}\n}})");
-    deno_core::scope!(scope, runtime);
-    let source = v8::String::new(scope, &wrapped)
+    let tc = std::pin::pin!(v8::TryCatch::new(scope));
+    let mut tc = tc.init();
+    let source = v8::String::new(&tc, &wrapped)
         .ok_or_else(|| "failed to allocate V8 source string".to_string())?;
-    v8::tc_scope!(let tc_scope, scope);
-    match v8::Script::compile(tc_scope, source, None) {
+    match v8::Script::compile(&tc, source, None) {
         Some(_) => Ok(()),
-        None => {
-            let exception = tc_scope
-                .exception()
-                .ok_or_else(|| "unknown JavaScript syntax error".to_string())?;
-            let message = exception
-                .to_string(tc_scope)
-                .map(|s| s.to_rust_string_lossy(tc_scope))
-                .unwrap_or_else(|| "unknown JavaScript syntax error".to_string());
-            Err(message)
+        None => Err(exception_text!(tc)),
+    }
+}
+
+fn json_to_v8<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    value: &JsonValue,
+) -> Option<v8::Local<'s, v8::Value>> {
+    match value {
+        JsonValue::Null => Some(v8::null(scope).into()),
+        JsonValue::Bool(value) => Some(v8::Boolean::new(scope, *value).into()),
+        JsonValue::Number(value) => value
+            .as_f64()
+            .and_then(|n| v8::Number::new(scope, n).try_into().ok()),
+        JsonValue::String(value) => v8::String::new(scope, value).map(Into::into),
+        JsonValue::Array(values) => {
+            let array = v8::Array::new(scope, values.len() as i32);
+            for (idx, value) in values.iter().enumerate() {
+                let value = json_to_v8(scope, value)?;
+                array.set_index(scope, idx as u32, value);
+            }
+            Some(array.into())
+        }
+        JsonValue::Object(map) => {
+            let object = v8::Object::new(scope);
+            for (key, value) in map {
+                let key = v8::String::new(scope, key)?;
+                let value = json_to_v8(scope, value)?;
+                object.set(scope, key.into(), value);
+            }
+            Some(object.into())
         }
     }
+}
+
+fn v8_value_to_json(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> Result<JsonValue, String> {
+    let global = v8::json::stringify(scope, value)
+        .ok_or_else(|| "value is not JSON-serializable".to_string())?;
+    let text = global.to_rust_string_lossy(scope);
+    serde_json::from_str(&text).map_err(|e| format!("failed to deserialize JSON value: {e}"))
+}
+
+fn value_to_error_text(
+    scope: &mut v8::PinScope<'_, '_>,
+    value: v8::Local<'_, v8::Value>,
+) -> String {
+    value
+        .to_string(scope)
+        .map(|s| s.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| "unknown JavaScript exception".to_string())
 }

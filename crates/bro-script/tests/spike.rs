@@ -16,8 +16,8 @@ use bro_capabilities::{
 };
 use bro_core::BroError;
 use bro_script::{
-    Capabilities, CellContract, DEFAULT_HEAP_LIMIT_BYTES, DENO_CORE_VERSION, ScriptRuntime,
-    SupervisionPolicy,
+    Capabilities, CellContract, ScriptRuntime, SupervisionPolicy, DEFAULT_HEAP_LIMIT_BYTES,
+    SCRIPT_RUNTIME_SUBSTRATE, V8_VERSION,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -75,7 +75,7 @@ impl RefactorCapability for StubRefactor {
 }
 
 // Stub host built-in tool seam (§5): echoes back the tool name + input so a test
-// can prove the in-box `fs.*`/`shell.*`/... bindings route through op_tool_invoke
+// can prove the in-box `fs.*`/`shell.*`/... bindings route through hostCall
 // to the injected ToolCapability and return values directly.
 // A `name` of "boom" yields an is_error result to exercise the JS-throw path.
 struct StubTools;
@@ -147,6 +147,22 @@ impl bro_capabilities::ToolCapability for StubTools {
                 "input": invocation.input_json,
             })),
         }
+    }
+}
+
+struct SlowTools;
+#[async_trait]
+impl bro_capabilities::ToolCapability for SlowTools {
+    async fn call_tool(
+        &self,
+        _invocation: bro_capabilities::ToolInvocation,
+    ) -> CapabilityResult<bro_capabilities::ToolCallOutput> {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        Ok(bro_capabilities::ToolCallOutput {
+            content: "{}".to_string(),
+            is_error: false,
+            content_type: "application/json".to_string(),
+        })
     }
 }
 
@@ -312,7 +328,8 @@ async fn stub_runtime() -> ScriptRuntime {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_proof_basic_execution() {
-    assert_eq!(DENO_CORE_VERSION, "0.403.0");
+    assert_eq!(SCRIPT_RUNTIME_SUBSTRATE, "raw-v8");
+    assert_eq!(V8_VERSION, "149.2.0");
     let rt = stub_runtime().await;
     let out = rt.execute("return 1 + 1;").await.unwrap();
     assert_eq!(out, "2");
@@ -611,15 +628,15 @@ async fn run_records_trace_entry() {
 }
 
 // ---------------------------------------------------------------------------
-// Structural panic guard (criterion #5) — sync and async op paths.
+// Structural panic guard (criterion #5) — sync callback and async host-call paths.
 // ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn panic_boundary_sync_op_surfaced_as_js_error() {
+async fn panic_boundary_sync_callback_surfaced_as_js_error() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
-            "try { Deno.core.ops.op_panic_guarded(); return 'NO_THROW'; } \
+            "try { __bb_test.panicGuarded(); return 'NO_THROW'; } \
              catch (e) { return 'caught'; }",
         )
         .await
@@ -633,20 +650,18 @@ async fn panic_boundary_sync_op_surfaced_as_js_error() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn panic_boundary_async_op_surfaced_as_js_error() {
-    // This op panics AFTER an await — the exact poll-resumption case that every
-    // capability op's `guard_async` wrapper must catch on the V8 thread.
+async fn panic_boundary_async_host_call_surfaced_as_js_error() {
     let rt = stub_runtime().await;
     let out = rt
         .execute(
-            "try { await Deno.core.ops.op_panic_guarded_async(); return 'NO_THROW'; } \
+            "try { await __bb_test.panicGuardedAsync(); return 'NO_THROW'; } \
              catch (e) { return 'caught'; }",
         )
         .await
         .unwrap();
     assert_eq!(
         out, "\"caught\"",
-        "async op panic (post-await) must surface as a catchable JS error"
+        "async host-call panic must surface as a catchable JS error"
     );
     assert_eq!(rt.execute("return 'alive';").await.unwrap(), "\"alive\"");
 }
@@ -808,6 +823,38 @@ async fn execution_timeout_auto_kills_and_runtime_reusable() {
     assert_eq!(out, "\"found:q\"");
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn host_call_timeout_does_not_strand_runtime_thread() {
+    let policy = SupervisionPolicy {
+        heap_limit_bytes: DEFAULT_HEAP_LIMIT_BYTES,
+        execution_timeout: Some(Duration::from_millis(50)),
+        ..SupervisionPolicy::default()
+    };
+    let caps = Capabilities {
+        atoms: Arc::new(StubAtoms),
+        refactor: Arc::new(StubRefactor),
+        tools: Some(Arc::new(SlowTools)),
+        kv: Arc::new(StubKv::default()),
+    };
+    let rt = ScriptRuntime::new(caps, policy).await.unwrap();
+
+    let result = rt.execute(r#"return await fs.read("slow.txt");"#).await;
+    assert!(
+        result.is_err(),
+        "slow host promise must hit the execution timeout, got {result:?}"
+    );
+    let msg = format!("{:#}", result.unwrap_err());
+    assert!(
+        msg.contains("timed out"),
+        "expected a timeout error, got: {msg}"
+    );
+
+    assert_eq!(
+        rt.execute("return 'after-host-timeout';").await.unwrap(),
+        "\"after-host-timeout\""
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Phase A value-return behavior.
 // ---------------------------------------------------------------------------
@@ -917,7 +964,7 @@ async fn tools_runtime() -> ScriptRuntime {
         .unwrap()
 }
 
-// fs.read routes through op_tool_invoke to the injected ToolCapability and
+// fs.read routes through hostCall to the injected ToolCapability and
 // returns the tool value directly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn fs_read_routes_through_tool_seam_and_returns_value() {
@@ -1000,7 +1047,7 @@ async fn host_tool_error_throws_catchable() {
             r#"let threw = false, msg = "";
                try { await fs.read("x"); } catch (_) {}
                try {
-                   await Deno.core.ops.op_tool_invoke(JSON.stringify({ name: "boom", input_json: {} }));
+                   await __bb_host_call('tool.invoke', { name: "boom", input_json: {} });
                } catch (e) { threw = true; msg = String(e); }
                return JSON.stringify({ threw, hasMsg: msg.includes('blew up') });"#,
         )

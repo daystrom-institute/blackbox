@@ -12,7 +12,7 @@ topic:
   - workflows
   - durable-execution
   - box-edge
-brief: "The atom and workflow systems predate the V8 sandbox. This doc argues they collapse into ONE authorial surface — a cell: an author-supplied JS snippet plus a declared contract. The model-facing VERB, not a separate runtime, sets the persistence tier: narf_exec = ephemeral (runs now, returns a value), narf_register = a named reusable cell (the atom slot — register out-box, invoke in-box by ref), narf_registerWorkflow/narf_scheduleWorkflow = a durable cell whose await-points are engine-owned park/resolve waits (the workflow slot). Grounded in code: prepare today is JS-syntax-only (no TS, no type/contract capture — confirmed at bro-script/src/lib.rs:1390/1457), so 'typed' means a DECLARED contract block validated alongside the snippet, NOT an inferred TS signature (no such toolchain exists). The durable tier reuses the existing IOCP-shaped park/resolve seam (WaitStore + signal_arc_dispatch + the arc loop's catch-up rescan), where child-bro completion is ALREADY a correlated signal (spawn_task_completed_router + spawn_system_event_signal_bridge). The V8 continuation wall is sidestepped the same way workflows sidestep it: the daemon engine owns the loop and the arc position; the cell body re-enters at await boundaries on resume — it never serializes a paused continuation. Two daemon services survive the collapse: a durable park/resolve executor and a contract/catalog registry. The atom 4-backend taxonomy (profile/workflow/deterministic/adapter) stops being distinct runtimes and becomes 'what the cell body happens to do.'"
+brief: "The atom and workflow systems predate the V8 sandbox. This doc argues they collapse into ONE authorial surface — a cell: an author-supplied JS snippet plus a declared contract. The model-facing VERB, not a separate runtime, sets the persistence tier: narf_exec = ephemeral (runs now, returns a value), narf_register = a named reusable cell (the atom slot — register out-box, invoke in-box by ref), narf_registerWorkflow/narf_scheduleWorkflow = a durable cell whose long-lived waits are explicit daemon-owned handles, not implicit serialization of every JS await. Grounded in code: prepare today is JS-syntax-only plus declared contract validation (no TS inference — see bro-script/src/lib.rs prepare_one / validate_script_syntax), so 'typed' means a DECLARED contract block validated alongside the snippet, NOT an inferred TS signature. Ordinary awaits are raw-V8/Codex-code-mode-shaped live async host calls: a callback stores a PromiseResolver, Rust resolves it back into the same activation, and the daemon may yield/poll independently. The durable tier may reuse the existing IOCP-shaped park/resolve seam (WaitStore + signal_arc_dispatch + the arc loop's catch-up rescan), but only through explicit durable handles. Two daemon services survive the collapse: a durable wait/resume executor and a contract/catalog registry. The atom 4-backend taxonomy (profile/workflow/deterministic/adapter) stops being distinct runtimes and becomes 'what the cell body happens to do.'"
 ---
 
 # NARF typed cells: one authorial surface, the verb sets the tier
@@ -84,18 +84,18 @@ type machinery at all today.**
 
 The entire `prepare` pipeline:
 
-- `prepare_one` (`crates/bro-script/src/lib.rs:1390`) calls `render_prepare`
-  (`:346`), which is **string concatenation** of resolved session-helper imports
+- `prepare_one` (`crates/bro-script/src/lib.rs:1368`) calls `render_prepare`
+  (`:296`), which is **string concatenation** of resolved session-helper imports
   followed by the author's source. No parse beyond that.
-- It then calls `validate_script_syntax` (`:1457`), which wraps the body in
+- It then calls `validate_script_syntax` (`:1459`), which wraps the body in
   `(async () => { … })` and calls `v8::Script::compile` inside a `tc_scope`. This
   is a **JS syntax check only**: no execution, no `.d.ts`, no signature parse, no
   schema extraction.
-- `PrepareResponse` (`:201`) is `{ ref_handle, status, diagnostics, source }`.
-  There is **no field** in which a cell's contract/signature could be stored.
+- `PrepareResponse` (`:142`) is `{ ref_handle, status, diagnostics, source,
+  contract }`. The contract field is declared input, not inferred from JS.
 
-So the operator's read is correct: *there is no TS wiring, and nothing captures a
-cell's type.* That has a hard consequence for this design:
+So the operator's read is correct about TS: *there is no TS wiring, and no
+inferred type capture.* That has a hard consequence for this design:
 
 > **"Typed" must mean a DECLARED contract, not an INFERRED TS signature.** There
 > is no TypeScript toolchain in the daemon or harness. Building a real
@@ -190,37 +190,50 @@ selection → out-box):
   cells, inspecting a contract). Authoring, naming, and launching a durable thing
   are model judgement calls — they belong to the awake model.
 - **In-box (exact deref):** *invoking* an already-named cell by exact ref —
-  `atom:reviewer@v1(input)` — and **parking on a promise handle the cell holds**: a
-  dispatch like `bro.exec(...)` returns a `Promise`; awaiting it **parks the bro and
-  returns** (the turn ends), and the daemon wakes a *new* turn when the promise
-  settles (**wake-native**, §4.0). No in-box wait verb, no correlation authored
-  in-box — the promise handle *is* the wait token. The box may call/await what it
-  was handed; it may not browse the catalog to decide what to call.
+  `atom:reviewer@v1(input)` — and **awaiting host promises the live cell
+  already holds**. In the ordinary case, `await shell.run(...)` / `await
+  atoms.invoke(...)` is a Codex-code-mode-shaped live async boundary: the host
+  call returns a JS promise, Rust performs the work outside the isolate, and the
+  result resolves back into the same live activation. This is not, by itself, a
+  model/daemon turn boundary and it is not restart-safe continuation
+  serialization. Cross-turn or cross-restart durability requires an explicit
+  daemon-owned durable handle (§4.0). The box may call/await what it was handed;
+  it may not browse the catalog to decide what to call.
 
 This is the same split the data-model doc draws for KV (`narf.kv.get(known-name)`
 in-box; `narf_kv_list` out-box) and tool-placement draws for `mcp.*`.
 
 ## 4. The durable tier rides the existing park/resolve seam (it's your IOCP picture, already built)
 
-### 4.0 Wake-native: one wake primitive, many producers
+### 4.0 Live async first; durability is explicit
 
-The model underneath every tier is **wake-native**. There is ONE wake primitive:
-**park-on-promise-settle**. A bro/cell that hits a wait does NOT hold its isolate
-and block — it **parks and returns** (the turn/isolate ends) and is resumed in a
-**new turn** when the awaited promise settles, replayed with the settle payload +
-persisted KV state. child-bro / timer / signal / webhook are just different
-**producers** of a promise; "wake" is the pending→settled transition; the
-`Promise<T>` handle **is** the wait token. This dissolves the blocking-await vs
-durable-background fork — they are the same thing. `bro.exec` returns a Promise;
-`bro.wait`/`whenAll`/`whenAny`/`pipeline` compose on promise-settle; a durable
-promise is park-on-promise-settle; `/loop` is park-on-timer. **There is no separate
-`narf.wait` verb** — parking is awaiting a promise handle the cell already holds.
-This is how the workflow engine already runs (below) and how Claude Code itself
-runs (woken by notifications, act, persist, sleep); "make bros wake-native" lifts
-that primitive from authored workflow arcs up to every bro and NARF cell. The
-existing harness-local substrate is `crates/bro-tools/src/promise.rs` +
-`agent_loop.rs::session_loop`: completion auto-injects a hidden `HARNESS_EVENT`
-turn on settle, and `promise_wait` consumes that wake.
+The model underneath the sandbox is **not** "one wake on every await." The
+baseline is Codex code-mode's live async cell:
+
+1. JS calls a host binding.
+2. The raw-V8 callback creates a `PromiseResolver`, records it by host-call id,
+   emits a host-call event, and returns the JS promise immediately.
+3. Rust executes the host work outside the isolate.
+4. The runtime resolves/rejects the recorded promise and performs a microtask
+   checkpoint, so JS continues in the same live activation.
+
+The daemon/controller may yield output to the model, pause at a pending frontier,
+or terminate the isolate, but ordinary `await` is a live-cell boundary, not a
+serialized continuation. This avoids a turn per await and keeps normal cell code
+JS-idiomatic.
+
+Durability is a separate daemon-owned layer. A producer that intentionally
+outlives the live cell (long shell job, child bro, timer, webhook, external
+signal) returns an explicit durable handle. That handle can later be waited on,
+joined, inspected, or used to start a new activation, but the runtime does not
+pretend that V8 continuations survive isolate teardown or daemon restart. The
+durable handle is the wait token; a plain JS promise is ephemeral unless a host
+producer explicitly backs it with durable state.
+
+The prior "wake-native" phrasing was an exploratory shortcut and must not be
+implemented as a universal runtime axiom. The durable tier should lift only the
+parts that are true: daemon-owned correlation, persisted completion records, and
+explicit resume policy.
 
 The operator described the durable mechanism as "vaguely TPL IO-completion-port
 shaped: first cell awaits → under the covers an IRP/DPC → later the result comes
@@ -351,14 +364,14 @@ The thesis is "mostly built." Precisely what is *not*:
    registered-handle `narf_run` validates input before calling the declared
    entry and output before returning. What does **not** exist yet is the durable
    workflow-tier enforcement around park/resume boundaries.
-2. **Promise-settle wake is not lifted to the bro/cell level (the wake-native
-   gap).** The park/resolve lifecycle exists only as workflow
-   `WaitSpec`/`run_wait_node` for authored arcs, and the harness-local
-   promise-wake exists only live-loop (`promise.rs` + `agent_loop.rs`). What is
-   missing is the unification (§4.0): a bro/cell awaiting a **held promise** (e.g.
-   `bro.exec(...)`) parking-and-returning and being woken the next turn by the
-   existing settle producers. There is **no `narf.wait` verb to build** — by
-   design; the work is the lift, not a new verb.
+2. **Durable handles are not lifted to the bro/cell level.** The live async
+   bridge exists for same-activation promises, and the workflow
+   `WaitSpec`/`run_wait_node` lifecycle exists for authored arcs. What is missing
+   is an explicit durable-handle layer for producers that intentionally outlive a
+   live cell: a child bro, long shell job, timer, webhook, or signal. Do not
+   implement this as "every `await` parks and wakes a new turn"; ordinary awaits
+   should resolve inside the live activation. The build is a daemon-owned
+   durable wait/join/resume policy over explicit handles.
 3. **WaitStore is not persisted; parked arcs do not survive restart.**
    `wait.rs:121` is explicit ("v1 — no persistence"), and `restore_runtime_state`
    (`src/server/restore.rs:6`) restores webhooks/pollers/crons/whiteboards/
@@ -409,13 +422,13 @@ The thesis is "mostly built." Precisely what is *not*:
 
 - **D1 — Contract schema dialect.** JSON Schema (verbose, standard, already used
   by atoms) vs a thinner bespoke shape. Leaning JSON Schema for atom parity.
-- **D2 — Wait authority — DECIDED (wake-native; no wait verb).** There is no
-  `narf.wait`/correlation verb. A cell parks only by awaiting a **promise handle it
-  holds** (e.g. its own `bro.exec(...)`); the promise *is* the wait token. A cell
-  never authors a `{signal, correlation}` selector in-box — that is correlation
-  *selection*, which stays out-box (an operator/scheduling trigger is bound out-box
-  and handed to the cell as a promise to await). Aligns parking with the box-edge
-  rule: the box awaits what it was handed; it never selects what to wait on.
+- **D2 — Wait authority — DECIDED (explicit durable handles; live awaits stay
+  live).** A cell never authors a `{signal, correlation}` selector in-box — that
+  is correlation *selection*, which stays out-box. Ordinary JS promises are
+  ephemeral live-activation promises. Cross-turn/cross-restart waiting requires a
+  daemon-issued durable handle from a producer that is explicitly durable. The box
+  may await or join handles it was handed; it never selects what external signal
+  to wait on.
 - **D3 — Determinism discipline enforcement.** §4.2 asks durable bodies to be
   checkpoint-structured. Is that a lint, a runtime guard (e.g. forbid
   non-idempotent effects between un-checkpointed park points), or just doc

@@ -77,6 +77,18 @@ points to a backlog doc.
   (set/get/peek/delete, **no enumeration**); `list`/`keys` (discovery/selection)
   are out-box. **Supersedes** [`narf-tool-placement.md`](narf-tool-placement.md)
   (now archived) + the §9-1 ref substrate.
+- [Workflow-JS: workflows as reactive cells](narf-workflow-js.md) — proposed:
+  finishes the [typed-cells](narf-typed-cells.md) subsumption for the workflow
+  engine. A durable workflow is a registered cell *template* — a static trigger
+  manifest (the closed alphabet of cron/webhook/signal names) + a handler table —
+  driven by the daemon via the embedded-host inversion-of-control pattern (game
+  Lua / CEF / RN). The per-instance container is today's `ArcContext` handed in as
+  `ctx`; state lives in the durable KV, never a frozen V8 stack, so it is
+  restart-proof by construction. `ctx.arm(knownSignal, runtimeCorrelation)` lifts
+  the existing `WaitStore`/`signal_arc_dispatch` IOCP seam from node-graph arcs up
+  to cells; the webhook routing *verdict* dissolves into instance-armed-handler
+  lookup; predicate/extractor/step are all cells. `effects` safety is elided
+  (purity by construction). Closes typed-cells §7 items 2/3.
 
 ## Cluster conventions
 
