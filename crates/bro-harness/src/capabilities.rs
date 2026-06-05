@@ -17,8 +17,9 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bro_capabilities::{
     AtomCapability, AtomInvocation, CapabilityResult, CellLoadRequest, CellRegisterRequest,
-    CellRegistryCapability, CorpusCapability, CorpusLookup, KvCapability, KvEntry, KvEntryInfo,
-    KvGet, KvOrigin, KvSummary, RefactorCapability, RefactorRequest, ToolCallOutput,
+    CellRegistryCapability, CellWorkflowCapability, CellWorkflowRegisterRequest,
+    CellWorkflowScheduleRequest, CorpusCapability, CorpusLookup, KvCapability, KvEntry,
+    KvEntryInfo, KvGet, KvOrigin, KvSummary, RefactorCapability, RefactorRequest, ToolCallOutput,
     ToolCapability, ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
@@ -36,6 +37,7 @@ const KV_SUMMARY_LINE_BYTES: usize = 160;
 static CORPUS: RwLock<Option<Arc<dyn CorpusCapability>>> = RwLock::new(None);
 static ATOMS: RwLock<Option<Arc<dyn AtomCapability>>> = RwLock::new(None);
 static CELLS: RwLock<Option<Arc<dyn CellRegistryCapability>>> = RwLock::new(None);
+static CELL_WORKFLOWS: RwLock<Option<Arc<dyn CellWorkflowCapability>>> = RwLock::new(None);
 static REFACTOR: RwLock<Option<Arc<dyn RefactorCapability>>> = RwLock::new(None);
 
 /// Install the daemon's in-memory corpus implementation. Called once, at daemon
@@ -57,6 +59,13 @@ pub fn install_cells(capability: Arc<dyn CellRegistryCapability>) {
     *CELLS.write().expect("cell capability slot poisoned") = Some(capability);
 }
 
+/// Install the daemon's durable cell workflow implementation.
+pub fn install_cell_workflows(capability: Arc<dyn CellWorkflowCapability>) {
+    *CELL_WORKFLOWS
+        .write()
+        .expect("cell workflow capability slot poisoned") = Some(capability);
+}
+
 /// Install the daemon's in-memory refactor implementation. Called once, at
 /// daemon startup, from the `blackbox` crate. Last writer wins.
 pub fn install_refactor(capability: Arc<dyn RefactorCapability>) {
@@ -76,6 +85,13 @@ fn atoms() -> Option<Arc<dyn AtomCapability>> {
 
 fn cells() -> Option<Arc<dyn CellRegistryCapability>> {
     CELLS.read().expect("cell capability slot poisoned").clone()
+}
+
+fn cell_workflows() -> Option<Arc<dyn CellWorkflowCapability>> {
+    CELL_WORKFLOWS
+        .read()
+        .expect("cell workflow capability slot poisoned")
+        .clone()
 }
 
 fn refactor() -> Option<Arc<dyn RefactorCapability>> {
@@ -334,6 +350,7 @@ pub fn capability_tools(
     }
     let atom_cap = atoms();
     let cell_cap = cells();
+    let cell_workflow_cap = cell_workflows();
     let refactor_cap = refactor();
     if let Some(a) = atom_cap.clone() {
         tools.push(Arc::new(AtomInvokeTool(a)));
@@ -369,6 +386,12 @@ pub fn capability_tools(
                 session: session.clone(),
                 cells,
             }));
+        }
+        if let Some(workflows) = cell_workflow_cap {
+            tools.push(Arc::new(NarfRegisterWorkflowTool {
+                workflows: workflows.clone(),
+            }));
+            tools.push(Arc::new(NarfScheduleWorkflowTool { workflows }));
         }
         tools.push(Arc::new(NarfRunTool {
             session: session.clone(),
@@ -997,6 +1020,150 @@ impl Tool for NarfRegisterTool {
     }
 }
 
+struct NarfRegisterWorkflowTool {
+    workflows: Arc<dyn CellWorkflowCapability>,
+}
+
+#[async_trait]
+impl Tool for NarfRegisterWorkflowTool {
+    fn name(&self) -> &str {
+        "narf_registerWorkflow"
+    }
+
+    fn description(&self) -> &str {
+        "Register a durable workflow wrapper around an exact registered cell handle. Takes {name,cell_handle,version?,input?}; installs a hook-only workflow that runs the cell through the daemon engine."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Workflow name." },
+                "cell_handle": { "type": "string", "description": "Exact registered cell handle, e.g. atom:reviewer@v1." },
+                "version": { "type": "string", "description": "Workflow version (default v1)." },
+                "input": { "description": "Default input JSON for the workflow cell run." }
+            },
+            "required": ["name", "cell_handle"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let name = match input.get("name").and_then(Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.to_string(),
+            _ => return ToolResult::Error("narf_registerWorkflow: `name` is required".into()),
+        };
+        let cell_handle = match input.get("cell_handle").and_then(Value::as_str) {
+            Some(h) if !h.trim().is_empty() => h.to_string(),
+            _ => {
+                return ToolResult::Error(
+                    "narf_registerWorkflow: `cell_handle` is required".into(),
+                );
+            }
+        };
+        let version = input
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("v1")
+            .to_string();
+        let request = CellWorkflowRegisterRequest {
+            name,
+            version,
+            cell_handle,
+            input_json: input.get("input").cloned(),
+        };
+        match self.workflows.register_workflow(request).await {
+            Ok(out) => ToolResult::Json(json!({
+                "status": "registered",
+                "workflow_id": out.workflow_id,
+                "cell_handle": out.cell_handle,
+                "name": out.name,
+                "version": out.version,
+            })),
+            Err(e) => ToolResult::Error(format!(
+                "narf_registerWorkflow failed: {}: {}",
+                e.code, e.message
+            )),
+        }
+    }
+}
+
+struct NarfScheduleWorkflowTool {
+    workflows: Arc<dyn CellWorkflowCapability>,
+}
+
+#[async_trait]
+impl Tool for NarfScheduleWorkflowTool {
+    fn name(&self) -> &str {
+        "narf_scheduleWorkflow"
+    }
+
+    fn description(&self) -> &str {
+        "Schedule a registered durable cell workflow with an existing cron trigger. Takes {name,workflow_id,schedule,input?,concurrency?,default_project_dir?}."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Schedule/cron name." },
+                "workflow_id": { "type": "string", "description": "Registered workflow id." },
+                "schedule": { "type": "string", "description": "6-field cron expression." },
+                "input": { "description": "Input JSON passed as workflow var `input`." },
+                "concurrency": { "type": "integer", "minimum": 0 },
+                "default_project_dir": { "type": "string" }
+            },
+            "required": ["name", "workflow_id", "schedule"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let name = match input.get("name").and_then(Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.to_string(),
+            _ => return ToolResult::Error("narf_scheduleWorkflow: `name` is required".into()),
+        };
+        let workflow_id = match input.get("workflow_id").and_then(Value::as_str) {
+            Some(id) if !id.trim().is_empty() => id.to_string(),
+            _ => {
+                return ToolResult::Error(
+                    "narf_scheduleWorkflow: `workflow_id` is required".into(),
+                );
+            }
+        };
+        let schedule = match input.get("schedule").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => s.to_string(),
+            _ => return ToolResult::Error("narf_scheduleWorkflow: `schedule` is required".into()),
+        };
+        let request = CellWorkflowScheduleRequest {
+            name,
+            workflow_id,
+            schedule,
+            input_json: input.get("input").cloned(),
+            concurrency: input
+                .get("concurrency")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32),
+            default_project_dir: input
+                .get("default_project_dir")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .map(str::to_string),
+        };
+        match self.workflows.schedule_workflow(request).await {
+            Ok(out) => ToolResult::Json(json!({
+                "status": "scheduled",
+                "cron_name": out.cron_name,
+                "workflow_id": out.workflow_id,
+                "routing_packet": out.routing_packet,
+            })),
+            Err(e) => ToolResult::Error(format!(
+                "narf_scheduleWorkflow failed: {}: {}",
+                e.code, e.message
+            )),
+        }
+    }
+}
+
 /// `narf_run`: execute a prepared script by handle and return its result.
 /// Model-facing replacement for the mislayered in-box `narf.run`.
 struct NarfRunTool {
@@ -1129,8 +1296,8 @@ impl Tool for NarfDefineTool {
 mod tests {
     use super::*;
     use bro_capabilities::{
-        AtomOutput, CapabilityResult, CellLoadOutput, CellRegisterOutput, CorpusHit,
-        RefactorPlanHandle,
+        AtomOutput, CapabilityResult, CellLoadOutput, CellRegisterOutput,
+        CellWorkflowRegisterOutput, CellWorkflowScheduleOutput, CorpusHit, RefactorPlanHandle,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1250,6 +1417,34 @@ mod tests {
                 .get(&request.handle)
                 .cloned()
                 .ok_or_else(|| bro_core::BroError::new("unknown_cell", request.handle))
+        }
+    }
+
+    struct StubCellWorkflows;
+
+    #[async_trait]
+    impl CellWorkflowCapability for StubCellWorkflows {
+        async fn register_workflow(
+            &self,
+            request: CellWorkflowRegisterRequest,
+        ) -> CapabilityResult<CellWorkflowRegisterOutput> {
+            Ok(CellWorkflowRegisterOutput {
+                workflow_id: request.name.clone(),
+                cell_handle: request.cell_handle,
+                name: request.name,
+                version: request.version,
+            })
+        }
+
+        async fn schedule_workflow(
+            &self,
+            request: CellWorkflowScheduleRequest,
+        ) -> CapabilityResult<CellWorkflowScheduleOutput> {
+            Ok(CellWorkflowScheduleOutput {
+                cron_name: request.name,
+                workflow_id: request.workflow_id,
+                routing_packet: "domain:narf-schedule/test".to_string(),
+            })
         }
     }
 
@@ -1827,5 +2022,55 @@ mod tests {
             )
             .await;
         assert!(matches!(bad, ToolResult::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn narf_workflow_tools_dispatch_to_cell_workflow_capability() {
+        let workflows = Arc::new(StubCellWorkflows);
+        let register = NarfRegisterWorkflowTool {
+            workflows: workflows.clone(),
+        };
+        let schedule = NarfScheduleWorkflowTool { workflows };
+
+        let registered = register
+            .call(
+                json!({
+                    "name": "wf",
+                    "version": "v1",
+                    "cell_handle": "atom:math/double@v1",
+                    "input": { "n": 2 }
+                }),
+                &test_cx(),
+            )
+            .await;
+        match registered {
+            ToolResult::Json(v) => {
+                assert_eq!(v["status"], "registered");
+                assert_eq!(v["workflow_id"], "wf");
+                assert_eq!(v["cell_handle"], "atom:math/double@v1");
+            }
+            other => panic!("expected Json register workflow, got {other:?}"),
+        }
+
+        let scheduled = schedule
+            .call(
+                json!({
+                    "name": "hourly",
+                    "workflow_id": "wf",
+                    "schedule": "0 0 * * * *",
+                    "input": { "n": 3 },
+                    "concurrency": 1
+                }),
+                &test_cx(),
+            )
+            .await;
+        match scheduled {
+            ToolResult::Json(v) => {
+                assert_eq!(v["status"], "scheduled");
+                assert_eq!(v["cron_name"], "hourly");
+                assert_eq!(v["workflow_id"], "wf");
+            }
+            other => panic!("expected Json schedule workflow, got {other:?}"),
+        }
     }
 }

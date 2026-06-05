@@ -743,6 +743,14 @@ before relying on any line here.
   against the stored contract. This is intentionally a cell registry, not an
   atom backend. Durable workflow registration, scheduling, `narf.wait`, and
   parked-arc restart persistence remain separate follow-up slices.
+- **Durable cell workflow registration + scheduling (A3 wrapper slice).**
+  `narf_registerWorkflow` installs a hook-only workflow wrapper around an exact
+  registered cell handle; the workflow engine runs the cell through a new
+  `cell_run` hook op and records the result in `vars.cell_result`.
+  `narf_scheduleWorkflow` installs a cron plus routing packet that starts that
+  workflow with scheduled input. This uses existing workflow/cron substrate; it
+  still does not implement in-cell `narf.wait` or restart-persistent parked
+  continuations.
 
 The whole stack was exercised live through the real fleet TUI (tmux): a dispatch
 flows TUI → `/control/exec` → in-process harness (task-local identity, `--cwd`,
