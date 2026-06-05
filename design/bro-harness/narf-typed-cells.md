@@ -44,7 +44,7 @@ Three tiers, one body:
 | Verb | Tier | Lives | Backed by (today) |
 |---|---|---|---|
 | `narf_exec` | **ephemeral** | one call, returns a value | `run_one` (bro-script) |
-| `narf_register` | **named/reusable** (the atom slot) | catalog entry; invoke by ref | prepared-script store + artifact catalog |
+| `narf_register` | **named/reusable** (replaces the atom; see §0.1) | cell-registry entry; invoke by ref | cell registry (storage MAY reuse the artifact catalog) |
 | `narf_registerWorkflow` / `narf_scheduleWorkflow` | **durable** (the workflow slot) | an engine arc that parks and resumes | `WaitStore` + `signal_arc_dispatch` + arc loop |
 
 The body is the same in all three: a JS snippet against the injected NARF
@@ -52,6 +52,29 @@ capabilities (`fs`/`search`/`git`/`shell`/`web`/`narf.kv`/`mcp.<server>.<tool>`/
 `narf.encode`, per the data-model and tool-placement docs). What changes is the
 *verb*, and the verb is a box-edge control: **you register/schedule out-box, you
 invoke in-box.** (§3.)
+
+### 0.1 What this collapse is NOT — read before implementing
+
+This doc is misread in exactly one way, and the misread is expensive. **The cell
+is the primary abstraction; the atom 4-backend taxonomy DISSOLVES into it.**
+
+- ✅ **RIGHT:** `narf_register` writes a **cell** (source + contract) to a cell
+  registry; the unit stored and invoked is a cell. The four atom backends
+  (profile / workflow / deterministic / adapter) stop existing as distinct
+  runtimes. `atom:<name>` survives ONLY as an invocation **handle** that resolves
+  to a cell — see [`narf-data-model.md`](./narf-data-model.md): "`atom:` survives
+  only as a handle, never as data composition." Storage MAY reuse the
+  `bbox_artifact_*` catalog as a backing store, but that is a *storage* detail —
+  the record in it is a cell.
+- ❌ **WRONG — do not build this:** adding a fifth atom backend
+  (`AtomBackend::Cell`, "cell-type backing") to the existing atom system so atoms
+  can be *backed by* cells. That entrenches the 4-backend taxonomy this design
+  exists to delete and inverts the hierarchy (atom-on-top, cell-underneath).
+
+When the prose below says "the backend is a NARF cell" or "the atom slot," it
+means the cell **replaces** the backends — never that a cell becomes one of them.
+**If you are extending the atom backend rather than collapsing it into the cell,
+stop: you are implementing the inverse of this design.**
 
 ## 1. What "typed cell" actually means — grounded, not aspirational
 
@@ -103,7 +126,8 @@ A registered/durable cell supplies, next to its `source`, a declared contract:
 
 This is exactly the atom contract from `docs/atoms.md` (stable name, input/output
 schema, effect upper-bounds, composition rules, dispatch/depth budget), but the
-*backend* is "a NARF cell" rather than one of four bespoke runtimes. The contract
+contract is satisfied by **a cell** — which *replaces* the four bespoke atom
+backends, rather than adding a fifth (see §0.1). The contract
 is validated two ways:
 
 1. **At prepare/register time:** JSON-schema well-formedness + the `entry`
