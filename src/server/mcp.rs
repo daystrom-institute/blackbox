@@ -66,7 +66,10 @@ pub(super) fn build_http_app(
         // — consumers depend on the neutral control endpoint, not on each other's
         // namespace.
         .route("/control/exec", axum::routing::post(control_exec_handler))
-        .route("/control/resume", axum::routing::post(control_resume_handler))
+        .route(
+            "/control/resume",
+            axum::routing::post(control_resume_handler),
+        )
         .route("/control/steer", axum::routing::post(control_steer_handler))
         .route(
             "/control/interrupt",
@@ -84,7 +87,10 @@ pub(super) fn build_http_app(
             "/control/dashboard",
             axum::routing::get(control_dashboard_handler),
         )
-        .route("/control/cancel", axum::routing::post(control_cancel_handler))
+        .route(
+            "/control/cancel",
+            axum::routing::post(control_cancel_handler),
+        )
         .route(
             "/control/team/{team_name}",
             axum::routing::get(control_team_handler),
@@ -198,12 +204,7 @@ mod tests {
     async fn control_and_irc_dashboard_both_resolve_to_same_handler() {
         for path in ["/control/dashboard", "/irc/dashboard"] {
             let resp = test_app()
-                .oneshot(
-                    Request::builder()
-                        .uri(path)
-                        .body(Body::empty())
-                        .unwrap(),
-                )
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
             assert_ne!(
@@ -219,7 +220,14 @@ mod tests {
     /// verbs yields 405 (not 404) — proving the path exists with a handler.
     #[tokio::test]
     async fn control_verbs_mounted_under_both_namespaces() {
-        let verbs = ["exec", "resume", "steer", "interrupt", "broadcast", "cancel"];
+        let verbs = [
+            "exec",
+            "resume",
+            "steer",
+            "interrupt",
+            "broadcast",
+            "cancel",
+        ];
         for ns in ["/control", "/irc"] {
             for verb in verbs {
                 let path = format!("{ns}/{verb}");

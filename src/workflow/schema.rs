@@ -493,4 +493,3 @@ pub enum BranchSelector {
 pub fn load_workflow(src: &str) -> Result<Workflow> {
     serde_json::from_str(src).context("workflow JSON parse failed")
 }
-

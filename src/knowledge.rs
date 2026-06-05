@@ -3306,13 +3306,28 @@ This is also OUTSIDE the markers and must NEVER be absorbed.
             .unwrap()
             .id;
 
-        let in_worktree = worktree_root.join(".bbox").join("knowledge").join(format!("{id}.json"));
-        let in_base = base_root.join(".bbox").join("knowledge").join(format!("{id}.json"));
-        assert!(in_worktree.exists(), "entry should be written into the worktree: {}", in_worktree.display());
-        assert!(!in_base.exists(), "entry must NOT be written into the registered base");
+        let in_worktree = worktree_root
+            .join(".bbox")
+            .join("knowledge")
+            .join(format!("{id}.json"));
+        let in_base = base_root
+            .join(".bbox")
+            .join("knowledge")
+            .join(format!("{id}.json"));
+        assert!(
+            in_worktree.exists(),
+            "entry should be written into the worktree: {}",
+            in_worktree.display()
+        );
+        assert!(
+            !in_base.exists(),
+            "entry must NOT be written into the registered base"
+        );
 
         // Rider is repo-relative — actionable from the worktree cwd, no absolute leak.
-        let rider = kb.repo_record_rider(&id).expect("committed entry should rider");
+        let rider = kb
+            .repo_record_rider(&id)
+            .expect("committed entry should rider");
         assert!(
             rider.contains(&format!("git add .bbox/knowledge/{id}.json")),
             "rider should be worktree-relative and actionable: {rider}"

@@ -1072,7 +1072,11 @@ mod tests {
 
         let mut vars = std::collections::BTreeMap::new();
         vars.insert("BRO_HARNESS_TRANSPORT".to_string(), "anthropic".to_string());
-        for k in ["ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"] {
+        for k in [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_API_KEY",
+        ] {
             if let Some(val) = v["env"][k].as_str() {
                 vars.insert(k.to_string(), val.to_string());
             }

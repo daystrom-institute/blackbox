@@ -7,8 +7,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, watch};
 use tokio::time::{Duration, Instant};
@@ -62,16 +62,13 @@ impl PromiseProgress {
     }
 
     pub fn heartbeat(&self, kind: StreamKind, n: usize) {
-        self.last_output_at_ms
-            .store(now_ms(), Ordering::Relaxed);
+        self.last_output_at_ms.store(now_ms(), Ordering::Relaxed);
         match kind {
             StreamKind::Stdout => {
-                self.stdout_bytes
-                    .fetch_add(n as u64, Ordering::Relaxed);
+                self.stdout_bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
             StreamKind::Stderr => {
-                self.stderr_bytes
-                    .fetch_add(n as u64, Ordering::Relaxed);
+                self.stderr_bytes.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
     }

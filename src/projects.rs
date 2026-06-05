@@ -894,7 +894,11 @@ mod tests {
             ])
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         let worktree_canon = worktree.canonicalize().unwrap();
 
         let registered = vec![ProjectRecord {

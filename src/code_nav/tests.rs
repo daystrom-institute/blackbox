@@ -1456,17 +1456,18 @@ fn test_code_symbols_resolves_managed_fleet_worktree_to_base() {
         ],
     );
     let worktree = worktree.canonicalize().unwrap();
-    fs::write(
-        worktree.join("Test.java"),
-        "class Test { void run() {} }\n",
-    )
-    .unwrap();
+    fs::write(worktree.join("Test.java"), "class Test { void run() {} }\n").unwrap();
 
     // Register only the base repo.
     let registered = vec![ProjectRecord {
         project_id: "base-project".to_string(),
         repo_id: None,
-        canonical_path: base.path().canonicalize().unwrap().to_string_lossy().into_owned(),
+        canonical_path: base
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned(),
         registered_at: "2026-01-01T00:00:00Z".to_string(),
         is_git_repo: true,
         languages: BTreeSet::new(),

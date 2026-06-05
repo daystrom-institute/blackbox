@@ -262,7 +262,11 @@ pub(super) fn build_body(
 /// item), so this is just the current history + tools + instructions — no
 /// streaming, no `store`, no plaintext rendering. Codex-faithful minimal shape,
 /// validated live (design/bro-harness/brodex-compaction.md §5).
-pub(super) fn build_compaction_input(input: &[Value], tools: &[ToolSpec], opts: &TurnOpts) -> Value {
+pub(super) fn build_compaction_input(
+    input: &[Value],
+    tools: &[ToolSpec],
+    opts: &TurnOpts,
+) -> Value {
     let tool_defs: Vec<Value> = tools
         .iter()
         .map(|t| {
@@ -361,10 +365,7 @@ pub(super) fn parse_sse(input: &mut Vec<Value>, sse: &str) -> Result<TurnOutput>
                 // cause so the agent loop can compact + retry rather than fail
                 // the turn. Flows through both the HTTP path and the WS path
                 // (WsOutcome::Api), since both classify via this parser.
-                if matches!(
-                    code,
-                    "context_length_exceeded" | "context_window_exceeded"
-                ) {
+                if matches!(code, "context_length_exceeded" | "context_window_exceeded") {
                     return Err(anyhow::Error::new(super::ContextWindowExceeded(
                         classify_stream_error(code, message),
                     )));
@@ -389,7 +390,10 @@ pub(super) fn parse_sse(input: &mut Vec<Value>, sse: &str) -> Result<TurnOutput>
             .iter()
             .filter(|item| {
                 item["type"].as_str() != Some("reasoning")
-                    || item.get("encrypted_content").and_then(Value::as_str).is_some()
+                    || item
+                        .get("encrypted_content")
+                        .and_then(Value::as_str)
+                        .is_some()
             })
             .cloned(),
     );
@@ -726,7 +730,11 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
         );
         s.parse_sse(sse).unwrap();
-        let reasoning: Vec<_> = s.input.iter().filter(|i| i["type"] == "reasoning").collect();
+        let reasoning: Vec<_> = s
+            .input
+            .iter()
+            .filter(|i| i["type"] == "reasoning")
+            .collect();
         assert_eq!(reasoning.len(), 1);
         assert_eq!(reasoning[0]["encrypted_content"], "ENC");
     }
@@ -823,7 +831,10 @@ mod tests {
         let body = build_compaction_input(
             &input,
             &tools,
-            &opts(SystemPrompt { stable: Some("BASE".into()), volatile: Some("VOL".into()) }),
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: Some("VOL".into()),
+            }),
         );
         assert_eq!(body["model"], "gpt-5-codex");
         // Stable instructions only; the volatile developer item is NOT appended
@@ -885,7 +896,9 @@ mod tests {
         let model = std::env::var("BRO_HARNESS_PROBE_MODEL")
             .unwrap_or_else(|_| "gpt-5.1-codex".to_string());
         let http = reqwest::Client::new();
-        let auth = resolve_auth(&http).await.expect("resolve auth (refreshes token)");
+        let auth = resolve_auth(&http)
+            .await
+            .expect("resolve auth (refreshes token)");
         let endpoint = http_endpoint(&auth);
         let compact_url = format!("{endpoint}/compact");
         let session_id = new_id();
@@ -906,7 +919,14 @@ mod tests {
             let headers = headers.clone();
             async move {
                 let mut rb = http.post(&url).header("content-type", "application/json");
-                rb = rb.header("accept", if sse { "text/event-stream" } else { "application/json" });
+                rb = rb.header(
+                    "accept",
+                    if sse {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                );
                 for (n, v) in &headers {
                     rb = rb.header(*n, v);
                 }
@@ -926,7 +946,10 @@ mod tests {
             true,
         )
         .await;
-        eprintln!("\n[probe 1] NORMAL /responses -> {st}\n{}", head(&body, 800));
+        eprintln!(
+            "\n[probe 1] NORMAL /responses -> {st}\n{}",
+            head(&body, 800)
+        );
 
         // 2. Unary /responses/compact — CompactionInput shape.
         let (st, body2) = send(
@@ -936,7 +959,10 @@ mod tests {
             false,
         )
         .await;
-        eprintln!("\n[probe 2] UNARY /responses/compact -> {st}\n{}", head(&body2, 1500));
+        eprintln!(
+            "\n[probe 2] UNARY /responses/compact -> {st}\n{}",
+            head(&body2, 1500)
+        );
 
         // 3. Streaming compaction_trigger on /responses.
         let mut trig = convo.as_array().unwrap().clone();
@@ -948,7 +974,10 @@ mod tests {
             true,
         )
         .await;
-        eprintln!("\n[probe 3] STREAM compaction_trigger -> {st}\n{}", head(&body3, 1200));
+        eprintln!(
+            "\n[probe 3] STREAM compaction_trigger -> {st}\n{}",
+            head(&body3, 1200)
+        );
 
         // 4. REPLAY: feed the unary-compacted output (incl. the encrypted
         // compaction_summary) back as input + a fresh user turn. Proves the
@@ -982,7 +1011,10 @@ mod tests {
                     .filter_map(|e| e["delta"].as_str().map(str::to_string))
                     .collect();
                 eprintln!("[probe 4] model answer: {}", head(&answer, 400));
-                eprintln!("[probe 4] mentions BANANA-7: {}", answer.contains("BANANA-7"));
+                eprintln!(
+                    "[probe 4] mentions BANANA-7: {}",
+                    answer.contains("BANANA-7")
+                );
                 eprintln!("[probe 4] mentions 51: {}", answer.contains("51"));
             }
             _ => eprintln!("\n[probe 4] skipped: no output array in unary compact body"),

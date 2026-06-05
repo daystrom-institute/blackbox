@@ -76,7 +76,11 @@ impl OpenAiResponsesTransport {
 
     /// Send with transport retry, recovering from a single `401` (ChatGPT arm)
     /// by force-refreshing the codex token. Mirrors codex's reload→refresh.
-    async fn send_with_auth_recovery(&mut self, label: &str, body: &Value) -> Result<reqwest::Response> {
+    async fn send_with_auth_recovery(
+        &mut self,
+        label: &str,
+        body: &Value,
+    ) -> Result<reqwest::Response> {
         let resp = super::http::send_with_retry(label, || {
             self.apply_headers(self.http.post(&self.http_endpoint))
                 .json(body)
@@ -123,7 +127,9 @@ impl OpenAiResponsesTransport {
 
         'attempt: loop {
             attempt += 1;
-            let resp = self.send_with_auth_recovery("openai-responses", &body).await?;
+            let resp = self
+                .send_with_auth_recovery("openai-responses", &body)
+                .await?;
             let status = resp.status();
             if !status.is_success() {
                 let sse = resp.text().await.unwrap_or_default();
@@ -193,7 +199,8 @@ impl OpenAiResponsesTransport {
                                 emitted_text = true;
                             }
                         }
-                        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                        "response.reasoning_summary_text.delta"
+                        | "response.reasoning_text.delta" => {
                             if let Some(t) = ev["delta"].as_str()
                                 && !t.is_empty()
                             {
@@ -204,7 +211,10 @@ impl OpenAiResponsesTransport {
                                 }));
                             }
                         }
-                        "response.completed" | "response.incomplete" | "response.failed" | "error" => {
+                        "response.completed"
+                        | "response.incomplete"
+                        | "response.failed"
+                        | "error" => {
                             terminal_seen = true;
                         }
                         _ => {}
@@ -347,7 +357,9 @@ impl OpenAiResponsesTransport {
         let body = responses_common::build_compaction_input(&self.state.input, tools, opts);
 
         let mut resp = super::http::send_with_retry("openai-responses/compact", || {
-            self.apply_compact_headers(self.http.post(&url)).json(&body).send()
+            self.apply_compact_headers(self.http.post(&url))
+                .json(&body)
+                .send()
         })
         .await
         .context("responses compact request")?;
@@ -364,7 +376,9 @@ impl OpenAiResponsesTransport {
                 account_id: fresh.account_id,
             };
             resp = super::http::send_with_retry("openai-responses/compact", || {
-                self.apply_compact_headers(self.http.post(&url)).json(&body).send()
+                self.apply_compact_headers(self.http.post(&url))
+                    .json(&body)
+                    .send()
             })
             .await
             .context("responses compact retry")?;
@@ -527,7 +541,9 @@ mod tests {
             return;
         }
         let model = std::env::var("BRO_HARNESS_PROBE_MODEL").unwrap_or_else(|_| "gpt-5.5".into());
-        let mut tx = OpenAiResponsesTransport::from_env().await.expect("from_env (OAuth)");
+        let mut tx = OpenAiResponsesTransport::from_env()
+            .await
+            .expect("from_env (OAuth)");
         tx.set_session_id("probe-compact-e2e".into());
         tx.push_user_text("Remember the magic token KIWI-9. Acknowledge briefly.");
         tx.state.input.push(json!({
@@ -553,7 +569,10 @@ mod tests {
             summary_max_tokens: 8192,
             tool_render_cap: 2000,
         };
-        let summary = tx.compact(params, "compact", &[], &opts).await.expect("compact call");
+        let summary = tx
+            .compact(params, "compact", &[], &opts)
+            .await
+            .expect("compact call");
 
         let kinds: Vec<&str> = tx
             .state
@@ -568,7 +587,10 @@ mod tests {
         );
         assert!(summary.is_some(), "remote_compact should return a summary");
         assert!(
-            tx.state.input.iter().any(|i| i["type"] == "compaction_summary"),
+            tx.state
+                .input
+                .iter()
+                .any(|i| i["type"] == "compaction_summary"),
             "compacted history must contain a compaction_summary item"
         );
         assert!(

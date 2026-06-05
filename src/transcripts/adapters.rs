@@ -77,4 +77,3 @@ impl TranscriptAdapterRegistry {
         adapter.locate(session_id)
     }
 }
-

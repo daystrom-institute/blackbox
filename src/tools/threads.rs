@@ -24,7 +24,10 @@ impl BlackboxServer {
             // agent's branch. Resolution lives here (the adapter holds the project
             // registry); the threads store stays registry-free.
             let resolved = p.project.as_deref().and_then(|proj| {
-                crate::projects::fleet_worktree_scope_and_dir(proj, &self.state.projects.read().list())
+                crate::projects::fleet_worktree_scope_and_dir(
+                    proj,
+                    &self.state.projects.read().list(),
+                )
             });
             let mutation = {
                 let mut threads = self.state.threads.write();
@@ -66,8 +69,11 @@ impl BlackboxServer {
             // base so list-before-open (create etiquette) sees base-keyed threads
             // from inside a worktree and doesn't drive duplicate opens.
             let normalized = p.project.as_deref().and_then(|proj| {
-                crate::projects::fleet_worktree_scope_and_dir(proj, &self.state.projects.read().list())
-                    .map(|(base, _worktree)| base)
+                crate::projects::fleet_worktree_scope_and_dir(
+                    proj,
+                    &self.state.projects.read().list(),
+                )
+                .map(|(base, _worktree)| base)
             });
             match normalized {
                 Some(base) => {
@@ -91,7 +97,12 @@ mod tests {
     use std::sync::Arc;
 
     fn run_git(cwd: &Path, args: &[&str]) {
-        let out = Command::new("git").arg("-C").arg(cwd).args(args).output().unwrap();
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(args)
+            .output()
+            .unwrap();
         assert!(
             out.status.success(),
             "git {args:?} failed: {}",
@@ -152,13 +163,25 @@ mod tests {
         let worktree = tmp.path().join("wt");
         run_git(
             &base,
-            &["worktree", "add", "-b", "bro-fleet/x", worktree.to_str().unwrap(), "HEAD"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "bro-fleet/x",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
         );
         let worktree_canon = worktree.canonicalize().unwrap();
         let wt = worktree_canon.to_string_lossy().into_owned();
 
         let server = BlackboxServer::new(Arc::new(SharedState::for_test(tmp.path())));
-        server.state.projects.write().register_path(&base_canon).unwrap();
+        server
+            .state
+            .projects
+            .write()
+            .register_path(&base_canon)
+            .unwrap();
 
         // Open from the worktree.
         let open = server.bbox_thread(Parameters(ThreadParams {
@@ -174,8 +197,16 @@ mod tests {
             let t = th.all().first().expect("one thread").clone();
             (t.id, t.project, t.record_dir)
         };
-        assert_eq!(project, base_canon.to_string_lossy(), "scope must be the registered base");
-        assert_eq!(record_dir.as_deref(), Some(wt.as_str()), "write-dir must be the worktree");
+        assert_eq!(
+            project,
+            base_canon.to_string_lossy(),
+            "scope must be the registered base"
+        );
+        assert_eq!(
+            record_dir.as_deref(),
+            Some(wt.as_str()),
+            "write-dir must be the worktree"
+        );
 
         // Resolve from the worktree → record in worktree, not base.
         let resolve = server.bbox_thread(Parameters(ThreadParams {
@@ -186,11 +217,19 @@ mod tests {
         }));
         assert_ne!(resolve.is_error, Some(true), "resolve failed: {resolve:?}");
         assert!(
-            worktree_canon.join(".bbox").join("record").join(format!("{id}.json")).exists(),
+            worktree_canon
+                .join(".bbox")
+                .join("record")
+                .join(format!("{id}.json"))
+                .exists(),
             "record should be written into the worktree"
         );
         assert!(
-            !base_canon.join(".bbox").join("record").join(format!("{id}.json")).exists(),
+            !base_canon
+                .join(".bbox")
+                .join("record")
+                .join(format!("{id}.json"))
+                .exists(),
             "record must NOT be written into the base repo"
         );
 

@@ -781,7 +781,11 @@ impl Threads {
         })
     }
 
-    fn thread_resolve(&mut self, p: &ThreadParams, write_dir: Option<&str>) -> Result<ThreadMutation> {
+    fn thread_resolve(
+        &mut self,
+        p: &ThreadParams,
+        write_dir: Option<&str>,
+    ) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
 
         let thread = self
@@ -812,9 +816,10 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some((root, path))) => {
-                Some(crate::util::repo_artifact_rider(&root.to_string_lossy(), &path))
-            }
+            Ok(Some((root, path))) => Some(crate::util::repo_artifact_rider(
+                &root.to_string_lossy(),
+                &path,
+            )),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -834,7 +839,11 @@ impl Threads {
         })
     }
 
-    fn thread_promote(&mut self, p: &ThreadParams, write_dir: Option<&str>) -> Result<ThreadMutation> {
+    fn thread_promote(
+        &mut self,
+        p: &ThreadParams,
+        write_dir: Option<&str>,
+    ) -> Result<ThreadMutation> {
         let id = self.resolve_thread_id(p)?;
         let promoted_to = p
             .promoted_to
@@ -869,9 +878,10 @@ impl Threads {
 
         self.save()?;
         let record_rider = match write_thread_record(&thread_for_embed) {
-            Ok(Some((root, path))) => {
-                Some(crate::util::repo_artifact_rider(&root.to_string_lossy(), &path))
-            }
+            Ok(Some((root, path))) => Some(crate::util::repo_artifact_rider(
+                &root.to_string_lossy(),
+                &path,
+            )),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!("thread record write for {id}: {e:#}");
@@ -1305,7 +1315,11 @@ mod tests {
         let wt = worktree_root.to_string_lossy().into_owned();
         let mut threads = Threads::open(&dir.path().join("threads.json")).unwrap();
 
-        let id = open_thread_id(&mut threads, "audit the dispatch path", &base_root.to_string_lossy());
+        let id = open_thread_id(
+            &mut threads,
+            "audit the dispatch path",
+            &base_root.to_string_lossy(),
+        );
         let msg = threads
             .thread_mutation(
                 &ThreadParams {
@@ -1318,9 +1332,19 @@ mod tests {
             .unwrap()
             .message;
 
-        let in_worktree = worktree_root.join(".bbox").join("record").join(format!("{id}.json"));
-        let in_base = base_root.join(".bbox").join("record").join(format!("{id}.json"));
-        assert!(in_worktree.exists(), "record should land in the worktree: {}", in_worktree.display());
+        let in_worktree = worktree_root
+            .join(".bbox")
+            .join("record")
+            .join(format!("{id}.json"));
+        let in_base = base_root
+            .join(".bbox")
+            .join("record")
+            .join(format!("{id}.json"));
+        assert!(
+            in_worktree.exists(),
+            "record should land in the worktree: {}",
+            in_worktree.display()
+        );
         assert!(!in_base.exists(), "record must NOT land in the base repo");
         // Rider is worktree-relative and actionable from the worktree cwd.
         assert!(
@@ -1350,16 +1374,31 @@ mod tests {
                 Some(gone.to_string_lossy().as_ref()),
             )
             .unwrap();
-        let id = open_msg.message.split_whitespace().nth(2).unwrap().to_string();
+        let id = open_msg
+            .message
+            .split_whitespace()
+            .nth(2)
+            .unwrap()
+            .to_string();
 
         let msg = threads
-            .thread(&ThreadParams { id: Some(id.clone()), ..params("resolve") })
+            .thread(&ThreadParams {
+                id: Some(id.clone()),
+                ..params("resolve")
+            })
             .unwrap();
         assert!(
-            base_root.join(".bbox").join("record").join(format!("{id}.json")).exists(),
+            base_root
+                .join(".bbox")
+                .join("record")
+                .join(format!("{id}.json"))
+                .exists(),
             "stale worktree record_dir should fall back to base, not silently drop"
         );
-        assert!(msg.contains(".bbox/record/"), "rider expected on fallback write: {msg}");
+        assert!(
+            msg.contains(".bbox/record/"),
+            "rider expected on fallback write: {msg}"
+        );
     }
 
     #[test]

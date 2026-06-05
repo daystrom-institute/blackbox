@@ -719,7 +719,8 @@ async fn ensure_council_instances(
     team: &str,
     channel: &str,
 ) -> Result<()> {
-    let roster: TeamMembersResponse = get_json(client, daemon, &format!("control/team/{team}")).await?;
+    let roster: TeamMembersResponse =
+        get_json(client, daemon, &format!("control/team/{team}")).await?;
     let mut used = HashSet::new();
     let mut to_spawn = Vec::new();
 

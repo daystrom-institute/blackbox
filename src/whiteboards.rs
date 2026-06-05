@@ -1559,11 +1559,21 @@ mod tests {
         let r = fresh_registry();
         r.open("b1", "topic", "/proj", None, "fac").unwrap();
         r.register("b1", "fac", Role::Facilitator, "ops").unwrap();
-        r.register("b1", "v", Role::Specialist, "validator").unwrap();
+        r.register("b1", "v", Role::Specialist, "validator")
+            .unwrap();
         for lens in ["l1", "l2", "l3"] {
             r.register("b1", lens, Role::Specialist, "lens").unwrap();
             r.post(
-                "b1", lens, PostType::Claim, lens, "body", None, None, None, vec![], vec![],
+                "b1",
+                lens,
+                PostType::Claim,
+                lens,
+                "body",
+                None,
+                None,
+                None,
+                vec![],
+                vec![],
             )
             .unwrap();
         }
@@ -1576,13 +1586,23 @@ mod tests {
     fn post_standing_precedence() {
         let r = board_in_validate();
         r.annotate(
-            "b1", "v", "post-001", AnnotationType::Validation, "ok",
-            Some(ValidationResult::Confirmed), None,
+            "b1",
+            "v",
+            "post-001",
+            AnnotationType::Validation,
+            "ok",
+            Some(ValidationResult::Confirmed),
+            None,
         )
         .unwrap();
         r.annotate(
-            "b1", "v", "post-002", AnnotationType::Validation, "nope",
-            Some(ValidationResult::Refuted), None,
+            "b1",
+            "v",
+            "post-002",
+            AnnotationType::Validation,
+            "nope",
+            Some(ValidationResult::Refuted),
+            None,
         )
         .unwrap();
         let arc = r.get("b1").unwrap();
@@ -1596,15 +1616,61 @@ mod tests {
     #[test]
     fn post_standing_refuted_wins_and_confirmed_beats_inconclusive() {
         let r = board_in_validate();
-        r.register("b1", "v2", Role::Specialist, "validator").unwrap();
+        r.register("b1", "v2", Role::Specialist, "validator")
+            .unwrap();
         // post-001: confirmed + refuted → Excluded (refuted is dispositive).
-        r.annotate("b1", "v", "post-001", AnnotationType::Validation, "c", Some(ValidationResult::Confirmed), None).unwrap();
-        r.annotate("b1", "v2", "post-001", AnnotationType::Validation, "r", Some(ValidationResult::Refuted), None).unwrap();
+        r.annotate(
+            "b1",
+            "v",
+            "post-001",
+            AnnotationType::Validation,
+            "c",
+            Some(ValidationResult::Confirmed),
+            None,
+        )
+        .unwrap();
+        r.annotate(
+            "b1",
+            "v2",
+            "post-001",
+            AnnotationType::Validation,
+            "r",
+            Some(ValidationResult::Refuted),
+            None,
+        )
+        .unwrap();
         // post-002: confirmed + inconclusive → Confirmed.
-        r.annotate("b1", "v", "post-002", AnnotationType::Validation, "c", Some(ValidationResult::Confirmed), None).unwrap();
-        r.annotate("b1", "v2", "post-002", AnnotationType::Validation, "i", Some(ValidationResult::Inconclusive), None).unwrap();
+        r.annotate(
+            "b1",
+            "v",
+            "post-002",
+            AnnotationType::Validation,
+            "c",
+            Some(ValidationResult::Confirmed),
+            None,
+        )
+        .unwrap();
+        r.annotate(
+            "b1",
+            "v2",
+            "post-002",
+            AnnotationType::Validation,
+            "i",
+            Some(ValidationResult::Inconclusive),
+            None,
+        )
+        .unwrap();
         // post-003: inconclusive only → Inconclusive.
-        r.annotate("b1", "v", "post-003", AnnotationType::Validation, "i", Some(ValidationResult::Inconclusive), None).unwrap();
+        r.annotate(
+            "b1",
+            "v",
+            "post-003",
+            AnnotationType::Validation,
+            "i",
+            Some(ValidationResult::Inconclusive),
+            None,
+        )
+        .unwrap();
         let arc = r.get("b1").unwrap();
         let b = arc.read();
         assert_eq!(b.post_standing("post-001"), PostStanding::Excluded);
@@ -1615,8 +1681,26 @@ mod tests {
     #[test]
     fn validation_summary_partitions_surviving_and_excluded() {
         let r = board_in_validate();
-        r.annotate("b1", "v", "post-001", AnnotationType::Validation, "c", Some(ValidationResult::Confirmed), None).unwrap();
-        r.annotate("b1", "v", "post-002", AnnotationType::Validation, "r", Some(ValidationResult::Refuted), None).unwrap();
+        r.annotate(
+            "b1",
+            "v",
+            "post-001",
+            AnnotationType::Validation,
+            "c",
+            Some(ValidationResult::Confirmed),
+            None,
+        )
+        .unwrap();
+        r.annotate(
+            "b1",
+            "v",
+            "post-002",
+            AnnotationType::Validation,
+            "r",
+            Some(ValidationResult::Refuted),
+            None,
+        )
+        .unwrap();
         // post-003 left unvalidated.
         let arc = r.get("b1").unwrap();
         let vs = arc.read().validation_summary();
@@ -1639,8 +1723,26 @@ mod tests {
         let arc = r.get("b1").unwrap();
         assert_eq!(arc.read().unreviewed_post_count(), 3);
         // l2 challenges post-001, l3 corroborates post-002 → only post-003 unreviewed.
-        r.annotate("b1", "l2", "post-001", AnnotationType::Challenge, "disagree", None, None).unwrap();
-        r.annotate("b1", "l3", "post-002", AnnotationType::Corroborate, "agree", None, None).unwrap();
+        r.annotate(
+            "b1",
+            "l2",
+            "post-001",
+            AnnotationType::Challenge,
+            "disagree",
+            None,
+            None,
+        )
+        .unwrap();
+        r.annotate(
+            "b1",
+            "l3",
+            "post-002",
+            AnnotationType::Corroborate,
+            "agree",
+            None,
+            None,
+        )
+        .unwrap();
         let arc = r.get("b1").unwrap();
         assert_eq!(arc.read().unreviewed_post_count(), 1);
     }

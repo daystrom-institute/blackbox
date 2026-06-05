@@ -123,7 +123,11 @@ pub(crate) fn current_branch(root: &Path) -> Option<String> {
 /// base project. Returns `None` when `cwd` is not in a git repo or the path can't
 /// be canonicalized.
 pub(crate) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
-    let output = git_output(cwd, &["rev-parse", "--git-common-dir"], "resolving git common dir")?;
+    let output = git_output(
+        cwd,
+        &["rev-parse", "--git-common-dir"],
+        "resolving git common dir",
+    )?;
     if !output.status.success() {
         return None;
     }
@@ -133,7 +137,11 @@ pub(crate) fn git_common_dir(cwd: &Path) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(raw);
-    let path = if path.is_absolute() { path } else { cwd.join(path) };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
     std::fs::canonicalize(path).ok()
 }
 

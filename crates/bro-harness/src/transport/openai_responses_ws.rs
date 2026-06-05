@@ -147,7 +147,11 @@ impl WsChannel {
 
     /// Incremental `input` delta vs. the server's known state, or `None` to
     /// full-replay. Faithful to codex's `get_incremental_items`.
-    fn compute_delta(&self, current_input: &[Value], current_nonfields: &Value) -> Option<Vec<Value>> {
+    fn compute_delta(
+        &self,
+        current_input: &[Value],
+        current_nonfields: &Value,
+    ) -> Option<Vec<Value>> {
         self.last_response_id.as_ref()?;
         let last_input = self.last_full_input.as_ref()?;
         if self.last_nonfields.as_ref() != Some(current_nonfields) {
@@ -196,7 +200,9 @@ impl WsChannel {
             frame["type"] = json!("response.create");
             let frame_text = match serde_json::to_string(&frame) {
                 Ok(t) => t,
-                Err(e) => return WsOutcome::Api(anyhow::Error::new(e).context("serialize ws frame")),
+                Err(e) => {
+                    return WsOutcome::Api(anyhow::Error::new(e).context("serialize ws frame"));
+                }
             };
 
             // Ensure a connection.
@@ -333,7 +339,9 @@ impl WsChannel {
             }
 
             if fault.is_none() && !terminal_seen {
-                fault = Some(anyhow::anyhow!("websocket stream closed before a terminal event"));
+                fault = Some(anyhow::anyhow!(
+                    "websocket stream closed before a terminal event"
+                ));
             }
 
             if let Some(err) = fault {
@@ -401,7 +409,10 @@ mod tests {
     #[test]
     fn no_delta_without_a_prior_response() {
         let c = channel();
-        assert!(c.compute_delta(&[item("a")], &json!({"model": "m"})).is_none());
+        assert!(
+            c.compute_delta(&[item("a")], &json!({"model": "m"}))
+                .is_none()
+        );
     }
 
     #[test]

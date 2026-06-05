@@ -288,7 +288,8 @@ pub(super) fn write_pathology_plan(
         ),
         // Validator-refuted findings are excluded from the remediation slices
         // above and recorded here for audit (omitted when nothing was refuted).
-        refuted = pathology_optional_findings_section(plan.get("refuted_findings"), "Refuted Findings"),
+        refuted =
+            pathology_optional_findings_section(plan.get("refuted_findings"), "Refuted Findings"),
         deferred = pathology_markdown(
             plan.get("deferred"),
             "No deferred candidates were recorded."
@@ -421,10 +422,16 @@ pub(super) fn pathology_findings_markdown(value: Option<&Value>, fallback: &str)
 pub(super) fn pathology_optional_findings_section(value: Option<&Value>, heading: &str) -> String {
     match value {
         Some(Value::String(s)) if !s.trim().is_empty() => {
-            format!("## {heading}\n\n{}\n\n", pathology_findings_markdown(value, ""))
+            format!(
+                "## {heading}\n\n{}\n\n",
+                pathology_findings_markdown(value, "")
+            )
         }
         Some(Value::Array(items)) if !items.is_empty() => {
-            format!("## {heading}\n\n{}\n\n", pathology_findings_markdown(value, ""))
+            format!(
+                "## {heading}\n\n{}\n\n",
+                pathology_findings_markdown(value, "")
+            )
         }
         _ => String::new(),
     }
