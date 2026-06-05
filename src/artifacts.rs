@@ -19,6 +19,7 @@ pub enum ArtifactKind {
     Brofile,
     Agent,
     Atom,
+    Cell,
     Team,
     Cron,
 }
@@ -31,6 +32,7 @@ impl ArtifactKind {
             Self::Brofile => "brofile",
             Self::Agent => "agent",
             Self::Atom => "atom",
+            Self::Cell => "cell",
             Self::Team => "team",
             Self::Cron => "cron",
         }
@@ -356,6 +358,7 @@ impl ArtifactCatalog {
                 ArtifactKind::Brofile,
                 ArtifactKind::Agent,
                 ArtifactKind::Atom,
+                ArtifactKind::Cell,
                 ArtifactKind::Team,
                 ArtifactKind::Cron,
             ],
@@ -1095,6 +1098,7 @@ pub fn artifact_kind_from_dir_pub(component: &str) -> Option<ArtifactKind> {
         "brofiles" => Some(ArtifactKind::Brofile),
         "agents" => Some(ArtifactKind::Agent),
         "atoms" => Some(ArtifactKind::Atom),
+        "cells" => Some(ArtifactKind::Cell),
         "teams" => Some(ArtifactKind::Team),
         "crons" => Some(ArtifactKind::Cron),
         _ => None,
@@ -1107,6 +1111,7 @@ fn artifact_name(kind: ArtifactKind, value: &Value) -> Option<String> {
         | ArtifactKind::Brofile
         | ArtifactKind::Agent
         | ArtifactKind::Atom
+        | ArtifactKind::Cell
         | ArtifactKind::Team
         | ArtifactKind::Cron => value.get("name")?.as_str().map(str::to_string),
         ArtifactKind::Packet => value.get("domain")?.as_str().map(str::to_string),

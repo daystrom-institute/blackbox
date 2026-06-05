@@ -13,7 +13,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CellLoadOutput, CellLoadRequest,
+    CellRegisterOutput, CellRegisterRequest, CellRegistryCapability, CorpusCapability, CorpusHit,
     CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
@@ -83,6 +84,29 @@ impl AtomCapability for DaemonAtoms {
         Ok(AtomOutput {
             output_json: output,
         })
+    }
+}
+
+/// Cell registry backed by the daemon's artifact catalog. This is deliberately
+/// separate from `orchestration::atoms`: cells replace the atom backend taxonomy;
+/// `atom:` survives only as an exact handle shape.
+pub(crate) struct DaemonCells {
+    pub(crate) state: Arc<SharedState>,
+}
+
+#[async_trait]
+impl CellRegistryCapability for DaemonCells {
+    async fn register_cell(
+        &self,
+        request: CellRegisterRequest,
+    ) -> CapabilityResult<CellRegisterOutput> {
+        crate::cells::register_cell(&self.state.artifacts.read(), request)
+            .map_err(|e| BroError::new("cell_register_failed", e.to_string()))
+    }
+
+    async fn load_cell(&self, request: CellLoadRequest) -> CapabilityResult<CellLoadOutput> {
+        crate::cells::load_cell(&self.state.artifacts.read(), request)
+            .map_err(|e| BroError::new("cell_load_failed", e.to_string()))
     }
 }
 
@@ -168,6 +192,9 @@ pub(crate) fn install(state: &Arc<SharedState>) {
     bro_harness::capabilities::install_atoms(Arc::new(DaemonAtoms {
         state: state.clone(),
     }));
+    bro_harness::capabilities::install_cells(Arc::new(DaemonCells {
+        state: state.clone(),
+    }));
     bro_harness::capabilities::install_refactor(Arc::new(DaemonRefactor::new(state.clone())));
 }
 
@@ -213,6 +240,43 @@ mod tests {
             .await;
         let err = result.expect_err("unknown atom must error");
         assert_eq!(err.code, "atom_invoke_failed");
+    }
+
+    #[tokio::test]
+    async fn daemon_cells_registers_and_loads_catalog_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(SharedState::for_test(dir.path()));
+        let cells = DaemonCells {
+            state: state.clone(),
+        };
+        let registered = cells
+            .register_cell(CellRegisterRequest {
+                name: "math/double".to_string(),
+                version: "v1".to_string(),
+                source: "function run(input) { return input.n * 2; }".to_string(),
+                contract_json: serde_json::json!({
+                    "entry": "run",
+                    "input": { "type": "object" },
+                    "output": { "type": "integer" }
+                }),
+                description: Some("double an integer".to_string()),
+                supersedes: None,
+            })
+            .await
+            .expect("register cell");
+        assert_eq!(registered.handle, "atom:math/double@v1");
+        assert_eq!(registered.artifact_ref, "cell:math/double@v1");
+
+        let loaded = cells
+            .load_cell(CellLoadRequest {
+                handle: "atom:math/double@v1".to_string(),
+            })
+            .await
+            .expect("load cell");
+        assert_eq!(loaded.name, "math/double");
+        assert_eq!(loaded.version, "v1");
+        assert!(loaded.source.contains("input.n * 2"));
+        assert_eq!(loaded.contract_json["entry"], "run");
     }
 
     /// A bogus plan kind drives the real plan dispatch and surfaces its error —

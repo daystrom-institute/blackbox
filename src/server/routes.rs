@@ -1180,6 +1180,23 @@ pub(crate) async fn install_artifact_value(
             };
             orchestration::atoms::validate::validate_atom_install(&value, &ctx)?;
         }
+        artifacts::ArtifactKind::Cell => {
+            if !value.is_object() {
+                anyhow::bail!("cell artifact must be a JSON object");
+            }
+            let artifact: crate::cells::CellArtifact = serde_json::from_value(value.clone())?;
+            if artifact.kind != "cell" {
+                anyhow::bail!("cell artifact kind must be `cell`");
+            }
+            if artifact
+                .contract
+                .get("entry")
+                .and_then(Value::as_str)
+                .is_none()
+            {
+                anyhow::bail!("cell artifact contract.entry is required");
+            }
+        }
     }
     let mut meta = state
         .artifacts
@@ -1435,6 +1452,9 @@ pub(crate) fn deactivate_artifact(
         }
         artifacts::ArtifactKind::Atom => {
             // No separate registry to deactivate for atoms (yet).
+        }
+        artifacts::ArtifactKind::Cell => {
+            // Cells are stored purely as catalog artifacts in v1.
         }
         artifacts::ArtifactKind::Team => {
             // Teams are stored purely as artifacts; no separate registry to deactivate.

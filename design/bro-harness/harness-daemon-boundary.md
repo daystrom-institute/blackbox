@@ -733,9 +733,16 @@ before relying on any line here.
   `narf_prepare` now accepts an optional declared `contract`, validates its
   `entry` identifier, validates `input`/`output` with JSON Schema Draft 2020-12,
   echoes the contract in `PrepareResponse`, and keeps it with the prepared
-  script for the later register/invoke verbs. The harness tool schema exposes the
-  same field. This is not yet `narf_register` or invoke-time input/output
-  enforcement; those remain the next typed-cell steps.
+  script for later register/invoke verbs. The harness tool schema exposes the
+  same field. The reusable register/invoke enforcement slice is now recorded
+  below; durable workflow enforcement remains a later typed-cell step.
+- **Reusable typed-cell registration (A2 reusable slice).** `narf_register`
+  persists reviewed prepared source+contract through a new contract-bottom
+  `CellRegistryCapability` into `ArtifactKind::Cell`; `narf_run` can execute
+  either a prepared handle or a registered exact handle, validating input/output
+  against the stored contract. This is intentionally a cell registry, not an
+  atom backend. Durable workflow registration, scheduling, `narf.wait`, and
+  parked-arc restart persistence remain separate follow-up slices.
 
 The whole stack was exercised live through the real fleet TUI (tmux): a dispatch
 flows TUI → `/control/exec` → in-process harness (task-local identity, `--cwd`,

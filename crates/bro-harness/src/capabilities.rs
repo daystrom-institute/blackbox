@@ -16,13 +16,14 @@ use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, CapabilityResult, CorpusCapability, CorpusLookup, KvCapability,
-    KvEntry, KvEntryInfo, KvGet, KvOrigin, KvSummary, RefactorCapability, RefactorRequest,
-    ToolCallOutput, ToolCapability, ToolInvocation,
+    AtomCapability, AtomInvocation, CapabilityResult, CellLoadRequest, CellRegisterRequest,
+    CellRegistryCapability, CorpusCapability, CorpusLookup, KvCapability, KvEntry, KvEntryInfo,
+    KvGet, KvOrigin, KvSummary, RefactorCapability, RefactorRequest, ToolCallOutput,
+    ToolCapability, ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const DEFAULT_KV_GET_MAX_BYTES: usize = 256 * 1024;
 const KV_SUMMARY_LINES: usize = 2;
@@ -34,6 +35,7 @@ const KV_SUMMARY_LINE_BYTES: usize = 160;
 /// pulled — the harness keeps no dependency on the daemon.
 static CORPUS: RwLock<Option<Arc<dyn CorpusCapability>>> = RwLock::new(None);
 static ATOMS: RwLock<Option<Arc<dyn AtomCapability>>> = RwLock::new(None);
+static CELLS: RwLock<Option<Arc<dyn CellRegistryCapability>>> = RwLock::new(None);
 static REFACTOR: RwLock<Option<Arc<dyn RefactorCapability>>> = RwLock::new(None);
 
 /// Install the daemon's in-memory corpus implementation. Called once, at daemon
@@ -46,6 +48,13 @@ pub fn install_corpus(capability: Arc<dyn CorpusCapability>) {
 /// startup, from the `blackbox` crate. Last writer wins.
 pub fn install_atoms(capability: Arc<dyn AtomCapability>) {
     *ATOMS.write().expect("atom capability slot poisoned") = Some(capability);
+}
+
+/// Install the daemon's cell registry implementation. Cells are the primary
+/// typed-cell abstraction; `atom:` is only an exact handle shape that may resolve
+/// to a cell.
+pub fn install_cells(capability: Arc<dyn CellRegistryCapability>) {
+    *CELLS.write().expect("cell capability slot poisoned") = Some(capability);
 }
 
 /// Install the daemon's in-memory refactor implementation. Called once, at
@@ -63,6 +72,10 @@ fn corpus() -> Option<Arc<dyn CorpusCapability>> {
 
 fn atoms() -> Option<Arc<dyn AtomCapability>> {
     ATOMS.read().expect("atom capability slot poisoned").clone()
+}
+
+fn cells() -> Option<Arc<dyn CellRegistryCapability>> {
+    CELLS.read().expect("cell capability slot poisoned").clone()
 }
 
 fn refactor() -> Option<Arc<dyn RefactorCapability>> {
@@ -320,6 +333,7 @@ pub fn capability_tools(
         tools.push(Arc::new(CorpusSearchTool(c)));
     }
     let atom_cap = atoms();
+    let cell_cap = cells();
     let refactor_cap = refactor();
     if let Some(a) = atom_cap.clone() {
         tools.push(Arc::new(AtomInvokeTool(a)));
@@ -337,13 +351,25 @@ pub fn capability_tools(
         // One shared per-session runtime behind the four model-facing NARF
         // controls, so helpers + prepared scripts persist across exec/prepare/
         // run/define (box-edge invariant, narf-capability-library.md §0.1).
-        let session = Arc::new(NarfSession::new(atoms, refactor, host_tools, kv));
+        let session = Arc::new(NarfSession::new(
+            atoms,
+            cell_cap.clone(),
+            refactor,
+            host_tools,
+            kv,
+        ));
         tools.push(Arc::new(NarfExecTool {
             session: session.clone(),
         }));
         tools.push(Arc::new(NarfPrepareTool {
             session: session.clone(),
         }));
+        if let Some(cells) = cell_cap {
+            tools.push(Arc::new(NarfRegisterTool {
+                session: session.clone(),
+                cells,
+            }));
+        }
         tools.push(Arc::new(NarfRunTool {
             session: session.clone(),
         }));
@@ -666,6 +692,7 @@ impl Tool for NarfKvGetTool {
 /// controls are model-facing tools, never in-box `narf.*` bindings.
 struct NarfSession {
     atoms: Arc<dyn AtomCapability>,
+    cells: Option<Arc<dyn CellRegistryCapability>>,
     refactor: Arc<dyn RefactorCapability>,
     tools: Option<Arc<dyn ToolCapability>>,
     kv: Arc<dyn KvCapability>,
@@ -675,12 +702,14 @@ struct NarfSession {
 impl NarfSession {
     fn new(
         atoms: Arc<dyn AtomCapability>,
+        cells: Option<Arc<dyn CellRegistryCapability>>,
         refactor: Arc<dyn RefactorCapability>,
         tools: Option<Arc<dyn ToolCapability>>,
         kv: Arc<dyn KvCapability>,
     ) -> Self {
         Self {
             atoms,
+            cells,
             refactor,
             tools,
             kv,
@@ -844,6 +873,130 @@ impl Tool for NarfPrepareTool {
     }
 }
 
+/// `narf_register`: persist a reviewed prepared cell (source + declared
+/// contract) in the daemon's cell registry. This writes a cell artifact, not an
+/// atom backend; the returned `atom:` handle is compatibility syntax for exact
+/// invocation only.
+struct NarfRegisterTool {
+    session: Arc<NarfSession>,
+    cells: Arc<dyn CellRegistryCapability>,
+}
+
+#[async_trait]
+impl Tool for NarfRegisterTool {
+    fn name(&self) -> &str {
+        "narf_register"
+    }
+
+    fn description(&self) -> &str {
+        "Register a reviewed prepared NARF typed cell as a reusable cell. Takes {ref,name,version?,description?,supersedes?}; persists source+contract and returns an exact invocation handle."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Prepared script handle returned by narf_prepare."
+                },
+                "name": {
+                    "type": "string",
+                    "description": "Stable reusable cell name."
+                },
+                "version": {
+                    "type": "string",
+                    "description": "Cell version (default v1)."
+                },
+                "description": {
+                    "type": "string",
+                    "description": "Human review description."
+                },
+                "supersedes": {
+                    "type": "string",
+                    "description": "Previous cell name superseded by this install."
+                }
+            },
+            "required": ["ref", "name"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let prepared_ref = match input.get("ref").and_then(Value::as_str) {
+            Some(r) if !r.trim().is_empty() => r.to_string(),
+            _ => return ToolResult::Error("narf_register: `ref` is required".into()),
+        };
+        let name = match input.get("name").and_then(Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.to_string(),
+            _ => return ToolResult::Error("narf_register: `name` is required".into()),
+        };
+        let version = input
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("v1")
+            .to_string();
+        let description = input
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+        let supersedes = input
+            .get("supersedes")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+
+        let guard = match self.session.ensure().await {
+            Ok(g) => g,
+            Err(e) => return ToolResult::Error(e),
+        };
+        let prepared = match guard
+            .as_ref()
+            .expect("runtime")
+            .prepared(prepared_ref)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => return ToolResult::Error(format!("narf_register failed: {e:#}")),
+        };
+        let contract = match prepared.contract {
+            Some(c) => c,
+            None => {
+                return ToolResult::Error(
+                    "narf_register: prepared script has no declared contract".into(),
+                );
+            }
+        };
+        let contract_json = match serde_json::to_value(contract) {
+            Ok(v) => v,
+            Err(e) => {
+                return ToolResult::Error(format!("narf_register contract serialize failed: {e}"));
+            }
+        };
+        drop(guard);
+
+        let request = CellRegisterRequest {
+            name,
+            version,
+            source: prepared.source,
+            contract_json,
+            description,
+            supersedes,
+        };
+        match self.cells.register_cell(request).await {
+            Ok(out) => ToolResult::Json(json!({
+                "status": "registered",
+                "handle": out.handle,
+                "artifact_ref": out.artifact_ref,
+                "name": out.name,
+                "version": out.version,
+            })),
+            Err(e) => ToolResult::Error(format!("narf_register failed: {}: {}", e.code, e.message)),
+        }
+    }
+}
+
 /// `narf_run`: execute a prepared script by handle and return its result.
 /// Model-facing replacement for the mislayered in-box `narf.run`.
 struct NarfRunTool {
@@ -857,14 +1010,15 @@ impl Tool for NarfRunTool {
     }
 
     fn description(&self) -> &str {
-        "Run a prepared NARF script by its handle (from narf_prepare); returns the script's result value."
+        "Run a prepared NARF script handle, or run a registered exact cell handle with optional input; returns the result value."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "ref": { "type": "string", "description": "Prepared script handle." }
+                "ref": { "type": "string", "description": "Prepared script handle or registered cell handle." },
+                "input": { "description": "Input JSON for a registered contracted cell." }
             },
             "required": ["ref"]
         })
@@ -875,11 +1029,52 @@ impl Tool for NarfRunTool {
             Some(h) if !h.trim().is_empty() => h.to_string(),
             _ => return ToolResult::Error("narf_run: `ref` is required".into()),
         };
+        if handle.starts_with("narf-script:") {
+            let guard = match self.session.ensure().await {
+                Ok(g) => g,
+                Err(e) => return ToolResult::Error(e),
+            };
+            return match guard.as_ref().expect("runtime").run(handle).await {
+                Ok(output) => narf_result(output),
+                Err(e) => ToolResult::Error(format!("narf_run failed: {e:#}")),
+            };
+        }
+
+        let cells = match self.session.cells.clone() {
+            Some(c) => c,
+            None => {
+                return ToolResult::Error(
+                    "narf_run: registered cell registry is not installed".into(),
+                );
+            }
+        };
+        let input_json = input.get("input").cloned().unwrap_or(Value::Null);
+        let loaded = match cells
+            .load_cell(CellLoadRequest {
+                handle: handle.clone(),
+            })
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return ToolResult::Error(format!("narf_run failed: {}: {}", e.code, e.message));
+            }
+        };
+        let contract: bro_script::CellContract = match serde_json::from_value(loaded.contract_json)
+        {
+            Ok(c) => c,
+            Err(e) => return ToolResult::Error(format!("narf_run contract parse failed: {e}")),
+        };
         let guard = match self.session.ensure().await {
             Ok(g) => g,
             Err(e) => return ToolResult::Error(e),
         };
-        match guard.as_ref().expect("runtime").run(handle).await {
+        match guard
+            .as_ref()
+            .expect("runtime")
+            .call_cell(loaded.source, contract, input_json)
+            .await
+        {
             Ok(output) => narf_result(output),
             Err(e) => ToolResult::Error(format!("narf_run failed: {e:#}")),
         }
@@ -933,7 +1128,10 @@ impl Tool for NarfDefineTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bro_capabilities::{AtomOutput, CapabilityResult, CorpusHit, RefactorPlanHandle};
+    use bro_capabilities::{
+        AtomOutput, CapabilityResult, CellLoadOutput, CellRegisterOutput, CorpusHit,
+        RefactorPlanHandle,
+    };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Stub capability that records invocations — proves the tool dispatches to
@@ -1010,6 +1208,48 @@ mod tests {
                     "echo": invocation.input_json,
                 }),
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct StubCells {
+        cells: std::sync::Mutex<std::collections::HashMap<String, CellLoadOutput>>,
+    }
+
+    #[async_trait]
+    impl CellRegistryCapability for StubCells {
+        async fn register_cell(
+            &self,
+            request: CellRegisterRequest,
+        ) -> CapabilityResult<CellRegisterOutput> {
+            let handle = format!("atom:{}@{}", request.name, request.version);
+            let artifact_ref = format!("cell:{}@{}", request.name, request.version);
+            self.cells.lock().unwrap().insert(
+                handle.clone(),
+                CellLoadOutput {
+                    handle: handle.clone(),
+                    artifact_ref: artifact_ref.clone(),
+                    name: request.name.clone(),
+                    version: request.version.clone(),
+                    source: request.source,
+                    contract_json: request.contract_json,
+                },
+            );
+            Ok(CellRegisterOutput {
+                handle,
+                artifact_ref,
+                name: request.name,
+                version: request.version,
+            })
+        }
+
+        async fn load_cell(&self, request: CellLoadRequest) -> CapabilityResult<CellLoadOutput> {
+            self.cells
+                .lock()
+                .unwrap()
+                .get(&request.handle)
+                .cloned()
+                .ok_or_else(|| bro_core::BroError::new("unknown_cell", request.handle))
         }
     }
 
@@ -1116,8 +1356,19 @@ mod tests {
     ) -> Arc<NarfSession> {
         Arc::new(NarfSession::new(
             atoms,
+            None,
             Arc::new(StubRefactor::default()),
             tools,
+            Arc::new(KvStore::default()),
+        ))
+    }
+
+    fn narf_session_with_cells(cells: Arc<dyn CellRegistryCapability>) -> Arc<NarfSession> {
+        Arc::new(NarfSession::new(
+            Arc::new(StubAtoms),
+            Some(cells),
+            Arc::new(StubRefactor::default()),
+            None,
             Arc::new(KvStore::default()),
         ))
     }
@@ -1497,5 +1748,84 @@ mod tests {
             ToolResult::Json(v) => assert_eq!(v, json!(42)),
             other => panic!("expected Json result, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn narf_register_persists_prepared_cell_and_run_validates_contract() {
+        let cells = Arc::new(StubCells::default());
+        let session = narf_session_with_cells(cells.clone());
+        let prepare = NarfPrepareTool {
+            session: session.clone(),
+        };
+        let register = NarfRegisterTool {
+            session: session.clone(),
+            cells,
+        };
+        let run = NarfRunTool { session };
+
+        let prepared = prepare
+            .call(
+                json!({
+                    "source": "function run(input) { return { doubled: input.n * 2 }; }",
+                    "contract": {
+                        "entry": "run",
+                        "input": {
+                            "type": "object",
+                            "properties": { "n": { "type": "integer" } },
+                            "required": ["n"],
+                            "additionalProperties": false
+                        },
+                        "output": {
+                            "type": "object",
+                            "properties": { "doubled": { "type": "integer" } },
+                            "required": ["doubled"],
+                            "additionalProperties": false
+                        }
+                    }
+                }),
+                &test_cx(),
+            )
+            .await;
+        let prepared_ref = match prepared {
+            ToolResult::Json(v) => v["ref"].as_str().unwrap().to_string(),
+            other => panic!("expected Json prepare, got {other:?}"),
+        };
+
+        let registered = register
+            .call(
+                json!({
+                    "ref": prepared_ref,
+                    "name": "math/double",
+                    "version": "v1",
+                    "description": "double an integer"
+                }),
+                &test_cx(),
+            )
+            .await;
+        let handle = match registered {
+            ToolResult::Json(v) => {
+                assert_eq!(v["status"], "registered");
+                assert_eq!(v["artifact_ref"], "cell:math/double@v1");
+                v["handle"].as_str().unwrap().to_string()
+            }
+            other => panic!("expected Json register, got {other:?}"),
+        };
+        assert_eq!(handle, "atom:math/double@v1");
+
+        let ok = run
+            .call(json!({ "ref": handle, "input": { "n": 21 } }), &test_cx())
+            .await;
+        match ok {
+            ToolResult::Json(v) => assert_eq!(v, json!({ "doubled": 42 })),
+            other => panic!("expected Json run, got {other:?}"),
+        }
+
+        let bad = run
+            .call(
+                json!({ "ref": "atom:math/double@v1", "input": { "n": "bad" } }),
+                &test_cx(),
+            )
+            .await;
+        assert!(matches!(bad, ToolResult::Error(_)));
     }
 }

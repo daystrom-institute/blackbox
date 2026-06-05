@@ -53,18 +53,18 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use deno_core::v8;
-use deno_core::{op2, OpState, PollEventLoopOptions, RuntimeOptions};
+use deno_core::{OpState, PollEventLoopOptions, RuntimeOptions, op2};
 use deno_error::JsErrorBox;
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
@@ -145,11 +145,7 @@ struct PreparedScripts {
     scripts: HashMap<String, PreparedScript>,
 }
 
-#[derive(Clone, Debug)]
-struct PreparedScript {
-    source: String,
-    contract: Option<CellContract>,
-}
+type PreparedScript = PreparedCell;
 
 impl PreparedScripts {
     fn put(&mut self, source: String, contract: Option<CellContract>) -> String {
@@ -235,6 +231,12 @@ pub struct PrepareResponse {
     /// Optional declared typed-cell contract. v1 contracts are explicit JSON
     /// Schema-ish declarations, not inferred TypeScript signatures.
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract: Option<CellContract>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct PreparedCell {
+    pub source: String,
     pub contract: Option<CellContract>,
 }
 
@@ -420,6 +422,30 @@ fn validate_json_schema(label: &str, schema: &serde_json::Value) -> Result<(), S
         .compile(schema)
         .map(|_| ())
         .map_err(|e| format!("{label} is not a valid JSON Schema: {e}"))
+}
+
+fn validate_json_value(
+    label: &str,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let compiled = JSONSchema::options()
+        .with_draft(Draft::Draft202012)
+        .compile(schema)
+        .map_err(|e| format!("{label} schema is not a valid JSON Schema: {e}"))?;
+    let errors = compiled
+        .validate(value)
+        .err()
+        .map(|errors| errors.map(|e| e.to_string()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{label} failed schema validation: {}",
+            errors.join("; ")
+        ))
+    }
 }
 
 fn source_declares_entry(source: &str, entry: &str) -> bool {
@@ -984,6 +1010,16 @@ enum Job {
         handle: String,
         reply: oneshot::Sender<Result<String>>,
     },
+    Prepared {
+        handle: String,
+        reply: oneshot::Sender<Result<PreparedCell>>,
+    },
+    CallCell {
+        source: String,
+        contract: CellContract,
+        input_json: serde_json::Value,
+        reply: oneshot::Sender<Result<String>>,
+    },
     Define {
         input_json: serde_json::Value,
         reply: oneshot::Sender<Result<()>>,
@@ -1328,6 +1364,49 @@ impl ScriptRuntime {
         }
     }
 
+    pub async fn prepared(&self, handle: impl Into<String>) -> Result<PreparedCell> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(Job::Prepared {
+                handle: handle.into(),
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("V8 thread dropped the reply"))?
+    }
+
+    pub async fn call_cell(
+        &self,
+        source: String,
+        contract: CellContract,
+        input_json: serde_json::Value,
+    ) -> Result<String> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.job_tx
+            .send(Job::CallCell {
+                source,
+                contract,
+                input_json,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("V8 thread is gone"))?;
+
+        match self.execution_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, reply_rx).await {
+                Ok(reply) => reply.map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+                Err(_elapsed) => {
+                    self.isolate_handle.terminate_execution();
+                    Err(anyhow!("script execution timed out after {timeout:?}"))
+                }
+            },
+            None => reply_rx
+                .await
+                .map_err(|_| anyhow!("V8 thread dropped the reply"))?,
+        }
+    }
+
     pub async fn trace_len(&self) -> Result<usize> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.job_tx
@@ -1431,6 +1510,21 @@ fn v8_thread_main(
                     runtime.v8_isolate().cancel_terminate_execution();
                     let _ = reply.send(result);
                 }
+                Job::Prepared { handle, reply } => {
+                    let result = get_prepared(&mut runtime, &handle);
+                    let _ = reply.send(result);
+                }
+                Job::CallCell {
+                    source,
+                    contract,
+                    input_json,
+                    reply,
+                } => {
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let result = call_cell(&mut runtime, &source, &contract, input_json).await;
+                    runtime.v8_isolate().cancel_terminate_execution();
+                    let _ = reply.send(result);
+                }
                 Job::Define { input_json, reply } => {
                     let result = define_one(&mut runtime, input_json);
                     let _ = reply.send(result);
@@ -1454,8 +1548,12 @@ fn v8_thread_main(
 
 async fn run_one(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<String> {
     let wrapped = format!("(async () => {{ {body} }})()");
+    run_wrapped(runtime, &wrapped).await
+}
+
+async fn run_wrapped(runtime: &mut deno_core::JsRuntime, wrapped: &str) -> Result<String> {
     let promise = runtime
-        .execute_script("<bro-script>", wrapped)
+        .execute_script("<bro-script>", wrapped.to_string())
         .map_err(|e| anyhow!("{e}"))?;
 
     // Drive the event loop while resolving the IIFE promise — this is what lets
@@ -1473,6 +1571,32 @@ async fn run_one(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<Strin
     let value: serde_json::Value = deno_core::serde_v8::from_v8(scope, local)
         .map_err(|e| anyhow!("failed to deserialize result: {e}"))?;
     Ok(value.to_string())
+}
+
+async fn call_cell(
+    runtime: &mut deno_core::JsRuntime,
+    source: &str,
+    contract: &CellContract,
+    input_json: serde_json::Value,
+) -> Result<String> {
+    validate_cell_contract(contract, source).map_err(|e| anyhow!("cell contract invalid: {e}"))?;
+    if let Some(schema) = &contract.input {
+        validate_json_value("cell input", schema, &input_json).map_err(|e| anyhow!(e))?;
+    }
+
+    let encoded_input =
+        serde_json::to_string(&input_json).map_err(|e| anyhow!("cell input encode failed: {e}"))?;
+    let wrapped = format!(
+        "(async () => {{\n{source}\nreturn await {entry}({encoded_input});\n}})()",
+        entry = contract.entry
+    );
+    let output = run_wrapped(runtime, &wrapped).await?;
+    let output_json: serde_json::Value =
+        serde_json::from_str(&output).map_err(|e| anyhow!("cell output decode failed: {e}"))?;
+    if let Some(schema) = &contract.output {
+        validate_json_value("cell output", schema, &output_json).map_err(|e| anyhow!(e))?;
+    }
+    Ok(output_json.to_string())
 }
 
 fn prepare_one(
@@ -1530,13 +1654,7 @@ fn define_one(runtime: &mut deno_core::JsRuntime, input_json: serde_json::Value)
 }
 
 async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<String> {
-    let script = {
-        let op_state = runtime.op_state();
-        let state = op_state.borrow();
-        let scripts = state.borrow::<PreparedScriptsCell>().clone();
-        let script = scripts.borrow().get(handle).map_err(|e| anyhow!(e))?;
-        script
-    };
+    let script = get_prepared(runtime, handle)?;
     let source = script.source;
     let _contract = script.contract;
     {
@@ -1551,6 +1669,14 @@ async fn run_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Resul
         });
     }
     run_one(runtime, &source).await
+}
+
+fn get_prepared(runtime: &mut deno_core::JsRuntime, handle: &str) -> Result<PreparedCell> {
+    let op_state = runtime.op_state();
+    let state = op_state.borrow();
+    let scripts = state.borrow::<PreparedScriptsCell>().clone();
+    let result = scripts.borrow().get(handle).map_err(|e| anyhow!(e));
+    result
 }
 
 fn validate_script_syntax(runtime: &mut deno_core::JsRuntime, body: &str) -> Result<(), String> {

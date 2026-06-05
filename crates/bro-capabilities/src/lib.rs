@@ -26,6 +26,51 @@ pub trait AtomCapability: Send + Sync {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellRegisterRequest {
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub contract_json: serde_json::Value,
+    pub description: Option<String>,
+    pub supersedes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellRegisterOutput {
+    /// Exact invocation handle. The v1 compatibility shape is `atom:name@version`;
+    /// it resolves to a cell record, never to an atom backend.
+    pub handle: String,
+    pub artifact_ref: String,
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellLoadRequest {
+    pub handle: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellLoadOutput {
+    pub handle: String,
+    pub artifact_ref: String,
+    pub name: String,
+    pub version: String,
+    pub source: String,
+    pub contract_json: serde_json::Value,
+}
+
+#[async_trait]
+pub trait CellRegistryCapability: Send + Sync {
+    async fn register_cell(
+        &self,
+        request: CellRegisterRequest,
+    ) -> CapabilityResult<CellRegisterOutput>;
+
+    async fn load_cell(&self, request: CellLoadRequest) -> CapabilityResult<CellLoadOutput>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CorpusLookup {
     pub query: String,
     pub limit: usize,

@@ -16,7 +16,8 @@ use bro_capabilities::{
 };
 use bro_core::BroError;
 use bro_script::{
-    Capabilities, ScriptRuntime, SupervisionPolicy, DEFAULT_HEAP_LIMIT_BYTES, DENO_CORE_VERSION,
+    Capabilities, CellContract, DEFAULT_HEAP_LIMIT_BYTES, DENO_CORE_VERSION, ScriptRuntime,
+    SupervisionPolicy,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -1029,6 +1030,49 @@ async fn host_tools_fail_closed_when_absent() {
         serde_json::from_str(&serde_json::from_str::<String>(&out).unwrap()).unwrap();
     assert_eq!(v["threw"], true);
     assert_eq!(v["failClosed"], true);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_cell_call_validates_input_and_output_contract() {
+    let rt = stub_runtime().await;
+    let contract = CellContract {
+        entry: "run".to_string(),
+        input: Some(serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer" } },
+            "required": ["n"],
+            "additionalProperties": false
+        })),
+        output: Some(serde_json::json!({ "type": "integer" })),
+        effects: Vec::new(),
+        may_invoke: Vec::new(),
+        dispatch_budget: None,
+    };
+
+    let out = rt
+        .call_cell(
+            "function run(input) { return input.n + 1; }".to_string(),
+            contract.clone(),
+            serde_json::json!({ "n": 41 }),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v, serde_json::json!(42));
+
+    let err = rt
+        .call_cell(
+            "function run(input) { return input.n + 1; }".to_string(),
+            contract,
+            serde_json::json!({ "n": "bad" }),
+        )
+        .await
+        .expect_err("schema mismatch must fail closed");
+    assert!(
+        err.to_string()
+            .contains("cell input failed schema validation"),
+        "{err:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------
