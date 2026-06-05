@@ -46,6 +46,41 @@ pub struct CellRegisterOutput {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableCellRegisterRequest {
+    pub name: String,
+    pub version: String,
+    pub cell_handle: String,
+    pub description: Option<String>,
+    pub supersedes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableCellRegisterOutput {
+    pub handle: String,
+    pub artifact_ref: String,
+    pub name: String,
+    pub version: String,
+    pub source_cell: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellScheduleRequest {
+    pub name: String,
+    pub cell_handle: String,
+    pub schedule: String,
+    pub input_json: serde_json::Value,
+    pub concurrency: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellScheduleOutput {
+    pub name: String,
+    pub cell_handle: String,
+    pub schedule: String,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellLoadRequest {
     pub handle: String,
 }
@@ -68,6 +103,19 @@ pub trait CellRegistryCapability: Send + Sync {
     ) -> CapabilityResult<CellRegisterOutput>;
 
     async fn load_cell(&self, request: CellLoadRequest) -> CapabilityResult<CellLoadOutput>;
+}
+
+#[async_trait]
+pub trait DurableCellCapability: Send + Sync {
+    async fn register_durable_cell(
+        &self,
+        request: DurableCellRegisterRequest,
+    ) -> CapabilityResult<DurableCellRegisterOutput>;
+
+    async fn schedule_cell(
+        &self,
+        request: CellScheduleRequest,
+    ) -> CapabilityResult<CellScheduleOutput>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

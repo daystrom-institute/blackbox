@@ -17,9 +17,10 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use bro_capabilities::{
     AtomCapability, AtomInvocation, CapabilityResult, CellLoadRequest, CellRegisterRequest,
-    CellRegistryCapability, CorpusCapability, CorpusLookup, KvCapability, KvEntry, KvEntryInfo,
-    KvGet, KvOrigin, KvSummary, RefactorCapability, RefactorRequest, ToolCallOutput,
-    ToolCapability, ToolInvocation,
+    CellRegistryCapability, CellScheduleRequest, CorpusCapability, CorpusLookup,
+    DurableCellCapability, DurableCellRegisterRequest, KvCapability, KvEntry, KvEntryInfo, KvGet,
+    KvOrigin, KvSummary, RefactorCapability, RefactorRequest, ToolCallOutput, ToolCapability,
+    ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
@@ -36,6 +37,7 @@ const KV_SUMMARY_LINE_BYTES: usize = 160;
 static CORPUS: RwLock<Option<Arc<dyn CorpusCapability>>> = RwLock::new(None);
 static ATOMS: RwLock<Option<Arc<dyn AtomCapability>>> = RwLock::new(None);
 static CELLS: RwLock<Option<Arc<dyn CellRegistryCapability>>> = RwLock::new(None);
+static DURABLE_CELLS: RwLock<Option<Arc<dyn DurableCellCapability>>> = RwLock::new(None);
 static REFACTOR: RwLock<Option<Arc<dyn RefactorCapability>>> = RwLock::new(None);
 
 /// Install the daemon's in-memory corpus implementation. Called once, at daemon
@@ -57,6 +59,15 @@ pub fn install_cells(capability: Arc<dyn CellRegistryCapability>) {
     *CELLS.write().expect("cell capability slot poisoned") = Some(capability);
 }
 
+/// Install the daemon's durable-cell implementation. This is the cell-native
+/// workflow/schedule tier; it must not lower through atom backends, workflow
+/// hook ops, or routing-packet evaluators.
+pub fn install_durable_cells(capability: Arc<dyn DurableCellCapability>) {
+    *DURABLE_CELLS
+        .write()
+        .expect("durable cell capability slot poisoned") = Some(capability);
+}
+
 /// Install the daemon's in-memory refactor implementation. Called once, at
 /// daemon startup, from the `blackbox` crate. Last writer wins.
 pub fn install_refactor(capability: Arc<dyn RefactorCapability>) {
@@ -76,6 +87,13 @@ fn atoms() -> Option<Arc<dyn AtomCapability>> {
 
 fn cells() -> Option<Arc<dyn CellRegistryCapability>> {
     CELLS.read().expect("cell capability slot poisoned").clone()
+}
+
+fn durable_cells() -> Option<Arc<dyn DurableCellCapability>> {
+    DURABLE_CELLS
+        .read()
+        .expect("durable cell capability slot poisoned")
+        .clone()
 }
 
 fn refactor() -> Option<Arc<dyn RefactorCapability>> {
@@ -334,6 +352,7 @@ pub fn capability_tools(
     }
     let atom_cap = atoms();
     let cell_cap = cells();
+    let durable_cell_cap = durable_cells();
     let refactor_cap = refactor();
     if let Some(a) = atom_cap.clone() {
         tools.push(Arc::new(AtomInvokeTool(a)));
@@ -369,6 +388,12 @@ pub fn capability_tools(
                 session: session.clone(),
                 cells,
             }));
+        }
+        if let Some(durable_cells) = durable_cell_cap {
+            tools.push(Arc::new(NarfRegisterWorkflowTool {
+                durable_cells: durable_cells.clone(),
+            }));
+            tools.push(Arc::new(NarfScheduleWorkflowTool { durable_cells }));
         }
         tools.push(Arc::new(NarfRunTool {
             session: session.clone(),
@@ -997,6 +1022,166 @@ impl Tool for NarfRegisterTool {
     }
 }
 
+/// `narf_registerWorkflow`: promote a registered exact cell handle into the
+/// durable cell tier. This writes another cell artifact tier; it does not
+/// install a workflow graph, atom backend, hook op, or routing packet.
+struct NarfRegisterWorkflowTool {
+    durable_cells: Arc<dyn DurableCellCapability>,
+}
+
+#[async_trait]
+impl Tool for NarfRegisterWorkflowTool {
+    fn name(&self) -> &str {
+        "narf_registerWorkflow"
+    }
+
+    fn description(&self) -> &str {
+        "Register an exact reusable cell handle as a durable cell. Takes {name,cell_handle,version?,description?,supersedes?}; returns a durable cell handle. Does not create a workflow-engine graph."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Durable cell name." },
+                "cell_handle": { "type": "string", "description": "Exact registered cell handle returned by narf_register." },
+                "version": { "type": "string", "description": "Durable cell version (default v1)." },
+                "description": { "type": "string", "description": "Human review description." },
+                "supersedes": { "type": "string", "description": "Previous durable cell name superseded by this registration." }
+            },
+            "required": ["name", "cell_handle"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let name = match input.get("name").and_then(Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.to_string(),
+            _ => return ToolResult::Error("narf_registerWorkflow: `name` is required".into()),
+        };
+        let cell_handle = match input.get("cell_handle").and_then(Value::as_str) {
+            Some(h) if !h.trim().is_empty() => h.to_string(),
+            _ => {
+                return ToolResult::Error(
+                    "narf_registerWorkflow: `cell_handle` is required".into(),
+                );
+            }
+        };
+        let version = input
+            .get("version")
+            .and_then(Value::as_str)
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or("v1")
+            .to_string();
+        let description = input
+            .get("description")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+        let supersedes = input
+            .get("supersedes")
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_string);
+        let request = DurableCellRegisterRequest {
+            name,
+            version,
+            cell_handle,
+            description,
+            supersedes,
+        };
+        match self.durable_cells.register_durable_cell(request).await {
+            Ok(out) => ToolResult::Json(json!({
+                "status": "registered",
+                "handle": out.handle,
+                "artifact_ref": out.artifact_ref,
+                "name": out.name,
+                "version": out.version,
+                "source_cell": out.source_cell,
+            })),
+            Err(e) => ToolResult::Error(format!(
+                "narf_registerWorkflow failed: {}: {}",
+                e.code, e.message
+            )),
+        }
+    }
+}
+
+/// `narf_scheduleWorkflow`: install a cell-native schedule for an exact durable
+/// cell handle. On each tick the daemon invokes the cell directly and passes the
+/// payload into JS; the cell body owns any predicate/evaluator logic.
+struct NarfScheduleWorkflowTool {
+    durable_cells: Arc<dyn DurableCellCapability>,
+}
+
+#[async_trait]
+impl Tool for NarfScheduleWorkflowTool {
+    fn name(&self) -> &str {
+        "narf_scheduleWorkflow"
+    }
+
+    fn description(&self) -> &str {
+        "Schedule an exact durable cell handle directly. Takes {name,cell_handle,schedule,input?,concurrency?}; no workflow graph, routing packet, or atom backend is created."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "description": "Schedule name." },
+                "cell_handle": { "type": "string", "description": "Exact durable cell handle returned by narf_registerWorkflow." },
+                "schedule": { "type": "string", "description": "Cron expression (6/7-field cron crate form)." },
+                "input": { "description": "JSON input passed to the cell on every tick." },
+                "concurrency": { "type": "integer", "description": "Max in-flight cell runs for this schedule; 0 disables the cap." }
+            },
+            "required": ["name", "cell_handle", "schedule"]
+        })
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
+        let name = match input.get("name").and_then(Value::as_str) {
+            Some(n) if !n.trim().is_empty() => n.to_string(),
+            _ => return ToolResult::Error("narf_scheduleWorkflow: `name` is required".into()),
+        };
+        let cell_handle = match input.get("cell_handle").and_then(Value::as_str) {
+            Some(h) if !h.trim().is_empty() => h.to_string(),
+            _ => {
+                return ToolResult::Error(
+                    "narf_scheduleWorkflow: `cell_handle` is required".into(),
+                );
+            }
+        };
+        let schedule = match input.get("schedule").and_then(Value::as_str) {
+            Some(s) if !s.trim().is_empty() => s.to_string(),
+            _ => return ToolResult::Error("narf_scheduleWorkflow: `schedule` is required".into()),
+        };
+        let input_json = input.get("input").cloned().unwrap_or(Value::Null);
+        let concurrency = input
+            .get("concurrency")
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .min(u32::MAX as u64) as u32;
+        let request = CellScheduleRequest {
+            name,
+            cell_handle,
+            schedule,
+            input_json,
+            concurrency,
+        };
+        match self.durable_cells.schedule_cell(request).await {
+            Ok(out) => ToolResult::Json(json!({
+                "status": out.status,
+                "name": out.name,
+                "cell_handle": out.cell_handle,
+                "schedule": out.schedule,
+            })),
+            Err(e) => ToolResult::Error(format!(
+                "narf_scheduleWorkflow failed: {}: {}",
+                e.code, e.message
+            )),
+        }
+    }
+}
+
 /// `narf_run`: execute a prepared script by handle and return its result.
 /// Model-facing replacement for the mislayered in-box `narf.run`.
 struct NarfRunTool {
@@ -1129,8 +1314,8 @@ impl Tool for NarfDefineTool {
 mod tests {
     use super::*;
     use bro_capabilities::{
-        AtomOutput, CapabilityResult, CellLoadOutput, CellRegisterOutput, CorpusHit,
-        RefactorPlanHandle,
+        AtomOutput, CapabilityResult, CellLoadOutput, CellRegisterOutput, CellScheduleOutput,
+        CorpusHit, DurableCellRegisterOutput, RefactorPlanHandle,
     };
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1253,6 +1438,42 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct StubDurableCells {
+        registrations: std::sync::Mutex<Vec<DurableCellRegisterRequest>>,
+        schedules: std::sync::Mutex<Vec<CellScheduleRequest>>,
+    }
+
+    #[async_trait]
+    impl DurableCellCapability for StubDurableCells {
+        async fn register_durable_cell(
+            &self,
+            request: DurableCellRegisterRequest,
+        ) -> CapabilityResult<DurableCellRegisterOutput> {
+            self.registrations.lock().unwrap().push(request.clone());
+            Ok(DurableCellRegisterOutput {
+                handle: format!("cell:{}@{}", request.name, request.version),
+                artifact_ref: format!("cell:{}@{}", request.name, request.version),
+                name: request.name,
+                version: request.version,
+                source_cell: request.cell_handle,
+            })
+        }
+
+        async fn schedule_cell(
+            &self,
+            request: CellScheduleRequest,
+        ) -> CapabilityResult<CellScheduleOutput> {
+            self.schedules.lock().unwrap().push(request.clone());
+            Ok(CellScheduleOutput {
+                name: request.name,
+                cell_handle: request.cell_handle,
+                schedule: request.schedule,
+                status: "scheduled".to_string(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn atom_invoke_tool_dispatches_to_injected_capability() {
         let tool = AtomInvokeTool(Arc::new(StubAtoms));
@@ -1276,6 +1497,58 @@ mod tests {
         let tool = AtomInvokeTool(Arc::new(StubAtoms));
         let result = tool.call(json!({ "args": {} }), &test_cx()).await;
         assert!(matches!(result, ToolResult::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn durable_cell_tools_dispatch_without_workflow_surface() {
+        let cap = Arc::new(StubDurableCells::default());
+        let register = NarfRegisterWorkflowTool {
+            durable_cells: cap.clone(),
+        };
+        let schedule = NarfScheduleWorkflowTool {
+            durable_cells: cap.clone(),
+        };
+
+        let registered = register
+            .call(
+                json!({
+                    "name": "daily-review",
+                    "cell_handle": "atom:review@v1",
+                    "version": "v2"
+                }),
+                &test_cx(),
+            )
+            .await;
+        match registered {
+            ToolResult::Json(v) => {
+                assert_eq!(v["handle"], "cell:daily-review@v2");
+                assert_eq!(v["source_cell"], "atom:review@v1");
+            }
+            other => panic!("expected Json result, got {other:?}"),
+        }
+
+        let scheduled = schedule
+            .call(
+                json!({
+                    "name": "daily-review",
+                    "cell_handle": "cell:daily-review@v2",
+                    "schedule": "0 0 9 * * *",
+                    "input": { "mode": "scan" },
+                    "concurrency": 1
+                }),
+                &test_cx(),
+            )
+            .await;
+        match scheduled {
+            ToolResult::Json(v) => {
+                assert_eq!(v["status"], "scheduled");
+                assert_eq!(v["cell_handle"], "cell:daily-review@v2");
+            }
+            other => panic!("expected Json result, got {other:?}"),
+        }
+
+        assert_eq!(cap.registrations.lock().unwrap().len(), 1);
+        assert_eq!(cap.schedules.lock().unwrap().len(), 1);
     }
 
     /// Stub refactor capability with a tiny host-side store, proving the

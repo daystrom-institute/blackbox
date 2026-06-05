@@ -741,8 +741,15 @@ before relying on any line here.
   `CellRegistryCapability` into `ArtifactKind::Cell`; `narf_run` can execute
   either a prepared handle or a registered exact handle, validating input/output
   against the stored contract. This is intentionally a cell registry, not an
-  atom backend. Durable workflow registration, scheduling, `narf.wait`, and
-  parked-arc restart persistence remain separate follow-up slices.
+  atom backend.
+- **Durable/scheduled typed-cell registration (A3 cell-native slice).**
+  `narf_registerWorkflow` promotes an exact registered cell handle into a
+  durable cell artifact through `DurableCellCapability`; `narf_scheduleWorkflow`
+  persists a cell-native schedule under the daemon state dir and wakes the exact
+  durable cell directly. This slice does not add atom backends, workflow hook
+  ops, workflow graph wrappers, routing packets, or packet evaluators. Park/
+  resume lifting and parked-state restart persistence remain separate follow-up
+  slices.
 
 The whole stack was exercised live through the real fleet TUI (tmux): a dispatch
 flows TUI → `/control/exec` → in-process harness (task-local identity, `--cwd`,

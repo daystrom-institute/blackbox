@@ -179,6 +179,7 @@ pub(super) fn open_shared_state(home: &Path) -> anyhow::Result<OpenedServer> {
         projects: RwLock::new(projects_store),
         packets: RwLock::new(packets_store),
         artifacts: RwLock::new(artifacts_store),
+        cell_schedules: Arc::new(crate::cells::CellScheduleRegistry::new()),
         bbox_watcher: std::sync::Mutex::new(None),
         reindex_dirty,
         edge_index: RwLock::new(edge_index),

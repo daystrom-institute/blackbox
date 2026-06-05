@@ -175,9 +175,10 @@ the daemon can already back:
   slot).** Same authoring surface; the body is allowed to *park* on external
   completion (a child bro, a webhook, a timer). Parking is not a JS `await` the
   cell holds across a restart — it compiles to an engine **wait** (§4). The
-  scheduled variant additionally registers a cron/poller trigger (the existing
-  `crons`/`pollers` restore machinery already survives restart — `restore.rs:38`/
-  `:52`).
+  scheduled variant is cell-native: a schedule wakes an exact cell handle and
+  passes tick context into JS. The cell body is the evaluator; scheduling does
+  not add routing packets, packet evaluators, workflow hook ops, or atom
+  backends.
 
 ## 3. Box-edge placement of the verbs
 
@@ -368,9 +369,14 @@ The thesis is "mostly built." Precisely what is *not*:
    `WaitStore` (the struct is "designed serializable" already) + respawn parked
    arc-runners on boot so they re-enter their wait node and let the catch-up
    rescan re-resolve.
-4. **`narf_registerWorkflow` / `narf_scheduleWorkflow` verbs do not exist.**
-   `narf_register` exists for named reusable cells and writes the cell catalog.
-   The durable workflow verbs and their trigger/arc wiring are still net-new.
+4. **Durable/scheduled cell verbs exist, but not parked continuation
+   enforcement.** `narf_registerWorkflow` promotes an exact registered cell
+   handle into a durable cell artifact; `narf_scheduleWorkflow` persists a
+   cell-native schedule and wakes the exact durable cell directly with the
+   schedule payload plus `schedule_name`/`tick_at`. This path deliberately does
+   **not** install a workflow graph, workflow hook op, atom backend, routing
+   packet, or packet evaluator. What remains absent is the park/resume lift in
+   item 2 and cross-restart parked state in item 3.
 5. **No TS toolchain.** Restating §1: "typed" is a declared contract, validated;
    it is not an inferred TS signature. If inferred typing is ever wanted, it is a
    separate, scoped toolchain decision — not part of this doc's v1.
@@ -417,8 +423,11 @@ The thesis is "mostly built." Precisely what is *not*:
 - **D4 — Where the contract registry physically lives.** Graduate the
   prepared-script store into the `bbox_artifact_*` catalog, or a dedicated cell
   registry? Catalog reuse is cheaper and gets versioning/supersession for free.
-- **D5 — Scheduling triggers.** `narf_scheduleWorkflow` over the existing
-  `crons`/`pollers` (restart-durable today) vs a new trigger kind. Reuse first.
+- **D5 — Scheduling triggers — DECIDED (cell-native scheduler).**
+  `narf_scheduleWorkflow` owns a typed-cell schedule registry and invokes exact
+  durable cell handles directly. Existing `crons`/`pollers` and routing packets
+  remain for legacy workflow/event ingress; they are not the typed-cell
+  scheduling implementation.
 
 ## 9. Relationship to sibling docs
 
