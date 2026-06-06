@@ -1766,7 +1766,10 @@ mod tests {
                     name: None,
                     providers: vec![Provider::Deepseek],
                 }),
-                capabilities: vec![Capability::StructuredOutput],
+                // Vision is satisfied by no harness provider (StructuredOutput is
+                // now satisfiable via the harness `final_result` tool), so this
+                // still exercises the fail-closed-on-missing-capability path.
+                capabilities: vec![Capability::Vision],
                 ..Default::default()
             };
             let allocation = allocate(
