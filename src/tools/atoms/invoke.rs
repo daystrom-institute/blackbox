@@ -247,11 +247,12 @@ impl BlackboxServer {
             &self.state.store_dir,
             bf.context.as_ref(),
         );
-        let exec_opts = if bf.model.is_some() || bf.effort.is_some() {
+        let exec_opts = if bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some() {
             Some(orchestration::providers::ExecOpts {
                 model: bf.model.clone(),
                 effort: bf.effort.clone(),
                 provider_defaults: None,
+                code_mode: bf.code_mode,
             })
         } else {
             None
@@ -298,6 +299,7 @@ impl BlackboxServer {
         } else {
             runtime
         };
+        let atom_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
         let dispatched =
             self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
@@ -319,6 +321,7 @@ impl BlackboxServer {
                 spawn_agent_label: Some(atom_label.clone()),
                 record_to_bro: None,
                 brofile_context: bf.context,
+                code_mode: atom_code_mode,
             })?;
         let (task_id, session_id, selected_provider) = {
             let inner = dispatched.task.inner.lock();

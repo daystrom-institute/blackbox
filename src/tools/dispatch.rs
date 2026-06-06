@@ -48,6 +48,11 @@ pub(crate) struct FreshDispatchRequest {
     /// initial enforce in resolve_*_target only sees the brofile's
     /// nominal provider, not the allocator's selected lane.
     pub(crate) brofile_context: Option<orchestration::brofile::BrofileContext>,
+    /// Resolved code-mode for this fresh dispatch (per-dispatch
+    /// `ExecParams.code_mode` override ?? brofile `code_mode`). Folded onto
+    /// `exec_opts` just before arg construction so it survives an allocator
+    /// rebuild of `exec_opts`. `None` ⇒ no `--code-mode` flag (harness default).
+    pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
 }
 
 pub(crate) struct FreshDispatchResult {
@@ -219,6 +224,7 @@ fn allocator_status_runtime_request(
         capabilities: p.capabilities.clone(),
         durable: p.durable,
         selection_policy: p.selection_policy.clone(),
+        code_mode: None,
     };
     exec_params_runtime_request(&exec_like, None)
 }
@@ -292,6 +298,13 @@ impl BlackboxServer {
             request.exec_opts,
             request.brofile_context.as_ref(),
         );
+        // Fold the resolved code-mode onto exec_opts AFTER any allocator rebuild
+        // (which replaces exec_opts wholesale and would otherwise drop it).
+        if let Some(cm) = request.code_mode {
+            let mut o = request.exec_opts.take().unwrap_or_default();
+            o.code_mode = Some(cm);
+            request.exec_opts = Some(o);
+        }
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -455,6 +468,13 @@ impl BlackboxServer {
             }
         }
         let coerce_workspace = p.coerce_workspace.unwrap_or(brofile_coerce_workspace);
+        // Resolve code-mode: explicit per-dispatch override wins, else the
+        // brofile's code_mode (surfaced via the resolved ExecOpts before the
+        // allocator may rebuild it). Folded onto exec_opts in
+        // dispatch_fresh_bro_task right before arg construction.
+        let resolved_code_mode = p
+            .code_mode
+            .or_else(|| exec_opts.as_ref().and_then(|o| o.code_mode));
         let lease_brofile_context = brofile_context.clone();
         let dispatched = match self.dispatch_fresh_bro_task(FreshDispatchRequest {
             prompt: p.prompt.clone(),
@@ -476,6 +496,7 @@ impl BlackboxServer {
             spawn_agent_label: None,
             record_to_bro: p.bro.clone(),
             brofile_context,
+            code_mode: resolved_code_mode,
         }) {
             Ok(result) => result,
             Err(e) => return Self::err_text(&e),
@@ -1210,11 +1231,15 @@ impl BlackboxServer {
                         capabilities: lease.capabilities.clone(),
                     },
                 )
-            } else if brofile.model.is_some() || brofile.effort.is_some() {
+            } else if brofile.model.is_some()
+                || brofile.effort.is_some()
+                || brofile.code_mode.is_some()
+            {
                 Some(ExecOpts {
                     model: brofile.model.clone(),
                     effort: brofile.effort.clone(),
                     provider_defaults: None,
+                    code_mode: brofile.code_mode,
                 })
             } else {
                 None
@@ -1771,6 +1796,9 @@ impl BlackboxServer {
                         model: bf.model.clone(),
                         effort: bf.effort.clone(),
                         provider_defaults: None,
+                        // Resume restores the session's persisted code_mode; the
+                        // daemon does not re-pass it (mirrors --model).
+                        code_mode: None,
                     })
                 } else {
                     None
@@ -1949,11 +1977,15 @@ impl BlackboxServer {
                         store_dir,
                         bf.context.as_ref(),
                     );
-                    let opts = if bf.model.is_some() || bf.effort.is_some() {
+                    let opts = if bf.model.is_some()
+                        || bf.effort.is_some()
+                        || bf.code_mode.is_some()
+                    {
                         Some(ExecOpts {
                             model: bf.model.clone(),
                             effort: bf.effort.clone(),
                             provider_defaults: None,
+                            code_mode: bf.code_mode,
                         })
                     } else {
                         None
@@ -2001,11 +2033,12 @@ impl BlackboxServer {
                 store_dir,
                 bf.context.as_ref(),
             );
-            let opts = if bf.model.is_some() || bf.effort.is_some() {
+            let opts = if bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some() {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
                     provider_defaults: None,
+                    code_mode: bf.code_mode,
                 })
             } else {
                 None
@@ -2155,6 +2188,9 @@ impl BlackboxServer {
                         model: bf.model.clone(),
                         effort: bf.effort.clone(),
                         provider_defaults: None,
+                        // Resume restores the session's persisted code_mode; the
+                        // daemon does not re-pass it (mirrors --model).
+                        code_mode: None,
                     })
                 } else {
                     None
@@ -2427,6 +2463,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
+                code_mode: None,
             },
             "global",
             &tmp.path().join("bro"),
@@ -2460,6 +2497,7 @@ mod tests {
             capabilities: None,
             durable: None,
             selection_policy: None,
+            code_mode: None,
         }
     }
 

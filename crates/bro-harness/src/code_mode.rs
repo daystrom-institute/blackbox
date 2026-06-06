@@ -27,6 +27,65 @@ use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
 
+/// Tri-state code-mode selector — the harness mirror of Codex's `ToolMode`
+/// (`Direct`/`CodeMode`/`CodeModeOnly`).
+///
+/// - [`Off`](CodeMode::Off): no `exec`/`wait`; the flat tool surface only.
+/// - [`Optional`](CodeMode::Optional) (default): flat tools AND `exec`/`wait`
+///   are both model-visible. The exec description does not claim "only".
+/// - [`Only`](CodeMode::Only): flat builtins are demoted out of the wire array
+///   (still `tool_search`-loadable); the model sees `exec`/`wait` as the
+///   authorial surface and the exec description is rendered code-mode-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodeMode {
+    Off,
+    #[default]
+    Optional,
+    Only,
+}
+
+impl std::str::FromStr for CodeMode {
+    type Err = ();
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "direct" | "0" | "false" => Ok(CodeMode::Off),
+            "optional" | "code_mode" | "codemode" | "on" => Ok(CodeMode::Optional),
+            "only" | "code_mode_only" | "codemodeonly" => Ok(CodeMode::Only),
+            _ => Err(()),
+        }
+    }
+}
+
+impl CodeMode {
+    /// Parse a free-form value (CLI/env), warning and falling back to the
+    /// default on an unrecognized token.
+    pub fn parse_or_default(s: &str) -> Self {
+        s.parse().unwrap_or_else(|()| {
+            eprintln!("bro-harness: unknown code-mode '{s}', using '{:?}'", CodeMode::default());
+            CodeMode::default()
+        })
+    }
+
+    /// Whether `exec`/`wait` should be registered + pinned at all.
+    pub fn enables_code_surface(self) -> bool {
+        !matches!(self, CodeMode::Off)
+    }
+
+    /// Whether the flat builtins should be hidden from the wire array (deferred).
+    pub fn defers_builtins(self) -> bool {
+        matches!(self, CodeMode::Only)
+    }
+
+    /// The canonical CLI/serde token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodeMode::Off => "off",
+            CodeMode::Optional => "optional",
+            CodeMode::Only => "only",
+        }
+    }
+}
+
 // Vendored verbatim from openai/codex
 // `codex-rs/core/src/tools/code_mode/execute_spec.rs`.
 const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
@@ -314,6 +373,7 @@ impl Tool for WaitTool {
 pub fn code_mode_tools(
     callable: &[Arc<dyn Tool>],
     seam: Arc<dyn ToolCapability>,
+    mode: CodeMode,
 ) -> Vec<Arc<dyn Tool>> {
     let catalog: Vec<ToolDefinition> = callable
         .iter()
@@ -331,7 +391,7 @@ pub fn code_mode_tools(
     let description = build_exec_tool_description(
         &catalog,
         &BTreeMap::new(),
-        /*code_mode_only*/ true,
+        /*code_mode_only*/ mode == CodeMode::Only,
         false,
     );
     let surface = Arc::new(CodeModeSurface::new(seam, catalog));
@@ -388,7 +448,20 @@ mod tests {
             callable.clone(),
             test_cx(),
         ));
-        code_mode_tools(&callable, seam).remove(0)
+        code_mode_tools(&callable, seam, CodeMode::Only).remove(0)
+    }
+
+    #[test]
+    fn code_mode_parses_tristate_and_defaults() {
+        assert_eq!("off".parse(), Ok(CodeMode::Off));
+        assert_eq!("optional".parse(), Ok(CodeMode::Optional));
+        assert_eq!("only".parse(), Ok(CodeMode::Only));
+        assert_eq!(CodeMode::default(), CodeMode::Optional);
+        assert_eq!(CodeMode::parse_or_default("bogus"), CodeMode::Optional);
+        assert!(CodeMode::Optional.enables_code_surface());
+        assert!(!CodeMode::Off.enables_code_surface());
+        assert!(CodeMode::Only.defers_builtins());
+        assert!(!CodeMode::Optional.defers_builtins());
     }
 
     #[tokio::test]
@@ -428,7 +501,7 @@ mod tests {
             callable.clone(),
             cx.clone(),
         ));
-        let exec = code_mode_tools(&callable, seam).remove(0);
+        let exec = code_mode_tools(&callable, seam, CodeMode::Only).remove(0);
         let result = exec
             .call(
                 json!({ "source": "const r = await tools.file_read({ file_path: 'probe.txt' }); text(typeof r === 'string' ? r : JSON.stringify(r));" }),
@@ -468,7 +541,7 @@ mod tests {
         let callable = vec![Arc::new(Echo) as Arc<dyn Tool>];
         let empty_seam: Arc<dyn ToolCapability> =
             Arc::new(crate::capabilities::HostTools::new(Vec::new(), test_cx()));
-        let exec = code_mode_tools(&callable, empty_seam).remove(0);
+        let exec = code_mode_tools(&callable, empty_seam, CodeMode::Only).remove(0);
         let result = exec
             .call(
                 json!({ "source": "await tools.echo({ a: 1 });" }),

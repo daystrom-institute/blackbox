@@ -728,6 +728,7 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
     let provider = app.next_provider;
     let model = app.next_model.clone();
     let effort = app.next_effort.clone();
+    let code_mode = app.config.code_mode.clone();
     let alias = project.alias.clone();
     let classifier_cfg = app.orch.classifier();
     let orch = app.orch.clone();
@@ -752,6 +753,7 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
             provider,
             model,
             effort,
+            code_mode,
             classifier_cfg,
             alias,
         );
@@ -771,6 +773,7 @@ fn build_fleet_dispatch(
     provider: Provider,
     model: Option<String>,
     effort: Option<String>,
+    code_mode: Option<String>,
     classifier_cfg: Option<ClassifierConfig>,
     alias: Option<String>,
 ) -> DispatchOutcome {
@@ -801,6 +804,8 @@ fn build_fleet_dispatch(
     spec.effort = effort.clone();
     spec.env_overrides = worktree.env_overrides.clone();
     spec.name = Some(name.clone());
+    // Fleet-wide code-mode default from /config carries to NEW roster sessions.
+    spec.code_mode = code_mode;
     let task = orch.dispatch(spec);
 
     DispatchOutcome::Ready(Box::new(DispatchedAgent {
@@ -887,6 +892,7 @@ fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: String) {
     let provider = app.next_provider;
     let model = app.next_model.clone();
     let effort = app.next_effort.clone();
+    let code_mode = app.config.code_mode.clone();
     let orch = app.orch.clone();
     let tx = app.standalone_tx.clone();
     let is_resume = pending_resume.is_some();
@@ -918,6 +924,8 @@ fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: String) {
             spec.model = model.clone();
             spec.effort = effort.clone();
             spec.name = Some(name.clone());
+            // New session carries the fleet-wide code-mode; resume does not.
+            spec.code_mode = code_mode.clone();
             orch.dispatch(spec)
         };
         let _ = tx.send(StandaloneOutcome {
@@ -2092,6 +2100,7 @@ fn close_config(app: &mut App) {
 
 #[derive(Debug, Clone, Copy)]
 enum ConfigField {
+    CodeMode,
     ClassifierEnabled,
     ClassifierProvider,
     ClassifierAutoSend,
@@ -2100,7 +2109,8 @@ enum ConfigField {
 }
 
 impl ConfigField {
-    const ALL: [ConfigField; 5] = [
+    const ALL: [ConfigField; 6] = [
+        ConfigField::CodeMode,
         ConfigField::ClassifierEnabled,
         ConfigField::ClassifierProvider,
         ConfigField::ClassifierAutoSend,
@@ -2110,6 +2120,7 @@ impl ConfigField {
 
     fn label(self) -> &'static str {
         match self {
+            ConfigField::CodeMode => "Code mode",
             ConfigField::ClassifierEnabled => "Classifier",
             ConfigField::ClassifierProvider => "Intern provider",
             ConfigField::ClassifierAutoSend => "Relay suggestions",
@@ -2119,8 +2130,16 @@ impl ConfigField {
     }
 
     fn value(self, cfg: &FleetConfig) -> String {
+        // Code-mode is independent of the classifier block.
+        if let ConfigField::CodeMode = self {
+            return cfg
+                .code_mode
+                .clone()
+                .unwrap_or_else(|| "optional".to_string());
+        }
         let Some(c) = cfg.classifier.as_ref() else {
             return match self {
+                ConfigField::CodeMode => unreachable!(),
                 ConfigField::ClassifierEnabled => "off".to_string(),
                 ConfigField::ClassifierProvider => "glm".to_string(),
                 ConfigField::ClassifierAutoSend => "on".to_string(),
@@ -2129,6 +2148,7 @@ impl ConfigField {
             };
         };
         match self {
+            ConfigField::CodeMode => unreachable!(),
             ConfigField::ClassifierEnabled => {
                 if c.enabled_resolved() {
                     "on".to_string()
@@ -2153,6 +2173,9 @@ impl ConfigField {
 
     fn hint(self) -> &'static str {
         match self {
+            ConfigField::CodeMode => {
+                "Authorial tool surface for new sessions: off, optional (flat + exec/wait), only."
+            }
             ConfigField::ClassifierEnabled => "Start or stop intern companions for fleet agents.",
             ConfigField::ClassifierProvider => "Classifier session provider; must be steerable.",
             ConfigField::ClassifierAutoSend => {
@@ -2206,6 +2229,11 @@ fn ensure_classifier_config(app: &mut App) -> &mut ClassifierConfig {
 fn config_change_selected(app: &mut App, delta: isize) {
     let field = ConfigField::ALL[app.config_cursor];
     match field {
+        ConfigField::CodeMode => {
+            const VALUES: [&str; 3] = ["off", "optional", "only"];
+            let current = app.config.code_mode.as_deref().unwrap_or("optional");
+            app.config.code_mode = Some(cycle_str_value(Some(current), &VALUES, delta));
+        }
         ConfigField::ClassifierEnabled => {
             let c = ensure_classifier_config(app);
             c.enabled = Some(!c.enabled.unwrap_or(false));
@@ -2254,6 +2282,16 @@ fn cycle_u32_value(current: u32, values: &[u32], delta: isize) -> u32 {
 }
 
 fn apply_config_change(app: &mut App) {
+    // Persist the fleet-wide code-mode default. load→modify→save preserves the
+    // classifier block, and the set_classifier call below preserves code_mode,
+    // so the two writes compose regardless of order.
+    if let Err(e) = app.orch.set_code_mode(app.config.code_mode.clone()) {
+        app.set_status(
+            format!("code-mode save failed: {e:#}"),
+            Duration::from_secs(6),
+        );
+        return;
+    }
     match app.orch.set_classifier(app.config.classifier.clone()) {
         Ok(path) => {
             let sync = sync_classifier_monitors(app);

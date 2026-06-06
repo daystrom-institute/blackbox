@@ -136,6 +136,7 @@ impl BlackboxServer {
                 runtime,
                 exclude_providers,
             );
+            let wf_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
             let dispatched =
                 self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                     prompt: prompt.to_string(),
@@ -157,6 +158,7 @@ impl BlackboxServer {
                     spawn_agent_label: None,
                     record_to_bro: Some(brofile.to_string()),
                     brofile_context,
+                    code_mode: wf_code_mode,
                 })?;
             return Ok(dispatched.task);
         }

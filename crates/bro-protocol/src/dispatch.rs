@@ -27,6 +27,11 @@ pub struct DispatchSpec {
     /// Display name persisted with the task (stored in `bro_label`) so it
     /// survives a cockpit reload. Defaults to the initial prompt's head.
     pub name: Option<String>,
+    /// Code-mode for harness-backed providers (`off`/`optional`/`only`),
+    /// forwarded to the daemon as `ExecParams.code_mode`. Set on new roster
+    /// dispatches from the cockpit's `/config` toggle; `None` ⇒ harness default.
+    /// Resume does not carry this — the session restores its persisted value.
+    pub code_mode: Option<String>,
 }
 
 impl DispatchSpec {
@@ -39,6 +44,7 @@ impl DispatchSpec {
             effort: None,
             env_overrides: None,
             name: None,
+            code_mode: None,
         }
     }
 }

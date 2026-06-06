@@ -95,6 +95,12 @@ pub(crate) struct ExecParams {
     /// and uses availability scoring.
     #[serde(default)]
     pub(crate) selection_policy: Option<serde_json::Value>,
+    /// Per-dispatch code-mode override (`off`/`optional`/`only`) for
+    /// harness-backed providers. Overrides the resolved brofile's `code_mode`;
+    /// unset → brofile value, else harness default (`optional`). This is the
+    /// lane the Fleet TUI `/config` toggle rides for new roster dispatches.
+    #[serde(default)]
+    pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
@@ -626,6 +632,11 @@ pub(crate) struct BrofileParams {
     /// suppression for providers that support it.
     #[serde(default)]
     pub(crate) context: Option<orchestration::brofile::BrofileContext>,
+    /// Optional code-mode embedded in the brofile (`off`/`optional`/`only`).
+    /// Sets the authorial tool surface for harness-backed dispatches; unset →
+    /// harness default (`optional`).
+    #[serde(default)]
+    pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
 }
 
 #[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]

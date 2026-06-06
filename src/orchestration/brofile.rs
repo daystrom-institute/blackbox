@@ -59,6 +59,13 @@ pub struct Brofile {
     /// context-producer fields are not part of v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<BrofileContext>,
+    /// Optional code-mode selector (harness-backed providers). Sets the
+    /// authorial tool surface for sessions this brofile dispatches:
+    /// `off`/`optional`/`only`. Unset → harness default (`optional`). A
+    /// per-dispatch `ExecParams.code_mode` overrides this. See
+    /// `crate::orchestration::brofile::CodeMode`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<CodeMode>,
 }
 
 // ---------------------------------------------------------------------------
@@ -96,6 +103,33 @@ pub enum ProviderDefaultsMode {
 impl ProviderDefaultsMode {
     pub fn suppresses(self) -> bool {
         !matches!(self, ProviderDefaultsMode::Default)
+    }
+}
+
+/// Code-mode selector carried to the harness as `--code-mode`. Mirrors the
+/// harness-side `CodeMode` (Codex's `ToolMode`): `off` (flat tools only),
+/// `optional` (flat tools + `exec`/`wait`), `only` (`exec`/`wait` authorial
+/// surface, flat builtins hidden). When unset the harness applies its default
+/// (`optional`). Only harness-backed providers honor it.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CodeMode {
+    Off,
+    #[default]
+    Optional,
+    Only,
+}
+
+impl CodeMode {
+    /// The `--code-mode` token / serde value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CodeMode::Off => "off",
+            CodeMode::Optional => "optional",
+            CodeMode::Only => "only",
+        }
     }
 }
 
@@ -642,6 +676,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("reviewer", dir.path(), None);
@@ -672,6 +707,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         let written = save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(
@@ -701,6 +737,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&global_bf, "global", store.path(), None).expect("brofile save");
 
@@ -716,6 +753,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(
             &project_bf,
@@ -750,6 +788,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
+                code_mode: None,
             };
             save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         }
@@ -774,6 +813,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         assert!(resolve_brofile("to_delete", dir.path(), None).is_some());
@@ -824,6 +864,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("auditor", dir.path(), None).unwrap();
@@ -848,6 +889,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("readonly-persona", dir.path(), None).unwrap();
@@ -1127,11 +1169,43 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("fast", dir.path(), None).unwrap();
         assert_eq!(loaded.model.as_deref(), Some("gpt-5.4-mini"));
         assert_eq!(loaded.effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn test_brofile_code_mode_round_trip() {
+        let dir = temp_store();
+        let bf = Brofile {
+            name: "coder".into(),
+            provider: Provider::Glm,
+            account: None,
+            lens: None,
+            model: None,
+            effort: None,
+            filters: None,
+            surface: None,
+            coerce_workspace: None,
+            runtime: None,
+            context: None,
+            code_mode: Some(CodeMode::Only),
+        };
+        save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
+        let loaded = resolve_brofile("coder", dir.path(), None).unwrap();
+        assert_eq!(loaded.code_mode, Some(CodeMode::Only));
+
+        // Absent in JSON ⇒ None (serde default), and the token is snake_case.
+        let json = r#"{"name":"plain","provider":"glm"}"#;
+        let plain: Brofile = serde_json::from_str(json).unwrap();
+        assert_eq!(plain.code_mode, None);
+        assert_eq!(CodeMode::Only.as_str(), "only");
+        let parsed: Brofile =
+            serde_json::from_str(r#"{"name":"x","provider":"glm","code_mode":"optional"}"#).unwrap();
+        assert_eq!(parsed.code_mode, Some(CodeMode::Optional));
     }
 
     #[test]
@@ -1149,6 +1223,7 @@ mod tests {
             coerce_workspace: Some(true),
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf, "global", dir.path(), None).expect("brofile save");
         let loaded = resolve_brofile("ws-worker", dir.path(), None).unwrap();
@@ -1166,6 +1241,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         save_brofile(&bf_off, "global", dir.path(), None).expect("brofile save");
         let loaded_off = resolve_brofile("ws-off", dir.path(), None).unwrap();

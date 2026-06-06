@@ -709,11 +709,12 @@ impl BlackboxServer {
                 &self.state.store_dir,
                 bf.context.as_ref(),
             );
-            let opts = if bf.model.is_some() || bf.effort.is_some() {
+            let opts = if bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some() {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
                     provider_defaults: None,
+                    code_mode: bf.code_mode,
                 })
             } else {
                 None
@@ -776,6 +777,9 @@ impl BlackboxServer {
                         .and_then(|v| v.as_str())
                         .map(String::from),
                     provider_defaults: None,
+                    // Inline brofiles don't carry code_mode in v1 (parallels
+                    // the inline-context rejection above).
+                    code_mode: None,
                 })
             } else {
                 None
@@ -893,6 +897,9 @@ impl BlackboxServer {
             exec_opts.as_ref().and_then(|o| o.model.clone()),
             exec_opts.as_ref().and_then(|o| o.effort.clone()),
         );
+        // Preserve the resolved code-mode across the allocator's exec_opts
+        // rebuild inside dispatch_fresh_bro_task.
+        let agent_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
         let dispatched =
             match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
@@ -914,6 +921,7 @@ impl BlackboxServer {
                 spawn_agent_label: Some(bro_label.clone()),
                 record_to_bro: p.bro.clone(),
                 brofile_context,
+                code_mode: agent_code_mode,
             }) {
                 Ok(result) => result,
                 Err(e) => return Self::err_text(&e),
@@ -1543,6 +1551,7 @@ mod tests {
             coerce_workspace: None,
             runtime: None,
             context: None,
+            code_mode: None,
         };
         let _ = orchestration::brofile::save_brofile(&bf, "global", &server.state.store_dir, None);
         let manifest = serde_json::json!({

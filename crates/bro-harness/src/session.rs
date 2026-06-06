@@ -30,6 +30,12 @@ pub struct Restored {
     /// re-pass --model (it's implied by the session), so the harness falls
     /// back to this persisted value.
     pub model: Option<String>,
+    /// Code-mode the session was created with. Like `model`, the daemon does
+    /// not re-pass `--code-mode` on resume — the surface shape is session-
+    /// intrinsic (a transcript may contain `exec` cells that depend on it), so
+    /// the harness restores this value. `None` for sessions written before this
+    /// field existed.
+    pub code_mode: Option<String>,
     pub snapshot: Value,
     /// Loop-level side cells from the prior run (`Value::Null` if absent, e.g.
     /// sessions written before this field existed).
@@ -42,6 +48,7 @@ pub struct Restored {
 pub struct SaveState<'a> {
     pub transport: &'a str,
     pub model: &'a str,
+    pub code_mode: &'a str,
     pub snapshot: Value,
     pub side: Value,
 }
@@ -70,6 +77,7 @@ impl SessionStore {
                     Some(Restored {
                         transport: v["transport"].as_str().unwrap_or_default().to_string(),
                         model: v["model"].as_str().map(str::to_string),
+                        code_mode: v["code_mode"].as_str().map(str::to_string),
                         snapshot: v["snapshot"].clone(),
                         side: v.get("side").cloned().unwrap_or(Value::Null),
                     })
@@ -99,6 +107,7 @@ impl SessionStore {
         let body = serde_json::to_string(&json!({
             "transport": state.transport,
             "model": state.model,
+            "code_mode": state.code_mode,
             "snapshot": state.snapshot,
             "side": state.side,
         }))
@@ -144,6 +153,7 @@ mod tests {
             Restored {
                 transport: v["transport"].as_str().unwrap_or_default().to_string(),
                 model: v["model"].as_str().map(str::to_string),
+                code_mode: v["code_mode"].as_str().map(str::to_string),
                 snapshot: v["snapshot"].clone(),
                 side: v.get("side").cloned().unwrap_or(Value::Null),
             }
@@ -163,6 +173,7 @@ mod tests {
             .save(&SaveState {
                 transport: "anthropic",
                 model: "m",
+                code_mode: "only",
                 snapshot: json!({"msgs": 1}),
                 side: json!({"todos": []}),
             })
@@ -171,6 +182,7 @@ mod tests {
         let r = resume_in(&dir, "sess-1").restored.expect("restored");
         assert_eq!(r.transport, "anthropic");
         assert_eq!(r.model.as_deref(), Some("m"));
+        assert_eq!(r.code_mode.as_deref(), Some("only"));
         assert_eq!(r.snapshot, json!({"msgs": 1}));
         assert_eq!(r.side["todos"], json!([]));
 
@@ -189,6 +201,8 @@ mod tests {
         let r = resume_in(&dir, "old").restored.expect("restored");
         assert_eq!(r.snapshot, json!({"x": 1}));
         assert_eq!(r.side, Value::Null);
+        // A session written before code_mode existed restores it as absent.
+        assert_eq!(r.code_mode, None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

@@ -1472,6 +1472,9 @@ pub fn exec_opts_for_lane(lane: &RuntimeLane) -> Option<ExecOpts> {
         model: lane.model.clone(),
         effort: lane.effort.clone(),
         provider_defaults: None,
+        // Code-mode is not an allocation dimension; folded in later from the
+        // dispatch's resolved value (FreshDispatchRequest.code_mode).
+        code_mode: None,
     })
 }
 

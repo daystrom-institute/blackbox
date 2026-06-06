@@ -89,6 +89,16 @@ pub struct Cli {
     #[arg(long = "allow-tools")]
     pub allow_tools: Option<String>,
 
+    /// Code-mode selector — `off` (flat tools only, no `exec`/`wait`),
+    /// `optional` (flat tools AND `exec`/`wait`; default), or `only`
+    /// (`exec`/`wait` are the authorial surface, flat builtins hidden from the
+    /// wire array but still `tool_search`-loadable). On resume this falls back
+    /// to the value persisted with the session (the daemon need not re-pass it),
+    /// then to `BRO_HARNESS_CODE_MODE`, then to the default. Unknown values warn
+    /// and use the default.
+    #[arg(long = "code-mode")]
+    pub code_mode: Option<String>,
+
     // --- accepted, no-op (we always stream NDJSON; safety is the denylist) ---
     #[arg(long = "verbose", default_value_t = false)]
     pub verbose: bool,

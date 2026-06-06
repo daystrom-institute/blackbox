@@ -72,6 +72,15 @@ pub struct FleetConfig {
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     pub classifier: Option<ClassifierConfig>,
+
+    /// Default code-mode for new roster dispatches (`off`/`optional`/`only`),
+    /// toggled via `/config`. Forwarded on `DispatchSpec.code_mode` for fresh
+    /// sessions only; resume relies on the session's persisted value. Absent →
+    /// harness default (`optional`). Round-tripped but not interpreted by the
+    /// client (the daemon/harness own code-mode semantics).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code_mode: Option<String>,
 }
 
 /// Config for the experimental classifier companion — the "assistant's
@@ -964,6 +973,9 @@ fn dispatch_body(spec: &DispatchSpec) -> Value {
     if let Some(effort) = &spec.effort {
         body["pin_effort"] = Value::String(effort.clone());
     }
+    if let Some(code_mode) = &spec.code_mode {
+        body["code_mode"] = Value::String(code_mode.clone());
+    }
     body
 }
 
@@ -1256,6 +1268,17 @@ impl FleetOrchestrator {
         Ok(path)
     }
 
+    /// Persist the fleet-wide default code-mode (`off`/`optional`/`only`, or
+    /// `None` to clear → harness default) to `fleet.json`. Mirrors
+    /// [`set_classifier`](Self::set_classifier): load → modify → save, so the
+    /// other fleet config fields are preserved. New roster dispatches read this
+    /// onto `DispatchSpec.code_mode`.
+    pub fn set_code_mode(&self, code_mode: Option<String>) -> anyhow::Result<PathBuf> {
+        let mut cfg = FleetConfig::load();
+        cfg.code_mode = code_mode;
+        cfg.save()
+    }
+
     /// Flush the current task store to disk so a later cockpit launch can
     /// reload these sessions. The cockpit calls this after each dispatch and on
     /// quit.
@@ -1417,6 +1440,29 @@ mod tests {
         // must deserialize, not error — mcpServers defaults to empty.
         let cfg: FleetConfig = serde_json::from_str("{}").unwrap();
         assert!(cfg.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn dispatch_body_carries_code_mode_only_when_set() {
+        let mut spec = DispatchSpec::new(Provider::Glm, "hi");
+        // Absent ⇒ no code_mode key (harness applies its default).
+        assert!(dispatch_body(&spec).get("code_mode").is_none());
+        // Set ⇒ forwarded as ExecParams.code_mode.
+        spec.code_mode = Some("only".to_string());
+        assert_eq!(
+            dispatch_body(&spec).get("code_mode").and_then(|v| v.as_str()),
+            Some("only")
+        );
+    }
+
+    #[test]
+    fn fleet_config_code_mode_round_trips() {
+        let cfg: FleetConfig = serde_json::from_str(r#"{"code_mode":"only"}"#).unwrap();
+        assert_eq!(cfg.code_mode.as_deref(), Some("only"));
+        // Absent ⇒ None (harness default), and it's skipped when serializing.
+        let bare: FleetConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(bare.code_mode, None);
+        assert!(!serde_json::to_string(&bare).unwrap().contains("code_mode"));
     }
 
     #[test]

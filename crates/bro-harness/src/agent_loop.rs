@@ -423,6 +423,10 @@ async fn run_prompt_with_controls(
 struct Session {
     tx: Box<dyn Transport>,
     reg: Registry,
+    /// Resolved code-mode for this session. Session-intrinsic (like `model`):
+    /// persisted in the session file and restored on resume so the surface
+    /// shape stays consistent with any `exec` cells already in the transcript.
+    code_mode: crate::code_mode::CodeMode,
     cx: ToolCx,
     reference_context_item: Option<crate::context::TurnContextItem>,
     hooks: HookEngine,
@@ -517,6 +521,7 @@ impl Session {
         // per-request id).
         tx.set_session_id(store.id.clone());
         let restored_model = store.restored.as_ref().and_then(|r| r.model.clone());
+        let restored_code_mode = store.restored.as_ref().and_then(|r| r.code_mode.clone());
         // Loop-level side cells restored from a prior turn. Each cell
         // deserializes its own slot tolerantly (absent/garbage → empty).
         let prior_side = store
@@ -619,23 +624,49 @@ impl Session {
         // tools + all MCP — and a ToolCapability seam over that same set
         // dispatches a cell's nested tools.* (deny-filter honored; exec/wait are
         // excluded from the projected namespace so a cell cannot relaunch the box).
+        // Resolved code-mode: explicit --code-mode wins; on resume fall back to
+        // the value persisted with the session (the daemon doesn't re-pass it,
+        // mirroring --model); then the env default; then `optional`.
+        let code_mode = cli
+            .code_mode
+            .clone()
+            .or(restored_code_mode)
+            .or_else(|| std::env::var("BRO_HARNESS_CODE_MODE").ok())
+            .map(|v| crate::code_mode::CodeMode::parse_or_default(&v))
+            .unwrap_or_default();
+
         let mut cm_callable: Vec<Arc<dyn Tool>> = builtins
             .iter()
             .filter(|t| tool_filter.permits(t.name()))
             .cloned()
             .collect();
         cm_callable.extend(mcp_all_for_code_mode);
-        let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
-            crate::capabilities::HostTools::new(cm_callable.clone(), cx.clone()),
-        );
-        builtins.extend(crate::code_mode::code_mode_tools(&cm_callable, cm_seam));
         let mut pin = PinPolicy::from_env();
-        pin.also_pin(bro_code_mode::PUBLIC_TOOL_NAME);
-        pin.also_pin(bro_code_mode::WAIT_TOOL_NAME);
+        // `off` ⇒ no authorial code surface: skip exec/wait entirely. `optional`
+        // and `only` register + pin them; `only` additionally hides the flat
+        // builtins from the wire array (below), making exec/wait the surface.
+        if code_mode.enables_code_surface() {
+            let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
+                crate::capabilities::HostTools::new(cm_callable.clone(), cx.clone()),
+            );
+            builtins.extend(crate::code_mode::code_mode_tools(
+                &cm_callable,
+                cm_seam,
+                code_mode,
+            ));
+            pin.also_pin(bro_code_mode::PUBLIC_TOOL_NAME);
+            pin.also_pin(bro_code_mode::WAIT_TOOL_NAME);
+        }
         if fleet {
             pin.also_pin(crate::report::REPORT_TOOL);
         }
-        let reg = Registry::new(builtins, mcp_out_box, &pin, &tool_filter);
+        let reg = Registry::with_options(
+            builtins,
+            mcp_out_box,
+            &pin,
+            &tool_filter,
+            code_mode.defers_builtins(),
+        );
 
         let base_opts = TurnOpts {
             base_instructions: Some(transport::base_instructions_for(&model)),
@@ -659,6 +690,7 @@ impl Session {
         Ok(Self {
             tx,
             reg,
+            code_mode,
             cx,
             reference_context_item,
             hooks,
@@ -1281,6 +1313,7 @@ impl Session {
         self.store.save(&SaveState {
             transport: self.tx.name(),
             model: &self.base_opts.model,
+            code_mode: self.code_mode.as_str(),
             snapshot: self.tx.snapshot(),
             side: self.side_state(),
         })
@@ -1811,6 +1844,7 @@ mod tests {
         let id = format!("bh-test-{}-{}", std::process::id(), nanos);
         let session = Session {
             tx: Box::new(mock),
+            code_mode: crate::code_mode::CodeMode::Optional,
             reg: Registry::new(
                 vec![
                     Arc::new(SlowTool {

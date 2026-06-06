@@ -1,5 +1,5 @@
 use crate::config::ProviderConfig;
-use crate::orchestration::brofile::{BrofileContext, ProviderDefaultsMode};
+use crate::orchestration::brofile::{BrofileContext, CodeMode, ProviderDefaultsMode};
 
 use std::path::PathBuf;
 
@@ -95,6 +95,10 @@ pub struct ExecOpts {
     pub model: Option<String>,
     pub effort: Option<String>,
     pub provider_defaults: Option<ProviderDefaultsMode>,
+    /// Code-mode to pass the harness as `--code-mode` (harness-backed providers
+    /// only). `None` ⇒ no flag emitted, so the harness applies its own
+    /// precedence (persisted session value → env → default `optional`).
+    pub code_mode: Option<CodeMode>,
 }
 
 const EMPTY_SYSTEM_PROMPT_OVERRIDE: &str = "";
@@ -213,6 +217,7 @@ impl ProviderExec for Provider {
             .map(|m| normalize_model_for_provider(*self, m))
             .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
+        let code_mode = opts.and_then(|o| o.code_mode);
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
@@ -247,6 +252,9 @@ impl ProviderExec for Provider {
                 if let Some(e) = effort {
                     args.extend(["--effort".into(), e.into()]);
                 }
+                if let Some(cm) = code_mode {
+                    args.extend(["--code-mode".into(), cm.as_str().into()]);
+                }
                 args
             }
             Provider::Workflow => Vec::new(),
@@ -264,6 +272,7 @@ impl ProviderExec for Provider {
             .map(|m| normalize_model_for_provider(*self, m))
             .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
+        let code_mode = opts.and_then(|o| o.code_mode);
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
@@ -296,6 +305,12 @@ impl ProviderExec for Provider {
                 }
                 if let Some(e) = effort {
                     args.extend(["--effort".into(), e.into()]);
+                }
+                // Resume normally leaves this None — the harness restores the
+                // session's persisted code_mode. Emitted only if a caller
+                // explicitly overrides it on resume.
+                if let Some(cm) = code_mode {
+                    args.extend(["--code-mode".into(), cm.as_str().into()]);
                 }
                 args
             }

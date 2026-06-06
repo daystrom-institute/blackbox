@@ -98,6 +98,28 @@ impl Registry {
         pin: &PinPolicy,
         filter: &ToolFilter,
     ) -> Self {
+        Self::with_options(builtins, mcp, pin, filter, false)
+    }
+
+    /// Like [`Registry::new`], but `defer_builtins` controls the default tier of
+    /// non-pinned built-ins. `false` (the [`new`](Registry::new) default) keeps
+    /// them `Eager` (always in the wire array). `true` demotes them to
+    /// `Deferred` — out of the wire array but still `tool_search`-loadable —
+    /// which is how code-mode `only` hides the flat surface so `exec`/`wait`
+    /// (pinned) are the sole authorial entrypoints. Pinned built-ins are
+    /// unaffected (they stay visible regardless).
+    pub fn with_options(
+        builtins: Vec<Arc<dyn Tool>>,
+        mcp: Vec<Arc<dyn Tool>>,
+        pin: &PinPolicy,
+        filter: &ToolFilter,
+        defer_builtins: bool,
+    ) -> Self {
+        let default_builtin_tier = if defer_builtins {
+            Tier::Deferred
+        } else {
+            Tier::Eager
+        };
         let mut tools: HashMap<String, Entry> = HashMap::new();
         for t in builtins {
             if !filter.permits(t.name()) {
@@ -106,7 +128,7 @@ impl Registry {
             let tier = if pin.matches(t.name()) {
                 Tier::Pinned
             } else {
-                Tier::Eager
+                default_builtin_tier
             };
             tools.insert(t.name().to_string(), Entry { tool: t, tier });
         }
@@ -412,6 +434,39 @@ mod tests {
         let wire: Vec<String> = reg.wire_specs().into_iter().map(|s| s.name).collect();
         assert!(wire.contains(&"bbox_stats".to_string()));
         assert!(!reg.manifest().iter().any(|(n, _)| n == "bbox_stats"));
+    }
+
+    #[test]
+    fn defer_builtins_hides_flat_surface_but_keeps_pinned() {
+        // code-mode `only`: exec/wait (pinned) stay in wire; flat builtins drop
+        // out of wire and into the tool_search-loadable manifest.
+        let pin = PinPolicy {
+            patterns: vec!["exec".into()],
+        };
+        let builtins = vec![mk("exec", "code surface"), mk("file_read", "read a file")];
+
+        // optional/off (defer_builtins=false): both visible in wire.
+        let optional = Registry::with_options(
+            builtins.clone(),
+            vec![],
+            &pin,
+            &ToolFilter::default(),
+            false,
+        );
+        let wire: Vec<String> = optional.wire_specs().into_iter().map(|s| s.name).collect();
+        assert!(wire.contains(&"exec".to_string()));
+        assert!(wire.contains(&"file_read".to_string()), "optional: {wire:?}");
+
+        // only (defer_builtins=true): exec pinned/visible, file_read deferred.
+        let only =
+            Registry::with_options(builtins, vec![], &pin, &ToolFilter::default(), true);
+        let wire: Vec<String> = only.wire_specs().into_iter().map(|s| s.name).collect();
+        assert!(wire.contains(&"exec".to_string()), "only wire: {wire:?}");
+        assert!(!wire.contains(&"file_read".to_string()), "only wire: {wire:?}");
+        assert!(
+            only.manifest().iter().any(|(n, _)| n == "file_read"),
+            "deferred builtin must be tool_search-loadable"
+        );
     }
 
     /// Helper: collect every tool name the registry would expose — wire (pinned

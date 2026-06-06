@@ -538,6 +538,7 @@ mod tests {
                 coerce_workspace: None,
                 runtime: None,
                 context: None,
+                code_mode: None,
             },
             "global",
             &tmp.path().join("bro"),

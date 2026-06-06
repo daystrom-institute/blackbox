@@ -33,6 +33,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         model: Some("zai-coding-plan/glm-5.1".into()),
         effort: Some("high".into()),
         provider_defaults: None,
+        code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
     };
     let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
     assert_eq!(glm[0], "-p");
@@ -44,6 +45,9 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(glm.contains(&"glm-5.1".to_string()));
     assert!(!glm.contains(&"zai-coding-plan/glm-5.1".to_string()));
     assert!(glm.contains(&"--effort".to_string()));
+    // code_mode is emitted as `--code-mode <value>` for harness providers.
+    assert!(glm.contains(&"--code-mode".to_string()));
+    assert!(glm.contains(&"only".to_string()));
     assert!(
         !glm.contains(&"--mcp-config".to_string()),
         "in-process harness providers get typed MCP config, not CLI JSON"
@@ -53,6 +57,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         model: Some("deepseek/deepseek-v4-pro".into()),
         effort: None,
         provider_defaults: None,
+        code_mode: None,
     };
     let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&deepseek_opts));
     assert!(deepseek.contains(&"--resume".to_string()));
@@ -60,6 +65,8 @@ fn harness_exec_and_resume_args_use_stream_json() {
     assert!(deepseek.contains(&"--model".to_string()));
     assert!(deepseek.contains(&"deepseek-v4-pro".to_string()));
     assert!(!deepseek.contains(&"deepseek/deepseek-v4-pro".to_string()));
+    // No code_mode set on resume ⇒ no flag emitted (session restores it).
+    assert!(!deepseek.contains(&"--code-mode".to_string()));
     assert!(
         !deepseek.contains(&"--mcp-config".to_string()),
         "in-process resume also avoids CLI MCP config"
@@ -69,6 +76,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         model: Some("minimax/MiniMax-M3".into()),
         effort: Some("medium".into()),
         provider_defaults: None,
+        code_mode: None,
     };
     let minimax =
         Provider::Minimax.build_exec_args("hello minimax", "sid-3", None, Some(&minimax_opts));
