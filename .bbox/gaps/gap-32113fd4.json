@@ -13,10 +13,12 @@
   "blocking_level": "workaround_available",
   "dedupe_key": "tooling/provider-dispatch/minimax-terminal-missing-result",
   "notes": "Dispatch on the dev daemon selected provider=minimax model=MiniMax-M3 and immediately reached terminal completed state with only an init system event. The result capture reported no assistant result, no stderr, and no located transcript, so the operator cannot distinguish provider silence from harness capture failure.",
-  "resolution": "unresolved",
+  "resolution": "addressed",
   "task_id": "6b762a82-aa94-4cd4-ae52-211d760a1598",
   "provider": "minimax",
   "thread_id": "thread-7cba3fc5",
   "created_at": "2026-06-05T23:09:06Z",
-  "updated_at": "2026-06-05T23:09:06Z"
+  "updated_at": "2026-06-06T01:42:44Z",
+  "resolved_at": "2026-06-06T01:42:44Z",
+  "resolution_note": "Fixed in commit 8bcd551 on beta/blackbox-v2. Root cause: the in-process harness controlled-session loop (run_prompt_with_controls) swallowed failed turns — logged to process stderr and returned Ok — so the daemon recorded a silent completed/no-result. The triggering instance for MiniMax was the web_search server tool sent without input_schema (MiniMax error 2013), fixed separately in d0710c7. The observability fix: the harness now emits a terminal result event with is_error=true carrying the error text (Emitter::result_error), and the daemon's ingest_harness_event maps an is_error result to TaskStatus::Failed and preserves the message in stderr — the in-process analogue of the subprocess non-zero-exit path. Covered by tests result_error_emits_is_error_result_event and ingest_is_error_result_marks_in_process_task_failed_and_captures_message."
 }
