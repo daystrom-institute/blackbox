@@ -920,6 +920,29 @@ mod tests {
     }
 
     #[test]
+    fn grammar_tool_still_serializes_as_function_tool() {
+        let body = transport().build_body(
+            &[crate::transport::ToolSpec {
+                name: "exec".into(),
+                description: "Execute code".into(),
+                schema: json!({"type": "object", "properties": {"source": {"type": "string"}}}),
+                grammar: Some(bro_tools::FreeformGrammar {
+                    syntax: "lark".into(),
+                    definition: "start: SOURCE\nSOURCE: /[\\s\\S]+/".into(),
+                }),
+            }],
+            &opts(SystemPrompt::default()),
+        );
+
+        let tool = &body["tools"].as_array().unwrap()[0];
+        assert_eq!(tool["name"], "exec");
+        assert_eq!(tool["description"], "Execute code");
+        assert_eq!(tool["input_schema"]["type"], "object");
+        assert!(tool.get("format").is_none());
+        assert!(tool.get("type").is_none());
+    }
+
+    #[test]
     fn split_system_caches_stable_only() {
         let body = transport().build_body(
             &[],

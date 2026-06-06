@@ -180,6 +180,7 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub schema: Value,
+    pub grammar: Option<bro_tools::FreeformGrammar>,
 }
 
 /// The system prompt, split into a cache-stable prefix and a volatile tail.

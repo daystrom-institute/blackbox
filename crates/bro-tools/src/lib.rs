@@ -25,7 +25,7 @@ pub use promise::{PromiseProgress, PromiseStore, StreamKind, promise_tools};
 pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
-pub use tool::{Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
+pub use tool::{FreeformGrammar, Tool, ToolAnnotations, ToolCx, ToolResult, schema_for};
 
 use std::sync::Arc;
 

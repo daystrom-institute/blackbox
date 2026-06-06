@@ -11,6 +11,7 @@
 use super::{StopReason, ToolCall, ToolResult, ToolSpec, TurnOpts, TurnOutput, Usage};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 
 /// Auth material for a Responses request.
 pub(super) enum Auth {
@@ -34,6 +35,7 @@ pub(super) struct ResponsesState {
     pub thread_id: String,
     /// Flat Responses `input[]` buffer.
     pub input: Vec<Value>,
+    custom_tool_call_ids: HashSet<String>,
 }
 
 impl ResponsesState {
@@ -43,6 +45,7 @@ impl ResponsesState {
             session_id: String::new(),
             thread_id: new_id(),
             input: Vec::new(),
+            custom_tool_call_ids: HashSet::new(),
         }
     }
 
@@ -72,11 +75,19 @@ impl ResponsesState {
 
     pub(super) fn push_tool_results(&mut self, results: Vec<ToolResult>) {
         for r in results {
-            self.input.push(json!({
-                "type": "function_call_output",
-                "call_id": r.id,
-                "output": r.content,
-            }));
+            if self.custom_tool_call_ids.remove(&r.id) {
+                self.input.push(json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": r.id,
+                    "output": r.content,
+                }));
+            } else {
+                self.input.push(json!({
+                    "type": "function_call_output",
+                    "call_id": r.id,
+                    "output": r.content,
+                }));
+            }
         }
     }
 
@@ -87,11 +98,13 @@ impl ResponsesState {
     pub(super) fn restore(&mut self, snapshot: Value) {
         if let Some(arr) = snapshot.as_array() {
             self.input = arr.clone();
+            self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
         }
     }
 
     pub(super) fn normalize_for_prompt(&mut self) {
         normalize_responses_input(&mut self.input);
+        self.custom_tool_call_ids = pending_custom_tool_call_ids(&self.input);
     }
 
     pub(super) fn build_body(&self, tools: &[ToolSpec], opts: &TurnOpts) -> Value {
@@ -99,7 +112,7 @@ impl ResponsesState {
     }
 
     pub(super) fn parse_sse(&mut self, sse: &str) -> Result<TurnOutput> {
-        parse_sse(&mut self.input, sse)
+        parse_sse(&mut self.input, &mut self.custom_tool_call_ids, sse)
     }
 
     pub(super) fn identity_auth_headers(&self) -> Vec<(&'static str, String)> {
@@ -195,18 +208,7 @@ pub(super) fn build_body(
     tools: &[ToolSpec],
     opts: &TurnOpts,
 ) -> Value {
-    let mut tool_defs: Vec<Value> = tools
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.schema,
-                "strict": false,
-            })
-        })
-        .collect();
+    let mut tool_defs: Vec<Value> = tools.iter().map(responses_tool_definition).collect();
     if opts.web_search {
         tool_defs.push(json!({"type": "web_search"}));
     }
@@ -281,18 +283,7 @@ pub(super) fn build_compaction_input(
     tools: &[ToolSpec],
     opts: &TurnOpts,
 ) -> Value {
-    let tool_defs: Vec<Value> = tools
-        .iter()
-        .map(|t| {
-            json!({
-                "type": "function",
-                "name": t.name,
-                "description": t.description,
-                "parameters": t.schema,
-                "strict": false,
-            })
-        })
-        .collect();
+    let tool_defs: Vec<Value> = tools.iter().map(responses_tool_definition).collect();
     let instructions = response_instructions(opts);
     json!({
         "model": opts.model,
@@ -301,6 +292,29 @@ pub(super) fn build_compaction_input(
         "tools": tool_defs,
         "parallel_tool_calls": false,
     })
+}
+
+fn responses_tool_definition(t: &ToolSpec) -> Value {
+    if let Some(grammar) = &t.grammar {
+        json!({
+            "type": "custom",
+            "name": t.name,
+            "description": t.description,
+            "format": {
+                "type": "grammar",
+                "syntax": grammar.syntax,
+                "definition": grammar.definition,
+            },
+        })
+    } else {
+        json!({
+            "type": "function",
+            "name": t.name,
+            "description": t.description,
+            "parameters": t.schema,
+            "strict": false,
+        })
+    }
 }
 
 fn response_instructions(opts: &TurnOpts) -> String {
@@ -326,7 +340,11 @@ fn response_instructions(opts: &TurnOpts) -> String {
 /// `input` buffer (so the next turn carries context), and normalize. Shared by
 /// every Responses transport — the downstream event vocabulary is identical
 /// across HTTP-SSE and WebSocket.
-pub(super) fn parse_sse(input: &mut Vec<Value>, sse: &str) -> Result<TurnOutput> {
+pub(super) fn parse_sse(
+    input: &mut Vec<Value>,
+    custom_tool_call_ids: &mut HashSet<String>,
+    sse: &str,
+) -> Result<TurnOutput> {
     let mut output_items: Vec<Value> = Vec::new();
     let mut usage = Usage::default();
     let mut stop = StopReason::Done;
@@ -469,6 +487,18 @@ pub(super) fn parse_sse(input: &mut Vec<Value>, sse: &str) -> Result<TurnOutput>
                     });
                 }
             }
+            "custom_tool_call" => {
+                if let (Some(call_id), Some(name)) =
+                    (item["call_id"].as_str(), item["name"].as_str())
+                {
+                    custom_tool_call_ids.insert(call_id.to_string());
+                    tool_calls.push(ToolCall {
+                        id: call_id.to_string(),
+                        name: name.to_string(),
+                        args: json!({ "source": item["input"].as_str().unwrap_or("") }),
+                    });
+                }
+            }
             _ => {} // reasoning / other items carried in buffer, not surfaced
         }
     }
@@ -492,42 +522,66 @@ pub(super) fn parse_sse(input: &mut Vec<Value>, sse: &str) -> Result<TurnOutput>
 pub(super) fn responses_split(input: &[Value], limit: usize) -> Option<usize> {
     (1..limit).rev().find(|&s| {
         let tail = &input[s..];
-        let calls: std::collections::HashSet<&str> = tail
+        let function_calls: HashSet<&str> = tail
             .iter()
             .filter(|it| it["type"] == "function_call")
             .filter_map(|it| it["call_id"].as_str())
             .collect();
+        let custom_calls: HashSet<&str> = tail
+            .iter()
+            .filter(|it| it["type"] == "custom_tool_call")
+            .filter_map(|it| it["call_id"].as_str())
+            .collect();
         !tail.iter().any(|it| {
-            it["type"] == "function_call_output"
-                && it["call_id"].as_str().is_some_and(|c| !calls.contains(c))
+            (it["type"] == "function_call_output"
+                && it["call_id"]
+                    .as_str()
+                    .is_some_and(|c| !function_calls.contains(c)))
+                || (it["type"] == "custom_tool_call_output"
+                    && it["call_id"]
+                        .as_str()
+                        .is_some_and(|c| !custom_calls.contains(c)))
         })
     })
 }
 
 pub(super) fn normalize_responses_input(input: &mut Vec<Value>) {
-    let calls: std::collections::HashSet<String> = input
+    let function_calls: HashSet<String> = input
         .iter()
         .filter(|item| item["type"] == "function_call")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_string))
+        .collect();
+    let custom_calls: HashSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "custom_tool_call")
         .filter_map(|item| item["call_id"].as_str().map(str::to_string))
         .collect();
 
     input.retain(|item| match item["type"].as_str() {
         Some("function_call_output") => item["call_id"]
             .as_str()
-            .is_some_and(|id| calls.contains(id)),
+            .is_some_and(|id| function_calls.contains(id)),
+        Some("custom_tool_call_output") => item["call_id"]
+            .as_str()
+            .is_some_and(|id| custom_calls.contains(id)),
         _ => true,
     });
 
-    let outputs: std::collections::HashSet<String> = input
+    let function_outputs: HashSet<String> = input
         .iter()
         .filter(|item| item["type"] == "function_call_output")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_string))
+        .collect();
+    let custom_outputs: HashSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "custom_tool_call_output")
         .filter_map(|item| item["call_id"].as_str().map(str::to_string))
         .collect();
     let mut missing_outputs = Vec::new();
     for (idx, item) in input.iter().enumerate() {
         if item["type"] == "function_call"
             && let Some(call_id) = item["call_id"].as_str()
-            && !outputs.contains(call_id)
+            && !function_outputs.contains(call_id)
         {
             missing_outputs.push((
                 idx,
@@ -538,10 +592,38 @@ pub(super) fn normalize_responses_input(input: &mut Vec<Value>) {
                 }),
             ));
         }
+        if item["type"] == "custom_tool_call"
+            && let Some(call_id) = item["call_id"].as_str()
+            && !custom_outputs.contains(call_id)
+        {
+            missing_outputs.push((
+                idx,
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": call_id,
+                    "output": "aborted",
+                }),
+            ));
+        }
     }
     for (idx, output) in missing_outputs.into_iter().rev() {
         input.insert(idx + 1, output);
     }
+}
+
+fn pending_custom_tool_call_ids(input: &[Value]) -> HashSet<String> {
+    let outputs: HashSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "custom_tool_call_output")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_string))
+        .collect();
+    input
+        .iter()
+        .filter(|item| item["type"] == "custom_tool_call")
+        .filter_map(|item| item["call_id"].as_str())
+        .filter(|id| !outputs.contains(*id))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Render a slice of the Responses input buffer to a plain-text transcript for
@@ -569,6 +651,15 @@ pub(super) fn render_responses_transcript(items: &[Value], tool_cap: usize) -> S
             )),
             "function_call_output" => s.push_str(&format!(
                 "\n## tool\n[tool_result {}]\n",
+                super::truncate(it["output"].as_str().unwrap_or(""), tool_cap)
+            )),
+            "custom_tool_call" => s.push_str(&format!(
+                "\n## assistant\n[custom_tool_call {} {}]\n",
+                it["name"].as_str().unwrap_or(""),
+                it["input"].as_str().unwrap_or("")
+            )),
+            "custom_tool_call_output" => s.push_str(&format!(
+                "\n## tool\n[custom_tool_result {}]\n",
                 super::truncate(it["output"].as_str().unwrap_or(""), tool_cap)
             )),
             _ => {}
@@ -722,6 +813,27 @@ mod tests {
         opts
     }
 
+    fn function_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("{name} description"),
+            schema: json!({"type": "object"}),
+            grammar: None,
+        }
+    }
+
+    fn grammar_spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.into(),
+            description: format!("{name} description"),
+            schema: json!({"type": "object"}),
+            grammar: Some(bro_tools::FreeformGrammar {
+                syntax: "lark".into(),
+                definition: "start: SOURCE\nSOURCE: /[\\s\\S]+/".into(),
+            }),
+        }
+    }
+
     #[test]
     fn stable_is_instructions_volatile_is_trailing_developer_item() {
         let body = state().build_body(
@@ -829,6 +941,102 @@ mod tests {
                 .iter()
                 .any(|item| item["type"] == "function_call_output" && item["call_id"] == "matched")
         );
+        assert!(!input.iter().any(|item| item["call_id"] == "orphan"));
+    }
+
+    #[test]
+    fn build_body_serializes_grammar_tools_as_custom_and_normal_tools_as_functions() {
+        let body = state().build_body(
+            &[grammar_spec("exec"), function_spec("wait")],
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: None,
+            }),
+        );
+
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "custom");
+        assert_eq!(tools[0]["name"], "exec");
+        assert_eq!(tools[0]["description"], "exec description");
+        assert_eq!(tools[0]["format"]["type"], "grammar");
+        assert_eq!(tools[0]["format"]["syntax"], "lark");
+        assert_eq!(
+            tools[0]["format"]["definition"],
+            "start: SOURCE\nSOURCE: /[\\s\\S]+/"
+        );
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "wait");
+        assert_eq!(tools[1]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn parse_sse_maps_custom_tool_call_input_to_source_arg() {
+        let mut s = state();
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call-1\",\"name\":\"exec\",\"input\":\"console.log(1)\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+        );
+
+        let out = s.parse_sse(sse).unwrap();
+
+        assert_eq!(out.stop, StopReason::ToolCalls);
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].id, "call-1");
+        assert_eq!(out.tool_calls[0].name, "exec");
+        assert_eq!(out.tool_calls[0].args["source"], "console.log(1)");
+    }
+
+    #[test]
+    fn custom_call_result_serializes_as_custom_tool_call_output() {
+        let mut s = state();
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"custom_tool_call\",\"call_id\":\"call-1\",\"name\":\"exec\",\"input\":\"console.log(1)\"}}\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n",
+        );
+        s.parse_sse(sse).unwrap();
+
+        s.push_tool_results(vec![ToolResult {
+            id: "call-1".into(),
+            content: "ok".into(),
+            is_error: false,
+        }]);
+
+        let output = s.input.last().unwrap();
+        assert_eq!(output["type"], "custom_tool_call_output");
+        assert_eq!(output["call_id"], "call-1");
+        assert_eq!(output["output"], "ok");
+    }
+
+    #[test]
+    fn normalize_synthesizes_missing_custom_outputs_and_removes_orphan_custom_outputs() {
+        let mut input = vec![
+            json!({"type": "custom_tool_call", "call_id": "missing", "name": "exec", "input": "a()"}),
+            json!({"type": "custom_tool_call", "call_id": "matched", "name": "exec", "input": "b()"}),
+            json!({"type": "custom_tool_call_output", "call_id": "orphan", "output": "drop"}),
+            json!({"type": "custom_tool_call_output", "call_id": "matched", "output": "keep"}),
+        ];
+
+        normalize_responses_input(&mut input);
+
+        assert_eq!(input.len(), 4);
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "custom_tool_call" && item["call_id"] == "missing")
+        );
+        assert!(input.iter().any(|item| {
+            item["type"] == "custom_tool_call_output"
+                && item["call_id"] == "missing"
+                && item["output"] == "aborted"
+        }));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "custom_tool_call" && item["call_id"] == "matched")
+        );
+        assert!(input.iter().any(|item| {
+            item["type"] == "custom_tool_call_output" && item["call_id"] == "matched"
+        }));
         assert!(!input.iter().any(|item| item["call_id"] == "orphan"));
     }
 
@@ -980,6 +1188,7 @@ mod tests {
             name: "do_thing".into(),
             description: "does a thing".into(),
             schema: json!({"type": "object"}),
+            grammar: None,
         }];
         let body = build_compaction_input(
             &input,

@@ -18,14 +18,26 @@ use async_trait::async_trait;
 use bro_capabilities::{ToolCapability, ToolInvocation};
 use bro_code_mode::{
     CellId, CodeModeNestedToolCall, CodeModeService, CodeModeSessionDelegate, CodeModeToolKind,
-    ExecuteRequest, FunctionCallOutputContentItem, NotificationFuture, RuntimeResponse, ToolDefinition,
-    ToolInvocationFuture, ToolName, WaitOutcome, WaitRequest, build_exec_tool_description,
-    build_wait_tool_description, is_code_mode_nested_tool, parse_exec_source, PUBLIC_TOOL_NAME,
-    WAIT_TOOL_NAME,
+    ExecuteRequest, FunctionCallOutputContentItem, NotificationFuture, PUBLIC_TOOL_NAME,
+    RuntimeResponse, ToolDefinition, ToolInvocationFuture, ToolName, WAIT_TOOL_NAME, WaitOutcome,
+    WaitRequest, build_exec_tool_description, build_wait_tool_description,
+    is_code_mode_nested_tool, parse_exec_source,
 };
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
+
+// Vendored verbatim from openai/codex
+// `codex-rs/core/src/tools/code_mode/execute_spec.rs`.
+const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
+start: pragma_source | plain_source
+pragma_source: PRAGMA_LINE NEWLINE SOURCE
+plain_source: SOURCE
+
+PRAGMA_LINE: /[ \t]*\/\/ @exec:[^\r\n]*/
+NEWLINE: /\r?\n/
+SOURCE: /[\s\S]+/
+"#;
 
 /// Delegate that dispatches a cell's nested `tools.X(...)` call into the harness
 /// tool seam. Holds the already-filtered [`ToolCapability`] (`HostTools`), so a
@@ -44,7 +56,10 @@ impl CodeModeSessionDelegate for HarnessDelegate {
         Box::pin(async move {
             let name = invocation.tool_name.to_string();
             let input_json = invocation.input.unwrap_or_else(|| json!({}));
-            let call = ToolInvocation { name: name.clone(), input_json };
+            let call = ToolInvocation {
+                name: name.clone(),
+                input_json,
+            };
             tokio::select! {
                 _ = cancellation_token.cancelled() => {
                     Err(format!("{name}: cell cancelled before the tool returned"))
@@ -190,6 +205,13 @@ impl Tool for ExecTool {
         })
     }
 
+    fn freeform_grammar(&self) -> Option<bro_tools::FreeformGrammar> {
+        Some(bro_tools::FreeformGrammar {
+            syntax: "lark".to_string(),
+            definition: CODE_MODE_FREEFORM_GRAMMAR.to_string(),
+        })
+    }
+
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
         let Some(source) = input.get("source").and_then(Value::as_str) else {
             return ToolResult::Error("exec: `source` is required".into());
@@ -255,7 +277,10 @@ impl Tool for WaitTool {
             return ToolResult::Error("wait: `cell_id` is required".into());
         };
         let cell_id = CellId::new(cell_id.to_string());
-        let terminate = input.get("terminate").and_then(Value::as_bool).unwrap_or(false);
+        let terminate = input
+            .get("terminate")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let outcome = if terminate {
             self.surface.service.terminate(cell_id).await
         } else {
@@ -265,7 +290,10 @@ impl Tool for WaitTool {
                 .unwrap_or(bro_code_mode::DEFAULT_WAIT_YIELD_TIME_MS);
             self.surface
                 .service
-                .wait(WaitRequest { cell_id, yield_time_ms })
+                .wait(WaitRequest {
+                    cell_id,
+                    yield_time_ms,
+                })
                 .await
         };
         match outcome {
@@ -300,8 +328,12 @@ pub fn code_mode_tools(
         })
         .collect();
 
-    let description =
-        build_exec_tool_description(&catalog, &BTreeMap::new(), /*code_mode_only*/ true, false);
+    let description = build_exec_tool_description(
+        &catalog,
+        &BTreeMap::new(),
+        /*code_mode_only*/ true,
+        false,
+    );
     let surface = Arc::new(CodeModeSurface::new(seam, catalog));
 
     vec![
@@ -353,8 +385,10 @@ mod tests {
     }
 
     fn exec_with(callable: Vec<Arc<dyn Tool>>) -> Arc<dyn Tool> {
-        let seam: Arc<dyn ToolCapability> =
-            Arc::new(crate::capabilities::HostTools::new(callable.clone(), test_cx()));
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            test_cx(),
+        ));
         code_mode_tools(&callable, seam).remove(0)
     }
 

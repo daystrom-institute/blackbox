@@ -7,6 +7,14 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+/// Grammar-constrained freeform authoring surface for transports that support
+/// it. Tools still expose [`Tool::input_schema`] as the JSON-function fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreeformGrammar {
+    pub syntax: String,
+    pub definition: String,
+}
+
 /// Execution context handed to every tool call.
 #[derive(Clone)]
 pub struct ToolCx {
@@ -87,6 +95,9 @@ pub trait Tool: Send + Sync {
     /// JSON Schema for the input object. Derive from a typed input with
     /// [`schema_for`].
     fn input_schema(&self) -> Value;
+    fn freeform_grammar(&self) -> Option<FreeformGrammar> {
+        None
+    }
     async fn call(&self, input: Value, cx: &ToolCx) -> ToolResult;
     fn annotations(&self) -> ToolAnnotations {
         ToolAnnotations::default()

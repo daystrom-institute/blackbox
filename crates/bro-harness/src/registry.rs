@@ -159,6 +159,7 @@ impl Registry {
             name: e.tool.name().to_string(),
             description: e.tool.description().to_string(),
             schema: e.tool.input_schema(),
+            grammar: e.tool.freeform_grammar(),
         }
     }
 
