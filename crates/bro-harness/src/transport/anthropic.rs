@@ -201,6 +201,11 @@ struct SseBlock {
     tool_name: String,
     /// Accumulated `input_json_delta.partial_json` (tool_use + server_tool_use).
     tool_json: String,
+    /// Accumulated `signature_delta.signature` for a `thinking` block. Persisted
+    /// into the replayed assistant turn so a thinking-native model (e.g.
+    /// MiniMax-M3) sees the prior turn's thinking block on a continuation —
+    /// without it, MiniMax returns empty output while `thinking` is enabled.
+    signature: String,
     /// Raw `content_block` captured verbatim at `content_block_start` for
     /// server-produced result blocks, whose content arrives inline there (no
     /// deltas) — kept so the server-tool turn replays faithfully and a paused
@@ -288,6 +293,11 @@ fn fold_sse(ev: &Value, blocks: &mut Vec<SseBlock>, usage: &mut Usage, stop: &mu
                         .text
                         .push_str(d["thinking"].as_str().unwrap_or(""));
                 }
+                Some("signature_delta") => {
+                    blocks[idx]
+                        .signature
+                        .push_str(d["signature"].as_str().unwrap_or(""));
+                }
                 Some("input_json_delta") => {
                     blocks[idx]
                         .tool_json
@@ -331,8 +341,10 @@ fn parse_tool_input(tool_json: &str) -> Value {
 /// `tool_result`/`web_search_tool_result` they produce) are preserved verbatim
 /// into `content` so the turn replays faithfully and a paused turn can be
 /// resumed — but they are NOT surfaced as client `tool_calls` (the server
-/// already executed them). Thinking is returned for display only and never
-/// enters `content` (Anthropic needs a persisted signature to replay it).
+/// already executed them). A `thinking` block IS persisted into `content` (with
+/// its `signature_delta` when the stream provided one) so a thinking-native
+/// model sees the prior turn's reasoning on a continuation; `thinking_out` is
+/// the same text surfaced separately for display.
 fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<super::ToolCall>) {
     let mut content: Vec<Value> = Vec::new();
     let mut text_out = String::new();
@@ -345,6 +357,17 @@ fn reconstruct_segment(blocks: &[SseBlock]) -> (Vec<Value>, String, String, Vec<
                 text_out.push_str(&b.text);
             }
             "thinking" if !b.text.is_empty() => {
+                // Replay the thinking block on the next turn. Thinking-native
+                // models (MiniMax-M3) return empty output on a continuation if a
+                // prior assistant turn's thinking block is missing while
+                // `thinking` is enabled. The signature is included when the
+                // stream provided one; MiniMax tolerates its absence, and real
+                // Anthropic needs it to validate the replayed block.
+                let mut tb = json!({"type": "thinking", "thinking": b.text});
+                if !b.signature.is_empty() {
+                    tb["signature"] = json!(b.signature);
+                }
+                content.push(tb);
                 thinking_out.push_str(&b.text);
             }
             "tool_use" => {
