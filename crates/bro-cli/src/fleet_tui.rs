@@ -247,6 +247,7 @@ fn fleet_state_from_snapshot(
 const FLEET_PROVIDERS: &[Provider] = &[
     Provider::Glm,
     Provider::Deepseek,
+    Provider::Minimax,
     Provider::Brodex,
     Provider::VibeBh,
 ];
@@ -2217,14 +2218,19 @@ fn steer_selected(app: &mut App) {
             }
             Err(e) => {
                 app.set_input(text);
-                if is_broken_pipe_error(&e) {
+                // A broken pipe (local stdin closed) or the daemon's
+                // not-running rejection both mean the live session is gone —
+                // the turn completed between `can_steer()` and this write
+                // (the race `can_steer`'s status gate cannot fully close).
+                // For a bidi provider that means resume, not a dead-end error.
+                if is_broken_pipe_error(&e) || is_session_not_live_error(&e) {
                     app.agents[idx].task = handle.without_stdin();
                     if provider_supports_bidi(provider) {
-                        app.set_status("stdin closed; resuming session", Duration::from_secs(2));
+                        app.set_status("session not live; resuming", Duration::from_secs(2));
                         resume_selected(app, idx);
                     } else {
                         app.set_status(
-                            "stdin closed; session is no longer steerable",
+                            "session is no longer steerable",
                             Duration::from_secs(4),
                         );
                     }
@@ -2320,6 +2326,17 @@ fn is_broken_pipe_error(e: &anyhow::Error) -> bool {
                 text.contains("Broken pipe") || text.contains("os error 32")
             }
     })
+}
+
+/// The daemon's `/control/steer` (and `/control/interrupt`) reject any task
+/// whose status is not `Running` with "task … is {Status}, not running"
+/// (`bro_steer`/`bro_interrupt` in `src/tools/dispatch.rs`). A finished bidi
+/// agent must be resumed rather than steered, so we treat this rejection like a
+/// broken pipe: it trips `steer_selected`'s resume fallback instead of dead-
+/// ending with the input stuck in the composer.
+fn is_session_not_live_error(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|cause| cause.to_string().contains("not running"))
 }
 
 fn run_agent_write<F>(app: &App, fut: F) -> anyhow::Result<()>

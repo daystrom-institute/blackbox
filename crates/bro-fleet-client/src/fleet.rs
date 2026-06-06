@@ -141,6 +141,7 @@ impl ClassifierConfig {
         {
             Some("glm") => Provider::Glm,
             Some("deepseek") | Some("ds") => Provider::Deepseek,
+            Some("minimax") | Some("mmx") => Provider::Minimax,
             Some("brodex") | Some("bdx") => Provider::Brodex,
             Some("vibebh") | Some("vibe-bh") => Provider::VibeBh,
             _ => Provider::Glm,
@@ -275,8 +276,18 @@ impl AgentHandle {
     /// True when this agent has a live daemon session that can be steered
     /// (user-turns / interrupt over `/control/*`). False for a reloaded or
     /// terminal agent — resume it first to get a fresh live handle.
+    ///
+    /// A daemon handle alone is not enough: it is set at dispatch and never
+    /// cleared on completion, so `daemon.is_some()` stays true for a finished
+    /// agent. The daemon's `/control/steer` only accepts a `Running` task
+    /// (`bro_steer`: "task … is {Status}, not running"), so we mirror that
+    /// exact condition. Otherwise the cockpit would steer a `Completed`
+    /// in-process agent, the daemon would reject it, and — because that
+    /// rejection is not a broken pipe — `steer_selected`'s resume fallback
+    /// would never fire (the §7 cut made fleet agents one-shot-per-dispatch;
+    /// multi-turn rides resume, not a persistent stdin session).
     pub fn can_steer(&self) -> bool {
-        self.daemon.is_some()
+        self.daemon.is_some() && matches!(self.task.inner.lock().status, TaskStatus::Running)
     }
 
     /// A clone of this handle marking it non-live (a later steer resumes it
@@ -1353,7 +1364,7 @@ fn default_daemon_url() -> String {
 pub fn provider_supports_bidi(provider: Provider) -> bool {
     matches!(
         provider,
-        Provider::Glm | Provider::Deepseek | Provider::Brodex | Provider::VibeBh
+        Provider::Glm | Provider::Deepseek | Provider::Minimax | Provider::Brodex | Provider::VibeBh
     )
 }
 
@@ -1444,6 +1455,7 @@ mod tests {
         for p in [
             Provider::Glm,
             Provider::Deepseek,
+            Provider::Minimax,
             Provider::Brodex,
             Provider::VibeBh,
         ] {
