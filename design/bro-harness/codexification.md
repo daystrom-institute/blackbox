@@ -326,13 +326,19 @@ with `UserInstructions` (wrapping `project_doc::discover`) and `EnvironmentConte
 Adding fragments without the baseline makes Stage 2 a rewrite. Also land the
 `for_prompt`-style normalize seam here (§3.7).
 
-**Stage 2 — diff engine (full set) + rollout baseline.** Wire the top-of-turn diff
-step (after the compaction check — see §2 ordering; hook near `agent_loop.rs:847`).
-Don't scope it to cwd/safety only: the diff path covers environment / model-switch
-/ permissions / collaboration / realtime / personality (`updates.rs:221`). Land rollout
-reconstruction of the baseline at the same time (§3.7) — the diff is meaningless on
-resume without it. (Port the *working* codex subset; don't assume apps/skills/plugins
-have steady-state diff coverage — §3.5.)
+**Stage 2 — baseline persistence/restore.** *(Reshaped during implementation,
+2026-06: the diff engine moved to Stage 4 — see below.)* Persist the
+`reference_context_item` baseline through the session side-state and restore it on
+resume (the harness analog of codex reconstructing it from rollout), so a resumed
+session restores the prior baseline instead of re-emitting environment context.
+**The diff-and-re-emit engine is deferred to Stage 4**, because bro-harness's
+environment is effectively static today (fixed session root, `$SHELL`, timezone)
+and codex's other diff dimensions (permissions/collaboration/realtime/personality)
+don't exist here until Stage 4 — there is nothing to diff yet, so building the
+engine in Stage 2 would be speculative. Pair it with the developer fragments that
+actually mutate. *(As-built: `git log` Stage 2 commit; the diff covered
+environment / model-switch / permissions / collaboration / realtime / personality
+per `updates.rs:221` in codex, deferred here.)*
 
 **Stage 3 — demote AGENTS.md (can move up).** Flip `compose_system`
 (`agent_loop.rs:1393`) so the stable prefix is `BaseInstructions + pinned-tools`
@@ -342,12 +348,16 @@ exists, do this immediately rather than carrying AGENTS.md in the system prompt
 through two more stages. Keep the `@`-import superset, documented as intentional
 divergence.
 
-**Stage 4 — developer fragments + rollout parity (NOT optional for fidelity).**
-Permissions / skills / apps / plugins are developer-role *first-turn* context in
-codex today, not extras; under §6 they become ordered Anthropic system blocks.
-First-class per-item rollout persistence (`record_conversation_items` shape) is
-*required* for resume/compaction correctness, not a nice-to-have. Treat this as
-finishing the port, not breadth.
+**Stage 4 — developer fragments + diff engine + rollout parity (NOT optional for
+fidelity).** Permissions / skills / apps / plugins are developer-role *first-turn*
+context in codex today, not extras; under §6 they become ordered Anthropic system
+blocks. **The diff-and-re-emit engine (moved here from Stage 2) belongs in this
+stage**: these developer fragments are the first context that actually mutates
+mid-session, so the diff mechanism (top-of-turn, after the compaction check; covers
+environment + the developer dimensions per codex `updates.rs:221`) has something to
+diff once they exist. First-class per-item rollout persistence
+(`record_conversation_items` shape) is *required* for resume/compaction
+correctness, not a nice-to-have. Treat this as finishing the port, not breadth.
 
 Stages 0–3 reach "verbatim codex context model for AGENTS.md + environment,
 Anthropic-mapped." Stage 4 closes the developer-fragment + persistence surface to
