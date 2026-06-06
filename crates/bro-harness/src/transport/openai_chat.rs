@@ -131,12 +131,43 @@ impl OpenAiChatTransport {
         // the conversation. Both are per-request only (not stored in
         // self.messages), so resume/edit stays cheap and the volatile tail
         // never persists into history.
+        // Chat-completions has no top-level system param — system is an inline
+        // message, conventionally system-first. The volatile tail (deferred-tool
+        // manifest + ambient nudges) normally rides as a TRAILING system message
+        // so it stays out of the cached prefix; that is legal after a
+        // user/assistant turn. But Mistral rejects a `system` message
+        // immediately after a `tool` message ("Unexpected role 'system' after
+        // role 'tool'", invalid_request_message_order) — which is the shape of
+        // every turn that follows a tool result in the multi-turn loop. When the
+        // conversation ends in tool results, fold the volatile tail into the
+        // leading system block instead of appending it after the tool turn.
+        // system-after-user / system-after-assistant stay legal, so the trailing
+        // placement (and its prefix-cache benefit) is preserved on every other
+        // turn. Verified against the live Mistral API: only system-after-tool is
+        // rejected.
+        let leading = leading_system_message(opts);
+        let volatile = opts.system.volatile_text();
+        let ends_with_tool =
+            self.messages.last().and_then(|m| m["role"].as_str()) == Some("tool");
+
         let mut msgs: Vec<Value> = Vec::with_capacity(self.messages.len() + 2);
-        if let Some(system) = leading_system_message(opts) {
+        let leading = if ends_with_tool {
+            match (leading, volatile) {
+                (Some(l), Some(v)) => Some(format!("{l}\n\n{v}")),
+                (Some(l), None) => Some(l),
+                (None, Some(v)) => Some(v.to_string()),
+                (None, None) => None,
+            }
+        } else {
+            leading
+        };
+        if let Some(system) = leading {
             msgs.push(json!({"role": "system", "content": system}));
         }
         msgs.extend(self.messages.iter().cloned());
-        if let Some(volatile) = opts.system.volatile_text() {
+        if !ends_with_tool
+            && let Some(volatile) = volatile
+        {
             msgs.push(json!({"role": "system", "content": volatile}));
         }
 
@@ -772,6 +803,67 @@ mod tests {
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0]["content"], "BASE");
         assert_eq!(msgs[1]["role"], "user");
+    }
+
+    /// Regression: when the conversation ends in a `tool` message (every turn
+    /// after a tool result in the multi-turn loop), the volatile tail must NOT
+    /// be appended as a trailing `system` message — Mistral rejects
+    /// system-after-tool. It folds into the leading system block instead.
+    fn transport_ending_in_tool() -> OpenAiChatTransport {
+        OpenAiChatTransport {
+            http: reqwest::Client::new(),
+            base_url: "http://x".into(),
+            api_key: "k".into(),
+            messages: vec![
+                json!({"role": "user", "content": "run pwd"}),
+                json!({"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "shell_run", "arguments": "{}"}}
+                ]}),
+                json!({"role": "tool", "tool_call_id": "c1", "content": "/tmp"}),
+            ],
+            reasoning: ReasoningProfile::Off,
+        }
+    }
+
+    #[test]
+    fn tool_tail_folds_volatile_into_leading_no_trailing_system() {
+        let body = transport_ending_in_tool().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: Some("BASE".into()),
+                volatile: Some("MANIFEST".into()),
+            }),
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        // [ system(BASE\n\nMANIFEST), user, assistant(tool_calls), tool ] —
+        // volatile folded into the leading block; the last message stays `tool`.
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "BASE\n\nMANIFEST");
+        assert_eq!(msgs.last().unwrap()["role"], "tool");
+        // No `system` message appears after the `tool` message.
+        let tool_idx = msgs.iter().position(|m| m["role"] == "tool").unwrap();
+        assert!(
+            !msgs[tool_idx + 1..]
+                .iter()
+                .any(|m| m["role"] == "system"),
+            "no system message may follow the tool message"
+        );
+    }
+
+    #[test]
+    fn tool_tail_with_only_volatile_becomes_leading_system() {
+        let body = transport_ending_in_tool().build_body(
+            &[],
+            &opts(SystemPrompt {
+                stable: None,
+                volatile: Some("MANIFEST".into()),
+            }),
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "MANIFEST");
+        assert_eq!(msgs.last().unwrap()["role"], "tool");
     }
 
     #[test]
