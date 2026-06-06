@@ -642,6 +642,36 @@ impl Transport for AnthropicTransport {
             // Reconstruct this segment and merge it into the single assistant
             // message that represents the (possibly multi-segment) turn.
             let (content, text, thinking, tool_calls) = reconstruct_segment(&blocks);
+
+            // Spurious empty stop: some Anthropic-compatible endpoints (observed:
+            // MiniMax-M3 — ~12% on history turns whose prior assistant message has
+            // no thinking block, 0% otherwise) occasionally return `end_turn` with
+            // no content at all. It is probabilistic for an identical request, so
+            // retry rather than surface a content-less turn — which the agent loop
+            // cannot act on, and which a thinking-native model would otherwise keep
+            // repeating. Bounded by max_inband; only on the first segment with
+            // nothing streamed, and BEFORE the empty assistant turn is pushed so
+            // the rebuilt body stays byte-identical. GLM/DeepSeek never hit this
+            // (0/16 observed); for them the guard is a no-op.
+            if assistant_idx.is_none()
+                && matches!(stop, StopReason::Done)
+                && !streamed_content
+                && content.is_empty()
+                && text.is_empty()
+                && tool_calls.is_empty()
+                && inband_attempt <= max_inband
+            {
+                let wait = super::http::backoff(inband_attempt);
+                tracing::warn!(
+                    label = "anthropic/messages",
+                    attempt = inband_attempt,
+                    wait_ms = wait.as_millis() as u64,
+                    "empty model output (end_turn, no content); retrying turn"
+                );
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+
             acc_text.push_str(&text);
             acc_thinking.push_str(&thinking);
             acc_tool_calls.extend(tool_calls);
@@ -1265,6 +1295,72 @@ mod tests {
 
         assert_eq!(out.stop, StopReason::Done);
         assert_eq!(out.end_turn, None);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn run_turn_retries_on_spurious_empty_end_turn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoSink;
+        impl crate::transport::TurnSink for NoSink {
+            fn stream_event(&self, _event: Value) {}
+        }
+
+        // First response is a spurious empty stop (end_turn, no content blocks),
+        // mimicking MiniMax; the second carries real text. run_turn must reroll
+        // and return the recovered text — and must NOT leave the empty assistant
+        // turn in the buffer (so the retried request is byte-identical).
+        let empty_body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let full_body = concat!(
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m2\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"recovered\"}}\n\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            for body in [empty_body, full_body] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0_u8; 4096];
+                let _ = socket.read(&mut request).await.unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        let mut tx = AnthropicTransport {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: Auth::Bearer("token".into()),
+            version: "2023-06-01".into(),
+            messages: Vec::new(),
+        };
+        tx.push_user_text("hi");
+
+        let out = tx
+            .run_turn(&[], &opts(SystemPrompt::default()), &NoSink)
+            .await
+            .unwrap();
+
+        assert_eq!(out.text, "recovered");
+        let assistant_turns = tx
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "assistant")
+            .count();
+        assert_eq!(assistant_turns, 1, "the empty turn must not be retained");
         server.await.unwrap();
     }
 
