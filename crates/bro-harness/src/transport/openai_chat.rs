@@ -523,6 +523,9 @@ impl Transport for OpenAiChatTransport {
             thinking: reasoning_out,
             tool_calls,
             stop,
+            // OpenAI Chat has no Responses-style `response.end_turn`
+            // follow-up signal; normal stop is represented by `finish_reason`.
+            end_turn: None,
             usage,
         })
     }

@@ -169,6 +169,10 @@ pub struct TurnOutput {
     pub thinking: String,
     pub tool_calls: Vec<ToolCall>,
     pub stop: StopReason,
+    /// Responses-only follow-up signal from `response.end_turn`.
+    /// `Some(false)` means the model wants another sampling request even when
+    /// it emitted no tool calls. Other transports leave this as `None`.
+    pub end_turn: Option<bool>,
     pub usage: Usage,
 }
 

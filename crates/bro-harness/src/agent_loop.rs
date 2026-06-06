@@ -994,12 +994,17 @@ impl Session {
                 self.emitter.assistant_message(assistant_content);
             }
 
-            if out.stop != StopReason::ToolCalls || out.tool_calls.is_empty() {
+            let has_tool_work = out.stop == StopReason::ToolCalls && !out.tool_calls.is_empty();
+            let wants_follow_up = out.end_turn == Some(false);
+            if !has_tool_work && !wants_follow_up {
                 break if out.stop == StopReason::ToolCalls {
                     "tool_calls_empty"
                 } else {
                     "model_stop"
                 };
+            }
+            if !has_tool_work {
+                continue;
             }
 
             // Dispatch tool calls, interruptibly. On interrupt mid-dispatch, pad
@@ -1699,6 +1704,8 @@ mod tests {
     enum MockTurn {
         /// Return text immediately (Done, no tool calls).
         Text(String),
+        /// Return text immediately with a Responses-style follow-up signal.
+        TextWithEndTurn(String, Option<bool>),
         /// Wait on the shared gate, then request a tool call.
         ToolCallAfterGate,
         /// Await a gate that tests never release — to be cancelled by interrupt.
@@ -1764,6 +1771,7 @@ mod tests {
                             args: json!({}),
                         }],
                         stop: StopReason::ToolCalls,
+                        end_turn: None,
                         usage: Usage::default(),
                     })
                 }
@@ -1774,6 +1782,18 @@ mod tests {
                         thinking: String::new(),
                         tool_calls: vec![],
                         stop: StopReason::Done,
+                        end_turn: None,
+                        usage: Usage::default(),
+                    })
+                }
+                MockTurn::TextWithEndTurn(t, end_turn) => {
+                    self.shared.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(transport::TurnOutput {
+                        text: t,
+                        thinking: String::new(),
+                        tool_calls: vec![],
+                        stop: StopReason::Done,
+                        end_turn,
                         usage: Usage::default(),
                     })
                 }
@@ -2193,6 +2213,32 @@ mod tests {
             &["alpha".to_string(), "beta".to_string()]
         );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn responses_end_turn_false_without_tools_samples_again() {
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::TextWithEndTurn("partial".into(), Some(false)),
+            MockTurn::TextWithEndTurn("done".into(), Some(true)),
+        ]);
+
+        run_user_turn(&mut session, "continue please").await;
+
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
+        let users = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(
+            user_turns_after_initial_context(&users),
+            &["continue please".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn done_without_end_turn_breaks_after_one_model_call() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("done".into())]);
+
+        run_user_turn(&mut session, "stop normally").await;
+
+        assert_eq!(shared.completed.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

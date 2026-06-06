@@ -670,6 +670,10 @@ impl Transport for AnthropicTransport {
                 thinking: acc_thinking,
                 tool_calls: acc_tool_calls,
                 stop,
+                // Anthropic stop_reason `end_turn` means normal completion
+                // (mapped to StopReason::Done), not the Responses
+                // `response.end_turn` follow-up signal.
+                end_turn: None,
                 usage: acc_usage,
             });
         }
@@ -1189,6 +1193,56 @@ mod tests {
             &mut stop,
         );
         assert_eq!(stop, StopReason::Done);
+    }
+
+    #[tokio::test]
+    async fn run_turn_maps_anthropic_end_turn_stop_reason_without_follow_up_signal() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        struct NoSink;
+        impl crate::transport::TurnSink for NoSink {
+            fn stream_event(&self, _event: Value) {}
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            let body = concat!(
+                "data: {\"type\":\"message_start\",\"message\":{\"id\":\"m1\",\"role\":\"assistant\",\"content\":[]}}\n\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"done\"}}\n\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+                "data: {\"type\":\"message_stop\"}\n\n",
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let mut tx = AnthropicTransport {
+            http: reqwest::Client::new(),
+            base_url: format!("http://{addr}"),
+            auth: Auth::Bearer("token".into()),
+            version: "2023-06-01".into(),
+            messages: Vec::new(),
+        };
+        tx.push_user_text("hi");
+
+        let out = tx
+            .run_turn(&[], &opts(SystemPrompt::default()), &NoSink)
+            .await
+            .unwrap();
+
+        assert_eq!(out.stop, StopReason::Done);
+        assert_eq!(out.end_turn, None);
+        server.await.unwrap();
     }
 
     #[test]

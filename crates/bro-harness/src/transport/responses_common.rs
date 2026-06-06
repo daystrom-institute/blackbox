@@ -348,6 +348,7 @@ pub(super) fn parse_sse(
     let mut output_items: Vec<Value> = Vec::new();
     let mut usage = Usage::default();
     let mut stop = StopReason::Done;
+    let mut end_turn = None;
 
     for line in sse.lines() {
         let line = line.trim();
@@ -369,6 +370,7 @@ pub(super) fn parse_sse(
             }
             "response.completed" | "response.incomplete" => {
                 let r = &ev["response"];
+                end_turn = r["end_turn"].as_bool();
                 // OpenAI Responses `input_tokens` is cache-INCLUSIVE; the
                 // cached subset lives in `input_tokens_details.cached_tokens`.
                 // Subtract it so `input_tokens` stays fresh.
@@ -512,6 +514,7 @@ pub(super) fn parse_sse(
         thinking,
         tool_calls,
         stop,
+        end_turn,
         usage,
     })
 }
@@ -1110,6 +1113,24 @@ mod tests {
         let out = state().parse_sse(sse).unwrap();
         assert_eq!(out.text, "answer");
         assert_eq!(out.thinking, "pondering");
+    }
+
+    #[test]
+    fn parse_sse_reads_responses_end_turn_follow_up_signal() {
+        let false_out = state()
+            .parse_sse("data: {\"type\":\"response.completed\",\"response\":{\"end_turn\":false,\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n")
+            .unwrap();
+        assert_eq!(false_out.end_turn, Some(false));
+
+        let true_out = state()
+            .parse_sse("data: {\"type\":\"response.completed\",\"response\":{\"end_turn\":true,\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n")
+            .unwrap();
+        assert_eq!(true_out.end_turn, Some(true));
+
+        let absent_out = state()
+            .parse_sse("data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":5,\"output_tokens\":3}}}\n")
+            .unwrap();
+        assert_eq!(absent_out.end_turn, None);
     }
 
     #[test]
