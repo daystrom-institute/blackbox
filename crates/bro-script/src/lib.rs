@@ -14,14 +14,14 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::future::Future;
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, mpsc as std_mpsc};
+use std::sync::{mpsc as std_mpsc, Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -612,8 +612,17 @@ const BOOTSTRAP: &str = r#"
         invoke: (handle, input) =>
             hostCall('atoms.invoke', { atom: handle, input_json: input ?? null }),
     };
+    const refactorPlanInput = (args) => {
+        const input = args ?? {};
+        return {
+            ...input,
+            input_json: input.input_json !== undefined
+                ? input.input_json
+                : (input.params !== undefined ? input.params : {}),
+        };
+    };
     globalThis.refactor = {
-        plan: (args) => hostCall('refactor.plan', args ?? {}),
+        plan: (args) => hostCall('refactor.plan', refactorPlanInput(args)),
         materialize: (handle) =>
             hostCall('refactor.materialize', typeof handle === 'string' ? handle : handle.id),
     };

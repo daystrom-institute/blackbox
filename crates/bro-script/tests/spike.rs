@@ -16,8 +16,8 @@ use bro_capabilities::{
 };
 use bro_core::BroError;
 use bro_script::{
-    Capabilities, CellContract, DEFAULT_HEAP_LIMIT_BYTES, SCRIPT_RUNTIME_SUBSTRATE, ScriptRuntime,
-    SupervisionPolicy, V8_VERSION,
+    Capabilities, CellContract, ScriptRuntime, SupervisionPolicy, DEFAULT_HEAP_LIMIT_BYTES,
+    SCRIPT_RUNTIME_SUBSTRATE, V8_VERSION,
 };
 use std::collections::BTreeMap;
 use std::sync::Mutex;
@@ -62,9 +62,17 @@ impl RefactorCapability for StubRefactor {
         request: RefactorRequest,
     ) -> CapabilityResult<RefactorPlanHandle> {
         tokio::task::yield_now().await;
+        let preview = match request
+            .input_json
+            .get("sym")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some(sym) => format!("preview of {}:{sym}", request.kind),
+            None => format!("preview of {}", request.kind),
+        };
         Ok(RefactorPlanHandle {
             id: format!("plan-{}", request.kind),
-            preview: format!("preview of {}", request.kind),
+            preview,
         })
     }
 
@@ -461,7 +469,20 @@ async fn refactor_plan_and_materialize_return_values() {
         )
         .await
         .unwrap();
-    assert_eq!(out, "\"preview of rename|plan-rename\"");
+    assert_eq!(out, "\"preview of rename:foo|plan-rename\"");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn refactor_plan_accepts_flat_tool_params_shape() {
+    let rt = stub_runtime().await;
+    let out = rt
+        .execute(
+            r#"const h = await refactor.plan({ kind: "rename", params: { sym: "bar" } });
+               return h.preview;"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(out, "\"preview of rename:bar\"");
 }
 
 // ---------------------------------------------------------------------------

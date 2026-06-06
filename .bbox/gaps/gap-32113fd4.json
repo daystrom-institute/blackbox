@@ -1,0 +1,22 @@
+{
+  "id": "gap-32113fd4",
+  "title": "MiniMax bro task can terminate without assistant result or transcript capture",
+  "gap_kind": "tooling",
+  "domain": "provider-dispatch",
+  "wanted_capability": "A MiniMax dispatch should either return a captured assistant result/transcript or a concrete provider/harness error explaining why no assistant turn was produced.",
+  "missing_primitive": "terminal task result capture for minimax harness dispatch",
+  "fallback_used": "Used GLM probe and local validation instead; retained MiniMax failure as provider-surface evidence.",
+  "evidence": [
+    "mcp__blackbox_dev.bro_wait task 6b762a82-aa94-4cd4-ae52-211d760a1598: status=completed, hasResult=false, resultCapture.status=missing, transcriptLocated=false, eventCount=1"
+  ],
+  "impact": "medium",
+  "blocking_level": "workaround_available",
+  "dedupe_key": "tooling/provider-dispatch/minimax-terminal-missing-result",
+  "notes": "Dispatch on the dev daemon selected provider=minimax model=MiniMax-M3 and immediately reached terminal completed state with only an init system event. The result capture reported no assistant result, no stderr, and no located transcript, so the operator cannot distinguish provider silence from harness capture failure.",
+  "resolution": "unresolved",
+  "task_id": "6b762a82-aa94-4cd4-ae52-211d760a1598",
+  "provider": "minimax",
+  "thread_id": "thread-7cba3fc5",
+  "created_at": "2026-06-05T23:09:06Z",
+  "updated_at": "2026-06-05T23:09:06Z"
+}

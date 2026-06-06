@@ -30,6 +30,34 @@ const DEFAULT_KV_GET_MAX_BYTES: usize = 256 * 1024;
 const KV_SUMMARY_LINES: usize = 2;
 const KV_SUMMARY_LINE_BYTES: usize = 160;
 
+// ---------------------------------------------------------------------------
+// JSON argument extraction helpers for the model-facing NARF tools.
+// ---------------------------------------------------------------------------
+
+/// Extract a required non-empty string from a JSON object by key, returning an
+/// error labelled with `tool: \`key\` is required` on missing/empty.
+fn require_str(input: &Value, key: &str, tool: &str) -> Result<String, ToolResult> {
+    match input.get(key).and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
+        _ => Err(ToolResult::Error(format!("{tool}: `{key}` is required"))),
+    }
+}
+
+/// Extract an optional non-empty string from a JSON object by key.
+/// Returns `None` when the key is absent, null, not a string, or blank.
+fn opt_str(input: &Value, key: &str) -> Option<String> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+}
+
+/// Extract an optional non-empty string with a fallback default.
+fn opt_str_or(input: &Value, key: &str, default: &str) -> String {
+    opt_str(input, key).unwrap_or_else(|| default.to_string())
+}
+
 /// Process-global capability slots. The daemon is a singleton, so a single
 /// installed implementation per capability is the whole story; standalone
 /// leaves them `None`. Pushed by the daemon (`blackbox` → `bro-harness`), never
@@ -655,9 +683,9 @@ impl Tool for NarfKvPeekTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let name = match input.get("name").and_then(Value::as_str) {
-            Some(n) if !n.trim().is_empty() => n.to_string(),
-            _ => return ToolResult::Error("narf_kv_peek: `name` is required".into()),
+        let name = match require_str(&input, "name", "narf_kv_peek") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         match self.0.peek(name).await {
             Ok(entry) => ToolResult::Json(json!(entry)),
@@ -694,9 +722,9 @@ impl Tool for NarfKvGetTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let name = match input.get("name").and_then(Value::as_str) {
-            Some(n) if !n.trim().is_empty() => n.to_string(),
-            _ => return ToolResult::Error("narf_kv_get: `name` is required".into()),
+        let name = match require_str(&input, "name", "narf_kv_get") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
         let max_bytes = input
             .get("max_bytes")
@@ -804,9 +832,9 @@ impl Tool for NarfExecTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let source = match input.get("source").and_then(Value::as_str) {
-            Some(s) if !s.trim().is_empty() => s.to_string(),
-            _ => return ToolResult::Error("narf_exec: `source` is required".into()),
+        let source = match require_str(&input, "source", "narf_exec") {
+            Ok(s) => s,
+            Err(e) => return e,
         };
         let guard = match self.session.ensure().await {
             Ok(g) => g,
@@ -881,7 +909,11 @@ impl Tool for NarfPrepareTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        if input.get("source").and_then(Value::as_str).is_none() {
+        if input
+            .get("source")
+            .and_then(Value::as_str)
+            .is_none_or(|s| s.trim().is_empty())
+        {
             return ToolResult::Error("narf_prepare: `source` is required".into());
         }
         let guard = match self.session.ensure().await {
@@ -947,30 +979,17 @@ impl Tool for NarfRegisterTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let prepared_ref = match input.get("ref").and_then(Value::as_str) {
-            Some(r) if !r.trim().is_empty() => r.to_string(),
-            _ => return ToolResult::Error("narf_register: `ref` is required".into()),
+        let prepared_ref = match require_str(&input, "ref", "narf_register") {
+            Ok(r) => r,
+            Err(e) => return e,
         };
-        let name = match input.get("name").and_then(Value::as_str) {
-            Some(n) if !n.trim().is_empty() => n.to_string(),
-            _ => return ToolResult::Error("narf_register: `name` is required".into()),
+        let name = match require_str(&input, "name", "narf_register") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
-        let version = input
-            .get("version")
-            .and_then(Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or("v1")
-            .to_string();
-        let description = input
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
-        let supersedes = input
-            .get("supersedes")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+        let version = opt_str_or(&input, "version", "v1");
+        let description = opt_str(&input, "description");
+        let supersedes = opt_str(&input, "supersedes");
 
         let guard = match self.session.ensure().await {
             Ok(g) => g,
@@ -1054,34 +1073,17 @@ impl Tool for NarfRegisterWorkflowTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let name = match input.get("name").and_then(Value::as_str) {
-            Some(n) if !n.trim().is_empty() => n.to_string(),
-            _ => return ToolResult::Error("narf_registerWorkflow: `name` is required".into()),
+        let name = match require_str(&input, "name", "narf_registerWorkflow") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
-        let cell_handle = match input.get("cell_handle").and_then(Value::as_str) {
-            Some(h) if !h.trim().is_empty() => h.to_string(),
-            _ => {
-                return ToolResult::Error(
-                    "narf_registerWorkflow: `cell_handle` is required".into(),
-                );
-            }
+        let cell_handle = match require_str(&input, "cell_handle", "narf_registerWorkflow") {
+            Ok(h) => h,
+            Err(e) => return e,
         };
-        let version = input
-            .get("version")
-            .and_then(Value::as_str)
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or("v1")
-            .to_string();
-        let description = input
-            .get("description")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
-        let supersedes = input
-            .get("supersedes")
-            .and_then(Value::as_str)
-            .filter(|s| !s.trim().is_empty())
-            .map(str::to_string);
+        let version = opt_str_or(&input, "version", "v1");
+        let description = opt_str(&input, "description");
+        let supersedes = opt_str(&input, "supersedes");
         let request = DurableCellRegisterRequest {
             name,
             version,
@@ -1138,21 +1140,17 @@ impl Tool for NarfScheduleWorkflowTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let name = match input.get("name").and_then(Value::as_str) {
-            Some(n) if !n.trim().is_empty() => n.to_string(),
-            _ => return ToolResult::Error("narf_scheduleWorkflow: `name` is required".into()),
+        let name = match require_str(&input, "name", "narf_scheduleWorkflow") {
+            Ok(n) => n,
+            Err(e) => return e,
         };
-        let cell_handle = match input.get("cell_handle").and_then(Value::as_str) {
-            Some(h) if !h.trim().is_empty() => h.to_string(),
-            _ => {
-                return ToolResult::Error(
-                    "narf_scheduleWorkflow: `cell_handle` is required".into(),
-                );
-            }
+        let cell_handle = match require_str(&input, "cell_handle", "narf_scheduleWorkflow") {
+            Ok(h) => h,
+            Err(e) => return e,
         };
-        let schedule = match input.get("schedule").and_then(Value::as_str) {
-            Some(s) if !s.trim().is_empty() => s.to_string(),
-            _ => return ToolResult::Error("narf_scheduleWorkflow: `schedule` is required".into()),
+        let schedule = match require_str(&input, "schedule", "narf_scheduleWorkflow") {
+            Ok(s) => s,
+            Err(e) => return e,
         };
         let input_json = input.get("input").cloned().unwrap_or(Value::Null);
         let concurrency = input
@@ -1210,9 +1208,9 @@ impl Tool for NarfRunTool {
     }
 
     async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let handle = match input.get("ref").and_then(Value::as_str) {
-            Some(h) if !h.trim().is_empty() => h.to_string(),
-            _ => return ToolResult::Error("narf_run: `ref` is required".into()),
+        let handle = match require_str(&input, "ref", "narf_run") {
+            Ok(h) => h,
+            Err(e) => return e,
         };
         if handle.starts_with("narf-script:") {
             let guard = match self.session.ensure().await {
