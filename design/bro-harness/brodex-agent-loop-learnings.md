@@ -112,6 +112,26 @@ continues. Low effort; verify how often the live backend actually sends
 
 ## 3. Intra-turn parallel tool execution — reconcile with the Promise layer
 
+> **As-built (2026-06, supersedes the analysis below).** Both halves of this
+> section have since landed, and the reconciliation resolved the *opposite* way
+> from this doc's "Promise layer is the load-bearing concurrency story":
+> - **Intra-turn parallel dispatch shipped** as codex's read=shared/write=exclusive
+>   idiom, adapted to bro-harness's single-owner LSP state as two phases:
+>   read-only tools (per `Tool::annotations().read_only`, via `Registry::read_only`)
+>   dispatch **concurrently** (`agent_loop.rs`, `join_all`); mutators stay serial.
+>   Validated live (GLM Anthropic transport, `parallel=3`).
+> - **The Promise push-system was retired** (`PromiseStore`, the 6 `promise_*`
+>   tools, `shell_run mode="promise"`, the auto-injected `HARNESS_EVENT` turns).
+>   On a codex-convergence branch it was a redundant second mechanism for the
+>   long-running axis that codex covers with pull-based yield-poll
+>   (`shell_run` cooperative yield + `shell_poll`, code-mode `wait`) — which
+>   bro-harness already had. Long-running concurrency is now codex-shaped:
+>   in-turn parallel reads + cooperative-yield/poll for long commands. So where
+>   the analysis below treats the Promise layer as the keeper and
+>   `parallel_tool_calls` as optional, the realized design is the inverse.
+> See `design/bro-harness/codexification.md` and the Stage A/B commits. The
+> original analysis is retained below for provenance.
+
 **Codex.** When the model emits several tool calls in one assistant message,
 codex dispatches them **concurrently** and joins before the next model turn:
 
