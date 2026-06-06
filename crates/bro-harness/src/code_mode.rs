@@ -407,6 +407,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cell_file_read_returns_file_contents() {
+        // Reproduction: GLM's `Promise.all([tools.file_read(...)])` cell reported
+        // empty file contents even though the files had content. A cell's
+        // file_read must return the real file text.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("probe.txt"), "hello-codemode-123").unwrap();
+        let cx = ToolCx {
+            root: dir.path().to_path_buf(),
+            safety: Arc::new(bro_tools::SafetyPolicy::new()),
+            http: reqwest::Client::new(),
+            todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
+            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
+            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
+            session_env: Arc::new(BTreeMap::new()),
+        };
+        let callable: Vec<Arc<dyn Tool>> =
+            vec![Arc::new(bro_tools::workspace::FileRead) as Arc<dyn Tool>];
+        let seam: Arc<dyn ToolCapability> = Arc::new(crate::capabilities::HostTools::new(
+            callable.clone(),
+            cx.clone(),
+        ));
+        let exec = code_mode_tools(&callable, seam).remove(0);
+        let result = exec
+            .call(
+                json!({ "source": "const r = await tools.file_read({ file_path: 'probe.txt' }); text(typeof r === 'string' ? r : JSON.stringify(r));" }),
+                &cx,
+            )
+            .await;
+        match result {
+            ToolResult::Text(t) => {
+                assert!(t.contains("hello-codemode-123"), "got: {t:?}")
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn store_load_persists_across_cells_in_a_session() {
         let exec = exec_with(vec![Arc::new(Echo) as Arc<dyn Tool>]);
         let _ = exec
