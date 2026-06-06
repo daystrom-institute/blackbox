@@ -89,8 +89,11 @@ provider.
 - Use `team::bro` when names are ambiguous across instantiated teams.
 - Dissolve ad hoc teams you created after all member tasks are terminal:
   `bro_team(action="dissolve", name="...", cancel_running=false)`.
-- Prune terminal task clutter you created with `bro_prune`; never use pruning
-  as a substitute for cancelling or waiting on running work.
+- Prune terminal task clutter you created with `bro_prune` **only after explicit
+  operator confirmation** — terminal status is not "done"; the operator may want
+  to resume the session or prune it with `retro=true`, so ask first (and offer the
+  retro pass). Never use pruning as a substitute for cancelling or waiting on
+  running work.
 
 ## Cancellation hygiene
 

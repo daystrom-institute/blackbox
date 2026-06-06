@@ -1798,9 +1798,10 @@ dispatch.
 rate limiting, or failure; status/tail is the evidence.
 - Use `bro_when_all` for fan-out/fan-in and `bro_when_any` for races. Do not \
 hand-roll sequential wait/poll loops when the coordination primitive exists.
-- After external orchestration, clean up only what you created: prune terminal \
-tasks with `bro_prune` and dissolve ad hoc teams after all member tasks are \
-terminal.
+- After external orchestration, clean up only what you created — but only after \
+explicit operator confirmation: terminal status is not "done", so ask before \
+pruning terminal tasks with `bro_prune` (offer `retro=true`) or dissolving ad hoc \
+teams. Cleanup is operator-gated, not automatic.
 - Memory lanes: `bbox_thread` (investigation state), \
 `bbox_learn`/`bbox_decide` (standing rules / commitments), \
 `bbox_remember` (cold grep-able facts), `bbox_pin` (arc-bound hot context). \
