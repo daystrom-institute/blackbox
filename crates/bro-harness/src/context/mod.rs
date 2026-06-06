@@ -1,0 +1,254 @@
+use bro_tools::ToolCx;
+use serde_json::{Value, json};
+use std::path::Path;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FragmentRole {
+    User,
+    Developer,
+}
+
+impl FragmentRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FragmentRole::User => "user",
+            FragmentRole::Developer => "developer",
+        }
+    }
+}
+
+pub trait ContextualUserFragment {
+    fn role(&self) -> FragmentRole;
+    fn markers(&self) -> (&'static str, &'static str);
+    fn body(&self) -> String;
+
+    fn render(&self) -> String {
+        let (open, close) = self.markers();
+        let body = self.body();
+        if open.is_empty() && close.is_empty() {
+            body
+        } else {
+            format!("{open}{body}{close}")
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextMessage {
+    pub role: FragmentRole,
+    pub text_blocks: Vec<String>,
+}
+
+pub fn build_contextual_user_message(sections: Vec<String>) -> Option<TextMessage> {
+    build_text_message(FragmentRole::User, sections)
+}
+
+pub fn build_developer_update_item(sections: Vec<String>) -> Option<TextMessage> {
+    build_text_message(FragmentRole::Developer, sections)
+}
+
+fn build_text_message(role: FragmentRole, sections: Vec<String>) -> Option<TextMessage> {
+    if sections.is_empty() {
+        return None;
+    }
+    Some(TextMessage {
+        role,
+        text_blocks: sections,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnContextItem {
+    pub cwd: String,
+    pub shell: Option<String>,
+    pub current_date: Option<String>,
+    pub timezone: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentContext {
+    pub cwd: String,
+    pub shell: Option<String>,
+    pub current_date: Option<String>,
+    pub timezone: Option<String>,
+}
+
+impl EnvironmentContext {
+    pub fn from_tool_cx(cx: &ToolCx) -> Self {
+        let (current_date, timezone) = local_time_context();
+        Self {
+            cwd: cx.root.to_string_lossy().into_owned(),
+            shell: shell_from_env(),
+            current_date: Some(current_date),
+            timezone: Some(timezone),
+        }
+    }
+
+    pub fn to_turn_context_item(&self) -> TurnContextItem {
+        TurnContextItem {
+            cwd: self.cwd.clone(),
+            shell: self.shell.clone(),
+            current_date: self.current_date.clone(),
+            timezone: self.timezone.clone(),
+        }
+    }
+}
+
+impl ContextualUserFragment for EnvironmentContext {
+    fn role(&self) -> FragmentRole {
+        FragmentRole::User
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        ("<environment_context>", "</environment_context>")
+    }
+
+    fn body(&self) -> String {
+        let mut lines = vec![format!("  <cwd>{}</cwd>", escape_xml(&self.cwd))];
+        if let Some(shell) = &self.shell {
+            lines.push(format!("  <shell>{}</shell>", escape_xml(shell)));
+        }
+        if let Some(current_date) = &self.current_date {
+            lines.push(format!(
+                "  <current_date>{}</current_date>",
+                escape_xml(current_date)
+            ));
+        }
+        if let Some(timezone) = &self.timezone {
+            lines.push(format!("  <timezone>{}</timezone>", escape_xml(timezone)));
+        }
+        // Codex also has network permissions, filesystem permission profile,
+        // and subagents fields. Stage 1 omits them until bro-harness has a
+        // faithful source for each value.
+        format!("\n{}\n", lines.join("\n"))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserInstructions {
+    pub directory: String,
+    pub text: String,
+}
+
+impl UserInstructions {
+    pub fn from_project(cwd: &Path) -> Option<Self> {
+        crate::project_doc::discover(cwd).map(|text| Self {
+            directory: cwd.to_string_lossy().into_owned(),
+            text,
+        })
+    }
+}
+
+impl ContextualUserFragment for UserInstructions {
+    fn role(&self) -> FragmentRole {
+        FragmentRole::User
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        ("# AGENTS.md instructions for ", "</INSTRUCTIONS>")
+    }
+
+    fn body(&self) -> String {
+        format!("{}\n\n<INSTRUCTIONS>\n{}\n", self.directory, self.text)
+    }
+}
+
+impl From<TextMessage> for Value {
+    fn from(message: TextMessage) -> Self {
+        json!({
+            "role": message.role.as_str(),
+            "content": message.text_blocks,
+        })
+    }
+}
+
+fn shell_from_env() -> Option<String> {
+    std::env::var("SHELL").ok().filter(|s| !s.is_empty())
+}
+
+fn local_time_context() -> (String, String) {
+    match iana_time_zone::get_timezone() {
+        Ok(timezone) => (chrono::Local::now().date_naive().to_string(), timezone),
+        Err(_) => (
+            chrono::Utc::now().date_naive().to_string(),
+            "Etc/UTC".to_string(),
+        ),
+    }
+}
+
+fn escape_xml(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragment_render_wraps_body_in_markers() {
+        let ctx = EnvironmentContext {
+            cwd: "/repo".into(),
+            shell: Some("/bin/zsh".into()),
+            current_date: Some("2026-06-06".into()),
+            timezone: Some("America/Edmonton".into()),
+        };
+        let rendered = ctx.render();
+        assert!(rendered.starts_with("<environment_context>\n"));
+        assert!(rendered.ends_with("\n</environment_context>"));
+        assert!(rendered.contains("<cwd>/repo</cwd>"));
+    }
+
+    #[test]
+    fn environment_context_body_contains_emitted_fields() {
+        let ctx = EnvironmentContext {
+            cwd: "/repo".into(),
+            shell: Some("zsh".into()),
+            current_date: Some("2026-06-06".into()),
+            timezone: Some("America/Edmonton".into()),
+        };
+        let body = ctx.body();
+        assert!(body.contains("<cwd>/repo</cwd>"));
+        assert!(body.contains("<shell>zsh</shell>"));
+        assert!(body.contains("<current_date>2026-06-06</current_date>"));
+        assert!(body.contains("<timezone>America/Edmonton</timezone>"));
+        assert!(!body.contains("safety_policy"));
+    }
+
+    #[test]
+    fn contextual_user_message_is_one_user_message_with_text_blocks() {
+        let message =
+            build_contextual_user_message(vec!["one".into(), "two".into()]).expect("message");
+        assert_eq!(message.role, FragmentRole::User);
+        assert_eq!(message.text_blocks, vec!["one", "two"]);
+    }
+
+    #[test]
+    fn developer_update_item_uses_developer_role() {
+        let message = build_developer_update_item(vec!["policy".into()]).expect("message");
+        assert_eq!(message.role, FragmentRole::Developer);
+        assert_eq!(message.text_blocks, vec!["policy"]);
+    }
+
+    #[test]
+    fn user_instructions_render_wraps_agents_text() {
+        let instructions = UserInstructions {
+            directory: "/repo".into(),
+            text: "rule".into(),
+        };
+        let rendered = instructions.render();
+        assert!(rendered.starts_with("# AGENTS.md instructions for /repo"));
+        assert!(rendered.contains("<INSTRUCTIONS>\nrule\n"));
+        assert!(rendered.ends_with("</INSTRUCTIONS>"));
+    }
+}

@@ -485,6 +485,7 @@ struct Session {
     tx: Box<dyn Transport>,
     reg: Registry,
     cx: ToolCx,
+    reference_context_item: Option<crate::context::TurnContextItem>,
     hooks: HookEngine,
     emitter: Emitter,
     base_opts: TurnOpts,
@@ -602,6 +603,7 @@ impl Session {
             }
             tx.restore(r.snapshot.clone());
         }
+        let restored_snapshot = store.restored.is_some();
 
         // On resume the daemon doesn't re-pass --model (implied by the session),
         // so fall back to the model persisted with the session.
@@ -626,6 +628,11 @@ impl Session {
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
         };
+        // Stage 1 has no rollout reconstruction yet. On resume, seed the
+        // context baseline gate so the already-persisted conversation is not
+        // front-loaded with a second fresh <environment_context>.
+        let reference_context_item = restored_snapshot
+            .then(|| crate::context::EnvironmentContext::from_tool_cx(&cx).to_turn_context_item());
         // The builtin `report` tool is harness-owned (it emits the cockpit's
         // status signal on the stream) and holds its own emitter handle. It is
         // registered always but only pinned in fleet (bidirectional) mode.
@@ -708,6 +715,7 @@ impl Session {
             tx,
             reg,
             cx,
+            reference_context_item,
             hooks,
             emitter,
             base_opts,
@@ -867,6 +875,7 @@ impl Session {
             // the whole turn instead of self-healing.
             let mut overflow_compacted = false;
             let out = 'attempt: loop {
+                self.tx.normalize_for_prompt();
                 let r = tokio::select! {
                     biased;
                     _ = cancel.changed() => {
@@ -1060,6 +1069,7 @@ impl Session {
     }
 
     fn push_user_text(&mut self, prompt: &str) {
+        self.emit_initial_context_if_needed();
         self.tx.push_user_text(prompt);
         self.pending_input_estimate = self
             .pending_input_estimate
@@ -1069,6 +1079,24 @@ impl Session {
                 self.tail_nudge = Some(n.message);
             }
         }
+    }
+
+    fn emit_initial_context_if_needed(&mut self) {
+        if self.reference_context_item.is_some() {
+            return;
+        }
+        let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
+        let rendered = crate::context::ContextualUserFragment::render(&env);
+        if let Some(message) = crate::context::build_contextual_user_message(vec![rendered]) {
+            let added_tokens = message
+                .text_blocks
+                .iter()
+                .map(|section| est_tokens(section))
+                .fold(0u64, u64::saturating_add);
+            self.tx.push_user_text_blocks(message.text_blocks);
+            self.pending_input_estimate = self.pending_input_estimate.saturating_add(added_tokens);
+        }
+        self.reference_context_item = Some(env.to_turn_context_item());
     }
 
     fn drain_mid_turn_user_inputs(&mut self, inputs: &Arc<StdMutex<VecDeque<String>>>) {
@@ -1726,6 +1754,7 @@ mod tests {
                 &mcp::ToolFilter::default(),
             ),
             cx,
+            reference_context_item: None,
             hooks: HookEngine::from_env(NudgeLedger::from_side(&Value::Null)),
             emitter: Emitter::new("test".into()),
             base_opts: TurnOpts {
@@ -1758,6 +1787,43 @@ mod tests {
         (session, shared)
     }
 
+    #[test]
+    fn first_user_push_emits_environment_context_and_baseline() {
+        let (mut session, shared) = mk_session(vec![]);
+        let expected_cwd = session.cx.root.to_string_lossy().into_owned();
+        session.push_user_text("hello");
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(pushed.len(), 2);
+        assert!(pushed[0].starts_with("<environment_context>"));
+        assert!(pushed[0].contains(&format!("<cwd>{expected_cwd}</cwd>")));
+        assert_eq!(pushed[1], "hello");
+
+        let baseline = session
+            .reference_context_item
+            .as_ref()
+            .expect("baseline captured");
+        assert_eq!(baseline.cwd, expected_cwd);
+        assert!(baseline.current_date.is_some());
+    }
+
+    #[test]
+    fn seeded_reference_context_suppresses_initial_context_emit() {
+        let (mut session, shared) = mk_session(vec![]);
+        let env = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
+        session.reference_context_item = Some(env.to_turn_context_item());
+
+        session.push_user_text("resume turn");
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(pushed.as_slice(), &["resume turn".to_string()]);
+    }
+
+    fn user_turns_after_initial_context(users: &[String]) -> &[String] {
+        assert!(users[0].starts_with("<environment_context>"), "{users:?}");
+        &users[1..]
+    }
+
     #[tokio::test]
     async fn session_loop_processes_turns_in_order() {
         let (mut session, shared) =
@@ -1771,7 +1837,10 @@ mod tests {
             .await
             .unwrap();
         let users = shared.pushed_users.lock().unwrap().clone();
-        assert_eq!(users, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            user_turns_after_initial_context(&users),
+            &["alpha".to_string(), "beta".to_string()]
+        );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
     }
 
@@ -1789,7 +1858,10 @@ mod tests {
             .await
             .unwrap();
         let users = shared.pushed_users.lock().unwrap().clone();
-        assert_eq!(users, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            user_turns_after_initial_context(&users),
+            &["alpha".to_string(), "beta".to_string()]
+        );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
     }
 
@@ -1867,7 +1939,10 @@ mod tests {
             .expect("session task must not panic")
             .unwrap();
         let users = shared.pushed_users.lock().unwrap().clone();
-        assert_eq!(users, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(
+            user_turns_after_initial_context(&users),
+            &["alpha".to_string(), "beta".to_string()]
+        );
         assert_eq!(shared.completed.load(Ordering::SeqCst), 2);
     }
 
@@ -1959,10 +2034,11 @@ mod tests {
             .unwrap();
 
         let users = shared.pushed_users.lock().unwrap().clone();
-        assert_eq!(users.len(), 1, "{users:?}");
-        assert!(users[0].contains("[HARNESS_EVENT promise_completed]"));
-        assert!(users[0].contains(&pid));
-        assert!(users[0].contains("call promise_status"));
+        assert_eq!(users.len(), 2, "{users:?}");
+        assert!(users[0].starts_with("<environment_context>"));
+        assert!(users[1].contains("[HARNESS_EVENT promise_completed]"));
+        assert!(users[1].contains(&pid));
+        assert!(users[1].contains("call promise_status"));
     }
 
     #[test]

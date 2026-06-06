@@ -292,6 +292,10 @@ impl Transport for OpenAiChatTransport {
         self.messages.push(json!({"role": "user", "content": text}));
     }
 
+    fn normalize_for_prompt(&mut self) {
+        normalize_chat_messages(&mut self.messages);
+    }
+
     fn push_tool_results(&mut self, results: Vec<super::ToolResult>) {
         for r in results {
             self.messages.push(json!({
@@ -586,6 +590,67 @@ fn chat_split(messages: &[Value], limit: usize) -> Option<usize> {
         .find(|&i| messages[i]["role"].as_str() == Some("assistant"))
 }
 
+fn normalize_chat_messages(messages: &mut Vec<Value>) {
+    let calls: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|message| message["role"].as_str() == Some("assistant"))
+        .flat_map(|message| {
+            message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|call| call["id"].as_str().map(str::to_string))
+        .collect();
+    messages.retain(|message| match message["role"].as_str() {
+        Some("tool") => message["tool_call_id"]
+            .as_str()
+            .is_some_and(|id| calls.contains(id)),
+        Some("assistant") => {
+            let has_content = match message.get("content") {
+                Some(Value::String(s)) => !s.is_empty(),
+                Some(Value::Null) | None => false,
+                Some(_) => true,
+            };
+            let has_tool_calls = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|arr| !arr.is_empty());
+            has_content || has_tool_calls
+        }
+        _ => true,
+    });
+
+    let existing_results: std::collections::HashSet<String> = messages
+        .iter()
+        .filter(|message| message["role"].as_str() == Some("tool"))
+        .filter_map(|message| message["tool_call_id"].as_str().map(str::to_string))
+        .collect();
+    let mut missing_results = Vec::new();
+    for (idx, message) in messages.iter().enumerate() {
+        if message["role"].as_str() != Some("assistant") {
+            continue;
+        }
+        let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) else {
+            continue;
+        };
+        for call in tool_calls {
+            if let Some(id) = call["id"].as_str()
+                && !existing_results.contains(id)
+            {
+                missing_results.push((
+                    idx,
+                    json!({"role": "tool", "tool_call_id": id, "content": "aborted"}),
+                ));
+            }
+        }
+    }
+    for (idx, result) in missing_results.into_iter().rev() {
+        messages.insert(idx + 1, result);
+    }
+}
+
 /// Render a slice of the chat buffer to a plain-text transcript for
 /// summarization. Tool results are truncated to keep the prompt bounded.
 fn render_chat_transcript(messages: &[Value], tool_cap: usize) -> String {
@@ -719,6 +784,35 @@ mod tests {
         assert_eq!(chat_split(&msgs, 3), Some(1));
         // No assistant before limit 1 → nothing safe to compact.
         assert_eq!(chat_split(&msgs, 1), None);
+    }
+
+    #[test]
+    fn normalize_synthesizes_missing_tool_results_and_removes_orphans() {
+        let mut messages = vec![
+            json!({"role": "user", "content": "go"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [
+                {"id": "missing", "type": "function", "function": {"name": "x", "arguments": "{}"}},
+                {"id": "matched", "type": "function", "function": {"name": "x", "arguments": "{}"}}
+            ]}),
+            json!({"role": "tool", "tool_call_id": "orphan", "content": "drop"}),
+            json!({"role": "tool", "tool_call_id": "matched", "content": "keep"}),
+        ];
+
+        normalize_chat_messages(&mut messages);
+
+        assert_eq!(messages.len(), 4);
+        let calls = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "missing");
+        assert_eq!(calls[1]["id"], "matched");
+        assert_eq!(messages[2]["tool_call_id"], "missing");
+        assert_eq!(messages[2]["content"], "aborted");
+        assert_eq!(messages[3]["tool_call_id"], "matched");
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message["tool_call_id"] == "orphan")
+        );
     }
 
     #[test]

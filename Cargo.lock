@@ -536,6 +536,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "http",
+ "iana-time-zone",
  "lsp-types",
  "reqwest 0.12.28",
  "rmcp",

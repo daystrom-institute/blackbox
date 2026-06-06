@@ -425,6 +425,14 @@ impl Transport for OpenAiResponsesTransport {
         self.state.push_user_text(text);
     }
 
+    fn push_user_text_blocks(&mut self, blocks: Vec<String>) {
+        self.state.push_user_text_blocks(blocks);
+    }
+
+    fn normalize_for_prompt(&mut self) {
+        self.state.normalize_for_prompt();
+    }
+
     fn push_tool_results(&mut self, results: Vec<super::ToolResult>) {
         self.state.push_tool_results(results);
     }

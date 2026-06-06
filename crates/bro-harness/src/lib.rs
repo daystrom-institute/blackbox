@@ -10,6 +10,7 @@ pub mod capabilities;
 pub mod cli;
 pub mod code_mode;
 pub mod compaction;
+pub mod context;
 pub mod diagnostics;
 pub mod emit;
 pub mod hooks;

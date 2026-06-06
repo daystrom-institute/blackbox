@@ -356,6 +356,13 @@ pub trait Transport: Send {
     /// Append the user's turn to the (transport-native) conversation.
     fn push_user_text(&mut self, text: &str);
 
+    /// Append one user-role contextual message made of multiple text blocks.
+    /// Transports that cannot represent block arrays natively may collapse
+    /// sections into one user message.
+    fn push_user_text_blocks(&mut self, blocks: Vec<String>) {
+        self.push_user_text(&blocks.join("\n\n"));
+    }
+
     /// Append tool results for the tool calls from the previous turn.
     fn push_tool_results(&mut self, results: Vec<ToolResult>);
 
@@ -363,6 +370,8 @@ pub trait Transport: Send {
     /// provider, append the assistant's native output to the buffer, and
     /// return the normalized result. Streaming transports forward incremental
     /// wire events to `sink` as they arrive.
+    fn normalize_for_prompt(&mut self) {}
+
     async fn run_turn(
         &mut self,
         tools: &[ToolSpec],

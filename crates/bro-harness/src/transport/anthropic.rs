@@ -430,6 +430,17 @@ impl Transport for AnthropicTransport {
         }));
     }
 
+    fn push_user_text_blocks(&mut self, blocks: Vec<String>) {
+        let content: Vec<Value> = blocks
+            .into_iter()
+            .map(|text| json!({"type": "text", "text": text}))
+            .collect();
+        self.messages.push(json!({
+            "role": "user",
+            "content": content,
+        }));
+    }
+
     fn push_tool_results(&mut self, results: Vec<super::ToolResult>) {
         let blocks: Vec<Value> = results
             .into_iter()
@@ -444,6 +455,10 @@ impl Transport for AnthropicTransport {
             .collect();
         self.messages
             .push(json!({"role": "user", "content": blocks}));
+    }
+
+    fn normalize_for_prompt(&mut self) {
+        normalize_anthropic_messages(&mut self.messages);
     }
 
     async fn run_turn(
@@ -783,6 +798,77 @@ fn messages_with_cache_breakpoint(messages: &[Value]) -> Vec<Value> {
     msgs
 }
 
+fn normalize_anthropic_messages(messages: &mut Vec<Value>) {
+    let tool_uses: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(content_blocks)
+        .filter(|block| matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")))
+        .filter_map(|block| block["id"].as_str().map(str::to_string))
+        .collect();
+
+    for message in messages.iter_mut() {
+        if let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) {
+            content.retain(|block| match block["type"].as_str() {
+                Some("tool_result") => block["tool_use_id"]
+                    .as_str()
+                    .is_some_and(|id| tool_uses.contains(id)),
+                _ => true,
+            });
+        }
+    }
+
+    messages.retain(|message| {
+        !message
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(Vec::is_empty)
+    });
+
+    let tool_results: std::collections::HashSet<String> = messages
+        .iter()
+        .flat_map(content_blocks)
+        .filter(|block| block["type"] == "tool_result")
+        .filter_map(|block| block["tool_use_id"].as_str().map(str::to_string))
+        .collect();
+
+    let mut idx = 0;
+    while idx < messages.len() {
+        let missing: Vec<Value> = content_blocks(&messages[idx])
+            .filter(|block| matches!(block["type"].as_str(), Some("tool_use" | "server_tool_use")))
+            .filter_map(|block| block["id"].as_str())
+            .filter(|id| !tool_results.contains(*id))
+            .map(|id| json!({"type": "tool_result", "tool_use_id": id, "content": "aborted"}))
+            .collect();
+        if missing.is_empty() {
+            idx += 1;
+            continue;
+        }
+
+        if messages
+            .get(idx + 1)
+            .and_then(|message| message["role"].as_str())
+            == Some("user")
+            && let Some(content) = messages[idx + 1]
+                .get_mut("content")
+                .and_then(Value::as_array_mut)
+        {
+            content.extend(missing);
+            idx += 1;
+        } else {
+            messages.insert(idx + 1, json!({"role": "user", "content": missing}));
+            idx += 2;
+        }
+    }
+}
+
+fn content_blocks(message: &Value) -> impl Iterator<Item = &Value> {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -958,6 +1044,36 @@ mod tests {
         let msgs = vec![json!({"role": "user", "content": "hi"})];
         let out = messages_with_cache_breakpoint(&msgs);
         assert_eq!(out[0]["content"], "hi");
+    }
+
+    #[test]
+    fn normalize_synthesizes_missing_tool_results_and_removes_orphans() {
+        let mut messages = vec![
+            json!({"role": "assistant", "content": [
+                {"type": "text", "text": "keep"},
+                {"type": "tool_use", "id": "missing", "name": "x", "input": {}},
+                {"type": "tool_use", "id": "matched", "name": "x", "input": {}}
+            ]}),
+            json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "orphan", "content": "drop"},
+                {"type": "tool_result", "tool_use_id": "matched", "content": "keep"}
+            ]}),
+        ];
+
+        normalize_anthropic_messages(&mut messages);
+
+        assert_eq!(messages.len(), 2);
+        let assistant = messages[0]["content"].as_array().unwrap();
+        assert_eq!(assistant.len(), 3);
+        assert_eq!(assistant[0]["type"], "text");
+        assert_eq!(assistant[1]["id"], "missing");
+        assert_eq!(assistant[2]["id"], "matched");
+        let user = messages[1]["content"].as_array().unwrap();
+        assert_eq!(user.len(), 2);
+        assert_eq!(user[0]["tool_use_id"], "matched");
+        assert_eq!(user[1]["tool_use_id"], "missing");
+        assert_eq!(user[1]["content"], "aborted");
+        assert!(!user.iter().any(|block| block["tool_use_id"] == "orphan"));
     }
 
     #[test]

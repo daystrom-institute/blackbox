@@ -57,6 +57,19 @@ impl ResponsesState {
         }));
     }
 
+    pub(super) fn push_user_text_blocks(&mut self, blocks: Vec<String>) {
+        self.thread_id = new_id();
+        let content: Vec<Value> = blocks
+            .into_iter()
+            .map(|text| json!({"type": "input_text", "text": text}))
+            .collect();
+        self.input.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": content,
+        }));
+    }
+
     pub(super) fn push_tool_results(&mut self, results: Vec<ToolResult>) {
         for r in results {
             self.input.push(json!({
@@ -75,6 +88,10 @@ impl ResponsesState {
         if let Some(arr) = snapshot.as_array() {
             self.input = arr.clone();
         }
+    }
+
+    pub(super) fn normalize_for_prompt(&mut self) {
+        normalize_responses_input(&mut self.input);
     }
 
     pub(super) fn build_body(&self, tools: &[ToolSpec], opts: &TurnOpts) -> Value {
@@ -487,6 +504,46 @@ pub(super) fn responses_split(input: &[Value], limit: usize) -> Option<usize> {
     })
 }
 
+pub(super) fn normalize_responses_input(input: &mut Vec<Value>) {
+    let calls: std::collections::HashSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_string))
+        .collect();
+
+    input.retain(|item| match item["type"].as_str() {
+        Some("function_call_output") => item["call_id"]
+            .as_str()
+            .is_some_and(|id| calls.contains(id)),
+        _ => true,
+    });
+
+    let outputs: std::collections::HashSet<String> = input
+        .iter()
+        .filter(|item| item["type"] == "function_call_output")
+        .filter_map(|item| item["call_id"].as_str().map(str::to_string))
+        .collect();
+    let mut missing_outputs = Vec::new();
+    for (idx, item) in input.iter().enumerate() {
+        if item["type"] == "function_call"
+            && let Some(call_id) = item["call_id"].as_str()
+            && !outputs.contains(call_id)
+        {
+            missing_outputs.push((
+                idx,
+                json!({
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "aborted",
+                }),
+            ));
+        }
+    }
+    for (idx, output) in missing_outputs.into_iter().rev() {
+        input.insert(idx + 1, output);
+    }
+}
+
 /// Render a slice of the Responses input buffer to a plain-text transcript for
 /// summarization. Tool outputs are truncated to keep the prompt bounded.
 pub(super) fn render_responses_transcript(items: &[Value], tool_cap: usize) -> String {
@@ -736,6 +793,43 @@ mod tests {
             ),
         );
         assert_eq!(body["instructions"], "OVERLAY");
+    }
+
+    #[test]
+    fn normalize_synthesizes_missing_function_outputs_and_removes_orphan_outputs() {
+        let mut input = vec![
+            json!({"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}),
+            json!({"type": "function_call", "call_id": "missing", "name": "x", "arguments": "{}"}),
+            json!({"type": "function_call", "call_id": "matched", "name": "x", "arguments": "{}"}),
+            json!({"type": "function_call_output", "call_id": "orphan", "output": "drop"}),
+            json!({"type": "function_call_output", "call_id": "matched", "output": "keep"}),
+        ];
+
+        normalize_responses_input(&mut input);
+
+        assert_eq!(input.len(), 5);
+        assert!(input.iter().any(|item| item["type"] == "message"));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call" && item["call_id"] == "missing")
+        );
+        assert!(input.iter().any(|item| {
+            item["type"] == "function_call_output"
+                && item["call_id"] == "missing"
+                && item["output"] == "aborted"
+        }));
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call" && item["call_id"] == "matched")
+        );
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "function_call_output" && item["call_id"] == "matched")
+        );
+        assert!(!input.iter().any(|item| item["call_id"] == "orphan"));
     }
 
     #[test]
