@@ -1607,6 +1607,24 @@ fn ingest_harness_event(
             apply_cwd_updates_from_event(&mut inner, &evt);
             inner.supervision.observe_event(&evt, &sink, now_ms());
             apply_sink_updates(&mut inner, sink);
+            // A terminal `result` event with `is_error: true` fails the task and
+            // preserves the message in stderr. The subprocess path derives this
+            // from a non-zero exit code, but the in-process harness loop returns
+            // Ok regardless of turn outcome, so without this an errored turn
+            // would be recorded as a silent successful completion (gap-32113fd4).
+            if evt.get("type").and_then(Value::as_str) == Some("result")
+                && evt.get("is_error").and_then(Value::as_bool) == Some(true)
+            {
+                if inner.status != TaskStatus::Cancelled {
+                    inner.status = TaskStatus::Failed;
+                }
+                if let Some(msg) = evt.get("result").and_then(Value::as_str)
+                    && !msg.trim().is_empty()
+                {
+                    inner.stderr.push_str(msg);
+                    inner.stderr.push('\n');
+                }
+            }
         }
         accepted
             .then(|| {
@@ -3387,6 +3405,54 @@ mod tests {
             store.get("task-known").unwrap().inner.lock().session_id,
             "session-a"
         );
+    }
+
+    #[test]
+    fn ingest_is_error_result_marks_in_process_task_failed_and_captures_message() {
+        // The in-process harness loop returns Ok regardless of turn outcome, so a
+        // failed turn is surfaced only as a terminal `result {is_error:true}`
+        // event. Ingesting it must fail the task and preserve the message
+        // (gap-32113fd4) — the in-process analogue of a non-zero subprocess exit.
+        let task = Arc::new(Task {
+            inner: Mutex::new(TaskInner {
+                id: "task-err".to_string(),
+                provider: Provider::Minimax,
+                session_id: "sess-err".to_string(),
+                events: vec![],
+                last_assistant_message: None,
+                usage: None,
+                cost_usd: None,
+                num_turns: None,
+                stderr: String::new(),
+                status: TaskStatus::Running,
+                started_at: now_ms(),
+                completed_at: None,
+                exit_code: None,
+                cwd: None,
+                bro_label: None,
+                agent_label: None,
+                report: None,
+                recoverable: false,
+                transcript_location: None,
+                transcript_cursor: None,
+                supervision: SupervisionState::default(),
+            }),
+            notify: Arc::new(Notify::new()),
+            child_id: Mutex::new(None),
+        });
+        let (tx, _rx) = tokio::sync::broadcast::channel(16);
+        let evt = serde_json::json!({
+            "type": "result",
+            "subtype": "error",
+            "is_error": true,
+            "session_id": "sess-err",
+            "result": "anthropic messages 400 Bad Request: boom",
+            "num_turns": 2,
+        });
+        ingest_harness_event(&task, Provider::Minimax, evt, &tx, "task-err", None);
+        let inner = task.inner.lock();
+        assert!(matches!(inner.status, TaskStatus::Failed));
+        assert!(inner.stderr.contains("400 Bad Request: boom"));
     }
 
     #[test]

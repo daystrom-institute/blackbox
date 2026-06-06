@@ -428,18 +428,13 @@ async fn run_prompt_with_controls(
     let mut deferred: Vec<(String, Value)> = Vec::new();
     let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
         Arc::new(StdMutex::new(VecDeque::new()));
-    {
+    let turn_result = {
         let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
         tokio::pin!(turn);
         loop {
             tokio::select! {
                 biased;
-                res = &mut turn => {
-                    if let Err(e) = res {
-                        tracing::error!("turn failed: {e:#}");
-                    }
-                    break;
-                }
+                res = &mut turn => break res,
                 maybe = input_rx.recv() => match maybe {
                     Some(Input::Control { subtype, req_id, raw }) if subtype == "interrupt" => {
                         queue_redirect_from_control(&raw, &mid_turn_user_inputs);
@@ -461,6 +456,16 @@ async fn run_prompt_with_controls(
                 }
             }
         }
+    };
+    // A failed turn must not be swallowed. Surface it as a terminal `result`
+    // event with `is_error: true` (captured in the transcript and ingested by
+    // the daemon, which maps it to a failed task with the message preserved) in
+    // addition to the stderr log. Without this the controlled-session loop
+    // returns Ok and the dispatch looks like a silent successful completion
+    // with no result — the silent-completion hole tracked in gap-32113fd4.
+    if let Err(e) = turn_result {
+        tracing::error!("turn failed: {e:#}");
+        session.emitter.result_error(&format!("{e:#}"), session.turns);
     }
     for (subtype, raw) in deferred {
         session.apply_control(&subtype, &raw);

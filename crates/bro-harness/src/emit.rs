@@ -225,6 +225,23 @@ impl Emitter {
         }
         self.write_line(v);
     }
+
+    /// Terminal `result` event for a turn that FAILED. Mirrors `result()` but
+    /// carries `is_error: true` and the error text, so the failure is a captured
+    /// protocol event (transcript + daemon ingest) rather than a stray stderr
+    /// line that the controlled-session loop would otherwise swallow. The daemon
+    /// recognizes `is_error: true` (`parse_claude_event` / `detect_disruption`)
+    /// and maps it to a failed task with the message preserved.
+    pub fn result_error(&self, error: &str, num_turns: u64) {
+        self.write_line(json!({
+            "type": "result",
+            "subtype": "error",
+            "is_error": true,
+            "session_id": self.session_id,
+            "result": error,
+            "num_turns": num_turns,
+        }));
+    }
 }
 
 impl crate::transport::TurnSink for Emitter {
@@ -258,5 +275,31 @@ mod tests {
         assert_eq!(events[0]["session_id"], "session-1");
         assert_eq!(events[1]["type"], "result");
         assert_eq!(events[1]["result"], "done");
+    }
+
+    #[test]
+    fn result_error_emits_is_error_result_event() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let captured = captured.clone();
+            Arc::new(move |event: Value| {
+                captured.lock().unwrap().push(event);
+            })
+        };
+        let emitter = Emitter::with_callback("session-err".into(), sink);
+
+        emitter.result_error("anthropic messages 400 Bad Request: boom", 3);
+
+        let events = captured.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "result");
+        assert_eq!(events[0]["subtype"], "error");
+        assert_eq!(events[0]["is_error"], true);
+        assert_eq!(events[0]["session_id"], "session-err");
+        assert_eq!(
+            events[0]["result"],
+            "anthropic messages 400 Bad Request: boom"
+        );
+        assert_eq!(events[0]["num_turns"], 3);
     }
 }
