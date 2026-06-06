@@ -147,11 +147,21 @@ routing facts:
 - GLM, DeepSeek, MiniMax, and Brodex dispatch through `bro-harness` (the custom
   provider harness, `crates/bro-harness`): GLM/DeepSeek/MiniMax on the Anthropic
   transport, Brodex on the OpenAI Responses transport (Codex/ChatGPT
-  backend). The harness emits the Claude stream-json envelope, so it slots
-  into the existing dispatch seam. Needs `bro-harness` on PATH or
-  `BRO_HARNESS_BIN`; transport + credentials are selected via env in
-  `brofile::resolve_provider_env`. See
-  `design/bro-harness/anthropic-harness.md`.
+  backend). The daemon links `bro-harness` as a **library crate** (`Cargo.toml`)
+  and runs these providers **in-process** — `spawn_task_with_tool_placement`
+  routes every harness provider to `spawn_harness_in_process_task`
+  (`orchestration/mod.rs`), which calls
+  `bro_harness::agent_loop::run_with_event_callback_and_input_mcp` directly. It is
+  **not** spawned as a `bro-harness` subprocess; the Claude stream-json envelope
+  is still the event shape, but it is delivered via an in-process `EventCallback`,
+  not a child process's stdout. Transport + credentials are selected via env in
+  `brofile::resolve_provider_env`. The legacy subprocess path
+  (`exec_args::bin_with_env` / `BRO_HARNESS_BIN` / `bro-harness` on PATH) is
+  **not** the execution mechanism for these providers; the on-PATH binary is now
+  consulted only by the allocator's availability gate
+  (`provider_binary_missing`, `allocator.rs`) and legacy MCP-CLI management. See
+  `design/bro-harness/anthropic-harness.md` and
+  `design/bro-harness/harness-daemon-boundary.md`.
 - Codex dispatches through the codex CLI — a path distinct from Brodex
   (`codex` → codex CLI; `brodex` → bro-harness/Responses), preserved unchanged.
 - Copilot, Vibe, and Gemini each have provider-specific arg builders.

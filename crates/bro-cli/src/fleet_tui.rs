@@ -9,16 +9,28 @@
 //! - A selectable, state-grouped roster (`ListState`; none existed before).
 //! - The zoom-axis navigation model + dual-mode composer (§5.1).
 //! - The fleet-state taxonomy + attention buckets (§5 state model).
-//! - In-process dispatch through [`FleetOrchestrator`] — daemon-free (§3).
+//! - Dispatch/control via [`FleetOrchestrator`] (`bro-fleet-client`).
 //!
-//! ## Deliberately deferred (depends on the harness/CLI bidirectional seam)
+//! ## Dispatch routing (corrected from the original skeleton)
+//! This was drafted as "in-process, daemon-free" dispatch. The realized design
+//! is **daemon-routed**: `FleetOrchestrator` is a thin client whose every
+//! dispatch/resume/steer/interrupt is an HTTP call to the daemon singleton's
+//! `/control/*` plane (`bro-fleet-client::fleet`, deps = `bro-protocol` +
+//! `bro-core` only). The daemon then runs the harness **in-process** off its
+//! linked `bro-harness` lib (`spawn_harness_in_process_task`) — not as a
+//! spawned `bro-harness` subprocess. So a fleet dispatch reaches the harness as:
+//! cockpit → `/control/exec` → daemon in-process harness.
+//!
+//! NOTE: the "deliberately deferred" bidirectional-seam framing below predates
+//! the `/control/{steer,interrupt}` plane and is likely stale; reconcile against
+//! `design/fleet-tui/fleet-tui.md` before trusting it.
+//!
+//! ## Originally deferred (verify against current /control/* before trusting)
 //! The keystone bidirectional control protocol (§1, §2) — persistent stdin,
-//! `control_request`/`interrupt`, `/compact`, live steering — is **not** wired
-//! here. That is harness + dispatch-seam work owned separately. v1 dispatch is
-//! the existing one-shot path: you can spawn entrypoint agents and watch their
-//! state/transcript, but steering a live session is stubbed with a status note
-//! until the seam exists. The verbose inline transcript parser (§5.4, item 14)
-//! is also a follow-up; this skeleton renders the latest assistant message.
+//! `control_request`/`interrupt`, `/compact`, live steering — was **not** wired
+//! in the skeleton. v1 dispatch was the one-shot path: spawn entrypoint agents
+//! and watch their state/transcript, steering stubbed with a status note. The
+//! verbose inline transcript parser (§5.4, item 14) was also a follow-up.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
