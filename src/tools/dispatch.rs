@@ -53,6 +53,11 @@ pub(crate) struct FreshDispatchRequest {
     /// `exec_opts` just before arg construction so it survives an allocator
     /// rebuild of `exec_opts`. `None` ⇒ no `--code-mode` flag (harness default).
     pub(crate) code_mode: Option<orchestration::brofile::CodeMode>,
+    /// Resolved structured-output JSON schema for this fresh dispatch (from an
+    /// agent manifest's `outputs.schema`). Like `code_mode`, folded onto
+    /// `exec_opts` just before arg construction so it survives an allocator
+    /// rebuild. `None` ⇒ no `--output-schema` flag (no structured output).
+    pub(crate) output_schema: Option<String>,
 }
 
 pub(crate) struct FreshDispatchResult {
@@ -305,6 +310,13 @@ impl BlackboxServer {
             o.code_mode = Some(cm);
             request.exec_opts = Some(o);
         }
+        // Same for the structured-output schema: re-apply after any allocator
+        // rebuild so a structured-output agent keeps its `--output-schema`.
+        if let Some(schema) = request.output_schema.take() {
+            let mut o = request.exec_opts.take().unwrap_or_default();
+            o.output_schema = Some(schema);
+            request.exec_opts = Some(o);
+        }
 
         let task_id = uuid::Uuid::new_v4().to_string();
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -497,6 +509,9 @@ impl BlackboxServer {
             record_to_bro: p.bro.clone(),
             brofile_context,
             code_mode: resolved_code_mode,
+            // bro_exec carries no output schema (structured output is delivered
+            // via agent dispatch from the manifest, not generic exec).
+            output_schema: None,
         }) {
             Ok(result) => result,
             Err(e) => return Self::err_text(&e),
@@ -1240,6 +1255,7 @@ impl BlackboxServer {
                     effort: brofile.effort.clone(),
                     provider_defaults: None,
                     code_mode: brofile.code_mode,
+output_schema: None,
                 })
             } else {
                 None
@@ -1799,6 +1815,8 @@ impl BlackboxServer {
                         // Resume restores the session's persisted code_mode; the
                         // daemon does not re-pass it (mirrors --model).
                         code_mode: None,
+                        // Resume does not re-pass the output schema.
+                        output_schema: None,
                     })
                 } else {
                     None
@@ -1986,6 +2004,7 @@ impl BlackboxServer {
                             effort: bf.effort.clone(),
                             provider_defaults: None,
                             code_mode: bf.code_mode,
+output_schema: None,
                         })
                     } else {
                         None
@@ -2039,6 +2058,7 @@ impl BlackboxServer {
                     effort: bf.effort.clone(),
                     provider_defaults: None,
                     code_mode: bf.code_mode,
+output_schema: None,
                 })
             } else {
                 None
@@ -2191,6 +2211,8 @@ impl BlackboxServer {
                         // Resume restores the session's persisted code_mode; the
                         // daemon does not re-pass it (mirrors --model).
                         code_mode: None,
+                        // Resume does not re-pass the output schema.
+                        output_schema: None,
                     })
                 } else {
                     None

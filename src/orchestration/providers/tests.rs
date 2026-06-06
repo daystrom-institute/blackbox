@@ -34,6 +34,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("high".into()),
         provider_defaults: None,
         code_mode: Some(crate::orchestration::brofile::CodeMode::Only),
+        output_schema: Some(r#"{"type":"object"}"#.into()),
     };
     let glm = Provider::Glm.build_exec_args("hello", "sid-1", None, Some(&glm_opts));
     assert_eq!(glm[0], "-p");
@@ -48,6 +49,9 @@ fn harness_exec_and_resume_args_use_stream_json() {
     // code_mode is emitted as `--code-mode <value>` for harness providers.
     assert!(glm.contains(&"--code-mode".to_string()));
     assert!(glm.contains(&"only".to_string()));
+    // output_schema is emitted as `--output-schema <json>` for harness providers.
+    assert!(glm.contains(&"--output-schema".to_string()));
+    assert!(glm.contains(&r#"{"type":"object"}"#.to_string()));
     assert!(
         !glm.contains(&"--mcp-config".to_string()),
         "in-process harness providers get typed MCP config, not CLI JSON"
@@ -58,6 +62,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: None,
         provider_defaults: None,
         code_mode: None,
+        output_schema: None,
     };
     let deepseek = Provider::Deepseek.build_resume_args("sid-2", "continue", Some(&deepseek_opts));
     assert!(deepseek.contains(&"--resume".to_string()));
@@ -77,6 +82,7 @@ fn harness_exec_and_resume_args_use_stream_json() {
         effort: Some("medium".into()),
         provider_defaults: None,
         code_mode: None,
+        output_schema: None,
     };
     let minimax =
         Provider::Minimax.build_exec_args("hello minimax", "sid-3", None, Some(&minimax_opts));

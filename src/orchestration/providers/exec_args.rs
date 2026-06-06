@@ -99,6 +99,10 @@ pub struct ExecOpts {
     /// only). `None` ⇒ no flag emitted, so the harness applies its own
     /// precedence (persisted session value → env → default `optional`).
     pub code_mode: Option<CodeMode>,
+    /// JSON schema for structured output. When set, emitted as
+    /// `--output-schema <json>` to the harness, which registers a synthetic
+    /// `final_result` terminal tool.
+    pub output_schema: Option<String>,
 }
 
 const EMPTY_SYSTEM_PROMPT_OVERRIDE: &str = "";
@@ -218,6 +222,7 @@ impl ProviderExec for Provider {
             .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let code_mode = opts.and_then(|o| o.code_mode);
+        let output_schema = opts.and_then(|o| o.output_schema.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
@@ -255,6 +260,9 @@ impl ProviderExec for Provider {
                 if let Some(cm) = code_mode {
                     args.extend(["--code-mode".into(), cm.as_str().into()]);
                 }
+                if let Some(schema) = output_schema {
+                    args.extend(["--output-schema".into(), schema.into()]);
+                }
                 args
             }
             Provider::Workflow => Vec::new(),
@@ -273,6 +281,7 @@ impl ProviderExec for Provider {
             .or_else(|| harness_default_model(*self));
         let effort = opts.and_then(|o| o.effort.as_deref());
         let code_mode = opts.and_then(|o| o.code_mode);
+        let output_schema = opts.and_then(|o| o.output_schema.as_deref());
         let suppress_provider_defaults = opts
             .and_then(|o| o.provider_defaults)
             .is_some_and(ProviderDefaultsMode::suppresses);
@@ -311,6 +320,9 @@ impl ProviderExec for Provider {
                 // explicitly overrides it on resume.
                 if let Some(cm) = code_mode {
                     args.extend(["--code-mode".into(), cm.as_str().into()]);
+                }
+                if let Some(schema) = output_schema {
+                    args.extend(["--output-schema".into(), schema.into()]);
                 }
                 args
             }

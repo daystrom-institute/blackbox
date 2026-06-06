@@ -488,6 +488,7 @@ fn build_dispatch(
                     effort: bf.effort.clone(),
                     provider_defaults: None,
                     code_mode: bf.code_mode,
+output_schema: None,
                 }
             })
         });

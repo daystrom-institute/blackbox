@@ -253,6 +253,7 @@ impl BlackboxServer {
                 effort: bf.effort.clone(),
                 provider_defaults: None,
                 code_mode: bf.code_mode,
+output_schema: None,
             })
         } else {
             None
@@ -322,6 +323,7 @@ impl BlackboxServer {
                 record_to_bro: None,
                 brofile_context: bf.context,
                 code_mode: atom_code_mode,
+                output_schema: None,
             })?;
         let (task_id, session_id, selected_provider) = {
             let inner = dispatched.task.inner.lock();

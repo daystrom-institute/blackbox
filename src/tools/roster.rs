@@ -819,6 +819,7 @@ Next step: <one concrete steering suggestion>\n",
                 effort: brofile.effort.clone(),
                 provider_defaults: None,
                 code_mode: brofile.code_mode,
+output_schema: None,
             })
         } else {
             None

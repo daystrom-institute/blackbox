@@ -709,12 +709,24 @@ impl BlackboxServer {
                 &self.state.store_dir,
                 bf.context.as_ref(),
             );
-            let opts = if bf.model.is_some() || bf.effort.is_some() || bf.code_mode.is_some() {
+            let agent_output_schema = manifest
+                .outputs
+                .as_ref()
+                .and_then(|o| o.schema.as_ref())
+                .map(|s| s.to_string());
+            let opts = if bf.model.is_some()
+                || bf.effort.is_some()
+                || bf.code_mode.is_some()
+                || agent_output_schema.is_some()
+            {
                 Some(ExecOpts {
                     model: bf.model.clone(),
                     effort: bf.effort.clone(),
                     provider_defaults: None,
                     code_mode: bf.code_mode,
+                    // Deliver the agent's declared output schema so a structured
+                    // -output agent gets the harness `final_result` terminal tool.
+                    output_schema: agent_output_schema,
                 })
             } else {
                 None
@@ -786,6 +798,8 @@ impl BlackboxServer {
                     // Inline brofiles don't carry code_mode in v1 (parallels
                     // the inline-context rejection above).
                     code_mode: None,
+                    // Inline brofiles don't carry an output schema in v1.
+                    output_schema: None,
                 })
             } else {
                 None
@@ -903,9 +917,10 @@ impl BlackboxServer {
             exec_opts.as_ref().and_then(|o| o.model.clone()),
             exec_opts.as_ref().and_then(|o| o.effort.clone()),
         );
-        // Preserve the resolved code-mode across the allocator's exec_opts
-        // rebuild inside dispatch_fresh_bro_task.
+        // Preserve the resolved code-mode + output schema across the allocator's
+        // exec_opts rebuild inside dispatch_fresh_bro_task.
         let agent_code_mode = exec_opts.as_ref().and_then(|o| o.code_mode);
+        let agent_output_schema = exec_opts.as_ref().and_then(|o| o.output_schema.clone());
         let dispatched =
             match self.dispatch_fresh_bro_task(crate::tools::dispatch::FreshDispatchRequest {
                 prompt,
@@ -928,6 +943,7 @@ impl BlackboxServer {
                 record_to_bro: p.bro.clone(),
                 brofile_context,
                 code_mode: agent_code_mode,
+                output_schema: agent_output_schema,
             }) {
                 Ok(result) => result,
                 Err(e) => return Self::err_text(&e),

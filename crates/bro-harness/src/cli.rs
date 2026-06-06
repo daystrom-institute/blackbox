@@ -99,6 +99,14 @@ pub struct Cli {
     #[arg(long = "code-mode")]
     pub code_mode: Option<String>,
 
+    /// JSON schema for structured output. When supplied, a synthetic
+    /// `final_result` tool is registered whose `input_schema` is this schema,
+    /// and the agent is instructed to call it with its final answer. The
+    /// captured arguments become the structured result. Env fallback:
+    /// `BRO_HARNESS_OUTPUT_SCHEMA`.
+    #[arg(long = "output-schema")]
+    pub output_schema: Option<String>,
+
     // --- accepted, no-op (we always stream NDJSON; safety is the denylist) ---
     #[arg(long = "verbose", default_value_t = false)]
     pub verbose: bool,

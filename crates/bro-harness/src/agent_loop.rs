@@ -45,6 +45,56 @@ const DEFAULT_MAX_TURNS: u64 = 50;
 /// transport buffer stays valid (every tool_use gets a matching result).
 const INTERRUPTED_TOOL_RESULT: &str = "[Request interrupted by user]";
 
+/// Name of the synthetic terminal tool for structured output.
+const FINAL_RESULT_TOOL: &str = "final_result";
+
+/// System-prompt instruction appended when structured output is active.
+const STRUCTURED_OUTPUT_INSTRUCTION: &str = "\
+When you have your final answer, call the `final_result` tool with arguments \
+that conform to its input schema. That call ends the session — do not make any \
+further tool calls after it.";
+
+// ---------------------------------------------------------------------------
+// FinalResultTool — synthetic terminal tool for structured output
+// ---------------------------------------------------------------------------
+
+/// A synthetic tool registered when `--output-schema` is provided. Its
+/// `input_schema` is the user-supplied JSON schema. When the model calls it,
+/// the agent loop captures the arguments as the structured result and
+/// terminates the session cleanly.
+struct FinalResultTool {
+    schema: Value,
+}
+
+impl FinalResultTool {
+    fn new(schema: Value) -> Self {
+        Self { schema }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for FinalResultTool {
+    fn name(&self) -> &str {
+        FINAL_RESULT_TOOL
+    }
+
+    fn description(&self) -> &str {
+        "Submit your final structured result. Call this tool when you have completed \
+         the task and have a final answer conforming to the output schema. This ends \
+         the session."
+    }
+
+    fn input_schema(&self) -> Value {
+        self.schema.clone()
+    }
+
+    async fn call(&self, input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+        // The agent loop intercepts `final_result` before normal dispatch,
+        // so this body is a fallback. Return the captured args as JSON.
+        bro_tools::ToolResult::Json(input)
+    }
+}
+
 /// Entry point. Branches one-shot vs. bidirectional on `--input-format`.
 pub async fn run(cli: Cli) -> Result<()> {
     run_with_emitter(cli, None, None).await
@@ -471,6 +521,11 @@ struct Session {
     pending_input_estimate: u64,
     /// Volatile system-tail nudge to surface on the upcoming model call.
     tail_nudge: Option<String>,
+    /// When set, a synthetic `final_result` tool was registered whose
+    /// `input_schema` is this JSON schema. The agent is instructed to call
+    /// `final_result` with its final answer; the turn loop captures the args
+    /// and terminates cleanly.
+    output_schema: Option<Value>,
 }
 
 impl Session {
@@ -660,6 +715,23 @@ impl Session {
         if fleet {
             pin.also_pin(crate::report::REPORT_TOOL);
         }
+
+        // Structured output: when an output schema is supplied, register a
+        // synthetic `final_result` tool whose input_schema IS the output schema,
+        // pinned into the wire surface. The agent loop detects a call to this
+        // tool, captures its arguments as the structured result, and terminates.
+        let output_schema: Option<String> = cli
+            .output_schema
+            .clone()
+            .or_else(|| std::env::var("BRO_HARNESS_OUTPUT_SCHEMA").ok());
+        let output_schema = output_schema
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+        if let Some(ref schema) = output_schema {
+            builtins.push(Arc::new(FinalResultTool::new(schema.clone())));
+            pin.also_pin(FINAL_RESULT_TOOL);
+        }
+
         let reg = Registry::with_options(
             builtins,
             mcp_out_box,
@@ -714,6 +786,7 @@ impl Session {
             last_prompt_tokens: 0,
             pending_input_estimate: 0,
             tail_nudge: None,
+            output_schema,
         })
     }
 
@@ -841,7 +914,7 @@ impl Session {
                 self.prepare_context_for_user_turn();
                 self.push_user_text_raw(prompt);
             }
-            let mut sys = compose_system(self.explicit_system.as_deref(), &self.reg);
+            let mut sys = compose_system(self.explicit_system.as_deref(), &self.reg, self.output_schema.is_some());
             if let Some(t) = self.tail_nudge.take() {
                 let v = sys.volatile.get_or_insert_with(String::new);
                 if !v.is_empty() {
@@ -961,6 +1034,49 @@ impl Session {
             }
             if !has_tool_work {
                 continue;
+            }
+
+            // Structured output interception: when an output schema is active and
+            // the model called `final_result`, capture the first call's arguments as
+            // the structured result, emit a synthetic tool_result back, and terminate
+            // the turn cleanly. The model should only call this once; ignore
+            // subsequent calls if it fires multiple times.
+            if self.output_schema.is_some() {
+                if let Some(fr) = out.tool_calls.iter().find(|tc| tc.name == FINAL_RESULT_TOOL) {
+                    let structured = fr.args.clone();
+                    tracing::info!("final_result captured; terminating turn");
+                    // Emit a tool_result so the transport buffer stays valid
+                    // (every tool_use gets a matching result).
+                    let fr_result = transport::ToolResult {
+                        id: fr.id.clone(),
+                        content: serde_json::to_string(&structured).unwrap_or_default(),
+                        is_error: false,
+                    };
+                    self.emitter.tool_results(&[fr_result]);
+                    // Pad any sibling tool calls that were NOT final_result with
+                    // interrupted markers so the buffer stays balanced.
+                    let mut padding: Vec<transport::ToolResult> = Vec::new();
+                    for tc in &out.tool_calls {
+                        if tc.name != FINAL_RESULT_TOOL {
+                            padding.push(transport::ToolResult {
+                                id: tc.id.clone(),
+                                content: INTERRUPTED_TOOL_RESULT.to_string(),
+                                is_error: true,
+                            });
+                        }
+                    }
+                    if !padding.is_empty() {
+                        self.emitter.tool_results(&padding);
+                    }
+                    // Emit the structured result as the final assistant result.
+                    self.emitter.result(
+                        &serde_json::to_string(&structured).unwrap_or_default(),
+                        &self.total_usage,
+                        self.turns,
+                        None,
+                    );
+                    return Ok(());
+                }
             }
 
             // Dispatch tool calls. Read-only tools (per their annotation) run
@@ -1502,7 +1618,7 @@ fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
 
 /// Compose the effective system prompt as a cache-stable prefix plus a volatile
 /// tail. See the transport `SystemPrompt` docs.
-fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
+fn compose_system(base: Option<&str>, reg: &Registry, has_structured_output: bool) -> SystemPrompt {
     let mut stable = base.unwrap_or("").to_string();
 
     let pinned = reg.pinned();
@@ -1529,6 +1645,10 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
     }
 
     let mut volatile = String::new();
+    if has_structured_output {
+        volatile.push_str(STRUCTURED_OUTPUT_INSTRUCTION);
+        volatile.push('\n');
+    }
     let manifest = reg.manifest();
     if !manifest.is_empty() {
         volatile.push_str(&format!(
@@ -1845,6 +1965,7 @@ mod tests {
         let session = Session {
             tx: Box::new(mock),
             code_mode: crate::code_mode::CodeMode::Optional,
+            output_schema: None,
             reg: Registry::new(
                 vec![
                     Arc::new(SlowTool {
@@ -2107,7 +2228,7 @@ mod tests {
             text: agents.into(),
         });
 
-        let system = compose_system(session.explicit_system.as_deref(), &session.reg);
+        let system = compose_system(session.explicit_system.as_deref(), &session.reg, false);
         assert!(
             !system.stable_text().unwrap_or("").contains(agents),
             "AGENTS text must not stay in system stable"
@@ -2133,7 +2254,7 @@ mod tests {
     fn no_agents_emits_only_environment_context_and_pinned_system() {
         let (mut session, shared) = mk_session(vec![]);
 
-        let system = compose_system(session.explicit_system.as_deref(), &session.reg);
+        let system = compose_system(session.explicit_system.as_deref(), &session.reg, false);
         let stable = system.stable_text().expect("pinned tools stable block");
         assert!(stable.contains("Always-available tools"));
         assert!(!stable.contains("AGENTS_UNIQUE_RULE"));
@@ -2154,7 +2275,7 @@ mod tests {
         session.explicit_system = Some(explicit.into());
         session.user_instructions = None;
 
-        let system = compose_system(session.explicit_system.as_deref(), &session.reg);
+        let system = compose_system(session.explicit_system.as_deref(), &session.reg, false);
         assert!(system.stable_text().unwrap().contains(explicit));
 
         session.push_user_text("hello");

@@ -118,20 +118,16 @@ impl Provider {
     pub fn capabilities(&self) -> std::collections::HashSet<Capability> {
         use Capability::*;
         let v: &[Capability] = match self {
-            // Codex/ChatGPT backend via bro-harness (Responses transport).
-            // Tool use + resume (transcript persistence). Structured output is
-            // not yet implemented in the harness, so it is intentionally
-            // absent (fail-closed per the RX-V capability invariants).
-            Provider::Brodex => &[ToolUse, Resume],
-            Provider::Glm => &[ToolUse, Resume],
-            Provider::Deepseek => &[ToolUse, Resume],
-            Provider::Minimax => &[ToolUse, Resume],
-            // Mistral via bro-harness (chat-completions transport). Native tool
-            // use + resume (harness transcript persistence). Structured output
-            // is not yet implemented in the harness, so it is intentionally
-            // absent (fail-closed per the RX-V capability invariants), matching
-            // the other harness-backed providers.
-            Provider::VibeBh => &[ToolUse, Resume],
+            // All harness-backed providers support structured output via the
+            // forced `final_result` terminal tool (transport-agnostic — works
+            // for every tool-using provider).
+            Provider::Brodex => &[StructuredOutput, ToolUse, Resume],
+            Provider::Glm => &[StructuredOutput, ToolUse, Resume],
+            Provider::Deepseek => &[StructuredOutput, ToolUse, Resume],
+            Provider::Minimax => &[StructuredOutput, ToolUse, Resume],
+            // Mistral via bro-harness (chat-completions transport). Structured
+            // output delivered via the same forced `final_result` terminal tool.
+            Provider::VibeBh => &[StructuredOutput, ToolUse, Resume],
             Provider::Workflow => &[],
         };
         v.iter().copied().collect()

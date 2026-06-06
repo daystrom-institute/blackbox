@@ -343,12 +343,13 @@ mod tests {
     fn runtime_actor_capability_validation_fails_when_no_candidate_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
-        // StructuredOutput is satisfied by no harness provider (intentionally
-        // fail-closed: it is not implemented in the harness transports), so the
-        // requirement is unsatisfiable and validation must reject.
+        // Vision is satisfied by no harness provider, so the requirement is
+        // unsatisfiable and validation must reject. (StructuredOutput is now
+        // satisfiable via the harness `final_result` terminal tool, so it no
+        // longer exercises the rejection path.)
         let compiled = runtime_actor_workflow(
             vec![orchestration::providers::Provider::Deepseek],
-            orchestration::providers::Capability::StructuredOutput,
+            orchestration::providers::Capability::Vision,
         );
 
         let err = validate_workflow_capabilities(&compiled, &state).unwrap_err();
