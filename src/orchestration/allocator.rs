@@ -1914,14 +1914,18 @@ mod tests {
     }
 
     #[test]
-    fn hard_effort_pin_fails_closed_when_provider_has_no_effort_surface() {
+    fn hard_effort_pin_fails_closed_when_effort_unsupported() {
         with_provider_bins(|| {
             let cfg = built_in_config();
+            // Every dispatchable provider now advertises an effort surface, so
+            // fail-closed is exercised by an effort the provider does not list
+            // (the allocator excludes the lane the same way it would an empty
+            // surface — allocator.rs `provider_disallows_effort`).
             let request = RuntimeRequest {
                 tier: Some("standard".into()),
                 pin: Some(RuntimePin {
                     provider: Some(Provider::Deepseek),
-                    effort: Some("high".into()),
+                    effort: Some("nonexistent-effort".into()),
                     authority: PinAuthority::Operator,
                     ..Default::default()
                 }),
@@ -2007,15 +2011,16 @@ mod tests {
                 tier: Some("standard".into()),
                 pool: Some(PoolRef {
                     name: Some("coding".into()),
-                    providers: vec![Provider::Glm, Provider::Glm],
+                    providers: vec![Provider::Glm, Provider::Deepseek],
                 }),
                 ..Default::default()
             };
             let probes = BTreeMap::from([
                 (
-                    lane_key(Provider::Glm, None),
+                    // High-utilization lane → low quota_capacity score (< 0.1).
+                    lane_key(Provider::Deepseek, None),
                     ProbeRecord {
-                        provider: Provider::Glm,
+                        provider: Provider::Deepseek,
                         account: None,
                         credential_status: CredentialStatus::Present,
                         quota_status: QuotaStatus::Known,

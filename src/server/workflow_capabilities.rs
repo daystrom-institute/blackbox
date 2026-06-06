@@ -279,6 +279,7 @@ mod tests {
 
     fn runtime_actor_workflow(
         providers: Vec<orchestration::providers::Provider>,
+        requires: orchestration::providers::Capability,
     ) -> workflow::CompiledWorkflow {
         workflow::compile(workflow::Workflow {
             name: "runtime-capabilities".into(),
@@ -291,7 +292,7 @@ mod tests {
                     team: None,
                     durable: false,
                     compaction_anchor: false,
-                    requires: vec![orchestration::providers::Capability::StructuredOutput],
+                    requires: vec![requires],
                     runtime: Some(orchestration::allocator::RuntimeRequest {
                         pool: Some(orchestration::allocator::PoolRef {
                             name: None,
@@ -324,10 +325,16 @@ mod tests {
     fn runtime_actor_capability_validation_accepts_mixed_pool_with_match() {
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
-        let compiled = runtime_actor_workflow(vec![
-            orchestration::providers::Provider::Deepseek,
-            orchestration::providers::Provider::Brodex,
-        ]);
+        // ToolUse is satisfied by every harness provider, so a mixed pool
+        // validates. (Capability sets are uniform across harness providers
+        // post-codexification; this asserts the satisfiable path.)
+        let compiled = runtime_actor_workflow(
+            vec![
+                orchestration::providers::Provider::Deepseek,
+                orchestration::providers::Provider::Brodex,
+            ],
+            orchestration::providers::Capability::ToolUse,
+        );
 
         validate_workflow_capabilities(&compiled, &state).unwrap();
     }
@@ -336,7 +343,13 @@ mod tests {
     fn runtime_actor_capability_validation_fails_when_no_candidate_matches() {
         let tmp = tempfile::tempdir().unwrap();
         let state = Arc::new(crate::server::state::SharedState::for_test(tmp.path()));
-        let compiled = runtime_actor_workflow(vec![orchestration::providers::Provider::Deepseek]);
+        // StructuredOutput is satisfied by no harness provider (intentionally
+        // fail-closed: it is not implemented in the harness transports), so the
+        // requirement is unsatisfiable and validation must reject.
+        let compiled = runtime_actor_workflow(
+            vec![orchestration::providers::Provider::Deepseek],
+            orchestration::providers::Capability::StructuredOutput,
+        );
 
         let err = validate_workflow_capabilities(&compiled, &state).unwrap_err();
         assert!(

@@ -740,7 +740,13 @@ impl BlackboxServer {
                 .get("provider")
                 .and_then(|v| v.as_str())
                 .unwrap_or("claude");
-            let provider = match prov_str.parse::<orchestration::providers::Provider>() {
+            // Parse via serde (not strum FromStr) so the provider taxonomy's
+            // aliases are honored — notably `claude` → Glm, which is also the
+            // legacy default here. strum's FromStr ignores `#[serde(alias)]`,
+            // so the bare `claude` default would otherwise fail closed.
+            let provider = match serde_json::from_value::<orchestration::providers::Provider>(
+                serde_json::Value::String(prov_str.to_string()),
+            ) {
                 Ok(p) => p,
                 Err(_) => {
                     return Self::err_text(&format!(
@@ -1581,10 +1587,12 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&extract_text(&result)).unwrap();
         assert_eq!(body["brofile_kind"], "ref");
         assert_eq!(body["brofile_name"], "auditor");
-        assert_eq!(body["brofile_provider"], "claude");
+        // The saved brofile is Provider::Glm; serde serializes it lowercase.
+        // (`claude` is only a deserialize alias for Glm, not a serialized form.)
+        assert_eq!(body["brofile_provider"], "glm");
         assert!(body["brofile"].is_object());
         assert_eq!(body["brofile"]["name"], "auditor");
-        assert_eq!(body["brofile"]["provider"], "claude");
+        assert_eq!(body["brofile"]["provider"], "glm");
         let allow = body["merged_filters"]["allow"].as_array().unwrap();
         let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
         assert!(

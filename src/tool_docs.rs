@@ -1953,11 +1953,14 @@ pub fn render_markdown() -> String {
 }
 
 fn hot_summary(summary: &'static str) -> Cow<'static, str> {
-    // Cap at 240 bytes — long enough for one or two informative sentences
-    // per tool, short enough that the rendered tool reference stays
-    // skimmable. Earlier value of 12 truncated mid-word and produced
-    // unreadable lines like "Hybrid BM25+ See MCP." for every entry.
-    const MAX_SUMMARY_BYTES: usize = 240;
+    // Cap at 200 bytes — long enough for one or two informative sentences per
+    // tool, short enough that the rendered tool reference stays skimmable and
+    // within the always-hot global-memory budget (asserted by
+    // `rendered_tool_reference_stays_prompt_sized`). Earlier value of 12
+    // truncated mid-word ("Hybrid BM25+ See MCP."); 240 let the reference creep
+    // over budget as the tool catalog grew. Tighten this knob (not the budget,
+    // per the render-hygiene convention) if the reference grows again.
+    const MAX_SUMMARY_BYTES: usize = 200;
     if summary.len() <= MAX_SUMMARY_BYTES {
         return Cow::Borrowed(summary);
     }

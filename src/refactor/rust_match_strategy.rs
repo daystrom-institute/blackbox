@@ -613,16 +613,19 @@ mod tests {
             replacement.contains("match self"),
             "router missing match: {replacement}"
         );
+        // The fixture enum is the synthetic `Provider { Claude, Codex, Copilot }`
+        // above (test data for the refactor codegen, unrelated to the real
+        // provider taxonomy), so the generated router matches those variants.
         assert!(
-            replacement.contains("Provider::Glm"),
+            replacement.contains("Provider::Claude"),
             "router missing Claude"
         );
         assert!(
-            replacement.contains("Provider::Brodex"),
+            replacement.contains("Provider::Codex"),
             "router missing Codex"
         );
         assert!(
-            replacement.contains("Provider::VibeBh"),
+            replacement.contains("Provider::Copilot"),
             "router missing Copilot"
         );
 
