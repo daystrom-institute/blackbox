@@ -1,4 +1,5 @@
 use bro_tools::ToolCx;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
 
@@ -57,12 +58,22 @@ fn build_text_message(role: FragmentRole, sections: Vec<String>) -> Option<TextM
     })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnContextItem {
     pub cwd: String,
     pub shell: Option<String>,
     pub current_date: Option<String>,
     pub timezone: Option<String>,
+}
+
+impl TurnContextItem {
+    pub fn to_side(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn from_side(value: &Value) -> Option<Self> {
+        serde_json::from_value(value.clone()).ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -223,6 +234,27 @@ mod tests {
         assert!(body.contains("<current_date>2026-06-06</current_date>"));
         assert!(body.contains("<timezone>America/Edmonton</timezone>"));
         assert!(!body.contains("safety_policy"));
+    }
+
+    #[test]
+    fn turn_context_item_round_trips_through_side() {
+        let item = TurnContextItem {
+            cwd: "/repo".into(),
+            shell: Some("/bin/zsh".into()),
+            current_date: Some("2026-06-06".into()),
+            timezone: Some("America/Edmonton".into()),
+        };
+
+        assert_eq!(TurnContextItem::from_side(&item.to_side()), Some(item));
+    }
+
+    #[test]
+    fn turn_context_item_from_side_is_tolerant() {
+        assert_eq!(TurnContextItem::from_side(&Value::Null), None);
+        assert_eq!(
+            TurnContextItem::from_side(&json!({"cwd": 7, "timezone": []})),
+            None
+        );
     }
 
     #[test]

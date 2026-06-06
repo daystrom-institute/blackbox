@@ -593,6 +593,9 @@ impl Session {
         ));
         let lsp_baselines =
             LspBaselines::from_side(prior_side.get("lsp_baselines").unwrap_or(&Value::Null));
+        let restored_reference_context = crate::context::TurnContextItem::from_side(
+            prior_side.get("reference_context").unwrap_or(&Value::Null),
+        );
         if let Some(r) = &store.restored {
             if r.transport != tx.name() {
                 anyhow::bail!(
@@ -629,10 +632,11 @@ impl Session {
             session_env: Arc::new(transport::session_env_snapshot()),
         };
         // Stage 1 has no rollout reconstruction yet. On resume, seed the
-        // context baseline gate so the already-persisted conversation is not
+        // context baseline gate for legacy sessions with no persisted
+        // `reference_context` so the already-persisted conversation is not
         // front-loaded with a second fresh <environment_context>.
-        let reference_context_item = restored_snapshot
-            .then(|| crate::context::EnvironmentContext::from_tool_cx(&cx).to_turn_context_item());
+        let reference_context_item =
+            reference_context_item_for_restore(restored_snapshot, restored_reference_context, &cx);
         // The builtin `report` tool is harness-owned (it emits the cockpit's
         // status signal on the stream) and holds its own emitter handle. It is
         // registered always but only pinned in fleet (bidirectional) mode.
@@ -1225,6 +1229,15 @@ impl Session {
     }
 
     fn persist(&self) -> Result<()> {
+        self.store.save(&SaveState {
+            transport: self.tx.name(),
+            model: &self.base_opts.model,
+            snapshot: self.tx.snapshot(),
+            side: self.side_state(),
+        })
+    }
+
+    fn side_state(&self) -> Value {
         // Flush loop-level cells back into `side`, preserving any slots this
         // build doesn't own.
         let mut side = match self.prior_side.clone() {
@@ -1238,13 +1251,26 @@ impl Session {
             .unwrap_or(Value::Null);
         side["nudges"] = self.hooks.to_side();
         side["lsp_baselines"] = self.lsp_baselines.to_side();
-        self.store.save(&SaveState {
-            transport: self.tx.name(),
-            model: &self.base_opts.model,
-            snapshot: self.tx.snapshot(),
-            side,
-        })
+        side["reference_context"] = self
+            .reference_context_item
+            .as_ref()
+            .map(crate::context::TurnContextItem::to_side)
+            .unwrap_or(Value::Null);
+        side
     }
+}
+
+fn reference_context_item_for_restore(
+    restored_snapshot: bool,
+    restored_reference_context: Option<crate::context::TurnContextItem>,
+    cx: &ToolCx,
+) -> Option<crate::context::TurnContextItem> {
+    if !restored_snapshot {
+        return None;
+    }
+    restored_reference_context.or_else(|| {
+        Some(crate::context::EnvironmentContext::from_tool_cx(cx).to_turn_context_item())
+    })
 }
 
 fn stop_reason_label(stop: Option<&StopReason>) -> Value {
@@ -1808,6 +1834,41 @@ mod tests {
     }
 
     #[test]
+    fn fresh_user_push_writes_reference_context_side_state() {
+        let (mut session, _shared) = mk_session(vec![]);
+        session.push_user_text("hello");
+
+        let side = session.side_state();
+        let persisted =
+            crate::context::TurnContextItem::from_side(&side["reference_context"]).unwrap();
+
+        assert_eq!(
+            Some(&persisted),
+            session.reference_context_item.as_ref(),
+            "{side}"
+        );
+    }
+
+    #[test]
+    fn restored_reference_context_suppresses_emit_and_preserves_persisted_baseline() {
+        let (mut session, shared) = mk_session(vec![]);
+        let persisted = crate::context::TurnContextItem {
+            cwd: "/persisted/baseline".into(),
+            shell: Some("/bin/persisted-shell".into()),
+            current_date: Some("2026-01-02".into()),
+            timezone: Some("America/New_York".into()),
+        };
+        session.reference_context_item =
+            reference_context_item_for_restore(true, Some(persisted.clone()), &session.cx);
+
+        session.push_user_text("resume turn");
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(pushed.as_slice(), &["resume turn".to_string()]);
+        assert_eq!(session.reference_context_item, Some(persisted));
+    }
+
+    #[test]
     fn seeded_reference_context_suppresses_initial_context_emit() {
         let (mut session, shared) = mk_session(vec![]);
         let env = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
@@ -1817,6 +1878,16 @@ mod tests {
 
         let pushed = shared.pushed_users.lock().unwrap();
         assert_eq!(pushed.as_slice(), &["resume turn".to_string()]);
+    }
+
+    #[test]
+    fn legacy_resumed_session_without_reference_context_gets_marker_baseline() {
+        let (session, _shared) = mk_session(vec![]);
+
+        let restored = reference_context_item_for_restore(true, None, &session.cx);
+
+        assert!(restored.is_some());
+        assert_eq!(restored.unwrap().cwd, session.cx.root.to_string_lossy());
     }
 
     fn user_turns_after_initial_context(users: &[String]) -> &[String] {
