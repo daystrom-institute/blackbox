@@ -1007,45 +1007,108 @@ impl Session {
                 continue;
             }
 
-            // Dispatch tool calls, interruptibly. On interrupt mid-dispatch, pad
-            // every not-yet-resolved call with an interrupted marker so the
+            // Dispatch tool calls. Read-only tools (per their annotation) run
+            // CONCURRENTLY; mutating tools run serially after them. Serializing
+            // mutators preserves the edit-sink + interrupt invariants and mirrors
+            // codex's RwLock gate — read = shared/parallel, write = exclusive
+            // (`codex-rs/core/src/tools/parallel.rs`). On interrupt, every
+            // not-yet-resolved call is padded with an interrupted marker so the
             // assistant(tool_use) message keeps a matching tool_result.
-            let mut results: Vec<transport::ToolResult> = Vec::with_capacity(out.tool_calls.len());
+            let call_count = out.tool_calls.len();
+            let mut raw: Vec<Option<(String, bool)>> = (0..call_count).map(|_| None).collect();
             last_tool_results.clear();
             let mut interrupted = false;
-            'dispatch: for tc in &out.tool_calls {
-                tracing::info!(tool = %tc.name, "dispatch");
-                tokio::select! {
-                    biased;
-                    _ = cancel.changed() => { interrupted = true; break 'dispatch; }
-                    res = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx) => {
-                        let (content, is_error) = res.into_content();
-                        // Spill an oversized result to disk and inline a head +
-                        // rider, uniformly across builtin and MCP tools (§2.3).
-                        let content = crate::bound::bound_tool_result(
-                            &tc.name,
-                            content,
-                            self.tool_result_cap,
-                            &self.dump_dir,
-                            &tc.id,
-                        );
-                        let mut result = transport::ToolResult {
-                            id: tc.id.clone(),
-                            content,
-                            is_error,
-                        };
-                        self.append_window0_diagnostics(&mut result.content).await;
-                        for n in self.hooks.on_tool_result(tc, &result) {
-                            match n.delivery {
-                                Delivery::Rider => result.content.push_str(&n.rider_block()),
-                                Delivery::SystemTail => self.tail_nudge = Some(n.message),
+
+            // Phase 1 — concurrent dispatch of read-only tools. They record no
+            // edits and touch no `&mut self` state, so overlapping them is safe
+            // and cuts latency on batches of reads (file_read/glob/search/…).
+            {
+                let read_idx: Vec<usize> = (0..call_count)
+                    .filter(|&i| self.reg.read_only(&out.tool_calls[i].name))
+                    .collect();
+                if !read_idx.is_empty() {
+                    tracing::info!(
+                        parallel = read_idx.len(),
+                        "dispatch (read-only, concurrent)"
+                    );
+                    let reg = &self.reg;
+                    let cx = &self.cx;
+                    let calls = &out.tool_calls;
+                    let futs = read_idx.into_iter().map(|i| {
+                        let tc = &calls[i];
+                        async move { (i, reg.dispatch(&tc.name, tc.args.clone(), cx).await) }
+                    });
+                    tokio::select! {
+                        biased;
+                        _ = cancel.changed() => { interrupted = true; }
+                        done = futures_util::future::join_all(futs) => {
+                            for (i, res) in done {
+                                raw[i] = Some(res.into_content());
                             }
                         }
-                        last_tool_results.push(tool_result_trace(tc, &result));
-                        results.push(result);
                     }
                 }
             }
+
+            // Phase 2 — serial dispatch of every still-unresolved (mutating)
+            // call, interruptible between calls.
+            if !interrupted {
+                for (i, tc) in out.tool_calls.iter().enumerate() {
+                    if raw[i].is_some() {
+                        continue;
+                    }
+                    tracing::info!(tool = %tc.name, "dispatch");
+                    tokio::select! {
+                        biased;
+                        _ = cancel.changed() => { interrupted = true; break; }
+                        res = self.reg.dispatch(&tc.name, tc.args.clone(), &self.cx) => {
+                            raw[i] = Some(res.into_content());
+                        }
+                    }
+                }
+            }
+
+            // Assemble results in tool-call order: bound oversized output, run
+            // result hooks. Diagnostics are deferred to the single batch-boundary
+            // pass below — the per-edit window-0 drain could not attribute edits
+            // under concurrent dispatch or V8 code-mode cells.
+            let mut results: Vec<transport::ToolResult> = Vec::with_capacity(call_count);
+            for (i, tc) in out.tool_calls.iter().enumerate() {
+                let Some((content, is_error)) = raw[i].take() else {
+                    continue;
+                };
+                // Spill an oversized result to disk and inline a head + rider,
+                // uniformly across builtin and MCP tools (§2.3).
+                let content = crate::bound::bound_tool_result(
+                    &tc.name,
+                    content,
+                    self.tool_result_cap,
+                    &self.dump_dir,
+                    &tc.id,
+                );
+                let mut result = transport::ToolResult {
+                    id: tc.id.clone(),
+                    content,
+                    is_error,
+                };
+                for n in self.hooks.on_tool_result(tc, &result) {
+                    match n.delivery {
+                        Delivery::Rider => result.content.push_str(&n.rider_block()),
+                        Delivery::SystemTail => self.tail_nudge = Some(n.message),
+                    }
+                }
+                last_tool_results.push(tool_result_trace(tc, &result));
+                results.push(result);
+            }
+
+            // Batch-boundary diagnostics: one analyzer pass over every edit this
+            // dispatch round produced, attached to the last result so it rides
+            // back with the batch. Replaces the per-tool window-0 drain (which
+            // could not attribute edits under concurrent dispatch / V8 cells).
+            if let Some(last) = results.last_mut() {
+                self.append_edit_diagnostics(&mut last.content).await;
+            }
+
             if interrupted {
                 let have: HashSet<String> = results.iter().map(|r| r.id.clone()).collect();
                 for tc in &out.tool_calls {
@@ -1063,12 +1126,6 @@ impl Session {
                         }));
                     }
                 }
-                self.emitter.tool_results(&results);
-                self.pending_input_estimate = self
-                    .pending_input_estimate
-                    .saturating_add(est_tool_results(&results));
-                self.tx.push_tool_results(results);
-                break "interrupted_dispatch";
             }
 
             self.emitter.tool_results(&results);
@@ -1076,6 +1133,9 @@ impl Session {
                 .pending_input_estimate
                 .saturating_add(est_tool_results(&results));
             self.tx.push_tool_results(results);
+            if interrupted {
+                break "interrupted_dispatch";
+            }
             self.drain_mid_turn_user_inputs(&mid_turn_user_inputs);
             self.hooks.tick();
         };
@@ -1268,12 +1328,15 @@ impl Session {
         (!events.is_empty()).then(|| events.join("\n\n"))
     }
 
-    /// Window-0 diagnostics seam: drain the per-dispatch edit sink, run the
-    /// analyzer against the edited files, and append a diagnostics rider to the
-    /// tool result `content` — synchronously, before control returns to the
-    /// model. A no-op when no edits were recorded. A diagnostics failure is
-    /// logged and swallowed: it must never break the dispatch loop.
-    async fn append_window0_diagnostics(&mut self, content: &mut String) {
+    /// Batch-boundary diagnostics seam: drain the edit sink accumulated over the
+    /// whole dispatch round, run the analyzer against the edited files, and
+    /// append a diagnostics rider to `content` — synchronously, before control
+    /// returns to the model. Invoked once per dispatch batch (not per tool), so
+    /// it attributes correctly under concurrent dispatch and V8 code-mode cells,
+    /// where a single drain may span many edits. A no-op when no edits were
+    /// recorded. A diagnostics failure is logged and swallowed: it must never
+    /// break the dispatch loop.
+    async fn append_edit_diagnostics(&mut self, content: &mut String) {
         let edits = self
             .cx
             .edits
@@ -1708,6 +1771,9 @@ mod tests {
         TextWithEndTurn(String, Option<bool>),
         /// Wait on the shared gate, then request a tool call.
         ToolCallAfterGate,
+        /// Request two read-only `concurrent_probe` calls in one batch (to prove
+        /// they dispatch concurrently).
+        TwoReadProbes,
         /// Await a gate that tests never release — to be cancelled by interrupt.
         Block,
     }
@@ -1721,6 +1787,9 @@ mod tests {
         model_gate: Arc<Notify>,
         tool_started: Arc<AtomicUsize>,
         tool_gate: Arc<Notify>,
+        /// Count of read-only probe calls that rendezvoused at the shared
+        /// barrier — only reaches 2 if the batch ran concurrently (phase 1).
+        rendezvous: Arc<AtomicUsize>,
     }
 
     struct MockTransport {
@@ -1770,6 +1839,28 @@ mod tests {
                             name: "slow_tool".into(),
                             args: json!({}),
                         }],
+                        stop: StopReason::ToolCalls,
+                        end_turn: None,
+                        usage: Usage::default(),
+                    })
+                }
+                MockTurn::TwoReadProbes => {
+                    self.shared.completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(transport::TurnOutput {
+                        text: String::new(),
+                        thinking: String::new(),
+                        tool_calls: vec![
+                            transport::ToolCall {
+                                id: "probe-1".into(),
+                                name: "concurrent_probe".into(),
+                                args: json!({}),
+                            },
+                            transport::ToolCall {
+                                id: "probe-2".into(),
+                                name: "concurrent_probe".into(),
+                                args: json!({}),
+                            },
+                        ],
                         stop: StopReason::ToolCalls,
                         end_turn: None,
                         usage: Usage::default(),
@@ -1840,6 +1931,48 @@ mod tests {
         }
     }
 
+    /// Read-only probe that rendezvouses at a shared 2-party barrier. Two of
+    /// these in one batch can only both pass the barrier if they are dispatched
+    /// concurrently; under serial dispatch the first waits alone until it times
+    /// out, so `rendezvous` never reaches 2.
+    struct ConcurrentProbe {
+        shared: MockShared,
+        barrier: Arc<tokio::sync::Barrier>,
+    }
+
+    #[async_trait]
+    impl bro_tools::Tool for ConcurrentProbe {
+        fn name(&self) -> &str {
+            "concurrent_probe"
+        }
+
+        fn description(&self) -> &str {
+            "test-only read-only concurrency probe"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type":"object"})
+        }
+
+        async fn call(&self, _input: Value, _cx: &ToolCx) -> bro_tools::ToolResult {
+            let rendezvoused =
+                tokio::time::timeout(std::time::Duration::from_secs(2), self.barrier.wait())
+                    .await
+                    .is_ok();
+            if rendezvoused {
+                self.shared.rendezvous.fetch_add(1, Ordering::SeqCst);
+            }
+            bro_tools::ToolResult::Text(if rendezvoused { "rendezvous" } else { "alone" }.into())
+        }
+
+        fn annotations(&self) -> bro_tools::ToolAnnotations {
+            bro_tools::ToolAnnotations {
+                read_only: true,
+                destructive: false,
+            }
+        }
+    }
+
     fn mk_session(scripts: Vec<MockTurn>) -> (Session, MockShared) {
         let shared = MockShared::default();
         let mock = MockTransport {
@@ -1865,9 +1998,15 @@ mod tests {
         let session = Session {
             tx: Box::new(mock),
             reg: Registry::new(
-                vec![Arc::new(SlowTool {
-                    shared: shared.clone(),
-                })],
+                vec![
+                    Arc::new(SlowTool {
+                        shared: shared.clone(),
+                    }),
+                    Arc::new(ConcurrentProbe {
+                        shared: shared.clone(),
+                        barrier: Arc::new(tokio::sync::Barrier::new(2)),
+                    }),
+                ],
                 vec![],
                 &PinPolicy::from_env(),
                 &mcp::ToolFilter::default(),
@@ -1918,6 +2057,24 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn read_only_tools_in_a_batch_dispatch_concurrently() {
+        // The model emits two read-only `concurrent_probe` calls in one batch.
+        // Each rendezvouses at a shared 2-party barrier; both can only pass if
+        // they run concurrently (phase 1). Serial dispatch would leave the first
+        // probe waiting alone until its timeout, so `rendezvous` would stay < 2.
+        let (mut session, shared) =
+            mk_session(vec![MockTurn::TwoReadProbes, MockTurn::Text("done".into())]);
+
+        run_user_turn(&mut session, "go").await;
+
+        assert_eq!(
+            shared.rendezvous.load(Ordering::SeqCst),
+            2,
+            "both read-only probes must have run concurrently"
+        );
     }
 
     #[test]
@@ -2607,7 +2764,7 @@ mod tests {
             ));
 
         let mut content = "{\"ok\":true}".to_string();
-        session.append_window0_diagnostics(&mut content).await;
+        session.append_edit_diagnostics(&mut content).await;
 
         assert!(
             content.contains("diagnostics:"),
@@ -2631,7 +2788,7 @@ mod tests {
     async fn window0_diagnostics_noop_without_edits() {
         let (mut session, _shared) = mk_session(vec![]);
         let mut content = "{\"ok\":true}".to_string();
-        session.append_window0_diagnostics(&mut content).await;
+        session.append_edit_diagnostics(&mut content).await;
         assert_eq!(content, "{\"ok\":true}", "no edits -> no rider appended");
     }
 }

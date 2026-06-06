@@ -227,6 +227,19 @@ impl Registry {
             None => ToolResult::Error(format!("unknown tool: {name}")),
         }
     }
+
+    /// Whether `name` is safe to dispatch concurrently with other tools — i.e.
+    /// the tool declares itself `read_only` and so records no edits and touches
+    /// no shared mutable workspace state. Unknown tools and tools that leave the
+    /// default annotation (`read_only: false`) are treated as **mutating** and
+    /// must be serialized. This is the conservative default for MCP tools, whose
+    /// effects the harness cannot inspect, and for any builtin that writes.
+    pub fn read_only(&self, name: &str) -> bool {
+        self.tools
+            .get(name)
+            .map(|e| e.tool.annotations().read_only)
+            .unwrap_or(false)
+    }
 }
 
 fn short_desc(d: &str) -> String {
