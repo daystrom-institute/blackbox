@@ -311,10 +311,19 @@ impl AgentHandle {
     /// `control_request{interrupt}` — cancel the running turn (§1.1, `Esc`) via
     /// `/control/interrupt`.
     pub async fn interrupt(&self) -> anyhow::Result<()> {
+        self.interrupt_redirect(None).await
+    }
+
+    /// Interrupt the running turn and, when `redirect` is `Some`, deliver it as
+    /// the immediate next turn (halt-and-redirect): the harness cancels the
+    /// model call, then `pending.push_front`s the redirect so it runs right away
+    /// — distinct from [`send_user_turn`], which interleaves at the next natural
+    /// boundary without cancelling.
+    pub async fn interrupt_redirect(&self, redirect: Option<&str>) -> anyhow::Result<()> {
         let Some(daemon) = &self.daemon else {
             anyhow::bail!("agent has no live daemon session — nothing to interrupt");
         };
-        daemon.interrupt(None).await
+        daemon.interrupt(redirect).await
     }
 
     /// `control_request{set_model}` — switch the model for subsequent turns. The

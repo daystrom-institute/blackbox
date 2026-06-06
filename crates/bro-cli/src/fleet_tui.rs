@@ -34,7 +34,6 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -402,6 +401,17 @@ struct App {
     /// Agent ids (pre-resume) with a resume in flight — guards against firing a
     /// second resume of the same session before the first lands.
     resuming: HashSet<String>,
+    /// Cloned into each off-thread steer/interrupt; the worker reports the
+    /// control-write result here so `/control/steer|interrupt` never blocks draw.
+    ctrl_tx: mpsc::Sender<CtrlOutcome>,
+    /// Drained each tick: applies steer/interrupt results (and the steer-failure
+    /// resume fallback) on the render thread.
+    ctrl_rx: mpsc::Receiver<CtrlOutcome>,
+    /// Cloned into the off-thread standalone (`bro agent`) start/resume; the
+    /// worker reports the single live agent back here.
+    standalone_tx: mpsc::Sender<StandaloneOutcome>,
+    /// Drained each tick: installs the single standalone agent.
+    standalone_rx: mpsc::Receiver<StandaloneOutcome>,
     /// Local clocks for the focused executor/classifier activity strip.
     activity_clocks: HashMap<String, ActivityClock>,
     activity_frame: usize,
@@ -431,6 +441,8 @@ impl App {
         let (classifier_tx, classifier_rx) = mpsc::channel();
         let (dispatch_tx, dispatch_rx) = mpsc::channel();
         let (resume_tx, resume_rx) = mpsc::channel();
+        let (ctrl_tx, ctrl_rx) = mpsc::channel();
+        let (standalone_tx, standalone_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
         let provider_cursor = default_fleet_provider_cursor();
         let model_cursor = default_provider
@@ -487,6 +499,10 @@ impl App {
             resume_tx,
             resume_rx,
             resuming: HashSet::new(),
+            ctrl_tx,
+            ctrl_rx,
+            standalone_tx,
+            standalone_rx,
             activity_clocks: HashMap::new(),
             activity_frame: 0,
         }
@@ -640,6 +656,40 @@ struct ResumeOutcome {
     agent_id: String,
     task: AgentHandle,
     classifier_cfg: Option<ClassifierConfig>,
+}
+
+/// Result of an off-thread steer/interrupt control write, applied on the render
+/// thread in [`install_ctrl`] (agent located by `agent_id`, since the roster may
+/// have moved). Keeps the two steering modes distinct: `Steer` interleaves at
+/// the next natural boundary; `Interrupt` cancels now and optionally redirects.
+enum CtrlOutcome {
+    /// `send_user_turn` (interleave). On a dead/not-running session the carried
+    /// `text` is re-delivered via resume rather than lost.
+    Steer {
+        agent_id: String,
+        text: String,
+        result: Result<(), String>,
+    },
+    /// `interrupt` — cancels the running turn; `redirect` (when `Some`) runs as
+    /// the immediate next turn once the cancel repairs alternation.
+    Interrupt {
+        agent_id: String,
+        redirect: Option<String>,
+        result: Result<(), String>,
+    },
+}
+
+/// Result of an off-thread standalone (`bro agent`) start/resume — the single
+/// live agent, installed by [`install_standalone`] on the render thread.
+struct StandaloneOutcome {
+    task: AgentHandle,
+    provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+    cwd: Option<String>,
+    name: String,
+    prompt: String,
+    is_resume: bool,
 }
 
 fn dispatch_current_input_for_mode(app: &mut App, mode: DispatchMode) {
@@ -834,55 +884,79 @@ fn dispatch_standalone_prompt(app: &mut App, prompt: String, name: String) {
     let pending_resume = app.mode.pending_resume().map(str::to_string);
     forget_standalone_agents(app, true);
 
-    let task = if let Some(session_id) = pending_resume.clone() {
-        let mut spec = ResumeSpec::new(app.next_provider, session_id, prompt.clone());
-        spec.cwd = cwd.clone();
-        spec.model = app.next_model.clone();
-        spec.effort = app.next_effort.clone();
-        spec.name = Some(name.clone());
-        app.orch.resume(spec)
-    } else {
-        let mut spec = DispatchSpec::new(app.next_provider, prompt.clone());
-        spec.cwd = cwd.clone();
-        spec.model = app.next_model.clone();
-        spec.effort = app.next_effort.clone();
-        spec.name = Some(name.clone());
-        app.orch.dispatch(spec)
-    };
-    let id = task.id();
+    let provider = app.next_provider;
+    let model = app.next_model.clone();
+    let effort = app.next_effort.clone();
+    let orch = app.orch.clone();
+    let tx = app.standalone_tx.clone();
+    let is_resume = pending_resume.is_some();
 
+    // The single agent appears in the SingleAgent view; clear the prior one and
+    // run start/resume off-thread so the launch (and any /resume) never blocks.
     app.mode.set_pending_resume(None);
     app.agents.clear();
+    app.focused_agent_id = None;
+    app.zone = Zone::SingleAgent;
+    app.clear_input();
+    app.history_cursor = None;
+    app.scroll_from_bottom = 0;
+    app.set_status(
+        if is_resume { "resuming…" } else { "starting…" },
+        Duration::from_secs(4),
+    );
+    app.rt.spawn(async move {
+        let task = if let Some(session_id) = pending_resume {
+            let mut spec = ResumeSpec::new(provider, session_id, prompt.clone());
+            spec.cwd = cwd.clone();
+            spec.model = model.clone();
+            spec.effort = effort.clone();
+            spec.name = Some(name.clone());
+            orch.resume(spec)
+        } else {
+            let mut spec = DispatchSpec::new(provider, prompt.clone());
+            spec.cwd = cwd.clone();
+            spec.model = model.clone();
+            spec.effort = effort.clone();
+            spec.name = Some(name.clone());
+            orch.dispatch(spec)
+        };
+        let _ = tx.send(StandaloneOutcome {
+            task,
+            provider,
+            model,
+            effort,
+            cwd,
+            name,
+            prompt,
+            is_resume,
+        });
+    });
+}
+
+/// UI-thread half: install the single standalone agent once its off-thread
+/// start/resume lands.
+fn install_standalone(app: &mut App, o: StandaloneOutcome) {
+    let id = o.task.id();
+    app.agents.clear();
     app.agents.push(Agent {
-        task,
+        task: o.task,
         classifier: None,
-        provider: app.next_provider,
-        selected_model: app.next_model.clone(),
-        selected_effort: app.next_effort.clone(),
-        selected_cwd: cwd.clone(),
-        name,
-        input_history: vec![prompt.clone()],
-        initial_prompt: pending_resume.is_none().then(|| prompt.clone()),
+        provider: o.provider,
+        selected_model: o.model,
+        selected_effort: o.effort,
+        selected_cwd: o.cwd,
+        name: o.name,
+        input_history: vec![o.prompt.clone()],
+        initial_prompt: (!o.is_resume).then(|| o.prompt.clone()),
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
     app.focused_agent_id = Some(id.clone());
     app.zone = Zone::SingleAgent;
-    app.clear_input();
-    app.history_cursor = None;
-    app.scroll_from_bottom = 0;
     app.orch.persist();
-    let verb = if pending_resume.is_some() {
-        "resumed"
-    } else {
-        "started"
-    };
+    let verb = if o.is_resume { "resumed" } else { "started" };
     app.set_status(
-        format!(
-            "{verb} {} agent {}",
-            app.next_provider,
-            &id[..8.min(id.len())]
-        ),
+        format!("{verb} {} agent {}", o.provider, &id[..8.min(id.len())]),
         Duration::from_secs(3),
     );
 }
@@ -1609,6 +1683,22 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
             }
             for outcome in resumed {
                 install_resume(app, outcome);
+            }
+            // Apply steer/interrupt results that landed this tick.
+            let mut ctrls = Vec::new();
+            while let Ok(outcome) = app.ctrl_rx.try_recv() {
+                ctrls.push(outcome);
+            }
+            for outcome in ctrls {
+                install_ctrl(app, outcome);
+            }
+            // Install the standalone (`bro agent`) agent once its start landed.
+            let mut standalones = Vec::new();
+            while let Ok(outcome) = app.standalone_rx.try_recv() {
+                standalones.push(outcome);
+            }
+            for outcome in standalones {
+                install_standalone(app, outcome);
             }
             app.maybe_clear_status();
             app.activity_frame = app.activity_frame.wrapping_add(1);
@@ -2380,6 +2470,11 @@ fn select_effort(app: &mut App, arg: &str) {
 /// Send the composer text into the focused agent. A live session takes it as a
 /// user-turn; a non-live but resumable one (Interrupted / reloaded) auto-resumes
 /// (§5); a one-shot provider can't be steered.
+/// `Enter` in the single-agent view — the **interleave** steer: deliver the
+/// composer text as a user turn that the harness consumes at the next natural
+/// boundary (tool-call/thinking break) without cancelling the running turn. The
+/// `/control/steer` write runs off-thread; the result (and the dead-session
+/// resume fallback) is applied in `install_ctrl`.
 fn steer_selected(app: &mut App) {
     let Some(idx) = app.selected_agent() else {
         return;
@@ -2388,40 +2483,26 @@ fn steer_selected(app: &mut App) {
     let handle = app.agents[idx].task.clone();
 
     if handle.can_steer() {
+        // Reconcile any already-echoed queued turns before appending a new one.
         let transcript = app.agents[idx].task.transcript();
         let _ = queued_user_turns(&mut app.agents[idx], &transcript);
         let text = std::mem::take(&mut app.input);
         app.cursor_pos = 0;
         app.history_cursor = None;
-        match run_agent_write(app, handle.send_user_turn(&text)) {
-            Ok(()) => {
-                app.agents[idx].input_history.push(text.clone());
-                app.agents[idx].pending_inputs.push_back(text);
-                app.set_status("steer queued to stdin", Duration::from_secs(2));
-            }
-            Err(e) => {
-                app.set_input(text);
-                // A broken pipe (local stdin closed) or the daemon's
-                // not-running rejection both mean the live session is gone —
-                // the turn completed between `can_steer()` and this write
-                // (the race `can_steer`'s status gate cannot fully close).
-                // For a bidi provider that means resume, not a dead-end error.
-                if is_broken_pipe_error(&e) || is_session_not_live_error(&e) {
-                    app.agents[idx].task = handle.without_stdin();
-                    if provider_supports_bidi(provider) {
-                        app.set_status("session not live; resuming", Duration::from_secs(2));
-                        resume_selected(app, idx);
-                    } else {
-                        app.set_status(
-                            "session is no longer steerable",
-                            Duration::from_secs(4),
-                        );
-                    }
-                } else {
-                    app.set_status(format!("steer: {e:#}"), Duration::from_secs(4));
-                }
-            }
-        }
+        let agent_id = handle.id();
+        let tx = app.ctrl_tx.clone();
+        app.set_status("steering…", Duration::from_secs(2));
+        app.rt.spawn(async move {
+            let result = handle
+                .send_user_turn(&text)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            let _ = tx.send(CtrlOutcome::Steer {
+                agent_id,
+                text,
+                result,
+            });
+        });
     } else if provider_supports_bidi(provider) {
         resume_selected(app, idx);
     } else {
@@ -2435,8 +2516,19 @@ fn steer_selected(app: &mut App) {
 /// Resume a non-live bidi session with the composer text as its next turn (§5):
 /// relaunch `--resume <session_id> -p <text>` and swap in the live handle.
 fn resume_selected(app: &mut App, idx: usize) {
+    let text = std::mem::take(&mut app.input);
+    app.cursor_pos = 0;
+    app.history_cursor = None;
+    resume_agent(app, idx, text);
+}
+
+/// Resume core with an explicit next-turn `text` — reused by the steer-failure
+/// fallback (the live session died between `can_steer()` and the write), which
+/// already holds the text the steer would have delivered.
+fn resume_agent(app: &mut App, idx: usize, text: String) {
     let snap = app.agents[idx].task.snapshot();
     if snap.session_id.is_empty() || snap.session_id == "pending" {
+        app.set_input(text); // restore so the operator doesn't lose the turn
         app.set_status("no session id — can't resume", Duration::from_secs(4));
         return;
     }
@@ -2444,12 +2536,10 @@ fn resume_selected(app: &mut App, idx: usize) {
     if app.resuming.contains(&old_id) {
         // A resume for this agent is already in flight; don't fire a second
         // (and don't swallow the composer text — let the operator retry).
+        app.set_input(text);
         app.set_status("resume already in progress", Duration::from_secs(2));
         return;
     }
-    let text = std::mem::take(&mut app.input);
-    app.cursor_pos = 0;
-    app.history_cursor = None;
 
     // Capture everything the worker needs before any mutable borrow of app.
     let provider = app.agents[idx].provider;
@@ -2527,60 +2617,176 @@ fn install_resume(app: &mut App, outcome: ResumeOutcome) {
     app.set_status("resumed session", Duration::from_secs(3));
 }
 
-/// `Esc` in the single-agent view: interrupt the running turn (§1.1). If a
-/// steer is queued it dequeues at the harness; interrupt-and-redirect.
+/// `Esc` in the single-agent view — the **halt** steer. With composer text it is
+/// interrupt-and-redirect: cancel the running model call now and deliver the
+/// text as the immediate next turn (`/control/interrupt` carrying the prompt,
+/// which the harness `pending.push_front`s after the cancel). With an empty
+/// composer it just cancels. Runs off-thread; result applied in `install_ctrl`.
 fn interrupt_selected(app: &mut App) {
     let Some(idx) = app.selected_agent() else {
         return;
     };
+    let provider = app.agents[idx].provider;
     let handle = app.agents[idx].task.clone();
+    let redirect = if app.input.trim().is_empty() {
+        None
+    } else {
+        let text = std::mem::take(&mut app.input);
+        app.cursor_pos = 0;
+        app.history_cursor = None;
+        Some(text)
+    };
+
     if !handle.can_steer() {
+        // No running turn to cancel. A typed turn meaning "halt and send now"
+        // shouldn't be lost — resume to deliver it (bidi only).
+        match redirect {
+            Some(text) if provider_supports_bidi(provider) => resume_agent(app, idx, text),
+            Some(text) => {
+                app.set_input(text);
+                app.set_status("nothing running to interrupt", Duration::from_secs(3));
+            }
+            None => app.set_status("nothing running to interrupt", Duration::from_secs(2)),
+        }
         return;
     }
-    match run_agent_write(app, handle.interrupt()) {
-        Ok(()) => app.set_status("interrupt sent", Duration::from_secs(2)),
-        Err(e) => {
-            if is_broken_pipe_error(&e) {
-                app.agents[idx].task = handle.without_stdin();
-                app.set_status(
-                    "stdin closed; session will resume on next steer",
-                    Duration::from_secs(4),
-                );
-            } else {
-                app.set_status(format!("interrupt: {e:#}"), Duration::from_secs(4));
+
+    let agent_id = handle.id();
+    let tx = app.ctrl_tx.clone();
+    let redirect_arg = redirect.clone();
+    app.set_status(
+        if redirect.is_some() {
+            "interrupting + redirecting…"
+        } else {
+            "interrupting…"
+        },
+        Duration::from_secs(2),
+    );
+    app.rt.spawn(async move {
+        let result = handle
+            .interrupt_redirect(redirect_arg.as_deref())
+            .await
+            .map_err(|e| format!("{e:#}"));
+        let _ = tx.send(CtrlOutcome::Interrupt {
+            agent_id,
+            redirect,
+            result,
+        });
+    });
+}
+
+/// Apply an off-thread steer/interrupt result on the render thread, located by
+/// `agent_id` (the roster may have moved). Keeps the two modes' post-conditions:
+/// a steer becomes a queued-to-stdin turn; an interrupt cancels (and its
+/// redirect, on success, is already running as the next turn at the harness).
+fn install_ctrl(app: &mut App, outcome: CtrlOutcome) {
+    match outcome {
+        CtrlOutcome::Steer {
+            agent_id,
+            text,
+            result,
+        } => {
+            let Some(idx) = app.agents.iter().position(|a| a.task.id() == agent_id) else {
+                return;
+            };
+            match result {
+                Ok(()) => {
+                    app.agents[idx].input_history.push(text.clone());
+                    app.agents[idx].pending_inputs.push_back(text);
+                    app.set_status(
+                        "steer queued — interleaves at next boundary",
+                        Duration::from_secs(2),
+                    );
+                }
+                Err(e) => {
+                    // The live session died between can_steer() and the write
+                    // (turn finished, or stdin closed) — for a bidi provider
+                    // that means resume, delivering the carried turn.
+                    let provider = app.agents[idx].provider;
+                    if err_is_broken_pipe(&e) || err_is_not_running(&e) {
+                        app.agents[idx].task = app.agents[idx].task.without_stdin();
+                        if provider_supports_bidi(provider) {
+                            app.set_status("session not live; resuming", Duration::from_secs(2));
+                            resume_agent(app, idx, text);
+                        } else {
+                            app.set_input(text);
+                            app.set_status(
+                                "session is no longer steerable",
+                                Duration::from_secs(4),
+                            );
+                        }
+                    } else {
+                        app.set_input(text);
+                        app.set_status(format!("steer: {e}"), Duration::from_secs(4));
+                    }
+                }
+            }
+        }
+        CtrlOutcome::Interrupt {
+            agent_id,
+            redirect,
+            result,
+        } => {
+            let Some(idx) = app.agents.iter().position(|a| a.task.id() == agent_id) else {
+                return;
+            };
+            match result {
+                Ok(()) => match redirect {
+                    Some(text) => {
+                        app.agents[idx].input_history.push(text);
+                        app.set_status("interrupted — your turn runs now", Duration::from_secs(3));
+                    }
+                    None => app.set_status("interrupt sent", Duration::from_secs(2)),
+                },
+                Err(e) => {
+                    let provider = app.agents[idx].provider;
+                    if err_is_not_running(&e) {
+                        // The turn ended before the interrupt landed; deliver any
+                        // redirect via resume so the turn isn't dropped.
+                        app.agents[idx].task = app.agents[idx].task.without_stdin();
+                        match redirect {
+                            Some(text) if provider_supports_bidi(provider) => {
+                                app.set_status(
+                                    "turn already ended; resuming with your turn",
+                                    Duration::from_secs(2),
+                                );
+                                resume_agent(app, idx, text);
+                            }
+                            Some(text) => {
+                                app.set_input(text);
+                                app.set_status("turn already ended", Duration::from_secs(3));
+                            }
+                            None => app.set_status("turn already ended", Duration::from_secs(2)),
+                        }
+                    } else if err_is_broken_pipe(&e) {
+                        app.agents[idx].task = app.agents[idx].task.without_stdin();
+                        app.set_status(
+                            "stdin closed; session will resume on next steer",
+                            Duration::from_secs(4),
+                        );
+                    } else {
+                        if let Some(text) = redirect {
+                            app.set_input(text);
+                        }
+                        app.set_status(format!("interrupt: {e}"), Duration::from_secs(4));
+                    }
+                }
             }
         }
     }
 }
 
-fn is_broken_pipe_error(e: &anyhow::Error) -> bool {
-    e.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io| io.kind() == io::ErrorKind::BrokenPipe)
-            || {
-                let text = cause.to_string();
-                text.contains("Broken pipe") || text.contains("os error 32")
-            }
-    })
+/// A broken-pipe class error from a control write (local stdin gone).
+fn err_is_broken_pipe(e: &str) -> bool {
+    e.contains("Broken pipe") || e.contains("os error 32")
 }
 
-/// The daemon's `/control/steer` (and `/control/interrupt`) reject any task
-/// whose status is not `Running` with "task … is {Status}, not running"
-/// (`bro_steer`/`bro_interrupt` in `src/tools/dispatch.rs`). A finished bidi
-/// agent must be resumed rather than steered, so we treat this rejection like a
-/// broken pipe: it trips `steer_selected`'s resume fallback instead of dead-
-/// ending with the input stuck in the composer.
-fn is_session_not_live_error(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|cause| cause.to_string().contains("not running"))
-}
-
-fn run_agent_write<F>(app: &App, fut: F) -> anyhow::Result<()>
-where
-    F: Future<Output = anyhow::Result<()>>,
-{
-    tokio::task::block_in_place(|| app.rt.block_on(fut))
+/// The daemon's `/control/steer|interrupt` reject any task whose status is not
+/// `Running` with "task … is {Status}, not running" (`bro_steer`/`bro_interrupt`).
+/// A finished bidi agent must be resumed, so this rejection trips the resume
+/// fallback instead of dead-ending with the turn lost.
+fn err_is_not_running(e: &str) -> bool {
+    e.contains("not running")
 }
 
 fn zoom_left(app: &mut App) {
@@ -5729,15 +5935,17 @@ mod tests {
     }
 
     #[test]
-    fn broken_pipe_error_is_detected() {
-        let io_err = anyhow::Error::new(io::Error::from(io::ErrorKind::BrokenPipe));
-        assert!(is_broken_pipe_error(&io_err));
+    fn control_write_error_classes_are_detected() {
+        // Broken-pipe class: local stdin gone.
+        assert!(err_is_broken_pipe("steer: Broken pipe (os error 32)"));
+        assert!(err_is_broken_pipe("write failed: os error 32"));
+        assert!(!err_is_broken_pipe("permission denied"));
 
-        let wrapped = anyhow::anyhow!("steer: Broken pipe (os error 32)");
-        assert!(is_broken_pipe_error(&wrapped));
-
-        let other = anyhow::anyhow!("permission denied");
-        assert!(!is_broken_pipe_error(&other));
+        // Not-running class: daemon rejected a steer/interrupt on a finished task.
+        assert!(err_is_not_running(
+            "task abc is Completed, not running"
+        ));
+        assert!(!err_is_not_running("Broken pipe (os error 32)"));
     }
 
     #[test]
