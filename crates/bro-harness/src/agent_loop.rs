@@ -150,7 +150,12 @@ async fn run_with_emitter(
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     session
-        .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
+        .user_turn(
+            &prompt,
+            cancel_rx,
+            Arc::new(StdMutex::new(VecDeque::new())),
+            true,
+        )
         .await?;
     session.persist()?;
     Ok(())
@@ -265,16 +270,16 @@ async fn session_loop(
     mut pending: VecDeque<String>,
 ) -> Result<()> {
     loop {
-        let prompt = match pending.pop_front() {
-            Some(p) => p,
+        let (prompt, allow_context_diff) = match pending.pop_front() {
+            Some(p) => (p, true),
             None => {
                 if let Some(event) = session.promise_completion_event_prompt() {
-                    event
+                    (event, false)
                 } else {
                     let promise_notify = session.promise_notifier();
                     tokio::select! {
                         maybe = input_rx.recv() => match maybe {
-                            Some(Input::User(p)) => p,
+                            Some(Input::User(p)) => (p, true),
                             Some(Input::Control {
                                 subtype,
                                 req_id,
@@ -289,7 +294,7 @@ async fn session_loop(
                         },
                         _ = promise_notify.notified() => {
                             match session.promise_completion_event_prompt() {
-                                Some(event) => event,
+                                Some(event) => (event, false),
                                 None => continue,
                             }
                         }
@@ -316,7 +321,12 @@ async fn session_loop(
         let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
             Arc::new(StdMutex::new(VecDeque::new()));
         {
-            let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
+            let turn = session.user_turn(
+                &prompt,
+                cancel_rx,
+                mid_turn_user_inputs.clone(),
+                allow_context_diff,
+            );
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -429,7 +439,7 @@ async fn run_prompt_with_controls(
     let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
         Arc::new(StdMutex::new(VecDeque::new()));
     let turn_result = {
-        let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
+        let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone(), true);
         tokio::pin!(turn);
         loop {
             tokio::select! {
@@ -784,6 +794,7 @@ impl Session {
             Some(summary) => {
                 self.emitter
                     .compact_boundary("manual", self.last_prompt_tokens, summary.len());
+                self.reference_context_item = None;
             }
             None => tracing::info!("manual /compact: nothing compactible yet"),
         }
@@ -803,8 +814,10 @@ impl Session {
         prompt: &str,
         mut cancel: watch::Receiver<bool>,
         mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
+        allow_context_diff: bool,
     ) -> Result<()> {
-        self.push_user_text(prompt);
+        let mut pending_prompt = Some(prompt);
+        let prompt_estimate = est_tokens(prompt);
 
         let mut final_text = String::new();
         let mut turn_steps = 0u64;
@@ -820,9 +833,6 @@ impl Session {
             if *cancel.borrow() {
                 break "cancelled";
             }
-            if let Some(event) = self.promise_completion_event_prompt() {
-                self.push_user_text(&event);
-            }
 
             let tool_specs = self.reg.wire_specs();
 
@@ -833,9 +843,14 @@ impl Session {
             // request triggers compaction *before* it's sent. Tools are forwarded
             // so the server-side compaction path (brodex) can faithfully process
             // tool-call history.
+            let pending_prompt_estimate = pending_prompt
+                .as_ref()
+                .map(|_| prompt_estimate)
+                .unwrap_or_default();
             let projected_tokens = self
                 .last_prompt_tokens
-                .saturating_add(self.pending_input_estimate);
+                .saturating_add(self.pending_input_estimate)
+                .saturating_add(pending_prompt_estimate);
             if let Some(thresh) = self.compact_threshold
                 && projected_tokens > thresh
             {
@@ -857,10 +872,18 @@ impl Session {
                         // by the upcoming call, so the appended-tail estimate no
                         // longer applies.
                         self.pending_input_estimate = 0;
+                        self.reference_context_item = None;
                     }
                     Ok(None) => {}
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
                 }
+            }
+            if let Some(prompt) = pending_prompt.take() {
+                self.prepare_context_for_user_turn(allow_context_diff);
+                self.push_user_text_raw(prompt);
+            }
+            if let Some(event) = self.promise_completion_event_prompt() {
+                self.push_user_text_raw(&event);
             }
             let mut sys = compose_system(self.explicit_system.as_deref(), &self.reg);
             if let Some(t) = self.tail_nudge.take() {
@@ -909,11 +932,14 @@ impl Session {
                             )
                             .await
                         {
-                            Ok(Some(summary)) => self.emitter.compact_boundary(
-                                "overflow",
-                                self.last_prompt_tokens,
-                                summary.len(),
-                            ),
+                            Ok(Some(summary)) => {
+                                self.emitter.compact_boundary(
+                                    "overflow",
+                                    self.last_prompt_tokens,
+                                    summary.len(),
+                                );
+                                self.reference_context_item = None;
+                            }
                             // Nothing compactible, or compaction itself failed:
                             // a retry would just re-overflow — surface the
                             // original error.
@@ -1076,8 +1102,13 @@ impl Session {
         Ok(())
     }
 
+    #[cfg(test)]
     fn push_user_text(&mut self, prompt: &str) {
         self.emit_initial_context_if_needed();
+        self.push_user_text_raw(prompt);
+    }
+
+    fn push_user_text_raw(&mut self, prompt: &str) {
         self.tx.push_user_text(prompt);
         self.pending_input_estimate = self
             .pending_input_estimate
@@ -1086,6 +1117,14 @@ impl Session {
             if n.delivery == Delivery::SystemTail {
                 self.tail_nudge = Some(n.message);
             }
+        }
+    }
+
+    fn prepare_context_for_user_turn(&mut self, allow_context_diff: bool) {
+        if self.reference_context_item.is_none() {
+            self.emit_initial_context_if_needed();
+        } else if allow_context_diff {
+            self.emit_environment_context_diff_if_needed();
         }
     }
 
@@ -1111,6 +1150,32 @@ impl Session {
         self.reference_context_item = Some(env.to_turn_context_item());
     }
 
+    fn emit_environment_context_diff_if_needed(&mut self) {
+        let Some(before) = self.reference_context_item.clone() else {
+            return;
+        };
+        let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
+        if let Some(delta) =
+            crate::context::EnvironmentContextDelta::from_turn_context_item(&before, &env)
+        {
+            let rendered = crate::context::ContextualUserFragment::render(&delta);
+            if let Some(message) = crate::context::build_contextual_user_message(vec![rendered]) {
+                let added_tokens = message
+                    .text_blocks
+                    .iter()
+                    .map(|section| est_tokens(section))
+                    .fold(0u64, u64::saturating_add);
+                self.tx.push_user_text_blocks(message.text_blocks);
+                self.pending_input_estimate =
+                    self.pending_input_estimate.saturating_add(added_tokens);
+            }
+        }
+        // Match Codex's runtime baseline advance: even a shell-only change
+        // emits no model-visible delta, but the in-memory side-state baseline
+        // still reflects the current turn environment.
+        self.reference_context_item = Some(env.to_turn_context_item());
+    }
+
     fn drain_mid_turn_user_inputs(&mut self, inputs: &Arc<StdMutex<VecDeque<String>>>) {
         let Ok(mut inputs) = inputs.lock() else {
             return;
@@ -1120,7 +1185,7 @@ impl Session {
                 tracing::info!("deferring /compact received during active turn");
                 continue;
             }
-            self.push_user_text(&prompt);
+            self.push_user_text_raw(&prompt);
         }
     }
 
@@ -1822,6 +1887,19 @@ mod tests {
         (session, shared)
     }
 
+    async fn run_user_turn(session: &mut Session, prompt: &str) {
+        let (_cancel_tx, cancel_rx) = watch::channel(false);
+        session
+            .user_turn(
+                prompt,
+                cancel_rx,
+                Arc::new(StdMutex::new(VecDeque::new())),
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
     #[test]
     fn first_user_push_emits_environment_context_and_baseline() {
         let (mut session, shared) = mk_session(vec![]);
@@ -1897,6 +1975,103 @@ mod tests {
 
         assert!(restored.is_some());
         assert_eq!(restored.unwrap().cwd, session.cx.root.to_string_lossy());
+    }
+
+    #[tokio::test]
+    async fn compaction_clear_persists_null_and_next_turn_reinjects_full_context() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("ok".into())]);
+        let env = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
+        session.reference_context_item = Some(env.to_turn_context_item());
+        session.user_instructions = Some(crate::context::UserInstructions {
+            directory: "/repo".into(),
+            text: "AGENTS_AFTER_COMPACT".into(),
+        });
+
+        session.compact_manual().await.unwrap();
+
+        assert_eq!(session.reference_context_item, None);
+        assert_eq!(session.side_state()["reference_context"], Value::Null);
+
+        run_user_turn(&mut session, "after compact").await;
+
+        let pushed = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 2, "{pushed:?}");
+        assert!(pushed[0].contains("# AGENTS.md instructions"), "{pushed:?}");
+        assert!(pushed[0].contains("AGENTS_AFTER_COMPACT"), "{pushed:?}");
+        assert!(pushed[0].contains("<environment_context>"), "{pushed:?}");
+        assert!(pushed[0].contains("<cwd>"), "{pushed:?}");
+        assert!(pushed[0].contains("<current_date>"), "{pushed:?}");
+        assert!(pushed[0].contains("<timezone>"), "{pushed:?}");
+        assert_eq!(pushed[1], "after compact");
+        assert!(
+            session.reference_context_item.is_some(),
+            "full re-inject should re-establish the baseline"
+        );
+    }
+
+    #[tokio::test]
+    async fn unchanged_environment_emits_no_second_turn_diff() {
+        let (mut session, shared) = mk_session(vec![
+            MockTurn::Text("one".into()),
+            MockTurn::Text("two".into()),
+        ]);
+
+        run_user_turn(&mut session, "one").await;
+        run_user_turn(&mut session, "two").await;
+
+        let pushed = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 3, "{pushed:?}");
+        assert!(pushed[0].starts_with("<environment_context>"), "{pushed:?}");
+        assert_eq!(pushed[1], "one");
+        assert_eq!(pushed[2], "two");
+    }
+
+    #[tokio::test]
+    async fn cwd_change_emits_one_field_environment_delta_and_updates_baseline() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("ok".into())]);
+        let current = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
+        session.reference_context_item = Some(crate::context::TurnContextItem {
+            cwd: "/old/cwd".into(),
+            shell: current.shell.clone(),
+            current_date: current.current_date.clone(),
+            timezone: current.timezone.clone(),
+        });
+
+        run_user_turn(&mut session, "turn").await;
+
+        let pushed = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(pushed.len(), 2, "{pushed:?}");
+        let delta = &pushed[0];
+        assert!(delta.starts_with("<environment_context>"), "{delta}");
+        assert!(delta.contains(&format!("<cwd>{}</cwd>", current.cwd)));
+        assert!(!delta.contains("<shell>"), "{delta}");
+        assert!(!delta.contains("<current_date>"), "{delta}");
+        assert!(!delta.contains("<timezone>"), "{delta}");
+        assert_eq!(pushed[1], "turn");
+        assert_eq!(
+            session
+                .reference_context_item
+                .as_ref()
+                .map(|item| &item.cwd),
+            Some(&current.cwd)
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_only_environment_change_emits_no_delta() {
+        let (mut session, shared) = mk_session(vec![MockTurn::Text("ok".into())]);
+        let current = crate::context::EnvironmentContext::from_tool_cx(&session.cx);
+        session.reference_context_item = Some(crate::context::TurnContextItem {
+            cwd: current.cwd.clone(),
+            shell: Some("different-shell".into()),
+            current_date: current.current_date.clone(),
+            timezone: current.timezone.clone(),
+        });
+
+        run_user_turn(&mut session, "turn").await;
+
+        let pushed = shared.pushed_users.lock().unwrap().clone();
+        assert_eq!(pushed, vec!["turn".to_string()]);
     }
 
     fn occurrences(haystack: &str, needle: &str) -> usize {

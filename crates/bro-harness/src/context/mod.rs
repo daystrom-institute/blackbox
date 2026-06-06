@@ -105,6 +105,62 @@ impl EnvironmentContext {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvironmentContextDelta {
+    pub cwd: Option<String>,
+    pub current_date: Option<String>,
+    pub timezone: Option<String>,
+}
+
+impl EnvironmentContextDelta {
+    pub fn from_turn_context_item(
+        before: &TurnContextItem,
+        after: &EnvironmentContext,
+    ) -> Option<Self> {
+        let delta = Self {
+            cwd: (before.cwd != after.cwd).then(|| after.cwd.clone()),
+            current_date: (before.current_date != after.current_date)
+                .then(|| after.current_date.clone())
+                .flatten(),
+            timezone: (before.timezone != after.timezone)
+                .then(|| after.timezone.clone())
+                .flatten(),
+        };
+        delta.has_changes().then_some(delta)
+    }
+
+    fn has_changes(&self) -> bool {
+        self.cwd.is_some() || self.current_date.is_some() || self.timezone.is_some()
+    }
+}
+
+impl ContextualUserFragment for EnvironmentContextDelta {
+    fn role(&self) -> FragmentRole {
+        FragmentRole::User
+    }
+
+    fn markers(&self) -> (&'static str, &'static str) {
+        ("<environment_context>", "</environment_context>")
+    }
+
+    fn body(&self) -> String {
+        let mut lines = Vec::new();
+        if let Some(cwd) = &self.cwd {
+            lines.push(format!("  <cwd>{}</cwd>", escape_xml(cwd)));
+        }
+        if let Some(current_date) = &self.current_date {
+            lines.push(format!(
+                "  <current_date>{}</current_date>",
+                escape_xml(current_date)
+            ));
+        }
+        if let Some(timezone) = &self.timezone {
+            lines.push(format!("  <timezone>{}</timezone>", escape_xml(timezone)));
+        }
+        format!("\n{}\n", lines.join("\n"))
+    }
+}
+
 impl ContextualUserFragment for EnvironmentContext {
     fn role(&self) -> FragmentRole {
         FragmentRole::User
@@ -234,6 +290,40 @@ mod tests {
         assert!(body.contains("<current_date>2026-06-06</current_date>"));
         assert!(body.contains("<timezone>America/Edmonton</timezone>"));
         assert!(!body.contains("safety_policy"));
+    }
+
+    #[test]
+    fn environment_context_delta_ignores_shell_and_renders_changed_fields_only() {
+        let before = TurnContextItem {
+            cwd: "/repo".into(),
+            shell: Some("/bin/bash".into()),
+            current_date: Some("2026-06-06".into()),
+            timezone: Some("America/Edmonton".into()),
+        };
+        let shell_only = EnvironmentContext {
+            cwd: "/repo".into(),
+            shell: Some("/bin/zsh".into()),
+            current_date: Some("2026-06-06".into()),
+            timezone: Some("America/Edmonton".into()),
+        };
+        assert_eq!(
+            EnvironmentContextDelta::from_turn_context_item(&before, &shell_only),
+            None
+        );
+
+        let changed = EnvironmentContext {
+            cwd: "/other".into(),
+            shell: Some("/bin/zsh".into()),
+            current_date: Some("2026-06-07".into()),
+            timezone: Some("America/Edmonton".into()),
+        };
+        let delta =
+            EnvironmentContextDelta::from_turn_context_item(&before, &changed).expect("delta");
+        let rendered = delta.render();
+        assert!(rendered.contains("<cwd>/other</cwd>"));
+        assert!(rendered.contains("<current_date>2026-06-07</current_date>"));
+        assert!(!rendered.contains("<shell>"));
+        assert!(!rendered.contains("<timezone>"));
     }
 
     #[test]
