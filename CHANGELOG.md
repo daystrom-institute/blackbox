@@ -10,6 +10,14 @@ out explicitly under `Changed` or `Removed`.
 
 ### Added
 
+- `bro-harness` code-mode (`exec` / `wait`): the authorial/metatool surface,
+  adopted from openai/codex's `code-mode` (vendored as the `bro-code-mode`
+  crate, Apache-2.0). `exec` runs a JS/TS cell that composes the whole filtered
+  tool surface as a typed `tools.*` namespace (a nested `tools.X(...)` dispatches
+  the same deny-filtered tool the flat surface exposes — no in-box bypass), emits
+  output via `text()`/`image()`, and persists across cells in a session via
+  `store()`/`load()`; `wait` resumes a still-running cell by `cell_id`. Replaces
+  the NARF authorial surface.
 - `minimax` provider: MiniMax M3 ridden through `bro-harness` on the Anthropic
   transport. Credentials/base URL are lifted from `~/.claude-mm/settings.json`
   (the same config selected by the `yolom` alias); default model is
@@ -270,6 +278,16 @@ out explicitly under `Changed` or `Removed`.
   are dropped before the `edge_index.write()` swap.
 
 ### Removed
+
+- NARF and its substrate, superseded by code-mode: the `narf_exec` /
+  `narf_prepare` / `narf_run` / `narf_define` / `narf_register` /
+  `narf_registerWorkflow` / `narf_scheduleWorkflow` tools, the `bro-script`
+  crate (the NARF raw-V8 runtime), and the model-facing `narf_kv_*` KV surface
+  with its `KvCapability` trait. (`bro-code-mode` is now the only V8 embedder in
+  the process.)
+- Durable/scheduled cells (half-baked): server-side cell execution
+  (`src/cells.rs`), the `CellRegistryCapability` / `DurableCellCapability`
+  capabilities, and the `cell` artifact kind.
 
 ## 0.0.1 - 2026-05-14
 

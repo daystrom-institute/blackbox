@@ -1,7 +1,8 @@
 ---
 title: "Workflow-JS: composable state machines as the workflow surface"
 kind: design
-lifecycle: proposed
+lifecycle: superseded
+superseded_by: "codexification.md — bro-harness adopted Codex code-mode (exec/wait); NARF retired"
 corpus: blackbox-design
 topic:
   - bro-harness

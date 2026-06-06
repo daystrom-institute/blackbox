@@ -1,7 +1,8 @@
 ---
 title: "NARF typed cells: one authorial surface, the verb sets the tier"
 kind: design
-lifecycle: proposed
+lifecycle: superseded
+superseded_by: "codexification.md — bro-harness adopted Codex code-mode (exec/wait); NARF retired"
 corpus: blackbox-design
 topic:
   - bro-harness

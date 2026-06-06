@@ -1,7 +1,8 @@
 ---
 title: "NARF capability library and prepared scripts"
 kind: design
-lifecycle: proposed
+lifecycle: superseded
+superseded_by: "codexification.md — bro-harness adopted Codex code-mode (exec/wait); NARF retired"
 corpus: blackbox-design
 topic:
   - bro-harness

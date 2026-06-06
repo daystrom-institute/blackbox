@@ -67,14 +67,13 @@ fn refactor() -> Option<Arc<dyn RefactorCapability>> {
         .clone()
 }
 
-/// The generic host built-in tool seam (`narf-tool-placement.md` §5): a NARF
-/// cell's `fs.*`/`shell.*`/`search.*`/`git.*`/`web.*` in-box bindings dispatch
-/// here, and this runs the matching pre-beta bro-tools built-in by name against
-/// the per-session [`ToolCx`] — the same `Tool::call` path the flat model-facing
-/// surface uses.
+/// The generic host built-in tool seam: a code-mode cell's `tools.*` call
+/// dispatches here, and this runs the matching bro-tools built-in by name
+/// against the per-session [`ToolCx`] — the same `Tool::call` path the flat
+/// model-facing surface uses.
 ///
-/// §4.5 invariant: the callable set is gated by the **same** `ToolFilter` as the
-/// flat surface (an unfiltered in-box surface would be a deny-bypass). The
+/// Deny-filter invariant: the callable set is gated by the **same** `ToolFilter`
+/// as the flat surface (an unfiltered in-box surface would be a deny-bypass). The
 /// caller constructs `HostTools` from the already-filtered built-in set, so a
 /// denied capability is absent here and fails closed.
 pub struct HostTools {
@@ -85,9 +84,9 @@ pub struct HostTools {
 impl HostTools {
     /// Build the host-tool seam from a pre-filtered built-in set + the session
     /// context. `filtered_builtins` MUST already have had the session's
-    /// `ToolFilter` applied by the caller (§4.5); capability/control tools
-    /// (`narf_exec`, `atom_invoke`, `report`, …) are intentionally NOT included —
-    /// they have their own in-box bindings or are out-box-only.
+    /// `ToolFilter` applied by the caller; capability/control tools
+    /// (`exec`, `wait`, `atom_invoke`, `report`, …) are intentionally NOT
+    /// included — they are model-facing controls, not nested cell tools.
     pub fn new(filtered_builtins: Vec<Arc<dyn Tool>>, cx: ToolCx) -> Self {
         let tools = filtered_builtins
             .into_iter()

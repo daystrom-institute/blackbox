@@ -1,7 +1,8 @@
 ---
 title: "NARF execution effects and safety — parked apparatus"
 kind: design
-lifecycle: proposed
+lifecycle: superseded
+superseded_by: "codexification.md — bro-harness adopted Codex code-mode (exec/wait); NARF retired"
 corpus: blackbox-design
 topic:
   - bro-harness
