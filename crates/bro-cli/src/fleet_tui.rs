@@ -386,6 +386,22 @@ struct App {
     classifier_tx: mpsc::Sender<ClassifierNote>,
     /// Drained each tick into a transient status flash.
     classifier_rx: mpsc::Receiver<ClassifierNote>,
+    /// Cloned into each off-thread dispatch task; the worker sends the finished
+    /// (or failed) dispatch back here so worktree-prep + HTTP never block draw.
+    dispatch_tx: mpsc::Sender<DispatchOutcome>,
+    /// Drained each tick: installs a ready agent or surfaces a dispatch error.
+    dispatch_rx: mpsc::Receiver<DispatchOutcome>,
+    /// Count of dispatches in flight (worker spawned, agent not yet installed),
+    /// surfaced in the roster footer so a dispatch reads as immediate.
+    pending_dispatches: usize,
+    /// Cloned into each off-thread resume task; the worker sends the relaunched
+    /// live handle back here so the `/control/resume` round-trip never blocks draw.
+    resume_tx: mpsc::Sender<ResumeOutcome>,
+    /// Drained each tick: swaps the resumed live handle into its agent.
+    resume_rx: mpsc::Receiver<ResumeOutcome>,
+    /// Agent ids (pre-resume) with a resume in flight — guards against firing a
+    /// second resume of the same session before the first lands.
+    resuming: HashSet<String>,
     /// Local clocks for the focused executor/classifier activity strip.
     activity_clocks: HashMap<String, ActivityClock>,
     activity_frame: usize,
@@ -413,6 +429,8 @@ impl App {
         mode: AppMode,
     ) -> Self {
         let (classifier_tx, classifier_rx) = mpsc::channel();
+        let (dispatch_tx, dispatch_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
         let default_provider = DEFAULT_FLEET_PROVIDER;
         let provider_cursor = default_fleet_provider_cursor();
         let model_cursor = default_provider
@@ -463,6 +481,12 @@ impl App {
             rt,
             classifier_tx,
             classifier_rx,
+            dispatch_tx,
+            dispatch_rx,
+            pending_dispatches: 0,
+            resume_tx,
+            resume_rx,
+            resuming: HashSet::new(),
             activity_clocks: HashMap::new(),
             activity_frame: 0,
         }
@@ -584,6 +608,40 @@ enum DispatchMode {
     Standalone,
 }
 
+/// Result of an off-thread fleet dispatch: the slow worktree-prep + `/control`
+/// HTTP runs on a worker task so the render loop never blocks. Delivered back to
+/// the UI thread over [`App::dispatch_rx`] and installed in [`install_dispatch`].
+enum DispatchOutcome {
+    Ready(Box<DispatchedAgent>),
+    Failed(String),
+}
+
+/// Everything the UI thread needs to build the roster [`Agent`] once the worker
+/// has created the worktree and registered the task with the daemon.
+struct DispatchedAgent {
+    task: AgentHandle,
+    provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+    project_cwd: String,
+    name: String,
+    /// The operator's own prompt (not the rider/grounding-wrapped first turn).
+    prompt: String,
+    classifier_cfg: Option<ClassifierConfig>,
+    alias: Option<String>,
+    worktree_tail: String,
+}
+
+/// Result of an off-thread resume: the relaunched live handle for the agent
+/// whose terminal task had id `agent_id`. Delivered over [`App::resume_rx`] and
+/// applied in [`install_resume`] (found by id, since the roster may have moved).
+struct ResumeOutcome {
+    /// The pre-resume (terminal) task id — used to locate the agent on install.
+    agent_id: String,
+    task: AgentHandle,
+    classifier_cfg: Option<ClassifierConfig>,
+}
+
 fn dispatch_current_input_for_mode(app: &mut App, mode: DispatchMode) {
     let prompt = app.input.trim().to_string();
     if prompt.is_empty() {
@@ -616,25 +674,65 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
     } else {
         name
     };
-    let launch_cwd = project.cwd.as_deref().or(app.launch_cwd.as_deref());
+    let launch_cwd = project.cwd.clone().or_else(|| app.launch_cwd.clone());
+    let provider = app.next_provider;
+    let model = app.next_model.clone();
+    let effort = app.next_effort.clone();
+    let alias = project.alias.clone();
+    let classifier_cfg = app.orch.classifier();
+    let orch = app.orch.clone();
+    let tx = app.dispatch_tx.clone();
 
-    let worktree = match prepare_dispatch_worktree(&app.orch, launch_cwd, &prompt) {
+    // The worktree git work and the `/control/exec` round-trip run on a worker
+    // task so the render loop never stalls; the finished agent is installed from
+    // `dispatch_rx` on the next tick (`install_dispatch`). The input clears and
+    // a "dispatching…" flash shows immediately, so a dispatch reads as instant.
+    app.pending_dispatches += 1;
+    app.set_status(
+        format!("dispatching {provider} agent…"),
+        Duration::from_secs(4),
+    );
+    app.clear_input();
+    app.rt.spawn(async move {
+        let outcome = build_fleet_dispatch(
+            orch,
+            launch_cwd,
+            prompt,
+            name,
+            provider,
+            model,
+            effort,
+            classifier_cfg,
+            alias,
+        );
+        let _ = tx.send(outcome);
+    });
+}
+
+/// Worker half of a fleet dispatch (runs off the render thread): create the
+/// isolated worktree, frame the first turn, and register the task with the
+/// daemon. The blocking git + HTTP live here, never on the UI loop.
+#[allow(clippy::too_many_arguments)]
+fn build_fleet_dispatch(
+    orch: Arc<FleetOrchestrator>,
+    launch_cwd: Option<String>,
+    prompt: String,
+    name: String,
+    provider: Provider,
+    model: Option<String>,
+    effort: Option<String>,
+    classifier_cfg: Option<ClassifierConfig>,
+    alias: Option<String>,
+) -> DispatchOutcome {
+    let worktree = match prepare_dispatch_worktree(&orch, launch_cwd.as_deref(), &prompt) {
         Ok(worktree) => worktree,
-        Err(e) => {
-            app.set_status(
-                format!("worktree isolation failed: {e}"),
-                Duration::from_secs(8),
-            );
-            return;
-        }
+        Err(e) => return DispatchOutcome::Failed(format!("worktree isolation failed: {e}")),
     };
 
-    // Classifier companion: if enabled, prepend the intern rider to the
-    // executor's first turn ONLY when suggestions will actually be relayed
-    // (classifier present AND auto_send). Gating on both keeps observe-only
-    // runs from telling the executor about an intern whose voice never
-    // appears — which would confuse a future agent reading the transcript.
-    let classifier_cfg = app.orch.classifier();
+    // Classifier companion: prepend the intern rider to the executor's first
+    // turn ONLY when suggestions will actually be relayed (classifier present
+    // AND auto_send). Gating on both keeps observe-only runs from telling the
+    // executor about an intern whose voice never appears.
     let frame_executor = classifier_cfg
         .as_ref()
         .is_some_and(|c| c.auto_send_resolved());
@@ -647,58 +745,81 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
     }
     dispatch_prompt.push_str(&prompt);
 
-    let mut spec = DispatchSpec::new(app.next_provider, dispatch_prompt);
+    let mut spec = DispatchSpec::new(provider, dispatch_prompt);
     spec.cwd = Some(worktree.cwd.clone());
-    spec.model = app.next_model.clone();
-    spec.effort = app.next_effort.clone();
+    spec.model = model.clone();
+    spec.effort = effort.clone();
     spec.env_overrides = worktree.env_overrides.clone();
     spec.name = Some(name.clone());
-    let task = app.orch.dispatch(spec);
-    let id = task.id();
+    let task = orch.dispatch(spec);
 
+    DispatchOutcome::Ready(Box::new(DispatchedAgent {
+        task,
+        provider,
+        model,
+        effort,
+        project_cwd: worktree.project_cwd.clone(),
+        name,
+        prompt,
+        classifier_cfg,
+        alias,
+        worktree_tail: path_tail(&worktree.cwd),
+    }))
+}
+
+/// UI-thread half: install a finished dispatch into the roster (or flash the
+/// error). Runs from the `dispatch_rx` drain so all `&mut App` mutation — agent
+/// push, classifier spawn, cursor anchor, persist — stays on the render thread.
+fn install_dispatch(app: &mut App, outcome: DispatchOutcome) {
+    app.pending_dispatches = app.pending_dispatches.saturating_sub(1);
+    let d = match outcome {
+        DispatchOutcome::Ready(d) => *d,
+        DispatchOutcome::Failed(e) => {
+            app.set_status(e, Duration::from_secs(8));
+            return;
+        }
+    };
+    let id = d.task.id();
     // Spawn the watching intern for this executor.
-    let classifier = classifier_cfg.map(|cfg| {
+    let classifier = d.classifier_cfg.map(|cfg| {
         spawn_monitor(
             &app.rt,
             app.orch.clone(),
-            task.clone(),
-            name.clone(),
+            d.task.clone(),
+            d.name.clone(),
             cfg,
             app.classifier_tx.clone(),
         )
     });
-
     app.agents.push(Agent {
-        task,
+        task: d.task,
         classifier,
-        provider: app.next_provider,
-        selected_model: app.next_model.clone(),
-        selected_effort: app.next_effort.clone(),
-        selected_cwd: Some(worktree.project_cwd.clone()),
-        name,
+        provider: d.provider,
+        selected_model: d.model,
+        selected_effort: d.effort,
+        selected_cwd: Some(d.project_cwd),
+        name: d.name,
         // Display the operator's own prompt, not the rider-wrapped first turn.
-        input_history: vec![prompt.clone()],
-        initial_prompt: Some(prompt.clone()),
+        input_history: vec![d.prompt.clone()],
+        initial_prompt: Some(d.prompt),
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
-    // Move the roster cursor onto the just-dispatched agent and pin it there, so
-    // it stays selected as it surfaces in (and later moves between) buckets.
+    // Pin the roster cursor to the freshly dispatched agent so it stays selected
+    // as it surfaces in (and later moves between) buckets.
     app.roster_anchor_id = Some(id.clone());
-    app.clear_input();
     // Persist so the session is recoverable even before it terminates.
     app.orch.persist();
     app.set_status(
         format!(
             "dispatched {} agent {}{} in {}",
-            app.next_provider,
+            d.provider,
             &id[..8.min(id.len())],
-            project
-                .alias
+            d.alias
                 .as_deref()
                 .map(|alias| format!(" @{alias}"))
                 .unwrap_or_default(),
-            path_tail(&worktree.cwd)
+            d.worktree_tail
         ),
         Duration::from_secs(3),
     );
@@ -1471,6 +1592,23 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
             }
             for note in notes {
                 app.ingest_classifier_note(note);
+            }
+            // Install agents whose off-thread dispatch finished this tick
+            // (collect first to avoid borrowing app.dispatch_rx while mutating).
+            let mut dispatched = Vec::new();
+            while let Ok(outcome) = app.dispatch_rx.try_recv() {
+                dispatched.push(outcome);
+            }
+            for outcome in dispatched {
+                install_dispatch(app, outcome);
+            }
+            // Swap in handles whose off-thread resume finished this tick.
+            let mut resumed = Vec::new();
+            while let Ok(outcome) = app.resume_rx.try_recv() {
+                resumed.push(outcome);
+            }
+            for outcome in resumed {
+                install_resume(app, outcome);
             }
             app.maybe_clear_status();
             app.activity_frame = app.activity_frame.wrapping_add(1);
@@ -2302,40 +2440,87 @@ fn resume_selected(app: &mut App, idx: usize) {
         app.set_status("no session id — can't resume", Duration::from_secs(4));
         return;
     }
+    let old_id = app.agents[idx].task.id();
+    if app.resuming.contains(&old_id) {
+        // A resume for this agent is already in flight; don't fire a second
+        // (and don't swallow the composer text — let the operator retry).
+        app.set_status("resume already in progress", Duration::from_secs(2));
+        return;
+    }
     let text = std::mem::take(&mut app.input);
     app.cursor_pos = 0;
     app.history_cursor = None;
-    let old_id = app.agents[idx].task.id();
 
+    // Capture everything the worker needs before any mutable borrow of app.
+    let provider = app.agents[idx].provider;
     let cwd = snap.cwd.clone();
-    let mut spec = ResumeSpec::new(app.agents[idx].provider, snap.session_id, text.clone());
-    spec.cwd = cwd.clone();
-    spec.model = app.agents[idx].selected_model.clone().or(snap.model);
-    spec.effort = app.agents[idx].selected_effort.clone();
-    spec.name = Some(app.agents[idx].name.clone());
-    spec.env_overrides = resume_env_overrides(app, idx, cwd.as_deref());
-    let handle = app.orch.resume(spec);
+    let model = app.agents[idx].selected_model.clone().or(snap.model.clone());
+    let effort = app.agents[idx].selected_effort.clone();
+    let name = app.agents[idx].name.clone();
+    let env_overrides = resume_env_overrides(app, idx, cwd.as_deref());
+    let session_id = snap.session_id.clone();
+    let classifier_cfg = app.orch.classifier();
+    let orch = app.orch.clone();
+    let tx = app.resume_tx.clone();
 
-    app.orch.forget(&old_id); // drop the stale Interrupted task
-    app.agents[idx].task = handle;
-    // The resumed task has a fresh id. If the single-agent view was focused on
-    // this agent (focused_agent_id == old id), repoint it at the new id —
-    // otherwise `selected_agent()` no longer matches and the cockpit silently
-    // falls back to `roster_selected`, rendering a different agent's transcript.
-    if app.focused_agent_id.as_deref() == Some(old_id.as_str()) {
-        app.focused_agent_id = Some(app.agents[idx].task.id());
+    // Show the steer immediately and run `/control/resume` off-thread; the
+    // relaunched live handle is swapped in from `resume_rx` (`install_resume`).
+    app.resuming.insert(old_id.clone());
+    app.agents[idx].input_history.push(text.clone());
+    app.set_status("resuming session…", Duration::from_secs(4));
+    app.rt.spawn(async move {
+        let mut spec = ResumeSpec::new(provider, session_id, text);
+        spec.cwd = cwd;
+        spec.model = model;
+        spec.effort = effort;
+        spec.name = Some(name);
+        spec.env_overrides = env_overrides;
+        let task = orch.resume(spec);
+        let _ = tx.send(ResumeOutcome {
+            agent_id: old_id,
+            task,
+            classifier_cfg,
+        });
+    });
+}
+
+/// UI-thread half: swap a relaunched live handle into its agent (found by the
+/// pre-resume id, since the roster may have re-sorted while the resume ran).
+fn install_resume(app: &mut App, outcome: ResumeOutcome) {
+    app.resuming.remove(&outcome.agent_id);
+    let Some(idx) = app
+        .agents
+        .iter()
+        .position(|a| a.task.id() == outcome.agent_id)
+    else {
+        // The agent was removed while its resume was in flight; the relaunched
+        // task is live on the daemon but unowned here — forget it to avoid a leak.
+        app.orch.forget(&outcome.task.id());
+        return;
+    };
+    app.orch.forget(&outcome.agent_id); // drop the stale terminal task
+    let new_id = outcome.task.id();
+    app.agents[idx].task = outcome.task;
+    // Repoint the stable identities at the resumed task's fresh id, or the
+    // single-agent view and roster cursor would lose this agent.
+    if app.focused_agent_id.as_deref() == Some(outcome.agent_id.as_str()) {
+        app.focused_agent_id = Some(new_id.clone());
     }
-    app.agents[idx].classifier = app.orch.classifier().map(|cfg| {
+    if app.roster_anchor_id.as_deref() == Some(outcome.agent_id.as_str()) {
+        app.roster_anchor_id = Some(new_id.clone());
+    }
+    let agent_task = app.agents[idx].task.clone();
+    let agent_name = app.agents[idx].name.clone();
+    app.agents[idx].classifier = outcome.classifier_cfg.map(|cfg| {
         spawn_monitor(
             &app.rt,
             app.orch.clone(),
-            app.agents[idx].task.clone(),
-            app.agents[idx].name.clone(),
+            agent_task,
+            agent_name,
             cfg,
             app.classifier_tx.clone(),
         )
     });
-    app.agents[idx].input_history.push(text);
     app.agents[idx].pending_inputs.clear();
     app.agents[idx].seen_user_steers = 0;
     app.orch.persist();
@@ -2991,6 +3176,13 @@ fn roster_status_spans(app: &App, views: &[AgentView]) -> Vec<Span<'static>> {
         Span::styled("-", dim),
         Span::styled(format!(" {waiting} waiting "), byline),
     ];
+    if app.pending_dispatches > 0 {
+        spans.push(Span::styled("──", dim));
+        spans.push(Span::styled(
+            format!(" {} dispatching ", app.pending_dispatches),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
     if !app.config.projects.is_empty() {
         let aliases = app
             .config
