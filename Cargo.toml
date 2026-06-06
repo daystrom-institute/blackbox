@@ -12,7 +12,7 @@ members = [
     "crates/bro-cli",
     "crates/bro-fleet-client",
     "crates/bro-transcript",
-    "crates/bro-script",
+    "crates/bro-code-mode",
 ]
 
 [package]
@@ -77,7 +77,6 @@ bro-protocol = { path = "crates/bro-protocol" }
 bro-capabilities = { path = "crates/bro-capabilities" }
 bro-transcript = { path = "crates/bro-transcript" }
 bro-harness = { path = "crates/bro-harness" }
-bro-script = { path = "crates/bro-script" }
 # Direct dep for the in-process session's child-process env scrub
 # (bro_tools::with_spawn_scrub); shell tools live here.
 bro-tools = { path = "crates/bro-tools" }

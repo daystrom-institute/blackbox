@@ -13,11 +13,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CellLoadOutput, CellLoadRequest,
-    CellRegisterOutput, CellRegisterRequest, CellRegistryCapability, CellScheduleOutput,
-    CellScheduleRequest, CorpusCapability, CorpusHit, CorpusLookup, DurableCellCapability,
-    DurableCellRegisterOutput, DurableCellRegisterRequest, RefactorCapability, RefactorPlanHandle,
-    RefactorRequest,
+    AtomCapability, AtomInvocation, AtomOutput, CapabilityResult, CorpusCapability, CorpusHit,
+    CorpusLookup, RefactorCapability, RefactorPlanHandle, RefactorRequest,
 };
 use bro_core::BroError;
 use parking_lot::RwLock;
@@ -86,48 +83,6 @@ impl AtomCapability for DaemonAtoms {
         Ok(AtomOutput {
             output_json: output,
         })
-    }
-}
-
-/// Cell registry backed by the daemon's artifact catalog. This is deliberately
-/// separate from `orchestration::atoms`: cells replace the atom backend taxonomy;
-/// `atom:` survives only as an exact handle shape.
-pub(crate) struct DaemonCells {
-    pub(crate) state: Arc<SharedState>,
-}
-
-#[async_trait]
-impl CellRegistryCapability for DaemonCells {
-    async fn register_cell(
-        &self,
-        request: CellRegisterRequest,
-    ) -> CapabilityResult<CellRegisterOutput> {
-        crate::cells::register_cell(&self.state.artifacts.read(), request)
-            .map_err(|e| BroError::new("cell_register_failed", e.to_string()))
-    }
-
-    async fn load_cell(&self, request: CellLoadRequest) -> CapabilityResult<CellLoadOutput> {
-        crate::cells::load_cell(&self.state.artifacts.read(), request)
-            .map_err(|e| BroError::new("cell_load_failed", e.to_string()))
-    }
-}
-
-#[async_trait]
-impl DurableCellCapability for DaemonCells {
-    async fn register_durable_cell(
-        &self,
-        request: DurableCellRegisterRequest,
-    ) -> CapabilityResult<DurableCellRegisterOutput> {
-        crate::cells::register_durable_cell(&self.state.artifacts.read(), request)
-            .map_err(|e| BroError::new("durable_cell_register_failed", e.to_string()))
-    }
-
-    async fn schedule_cell(
-        &self,
-        request: CellScheduleRequest,
-    ) -> CapabilityResult<CellScheduleOutput> {
-        crate::cells::schedule_cell(self.state.clone(), request)
-            .map_err(|e| BroError::new("cell_schedule_failed", e.to_string()))
     }
 }
 
@@ -213,12 +168,6 @@ pub(crate) fn install(state: &Arc<SharedState>) {
     bro_harness::capabilities::install_atoms(Arc::new(DaemonAtoms {
         state: state.clone(),
     }));
-    bro_harness::capabilities::install_cells(Arc::new(DaemonCells {
-        state: state.clone(),
-    }));
-    bro_harness::capabilities::install_durable_cells(Arc::new(DaemonCells {
-        state: state.clone(),
-    }));
     bro_harness::capabilities::install_refactor(Arc::new(DaemonRefactor::new(state.clone())));
 }
 
@@ -264,117 +213,6 @@ mod tests {
             .await;
         let err = result.expect_err("unknown atom must error");
         assert_eq!(err.code, "atom_invoke_failed");
-    }
-
-    #[tokio::test]
-    async fn daemon_cells_registers_and_loads_catalog_cell() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = Arc::new(SharedState::for_test(dir.path()));
-        let cells = DaemonCells {
-            state: state.clone(),
-        };
-        let registered = cells
-            .register_cell(CellRegisterRequest {
-                name: "math/double".to_string(),
-                version: "v1".to_string(),
-                source: "function run(input) { return input.n * 2; }".to_string(),
-                contract_json: serde_json::json!({
-                    "entry": "run",
-                    "input": { "type": "object" },
-                    "output": { "type": "integer" }
-                }),
-                description: Some("double an integer".to_string()),
-                supersedes: None,
-            })
-            .await
-            .expect("register cell");
-        assert_eq!(registered.handle, "atom:math/double@v1");
-        assert_eq!(registered.artifact_ref, "cell:math/double@v1");
-
-        let loaded = cells
-            .load_cell(CellLoadRequest {
-                handle: "atom:math/double@v1".to_string(),
-            })
-            .await
-            .expect("load cell");
-        assert_eq!(loaded.name, "math/double");
-        assert_eq!(loaded.version, "v1");
-        assert!(loaded.source.contains("input.n * 2"));
-        assert_eq!(loaded.contract_json["entry"], "run");
-    }
-
-    #[tokio::test]
-    async fn daemon_cells_registers_and_schedules_durable_cell_without_legacy_routing() {
-        let dir = tempfile::tempdir().unwrap();
-        let state = Arc::new(SharedState::for_test(dir.path()));
-        let cells = DaemonCells {
-            state: state.clone(),
-        };
-        let reusable = cells
-            .register_cell(CellRegisterRequest {
-                name: "math/inc".to_string(),
-                version: "v1".to_string(),
-                source: "function run(input) { return { n: input.n + 1 }; }".to_string(),
-                contract_json: serde_json::json!({
-                    "entry": "run",
-                    "input": { "type": "object" },
-                    "output": { "type": "object" }
-                }),
-                description: None,
-                supersedes: None,
-            })
-            .await
-            .expect("register reusable cell");
-
-        let durable = cells
-            .register_durable_cell(DurableCellRegisterRequest {
-                name: "nightly-inc".to_string(),
-                version: "v1".to_string(),
-                cell_handle: reusable.handle.clone(),
-                description: Some("scheduled increment cell".to_string()),
-                supersedes: None,
-            })
-            .await
-            .expect("register durable cell");
-        assert_eq!(durable.handle, "cell:nightly-inc@v1");
-        assert_eq!(durable.source_cell, "atom:math/inc@v1");
-
-        let direct = crate::cells::run_cell_once(
-            state.clone(),
-            &durable.handle,
-            serde_json::json!({ "n": 1 }),
-        )
-        .await
-        .expect("run durable cell directly");
-        assert_eq!(direct, serde_json::json!({ "n": 2 }));
-
-        let scheduled = cells
-            .schedule_cell(CellScheduleRequest {
-                name: "nightly-inc".to_string(),
-                cell_handle: durable.handle.clone(),
-                schedule: "0 0 0 1 1 * 2099".to_string(),
-                input_json: serde_json::json!({ "n": 41 }),
-                concurrency: 1,
-            })
-            .await
-            .expect("schedule durable cell");
-        assert_eq!(scheduled.status, "scheduled");
-        assert!(
-            state
-                .store_dir
-                .join("cell-schedules")
-                .join("nightly-inc.json")
-                .exists()
-        );
-        assert!(state.workflow_registry.read().is_empty());
-        assert!(state.crons.list().is_empty());
-        assert!(
-            state
-                .packets
-                .read()
-                .load("domain:cell-schedule/nightly-inc")
-                .is_err()
-        );
     }
 
     /// A bogus plan kind drives the real plan dispatch and surfaces its error —

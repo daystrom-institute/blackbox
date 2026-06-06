@@ -21,7 +21,7 @@ use crate::projects::ProjectRegistry;
 use crate::roadmap::Roadmap;
 use crate::threads::Threads;
 use crate::{
-    artifacts, cells, council, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
+    artifacts, council, crons, edge_index, lsp, path_cache, pollers, slack_channel_bindings,
     slack_proposal_links, slack_thread_store, system_events, webhooks, whiteboards, workflow,
 };
 
@@ -43,7 +43,6 @@ pub(crate) struct SharedState {
     pub(crate) projects: RwLock<ProjectRegistry>,
     pub(crate) packets: RwLock<Packets>,
     pub(crate) artifacts: RwLock<artifacts::ArtifactCatalog>,
-    pub(crate) cell_schedules: Arc<cells::CellScheduleRegistry>,
     pub(crate) bbox_watcher: std::sync::Mutex<Option<crate::watcher::BbxWatcher>>,
     /// Out-of-band trigger for the background reindex thread. The `.bbox/knowledge`
     /// watcher (and daemon startup) set it so repo-owned knowledge changes that
@@ -324,7 +323,6 @@ impl SharedState {
             projects: RwLock::new(ProjectRegistry::open(store_dir.join("projects.json")).unwrap()),
             packets: RwLock::new(Packets::open(store_dir).unwrap()),
             artifacts: RwLock::new(artifacts::ArtifactCatalog::open(store_dir).unwrap()),
-            cell_schedules: Arc::new(cells::CellScheduleRegistry::new()),
             bbox_watcher: std::sync::Mutex::new(None),
             reindex_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             edge_index: RwLock::new(edge_index::EdgeIndex::default()),

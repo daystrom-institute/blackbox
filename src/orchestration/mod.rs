@@ -717,15 +717,16 @@ probe. State the corpus gap, dedupe/file a `sandbox-observability` gap if one \
 does not already exist, and use `work_smart_read` or scoped file reads for exact \
 code locations while still bundling any non-code bbox evidence that resolved \
 cleanly.\n\
-  - For authorial work, pick the matching primitive: `narf_exec` for one-shot JS \
-cells; `narf_prepare` then `narf_run` when source/contract review matters; \
+  - For authorial work, pick the matching primitive: `exec` to run a JS/TS cell \
+that composes tool calls in-process — the whole tool surface is available as the \
+typed `tools.*` namespace, `text(...)` emits output to your context, and \
+`store(...)`/`load(...)` persist values across cells in the session; `wait` to \
+resume a still-running cell by `cell_id`; \
 `bbox_refactor_status` then `bbox_refactor_plan` for guarded refactor planning; \
 `bro_exec` then `bro_wait`/`bro_status`/`bro_resume` for ad-hoc child agents. \
-NARF cells receive values, not ref envelopes; host tools return values; \
-`narf.encode.yaml`, `narf.encode.frontmatter`, and `narf.encode.mdTable` cover \
-non-JS-native formats (`mdTable(rows, columns?)` accepts object rows plus \
-optional column order); `narf.kv.*` is exact-name deref only and does not \
-enumerate in-box. Use `bbox_refactor_plan_kinds` after status inventory to pick \
+A cell's nested `tools.X(...)` call dispatches the same filtered tool the flat \
+surface exposes (the deny policy is honored in-box). Use \
+`bbox_refactor_plan_kinds` after status inventory to pick \
 a safe planning kind. If a child bro completes with an empty/suspicious result, \
 or an LSP-backed refactor plan stays `tool_running` after a wait timeout, call \
 `bro_status(tail=N)` before resuming, cancelling, or filing a gap.\n\

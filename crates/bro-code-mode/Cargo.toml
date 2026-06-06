@@ -1,0 +1,32 @@
+# bro-code-mode — vendored Codex "code-mode" runtime, adapted for bro-harness.
+#
+# Vendored near-verbatim from openai/codex `codex-rs/code-mode` (Apache-2.0).
+# See NOTICE for provenance/attribution. Local changes: `ToolName` is localized
+# (src/tool_name.rs, vendored from codex-rs/protocol) to drop the codex-protocol
+# dependency; built against this workspace's v8 pin.
+#
+# INVARIANT: zero `blackbox` dependency. Like bro-script, this is a
+# contract-bottom-adjacent runtime crate and must never link the daemon. It
+# embeds V8, so the v8 dep lands in blackboxd and the version is a deliberate,
+# reported choice pinned exactly.
+[package]
+name = "bro-code-mode"
+version = "0.0.1"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+doctest = false
+
+[dependencies]
+v8 = "=149.2.0"
+deno_core_icudata = "0.77.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }

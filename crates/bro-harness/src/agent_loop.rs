@@ -652,32 +652,37 @@ impl Session {
         };
         let (mcp_in_box, mcp_out_box) =
             mcp::split_mcp_tools_by_placement(&mcp_tools, &tool_placement);
-        // §5 host built-in seam (narf-tool-placement.md): a NARF cell's in-box
-        // fs/shell/search/git/web bindings dispatch to the parity built-ins via
-        // HostTools, gated by the SAME ToolFilter as the flat surface (§4.5 — an
-        // unfiltered in-box surface would be a deny-bypass) and run against this
-        // session's ToolCx. MCP tools first pass the same filter in load_mcp_tools;
-        // placement only assigns the box side of those survivors.
-        let mut host_builtins: Vec<Arc<dyn Tool>> = builtin_tools_for_mode(fleet)
-            .into_iter()
-            .filter(|t| tool_filter.permits(t.name()))
-            .collect();
-        host_builtins.extend(mcp_in_box);
-        let host_tools: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
-            crate::capabilities::HostTools::new(host_builtins, cx.clone()),
-        );
+        // Code-mode projects the full tool surface (builtins + all MCP) into the
+        // exec/wait authorial surface, so capture every MCP tool regardless of
+        // box placement before the in/out-box vecs are consumed below.
+        let mcp_all_for_code_mode: Vec<Arc<dyn Tool>> =
+            mcp_in_box.iter().chain(mcp_out_box.iter()).cloned().collect();
         // In-process capability bindings (harness-daemon-boundary.md §6): when the
         // daemon has installed corpus/atom/refactor impls, expose them as direct
-        // trait-dispatch tools, and inject the host seam into the NARF runtime.
-        // Empty (no-op) for the standalone binary, so those surfaces fail closed
-        // by absence. Registered as builtins so the surface ToolFilter still gates
-        // them.
+        // trait-dispatch tools (corpus_search, atom_invoke, refactor_plan, KV
+        // inspection). Empty (no-op) for the standalone binary, so those surfaces
+        // fail closed by absence. Registered as builtins so the surface ToolFilter
+        // still gates them. The authorial surface is now code-mode (below).
         let kv_cap: Arc<dyn bro_capabilities::KvCapability> = kv.clone();
-        builtins.extend(crate::capabilities::capability_tools(
-            Some(host_tools),
-            Some(kv_cap),
-        ));
+        builtins.extend(crate::capabilities::capability_tools(Some(kv_cap)));
+        // Code-mode (exec/wait) supersedes NARF as the authorial surface. The
+        // callable set mirrors the flat surface — filtered builtins + capability
+        // tools + all MCP — and a ToolCapability seam over that same set
+        // dispatches a cell's nested tools.* (deny-filter honored; exec/wait are
+        // excluded from the projected namespace so a cell cannot relaunch the box).
+        let mut cm_callable: Vec<Arc<dyn Tool>> = builtins
+            .iter()
+            .filter(|t| tool_filter.permits(t.name()))
+            .cloned()
+            .collect();
+        cm_callable.extend(mcp_all_for_code_mode);
+        let cm_seam: Arc<dyn bro_capabilities::ToolCapability> = Arc::new(
+            crate::capabilities::HostTools::new(cm_callable.clone(), cx.clone()),
+        );
+        builtins.extend(crate::code_mode::code_mode_tools(&cm_callable, cm_seam));
         let mut pin = PinPolicy::from_env();
+        pin.also_pin(bro_code_mode::PUBLIC_TOOL_NAME);
+        pin.also_pin(bro_code_mode::WAIT_TOOL_NAME);
         if fleet {
             pin.also_pin(crate::report::REPORT_TOOL);
         }

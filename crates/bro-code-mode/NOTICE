@@ -1,0 +1,26 @@
+bro-code-mode
+=============
+
+This crate is vendored and adapted from the "code-mode" crate of the
+OpenAI Codex project:
+
+    https://github.com/openai/codex  (codex-rs/code-mode)
+
+The original work is licensed under the Apache License, Version 2.0.
+A copy of the license terms is available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Portions Copyright OpenAI.
+
+Local modifications by the Blackbox project:
+
+  - `ToolName` is vendored from codex-rs/protocol into `src/tool_name.rs` and
+    re-exported locally, removing the dependency on the `codex-protocol` crate.
+  - Built against this workspace's pinned `v8` version (=149.2.0) rather than
+    Codex's pin; runtime sources carry minor V8-API adjustments accordingly.
+  - The model-facing `exec`/`wait` tool description prose (description.rs) is
+    retained as a starting point and tuned for the Blackbox harness.
+
+This NOTICE file is provided in satisfaction of the Apache-2.0 attribution
+requirement. Do not remove it.

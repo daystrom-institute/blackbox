@@ -23,7 +23,6 @@ mod artifacts;
 #[cfg(test)]
 #[path = "../eval/badgey/check.rs"]
 mod badgey_eval_check;
-mod cells;
 mod chunker;
 pub mod code_nav;
 pub mod config;

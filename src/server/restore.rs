@@ -7,17 +7,12 @@ pub(super) async fn restore_runtime_state(shared: &Arc<SharedState>) {
     restore_webhooks(shared);
     restore_pollers(shared);
     restore_crons(shared);
-    restore_cell_schedules(shared);
     restore_whiteboards(shared);
     restore_councils(shared);
     restore_workflows(shared);
     restore_catalog_runtime_artifacts(shared);
     restore_reactions(shared).await;
     recover_outbox(shared);
-}
-
-fn restore_cell_schedules(shared: &Arc<SharedState>) {
-    crate::cells::restore_schedules(shared.clone());
 }
 
 fn restore_webhooks(shared: &Arc<SharedState>) {

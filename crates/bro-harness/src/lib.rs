@@ -8,6 +8,7 @@ pub mod agent_loop;
 pub mod bound;
 pub mod capabilities;
 pub mod cli;
+pub mod code_mode;
 pub mod compaction;
 pub mod diagnostics;
 pub mod emit;

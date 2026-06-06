@@ -1,0 +1,20 @@
+{
+  "id": "8540b10b",
+  "title": "code-mode supersedes NARF; durable/scheduled cells removed; single V8 embedder",
+  "content": "The bro-harness authorial/metatool surface is Codex-style \"code-mode\": the vendored crate `crates/bro-code-mode` plus the `exec` and `wait` tools in `crates/bro-harness/src/code_mode.rs`. The full filtered tool surface (builtins + capability tools + MCP) is projected into a cell as the typed `tools.*` namespace; a cell's nested `tools.X(...)` dispatches the same filtered tool the flat surface exposes (the deny policy is honored in-box, no bypass). This SUPERSEDES NARF, which is fully retired — `narf_exec/prepare/run/define/register/registerWorkflow/scheduleWorkflow`, `NarfSession`, and the whole box-edge invariant framing are removed. Durable/scheduled cells are also removed as half-baked: `crates/bro-script`, `src/cells.rs`, the `CellRegistryCapability`/`DurableCellCapability` traits in bro-capabilities, the `install_cells`/`install_durable_cells` hooks, and `ArtifactKind::Cell` are all deleted. INVARIANT: exactly one V8 embedder in the process — `bro-code-mode`; never reintroduce a second `v8::V8::initialize()` (two embedding crates poison the V8 platform init).",
+  "variants": {},
+  "category": "decision",
+  "scope": "project",
+  "providers": [],
+  "priority": "critical",
+  "weight": 100,
+  "status": "active",
+  "approval": "user_confirmed",
+  "render": true,
+  "decay": false,
+  "rationale": "Worked through the original NARF box-edge invariant (\"the box dereferences; never selects/reviews/launches\") and concluded it was the wrong frame: an unenforceable runtime re-encoding of an epistemic intent, with per-tool in-box/out-box placement a category error (role lives in data flow, not the tool). Codex code-mode is the battle-tested conservative shape. Adopting it forced NARF removal because two crates cannot both initialize the V8 platform in one process (the combined harness test binary poisoned the init lock). Durable/scheduled cells were removed at operator direction as half-baked. Landed and validated: bro-code-mode 35 tests pass on v8 149; bro-harness 142 pass; daemon builds and its capabilities/artifacts/system_events tests pass.",
+  "source": "user",
+  "created_at": "2026-06-06T03:21:26Z",
+  "updated_at": "2026-06-06T03:21:26Z",
+  "recall_count": 0
+}
