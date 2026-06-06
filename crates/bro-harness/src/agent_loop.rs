@@ -497,7 +497,6 @@ struct Session {
     store: SessionStore,
     prior_side: Value,
     todos: Arc<std::sync::Mutex<bro_tools::TodoList>>,
-    kv: Arc<crate::capabilities::KvStore>,
     /// Cross-turn diagnostics baselines: per-file `{sha256, version,
     /// diagnostics}` snapshots from the most recent analyzer pass, so a
     /// future differ can surface only NEW/CHANGED findings on the next edit.
@@ -586,9 +585,6 @@ impl Session {
         let todos = Arc::new(std::sync::Mutex::new(bro_tools::TodoList::from_side(
             prior_side.get("todos").unwrap_or(&Value::Null),
         )));
-        let kv = Arc::new(crate::capabilities::KvStore::from_side(
-            prior_side.get("narf_kv").unwrap_or(&Value::Null),
-        ));
         let hooks = HookEngine::from_env(NudgeLedger::from_side(
             prior_side.get("nudges").unwrap_or(&Value::Null),
         ));
@@ -663,8 +659,7 @@ impl Session {
         // inspection). Empty (no-op) for the standalone binary, so those surfaces
         // fail closed by absence. Registered as builtins so the surface ToolFilter
         // still gates them. The authorial surface is now code-mode (below).
-        let kv_cap: Arc<dyn bro_capabilities::KvCapability> = kv.clone();
-        builtins.extend(crate::capabilities::capability_tools(Some(kv_cap)));
+        builtins.extend(crate::capabilities::capability_tools());
         // Code-mode (exec/wait) supersedes NARF as the authorial surface. The
         // callable set mirrors the flat surface — filtered builtins + capability
         // tools + all MCP — and a ToolCapability seam over that same set
@@ -722,7 +717,6 @@ impl Session {
             store,
             prior_side,
             todos,
-            kv,
             lsp_baselines,
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
             lsp_documents: BTreeMap::new(),
@@ -1212,7 +1206,6 @@ impl Session {
             .map(|t| t.to_side())
             .unwrap_or(Value::Null);
         side["nudges"] = self.hooks.to_side();
-        side["narf_kv"] = self.kv.to_side();
         side["lsp_baselines"] = self.lsp_baselines.to_side();
         self.store.save(&SaveState {
             transport: self.tx.name(),
@@ -1704,7 +1697,6 @@ mod tests {
             scripts: Arc::new(Mutex::new(scripts.into_iter().collect())),
         };
         let todos = Arc::new(Mutex::new(bro_tools::TodoList::default()));
-        let kv = Arc::new(crate::capabilities::KvStore::default());
         let cx = ToolCx {
             root: std::env::temp_dir(),
             safety: Arc::new(SafetyPolicy::new()),
@@ -1750,7 +1742,6 @@ mod tests {
             store: SessionStore::open(Some(&id), None).unwrap(),
             prior_side: Value::Null,
             todos,
-            kv,
             lsp_baselines: LspBaselines::default(),
             lsp_pool: bro_lsp::SessionPool::new(bro_lsp::LspConfig::default()),
             lsp_documents: BTreeMap::new(),

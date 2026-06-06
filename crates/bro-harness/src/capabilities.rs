@@ -11,35 +11,17 @@
 //! fail-closed behaviour the boundary doc requires (§2 — "the standalone binary
 //! injects absent impls → corpus capabilities fail closed").
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bro_capabilities::{
-    AtomCapability, AtomInvocation, CapabilityResult, CorpusCapability, CorpusLookup, KvCapability,
-    KvEntry, KvEntryInfo, KvGet, KvOrigin, KvSummary, RefactorCapability, RefactorRequest,
-    ToolCallOutput, ToolCapability, ToolInvocation,
+    AtomCapability, AtomInvocation, CorpusCapability, CorpusLookup, RefactorCapability,
+    RefactorRequest, ToolCallOutput, ToolCapability, ToolInvocation,
 };
 use bro_core::{AtomRef, BroError};
 use bro_tools::{Tool, ToolCx, ToolResult};
 use serde_json::{Value, json};
-
-const DEFAULT_KV_GET_MAX_BYTES: usize = 256 * 1024;
-const KV_SUMMARY_LINES: usize = 2;
-const KV_SUMMARY_LINE_BYTES: usize = 160;
-
-// ---------------------------------------------------------------------------
-// JSON argument extraction helpers for the model-facing NARF tools.
-// ---------------------------------------------------------------------------
-
-/// Extract a required non-empty string from a JSON object by key, returning an
-/// error labelled with `tool: \`key\` is required` on missing/empty.
-fn require_str(input: &Value, key: &str, tool: &str) -> Result<String, ToolResult> {
-    match input.get(key).and_then(Value::as_str) {
-        Some(s) if !s.trim().is_empty() => Ok(s.to_string()),
-        _ => Err(ToolResult::Error(format!("{tool}: `{key}` is required"))),
-    }
-}
 
 /// Process-global capability slots. The daemon is a singleton, so a single
 /// installed implementation per capability is the whole story; standalone
@@ -83,178 +65,6 @@ fn refactor() -> Option<Arc<dyn RefactorCapability>> {
         .read()
         .expect("refactor capability slot poisoned")
         .clone()
-}
-
-// ---------------------------------------------------------------------------
-// Session KV
-// ---------------------------------------------------------------------------
-
-/// Side-backed session KV store. The contract is home-agnostic in
-/// `bro-capabilities`; this implementation rides the harness `side` spine for
-/// exec/resume and daemon restart persistence.
-#[derive(Debug, Default)]
-pub struct KvStore {
-    entries: std::sync::Mutex<BTreeMap<String, KvEntry>>,
-}
-
-impl KvStore {
-    /// Restore from `side["narf_kv"]`. Tolerant: absent/garbage -> empty so old
-    /// session files resume cleanly.
-    pub fn from_side(v: &Value) -> Self {
-        let entries: BTreeMap<String, KvEntry> = v
-            .get("entries")
-            .and_then(|r| serde_json::from_value(r.clone()).ok())
-            .unwrap_or_default();
-        Self {
-            entries: std::sync::Mutex::new(entries),
-        }
-    }
-
-    /// Serialize back into the `side` cell.
-    pub fn to_side(&self) -> Value {
-        let entries = self.entries.lock().map(|e| e.clone()).unwrap_or_default();
-        json!({ "entries": entries })
-    }
-
-    fn make_entry(
-        name: String,
-        value_json: Value,
-        tags: Option<Value>,
-    ) -> Result<KvEntry, BroError> {
-        let bytes = serde_json::to_vec(&value_json).map_err(|e| {
-            BroError::new(
-                "kv_serialize_failed",
-                format!("failed to serialize KV value: {e}"),
-            )
-        })?;
-        let rendered = value_json
-            .as_str()
-            .map(str::to_string)
-            .unwrap_or_else(|| serde_json::to_string_pretty(&value_json).unwrap_or_default());
-        let info = KvEntryInfo {
-            name,
-            origin: KvOrigin::Agent,
-            tags,
-            content_type: "application/json".to_string(),
-            size: bytes.len(),
-            summary: summarize_value(&rendered),
-        };
-        Ok(KvEntry { info, value_json })
-    }
-
-    fn get_entry(&self, name: &str) -> CapabilityResult<KvEntry> {
-        self.entries
-            .lock()
-            .map_err(|_| BroError::new("kv_poisoned", "KV store lock poisoned"))?
-            .get(name)
-            .cloned()
-            .ok_or_else(|| BroError::new("kv_missing", format!("KV entry not found: {name}")))
-    }
-}
-
-fn byte_prefix(s: &str, max: usize) -> (&str, bool) {
-    if s.len() <= max {
-        return (s, false);
-    }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    (&s[..end], true)
-}
-
-fn summarize_value(rendered: &str) -> KvSummary {
-    let raw_lines: Vec<&str> = if rendered.is_empty() {
-        vec![""]
-    } else {
-        rendered.lines().collect()
-    };
-    let lines = raw_lines.len();
-    let mut truncated = lines > KV_SUMMARY_LINES * 2;
-
-    let mut bound = |line: &&str| {
-        let (bounded, was_truncated) = byte_prefix(line, KV_SUMMARY_LINE_BYTES);
-        truncated |= was_truncated;
-        bounded.to_string()
-    };
-
-    let head = raw_lines
-        .iter()
-        .take(KV_SUMMARY_LINES)
-        .map(&mut bound)
-        .collect();
-    let tail_start = lines.saturating_sub(KV_SUMMARY_LINES);
-    let tail = raw_lines.iter().skip(tail_start).map(&mut bound).collect();
-
-    KvSummary {
-        lines,
-        head,
-        tail,
-        truncated,
-    }
-}
-
-#[async_trait]
-impl KvCapability for KvStore {
-    async fn set(
-        &self,
-        name: String,
-        value_json: Value,
-        tags: Option<Value>,
-    ) -> CapabilityResult<KvEntryInfo> {
-        if name.trim().is_empty() {
-            return Err(BroError::new("kv_bad_name", "KV entry name is required"));
-        }
-        let entry = Self::make_entry(name.clone(), value_json, tags)?;
-        let info = entry.info.clone();
-        self.entries
-            .lock()
-            .map_err(|_| BroError::new("kv_poisoned", "KV store lock poisoned"))?
-            .insert(name, entry);
-        Ok(info)
-    }
-
-    async fn get(&self, name: String, max_bytes: Option<usize>) -> CapabilityResult<KvGet> {
-        let entry = self.get_entry(&name)?;
-        let limit = max_bytes
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_KV_GET_MAX_BYTES);
-        if entry.info.size > limit {
-            return Err(BroError::new(
-                "kv_value_too_large",
-                format!(
-                    "KV entry '{}' is {} bytes, over max_bytes {}",
-                    entry.info.name, entry.info.size, limit
-                ),
-            ));
-        }
-        Ok(KvGet {
-            name: entry.info.name,
-            value_json: entry.value_json,
-            size: entry.info.size,
-        })
-    }
-
-    async fn peek(&self, name: String) -> CapabilityResult<KvEntryInfo> {
-        Ok(self.get_entry(&name)?.info)
-    }
-
-    async fn list(&self) -> CapabilityResult<Vec<KvEntryInfo>> {
-        let entries = self
-            .entries
-            .lock()
-            .map_err(|_| BroError::new("kv_poisoned", "KV store lock poisoned"))?;
-        Ok(entries.values().map(|e| e.info.clone()).collect())
-    }
-
-    async fn delete(&self, name: String) -> CapabilityResult<bool> {
-        Ok(self
-            .entries
-            .lock()
-            .map_err(|_| BroError::new("kv_poisoned", "KV store lock poisoned"))?
-            .remove(&name)
-            .is_some())
-    }
 }
 
 /// The generic host built-in tool seam (`narf-tool-placement.md` §5): a NARF
@@ -326,7 +136,7 @@ impl ToolCapability for HostTools {
 /// (`crate::code_mode`), which supersedes the retired NARF tools. These remaining
 /// tools are the direct trait-dispatch surfaces: corpus search, atom invoke,
 /// refactor plan, and KV inspection.
-pub fn capability_tools(kv: Option<Arc<dyn KvCapability>>) -> Vec<Arc<dyn Tool>> {
+pub fn capability_tools() -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = Vec::new();
     if let Some(c) = corpus() {
         tools.push(Arc::new(CorpusSearchTool(c)));
@@ -337,11 +147,6 @@ pub fn capability_tools(kv: Option<Arc<dyn KvCapability>>) -> Vec<Arc<dyn Tool>>
     if let Some(r) = refactor() {
         tools.push(Arc::new(RefactorPlanTool(r.clone())));
         tools.push(Arc::new(RefactorPlanGetTool(r)));
-    }
-    if let Some(kv) = kv {
-        tools.push(Arc::new(NarfKvListTool(kv.clone())));
-        tools.push(Arc::new(NarfKvPeekTool(kv.clone())));
-        tools.push(Arc::new(NarfKvGetTool(kv)));
     }
     tools
 }
@@ -544,110 +349,6 @@ impl Tool for RefactorPlanGetTool {
                 "refactor_plan_get failed: {}: {}",
                 e.code, e.message
             )),
-        }
-    }
-}
-
-struct NarfKvListTool(Arc<dyn KvCapability>);
-
-#[async_trait]
-impl Tool for NarfKvListTool {
-    fn name(&self) -> &str {
-        "narf_kv_list"
-    }
-
-    fn description(&self) -> &str {
-        "List NARF session KV entries by name with summaries only. This is the model-facing enumeration surface; in-box cells cannot list keys."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {}
-        })
-    }
-
-    async fn call(&self, _input: Value, _cx: &ToolCx) -> ToolResult {
-        match self.0.list().await {
-            Ok(entries) => ToolResult::Json(json!({ "entries": entries })),
-            Err(e) => ToolResult::Error(format!("narf_kv_list failed: {}: {}", e.code, e.message)),
-        }
-    }
-}
-
-struct NarfKvPeekTool(Arc<dyn KvCapability>);
-
-#[async_trait]
-impl Tool for NarfKvPeekTool {
-    fn name(&self) -> &str {
-        "narf_kv_peek"
-    }
-
-    fn description(&self) -> &str {
-        "Inspect one NARF session KV entry by exact name. Returns metadata and summary, never the value."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Exact KV entry name." }
-            },
-            "required": ["name"]
-        })
-    }
-
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let name = match require_str(&input, "name", "narf_kv_peek") {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        match self.0.peek(name).await {
-            Ok(entry) => ToolResult::Json(json!(entry)),
-            Err(e) => ToolResult::Error(format!("narf_kv_peek failed: {}: {}", e.code, e.message)),
-        }
-    }
-}
-
-struct NarfKvGetTool(Arc<dyn KvCapability>);
-
-#[async_trait]
-impl Tool for NarfKvGetTool {
-    fn name(&self) -> &str {
-        "narf_kv_get"
-    }
-
-    fn description(&self) -> &str {
-        "Get one NARF session KV value by exact name, bounded by max_bytes (default 256 KiB). Use list/peek first to choose keys."
-    }
-
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "name": { "type": "string", "description": "Exact KV entry name." },
-                "max_bytes": {
-                    "type": "integer",
-                    "description": "Maximum serialized JSON bytes to return (default 262144).",
-                    "minimum": 1
-                }
-            },
-            "required": ["name"]
-        })
-    }
-
-    async fn call(&self, input: Value, _cx: &ToolCx) -> ToolResult {
-        let name = match require_str(&input, "name", "narf_kv_get") {
-            Ok(n) => n,
-            Err(e) => return e,
-        };
-        let max_bytes = input
-            .get("max_bytes")
-            .and_then(Value::as_u64)
-            .map(|n| n as usize);
-        match self.0.get(name, max_bytes).await {
-            Ok(value) => ToolResult::Json(json!(value)),
-            Err(e) => ToolResult::Error(format!("narf_kv_get failed: {}: {}", e.code, e.message)),
         }
     }
 }
@@ -865,80 +566,6 @@ mod tests {
             .await;
         let err = denied.expect_err("denied tool must fail closed");
         assert_eq!(err.code, "tool_unavailable");
-    }
-
-    #[tokio::test]
-    async fn kv_store_side_round_trip_preserves_entries() {
-        let kv = KvStore::default();
-        kv.set(
-            "records".to_string(),
-            json!([{ "id": 1 }]),
-            Some(json!({ "source": "test" })),
-        )
-        .await
-        .unwrap();
-
-        let blob = kv.to_side();
-        let restored = KvStore::from_side(&blob);
-        let entry = restored.peek("records".to_string()).await.unwrap();
-        assert_eq!(entry.name, "records");
-        assert_eq!(entry.origin, KvOrigin::Agent);
-        assert_eq!(entry.tags.unwrap()["source"], "test");
-        assert!(entry.size > 0);
-
-        let value = restored.get("records".to_string(), None).await.unwrap();
-        assert_eq!(value.value_json, json!([{ "id": 1 }]));
-    }
-
-    #[tokio::test]
-    async fn narf_kv_outbox_tools_list_peek_and_get_bounded() {
-        let kv = Arc::new(KvStore::default());
-        kv.set(
-            "memo".to_string(),
-            json!("alpha\nbeta\ngamma\ndelta\nepsilon"),
-            None,
-        )
-        .await
-        .unwrap();
-
-        let list = NarfKvListTool(kv.clone()).call(json!({}), &test_cx()).await;
-        match list {
-            ToolResult::Json(v) => {
-                let entries = v["entries"].as_array().expect("entries array");
-                assert_eq!(entries.len(), 1);
-                assert_eq!(entries[0]["name"], "memo");
-                assert_eq!(entries[0]["summary"]["head"][0], "alpha");
-                assert_eq!(entries[0]["summary"]["truncated"], true);
-            }
-            other => panic!("expected Json list, got {other:?}"),
-        }
-
-        let peek = NarfKvPeekTool(kv.clone())
-            .call(json!({ "name": "memo" }), &test_cx())
-            .await;
-        match peek {
-            ToolResult::Json(v) => {
-                assert_eq!(v["name"], "memo");
-                assert!(v.get("value_json").is_none(), "peek must not return value");
-            }
-            other => panic!("expected Json peek, got {other:?}"),
-        }
-
-        let too_small = NarfKvGetTool(kv.clone())
-            .call(json!({ "name": "memo", "max_bytes": 4 }), &test_cx())
-            .await;
-        assert!(matches!(too_small, ToolResult::Error(_)));
-
-        let get = NarfKvGetTool(kv)
-            .call(json!({ "name": "memo", "max_bytes": 1024 }), &test_cx())
-            .await;
-        match get {
-            ToolResult::Json(v) => {
-                assert_eq!(v["name"], "memo");
-                assert_eq!(v["value_json"], "alpha\nbeta\ngamma\ndelta\nepsilon");
-            }
-            other => panic!("expected Json get, got {other:?}"),
-        }
     }
 
 }
