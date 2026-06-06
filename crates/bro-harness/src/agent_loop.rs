@@ -489,8 +489,10 @@ struct Session {
     hooks: HookEngine,
     emitter: Emitter,
     base_opts: TurnOpts,
-    /// Caller-supplied system text (None ⇒ provider defaults).
-    system: Option<String>,
+    /// Explicit caller-supplied system text. Discovered AGENTS/UserInstructions
+    /// lives in `user_instructions`, not in the system slot.
+    explicit_system: Option<String>,
+    user_instructions: Option<crate::context::UserInstructions>,
     max_turns: u64,
     compaction: crate::compaction::CompactionPolicy,
     compact_threshold: Option<u64>,
@@ -547,12 +549,10 @@ impl Session {
             .unwrap_or(true);
 
         // Three-state --system-prompt:
-        //   non-empty ⇒ explicit override, used verbatim;
-        //   ""        ⇒ explicit suppress (no system prompt) — Codex's
-        //               project_doc_max_bytes=0 / AGENTS-omitting overlay analog;
-        //   absent    ⇒ not overridden ⇒ Codex-style AGENTS.md overlay
-        //               (global $CODEX_HOME/AGENTS.md + repo AGENTS.md, project
-        //               scope). Falls back to None when no AGENTS docs exist.
+        //   non-empty ⇒ explicit override, kept verbatim in the system slot;
+        //   ""        ⇒ explicit suppress (no system prompt, no AGENTS fragment);
+        //   absent    ⇒ not overridden ⇒ Codex-style AGENTS.md discovery moves
+        //               to UserInstructions in the contextual user message.
         // Per-session working directory: explicit `--cwd` (the daemon's
         // dispatch cwd, passed instead of mutating the process cwd) or the
         // process cwd for the standalone binary. All file/shell tools and
@@ -563,10 +563,10 @@ impl Session {
             None => std::env::current_dir().context("cwd")?,
         };
 
-        let system = match cli.system_prompt.as_deref() {
-            Some("") => None,
-            Some(s) => Some(s.to_string()),
-            None => crate::project_doc::discover(&root),
+        let (explicit_system, user_instructions) = match cli.system_prompt.as_deref() {
+            Some("") => (None, None),
+            Some(s) => (Some(s.to_string()), None),
+            None => (None, crate::context::UserInstructions::from_project(&root)),
         };
 
         let kind = TransportKind::from_env();
@@ -664,8 +664,11 @@ impl Session {
         // Code-mode projects the full tool surface (builtins + all MCP) into the
         // exec/wait authorial surface, so capture every MCP tool regardless of
         // box placement before the in/out-box vecs are consumed below.
-        let mcp_all_for_code_mode: Vec<Arc<dyn Tool>> =
-            mcp_in_box.iter().chain(mcp_out_box.iter()).cloned().collect();
+        let mcp_all_for_code_mode: Vec<Arc<dyn Tool>> = mcp_in_box
+            .iter()
+            .chain(mcp_out_box.iter())
+            .cloned()
+            .collect();
         // In-process capability bindings (harness-daemon-boundary.md §6): when the
         // daemon has installed corpus/atom/refactor impls, expose them as direct
         // trait-dispatch tools (corpus_search, atom_invoke, refactor_plan, KV
@@ -723,7 +726,8 @@ impl Session {
             hooks,
             emitter,
             base_opts,
-            system,
+            explicit_system,
+            user_instructions,
             max_turns,
             compaction,
             compact_threshold,
@@ -858,7 +862,7 @@ impl Session {
                     Err(e) => tracing::warn!("compaction failed: {e:#}"),
                 }
             }
-            let mut sys = compose_system(self.system.as_deref(), &self.reg);
+            let mut sys = compose_system(self.explicit_system.as_deref(), &self.reg);
             if let Some(t) = self.tail_nudge.take() {
                 let v = sys.volatile.get_or_insert_with(String::new);
                 if !v.is_empty() {
@@ -1090,8 +1094,12 @@ impl Session {
             return;
         }
         let env = crate::context::EnvironmentContext::from_tool_cx(&self.cx);
-        let rendered = crate::context::ContextualUserFragment::render(&env);
-        if let Some(message) = crate::context::build_contextual_user_message(vec![rendered]) {
+        let mut sections = Vec::new();
+        if let Some(instructions) = &self.user_instructions {
+            sections.push(crate::context::ContextualUserFragment::render(instructions));
+        }
+        sections.push(crate::context::ContextualUserFragment::render(&env));
+        if let Some(message) = crate::context::build_contextual_user_message(sections) {
             let added_tokens = message
                 .text_blocks
                 .iter()
@@ -1792,7 +1800,8 @@ mod tests {
                 web_search: false,
                 service_tier: None,
             },
-            system: None,
+            explicit_system: None,
+            user_instructions: None,
             max_turns: 50,
             compaction: crate::compaction::CompactionPolicy::from_env(),
             compact_threshold: None,
@@ -1888,6 +1897,81 @@ mod tests {
 
         assert!(restored.is_some());
         assert_eq!(restored.unwrap().cwd, session.cx.root.to_string_lossy());
+    }
+
+    fn occurrences(haystack: &str, needle: &str) -> usize {
+        haystack.match_indices(needle).count()
+    }
+
+    #[test]
+    fn discovered_agents_move_to_context_before_environment() {
+        let (mut session, shared) = mk_session(vec![]);
+        let agents = "AGENTS_UNIQUE_RULE";
+        session.user_instructions = Some(crate::context::UserInstructions {
+            directory: "/repo".into(),
+            text: agents.into(),
+        });
+
+        let system = compose_system(session.explicit_system.as_deref(), &session.reg);
+        assert!(
+            !system.stable_text().unwrap_or("").contains(agents),
+            "AGENTS text must not stay in system stable"
+        );
+
+        session.push_user_text("hello");
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(pushed.len(), 2);
+        let context = &pushed[0];
+        let user_idx = context.find("# AGENTS.md instructions").unwrap();
+        let env_idx = context.find("<environment_context>").unwrap();
+        assert!(user_idx < env_idx, "{context}");
+        assert_eq!(
+            occurrences(system.stable_text().unwrap_or(""), agents)
+                + occurrences(context, agents)
+                + occurrences(&pushed[1], agents),
+            1
+        );
+    }
+
+    #[test]
+    fn no_agents_emits_only_environment_context_and_pinned_system() {
+        let (mut session, shared) = mk_session(vec![]);
+
+        let system = compose_system(session.explicit_system.as_deref(), &session.reg);
+        let stable = system.stable_text().expect("pinned tools stable block");
+        assert!(stable.contains("Always-available tools"));
+        assert!(!stable.contains("AGENTS_UNIQUE_RULE"));
+
+        session.push_user_text("hello");
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(pushed.len(), 2);
+        assert!(pushed[0].starts_with("<environment_context>"));
+        assert!(!pushed[0].contains("# AGENTS.md instructions"));
+        assert_eq!(pushed[1], "hello");
+    }
+
+    #[test]
+    fn explicit_system_override_stays_system_and_not_user_instructions() {
+        let (mut session, shared) = mk_session(vec![]);
+        let explicit = "EXPLICIT_SYSTEM_UNIQUE";
+        session.explicit_system = Some(explicit.into());
+        session.user_instructions = None;
+
+        let system = compose_system(session.explicit_system.as_deref(), &session.reg);
+        assert!(system.stable_text().unwrap().contains(explicit));
+
+        session.push_user_text("hello");
+
+        let pushed = shared.pushed_users.lock().unwrap();
+        assert_eq!(
+            occurrences(system.stable_text().unwrap_or(""), explicit)
+                + occurrences(&pushed.join("\n"), explicit),
+            1
+        );
+        assert!(pushed[0].starts_with("<environment_context>"));
+        assert!(!pushed[0].contains("# AGENTS.md instructions"));
     }
 
     fn user_turns_after_initial_context(users: &[String]) -> &[String] {
