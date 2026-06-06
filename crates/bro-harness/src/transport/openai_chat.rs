@@ -126,15 +126,14 @@ impl OpenAiChatTransport {
             })
             .collect();
 
-        // System prompt is split: the cache-stable prefix is the leading system
-        // message (so the prefix stays byte-identical and the endpoint's
-        // automatic prefix cache holds); the volatile tail (manifest/nudges) is
-        // a *trailing* system message after the conversation. Both are
-        // per-request only (not stored in self.messages), so resume/edit stays
-        // cheap and the volatile tail never persists into history.
+        // Base prompt plus stable overlay are the leading system message; the
+        // volatile tail (manifest/nudges) is a trailing system message after
+        // the conversation. Both are per-request only (not stored in
+        // self.messages), so resume/edit stays cheap and the volatile tail
+        // never persists into history.
         let mut msgs: Vec<Value> = Vec::with_capacity(self.messages.len() + 2);
-        if let Some(stable) = opts.system.stable_text() {
-            msgs.push(json!({"role": "system", "content": stable}));
+        if let Some(system) = leading_system_message(opts) {
+            msgs.push(json!({"role": "system", "content": system}));
         }
         msgs.extend(self.messages.iter().cloned());
         if let Some(volatile) = opts.system.volatile_text() {
@@ -210,6 +209,21 @@ impl OpenAiChatTransport {
         }
         Ok(summary)
     }
+}
+
+fn leading_system_message(opts: &TurnOpts) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(base) = opts
+        .base_instructions
+        .as_ref()
+        .and_then(super::BaseInstructions::text)
+    {
+        parts.push(base);
+    }
+    if let Some(stable) = opts.system.stable_text() {
+        parts.push(stable);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
 /// One in-progress tool call accumulated across `chat.completion.chunk` deltas
@@ -603,7 +617,7 @@ fn render_chat_transcript(messages: &[Value], tool_cap: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::SystemPrompt;
+    use crate::transport::{BaseInstructions, SystemPrompt};
 
     fn transport() -> OpenAiChatTransport {
         OpenAiChatTransport {
@@ -618,11 +632,18 @@ mod tests {
         TurnOpts {
             model: "m".into(),
             max_tokens: 16,
+            base_instructions: None,
             system,
             effort: None,
             web_search: false,
             service_tier: None,
         }
+    }
+
+    fn opts_with_base(base: &str, system: SystemPrompt) -> TurnOpts {
+        let mut opts = opts(system);
+        opts.base_instructions = Some(BaseInstructions::new(base));
+        opts
     }
 
     #[test]
@@ -648,6 +669,26 @@ mod tests {
         assert_eq!(body["stream_options"]["include_usage"], true);
         // Neither system message was persisted into the buffer.
         assert_eq!(transport().messages.len(), 1);
+    }
+
+    #[test]
+    fn base_leads_stable_in_leading_system_message() {
+        let body = transport().build_body(
+            &[],
+            &opts_with_base(
+                "BASE",
+                SystemPrompt {
+                    stable: Some("OVERLAY".into()),
+                    volatile: Some("MANIFEST".into()),
+                },
+            ),
+        );
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "BASE\n\nOVERLAY");
+        assert_eq!(msgs[1]["role"], "user");
+        assert_eq!(msgs[2]["content"], "MANIFEST");
     }
 
     #[test]

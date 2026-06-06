@@ -168,10 +168,10 @@ pub(super) fn identity_auth_headers(
     headers
 }
 
-/// Build the Responses request body (pure; no I/O). The system split (stable
-/// `instructions` + a trailing volatile `developer` item that is never persisted
-/// into the buffer) is unit-testable. `input` is the conversation buffer;
-/// `session_id` keys the prompt cache.
+/// Build the Responses request body (pure; no I/O). The base instructions plus
+/// stable overlay go in `instructions`; the volatile `developer` item is never
+/// persisted into the buffer. `input` is the conversation buffer; `session_id`
+/// keys the prompt cache.
 pub(super) fn build_body(
     input: &[Value],
     session_id: &str,
@@ -194,10 +194,10 @@ pub(super) fn build_body(
         tool_defs.push(json!({"type": "web_search"}));
     }
 
-    // The cache-stable prefix goes in `instructions` (cached via
+    // The base prompt and cache-stable overlay go in `instructions` (cached via
     // prompt_cache_key); the volatile tail (manifest/nudges) rides as a
-    // trailing `developer` input item, appended per-request only so it
-    // never persists into the buffer and can't disturb the cached prefix.
+    // trailing `developer` input item, appended per-request only so it never
+    // persists into the buffer and can't disturb the cached prefix.
     let mut input = input.to_vec();
     if let Some(volatile) = opts.system.volatile_text() {
         input.push(json!({
@@ -216,10 +216,7 @@ pub(super) fn build_body(
     });
     // The ChatGPT backend rejects an empty/missing `instructions` field
     // ("Instructions are required"); always send a non-empty value.
-    let instructions = opts
-        .system
-        .stable_text()
-        .unwrap_or("You are a helpful coding assistant operating non-interactively.");
+    let instructions = response_instructions(opts);
     body["instructions"] = json!(instructions);
     if !tool_defs.is_empty() {
         body["tools"] = json!(tool_defs);
@@ -279,10 +276,7 @@ pub(super) fn build_compaction_input(
             })
         })
         .collect();
-    let instructions = opts
-        .system
-        .stable_text()
-        .unwrap_or("You are a helpful coding assistant operating non-interactively.");
+    let instructions = response_instructions(opts);
     json!({
         "model": opts.model,
         "input": input,
@@ -290,6 +284,25 @@ pub(super) fn build_compaction_input(
         "tools": tool_defs,
         "parallel_tool_calls": false,
     })
+}
+
+fn response_instructions(opts: &TurnOpts) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(base) = opts
+        .base_instructions
+        .as_ref()
+        .and_then(super::BaseInstructions::text)
+    {
+        parts.push(base);
+    }
+    if let Some(stable) = opts.system.stable_text() {
+        parts.push(stable);
+    }
+    if parts.is_empty() {
+        "You are a helpful coding assistant operating non-interactively.".to_string()
+    } else {
+        parts.join("\n\n")
+    }
 }
 
 /// Parse the SSE body: accumulate completed output items, append them to the
@@ -623,7 +636,7 @@ pub(super) fn classify_http_error(status: reqwest::StatusCode, body: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::SystemPrompt;
+    use crate::transport::{BaseInstructions, SystemPrompt};
 
     fn state() -> ResponsesState {
         let mut s = ResponsesState::new(Auth::ApiKey("k".into()));
@@ -638,11 +651,18 @@ mod tests {
         TurnOpts {
             model: "gpt-5-codex".into(),
             max_tokens: 16,
+            base_instructions: None,
             system,
             effort: None,
             web_search: false,
             service_tier: None,
         }
+    }
+
+    fn opts_with_base(base: &str, system: SystemPrompt) -> TurnOpts {
+        let mut opts = opts(system);
+        opts.base_instructions = Some(BaseInstructions::new(base));
+        opts
     }
 
     #[test]
@@ -665,6 +685,30 @@ mod tests {
     }
 
     #[test]
+    fn base_leads_instructions_and_preserves_overlay_content() {
+        let body = state().build_body(
+            &[],
+            &opts_with_base(
+                "BASE",
+                SystemPrompt {
+                    stable: Some("OVERLAY".into()),
+                    volatile: Some("MANIFEST".into()),
+                },
+            ),
+        );
+        let instructions = body["instructions"].as_str().unwrap();
+        assert!(instructions.starts_with("BASE"));
+        assert!(instructions.contains("OVERLAY"));
+        assert!(!instructions.contains("You are a helpful coding assistant"));
+
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[1]["role"], "developer");
+        assert_eq!(input[1]["content"][0]["text"], "MANIFEST");
+    }
+
+    #[test]
     fn empty_stable_falls_back_to_nonempty_instructions() {
         let body = state().build_body(
             &[],
@@ -677,6 +721,21 @@ mod tests {
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 2);
         assert_eq!(input[1]["role"], "developer");
+    }
+
+    #[test]
+    fn empty_base_degrades_to_prior_stable_behavior() {
+        let body = state().build_body(
+            &[],
+            &opts_with_base(
+                "",
+                SystemPrompt {
+                    stable: Some("OVERLAY".into()),
+                    volatile: None,
+                },
+            ),
+        );
+        assert_eq!(body["instructions"], "OVERLAY");
     }
 
     #[test]

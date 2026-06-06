@@ -89,10 +89,19 @@ impl AnthropicTransport {
             "messages": messages_with_cache_breakpoint(&self.messages),
             "stream": true,
         });
-        // System is up to two blocks: a cache-stable prefix (carries the
-        // ephemeral cache breakpoint) and a volatile tail (manifest/nudges,
-        // never cached, so a changing tail can't invalidate the cached prefix).
+        // System is ordered base -> stable overlay -> volatile tail. Base and
+        // stable are cache-stable blocks; volatile is never cached, so a
+        // changing tail can't invalidate the cached prefix.
         let mut system_blocks: Vec<Value> = Vec::new();
+        if let Some(base) = opts
+            .base_instructions
+            .as_ref()
+            .and_then(super::BaseInstructions::text)
+        {
+            system_blocks.push(json!({
+                "type": "text", "text": base, "cache_control": cache_control(),
+            }));
+        }
         if let Some(stable) = opts.system.stable_text() {
             system_blocks.push(json!({
                 "type": "text", "text": stable, "cache_control": cache_control(),
@@ -777,7 +786,7 @@ fn messages_with_cache_breakpoint(messages: &[Value]) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::SystemPrompt;
+    use crate::transport::{BaseInstructions, SystemPrompt};
 
     fn transport() -> AnthropicTransport {
         AnthropicTransport {
@@ -792,11 +801,18 @@ mod tests {
         TurnOpts {
             model: "m".into(),
             max_tokens: 16,
+            base_instructions: None,
             system,
             effort: None,
             web_search: false,
             service_tier: None,
         }
+    }
+
+    fn opts_with_base(base: &str, system: SystemPrompt) -> TurnOpts {
+        let mut opts = opts(system);
+        opts.base_instructions = Some(BaseInstructions::new(base));
+        opts
     }
 
     #[test]
@@ -841,6 +857,28 @@ mod tests {
         assert_eq!(body["messages"].as_array().unwrap().len(), 1);
         // Streaming is requested.
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn base_leads_stable_then_volatile_system_blocks() {
+        let body = transport().build_body(
+            &[],
+            &opts_with_base(
+                "BASE",
+                SystemPrompt {
+                    stable: Some("OVERLAY".into()),
+                    volatile: Some("MANIFEST".into()),
+                },
+            ),
+        );
+        let sys = body["system"].as_array().expect("system array");
+        assert_eq!(sys.len(), 3);
+        assert_eq!(sys[0]["text"], "BASE");
+        assert_eq!(sys[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys[1]["text"], "OVERLAY");
+        assert_eq!(sys[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(sys[2]["text"], "MANIFEST");
+        assert!(sys[2].get("cache_control").is_none());
     }
 
     #[test]
@@ -1121,6 +1159,7 @@ mod tests {
             let opts = TurnOpts {
                 model,
                 max_tokens: 32,
+                base_instructions: None,
                 system: SystemPrompt::default(),
                 effort: None,
                 web_search: false,

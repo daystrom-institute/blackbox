@@ -469,6 +469,7 @@ mod tests {
         let opts = TurnOpts {
             model: "gpt-5-codex".into(),
             max_tokens: 16,
+            base_instructions: None,
             system: crate::transport::SystemPrompt::default(),
             effort: None,
             web_search: false,

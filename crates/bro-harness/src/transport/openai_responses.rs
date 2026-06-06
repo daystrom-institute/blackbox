@@ -556,6 +556,7 @@ mod tests {
         let opts = TurnOpts {
             model,
             max_tokens: 256,
+            base_instructions: None,
             system: SystemPrompt {
                 stable: Some("You are a helpful assistant.".into()),
                 volatile: None,

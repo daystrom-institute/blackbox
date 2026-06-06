@@ -189,9 +189,9 @@ pub struct ToolSpec {
 /// `volatile` (the deferred-tool manifest, and later ambient nudges) is
 /// recomposed every turn and is never cached — placing it after the breakpoint
 /// keeps a changing tail from invalidating the cached prefix. Each transport
-/// renders the split natively (Anthropic: two `system` blocks, cache_control on
-/// the first; OpenAI Chat: leading system message + trailing system message;
-/// Responses: `instructions` + trailing `developer` input item). See
+/// renders the split natively after [`BaseInstructions`] (Anthropic: cached
+/// `system` blocks; OpenAI Chat: leading system message + trailing system
+/// message; Responses: `instructions` + trailing `developer` input item). See
 /// design/bro-harness/bro-harness-hooks.md §1.
 #[derive(Debug, Default, Clone)]
 pub struct SystemPrompt {
@@ -210,6 +210,78 @@ impl SystemPrompt {
     }
 }
 
+pub const BASE_INSTRUCTIONS_DEFAULT: &str =
+    include_str!("../../prompts/base_instructions/default.md");
+pub const BASE_INSTRUCTIONS_FALLBACK: &str =
+    include_str!("../../prompts/base_instructions/fallback.md");
+// The model-family files are resolved templates with Codex's default empty
+// personality baked in; dynamic personality is a later fragment-stage concern.
+pub const BASE_INSTRUCTIONS_GPT_5_5: &str =
+    include_str!("../../prompts/base_instructions/gpt-5.5.md");
+pub const BASE_INSTRUCTIONS_GPT_5_CODEX: &str =
+    include_str!("../../prompts/base_instructions/gpt-5-codex.md");
+
+/// Model-family base instructions, rendered into the transport's native
+/// system/instructions slot before the existing harness overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaseInstructions {
+    pub text: String,
+}
+
+impl BaseInstructions {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self { text: text.into() }
+    }
+
+    /// Non-empty base text, if any.
+    pub fn text(&self) -> Option<&str> {
+        (!self.text.is_empty()).then_some(self.text.as_str())
+    }
+}
+
+impl Default for BaseInstructions {
+    fn default() -> Self {
+        Self::new(BASE_INSTRUCTIONS_FALLBACK)
+    }
+}
+
+/// Select the model-family base prompt. Stage 0 vendors codex's unknown-model
+/// fallback plus resolved model-catalog templates available in the local codex
+/// clone.
+pub fn base_instructions_for(model: &str) -> BaseInstructions {
+    let slug = normalize_model_slug(model);
+    if slug == "gpt-5.5" {
+        BaseInstructions::new(BASE_INSTRUCTIONS_GPT_5_5)
+    } else if is_gpt_5_codex_family(&slug) {
+        BaseInstructions::new(BASE_INSTRUCTIONS_GPT_5_CODEX)
+    } else {
+        BaseInstructions::default()
+    }
+}
+
+fn normalize_model_slug(model: &str) -> String {
+    let mut slug = model
+        .trim()
+        .to_ascii_lowercase()
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    while !slug.starts_with("gpt-") {
+        let Some((_, rest)) = slug.split_once('.') else {
+            break;
+        };
+        slug = rest.to_string();
+    }
+    slug
+}
+
+fn is_gpt_5_codex_family(slug: &str) -> bool {
+    slug == "gpt-5-codex"
+        || slug.starts_with("gpt-5-codex-")
+        || (slug.starts_with("gpt-5.") && slug.contains("-codex"))
+}
+
 /// Per-turn knobs. `web_search` requests the transport's *server-side* search
 /// tool when it has one (Anthropic `web_search_20250305`, Responses
 /// `web_search`); transports without one ignore it.
@@ -221,6 +293,7 @@ impl SystemPrompt {
 pub struct TurnOpts {
     pub model: String,
     pub max_tokens: u32,
+    pub base_instructions: Option<BaseInstructions>,
     pub system: SystemPrompt,
     pub effort: Option<String>,
     pub web_search: bool,
@@ -341,6 +414,44 @@ pub enum TransportKind {
     Anthropic,
     OpenAiChat,
     OpenAiResponses,
+}
+
+#[cfg(test)]
+mod base_instruction_tests {
+    use super::*;
+
+    #[test]
+    fn default_base_instructions_are_loaded_from_vendored_file() {
+        let base = base_instructions_for("not-a-codex-model");
+        assert!(!base.text.is_empty());
+        assert!(base.text.contains("Codex CLI"));
+        assert_eq!(base.text, BASE_INSTRUCTIONS_FALLBACK);
+    }
+
+    #[test]
+    fn codex_family_models_select_catalog_base_instructions() {
+        let gpt_5_5 = base_instructions_for("gpt-5.5");
+        assert_eq!(gpt_5_5.text, BASE_INSTRUCTIONS_GPT_5_5);
+        assert!(gpt_5_5.text.contains("You are Codex"));
+        assert!(!gpt_5_5.text.contains("{{ personality }}"));
+
+        let namespaced_gpt_5_5 = base_instructions_for("openai.gpt-5.5");
+        assert_eq!(namespaced_gpt_5_5.text, BASE_INSTRUCTIONS_GPT_5_5);
+
+        let gpt_5_codex = base_instructions_for("custom/gpt-5.3-codex");
+        assert_eq!(gpt_5_codex.text, BASE_INSTRUCTIONS_GPT_5_CODEX);
+        assert!(gpt_5_codex.text.contains("You are Codex"));
+        assert!(!gpt_5_codex.text.contains("{{ personality }}"));
+
+        let gpt_5_codex_mini = base_instructions_for("gpt-5-codex-mini");
+        assert_eq!(gpt_5_codex_mini.text, BASE_INSTRUCTIONS_GPT_5_CODEX);
+
+        let gpt_5_x_codex = base_instructions_for("gpt-5.x-codex");
+        assert_eq!(gpt_5_x_codex.text, BASE_INSTRUCTIONS_GPT_5_CODEX);
+
+        let gpt_5_x_codex_suffix = base_instructions_for("gpt-5.x-codex-alpha");
+        assert_eq!(gpt_5_x_codex_suffix.text, BASE_INSTRUCTIONS_GPT_5_CODEX);
+    }
 }
 
 impl TransportKind {

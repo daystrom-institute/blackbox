@@ -465,7 +465,9 @@ async fn run_prompt_with_controls(
     // with no result — the silent-completion hole tracked in gap-32113fd4.
     if let Err(e) = turn_result {
         tracing::error!("turn failed: {e:#}");
-        session.emitter.result_error(&format!("{e:#}"), session.turns);
+        session
+            .emitter
+            .result_error(&format!("{e:#}"), session.turns);
     }
     for (subtype, raw) in deferred {
         session.apply_control(&subtype, &raw);
@@ -684,6 +686,7 @@ impl Session {
         let reg = Registry::new(builtins, mcp_out_box, &pin, &tool_filter);
 
         let base_opts = TurnOpts {
+            base_instructions: Some(transport::base_instructions_for(&model)),
             model,
             max_tokens,
             system: SystemPrompt::default(),
@@ -1728,6 +1731,7 @@ mod tests {
             base_opts: TurnOpts {
                 model: "m".into(),
                 max_tokens: 8,
+                base_instructions: None,
                 system: SystemPrompt::default(),
                 effort: None,
                 web_search: false,
