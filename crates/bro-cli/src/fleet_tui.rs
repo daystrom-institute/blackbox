@@ -319,6 +319,11 @@ struct App {
     zone: Zone,
     /// Index into the bucket-ordered agent list (see [`ordered_agents`]).
     roster_selected: usize,
+    /// Task id the roster cursor is pinned to, so the selection follows that
+    /// agent across live re-sorts (bucket/started_at changes) instead of a row
+    /// index pointing at whatever agent slid into that slot. Reconciled to a row
+    /// index each frame; updated whenever the user moves the cursor.
+    roster_anchor_id: Option<String>,
     /// Stable task id for the currently open single-agent view. Roster order is
     /// live-sorted, so a row index is not a stable identity while agents update.
     focused_agent_id: Option<String>,
@@ -427,6 +432,7 @@ impl App {
             mode,
             zone: Zone::Roster,
             roster_selected: 0,
+            roster_anchor_id: None,
             focused_agent_id: None,
             provider_cursor,
             model_cursor,
@@ -523,6 +529,38 @@ impl App {
         order
             .iter()
             .position(|&idx| self.agents[idx].task.id() == id)
+    }
+
+    /// Pin the roster cursor to the agent currently under it, so a later
+    /// re-sort can move the row index to keep tracking the same agent. Call
+    /// after any user-driven change to `roster_selected`.
+    fn anchor_roster_selection(&mut self) {
+        let (_, order) = self.ordered_agents();
+        self.roster_anchor_id = order
+            .get(self.roster_selected)
+            .map(|&idx| self.agents[idx].task.id());
+    }
+
+    /// Re-point `roster_selected` at the anchored agent if a live re-sort moved
+    /// it, then clamp and refresh the anchor. Runs once per frame before draw so
+    /// the cursor never silently slides onto a different agent (e.g. when the
+    /// selected agent finishes and drops from the active bucket to Finished).
+    fn reconcile_roster_selection(&mut self) {
+        let (_, order) = self.ordered_agents();
+        if order.is_empty() {
+            self.roster_selected = 0;
+            self.roster_anchor_id = None;
+            return;
+        }
+        if let Some(id) = &self.roster_anchor_id
+            && let Some(pos) = order.iter().position(|&idx| self.agents[idx].task.id() == *id)
+        {
+            self.roster_selected = pos;
+        }
+        if self.roster_selected >= order.len() {
+            self.roster_selected = order.len() - 1;
+        }
+        self.roster_anchor_id = Some(self.agents[order[self.roster_selected]].task.id());
     }
 
     fn dispatch_current_input(&mut self) {
@@ -644,6 +682,9 @@ fn dispatch_fleet_prompt(app: &mut App, prompt: String, name: String) {
         pending_inputs: VecDeque::new(),
         seen_user_steers: 0,
     });
+    // Move the roster cursor onto the just-dispatched agent and pin it there, so
+    // it stays selected as it surfaces in (and later moves between) buckets.
+    app.roster_anchor_id = Some(id.clone());
     app.clear_input();
     // Persist so the session is recoverable even before it terminates.
     app.orch.persist();
@@ -1401,6 +1442,10 @@ fn run_tui_inner(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> anyhow::R
                 terminal.clear()?;
                 drawn_zone = Some(app.zone);
             }
+            // Follow the anchored agent across any re-sort that landed since the
+            // last frame, so the roster cursor (and a subsequent zoom-into-agent)
+            // stays on the same agent rather than whatever row slid under it.
+            app.reconcile_roster_selection();
             terminal.draw(|f| draw(f, app))?;
 
             if event::poll(Duration::from_millis(100))? {
@@ -2273,6 +2318,13 @@ fn resume_selected(app: &mut App, idx: usize) {
 
     app.orch.forget(&old_id); // drop the stale Interrupted task
     app.agents[idx].task = handle;
+    // The resumed task has a fresh id. If the single-agent view was focused on
+    // this agent (focused_agent_id == old id), repoint it at the new id —
+    // otherwise `selected_agent()` no longer matches and the cockpit silently
+    // falls back to `roster_selected`, rendering a different agent's transcript.
+    if app.focused_agent_id.as_deref() == Some(old_id.as_str()) {
+        app.focused_agent_id = Some(app.agents[idx].task.id());
+    }
     app.agents[idx].classifier = app.orch.classifier().map(|cfg| {
         spawn_monitor(
             &app.rt,
@@ -2355,6 +2407,7 @@ fn zoom_left(app: &mut App) {
             && let Some(pos) = app.roster_position_for_agent_id(id)
         {
             app.roster_selected = pos;
+            app.anchor_roster_selection();
         }
         app.focused_agent_id = None;
     }
@@ -2506,6 +2559,7 @@ fn vertical(app: &mut App, delta: isize) {
             }
             let cur = app.roster_selected as isize;
             app.roster_selected = (((cur + delta) % n as isize + n as isize) % n as isize) as usize;
+            app.anchor_roster_selection();
         }
         Zone::SingleAgent => recall_history(app, delta),
         Zone::Config => config_vertical(app, delta),
