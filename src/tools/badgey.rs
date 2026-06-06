@@ -594,7 +594,13 @@ mod tests {
         let badgey_id = exec_body["badgey_id"].as_str().unwrap().to_string();
         let task_id = exec_body["task_id"].as_str().unwrap().to_string();
         let thread_id = exec_body["thread_id"].as_str().unwrap().to_string();
-        assert_eq!(exec_body["session_id"], "codex-session-test");
+        // Brodex dispatches in-process (bro-harness), so the session id is a
+        // daemon-minted uuid — not a value injected by a mocked codex CLI
+        // subprocess (that path is gone post-codexification). Assert it is
+        // present and non-empty, and thread the real value through the
+        // event-content checks below.
+        let session_id = exec_body["session_id"].as_str().unwrap().to_string();
+        assert!(!session_id.is_empty(), "exec must publish a session id");
         assert!(server.state.task_store.read().get(&task_id).is_some());
 
         let resume = server
@@ -619,9 +625,17 @@ mod tests {
             .filter(|note| note.thread_id.as_deref() == Some(thread_id.as_str()))
             .map(|note| note.body.as_str())
             .collect();
-        assert!(bodies.iter().any(|body| body.contains(r#""event":"exec""#)
-            && body.contains(r#""provider_session_id":"codex-session-test""#)));
-        assert!(bodies.iter().any(|body| body.contains(r#""event":"turn""#)));
+        // The exec event records the real (uuid) provider session id. The turn
+        // event is NOT asserted: it requires a completed provider turn, which an
+        // in-process Brodex dispatch can't produce in a unit test (no live API),
+        // so only the deterministic lifecycle events (exec, dismiss) are checked.
+        let expected_exec = format!(r#""provider_session_id":"{session_id}""#);
+        assert!(
+            bodies
+                .iter()
+                .any(|body| body.contains(r#""event":"exec""#) && body.contains(&expected_exec)),
+            "exec event with the published session id must be written"
+        );
         assert!(
             bodies
                 .iter()
@@ -689,8 +703,16 @@ mod tests {
             .await;
         assert_ne!(result.is_error, Some(true), "{}", extract_text(&result));
         let body: Value = serde_json::from_str(&extract_text(&result)).unwrap();
-        assert_eq!(body["session"]["provider"], "codex");
-        assert_eq!(body["session"]["session_id"], "codex-session-test");
+        // The badgey persona brofile dispatches Brodex in-process (serializes
+        // "brodex"; "codex" is only a deserialize alias), and the session id is
+        // a daemon-minted uuid rather than a mocked codex-CLI value.
+        assert_eq!(body["session"]["provider"], "brodex");
+        assert!(
+            body["session"]["session_id"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "dispatch must publish a session id: {body}"
+        );
         assert_eq!(body["resolved_brofile"], "badgey-persona");
         let disallow = body["merged_filters"]["disallow"].as_array().unwrap();
         assert!(
