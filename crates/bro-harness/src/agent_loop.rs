@@ -24,8 +24,7 @@ use crate::registry::{PinPolicy, Registry};
 use crate::session::{SaveState, SessionStore};
 use crate::transport::{self, StopReason, SystemPrompt, Transport, TransportKind, TurnOpts, Usage};
 use anyhow::{Context, Result};
-use async_trait::async_trait;
-use bro_tools::{SafetyPolicy, ShellRun, Tool, ToolCx, ToolResult, builtin_tools};
+use bro_tools::{SafetyPolicy, Tool, ToolCx, builtin_tools};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Read as _;
@@ -41,51 +40,6 @@ const DEFAULT_MAX_TOKENS: u32 = 32000;
 /// Hard backstop on loop iterations *per user turn*; the daemon's supervision is
 /// the outer guard. Override with `BRO_HARNESS_MAX_TURNS`.
 const DEFAULT_MAX_TURNS: u64 = 50;
-
-fn builtin_tools_for_mode(fleet: bool) -> Vec<Arc<dyn Tool>> {
-    let mut tools = builtin_tools();
-    if fleet {
-        tools.retain(|tool| {
-            !matches!(
-                tool.name(),
-                "shell_run" | "shell_poll" | "shell_kill" | "shell_list"
-            )
-        });
-        tools.push(Arc::new(FleetShellRun));
-    }
-    tools
-}
-
-struct FleetShellRun;
-
-#[async_trait]
-impl Tool for FleetShellRun {
-    fn name(&self) -> &str {
-        "shell_run"
-    }
-
-    fn description(&self) -> &str {
-        "Run a shell command in fleet mode as a harness-local Promise. Starts immediately and returns {promise_id,state,running,next_step}; use promise_wait, promise_status, promise_when_all, promise_when_any, or promise_cancel for lifecycle. Completion automatically injects a hidden HARNESS_EVENT turn unless a terminal wait already returned the result. The blocking/yield-poll shell_run path and shell_poll sessions are intentionally unavailable in fleet mode."
-    }
-
-    fn input_schema(&self) -> Value {
-        let mut schema = ShellRun.input_schema();
-        if let Some(props) = schema.get_mut("properties").and_then(Value::as_object_mut) {
-            props.remove("mode");
-            props.remove("yield_time_ms");
-        }
-        schema
-    }
-
-    async fn call(&self, mut input: Value, cx: &ToolCx) -> ToolResult {
-        let Some(obj) = input.as_object_mut() else {
-            return ToolResult::Error("bad input: expected object".into());
-        };
-        obj.insert("mode".into(), Value::String("promise".into()));
-        obj.remove("yield_time_ms");
-        ShellRun.call(input, cx).await
-    }
-}
 
 /// Marker injected as a tool_result when a tool dispatch is interrupted, so the
 /// transport buffer stays valid (every tool_use gets a matching result).
@@ -150,12 +104,7 @@ async fn run_with_emitter(
     // A cancel channel that never fires — one-shot turns are not interruptible.
     let (_cancel_tx, cancel_rx) = watch::channel(false);
     session
-        .user_turn(
-            &prompt,
-            cancel_rx,
-            Arc::new(StdMutex::new(VecDeque::new())),
-            true,
-        )
+        .user_turn(&prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
         .await?;
     session.persist()?;
     Ok(())
@@ -270,37 +219,22 @@ async fn session_loop(
     mut pending: VecDeque<String>,
 ) -> Result<()> {
     loop {
-        let (prompt, allow_context_diff) = match pending.pop_front() {
-            Some(p) => (p, true),
-            None => {
-                if let Some(event) = session.promise_completion_event_prompt() {
-                    (event, false)
-                } else {
-                    let promise_notify = session.promise_notifier();
-                    tokio::select! {
-                        maybe = input_rx.recv() => match maybe {
-                            Some(Input::User(p)) => (p, true),
-                            Some(Input::Control {
-                                subtype,
-                                req_id,
-                                raw,
-                            }) => {
-                                // Control while idle: apply any mutation, ack success.
-                                session.apply_control(&subtype, &raw);
-                                ctrl_emitter.control_response_success(req_id.as_deref());
-                                continue;
-                            }
-                            None => break, // stdin closed and nothing pending
-                        },
-                        _ = promise_notify.notified() => {
-                            match session.promise_completion_event_prompt() {
-                                Some(event) => (event, false),
-                                None => continue,
-                            }
-                        }
-                    }
+        let prompt = match pending.pop_front() {
+            Some(p) => p,
+            None => match input_rx.recv().await {
+                Some(Input::User(p)) => p,
+                Some(Input::Control {
+                    subtype,
+                    req_id,
+                    raw,
+                }) => {
+                    // Control while idle: apply any mutation, ack success.
+                    session.apply_control(&subtype, &raw);
+                    ctrl_emitter.control_response_success(req_id.as_deref());
+                    continue;
                 }
-            }
+                None => break, // stdin closed and nothing pending
+            },
         };
 
         // `/compact` is an in-stream slash command, not a model turn.
@@ -321,12 +255,7 @@ async fn session_loop(
         let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
             Arc::new(StdMutex::new(VecDeque::new()));
         {
-            let turn = session.user_turn(
-                &prompt,
-                cancel_rx,
-                mid_turn_user_inputs.clone(),
-                allow_context_diff,
-            );
+            let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
             tokio::pin!(turn);
             loop {
                 tokio::select! {
@@ -439,7 +368,7 @@ async fn run_prompt_with_controls(
     let mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>> =
         Arc::new(StdMutex::new(VecDeque::new()));
     let turn_result = {
-        let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone(), true);
+        let turn = session.user_turn(&prompt, cancel_rx, mid_turn_user_inputs.clone());
         tokio::pin!(turn);
         loop {
             tokio::select! {
@@ -637,7 +566,6 @@ impl Session {
             http: reqwest::Client::new(),
             todos: todos.clone(),
             shell_sessions: Arc::new(std::sync::Mutex::new(bro_tools::ShellSessions::default())),
-            promises: Arc::new(std::sync::Mutex::new(bro_tools::PromiseStore::default())),
             edits: edits.clone(),
             session_env: Arc::new(transport::session_env_snapshot()),
         };
@@ -653,7 +581,7 @@ impl Session {
         let fleet = cli.input_format.as_deref() == Some("stream-json");
         let tool_filter =
             mcp::ToolFilter::from_csv(cli.deny_tools.as_deref(), cli.allow_tools.as_deref());
-        let mut builtins = builtin_tools_for_mode(fleet);
+        let mut builtins = builtin_tools();
         builtins.push(Arc::new(crate::report::ReportTool::new(make_emitter(
             store.id.clone(),
             callback.clone(),
@@ -814,7 +742,6 @@ impl Session {
         prompt: &str,
         mut cancel: watch::Receiver<bool>,
         mid_turn_user_inputs: Arc<StdMutex<VecDeque<String>>>,
-        allow_context_diff: bool,
     ) -> Result<()> {
         let mut pending_prompt = Some(prompt);
         let prompt_estimate = est_tokens(prompt);
@@ -879,11 +806,8 @@ impl Session {
                 }
             }
             if let Some(prompt) = pending_prompt.take() {
-                self.prepare_context_for_user_turn(allow_context_diff);
+                self.prepare_context_for_user_turn();
                 self.push_user_text_raw(prompt);
-            }
-            if let Some(event) = self.promise_completion_event_prompt() {
-                self.push_user_text_raw(&event);
             }
             let mut sys = compose_system(self.explicit_system.as_deref(), &self.reg);
             if let Some(t) = self.tail_nudge.take() {
@@ -1185,10 +1109,10 @@ impl Session {
         }
     }
 
-    fn prepare_context_for_user_turn(&mut self, allow_context_diff: bool) {
+    fn prepare_context_for_user_turn(&mut self) {
         if self.reference_context_item.is_none() {
             self.emit_initial_context_if_needed();
-        } else if allow_context_diff {
+        } else {
             self.emit_environment_context_diff_if_needed();
         }
     }
@@ -1264,13 +1188,10 @@ impl Session {
         final_text: &str,
     ) -> Value {
         let shell_ids = self.cx.shell_sessions.lock().unwrap().ids();
-        let promise_list = self.cx.promises.lock().unwrap().list();
-        let promises = promise_summary(&promise_list);
-        let running_promises = promises["running_count"].as_u64().unwrap_or(0);
         let last_tool_running = last_tool_results
             .iter()
             .any(|v| v["running"].as_bool() == Some(true));
-        let outstanding_async = !shell_ids.is_empty() || running_promises > 0 || last_tool_running;
+        let outstanding_async = !shell_ids.is_empty() || last_tool_running;
 
         // Empty-output stop: the model itself ended the turn (not max_turns /
         // cancel / interrupt) having produced no assistant text AND no tool
@@ -1286,9 +1207,6 @@ impl Session {
         let mut suspicion_reasons: Vec<&str> = Vec::new();
         if !shell_ids.is_empty() {
             suspicion_reasons.push("outstanding_shell_sessions");
-        }
-        if running_promises > 0 {
-            suspicion_reasons.push("running_promises");
         }
         if last_tool_running {
             suspicion_reasons.push("last_tool_running");
@@ -1312,20 +1230,10 @@ impl Session {
                 "count": shell_ids.len(),
                 "ids": shell_ids,
             },
-            "promises": promises,
             "last_tool_results": last_tool_results,
             "suspicion_reasons": suspicion_reasons,
             "suspicious": suspicious,
         })
-    }
-
-    fn promise_notifier(&self) -> Arc<tokio::sync::Notify> {
-        self.cx.promises.lock().unwrap().notifier()
-    }
-
-    fn promise_completion_event_prompt(&mut self) -> Option<String> {
-        let events = self.cx.promises.lock().unwrap().drain_completion_events();
-        (!events.is_empty()).then(|| events.join("\n\n"))
     }
 
     /// Batch-boundary diagnostics seam: drain the edit sink accumulated over the
@@ -1424,28 +1332,6 @@ fn stop_reason_label(stop: Option<&StopReason>) -> Value {
     }
 }
 
-fn promise_summary(list: &Value) -> Value {
-    let Some(entries) = list.as_array() else {
-        return json!({
-            "count": 0,
-            "running_count": 0,
-            "running_ids": [],
-            "terminal_count": 0,
-        });
-    };
-    let running_ids: Vec<Value> = entries
-        .iter()
-        .filter(|entry| entry["running"].as_bool() == Some(true))
-        .filter_map(|entry| entry["promise_id"].as_str().map(|id| json!(id)))
-        .collect();
-    json!({
-        "count": entries.len(),
-        "running_count": running_ids.len(),
-        "running_ids": running_ids,
-        "terminal_count": entries.len().saturating_sub(running_ids.len()),
-    })
-}
-
 fn tool_result_trace(call: &transport::ToolCall, result: &transport::ToolResult) -> Value {
     let parsed = serde_json::from_str::<Value>(&result.content).ok();
     let mut trace = json!({
@@ -1460,9 +1346,6 @@ fn tool_result_trace(call: &transport::ToolCall, result: &transport::ToolResult)
         }
         if let Some(session_id) = body["session_id"].as_str() {
             trace["session_id"] = json!(session_id);
-        }
-        if let Some(promise_id) = body["promise_id"].as_str() {
-            trace["promise_id"] = json!(promise_id);
         }
         if let Some(timed_out) = body["timed_out"].as_bool() {
             trace["timed_out"] = json!(timed_out);
@@ -1588,7 +1471,6 @@ fn est_tool_results(results: &[transport::ToolResult]) -> u64 {
 /// tail. See the transport `SystemPrompt` docs.
 fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
     let mut stable = base.unwrap_or("").to_string();
-    let shell_promises_only = reg.contains("shell_run") && !reg.contains("shell_poll");
 
     let pinned = reg.pinned();
     if !pinned.is_empty() {
@@ -1603,25 +1485,12 @@ fn compose_system(base: Option<&str>, reg: &Registry) -> SystemPrompt {
         for (name, desc) in pinned {
             stable.push_str(&format!("- `{name}` — {desc}\n"));
         }
-        if shell_promises_only {
-            stable.push_str(
-                "\nShell promises: `shell_run` starts commands as harness-local Promises in fleet mode; \
-                 the blocking/yield-poll path and `shell_poll` sessions are unavailable. Use \
-                 `promise_wait`, `promise_status`, `promise_when_all`, `promise_when_any`, \
-                 or `promise_cancel` with the returned `promise_id`. Promise completion \
-                 automatically injects a hidden HARNESS_EVENT turn at a safe boundary unless a \
-                 terminal wait already returned the result.\n",
-            );
-        } else if reg.contains("shell_poll") {
+        if reg.contains("shell_poll") {
             stable.push_str(
                 "\nShell sessions: if `shell_run` or `shell_poll` returns `running=true`, the command \
                  is still active. Do not treat the command as complete or stop the turn there; call \
                  `shell_poll` with the returned `session_id` until `running=false`, or `shell_kill` \
-                 if you are abandoning it. For work you want to start and then continue past, call \
-                 `shell_run` with `mode=\"promise\"`, then use `promise_wait`, `promise_status`, \
-                 `promise_when_all`, or `promise_when_any`; promise completion automatically injects \
-                 a hidden HARNESS_EVENT turn at a safe boundary unless a terminal wait already \
-                 returned the result.\n",
+                 if you are abandoning it.\n",
             );
         }
     }
@@ -1672,23 +1541,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fleet_builtin_tools_replace_shell_sessions_with_promises() {
-        let names: HashSet<_> = builtin_tools_for_mode(true)
-            .into_iter()
-            .map(|tool| tool.name().to_string())
-            .collect();
-
-        assert!(names.contains("shell_run"));
-        assert!(!names.contains("shell_poll"));
-        assert!(!names.contains("shell_kill"));
-        assert!(!names.contains("shell_list"));
-        assert!(names.contains("promise_wait"));
-        assert!(names.contains("promise_status"));
-    }
-
-    #[test]
-    fn non_fleet_builtin_tools_keep_shell_sessions() {
-        let names: HashSet<_> = builtin_tools_for_mode(false)
+    fn builtin_tools_include_yield_poll_shell_session_tools() {
+        // Both fleet and non-fleet now use the same yield/poll shell tools
+        // (the promise-only fleet shell was retired in favor of codex's pull
+        // model). The shell-session family must always be present.
+        let names: HashSet<_> = builtin_tools()
             .into_iter()
             .map(|tool| tool.name().to_string())
             .collect();
@@ -1697,48 +1554,6 @@ mod tests {
         assert!(names.contains("shell_poll"));
         assert!(names.contains("shell_kill"));
         assert!(names.contains("shell_list"));
-    }
-
-    #[tokio::test]
-    async fn fleet_shell_run_always_returns_a_promise() {
-        let c = ToolCx {
-            root: std::env::temp_dir(),
-            safety: Arc::new(SafetyPolicy::new()),
-            http: reqwest::Client::new(),
-            todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
-            shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
-            promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
-            edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
-            session_env: Arc::new(BTreeMap::new()),
-        };
-
-        let v = match FleetShellRun
-            .call(json!({"command": "echo fleet", "yield_time_ms": 0}), &c)
-            .await
-        {
-            ToolResult::Json(v) => v,
-            other => panic!("expected json, got {other:?}"),
-        };
-        assert_eq!(v["running"], true, "{v}");
-        assert!(v["promise_id"].as_str().is_some(), "{v}");
-        assert!(
-            c.shell_sessions.lock().unwrap().is_empty(),
-            "fleet shell_run must not create shell_poll sessions"
-        );
-
-        let waited = match bro_tools::promise::PromiseWait
-            .call(
-                json!({"promise_id": v["promise_id"], "timeout_ms": 3000}),
-                &c,
-            )
-            .await
-        {
-            ToolResult::Json(v) => v,
-            other => panic!("expected json, got {other:?}"),
-        };
-        assert_eq!(waited["state"], "completed", "{waited}");
-        assert_eq!(waited["result"]["exit_code"], 0, "{waited}");
-        assert_eq!(waited["result"]["stdout"], "fleet\n", "{waited}");
     }
 
     #[test]
@@ -1986,7 +1801,6 @@ mod tests {
             http: reqwest::Client::new(),
             todos: todos.clone(),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
-            promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(BTreeMap::new()),
         };
@@ -2049,12 +1863,7 @@ mod tests {
     async fn run_user_turn(session: &mut Session, prompt: &str) {
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         session
-            .user_turn(
-                prompt,
-                cancel_rx,
-                Arc::new(StdMutex::new(VecDeque::new())),
-                true,
-            )
+            .user_turn(prompt, cancel_rx, Arc::new(StdMutex::new(VecDeque::new())))
             .await
             .unwrap();
     }
@@ -2544,44 +2353,9 @@ mod tests {
         assert_eq!(session.base_opts.model, "new-model");
     }
 
-    #[tokio::test]
-    async fn settled_promise_completion_injects_hidden_turn() {
-        let (mut session, shared) = mk_session(vec![MockTurn::Text("completion handled".into())]);
-        let (pid, _cancel_rx) = session.cx.promises.lock().unwrap().start(
-            "shell_run",
-            json!({"command": "echo done"}),
-            None,
-        );
-        session
-            .cx
-            .promises
-            .lock()
-            .unwrap()
-            .settle_completed(&pid, json!({"exit_code": 0, "stdout": "done\n"}));
-
-        let (tx, rx) = mpsc::unbounded_channel();
-        drop(tx);
-        let ctrl = Emitter::new("ctrl".into());
-        session_loop(&mut session, rx, &ctrl, VecDeque::new())
-            .await
-            .unwrap();
-
-        let users = shared.pushed_users.lock().unwrap().clone();
-        assert_eq!(users.len(), 2, "{users:?}");
-        assert!(users[0].starts_with("<environment_context>"));
-        assert!(users[1].contains("[HARNESS_EVENT promise_completed]"));
-        assert!(users[1].contains(&pid));
-        assert!(users[1].contains("call promise_status"));
-    }
-
     #[test]
-    fn turn_end_diagnostics_flags_running_async_work() {
+    fn turn_end_diagnostics_flags_running_shell_session() {
         let (session, _shared) = mk_session(vec![]);
-        let (pid, _cancel_rx) = session.cx.promises.lock().unwrap().start(
-            "shell_run",
-            json!({"command": "cargo test"}),
-            None,
-        );
 
         let trace = tool_result_trace(
             &transport::ToolCall {
@@ -2592,8 +2366,7 @@ mod tests {
             &transport::ToolResult {
                 id: "tc-1".into(),
                 content: json!({
-                    "promise_id": pid,
-                    "state": "running",
+                    "session_id": "sh-1",
                     "running": true,
                 })
                 .to_string(),
@@ -2601,8 +2374,8 @@ mod tests {
             },
         );
 
-        // Non-empty final text proves the async path is flagged independently
-        // of the empty-output heuristic.
+        // A still-running shell session (last tool result `running:true`) flags
+        // outstanding async work independently of the empty-output heuristic.
         let diag = session.turn_end_diagnostics(
             "model_stop",
             Some(&StopReason::Done),
@@ -2614,7 +2387,6 @@ mod tests {
 
         assert_eq!(diag["break_reason"], "model_stop");
         assert_eq!(diag["last_model_stop"], "done");
-        assert_eq!(diag["promises"]["running_count"], 1);
         assert_eq!(diag["last_tool_results"][0]["running"], true);
         assert_eq!(diag["produced_text"], true);
         assert_eq!(diag["empty_output_stop"], false);
@@ -2624,7 +2396,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|r| r == "running_promises"),
+                .any(|r| r == "last_tool_running"),
             "{diag}"
         );
     }

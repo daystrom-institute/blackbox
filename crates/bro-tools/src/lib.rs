@@ -21,7 +21,7 @@ pub mod web;
 pub mod workspace;
 
 pub use edits::{EditEvent, EditSink};
-pub use promise::{PromiseProgress, PromiseStore, StreamKind, promise_tools};
+pub use promise::{PromiseProgress, StreamKind};
 pub use safety::SafetyPolicy;
 pub use shell::{ShellKill, ShellList, ShellPoll, ShellRun, ShellSessions};
 pub use todo::{TodoItem, TodoList, TodoStatus, TodoWrite};
@@ -60,7 +60,5 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(crate::fleet_worktree::EnterWorktree),
         Arc::new(crate::fleet_worktree::ExitWorktree),
     ];
-    let mut tools = tools;
-    tools.extend(crate::promise::promise_tools());
     tools
 }

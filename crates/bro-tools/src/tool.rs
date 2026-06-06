@@ -32,12 +32,10 @@ pub struct ToolCx {
     /// Live shell sessions (shell_run/shell_poll). In-memory, single-`run()`
     /// lifetime — holds running OS children, so it is NOT persisted to `side`.
     pub shell_sessions: Arc<std::sync::Mutex<crate::shell::ShellSessions>>,
-    /// Harness-local async promises. In-memory, same-dispatch lifetime.
-    pub promises: Arc<std::sync::Mutex<crate::promise::PromiseStore>>,
     /// Per-turn capture of file mutations: file-mutating tools push an
     /// [`crate::edits::EditEvent`] (pre-image + pre/post sha256 + path) here
-    /// at mutation time, and the edit loop drains the sink after each
-    /// dispatch to feed window-0 diagnostics. Ephemeral — never persisted to
+    /// at mutation time, and the edit loop drains the sink at the batch
+    /// boundary to feed edit diagnostics. Ephemeral — never persisted to
     /// `side`.
     pub edits: Arc<std::sync::Mutex<crate::edits::EditSink>>,
     /// Per-session daemon-supplied identity/config env. This is intentionally

@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin};
-use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 
@@ -93,8 +92,8 @@ struct ShellSession {
     command: String,
     /// When the session was spawned, for an elapsed readout in `shell_list`.
     started: Instant,
-    /// Shared progress for promise mode — the readers heartbeat into this so
-    /// `promise_status` can expose running-progress metadata.
+    /// Shared progress for a yielded session — the readers heartbeat into this
+    /// so `shell_poll`/`shell_list` can expose running-progress metadata.
     progress: Option<Arc<PromiseProgress>>,
 }
 
@@ -141,19 +140,12 @@ enum Outcome {
 /// [`PromiseProgress`] the pipe readers heartbeat into. Surfaces elapsed
 /// runtime, last-output recency, and stdout/stderr byte counts so an agent
 /// polling a silent-but-healthy long command (a quiet `cargo build`) sees it is
-/// still making progress. Mirrors the `progress` field on promise snapshots.
+/// still making progress.
 fn session_progress(session: &ShellSession) -> Option<Value> {
     let progress = session.progress.as_ref()?;
     let started_ms =
         crate::promise::now_ms().saturating_sub(session.started.elapsed().as_millis() as u64);
     Some(progress.snapshot(started_ms))
-}
-
-enum PromiseOutcome {
-    Exited(Option<i32>),
-    TimedOut,
-    Cancelled,
-    Failed(String),
 }
 
 /// Drive a child until it exits, the yield deadline elapses, or the hard-kill
@@ -169,92 +161,6 @@ async fn drive(child: &mut Child, yield_at: Option<Instant>, kill_at: Option<Ins
             let _ = child.kill().await;
             Outcome::TimedOut
         }
-    }
-}
-
-async fn drive_promise(
-    child: &mut Child,
-    kill_at: Option<Instant>,
-    cancel: &mut watch::Receiver<bool>,
-) -> PromiseOutcome {
-    enum Event {
-        Exited(std::io::Result<std::process::ExitStatus>),
-        TimedOut,
-        Cancelled,
-    }
-
-    let event = if let Some(kill_at) = kill_at {
-        tokio::select! {
-            s = child.wait() => Event::Exited(s),
-            _ = sleep_until(kill_at) => Event::TimedOut,
-            _ = cancel.changed() => Event::Cancelled,
-        }
-    } else {
-        tokio::select! {
-            s = child.wait() => Event::Exited(s),
-            _ = cancel.changed() => Event::Cancelled,
-        }
-    };
-
-    match event {
-        Event::Exited(Ok(status)) => PromiseOutcome::Exited(status.code()),
-        Event::Exited(Err(e)) => PromiseOutcome::Failed(format!("wait failed: {e}")),
-        Event::TimedOut => {
-            let _ = child.kill().await;
-            PromiseOutcome::TimedOut
-        }
-        Event::Cancelled => {
-            let _ = child.kill().await;
-            PromiseOutcome::Cancelled
-        }
-    }
-}
-
-async fn run_shell_promise(
-    mut session: ShellSession,
-    cx: ToolCx,
-    promise_id: String,
-    max_tokens: usize,
-    mut cancel_rx: watch::Receiver<bool>,
-) {
-    let outcome = drive_promise(&mut session.child, session.kill_at, &mut cancel_rx).await;
-    let (so, se) = drain_final(&mut session, max_tokens).await;
-    match outcome {
-        PromiseOutcome::Exited(code) => {
-            let result = terminal_result(code, so, se, false);
-            settle_from_tool_result(&cx, &promise_id, result);
-        }
-        PromiseOutcome::TimedOut => {
-            let result = terminal_result(None, so, se, true);
-            settle_from_tool_result(&cx, &promise_id, result);
-        }
-        PromiseOutcome::Cancelled => {
-            let result = json!({
-                "exit_code": Value::Null,
-                "stdout": so,
-                "stderr": se,
-                "running": false,
-                "timed_out": false,
-                "cancelled": true,
-            });
-            cx.promises
-                .lock()
-                .unwrap()
-                .settle_cancelled(&promise_id, result);
-        }
-        PromiseOutcome::Failed(err) => cx.promises.lock().unwrap().settle_failed(&promise_id, err),
-    }
-}
-
-fn settle_from_tool_result(cx: &ToolCx, promise_id: &str, result: ToolResult) {
-    match result {
-        ToolResult::Json(v) => cx.promises.lock().unwrap().settle_completed(promise_id, v),
-        ToolResult::Text(t) => cx
-            .promises
-            .lock()
-            .unwrap()
-            .settle_completed(promise_id, json!({ "text": t })),
-        ToolResult::Error(e) => cx.promises.lock().unwrap().settle_failed(promise_id, e),
     }
 }
 
@@ -461,10 +367,6 @@ struct ShellRunInput {
     command: String,
     /// Working subdirectory relative to the worktree root.
     cwd: Option<String>,
-    /// Execution mode. Omit or set "inline" for normal shell_run behavior; set
-    /// "promise" to start immediately and return a promise_id for promise_*.
-    #[serde(default)]
-    mode: Option<String>,
     /// Hard-kill deadline in milliseconds. When set, the process is killed if
     /// it runs longer than this (honored across subsequent shell_poll calls).
     timeout_ms: Option<u64>,
@@ -499,7 +401,7 @@ impl Tool for ShellRun {
         "shell_run"
     }
     fn description(&self) -> &str {
-        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. Set mode=\"promise\" to start immediately and return a promise_id; then use promise_status/wait/when_all/when_any/cancel. Promise completion automatically injects a hidden HARNESS_EVENT turn at a safe boundary unless a terminal wait already returned the result. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
+        "Run a shell command in the worktree (bash -lc). Returns {exit_code, stdout, stderr, running, timed_out}. exit_code is null while running; it is ALSO null once terminated by a signal (UNIX has no exit code for signal-killed processes) — so exit_code:null with running:false means signal-terminated, not an error. Long commands cooperatively yield by default after ~1s with running=true + session_id; you MUST continue with shell_poll until running=false before trusting completion. Set yield_time_ms to tune the first wait; set yield_time_ms=0 only when deliberately blocking until completion/timeout. timeout_ms hard-kills a runaway; max_output_tokens caps output (tail kept). stdin feeds initial input; set close_stdin to send EOF (needed for read-until-EOF commands); env injects environment variables. Categorically destructive commands (rm -rf /, git reset --hard, kill-by-port, etc.) are refused."
     }
     fn input_schema(&self) -> Value {
         schema_for::<ShellRunInput>()
@@ -517,11 +419,6 @@ impl Tool for ShellRun {
                 Ok(p) => p,
                 Err(e) => return ToolResult::Error(e.to_string()),
             };
-        let promise_mode = match args.mode.as_deref().unwrap_or("inline") {
-            "inline" => false,
-            "promise" => true,
-            other => return ToolResult::Error(format!("unsupported shell_run mode: {other}")),
-        };
         let max_tokens = args.max_output_tokens.unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS);
 
         let mut cmd = tokio::process::Command::new("bash");
@@ -586,30 +483,6 @@ impl Tool for ShellRun {
             started: now,
             progress: Some(progress.clone()),
         };
-
-        if promise_mode {
-            let detail = json!({
-                "command": args.command,
-                "cwd": cwd.to_string_lossy(),
-                "timeout_ms": args.timeout_ms,
-            });
-            let (promise_id, cancel_rx) =
-                cx.promises
-                    .lock()
-                    .unwrap()
-                    .start("shell_run", detail, Some(progress));
-            let cx_bg = cx.clone();
-            let promise_id_bg = promise_id.clone();
-            tokio::spawn(async move {
-                run_shell_promise(session, cx_bg, promise_id_bg, max_tokens, cancel_rx).await;
-            });
-            return ToolResult::Json(json!({
-                "promise_id": promise_id,
-                "state": "running",
-                "running": true,
-                "next_step": format!("Use promise_status or promise_wait with promise_id={promise_id}; completion automatically injects a hidden HARNESS_EVENT turn when it settles."),
-            }));
-        }
 
         match drive(&mut session.child, yield_at, kill_at).await {
             Outcome::Exited(code) => {
@@ -900,7 +773,6 @@ mod tests {
             http: reqwest::Client::new(),
             todos: Arc::new(Mutex::new(crate::todo::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(ShellSessions::default())),
-            promises: Arc::new(Mutex::new(crate::promise::PromiseStore::default())),
             edits: Arc::new(Mutex::new(crate::edits::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
         }
@@ -1040,153 +912,6 @@ mod tests {
         assert_eq!(v["running"], false, "{v}");
         assert_eq!(v["exit_code"], 0, "{v}");
         assert_eq!(v["stdout"], "done\n");
-    }
-
-    #[tokio::test]
-    async fn promise_mode_returns_running_promise_then_waits() {
-        let c = cx();
-        let v = as_json(
-            ShellRun
-                .call(
-                    json!({"command": "sleep 0.1; echo promised", "mode": "promise"}),
-                    &c,
-                )
-                .await,
-        );
-        assert_eq!(v["running"], true, "{v}");
-        let pid = v["promise_id"].as_str().unwrap().to_string();
-
-        let waited = as_json(
-            crate::promise::PromiseWait
-                .call(json!({"promise_id": pid, "timeout_ms": 3000}), &c)
-                .await,
-        );
-        assert_eq!(waited["state"], "completed", "{waited}");
-        assert_eq!(waited["result"]["exit_code"], 0, "{waited}");
-        assert!(
-            waited["result"]["stdout"]
-                .as_str()
-                .unwrap()
-                .contains("promised"),
-            "{waited}"
-        );
-    }
-
-    #[tokio::test]
-    async fn promise_status_does_not_consume_hidden_event() {
-        let c = cx();
-        let v = as_json(
-            ShellRun
-                .call(json!({"command": "echo wake", "mode": "promise"}), &c)
-                .await,
-        );
-        let pid = v["promise_id"].as_str().unwrap().to_string();
-
-        let mut status = json!({"running": true});
-        for _ in 0..50 {
-            status = c.promises.lock().unwrap().status(&pid).unwrap();
-            if status["running"].as_bool() == Some(false) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(status["state"], "completed", "{status}");
-        assert_eq!(status["completion_event_delivered"], false, "{status}");
-
-        let events = c.promises.lock().unwrap().drain_completion_events();
-        assert_eq!(events.len(), 1, "{events:?}");
-        assert!(events[0].contains("[HARNESS_EVENT promise_completed]"));
-        assert!(events[0].contains(&pid));
-        assert!(events[0].contains("call promise_status"));
-    }
-
-    #[tokio::test]
-    async fn promise_wait_timeout_does_not_consume_hidden_event() {
-        let c = cx();
-        let v = as_json(
-            ShellRun
-                .call(
-                    json!({"command": "sleep 0.05; echo wake", "mode": "promise"}),
-                    &c,
-                )
-                .await,
-        );
-        let pid = v["promise_id"].as_str().unwrap().to_string();
-
-        let timed_out = as_json(
-            crate::promise::PromiseWait
-                .call(json!({"promise_id": pid, "timeout_ms": 1}), &c)
-                .await,
-        );
-        assert_eq!(timed_out["timed_out"], true, "{timed_out}");
-
-        let waited = as_json(
-            crate::promise::PromiseWait
-                .call(json!({"promise_id": pid, "timeout_ms": 3000}), &c)
-                .await,
-        );
-        assert_eq!(waited["state"], "completed", "{waited}");
-        assert_eq!(waited["completion_event_delivered"], true, "{waited}");
-    }
-
-    #[tokio::test]
-    async fn promise_wait_completion_consumes_hidden_event() {
-        let c = cx();
-        let v = as_json(
-            ShellRun
-                .call(json!({"command": "echo wake", "mode": "promise"}), &c)
-                .await,
-        );
-        let pid = v["promise_id"].as_str().unwrap().to_string();
-
-        let waited = as_json(
-            crate::promise::PromiseWait
-                .call(json!({"promise_id": pid, "timeout_ms": 3000}), &c)
-                .await,
-        );
-        assert_eq!(waited["state"], "completed", "{waited}");
-        assert_eq!(waited["completion_event_delivered"], true, "{waited}");
-        let events = c.promises.lock().unwrap().drain_completion_events();
-        assert!(
-            events.is_empty(),
-            "promise_wait returned the terminal result, so no stale wake should remain: {events:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn promise_cancel_stops_running_shell() {
-        let c = cx();
-        let v = as_json(
-            ShellRun
-                .call(json!({"command": "sleep 60", "mode": "promise"}), &c)
-                .await,
-        );
-        let pid = v["promise_id"].as_str().unwrap().to_string();
-        let cancelled = as_json(
-            crate::promise::PromiseCancel
-                .call(json!({"promise_id": pid}), &c)
-                .await,
-        );
-        assert_eq!(cancelled["running"], true, "{cancelled}");
-
-        let waited = as_json(
-            crate::promise::PromiseWait
-                .call(
-                    json!({"promise_id": cancelled["promise_id"], "timeout_ms": 3000}),
-                    &c,
-                )
-                .await,
-        );
-        assert_eq!(waited["state"], "cancelled", "{waited}");
-        assert_eq!(waited["completion_event_delivered"], true, "{waited}");
-        assert_eq!(waited["result"]["cancelled"], true, "{waited}");
-        assert!(
-            c.promises
-                .lock()
-                .unwrap()
-                .drain_completion_events()
-                .is_empty()
-        );
     }
 
     #[test]

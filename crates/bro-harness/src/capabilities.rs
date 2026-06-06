@@ -384,7 +384,6 @@ mod tests {
             http: reqwest::Client::new(),
             todos: Arc::new(Mutex::new(bro_tools::TodoList::default())),
             shell_sessions: Arc::new(Mutex::new(bro_tools::ShellSessions::default())),
-            promises: Arc::new(Mutex::new(bro_tools::PromiseStore::default())),
             edits: Arc::new(Mutex::new(bro_tools::EditSink::default())),
             session_env: Arc::new(std::collections::BTreeMap::new()),
         }
@@ -566,5 +565,4 @@ mod tests {
         let err = denied.expect_err("denied tool must fail closed");
         assert_eq!(err.code, "tool_unavailable");
     }
-
 }

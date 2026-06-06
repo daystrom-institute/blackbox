@@ -3920,20 +3920,7 @@ fn is_internal_tool(name: &str) -> bool {
 }
 
 fn shell_result_tool(name: Option<&str>) -> bool {
-    matches!(
-        name,
-        Some(
-            "shell_run"
-                | "shell_poll"
-                | "shell_kill"
-                | "promise_wait"
-                | "promise_status"
-                | "promise_when_all"
-                | "promise_when_any"
-                | "promise_cancel"
-                | "promise_list"
-        )
-    )
+    matches!(name, Some("shell_run" | "shell_poll" | "shell_kill"))
 }
 
 fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Line<'static>> {
@@ -3968,16 +3955,6 @@ fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Li
             if is_error { Color::Red } else { Color::Gray },
         );
     };
-    if obj.contains_key("promise_id") && obj.contains_key("state") {
-        return promise_snapshot_block(obj, is_error, max_lines);
-    }
-    if let Some(promises) = obj.get("promises").and_then(|v| v.as_array()) {
-        return promise_many_block("promises", promises, is_error, max_lines);
-    }
-    if let Some(promise) = obj.get("promise").and_then(|v| v.as_object()) {
-        return promise_snapshot_block(promise, is_error, max_lines);
-    }
-
     let exit = obj
         .get("exit_code")
         .map(|v| {
@@ -4042,175 +4019,6 @@ fn shell_result_block(content: &str, is_error: bool, max_lines: usize) -> Vec<Li
         )));
     }
     out
-}
-
-fn promise_many_block(
-    label: &str,
-    promises: &[serde_json::Value],
-    is_error: bool,
-    max_lines: usize,
-) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(Span::styled(
-        format!("↳ {label}: {}", promises.len()),
-        Style::default().fg(if is_error {
-            Color::Red
-        } else {
-            Color::DarkGray
-        }),
-    ))];
-    for promise in promises.iter().take(max_lines) {
-        if let Some(obj) = promise.as_object() {
-            out.extend(promise_snapshot_block(obj, is_error, max_lines));
-        }
-    }
-    if promises.len() > max_lines {
-        out.push(Line::from(Span::styled(
-            format!("… {} more promises", promises.len() - max_lines),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    out
-}
-
-/// Human-readable byte count: "128B", "4.2KB", "1.3MB".
-fn fmt_bytes(n: u64) -> String {
-    const KIB: f64 = 1024.0;
-    const MIB: f64 = KIB * 1024.0;
-    if n >= (MIB as u64) {
-        format!("{:.1}MB", n as f64 / MIB)
-    } else if n >= (KIB as u64) {
-        format!("{:.1}KB", n as f64 / KIB)
-    } else {
-        format!("{}B", n)
-    }
-}
-
-fn promise_snapshot_block(
-    obj: &serde_json::Map<String, serde_json::Value>,
-    is_error: bool,
-    max_lines: usize,
-) -> Vec<Line<'static>> {
-    let id = obj
-        .get("promise_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?");
-    let state = obj.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-    let mut head = format!("promise {id} {state}");
-    if let Some(producer) = obj.get("producer").and_then(|v| v.as_str()) {
-        head.push_str(&format!(" producer={producer}"));
-    }
-    if let Some(command) = obj
-        .get("detail")
-        .and_then(|v| v.get("command"))
-        .and_then(|v| v.as_str())
-    {
-        head.push_str(&format!(" cmd: {}", quote_flat_string(command)));
-    }
-
-    let state_color = match state {
-        "failed" => Color::Red,
-        "cancelled" => Color::Yellow,
-        "running" => Color::Yellow,
-        _ if is_error => Color::Red,
-        _ => Color::DarkGray,
-    };
-    let mut out = vec![Line::from(Span::styled(
-        format!("↳ {head}"),
-        Style::default().fg(state_color),
-    ))];
-    if let Some(next_step) = obj.get("next_step").and_then(|v| v.as_str())
-        && !next_step.is_empty()
-    {
-        out.push(Line::from(Span::styled(
-            format!("next: {next_step}"),
-            Style::default().fg(Color::Yellow),
-        )));
-    }
-    // Render progress metadata for running promises that have a heartbeat.
-    if let Some(progress) = obj.get("progress").and_then(|v| v.as_object()) {
-        let mut parts: Vec<String> = Vec::new();
-        if let Some(elapsed) = progress.get("elapsed_ms").and_then(|v| v.as_u64()) {
-            parts.push(format!("elapsed={:.1}s", elapsed as f64 / 1000.0));
-        }
-        if let Some(last) = progress
-            .get("last_output_elapsed_ms")
-            .and_then(|v| v.as_u64())
-            && last > 0
-        {
-            parts.push(format!("last_out={:.1}s ago", last as f64 / 1000.0));
-        }
-        let so = progress
-            .get("stdout_bytes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let se = progress
-            .get("stderr_bytes")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        parts.push(format!("stdout={} stderr={}", fmt_bytes(so), fmt_bytes(se)));
-        out.push(Line::from(Span::styled(
-            format!("  {}", parts.join("  ")),
-            Style::default().fg(Color::DarkGray),
-        )));
-    }
-    if let Some(error) = obj.get("error").and_then(|v| v.as_str())
-        && !error.is_empty()
-    {
-        out.push(Line::from(Span::styled(
-            format!("error: {error}"),
-            Style::default().fg(Color::Red),
-        )));
-    }
-    if let Some(result) = obj.get("result").and_then(|v| v.as_object()) {
-        append_shell_like_result(&mut out, result, max_lines);
-    }
-    out
-}
-
-fn append_shell_like_result(
-    out: &mut Vec<Line<'static>>,
-    obj: &serde_json::Map<String, serde_json::Value>,
-    max_lines: usize,
-) {
-    if obj.contains_key("exit_code") || obj.contains_key("stdout") || obj.contains_key("stderr") {
-        let mut head = obj
-            .get("exit_code")
-            .map(|v| {
-                if v.is_null() {
-                    "exit=null".to_string()
-                } else {
-                    format!("exit={}", v)
-                }
-            })
-            .unwrap_or_else(|| "exit=?".to_string());
-        if obj.get("timed_out").and_then(|v| v.as_bool()) == Some(true) {
-            head.push_str(" timed_out");
-        }
-        if obj.get("cancelled").and_then(|v| v.as_bool()) == Some(true) {
-            head.push_str(" cancelled");
-        }
-        out.push(Line::from(Span::styled(
-            format!("result: {head}"),
-            Style::default().fg(Color::DarkGray),
-        )));
-        for (label, color) in [("stdout", Color::Gray), ("stderr", Color::Red)] {
-            if let Some(text) = obj.get(label).and_then(|v| v.as_str())
-                && !text.is_empty()
-            {
-                out.push(Line::from(Span::styled(
-                    format!("{label}:"),
-                    Style::default().fg(color).add_modifier(Modifier::BOLD),
-                )));
-                out.extend(monospace_block(text, max_lines, color));
-            }
-        }
-        if let Some(register) = obj.get("stdout_register").and_then(|v| v.as_str()) {
-            out.push(Line::from(Span::styled(
-                format!("stdout → {register}"),
-                Style::default().fg(Color::Gray),
-            )));
-        }
-    }
 }
 
 fn render_file_edit_call(name: &str, args: &str, width: usize) -> Option<Vec<Line<'static>>> {
