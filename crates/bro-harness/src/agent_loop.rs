@@ -37,9 +37,14 @@ use tokio::sync::{mpsc, watch};
 // reasoning budget is not carved out of this, so output is no longer starved.
 // Override with `BRO_HARNESS_MAX_TOKENS`.
 const DEFAULT_MAX_TOKENS: u32 = 32000;
-/// Hard backstop on loop iterations *per user turn*; the daemon's supervision is
-/// the outer guard. Override with `BRO_HARNESS_MAX_TURNS`.
-const DEFAULT_MAX_TURNS: u64 = 50;
+/// Runaway backstop on loop iterations *per user turn*, set far above any real
+/// task — the daemon's supervision plus operator observation are the actual
+/// guards, so this only exists to stop a truly stuck loop. It must never
+/// guillotine a legitimate session: each iteration is one model round-trip
+/// (~one tool call for sequential-tool models), so a normal grounding +
+/// implement + build-poll sequence can easily run into the hundreds. Override
+/// with `BRO_HARNESS_MAX_TURNS`.
+const DEFAULT_MAX_TURNS: u64 = 1000;
 
 /// Marker injected as a tool_result when a tool dispatch is interrupted, so the
 /// transport buffer stays valid (every tool_use gets a matching result).
