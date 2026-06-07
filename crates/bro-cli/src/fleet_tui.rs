@@ -1348,11 +1348,13 @@ where
 }
 
 fn standalone_intro_lines(app: &App) -> Vec<Line<'static>> {
+    // Pre-install window of a prompt-launched / resumed dispatch: paint nothing
+    // in the transcript area (the composer chrome already shows "Agent activity
+    // working"). Rendering a line here would linger in scrollback once the real
+    // transcript flows in. Only the genuine empty-interactive launch shows the
+    // guidance intro below.
     if matches!(app.status.as_deref(), Some("starting…" | "resuming…")) {
-        return vec![Line::from(Span::styled(
-            app.status.clone().unwrap_or_default(),
-            Style::default().fg(Color::Yellow),
-        ))];
+        return Vec::new();
     }
 
     let target = app
