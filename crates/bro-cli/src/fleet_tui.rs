@@ -1151,7 +1151,6 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
     let mut terminal = custom_terminal::Terminal::with_options(backend)?;
 
     let result = (|| -> anyhow::Result<()> {
-        let mut previous_viewport: Option<Rect> = None;
         loop {
             drain_tui_events(app, &signals);
             if app.quit {
@@ -1199,14 +1198,6 @@ fn run_tui_inner_inline(app: &mut App, signals: mpsc::Receiver<TailEvent>) -> an
             let live_h = active_h.saturating_add(composer_h).min(screen_h).max(composer_h);
             let viewport = Rect::new(0, screen_h.saturating_sub(live_h), screen_w, live_h);
             terminal.set_viewport_area(viewport);
-            if let Some(previous) = previous_viewport.replace(viewport)
-                && previous != viewport
-            {
-                terminal.clear_after_position(Position {
-                    x: 0,
-                    y: previous.y.min(viewport.y),
-                })?;
-            }
             terminal.draw(|f| {
                 let area = f.area();
                 let composer_h = composer_h.min(area.height);
