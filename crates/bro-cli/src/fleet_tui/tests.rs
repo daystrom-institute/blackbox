@@ -4,6 +4,94 @@
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
+    /// Serialize rendered lines to a real ANSI string (SGR per span) for
+    /// live/tmux inspection of truecolor highlighting + styling.
+    fn lines_to_ansi(lines: &[Line<'_>]) -> String {
+        fn sgr(style: ratatui::style::Style) -> String {
+            let mut codes: Vec<String> = Vec::new();
+            if let Some(c) = style.fg {
+                match c {
+                    Color::Rgb(r, g, b) => codes.push(format!("38;2;{r};{g};{b}")),
+                    Color::Indexed(i) => codes.push(format!("38;5;{i}")),
+                    Color::Black => codes.push("30".into()),
+                    Color::Red => codes.push("31".into()),
+                    Color::Green => codes.push("32".into()),
+                    Color::Yellow => codes.push("33".into()),
+                    Color::Blue => codes.push("34".into()),
+                    Color::Magenta => codes.push("35".into()),
+                    Color::Cyan => codes.push("36".into()),
+                    Color::Gray => codes.push("37".into()),
+                    Color::DarkGray => codes.push("90".into()),
+                    Color::LightBlue => codes.push("94".into()),
+                    Color::White => codes.push("97".into()),
+                    _ => {}
+                }
+            }
+            if style.add_modifier.contains(Modifier::BOLD) {
+                codes.push("1".into());
+            }
+            if style.add_modifier.contains(Modifier::ITALIC) {
+                codes.push("3".into());
+            }
+            if style.add_modifier.contains(Modifier::DIM) {
+                codes.push("2".into());
+            }
+            if codes.is_empty() {
+                String::new()
+            } else {
+                format!("\x1b[{}m", codes.join(";"))
+            }
+        }
+        let mut out = String::new();
+        for line in lines {
+            for span in &line.spans {
+                let pre = sgr(span.style);
+                if pre.is_empty() {
+                    out.push_str(&span.content);
+                } else {
+                    out.push_str(&pre);
+                    out.push_str(&span.content);
+                    out.push_str("\x1b[0m");
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Dev helper (ignored by default): render a rich sample transcript through
+    /// the real render path and write real ANSI to /tmp/fleet_render_demo.ansi
+    /// for live truecolor inspection under tmux. Run with:
+    ///   cargo test -p bro-cli render_demo_to_ansi -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn render_demo_to_ansi() {
+        let md = concat!(
+            "## Rendering demo\n\n",
+            "Some **bold**, *italic*, and `inline code`, plus a ",
+            "[link](https://example.com/a/long/path).\n\n",
+            "```rust\n",
+            "fn main() {\n",
+            "    let items = vec![1, 2, 3];\n",
+            "    println!(\"sum = {}\", items.iter().sum::<i32>());\n",
+            "}\n",
+            "```\n\n",
+            "A table wrapped in a markdown fence (should unwrap to a real table):\n\n",
+            "```md\n",
+            "| Provider | Status | Cost |\n",
+            "|----------|--------|------|\n",
+            "| brodex   | ok     | 0.12 |\n",
+            "| glm      | error  | 0.00 |\n",
+            "```\n",
+        );
+        let items = vec![TranscriptItem::AssistantText(md.into())];
+        let steer = "this is a fairly long initial steer prompt that should word-wrap cleanly across the column width without breaking words";
+        let lines = render_transcript(&items, steer, &[], 64);
+        let ansi = lines_to_ansi(&lines);
+        std::fs::write("/tmp/fleet_render_demo.ansi", ansi).expect("write ansi demo");
+        eprintln!("wrote /tmp/fleet_render_demo.ansi ({} lines)", lines.len());
+    }
+
     // ---- Render snapshot safety net (Phase 0) ------------------------------
     //
     // Two complementary goldens lock the current rendering behavior before the
