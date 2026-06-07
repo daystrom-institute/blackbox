@@ -390,6 +390,58 @@ fn walk_base(root: &Path, rel: Option<&str>) -> anyhow::Result<PathBuf> {
     resolve_in_root(root, rel.unwrap_or("."))
 }
 
+/// Directory names that are pruned from every recursive workspace walk
+/// (`glob`, `content_search`). These are build/dependency/VCS trees that an
+/// agent never wants to grep and that can be enormous — a single Cargo
+/// `target/` in this very repo is 30 GB / 65k files. Pruning them by name is
+/// defense-in-depth that does not depend on any ignore file being present.
+const PRUNE_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".direnv",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    ".gradle",
+    ".cargo",
+];
+
+/// A recursive directory walker hardened against runaway traversals.
+///
+/// Two protections layered together:
+///   1. `require_git(false)` — honor `.gitignore` even when the walk root is not
+///      a *recognized* git repository. This is essential inside a linked git
+///      **worktree**, whose `.git` is a file (a `gitdir:` pointer), not a
+///      directory: `ignore`'s default git detection misses it, so without this
+///      it silently skips `.gitignore` and descends straight into the gitignored
+///      `target/`. (That is exactly how the in-process harness wedged the daemon
+///      — every `glob`/`content_search` walked 30 GB of build output.)
+///   2. `filter_entry` hard-prunes [`PRUNE_DIRS`] by name, so even a directory
+///      with no `.gitignore` at all (or one that doesn't list `target/`) can't
+///      trigger a catastrophic walk. Only directories are pruned; files that
+///      happen to share a name are still visited.
+fn hardened_walk(base: &Path) -> ignore::Walk {
+    WalkBuilder::new(base)
+        .require_git(false)
+        .filter_entry(|e| {
+            if e.file_type().is_some_and(|t| t.is_dir()) {
+                let name = e.file_name().to_str().unwrap_or_default();
+                !PRUNE_DIRS.contains(&name)
+            } else {
+                true
+            }
+        })
+        .build()
+}
+
 /// Read a file as UTF-8, returning None for binary/oversized/unreadable.
 fn read_text_capped(path: &Path, max_bytes: u64) -> Option<String> {
     let meta = std::fs::metadata(path).ok()?;
@@ -1051,7 +1103,7 @@ impl Tool for ContentSearch {
         // `files`/`count` modes count files; `content` counts lines.
         let mut total_matches = 0usize;
         let mut matched_files = 0usize;
-        'walk: for entry in WalkBuilder::new(&base).build().flatten() {
+        'walk: for entry in hardened_walk(&base).flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -1196,7 +1248,7 @@ impl Tool for Glob {
         let root = effective_root(&cx.root);
         // Collect (relpath, mtime) so we can order before formatting.
         let mut out: Vec<(String, std::time::SystemTime)> = Vec::new();
-        for entry in WalkBuilder::new(&base).build().flatten() {
+        for entry in hardened_walk(&base).flatten() {
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -1754,6 +1806,47 @@ mod tests {
         let r = Glob.call(json!({"pattern": "*.rs"}), &cx).await;
         match r {
             ToolResult::Text(t) => assert!(t.contains("alpha.rs") && !t.contains("beta.md")),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn glob_and_search_prune_heavy_dirs_without_gitignore() {
+        // Regression: a recursive walk must never descend into build/VCS trees
+        // like `target/` or `node_modules/`, EVEN when no .gitignore is present
+        // (e.g. a non-git dir, or a git worktree whose `.git` file defeats
+        // ignore-crate git detection). This is what wedged the in-process daemon
+        // by walking a 30 GB `target/`.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.rs"), "fn wanted() {}\n").unwrap();
+        for heavy in ["target", "node_modules"] {
+            let sub = dir.path().join(heavy);
+            std::fs::create_dir_all(&sub).unwrap();
+            std::fs::write(sub.join("buried.rs"), "fn wanted() {}\n").unwrap();
+        }
+        // No .gitignore written on purpose — pruning must not depend on one.
+        let cx = cx_at(dir.path());
+
+        let r = Glob.call(json!({"pattern": "**/*.rs"}), &cx).await;
+        match r {
+            ToolResult::Text(t) => {
+                assert!(t.contains("keep.rs"), "expected keep.rs, got: {t}");
+                assert!(
+                    !t.contains("buried.rs"),
+                    "heavy dirs must be pruned, got: {t}"
+                );
+            }
+            other => panic!("expected text, got {other:?}"),
+        }
+
+        let r = ContentSearch
+            .call(json!({"pattern": "fn wanted", "mode": "files"}), &cx)
+            .await;
+        match r {
+            ToolResult::Text(t) => assert!(
+                !t.contains("buried.rs"),
+                "content_search must prune heavy dirs, got: {t}"
+            ),
             other => panic!("expected text, got {other:?}"),
         }
     }
