@@ -10,10 +10,71 @@ pub(super) fn render_markdown_with_width(text: &str, width: usize) -> Vec<Line<'
 }
 
 pub(super) fn render_markdown_with_limit(text: &str, max_width: Option<usize>) -> Vec<Line<'static>> {
-    markdown_blocks_preserving_terminal_shapes(text)
+    let text = unwrap_markdown_table_fences(text);
+    markdown_blocks_preserving_terminal_shapes(&text)
         .into_iter()
         .flat_map(|block| render_markdown_block(block, max_width))
         .collect()
+}
+
+/// Strip ` ```md `/` ```markdown ` fences whose body contains a markdown table,
+/// so the table renders natively instead of as a monospace code block. Models
+/// load tables inside markdown fences surprisingly often.
+///
+/// Adapted (simplified) from codex markdown.rs::unwrap_markdown_fences
+/// (Apache-2.0). Conservative: only unwraps `md`/`markdown`-info fences whose
+/// body actually contains a header+delimiter table; every other fence (and
+/// non-table md fences) passes through verbatim. Does not handle nested fences
+/// or blockquoted fences (codex does); good enough for live agent output.
+fn unwrap_markdown_table_fences(text: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !text.contains("```") && !text.contains("~~~") {
+        return Cow::Borrowed(text);
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some(info) = opening_fence_language(line) {
+            let marker = fence_marker(line).unwrap_or("```");
+            let body_start = i + 1;
+            let mut j = body_start;
+            while j < lines.len() && !is_closing_fence(lines[j], marker) {
+                j += 1;
+            }
+            let body = &lines[body_start..j.min(lines.len())];
+            let is_md = info.as_deref().is_some_and(|l| {
+                let l = l.trim().to_ascii_lowercase();
+                l == "md" || l == "markdown"
+            });
+            if is_md && body_has_table(body) {
+                out.extend_from_slice(body); // unwrap: emit body without the fence
+                changed = true;
+            } else {
+                out.push(line); // opening fence
+                out.extend_from_slice(body);
+                if j < lines.len() {
+                    out.push(lines[j]); // closing fence
+                }
+            }
+            i = if j < lines.len() { j + 1 } else { j };
+            continue;
+        }
+        out.push(line);
+        i += 1;
+    }
+    if changed {
+        Cow::Owned(out.join("\n"))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+fn body_has_table(body: &[&str]) -> bool {
+    body.windows(2)
+        .any(|w| is_table_header_line(w[0]) && is_table_separator_line(w[1]))
 }
 
 pub(super) enum MarkdownBlock {
@@ -261,4 +322,41 @@ pub(super) fn render_rule_block() -> Vec<Line<'static>> {
         "─".repeat(HORIZONTAL_RULE_WIDTH),
         Style::default().fg(Color::DarkGray),
     ))]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unwraps_md_fenced_table() {
+        let src = "```md\n| A | B |\n|---|---|\n| 1 | 2 |\n```";
+        let out = unwrap_markdown_table_fences(src);
+        assert!(!out.contains("```"), "fence should be stripped: {out:?}");
+        assert!(out.contains("| A | B |"));
+        // ...and it actually renders as a table (box-drawing), not a code block.
+        let text: String = render_markdown_with_width(src, 40)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.to_string()))
+            .collect();
+        assert!(text.contains('┌') && text.contains('│'), "expected a table: {text:?}");
+    }
+
+    #[test]
+    fn leaves_code_fences_untouched() {
+        let src = "```rust\nfn main() {}\n```";
+        assert_eq!(unwrap_markdown_table_fences(src), src);
+    }
+
+    #[test]
+    fn leaves_md_fence_without_table_untouched() {
+        let src = "```md\njust some *text*\n```";
+        assert_eq!(unwrap_markdown_table_fences(src), src);
+    }
+
+    #[test]
+    fn plain_text_is_borrowed_unchanged() {
+        let src = "plain text\n| A | B |\n|---|---|";
+        assert_eq!(unwrap_markdown_table_fences(src), src);
+    }
 }
