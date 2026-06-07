@@ -2783,16 +2783,23 @@ fn selected_activity_spans(
     let agent = &app.agents[idx];
     let agent_id = agent.task.id();
     let classifier = agent.classifier.clone();
+    // A locally-submitted steer the harness hasn't echoed yet means a turn is in
+    // flight even though the stream-derived `turn_active` is briefly stale at the
+    // turn boundary (it still reflects the previous turn's `result`). Treat
+    // pending input as active so the status shows "working" rather than flashing
+    // a stale "✓ complete/took" before the new turn's first event arrives.
+    let pending_turn = !agent.pending_inputs.is_empty();
     let v = &views[idx];
+    let turn_active = v.turn_active || pending_turn;
     let agent_key = activity_key("agent", &agent_id);
-    let agent_clock = sync_activity_clock(&mut app.activity_clocks, agent_key, v.turn_active, now);
+    let agent_clock = sync_activity_clock(&mut app.activity_clocks, agent_key, turn_active, now);
 
     let mut spans = vec![Span::raw("  ")];
     spans.extend(activity_segment(
         "Agent activity",
         ActivityRole::Agent,
         v.state,
-        v.turn_active,
+        turn_active,
         v.needs_input,
         v.last_activity_ms,
         &agent_clock,
